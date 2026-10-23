@@ -131,13 +131,22 @@ async def _published_file_rows(session, schema, snapshot_id, identity):
     return sorted(file_versions, key=lambda file: file["source_file_version_id"]), source_keys
 
 
-async def published_plan_inventory(session, schema_name, ownership, *, operation_id):
+async def published_plan_inventory(session, schema_name, ownership, *, operation_id, source_authority=None):
     """Verify original authority and exact file joins; never infer plan-specific subsets."""
-    authority = (
-        await prepare_ptg_result_archive_source_authority(
-            session, schema_name=schema_name, snapshot_id=ownership["snapshot_id"], operation_id=operation_id
-        )
-    ).as_dict()
+    if source_authority is None:
+        authority = (
+            await prepare_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, snapshot_id=ownership["snapshot_id"], operation_id=operation_id
+            )
+        ).as_dict()
+    else:
+        from process.ptg_parts.result_archive_published_authority import lock_ptg_published_result_for_clone
+
+        authority = (
+            await lock_ptg_published_result_for_clone(session, schema_name=schema_name, authority=source_authority)
+        ).as_dict()
+        if authority != source_authority or authority["operation_id"] != operation_id:
+            raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
     if authority["contract"] != AUTHORITY_CONTRACT:
         raise RegistryPTGProducerScopeError("registry_ptg_published_source_required")
     identity = authority["identity"]

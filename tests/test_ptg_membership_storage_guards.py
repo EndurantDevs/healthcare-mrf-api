@@ -172,6 +172,7 @@ async def test_sibling_pin_requires_exact_sealed_same_source_attachment(monkeypa
     locate = AsyncMock(return_value=None if kind == "absent" else object())
     monkeypatch.setattr(storage, "locate", locate)
     session = _session(scalar=row)
+    session.scalar.side_effect = [100, row]
     if kind == "ready":
         await storage._require_sibling_pin(session, PARAMS, key)
         locate.assert_awaited_once_with(session, sibling)
@@ -180,6 +181,21 @@ async def test_sibling_pin_requires_exact_sealed_same_source_attachment(monkeypa
             await storage._require_sibling_pin(session, PARAMS, key)
         if kind != "absent":
             locate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_sibling_refuses_retirement_without_reading_missing_view(monkeypatch):
+    key = digest(PARAMS | {"code": "99214"})
+    locate = AsyncMock()
+    monkeypatch.setattr(storage, "locate", locate)
+    session = _session()
+    with pytest.raises(PTG2ManifestArtifactError, match="sibling retention pin is still preparing"):
+        await storage._require_sibling_pin(session, PARAMS, key)
+    assert session.scalar.await_count == 1
+    statement, parameters = session.scalar.call_args.args
+    assert str(statement) == "SELECT to_regclass(:relation)::oid"
+    assert parameters == {"relation": "hp_snapshot_retention." + storage._attachment_for_digest(key)}
+    locate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

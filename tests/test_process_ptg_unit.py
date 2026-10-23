@@ -18,15 +18,15 @@ import threading
 import time
 import zipfile
 from contextlib import asynccontextmanager
-from types import SimpleNamespace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from aiohttp import web
-from tests.live_progress_atomic_redis import AtomicLiveProgressRedis
 
+from tests.live_progress_atomic_redis import AtomicLiveProgressRedis
 
 process_pkg = importlib.import_module("process")
 process_ptg = importlib.import_module("process.ptg")
@@ -38,9 +38,7 @@ ptg_canonical = importlib.import_module("process.ptg_parts.canonical")
 ptg_copy_load = importlib.import_module("process.ptg_parts.copy_load")
 ptg_db_tables = importlib.import_module("process.ptg_parts.db_tables")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
-healthsparq_source_jobs = importlib.import_module(
-    "process.ptg_parts.healthsparq_source_jobs"
-)
+healthsparq_source_jobs = importlib.import_module("process.ptg_parts.healthsparq_source_jobs")
 ptg_import_rows = importlib.import_module("process.ptg_parts.import_rows")
 ptg_json_streams = importlib.import_module("process.ptg_parts.json_streams")
 ptg_live_progress = importlib.import_module("process.ptg_parts.live_progress")
@@ -62,10 +60,7 @@ def test_candidate_audit_worker_requires_uvloop_before_startup(monkeypatch):
     process_pkg.uvloop.run(run_startup())
 
     startup.assert_awaited_once_with({})
-    assert (
-        process_pkg.PTGCandidateAudit.on_startup
-        is process_pkg._ptg_candidate_audit_startup
-    )
+    assert process_pkg.PTGCandidateAudit.on_startup is process_pkg._ptg_candidate_audit_startup
 
 
 def _deflate64_zip_headers(
@@ -126,25 +121,14 @@ def _write_deflate64_zip(path: Path, member_name: str, member_payload: bytes) ->
         central_offset,
         0,
     )
-    path.write_bytes(
-        local_header
-        + name_bytes
-        + compressed
-        + central_header
-        + name_bytes
-        + end_record
-    )
+    path.write_bytes(local_header + name_bytes + compressed + central_header + name_bytes + end_record)
 
 
-ptg_provider_references = importlib.import_module(
-    "process.ptg_parts.provider_references"
-)
+ptg_provider_references = importlib.import_module("process.ptg_parts.provider_references")
 ptg_row_helpers = importlib.import_module("process.ptg_parts.row_helpers")
 ptg_rust_scanner = importlib.import_module("process.ptg_parts.rust_scanner")
 ptg_rust_stage = importlib.import_module("process.ptg_parts.rust_stage")
-ptg_manifest_publish = importlib.import_module(
-    "process.ptg_parts.ptg2_manifest_publish"
-)
+ptg_manifest_publish = importlib.import_module("process.ptg_parts.ptg2_manifest_publish")
 ptg_screen = importlib.import_module("process.ptg_parts.screen")
 
 
@@ -152,9 +136,7 @@ def _empty_provider_identifier_quarantine_scanner_summary():
     return {
         "scanner": {
             "summary": {
-                "provider_identifier_quarantine": (
-                    ptg_provider_quarantine.provider_identifier_quarantine_payload({})
-                )
+                "provider_identifier_quarantine": (ptg_provider_quarantine.provider_identifier_quarantine_payload({}))
             }
         }
     }
@@ -178,36 +160,18 @@ def test_shared_v4_empty_npi_evidence_is_exact_and_skips_duplicates():
     file_results = [
         {
             "summary": {
-                "scanner": {
-                    "summary": {
-                        "empty_npi_tin_only_normalization": (
-                            _v4_empty_npi_normalization_payload(2)
-                        )
-                    }
-                }
+                "scanner": {"summary": {"empty_npi_tin_only_normalization": (_v4_empty_npi_normalization_payload(2))}}
             }
         },
         {
             "summary": {
-                "scanner": {
-                    "summary": {
-                        "empty_npi_tin_only_normalization": (
-                            _v4_empty_npi_normalization_payload(3)
-                        )
-                    }
-                }
+                "scanner": {"summary": {"empty_npi_tin_only_normalization": (_v4_empty_npi_normalization_payload(3))}}
             }
         },
         {
             "skipped": True,
             "summary": {
-                "scanner": {
-                    "summary": {
-                        "empty_npi_tin_only_normalization": (
-                            _v4_empty_npi_normalization_payload(11)
-                        )
-                    }
-                }
+                "scanner": {"summary": {"empty_npi_tin_only_normalization": (_v4_empty_npi_normalization_payload(11))}}
             },
         },
     ]
@@ -218,13 +182,7 @@ def test_shared_v4_empty_npi_evidence_is_exact_and_skips_duplicates():
 def test_shared_v4_empty_npi_evidence_rejects_digest_tamper():
     payload = _v4_empty_npi_normalization_payload(2)
     payload["occurrence_count"] = 3
-    file_results = [
-        {
-            "summary": {
-                "scanner": {"summary": {"empty_npi_tin_only_normalization": payload}}
-            }
-        }
-    ]
+    file_results = [{"summary": {"scanner": {"summary": {"empty_npi_tin_only_normalization": payload}}}}]
 
     with pytest.raises(RuntimeError, match="digest changed"):
         process_ptg._sum_v4_tin_only_audits(file_results)
@@ -235,11 +193,7 @@ def test_shared_v4_empty_npi_evidence_rejects_aggregate_overflow():
         {
             "summary": {
                 "scanner": {
-                    "summary": {
-                        "empty_npi_tin_only_normalization": (
-                            _v4_empty_npi_normalization_payload(2**63)
-                        )
-                    }
+                    "summary": {"empty_npi_tin_only_normalization": (_v4_empty_npi_normalization_payload(2**63))}
                 }
             }
         }
@@ -266,24 +220,14 @@ def test_shared_v4_empty_npi_evidence_rejects_missing_or_negative_count(
     normalization_audit,
     expected_error,
 ):
-    file_results = [
-        {
-            "summary": {
-                "scanner": {
-                    "summary": {"empty_npi_tin_only_normalization": normalization_audit}
-                }
-            }
-        }
-    ]
+    file_results = [{"summary": {"scanner": {"summary": {"empty_npi_tin_only_normalization": normalization_audit}}}}]
 
     with pytest.raises(RuntimeError, match=expected_error):
         process_ptg._sum_v4_tin_only_audits(file_results)
 
 
 def test_shared_v3_quarantine_combines_scanners_and_skips_duplicates():
-    first_quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
-        {-17: 1, 123_456_789: 2}
-    )
+    first_quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload({-17: 1, 123_456_789: 2})
     second_quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
         {123_456_789: 3, 10_000_000_000: 4}
     )
@@ -553,22 +497,13 @@ def test_row_helper_split_keeps_facade_helpers_stable():
     assert process_ptg._make_checksum is ptg_row_helpers._make_checksum
     assert process_ptg._as_int_list is ptg_row_helpers._as_int_list
     assert process_ptg._normalized_npi_list is ptg_row_helpers._normalized_npi_list
-    assert (
-        process_ptg._provider_group_identity_hash
-        is ptg_row_helpers._provider_group_identity_hash
-    )
-    assert (
-        process_ptg._normalize_code_component
-        is ptg_row_helpers._normalize_code_component
-    )
+    assert process_ptg._provider_group_identity_hash is ptg_row_helpers._provider_group_identity_hash
+    assert process_ptg._normalize_code_component is ptg_row_helpers._normalize_code_component
 
 
 def test_progress_split_keeps_facade_helpers_stable():
     assert process_ptg._utcnow is ptg_progress._utcnow
-    assert (
-        process_ptg._artifact_progress_position
-        is ptg_progress._artifact_progress_position
-    )
+    assert process_ptg._artifact_progress_position is ptg_progress._artifact_progress_position
     assert ptg_progress._scale_stage_progress_pct(50, 5, 20) == 12.5
 
 
@@ -696,9 +631,7 @@ def test_weighted_file_progress_preserves_indeterminate_semantic_work(monkeypatc
     assert all(event["basis"] == "semantic_work" for event in events)
     assert all(event["denominator_state"] == "unknown" for event in events)
     assert all(event["eta_seconds"] is None for event in events)
-    assert all(
-        event["weighted_compressed_input_bytes_lower_bound"] == 0 for event in events
-    )
+    assert all(event["weighted_compressed_input_bytes_lower_bound"] == 0 for event in events)
     assert all(event["pct_lower_bound"] == 20 for event in events)
     assert second["counters"]["rate_chunks_completed"] == 2
 
@@ -875,19 +808,13 @@ def test_weighted_file_progress_rejects_invalid_shapes_and_indexes(monkeypatch):
 def test_file_progress_fraction_and_counter_aggregation_edges():
     """Normalize fallback fractions and aggregate mixed counter types."""
 
-    assert ptg_progress._file_progress_fraction(
-        {"phase_pct": float("nan"), "stage_pct": 25}
-    ) == pytest.approx(0.25)
+    assert ptg_progress._file_progress_fraction({"phase_pct": float("nan"), "stage_pct": 25}) == pytest.approx(0.25)
     assert (
-        ptg_progress._file_progress_fraction(
-            {"phase_pct": None, "stage_pct": None, "done": "invalid", "total": 4}
-        )
+        ptg_progress._file_progress_fraction({"phase_pct": None, "stage_pct": None, "done": "invalid", "total": 4})
         is None
     )
     assert ptg_progress._file_progress_fraction({"done": 1, "total": 0}) is None
-    assert ptg_progress._file_progress_fraction(
-        {"done": 3, "total": 4}
-    ) == pytest.approx(0.75)
+    assert ptg_progress._file_progress_fraction({"done": 3, "total": 4}) == pytest.approx(0.75)
 
     counters = ptg_progress._aggregate_file_progress_counters(
         [
@@ -951,27 +878,19 @@ def test_live_progress_attempt_fences_older_and_ambiguous_updates(monkeypatch):
         "_read_live_progress_payload",
         lambda _run_id: {"updated_at": "2026-07-23T10:00:04Z"},
     )
-    assert live_progress.read_live_progress("run-fenced") == {
-        "updated_at": "2026-07-23T10:00:04Z"
-    }
+    assert live_progress.read_live_progress("run-fenced") == {"updated_at": "2026-07-23T10:00:04Z"}
 
 
 def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch):
     writes = []
     events = []
 
-    fake_redis = AtomicLiveProgressRedis(
-        on_progress_write=lambda key, ttl, value: writes.append((key, ttl, value))
-    )
+    fake_redis = AtomicLiveProgressRedis(on_progress_write=lambda key, ttl, value: writes.append((key, ttl, value)))
     monkeypatch.setattr(live_progress, "_redis", lambda: fake_redis)
     monkeypatch.setattr(live_progress, "enqueue_status_event", events.append)
-    token = ptg_live_progress.set_live_progress_context(
-        run_id="run_ptg", snapshot_id="snap_1"
-    )
+    token = ptg_live_progress.set_live_progress_context(run_id="run_ptg", snapshot_id="snap_1")
     try:
-        ptg_live_progress.write_live_progress(
-            phase="download", pct=12.5, eta_seconds=60, message="downloading"
-        )
+        ptg_live_progress.write_live_progress(phase="download", pct=12.5, eta_seconds=60, message="downloading")
     finally:
         ptg_live_progress.reset_live_progress_context(token)
 
@@ -982,10 +901,7 @@ def test_ptg_live_progress_uses_redis_ttl_and_enqueues_status_event(monkeypatch)
     assert events[0]["progress"]["pct"] == 12.5
     assert events[0]["estimate"]["eta_seconds"] == 60
     assert process_ptg._format_duration is ptg_progress._format_duration
-    assert (
-        process_ptg._maybe_log_artifact_progress
-        is ptg_progress._maybe_log_artifact_progress
-    )
+    assert process_ptg._maybe_log_artifact_progress is ptg_progress._maybe_log_artifact_progress
 
 
 def _bounded_progress_snapshot(
@@ -1134,12 +1050,8 @@ def test_live_progress_heartbeat_preserves_recent_importer_progress(monkeypatch)
     )
 
     progress_payload = json.loads(store_map["import:progress:run_any"])
-    assert (
-        progress_payload["phase"] == "entity-address-unified building medication bridge"
-    )
-    assert (
-        progress_payload["message"] == "building support table 5/7: medication bridge"
-    )
+    assert progress_payload["phase"] == "entity-address-unified building medication bridge"
+    assert progress_payload["message"] == "building support table 5/7: medication bridge"
     assert progress_payload["unit"] == "steps"
     assert progress_payload["done"] == 5
     assert progress_payload["total"] == 7
@@ -1184,27 +1096,15 @@ def test_internal_ptg_import_heartbeat_updates_only_active_run(monkeypatch):
 def test_artifact_split_keeps_facade_helpers_stable():
     assert process_ptg.PTG2ArtifactStore is ptg_artifacts.PTG2ArtifactStore
     assert process_ptg.sha256_file is ptg_artifacts.sha256_file
-    assert (
-        process_ptg.choose_reusable_raw_artifact
-        is ptg_artifacts.choose_reusable_raw_artifact
-    )
+    assert process_ptg.choose_reusable_raw_artifact is ptg_artifacts.choose_reusable_raw_artifact
     assert process_ptg.content_addressed_path is ptg_artifacts.content_addressed_path
     assert process_ptg.ptg2_temp_parent is ptg_artifacts.ptg2_temp_parent
 
 
 def test_artifact_stream_split_keeps_facade_helpers_stable():
-    assert (
-        process_ptg.open_json_artifact_stream
-        is ptg_artifact_streams.open_json_artifact_stream
-    )
-    assert (
-        process_ptg.logical_artifact_identity
-        is ptg_artifact_streams.logical_artifact_identity
-    )
-    assert (
-        process_ptg.stream_logical_artifact
-        is ptg_artifact_streams.stream_logical_artifact
-    )
+    assert process_ptg.open_json_artifact_stream is ptg_artifact_streams.open_json_artifact_stream
+    assert process_ptg.logical_artifact_identity is ptg_artifact_streams.logical_artifact_identity
+    assert process_ptg.stream_logical_artifact is ptg_artifact_streams.stream_logical_artifact
     assert process_ptg.load_json_artifact is ptg_artifact_streams.load_json_artifact
 
 
@@ -1217,15 +1117,9 @@ def test_db_table_split_keeps_facade_helpers_stable():
 
 
 def test_copy_load_split_keeps_facade_helpers_stable():
-    assert (
-        process_ptg._copy_upsert_ptg2_objects is ptg_copy_load._copy_upsert_ptg2_objects
-    )
-    assert (
-        process_ptg._copy_insert_ptg2_objects is ptg_copy_load._copy_insert_ptg2_objects
-    )
-    assert (
-        process_ptg._copy_ignore_ptg2_objects is ptg_copy_load._copy_ignore_ptg2_objects
-    )
+    assert process_ptg._copy_upsert_ptg2_objects is ptg_copy_load._copy_upsert_ptg2_objects
+    assert process_ptg._copy_insert_ptg2_objects is ptg_copy_load._copy_insert_ptg2_objects
+    assert process_ptg._copy_ignore_ptg2_objects is ptg_copy_load._copy_ignore_ptg2_objects
 
 
 def test_push_ptg2_objects_routes_snapshot_state_writes(monkeypatch):
@@ -1345,11 +1239,7 @@ def test_price_set_copy_fence_never_falls_back_to_generic_write(monkeypatch):
     monkeypatch.setattr(
         process_ptg,
         "_copy_ignore_ptg2_objects",
-        AsyncMock(
-            side_effect=process_ptg.StaleMetadataFenceError(
-                "attempt is metadata-reconciled"
-            )
-        ),
+        AsyncMock(side_effect=process_ptg.StaleMetadataFenceError("attempt is metadata-reconciled")),
     )
     monkeypatch.setattr(process_ptg, "push_objects", generic_push)
 
@@ -1437,9 +1327,7 @@ def test_copy_load_strips_postgres_nuls_from_text_values():
         "payload": {"ij\0": ["kl\0mn"]},
     }
 
-    record = ptg_copy_load._ptg2_copy_record(
-        row_map, ["plain", "array", "payload"], {"payload"}
-    )
+    record = ptg_copy_load._ptg2_copy_record(row_map, ["plain", "array", "payload"], {"payload"})
 
     assert record[0] == "abcd"
     assert record[1] == ["efgh"]
@@ -1448,32 +1336,17 @@ def test_copy_load_strips_postgres_nuls_from_text_values():
 
 def test_import_row_split_keeps_facade_helpers_stable():
     assert process_ptg._normalize_import_id is ptg_import_rows._normalize_import_id
+    assert process_ptg._ptg2_provider_group_rows is ptg_import_rows._ptg2_provider_group_rows
+    assert process_ptg._build_provider_set_entry is ptg_import_rows._build_provider_set_entry
+    assert process_ptg._combine_provider_set_entries is ptg_import_rows._combine_provider_set_entries
+    assert process_ptg._fast_provider_entry_from_parts is ptg_import_rows._fast_provider_entry_from_parts
     assert (
-        process_ptg._ptg2_provider_group_rows
-        is ptg_import_rows._ptg2_provider_group_rows
-    )
-    assert (
-        process_ptg._build_provider_set_entry
-        is ptg_import_rows._build_provider_set_entry
-    )
-    assert (
-        process_ptg._combine_provider_set_entries
-        is ptg_import_rows._combine_provider_set_entries
-    )
-    assert (
-        process_ptg._fast_provider_entry_from_parts
-        is ptg_import_rows._fast_provider_entry_from_parts
-    )
-    assert (
-        process_ptg._fast_provider_entry_from_provider_refs
-        is ptg_import_rows._fast_provider_entry_from_provider_refs
+        process_ptg._fast_provider_entry_from_provider_refs is ptg_import_rows._fast_provider_entry_from_provider_refs
     )
     assert process_ptg._ptg2_provider_set_row is ptg_import_rows._ptg2_provider_set_row
     assert process_ptg._ptg2_procedure_row is ptg_import_rows._ptg2_procedure_row
     assert process_ptg._ptg2_price_atom_row is ptg_import_rows._ptg2_price_atom_row
-    assert (
-        process_ptg._ptg2_source_trace_rows is ptg_import_rows._ptg2_source_trace_rows
-    )
+    assert process_ptg._ptg2_source_trace_rows is ptg_import_rows._ptg2_source_trace_rows
     assert process_ptg._ptg2_context_row is ptg_import_rows._ptg2_context_row
     assert process_ptg._ptg2_plan_rows is ptg_import_rows._ptg2_plan_rows
 
@@ -1521,62 +1394,29 @@ def test_source_trace_uses_full_sha256_independent_of_compact_hash_mode(monkeypa
 
 
 def test_snapshot_table_split_keeps_facade_helpers_stable():
-    assert (
-        process_ptg._normalize_source_key is ptg_snapshot_tables._normalize_source_key
-    )
-    assert (
-        process_ptg._ptg2_snapshot_table_token
-        is ptg_snapshot_tables._ptg2_snapshot_table_token
-    )
-    assert (
-        process_ptg._ptg2_snapshot_table_name
-        is ptg_snapshot_tables._ptg2_snapshot_table_name
-    )
-    assert (
-        process_ptg._ptg2_snapshot_index_name
-        is ptg_snapshot_tables._ptg2_snapshot_index_name
-    )
+    assert process_ptg._normalize_source_key is ptg_snapshot_tables._normalize_source_key
+    assert process_ptg._ptg2_snapshot_table_token is ptg_snapshot_tables._ptg2_snapshot_table_token
+    assert process_ptg._ptg2_snapshot_table_name is ptg_snapshot_tables._ptg2_snapshot_table_name
+    assert process_ptg._ptg2_snapshot_index_name is ptg_snapshot_tables._ptg2_snapshot_index_name
 
 
 def test_source_pointer_split_keeps_facade_helpers_stable():
-    assert (
-        process_ptg._ptg2_plan_source_key is ptg_source_pointers._ptg2_plan_source_key
-    )
-    assert (
-        process_ptg._current_source_snapshot_id
-        is ptg_source_pointers._current_source_snapshot_id
-    )
+    assert process_ptg._ptg2_plan_source_key is ptg_source_pointers._ptg2_plan_source_key
+    assert process_ptg._current_source_snapshot_id is ptg_source_pointers._current_source_snapshot_id
     assert process_ptg._source_plan_rows is ptg_source_pointers._source_plan_rows
-    assert (
-        process_ptg._publish_ptg2_source_pointers
-        is ptg_source_pointers._publish_ptg2_source_pointers
-    )
+    assert process_ptg._publish_ptg2_source_pointers is ptg_source_pointers._publish_ptg2_source_pointers
 
 
 def test_source_job_split_keeps_facade_helpers_stable():
-    assert (
-        process_ptg._normalize_filter_values is ptg_source_jobs._normalize_filter_values
-    )
+    assert process_ptg._normalize_filter_values is ptg_source_jobs._normalize_filter_values
     assert process_ptg._dedupe_preserve is ptg_source_jobs._dedupe_preserve
     assert process_ptg._dedupe_rows_by is ptg_source_jobs._dedupe_rows_by
     assert process_ptg._plan_matches_filters is ptg_source_jobs._plan_matches_filters
-    assert (
-        process_ptg._filter_reporting_plans is ptg_source_jobs._filter_reporting_plans
-    )
-    assert (
-        process_ptg._normalize_plan_payload is ptg_source_jobs._normalize_plan_payload
-    )
-    assert (
-        process_ptg.parse_toc_catalog_entries
-        is ptg_source_jobs.parse_toc_catalog_entries
-    )
-    assert (
-        process_ptg._load_toc_urls_from_file is ptg_source_jobs._load_toc_urls_from_file
-    )
-    assert (
-        process_ptg._filter_jobs_by_url_contains
-        is ptg_source_jobs._filter_jobs_by_url_contains
-    )
+    assert process_ptg._filter_reporting_plans is ptg_source_jobs._filter_reporting_plans
+    assert process_ptg._normalize_plan_payload is ptg_source_jobs._normalize_plan_payload
+    assert process_ptg.parse_toc_catalog_entries is ptg_source_jobs.parse_toc_catalog_entries
+    assert process_ptg._load_toc_urls_from_file is ptg_source_jobs._load_toc_urls_from_file
+    assert process_ptg._filter_jobs_by_url_contains is ptg_source_jobs._filter_jobs_by_url_contains
     assert process_ptg._ptg_job_identity is ptg_source_jobs._ptg_job_identity
     assert process_ptg._plan_identity is ptg_source_jobs._plan_identity
     assert process_ptg._merge_ptg_job is ptg_source_jobs._merge_ptg_job
@@ -1585,38 +1425,15 @@ def test_source_job_split_keeps_facade_helpers_stable():
 
 def test_source_download_split_keeps_facade_helpers_stable():
     assert process_ptg._format_eta_seconds is ptg_source_download._format_eta_seconds
-    assert (
-        process_ptg._emit_download_progress
-        is ptg_source_download._emit_download_progress
-    )
+    assert process_ptg._emit_download_progress is ptg_source_download._emit_download_progress
     assert process_ptg.fetch_head_metadata is ptg_source_download.fetch_head_metadata
-    assert (
-        process_ptg._probe_http_range_support
-        is ptg_source_download._probe_http_range_support
-    )
-    assert (
-        process_ptg._download_raw_artifact_ranges
-        is ptg_source_download._download_raw_artifact_ranges
-    )
-    assert (
-        process_ptg._download_ptg_job_artifact
-        is ptg_source_download._download_ptg_job_artifact
-    )
-    assert (
-        process_ptg._download_ptg_job_artifact_sync
-        is ptg_source_download._download_ptg_job_artifact_sync
-    )
-    assert (
-        process_ptg._iter_downloaded_ptg_jobs
-        is ptg_source_download._iter_downloaded_ptg_jobs
-    )
-    assert (
-        process_ptg.download_raw_artifact is ptg_source_download.download_raw_artifact
-    )
-    assert (
-        process_ptg.materialize_json_source
-        is ptg_source_download.materialize_json_source
-    )
+    assert process_ptg._probe_http_range_support is ptg_source_download._probe_http_range_support
+    assert process_ptg._download_raw_artifact_ranges is ptg_source_download._download_raw_artifact_ranges
+    assert process_ptg._download_ptg_job_artifact is ptg_source_download._download_ptg_job_artifact
+    assert process_ptg._download_ptg_job_artifact_sync is ptg_source_download._download_ptg_job_artifact_sync
+    assert process_ptg._iter_downloaded_ptg_jobs is ptg_source_download._iter_downloaded_ptg_jobs
+    assert process_ptg.download_raw_artifact is ptg_source_download.download_raw_artifact
+    assert process_ptg.materialize_json_source is ptg_source_download.materialize_json_source
 
 
 def test_source_download_progress_scales_to_overall_run_progress(monkeypatch):
@@ -1709,9 +1526,7 @@ def test_download_worker_propagates_live_progress_context(monkeypatch):
 
 
 def test_source_download_tls_override_is_host_scoped(monkeypatch):
-    monkeypatch.delenv(
-        ptg_source_download.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, raising=False
-    )
+    monkeypatch.delenv(ptg_source_download.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, raising=False)
 
     assert ptg_source_download._request_ssl_kwargs(
         "https://api.midlandschoice.com/api/v1/fileshare/download?filename=synthetic.json.gz"
@@ -1722,9 +1537,7 @@ def test_source_download_tls_override_is_host_scoped(monkeypatch):
         "franciscans.childrenshospital.org",
         "www.hhcsinc.org",
     ):
-        assert ptg_source_download._request_ssl_kwargs(f"https://{host}/mrf") == {
-            "ssl": False
-        }
+        assert ptg_source_download._request_ssl_kwargs(f"https://{host}/mrf") == {"ssl": False}
     assert (
         ptg_source_download._request_ssl_kwargs(
             "https://example.com/api/v1/fileshare/download?filename=synthetic.json.gz"
@@ -1732,21 +1545,12 @@ def test_source_download_tls_override_is_host_scoped(monkeypatch):
         == {}
     )
 
-    monkeypatch.setenv(
-        ptg_source_download.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, "example.com"
-    )
-    assert (
-        ptg_source_download._request_ssl_kwargs("https://api.midlandschoice.com/mrf")
-        == {}
-    )
-    assert ptg_source_download._request_ssl_kwargs("https://example.com/mrf") == {
-        "ssl": False
-    }
+    monkeypatch.setenv(ptg_source_download.INCOMPLETE_TLS_CHAIN_HOSTS_ENV, "example.com")
+    assert ptg_source_download._request_ssl_kwargs("https://api.midlandschoice.com/mrf") == {}
+    assert ptg_source_download._request_ssl_kwargs("https://example.com/mrf") == {"ssl": False}
 
 
-def test_download_ptg_job_artifact_keeps_zip_logical_path_after_prefetch(
-    tmp_path, monkeypatch
-):
+def test_download_ptg_job_artifact_keeps_zip_logical_path_after_prefetch(tmp_path, monkeypatch):
     artifact_root = tmp_path / "artifacts"
     monkeypatch.setenv("HLTHPRT_PTG2_ARTIFACT_DIR", str(artifact_root))
 
@@ -1766,9 +1570,7 @@ def test_download_ptg_job_artifact_keeps_zip_logical_path_after_prefetch(
             byte_count=raw_size,
         )
 
-    monkeypatch.setattr(
-        ptg_source_download, "download_raw_artifact", fake_download_raw_artifact
-    )
+    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
 
     downloaded = asyncio.run(
         ptg_source_download._download_ptg_job_artifact(
@@ -1789,80 +1591,44 @@ def test_download_ptg_job_artifact_keeps_zip_logical_path_after_prefetch(
 
 def test_source_file_split_keeps_facade_helpers_stable():
     assert process_ptg._maybe_unzip is ptg_source_files._maybe_unzip
-    assert (
-        process_ptg._extract_metadata_fields
-        is ptg_source_files._extract_metadata_fields
-    )
+    assert process_ptg._extract_metadata_fields is ptg_source_files._extract_metadata_fields
     assert process_ptg._derive_plan_fields is ptg_source_files._derive_plan_fields
     assert process_ptg._build_file_row is ptg_source_files._build_file_row
 
 
 def test_source_version_split_keeps_facade_helpers_stable():
-    assert (
-        process_ptg._record_source_version is ptg_source_versions._record_source_version
-    )
+    assert process_ptg._record_source_version is ptg_source_versions._record_source_version
 
 
 def test_provider_reference_split_keeps_facade_helpers_stable():
     assert (
-        process_ptg._load_provider_references_from_file
-        is ptg_provider_references._load_provider_references_from_file
+        process_ptg._load_provider_references_from_file is ptg_provider_references._load_provider_references_from_file
     )
-    assert (
-        process_ptg._process_provider_reference_file
-        is ptg_provider_references._process_provider_reference_file
-    )
+    assert process_ptg._process_provider_reference_file is ptg_provider_references._process_provider_reference_file
 
 
 def test_table_setup_split_keeps_facade_helpers_stable():
     assert process_ptg.PTG2_MODEL_CLASSES is ptg_table_setup.PTG2_MODEL_CLASSES
     assert process_ptg._ensure_indexes is ptg_table_setup._ensure_indexes
-    assert (
-        process_ptg._ensure_ptg2_serving_rate_columns
-        is ptg_table_setup._ensure_ptg2_serving_rate_columns
-    )
-    assert (
-        process_ptg._ensure_ptg2_provider_set_columns
-        is ptg_table_setup._ensure_ptg2_provider_set_columns
-    )
-    assert (
-        process_ptg._ensure_ptg2_price_set_columns
-        is ptg_table_setup._ensure_ptg2_price_set_columns
-    )
-    assert (
-        process_ptg._ensure_ptg2_price_atom_columns
-        is ptg_table_setup._ensure_ptg2_price_atom_columns
-    )
+    assert process_ptg._ensure_ptg2_serving_rate_columns is ptg_table_setup._ensure_ptg2_serving_rate_columns
+    assert process_ptg._ensure_ptg2_provider_set_columns is ptg_table_setup._ensure_ptg2_provider_set_columns
+    assert process_ptg._ensure_ptg2_price_set_columns is ptg_table_setup._ensure_ptg2_price_set_columns
+    assert process_ptg._ensure_ptg2_price_atom_columns is ptg_table_setup._ensure_ptg2_price_atom_columns
     assert process_ptg._drop_ptg2_columns is ptg_table_setup._drop_ptg2_columns
-    assert (
-        process_ptg._ensure_ptg2_price_set_stage_table
-        is ptg_table_setup._ensure_ptg2_price_set_stage_table
-    )
-    assert (
-        process_ptg._ensure_ptg2_serving_rate_stage_table
-        is ptg_table_setup._ensure_ptg2_serving_rate_stage_table
-    )
+    assert process_ptg._ensure_ptg2_price_set_stage_table is ptg_table_setup._ensure_ptg2_price_set_stage_table
+    assert process_ptg._ensure_ptg2_serving_rate_stage_table is ptg_table_setup._ensure_ptg2_serving_rate_stage_table
     assert process_ptg.ensure_ptg2_tables is ptg_table_setup.ensure_ptg2_tables
     assert process_ptg._prepare_ptg_tables is ptg_table_setup._prepare_ptg_tables
 
 
 def test_snapshot_cleanup_split_keeps_facade_helpers_stable():
-    assert (
-        process_ptg._snapshot_manifest_table_names
-        is ptg_snapshot_cleanup._snapshot_manifest_table_names
-    )
-    assert (
-        process_ptg._drop_ptg2_snapshot_table_names
-        is ptg_snapshot_cleanup._drop_ptg2_snapshot_table_names
-    )
+    assert process_ptg._snapshot_manifest_table_names is ptg_snapshot_cleanup._snapshot_manifest_table_names
+    assert process_ptg._drop_ptg2_snapshot_table_names is ptg_snapshot_cleanup._drop_ptg2_snapshot_table_names
     assert (
         process_ptg._drop_ptg2_snapshot_tables_for_manifest
         is ptg_snapshot_cleanup._drop_ptg2_snapshot_tables_for_manifest
     )
-    assert (
-        process_ptg._cleanup_old_ptg2_source_tables
-        is ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables
-    )
+    assert process_ptg._cleanup_old_ptg2_source_tables is ptg_snapshot_cleanup._cleanup_old_ptg2_source_tables
 
 
 def test_snapshot_cleanup_collects_tables_for_any_storage():
@@ -1902,9 +1668,7 @@ def test_source_snapshot_cleanup_retains_four_snapshot_lineage(monkeypatch):
         {"snapshot_id": "snap-fifth", "previous_snapshot_id": None},
     ]
 
-    keep_snapshot_ids = ptg_snapshot_cleanup._source_snapshot_keep_ids(
-        rows, {"snap-current"}
-    )
+    keep_snapshot_ids = ptg_snapshot_cleanup._source_snapshot_keep_ids(rows, {"snap-current"})
 
     assert keep_snapshot_ids == {
         "snap-current",
@@ -1921,9 +1685,7 @@ def test_manifest_provider_group_location_indexes_default_to_lean_profile(monkey
         status_calls.append(statement)
 
     async def fake_all(statement, **_params):
-        raise AssertionError(
-            "lean provider-location indexes should not query taxonomy rules"
-        )
+        raise AssertionError("lean provider-location indexes should not query taxonomy rules")
 
     monkeypatch.delenv(
         ptg_manifest_publish.PTG2_MANIFEST_PROVIDER_GROUP_LOCATION_INDEX_PROFILE_ENV,
@@ -1977,35 +1739,17 @@ def test_manifest_provider_group_location_indexes_full_profile_includes_zip_cove
 
     joined = "\n".join(status_calls)
     assert "zip_type_cover_idx" in joined
-    assert (
-        "(zip5, address_type, provider_group_global_id_128, npi, address_checksum)"
-        in joined
-    )
+    assert "(zip5, address_type, provider_group_global_id_128, npi, address_checksum)" in joined
     assert "INCLUDE (taxonomy_array) WHERE npi IS NOT NULL" in joined
     assert "zip_taxonomy_rule_" in joined
-    assert (
-        "WHERE npi IS NOT NULL AND taxonomy_array && ARRAY[101,202]::integer[]"
-        in joined
-    )
+    assert "WHERE npi IS NOT NULL AND taxonomy_array && ARRAY[101,202]::integer[]" in joined
 
 
 def test_rust_scanner_split_keeps_facade_helpers_stable():
-    assert (
-        process_ptg._ptg2_rust_scanner_binary
-        is ptg_rust_scanner._ptg2_rust_scanner_binary
-    )
-    assert (
-        process_ptg._iter_top_level_object_bytes_rust
-        is ptg_rust_scanner._iter_top_level_object_bytes_rust
-    )
-    assert (
-        process_ptg._iter_compact_serving_records_rust
-        is ptg_rust_scanner._iter_compact_serving_records_rust
-    )
-    assert (
-        process_ptg._aiter_compact_serving_records_rust
-        is ptg_rust_scanner._aiter_compact_serving_records_rust
-    )
+    assert process_ptg._ptg2_rust_scanner_binary is ptg_rust_scanner._ptg2_rust_scanner_binary
+    assert process_ptg._iter_top_level_object_bytes_rust is ptg_rust_scanner._iter_top_level_object_bytes_rust
+    assert process_ptg._iter_compact_serving_records_rust is ptg_rust_scanner._iter_compact_serving_records_rust
+    assert process_ptg._aiter_compact_serving_records_rust is ptg_rust_scanner._aiter_compact_serving_records_rust
 
 
 def test_rust_scanner_frame_reader_retries_short_pipe_reads():
@@ -2016,12 +1760,8 @@ def test_rust_scanner_frame_reader_retries_short_pipe_reads():
     assert ptg_rust_scanner._read_exactly(ShortReader(b"abcdef"), 6) == b"abcdef"
 
 
-def test_ptg2_rust_scanner_release_requirement_skips_debug_binary(
-    monkeypatch, tmp_path
-):
-    debug_binary = (
-        tmp_path / "support" / "ptg2_scanner" / "target" / "debug" / "ptg2_scanner"
-    )
+def test_ptg2_rust_scanner_release_requirement_skips_debug_binary(monkeypatch, tmp_path):
+    debug_binary = tmp_path / "support" / "ptg2_scanner" / "target" / "debug" / "ptg2_scanner"
     debug_binary.parent.mkdir(parents=True)
     debug_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     debug_binary.chmod(0o755)
@@ -2032,12 +1772,8 @@ def test_ptg2_rust_scanner_release_requirement_skips_debug_binary(
     assert ptg_rust_scanner._ptg2_rust_scanner_binary() is None
 
 
-def test_ptg2_rust_scanner_release_requirement_accepts_release_binary(
-    monkeypatch, tmp_path
-):
-    release_binary = (
-        tmp_path / "support" / "ptg2_scanner" / "target" / "release" / "ptg2_scanner"
-    )
+def test_ptg2_rust_scanner_release_requirement_accepts_release_binary(monkeypatch, tmp_path):
+    release_binary = tmp_path / "support" / "ptg2_scanner" / "target" / "release" / "ptg2_scanner"
     release_binary.parent.mkdir(parents=True)
     release_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     release_binary.chmod(0o755)
@@ -2048,9 +1784,7 @@ def test_ptg2_rust_scanner_release_requirement_accepts_release_binary(
     assert ptg_rust_scanner._ptg2_rust_scanner_binary() == release_binary
 
 
-def test_async_rust_scanner_close_suppresses_generator_already_executing(
-    monkeypatch, tmp_path
-):
+def test_async_rust_scanner_close_suppresses_generator_already_executing(monkeypatch, tmp_path):
     class BlockingIterator:
         def __init__(self):
             self.started = threading.Event()
@@ -2357,15 +2091,11 @@ def _slow_manifest_copy(elapsed_seconds):
 
 
 def _assert_manifest_copy_cadence(progress_writes):
-    progress_snapshots = [
-        progress_snapshot for _at, progress_snapshot in progress_writes
-    ]
+    progress_snapshots = [progress_snapshot for _at, progress_snapshot in progress_writes]
     intermediate_bytes = [
         progress_snapshot["counters"]["manifest_copy_bytes"]
         for progress_snapshot in progress_snapshots
-        if 0
-        < int((progress_snapshot.get("counters") or {}).get("manifest_copy_bytes") or 0)
-        < 10
+        if 0 < int((progress_snapshot.get("counters") or {}).get("manifest_copy_bytes") or 0) < 10
     ]
     progress_gaps = [
         later_at - earlier_at
@@ -2376,9 +2106,9 @@ def _assert_manifest_copy_cadence(progress_writes):
     ]
     assert intermediate_bytes == [4, 8]
     assert max(progress_gaps) <= 4.0
-    assert [
-        progress_snapshot["progress_seq"] for progress_snapshot in progress_snapshots
-    ] == list(range(1, len(progress_snapshots) + 1))
+    assert [progress_snapshot["progress_seq"] for progress_snapshot in progress_snapshots] == list(
+        range(1, len(progress_snapshots) + 1)
+    )
 
 
 @pytest.mark.asyncio
@@ -2424,14 +2154,10 @@ def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
         captured_map.update(kwargs)
         return iter(())
 
-    monkeypatch.setattr(
-        ptg_rust_scanner, "_iter_compact_serving_records_rust", fake_iter
-    )
+    monkeypatch.setattr(ptg_rust_scanner, "_iter_compact_serving_records_rust", fake_iter)
 
     async def run():
-        token = ptg_live_progress.set_live_progress_context(
-            run_id="run_ptg", snapshot_id="snap_1"
-        )
+        token = ptg_live_progress.set_live_progress_context(run_id="run_ptg", snapshot_id="snap_1")
         try:
             async for _record in ptg_rust_scanner._aiter_compact_serving_records_rust(
                 tmp_path / "rates.json.gz",
@@ -2454,21 +2180,10 @@ def test_async_rust_scanner_passes_live_progress_context(monkeypatch, tmp_path):
 
 def test_json_stream_split_keeps_facade_helpers_stable():
     assert process_ptg._json_loads is ptg_json_streams._json_loads
-    assert (
-        process_ptg._iter_top_level_objects is ptg_json_streams._iter_top_level_objects
-    )
-    assert (
-        process_ptg._iter_top_level_object_bytes
-        is ptg_json_streams._iter_top_level_object_bytes
-    )
-    assert (
-        process_ptg._iter_top_level_objects_jsondecoder
-        is ptg_json_streams._iter_top_level_objects_jsondecoder
-    )
-    assert (
-        process_ptg._iter_top_level_objects_fast
-        is ptg_json_streams._iter_top_level_objects_fast
-    )
+    assert process_ptg._iter_top_level_objects is ptg_json_streams._iter_top_level_objects
+    assert process_ptg._iter_top_level_object_bytes is ptg_json_streams._iter_top_level_object_bytes
+    assert process_ptg._iter_top_level_objects_jsondecoder is ptg_json_streams._iter_top_level_objects_jsondecoder
+    assert process_ptg._iter_top_level_objects_fast is ptg_json_streams._iter_top_level_objects_fast
 
 
 def test_filter_reporting_plans_matches_group_plan_id():
@@ -2737,9 +2452,7 @@ def test_ptg2_semantic_hash_ignores_set_like_array_order():
         "negotiated_rate": "12.34",
     }
 
-    assert process_ptg.semantic_hash(
-        first_map, domain="rate"
-    ) == process_ptg.semantic_hash(second_map, domain="rate")
+    assert process_ptg.semantic_hash(first_map, domain="rate") == process_ptg.semantic_hash(second_map, domain="rate")
 
 
 @pytest.mark.parametrize(
@@ -2761,9 +2474,7 @@ def test_ptg2_semantic_hash_changes_for_rate_context_modifier_and_setting(change
     modified_map = dict(base_map)
     modified_map.update(changed)
 
-    assert process_ptg.semantic_hash(
-        base_map, domain="rate"
-    ) != process_ptg.semantic_hash(modified_map, domain="rate")
+    assert process_ptg.semantic_hash(base_map, domain="rate") != process_ptg.semantic_hash(modified_map, domain="rate")
 
 
 def test_ptg2_rejects_float_money_values():
@@ -2776,17 +2487,13 @@ def test_ptg2_modes_and_confidence_wording_are_explicit():
     assert process_ptg.normalize_ptg2_search_mode("exact_source") == "exact_source"
     with pytest.raises(ValueError):
         process_ptg.normalize_ptg2_search_mode("loose")
-    assert "Published negotiated rate" in process_ptg.ptg2_confidence_statement(
-        "tic_rate_npi_tin"
-    )
+    assert "Published negotiated rate" in process_ptg.ptg2_confidence_statement("tic_rate_npi_tin")
 
 
 def test_ptg2_domain_split_keeps_facade_symbols_stable():
     assert process_ptg.PTG2PriceAtomEvent is ptg_domain.PTG2PriceAtomEvent
     assert process_ptg.PTG2RawArtifact is ptg_domain.PTG2RawArtifact
-    assert (
-        process_ptg.normalize_ptg2_search_mode is ptg_domain.normalize_ptg2_search_mode
-    )
+    assert process_ptg.normalize_ptg2_search_mode is ptg_domain.normalize_ptg2_search_mode
     assert process_ptg.ptg2_confidence_statement is ptg_domain.ptg2_confidence_statement
 
 
@@ -2802,12 +2509,8 @@ def test_ptg2_provider_group_identity_is_source_independent_and_order_insensitiv
     tin_a_map = {"type": "EIN", "value": "12-3456789"}
     tin_b_map = {"type": "ein", "value": "123456789"}
 
-    first = process_ptg._provider_group_identity_hash(
-        tin_a_map, [1053488122, 123456789, 1093228306]
-    )
-    second = process_ptg._provider_group_identity_hash(
-        tin_b_map, [1093228306, 1053488122]
-    )
+    first = process_ptg._provider_group_identity_hash(tin_a_map, [1053488122, 123456789, 1093228306])
+    second = process_ptg._provider_group_identity_hash(tin_b_map, [1093228306, 1053488122])
 
     assert first == second
 
@@ -2870,9 +2573,7 @@ def test_ptg2_combined_provider_set_entry_packs_rate_provider_refs():
     first, _ = process_ptg._build_provider_set_entry(
         file_id=1,
         provider_group_ref=10,
-        provider_groups=[
-            {"tin": {"type": "ein", "value": "111"}, "npi": [1000000001, 1000000002]}
-        ],
+        provider_groups=[{"tin": {"type": "ein", "value": "111"}, "npi": [1000000001, 1000000002]}],
         network_names=["A"],
     )
     second, _ = process_ptg._build_provider_set_entry(
@@ -2882,12 +2583,8 @@ def test_ptg2_combined_provider_set_entry_packs_rate_provider_refs():
         network_names=["A"],
     )
 
-    combined_a, row_a = process_ptg._combine_provider_set_entries(
-        file_id=1, entries=[first, second]
-    )
-    combined_b, row_b = process_ptg._combine_provider_set_entries(
-        file_id=2, entries=[second, first]
-    )
+    combined_a, row_a = process_ptg._combine_provider_set_entries(file_id=1, entries=[first, second])
+    combined_b, row_b = process_ptg._combine_provider_set_entries(file_id=2, entries=[second, first])
 
     assert combined_a["__hash__"] == combined_b["__hash__"]
     assert row_a["provider_group_hash"] == row_b["provider_group_hash"]
@@ -2945,24 +2642,15 @@ def test_ptg2_procedure_identity_groups_display_text_variants():
 
 
 def test_ptg2_canonicalize_url_strips_signed_params():
-    url = (
-        "HTTPS://Example.COM:443/path/file.json.gz?"
-        "sig=secret&sv=2020&foo=bar&Signature=abc&Key-Pair-Id=k&b=2&a=1"
-    )
+    url = "HTTPS://Example.COM:443/path/file.json.gz?sig=secret&sv=2020&foo=bar&Signature=abc&Key-Pair-Id=k&b=2&a=1"
 
-    assert (
-        process_ptg.canonicalize_url(url)
-        == "https://example.com/path/file.json.gz?a=1&b=2&foo=bar"
-    )
+    assert process_ptg.canonicalize_url(url) == "https://example.com/path/file.json.gz?a=1&b=2&foo=bar"
 
 
 def test_ptg2_normalize_tic_source_url_unescapes_html_query_separators():
     url = "https://example.com/rates.json.gz?Expires=1&#38;Policy=abc"
 
-    assert (
-        process_ptg.normalize_tic_source_url(url)
-        == "https://example.com/rates.json.gz?Expires=1&Policy=abc"
-    )
+    assert process_ptg.normalize_tic_source_url(url) == "https://example.com/rates.json.gz?Expires=1&Policy=abc"
 
 
 def test_toc_parser_handles_uhc_duplicates():
@@ -2992,15 +2680,11 @@ def test_toc_parser_handles_uhc_duplicates():
         "https://payer.test/toc.json",
         plan_ids=["TESTPLAN001"],
     )
-    in_network_entries = [
-        entry for entry in entries if entry.source_type == "in-network"
-    ]
+    in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
 
     assert len(in_network_entries) == 1
     assert in_network_entries[0].canonical_url == "https://cdn.test/rates.json.gz?foo=1"
-    assert (
-        in_network_entries[0].plan_info[0]["plan_sponsor_name"] == "Example Sponsor Co"
-    )
+    assert in_network_entries[0].plan_info[0]["plan_sponsor_name"] == "Example Sponsor Co"
 
 
 def _plan_predicate_toc_payload():
@@ -3018,9 +2702,7 @@ def _plan_predicate_toc_payload():
                         "plan_market_type": "group",
                     }
                 ],
-                "in_network_files": [
-                    {"location": "https://cdn.test/unrelated-rates.json.gz"}
-                ],
+                "in_network_files": [{"location": "https://cdn.test/unrelated-rates.json.gz"}],
             },
             {
                 "reporting_plans": [
@@ -3031,9 +2713,7 @@ def _plan_predicate_toc_payload():
                         "plan_market_type": "group",
                     }
                 ],
-                "in_network_files": [
-                    {"location": "https://cdn.test/target-rates.json.gz"}
-                ],
+                "in_network_files": [{"location": "https://cdn.test/target-rates.json.gz"}],
             },
         ],
     }
@@ -3058,17 +2738,12 @@ def test_ptg2_toc_parser_applies_plan_predicate_before_file_expansion(monkeypatc
     entries = process_ptg.parse_toc_catalog_entries(
         toc_payload_dict,
         "https://payer.test/toc.json",
-        plan_predicate=lambda plan: "target employer"
-        in plan["plan_sponsor_name"].lower(),
+        plan_predicate=lambda plan: "target employer" in plan["plan_sponsor_name"].lower(),
     )
 
-    in_network_entries = [
-        entry for entry in entries if entry.source_type == "in-network"
-    ]
+    in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
     assert expanded_locations == ["https://cdn.test/target-rates.json.gz"]
-    assert [entry.original_url for entry in in_network_entries] == [
-        "https://cdn.test/target-rates.json.gz"
-    ]
+    assert [entry.original_url for entry in in_network_entries] == ["https://cdn.test/target-rates.json.gz"]
 
 
 def test_ptg2_toc_parser_merges_shared_file_plans_in_linear_work(monkeypatch):
@@ -3106,9 +2781,7 @@ def test_ptg2_toc_parser_merges_shared_file_plans_in_linear_work(monkeypatch):
         "https://payer.test/toc.json",
     )
 
-    in_network_entries = [
-        entry for entry in entries if entry.source_type == "in-network"
-    ]
+    in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
     [in_network_entry] = in_network_entries
     assert in_network_entry.original_url == shared_url
     assert len(in_network_entry.plan_info) == plan_count
@@ -3128,9 +2801,7 @@ def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
                         "plan_market_type": "group",
                     }
                 ],
-                "in_network_files": {
-                    "location": "https://cdn.test/in-network-rates.json.gz"
-                },
+                "in_network_files": {"location": "https://cdn.test/in-network-rates.json.gz"},
                 "allowed_amount_file": [
                     {
                         "location": "https://cdn.test/allowed-amounts-1.json.gz",
@@ -3145,9 +2816,7 @@ def test_ptg2_toc_parser_accepts_list_shaped_file_fields():
         ],
     }
 
-    entries = process_ptg.parse_toc_catalog_entries(
-        toc_map, "https://payer.test/toc.json"
-    )
+    entries = process_ptg.parse_toc_catalog_entries(toc_map, "https://payer.test/toc.json")
 
     assert [entry.source_type for entry in entries] == [
         "table-of-contents",
@@ -3164,8 +2833,7 @@ def test_ptg2_toc_parser_accepts_healthsparq_metadata_files(monkeypatch):
     """HealthSparq metadata entries should become normal PTG catalog entries."""
     monkeypatch.setenv("HLTHPRT_PTG2_HASH_MODE", "checksum64")
     metadata_url = (
-        "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/"
-        "prd/mrf/AETNACVS_I/ASA/latest_metadata.json"
+        "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/prd/mrf/AETNACVS_I/ASA/latest_metadata.json"
     )
     metadata_payload_by_key = {
         "files": [
@@ -3192,9 +2860,7 @@ def test_ptg2_toc_parser_accepts_healthsparq_metadata_files(monkeypatch):
         metadata_url,
         plan_market_types=["group"],
     )
-    in_network_catalog_entries = [
-        entry for entry in catalog_entries if entry.source_type == "in-network"
-    ]
+    in_network_catalog_entries = [entry for entry in catalog_entries if entry.source_type == "in-network"]
 
     assert len(in_network_catalog_entries) == 1
     assert in_network_catalog_entries[0].original_url == (
@@ -3202,15 +2868,9 @@ def test_ptg2_toc_parser_accepts_healthsparq_metadata_files(monkeypatch):
         "AETNACVS_I/ASA/2026-07-05/inNetworkRates/"
         "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz"
     )
-    assert (
-        in_network_catalog_entries[0].description
-        == "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz"
-    )
+    assert in_network_catalog_entries[0].description == "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz"
     assert in_network_catalog_entries[0].plan_info[0]["plan_id"] == "123456789"
-    assert (
-        in_network_catalog_entries[0].plan_info[0]["engine_plan_hash"]
-        == "5c283e9b979b6d5c"
-    )
+    assert in_network_catalog_entries[0].plan_info[0]["engine_plan_hash"] == "5c283e9b979b6d5c"
 
 
 def _tenant_relative_healthsparq_urls() -> tuple[str, str, str]:
@@ -3218,14 +2878,8 @@ def _tenant_relative_healthsparq_urls() -> tuple[str, str, str]:
 
     return (
         "https://mrf.healthsparq.com/tenant-a/prd/mrf/issuer/latest.json",
-        (
-            "https://mrf.healthsparq.com//prd/mrf/issuer/"
-            "rates.json.gz?token=value"
-        ),
-        (
-            "https://mrf.healthsparq.com/tenant-a/prd/mrf/issuer/"
-            "rates.json.gz?token=value"
-        ),
+        ("https://mrf.healthsparq.com//prd/mrf/issuer/rates.json.gz?token=value"),
+        ("https://mrf.healthsparq.com/tenant-a/prd/mrf/issuer/rates.json.gz?token=value"),
     )
 
 
@@ -3293,11 +2947,11 @@ def test_ptg2_toc_parser_repairs_healthsparq_tenant_relative_file_urls():
         + _tenant_relative_metadata_catalog_entries(toc_url, incomplete_url)
     )
 
-    assert [
-        entry.original_url
-        for entry in catalog_entries
-        if entry.source_type == "in-network"
-    ] == [corrected_url, corrected_url, corrected_url]
+    assert [entry.original_url for entry in catalog_entries if entry.source_type == "in-network"] == [
+        corrected_url,
+        corrected_url,
+        corrected_url,
+    ]
     deduped_jobs, duplicate_count = process_ptg._dedupe_ptg_jobs(
         [
             {
@@ -3353,9 +3007,7 @@ def test_healthsparq_source_schema_families(
     file_schema,
     expected_source_type,
 ):
-    source_type_and_domain = healthsparq_source_jobs._source_type_and_domain(
-        file_schema
-    )
+    source_type_and_domain = healthsparq_source_jobs._source_type_and_domain(file_schema)
 
     if expected_source_type is None:
         assert source_type_and_domain is None
@@ -3366,12 +3018,10 @@ def test_healthsparq_source_schema_families(
 def test_healthsparq_metadata_edge_shapes():
     metadata_file_by_field = {"filePath": "rates.json.gz"}
 
-    assert healthsparq_source_jobs._metadata_files(
-        {"data": {"files": [metadata_file_by_field]}}
-    ) == [metadata_file_by_field]
-    assert healthsparq_source_jobs._metadata_files(
-        {"data": [metadata_file_by_field]}
-    ) == [metadata_file_by_field]
+    assert healthsparq_source_jobs._metadata_files({"data": {"files": [metadata_file_by_field]}}) == [
+        metadata_file_by_field
+    ]
+    assert healthsparq_source_jobs._metadata_files({"data": [metadata_file_by_field]}) == [metadata_file_by_field]
     assert healthsparq_source_jobs._file_url("https://example.test/meta.json", {}) == ""
     assert (
         healthsparq_source_jobs._file_url(
@@ -3391,10 +3041,7 @@ def test_healthsparq_metadata_edge_shapes():
     ],
 )
 def test_healthsparq_download_location_validation(location, expected_result):
-    assert (
-        healthsparq_source_jobs._is_file_location_like_download(location)
-        is expected_result
-    )
+    assert healthsparq_source_jobs._is_file_location_like_download(location) is expected_result
 
 
 @pytest.mark.parametrize(
@@ -3457,9 +3104,7 @@ def test_ptg2_toc_parser_rejects_non_pricing_payload():
         ],
     }
 
-    entries = process_ptg.parse_toc_catalog_entries(
-        payload, "https://example.test/acadirectory/97176Index.json"
-    )
+    entries = process_ptg.parse_toc_catalog_entries(payload, "https://example.test/acadirectory/97176Index.json")
 
     assert entries == []
 
@@ -3491,9 +3136,7 @@ def test_ptg2_toc_parser_accepts_plural_allowed_amount_files():
         ],
     }
 
-    entries = process_ptg.parse_toc_catalog_entries(
-        toc_map, "https://payer.test/toc.json"
-    )
+    entries = process_ptg.parse_toc_catalog_entries(toc_map, "https://payer.test/toc.json")
 
     assert [entry.source_type for entry in entries] == [
         "table-of-contents",
@@ -3549,11 +3192,7 @@ def test_ptg2_flat_toc_derives_group_scope_from_ein_index():
     """Treat a numeric EIN index filename as its logical group-plan scope."""
 
     catalog_entries = process_ptg.parse_toc_catalog_entries(
-        {
-            "In-Network Negotiated Rates Files": [
-                {"url": "https://cdn.example.test/in-network-rates.json.gz"}
-            ]
-        },
+        {"In-Network Negotiated Rates Files": [{"url": "https://cdn.example.test/in-network-rates.json.gz"}]},
         "https://payer.example.test/12-3456789.json",
     )
 
@@ -3606,9 +3245,7 @@ def test_ptg2_toc_jobs_target_flat_carrier_file_lists(monkeypatch, tmp_path):
     )
 
     assert [job["type"] for job in selected_jobs] == ["in_network"]
-    assert selected_jobs[0]["url"] == (
-        f"https://cdn.example.test/{target_file_name}?Signature=random-rx-oon-token"
-    )
+    assert selected_jobs[0]["url"] == (f"https://cdn.example.test/{target_file_name}?Signature=random-rx-oon-token")
     assert selected_jobs[0]["description"] == target_file_name
     assert selected_jobs[0]["plan_info"][0]["plan_id"] == "123456789"
     assert [file_row["file_type"] for file_row in pushed_file_rows] == [
@@ -3643,21 +3280,15 @@ def test_ptg2_toc_parser_normalizes_asr_download_links():
         ],
     }
 
-    entries = process_ptg.parse_toc_catalog_entries(
-        toc_map, "https://payer.test/toc.json"
-    )
-    in_network_entries = [
-        entry for entry in entries if entry.source_type == "in-network"
-    ]
+    entries = process_ptg.parse_toc_catalog_entries(toc_map, "https://payer.test/toc.json")
+    in_network_entries = [entry for entry in entries if entry.source_type == "in-network"]
 
     assert len(in_network_entries) == 1
     assert in_network_entries[0].original_url == (
-        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload"
-        "?groupNumber=1208&fileType=InNetwork&fileId=595"
+        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?groupNumber=1208&fileType=InNetwork&fileId=595"
     )
     assert in_network_entries[0].canonical_url == (
-        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload"
-        "?fileId=595&fileType=InNetwork&groupNumber=1208"
+        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?fileId=595&fileType=InNetwork&groupNumber=1208"
     )
 
 
@@ -3710,14 +3341,10 @@ def test_ptg2_toc_jobs_normalize_asr_download_links(monkeypatch):
     )
 
     expected_url = (
-        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload"
-        "?groupNumber=1208&fileType=InNetwork&fileId=596"
+        "https://www.asrhealthbenefits.com/umbraco/surface/mrfdownload?groupNumber=1208&fileType=InNetwork&fileId=596"
     )
     assert jobs[0]["url"] == expected_url
-    assert any(
-        job_row["url"] == expected_url and job_row["file_type"] == "in-network"
-        for job_row in pushed_file_rows
-    )
+    assert any(job_row["url"] == expected_url and job_row["file_type"] == "in-network" for job_row in pushed_file_rows)
 
 
 def test_toc_limit_merges_shared_file_plan_scopes(monkeypatch):
@@ -3852,9 +3479,7 @@ def _write_missing_comma_toc(tmp_path) -> Path:
     return toc_path
 
 
-def test_ptg2_toc_repairs_missing_array_commas_and_ignores_unsupported_files(
-    monkeypatch, tmp_path
-):
+def test_ptg2_toc_repairs_missing_array_commas_and_ignores_unsupported_files(monkeypatch, tmp_path):
     """Verify this PTG import regression contract."""
 
     toc_path = _write_missing_comma_toc(tmp_path)
@@ -3907,12 +3532,7 @@ def _write_targeted_allowed_amount_toc_fixture(
                             }
                         ],
                         "in_network_files": [
-                            {
-                                "location": (
-                                    "https://files.example.test/"
-                                    "2026-07_in-network-rates.json.gz"
-                                )
-                            }
+                            {"location": ("https://files.example.test/2026-07_in-network-rates.json.gz")}
                         ],
                         "allowed_amount_file": {
                             "description": "historical payment evidence",
@@ -3956,9 +3576,7 @@ def test_ptg2_toc_jobs_emit_targeted_allowed_amount_file(monkeypatch, tmp_path):
         )
     )
 
-    assert [(job["type"], job["url"]) for job in jobs] == [
-        ("allowed_amounts", allowed_url)
-    ]
+    assert [(job["type"], job["url"]) for job in jobs] == [("allowed_amounts", allowed_url)]
     assert jobs[0]["plan_info"][0]["plan_id"] == "TESTPLAN001"
     assert [file_row["file_type"] for file_row in pushed_file_rows] == [
         "table-of-contents",
@@ -4007,13 +3625,10 @@ def _write_healthsparq_metadata_fixture(tmp_path, target_file_name: str) -> Path
 def test_ptg2_toc_jobs_accept_healthsparq_metadata_files(monkeypatch, tmp_path):
     """Targeted HealthSparq metadata imports should emit the matching rate-file job."""
     metadata_url = (
-        "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/"
-        "prd/mrf/AETNACVS_I/ASA/latest_metadata.json"
+        "https://mrf.healthsparq.com/aetnacvs-egress.nophi.kyruushsq.com/prd/mrf/AETNACVS_I/ASA/latest_metadata.json"
     )
     target_file_name = "2026-07-05_pl-xp-tr18_Aetna-Signature-Administrators.json.gz"
-    metadata_document_path = _write_healthsparq_metadata_fixture(
-        tmp_path, target_file_name
-    )
+    metadata_document_path = _write_healthsparq_metadata_fixture(tmp_path, target_file_name)
     pushed_ptg_file_rows = []
 
     async def fake_materialize(*_args, **_kwargs):
@@ -4067,8 +3682,7 @@ def _write_targeted_toc_fixture(tmp_path, source_file_locations):
                             }
                         ],
                         "in_network_files": [
-                            {"location": source_file_location}
-                            for source_file_location in source_file_locations
+                            {"location": source_file_location} for source_file_location in source_file_locations
                         ],
                     }
                 ],
@@ -4079,9 +3693,7 @@ def _write_targeted_toc_fixture(tmp_path, source_file_locations):
     return table_of_contents_path
 
 
-def test_ptg2_toc_targeted_file_filter_skips_full_catalog_expansion(
-    monkeypatch, tmp_path
-):
+def test_ptg2_toc_targeted_file_filter_skips_full_catalog_expansion(monkeypatch, tmp_path):
     """Targeted TOC imports avoid expanding all catalog entries before source-file filtering."""
     target_source_url = "https://cdn.example.test/target-473435755-in-network.json.gz"
     source_file_locations = [
@@ -4089,32 +3701,24 @@ def test_ptg2_toc_targeted_file_filter_skips_full_catalog_expansion(
         target_source_url,
         "https://cdn.example.test/another-unused-in-network.json.gz",
     ]
-    table_of_contents_path = _write_targeted_toc_fixture(
-        tmp_path, source_file_locations
-    )
+    table_of_contents_path = _write_targeted_toc_fixture(tmp_path, source_file_locations)
     pushed_ptg_file_rows = []
 
     async def fake_materialize(*_args, **_kwargs):
-        table_of_contents_artifact = SimpleNamespace(
-            logical_path=table_of_contents_path
-        )
+        table_of_contents_artifact = SimpleNamespace(logical_path=table_of_contents_path)
         return table_of_contents_artifact, table_of_contents_artifact
 
     async def fake_push_objects(ptg_rows_to_push, _cls, **_kwargs):
         pushed_ptg_file_rows.extend(ptg_rows_to_push)
 
     def fail_catalog_expansion(*_args, **_kwargs):
-        raise AssertionError(
-            "targeted source-file imports should not expand the full TOC catalog"
-        )
+        raise AssertionError("targeted source-file imports should not expand the full TOC catalog")
 
     monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
     monkeypatch.setattr(process_ptg, "_record_source_version", AsyncMock())
     monkeypatch.setattr(process_ptg, "push_objects", fake_push_objects)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(
-        process_ptg, "parse_toc_catalog_entries", fail_catalog_expansion
-    )
+    monkeypatch.setattr(process_ptg, "parse_toc_catalog_entries", fail_catalog_expansion)
 
     filtered_toc_jobs = asyncio.run(
         process_ptg._process_table_of_contents(
@@ -4151,9 +3755,7 @@ def _write_same_namespace_toc(tmp_path, prefix):
                                 "plan_market_type": "group",
                             }
                         ],
-                        "in_network_files": [
-                            {"location": f"{prefix}rate-{suffix}.json.gz"}
-                        ],
+                        "in_network_files": [{"location": f"{prefix}rate-{suffix}.json.gz"}],
                     }
                     for number, suffix in enumerate(("a", "b"), start=1)
                 ]
@@ -4164,19 +3766,11 @@ def _write_same_namespace_toc(tmp_path, prefix):
     return toc_path
 
 
-def test_ptg2_targeted_toc_jobs_repair_same_namespace_file_locations(
-    monkeypatch, tmp_path
-):
+def test_ptg2_targeted_toc_jobs_repair_same_namespace_file_locations(monkeypatch, tmp_path):
     """Only targeted jobs use the parent's exact dated namespace."""
 
-    index = (
-        "https://mrf.healthsparq.com/tenant-a/prd/mrf/ISSUER_A/BRAND_B/"
-        "2026-09-05/tableOfContents/index.json.gz"
-    )
-    prefix = (
-        "https://mrf.healthsparq.com//prd/mrf/ISSUER_A/BRAND_B/"
-        "2026-09-05/inNetworkRates/"
-    )
+    index = "https://mrf.healthsparq.com/tenant-a/prd/mrf/ISSUER_A/BRAND_B/2026-09-05/tableOfContents/index.json.gz"
+    prefix = "https://mrf.healthsparq.com//prd/mrf/ISSUER_A/BRAND_B/2026-09-05/inNetworkRates/"
     toc_path = _write_same_namespace_toc(tmp_path, prefix)
     pushed_rows = []
 
@@ -4202,8 +3796,7 @@ def test_ptg2_targeted_toc_jobs_repair_same_namespace_file_locations(
     )
 
     expected_urls = [
-        f"{prefix.replace('.com//prd/', '.com/tenant-a/prd/')}rate-{suffix}.json.gz"
-        for suffix in ("a", "b")
+        f"{prefix.replace('.com//prd/', '.com/tenant-a/prd/')}rate-{suffix}.json.gz" for suffix in ("a", "b")
     ]
     assert [job["url"] for job in jobs] == expected_urls
     assert [catalog_row["url"] for catalog_row in pushed_rows[1:]] == expected_urls
@@ -4231,21 +3824,11 @@ def _write_mixed_body_location_toc(tmp_path) -> Path:
                             {"location": "https://www.zelis.com/"},
                             {"location": "Missing file"},
                             {"location": "ftp://example.test/rates.json.gz"},
-                            {
-                                "location": (
-                                    "https://cdn.example.test/"
-                                    "2026-06_in-network-rates.json.gz"
-                                )
-                            },
+                            {"location": ("https://cdn.example.test/2026-06_in-network-rates.json.gz")},
                         ],
                         "allowed_amount_files": [
                             {"location": "https://example.test/"},
-                            {
-                                "location": (
-                                    "https://cdn.example.test/"
-                                    "2026-06_allowed-amounts.json.gz"
-                                )
-                            },
+                            {"location": ("https://cdn.example.test/2026-06_allowed-amounts.json.gz")},
                         ],
                     }
                 ],
@@ -4317,10 +3900,7 @@ def test_ptg2_toc_artifact_repair_preserves_string_literals(tmp_path):
 
     toc = process_ptg._load_table_of_contents_artifact(toc_path)
 
-    descriptions = [
-        repaired_row["description"]
-        for repaired_row in toc["reporting_structure"][0]["in_network_files"]
-    ]
+    descriptions = [repaired_row["description"] for repaired_row in toc["reporting_structure"][0]["in_network_files"]]
     assert descriptions == ["keep }{ literal", "next file"]
 
 
@@ -4345,9 +3925,7 @@ def test_ptg2_artifact_reuse_by_strong_etag_and_length(tmp_path):
         supports_head=True,
     )
 
-    reused, mode = process_ptg.choose_reusable_raw_artifact(
-        [candidate_map], head, store=store
-    )
+    reused, mode = process_ptg.choose_reusable_raw_artifact([candidate_map], head, store=store)
 
     assert reused == candidate_map
     assert mode == "strong_etag_length"
@@ -4373,9 +3951,7 @@ def test_ptg2_artifact_reuse_skips_missing_metadata_candidate(tmp_path):
         supports_head=True,
     )
 
-    reused, mode = process_ptg.choose_reusable_raw_artifact(
-        [candidate_map], head, store=store
-    )
+    reused, mode = process_ptg.choose_reusable_raw_artifact([candidate_map], head, store=store)
 
     assert reused is None
     assert mode is None
@@ -4431,9 +4007,7 @@ async def _download_replacement_gzip(
         await runner.cleanup()
 
 
-def test_download_raw_artifact_redownloads_bad_gzip_reuse_candidate(
-    monkeypatch, tmp_path
-):
+def test_download_raw_artifact_redownloads_bad_gzip_reuse_candidate(monkeypatch, tmp_path):
     """Redownload a reusable artifact whose gzip header is invalid."""
     downloaded_bytes = gzip.compress(b'{"ok": true}')
     bad_path = tmp_path / "bad.json.gz"
@@ -4453,22 +4027,15 @@ def test_download_raw_artifact_redownloads_bad_gzip_reuse_candidate(
             '"reuse-test"',
         )
     )
-    manifest_lines = (
-        (tmp_path / "store" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
-    )
+    manifest_lines = (tmp_path / "store" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
 
     assert artifact.reused is False
     assert Path(artifact.raw_path).read_bytes() == downloaded_bytes
     assert any('"status": "corrupt"' in line for line in manifest_lines)
-    assert any(
-        '"status": "available"' in line and artifact.raw_sha256 in line
-        for line in manifest_lines
-    )
+    assert any('"status": "available"' in line and artifact.raw_sha256 in line for line in manifest_lines)
 
 
-def test_download_raw_artifact_redownloads_corrupt_gzip_reuse_candidate(
-    monkeypatch, tmp_path
-):
+def test_download_raw_artifact_redownloads_corrupt_gzip_reuse_candidate(monkeypatch, tmp_path):
     """Redownload a reusable artifact whose gzip body fails integrity."""
     downloaded_bytes = gzip.compress(b'{"ok": true}' * 1024)
     bad_payload = bytearray(downloaded_bytes)
@@ -4490,20 +4057,12 @@ def test_download_raw_artifact_redownloads_corrupt_gzip_reuse_candidate(
             '"reuse-body-test"',
         )
     )
-    manifest_lines = (
-        (tmp_path / "store" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
-    )
+    manifest_lines = (tmp_path / "store" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
 
     assert artifact.reused is False
     assert Path(artifact.raw_path).read_bytes() == downloaded_bytes
-    assert any(
-        '"status": "corrupt"' in line and "integrity check" in line
-        for line in manifest_lines
-    )
-    assert any(
-        '"status": "available"' in line and artifact.raw_sha256 in line
-        for line in manifest_lines
-    )
+    assert any('"status": "corrupt"' in line and "integrity check" in line for line in manifest_lines)
+    assert any('"status": "available"' in line and artifact.raw_sha256 in line for line in manifest_lines)
 
 
 async def _download_from_test_server(handler, tmp_path):
@@ -4572,9 +4131,7 @@ def test_ptg2_range_download_assembles_artifact(monkeypatch, tmp_path):
                     "ETag": '"range-test"',
                 },
             )
-        return web.Response(
-            body=artifact_bytes, headers={"Content-Length": str(len(artifact_bytes))}
-        )
+        return web.Response(body=artifact_bytes, headers={"Content-Length": str(len(artifact_bytes))})
 
     _configure_range_download(monkeypatch)
     artifact = asyncio.run(_download_from_test_server(handle, tmp_path))
@@ -4610,10 +4167,7 @@ def test_ptg2_range_download_retries_short_chunk(monkeypatch, tmp_path):
         end = int(end_text)
         attempts_by_range[range_header] = attempts_by_range.get(range_header, 0) + 1
         chunk = artifact_bytes[start : end + 1]
-        if (
-            range_header == "bytes=1048576-2097151"
-            and attempts_by_range[range_header] == 1
-        ):
+        if range_header == "bytes=1048576-2097151" and attempts_by_range[range_header] == 1:
             chunk = chunk[: len(chunk) // 2]
         return web.Response(
             status=206,
@@ -4634,20 +4188,12 @@ def test_ptg2_range_download_retries_short_chunk(monkeypatch, tmp_path):
 
 
 def test_ptg2_packing_helpers_are_order_insensitive_for_sets():
-    provider_a = process_ptg.build_provider_set(
-        [3, 1, 2, 2], tin_type="ein", tin_value="123"
-    )
-    provider_b = process_ptg.build_provider_set(
-        [2, 3, 1], tin_type="ein", tin_value="123"
-    )
+    provider_a = process_ptg.build_provider_set([3, 1, 2, 2], tin_type="ein", tin_value="123")
+    provider_b = process_ptg.build_provider_set([2, 3, 1], tin_type="ein", tin_value="123")
     price_set_a = process_ptg.build_price_set(["b", "a", "a"])
     price_set_b = process_ptg.build_price_set(["a", "b"])
-    chunk_a = process_ptg.build_fact_chunk(
-        "ctx", "in_network", "proc", "0a", ["pack-b", "pack-a"]
-    )
-    chunk_b = process_ptg.build_fact_chunk(
-        "ctx", "in_network", "proc", "0a", ["pack-a", "pack-b"]
-    )
+    chunk_a = process_ptg.build_fact_chunk("ctx", "in_network", "proc", "0a", ["pack-b", "pack-a"])
+    chunk_b = process_ptg.build_fact_chunk("ctx", "in_network", "proc", "0a", ["pack-a", "pack-b"])
     rate_set_a = process_ptg.build_rate_set("ctx", ["chunk-b", "chunk-a"])
     rate_set_b = process_ptg.build_rate_set("ctx", ["chunk-a", "chunk-b"])
 
@@ -4656,9 +4202,7 @@ def test_ptg2_packing_helpers_are_order_insensitive_for_sets():
     assert price_set_a["price_set_hash"] == price_set_b["price_set_hash"]
     assert chunk_a["fact_chunk_hash"] == chunk_b["fact_chunk_hash"]
     assert rate_set_a["rate_set_hash"] == rate_set_b["rate_set_hash"]
-    assert process_ptg.provider_hash_bucket(
-        provider_a["provider_set_hash"], bucket_count=16
-    )
+    assert process_ptg.provider_hash_bucket(provider_a["provider_set_hash"], bucket_count=16)
 
 
 def test_ptg2_provider_bucket_count_is_configurable(monkeypatch):
@@ -4800,15 +4344,9 @@ def test_ptg2_provider_combo_cache_is_order_insensitive_and_bounded():
 
     assert key_a == key_b
     assert process_ptg._provider_combo_cache_get(cache, key_a, stats_map) is None
-    process_ptg._provider_combo_cache_put(
-        cache, key_a, {"__hash__": 1}, stats_map, limit=1
-    )
-    assert (
-        process_ptg._provider_combo_cache_get(cache, key_b, stats_map)["__hash__"] == 1
-    )
-    process_ptg._provider_combo_cache_put(
-        cache, ("3",), {"__hash__": 3}, stats_map, limit=1
-    )
+    process_ptg._provider_combo_cache_put(cache, key_a, {"__hash__": 1}, stats_map, limit=1)
+    assert process_ptg._provider_combo_cache_get(cache, key_b, stats_map)["__hash__"] == 1
+    process_ptg._provider_combo_cache_put(cache, ("3",), {"__hash__": 3}, stats_map, limit=1)
 
     assert key_a not in cache
     assert stats_map["provider_combo_cache_hits"] == 1
@@ -4844,10 +4382,7 @@ def test_ptg2_fast_provider_union_carries_count_without_npi_materialization(
     assert combined_entry["provider_count"] == 4
     assert provider_set_row["provider_count"] == 4
     assert provider_set_row["npi"] is None
-    assert (
-        provider_set_row["canonical_payload"]["provider_count_mode"]
-        == "summed_provider_groups"
-    )
+    assert provider_set_row["canonical_payload"]["provider_count_mode"] == "summed_provider_groups"
 
 
 def test_ptg2_stream_logical_artifact_handles_gzip_without_loading_all(tmp_path):
@@ -4910,9 +4445,7 @@ def test_ptg2_json_artifact_stream_strips_utf8_bom(tmp_path, container):
             gzip_fp.write(payload)
     else:
         raw_path = tmp_path / "rates.zip"
-        with zipfile.ZipFile(
-            raw_path, "w", compression=zipfile.ZIP_DEFLATED
-        ) as zip_ref:
+        with zipfile.ZipFile(raw_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_ref:
             zip_ref.writestr("rates.json", payload)
 
     with process_ptg.open_json_artifact_stream(raw_path) as json_fp:
@@ -4944,15 +4477,11 @@ def test_ptg2_bom_logical_identity_matches_materialized_artifact(tmp_path, conta
             gzip_fp.write(payload)
     else:
         raw_path = tmp_path / "rates.zip"
-        with zipfile.ZipFile(
-            raw_path, "w", compression=zipfile.ZIP_DEFLATED
-        ) as zip_ref:
+        with zipfile.ZipFile(raw_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_ref:
             zip_ref.writestr("rates.json", payload)
 
     identified = process_ptg.logical_artifact_identity(raw_path)
-    materialized = process_ptg.stream_logical_artifact(
-        raw_path, output_dir=tmp_path / "logical"
-    )
+    materialized = process_ptg.stream_logical_artifact(raw_path, output_dir=tmp_path / "logical")
 
     assert identified.logical_sha256 == process_ptg.sha256_bytes(expected)
     assert materialized.logical_sha256 == identified.logical_sha256
@@ -4994,9 +4523,7 @@ def test_ptg2_stream_logical_artifact_extracts_deflate64_zip(tmp_path):
     expected = b'{"in_network":[]}'
     _write_deflate64_zip(raw_path, "nested/rates.json", expected)
 
-    logical = process_ptg.stream_logical_artifact(
-        raw_path, output_dir=tmp_path / "logical"
-    )
+    logical = process_ptg.stream_logical_artifact(raw_path, output_dir=tmp_path / "logical")
 
     assert logical.compression == "zip"
     assert logical.member_name == "nested/rates.json"
@@ -5004,9 +4531,7 @@ def test_ptg2_stream_logical_artifact_extracts_deflate64_zip(tmp_path):
     assert logical.logical_sha256 == process_ptg.sha256_bytes(expected)
 
 
-def test_ptg2_materialize_json_source_extracts_zip_when_logical_deferral_requested(
-    tmp_path, monkeypatch
-):
+def test_ptg2_materialize_json_source_extracts_zip_when_logical_deferral_requested(tmp_path, monkeypatch):
     raw_path = tmp_path / "rates.zip"
     expected = b'{"in_network":[]}'
     with zipfile.ZipFile(raw_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_ref:
@@ -5023,9 +4548,7 @@ def test_ptg2_materialize_json_source_extracts_zip_when_logical_deferral_request
             byte_count=byte_count,
         )
 
-    monkeypatch.setattr(
-        ptg_source_download, "download_raw_artifact", fake_download_raw_artifact
-    )
+    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
 
     _raw, logical = asyncio.run(
         process_ptg.materialize_json_source(
@@ -5067,15 +4590,9 @@ def test_ptg2_ensure_tables_uses_existing_db_create_table(monkeypatch):
 
 
 def test_runtime_setup_ignores_v3_migrations():
-    runtime_owned_set = {
-        model.__table__.name for model in process_ptg.PTG2_MODEL_CLASSES
-    }
+    runtime_owned_set = {model.__table__.name for model in process_ptg.PTG2_MODEL_CLASSES}
 
-    assert not {
-        table_name
-        for table_name in runtime_owned_set
-        if table_name.startswith("ptg2_v3_")
-    }
+    assert not {table_name for table_name in runtime_owned_set if table_name.startswith("ptg2_v3_")}
 
 
 def test_ptg2_ensure_tables_requires_v3_migration_before_runtime_ddl(monkeypatch):
@@ -5125,11 +4642,7 @@ def test_ptg2_ensure_tables_cannot_recreate_v4_migration_tables(
         return None
 
     async def fake_all(_statement, **params):
-        return [
-            {"table_name": table_name}
-            for table_name in params["table_names"]
-            if table_name != missing_table_name
-        ]
+        return [{"table_name": table_name} for table_name in params["table_names"] if table_name != missing_table_name]
 
     async def fake_create_table(table, **_kwargs):
         created_list.append(table.name)
@@ -5219,9 +4732,7 @@ def test_ptg2_ensure_indexes_skips_duplicate_primary_unique_index(monkeypatch):
 
     asyncio.run(process_ptg._ensure_indexes(model, "mrf"))
 
-    assert not any(
-        "example_ptg_table_idx_primary" in statement for statement in statements
-    )
+    assert not any("example_ptg_table_idx_primary" in statement for statement in statements)
 
 
 def test_ptg2_ensure_indexes_ignores_concurrent_create_index_race(monkeypatch):
@@ -5326,9 +4837,7 @@ def _in_network_test_artifacts(
     )
 
 
-def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(
-    monkeypatch, tmp_path
-):
+def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(monkeypatch, tmp_path):
     raw_artifact, logical_artifact = _in_network_test_artifacts(tmp_path)
 
     async def fake_materialize(*_args, **_kwargs):
@@ -5347,9 +4856,7 @@ def test_ptg2_in_network_serving_only_zero_rows_returns_skipped_result(
 
     monkeypatch.setattr(process_ptg, "ptg2_temp_parent", lambda: tmp_path)
     monkeypatch.setattr(process_ptg, "materialize_json_source", fake_materialize)
-    monkeypatch.setattr(
-        process_ptg, "_extract_metadata_fields", AsyncMock(return_value={})
-    )
+    monkeypatch.setattr(process_ptg, "_extract_metadata_fields", AsyncMock(return_value={}))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", AsyncMock())
     monkeypatch.setattr(process_ptg, "_record_source_version", fake_source_version)
     monkeypatch.setattr(process_ptg, "_parse_in_network_file_strict_v3", fake_parse)
@@ -5417,9 +4924,7 @@ def test_ptg2_downloaded_jobs_are_prefetched_concurrently(monkeypatch):
     assert {context["run_progress_hold_pct"] for context in progress_contexts} == {5.0}
     assert {context["file_index"] for context in progress_contexts} == {1, 2}
     assert all(
-        context["overall_progress_start_pct"]
-        == context["overall_progress_end_pct"]
-        == 5.0
+        context["overall_progress_start_pct"] == context["overall_progress_end_pct"] == 5.0
         for context in progress_contexts
     )
 
@@ -5562,9 +5067,7 @@ def _install_concurrent_layout_mocks(monkeypatch, publish):
             }
         ),
     )
-    monkeypatch.setattr(
-        process_ptg, "validate_owned_serving_inputs", lambda entries, **_kwargs: list(entries)
-    )
+    monkeypatch.setattr(process_ptg, "validate_owned_serving_inputs", lambda entries, **_kwargs: list(entries))
     monkeypatch.setattr(process_ptg, "publish_strict_shared_v3_layout", publish)
     _install_candidate_stage_mock(monkeypatch)
 
@@ -5581,9 +5084,7 @@ def _install_concurrent_file_import_mocks(monkeypatch, state):
     monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
-    monkeypatch.setattr(
-        process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"})
-    )
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(
         process_ptg,
         "_create_serving_stage_table",
@@ -5596,9 +5097,7 @@ def _install_concurrent_file_import_mocks(monkeypatch, state):
     monkeypatch.setattr(process_ptg.db, "transaction", transaction)
     _install_concurrent_layout_mocks(monkeypatch, publish)
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
-    monkeypatch.setattr(
-        process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
     monkeypatch.setattr(
@@ -5625,10 +5124,7 @@ def _assert_concurrent_file_import(import_result, state):
         "status": "queued",
         "run_id": "run-refresh",
     }
-    assert (
-        "empty_npi_tin_only_normalization_count"
-        not in state.publish_call_kwargs_by_name
-    )
+    assert "empty_npi_tin_only_normalization_count" not in state.publish_call_kwargs_by_name
     state.refresh_mock.assert_awaited_once()
     refresh_kwargs = state.refresh_mock.await_args.kwargs
     assert refresh_kwargs["source_key"] == "file_concurrency_test"
@@ -5637,11 +5133,7 @@ def _assert_concurrent_file_import(import_result, state):
     assert refresh_kwargs["has_serving_files"] is True
     assert refresh_kwargs["source_scoped_compact"] is True
     assert refresh_kwargs["test_mode"] is False
-    import_run_rows = [
-        import_row
-        for cls_name, import_row in state.pushed_list
-        if cls_name == "PTG2ImportRun"
-    ]
+    import_run_rows = [import_row for cls_name, import_row in state.pushed_list if cls_name == "PTG2ImportRun"]
     assert import_run_rows[-1]["report"]["files_processed"] == 2
     assert import_run_rows[-1]["report"]["address_refresh"] == {
         "status": "queued",
@@ -5656,9 +5148,7 @@ def test_ptg2_main_processes_downloaded_files_concurrently_when_enabled(monkeypa
         concurrency_map={"active": 0, "max_active": 0},
         processed_jobs=[],
         publish_call_kwargs_by_name={},
-        refresh_mock=AsyncMock(
-            return_value={"status": "queued", "run_id": "run-refresh"}
-        ),
+        refresh_mock=AsyncMock(return_value={"status": "queued", "run_id": "run-refresh"}),
     )
     _install_concurrent_file_import_mocks(monkeypatch, state)
     import_result = asyncio.run(
@@ -5681,10 +5171,7 @@ def test_ptg2_main_rolls_back_claim_when_import_run_start_fails(monkeypatch):
     async def push(object_entries, cls, **_kwargs):
         pushed_entries.extend((cls, entry) for entry in object_entries)
         entry = object_entries[0]
-        if (
-            cls is process_ptg.PTG2Snapshot
-            and entry["status"] == process_ptg.PTG2_STATUS_BUILDING
-        ):
+        if cls is process_ptg.PTG2Snapshot and entry["status"] == process_ptg.PTG2_STATUS_BUILDING:
             raise RuntimeError("import run write failed")
         return None
 
@@ -5696,9 +5183,7 @@ def test_ptg2_main_rolls_back_claim_when_import_run_start_fails(monkeypatch):
         AsyncMock(return_value="snap_previous"),
     )
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
-    monkeypatch.setattr(
-        process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", final_table_cleanup
-    )
+    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", final_table_cleanup)
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
     monkeypatch.setattr(process_ptg, "_create_serving_stage_table", create_stage)
 
@@ -5712,9 +5197,7 @@ def test_ptg2_main_rolls_back_claim_when_import_run_start_fails(monkeypatch):
             )
         )
 
-    snapshot_entries = [
-        entry for cls, entry in pushed_entries if cls is process_ptg.PTG2Snapshot
-    ]
+    snapshot_entries = [entry for cls, entry in pushed_entries if cls is process_ptg.PTG2Snapshot]
     assert [entry["status"] for entry in snapshot_entries] == [
         process_ptg.PTG2_STATUS_BUILDING,
     ]
@@ -5731,10 +5214,7 @@ def _install_fenced_import_start(monkeypatch, pushed_entries):
     async def push(object_entries, cls, **_kwargs):
         pushed_entries.extend((cls, entry) for entry in object_entries)
         entry = object_entries[0]
-        if (
-            cls is process_ptg.PTG2Snapshot
-            and entry["status"] == process_ptg.PTG2_STATUS_BUILDING
-        ):
+        if cls is process_ptg.PTG2Snapshot and entry["status"] == process_ptg.PTG2_STATUS_BUILDING:
             raise process_ptg.StaleMetadataFenceError("attempt is metadata-reconciled")
         return None
 
@@ -5781,11 +5261,7 @@ def test_ptg2_main_exits_fenced_without_failure_cleanup(monkeypatch):
             )
         )
 
-    snapshot_statuses = [
-        entry["status"]
-        for cls, entry in pushed_entries
-        if cls is process_ptg.PTG2Snapshot
-    ]
+    snapshot_statuses = [entry["status"] for cls, entry in pushed_entries if cls is process_ptg.PTG2Snapshot]
     assert snapshot_statuses == [process_ptg.PTG2_STATUS_BUILDING]
     source_cleanup.assert_not_awaited()
     table_cleanup.assert_not_awaited()
@@ -5817,10 +5293,7 @@ def _assert_partial_stage_family_cleanup(stage_cleanup, partially_created_tables
     stage_table_names = stage_cleanup.await_args.args[0]
     assert partially_created_tables == [stage_table_names[0]]
     assert len(stage_table_names) == 4
-    assert (
-        stage_table_names[1:]
-        == process_ptg._ptg2_manifest_stage_table_names(stage_table_names[0])[1:]
-    )
+    assert stage_table_names[1:] == process_ptg._ptg2_manifest_stage_table_names(stage_table_names[0])[1:]
 
 
 def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkeypatch):
@@ -5832,33 +5305,24 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
     async def push(object_entries, cls, **_kwargs):
         pushed_entries.extend((cls, entry) for entry in object_entries)
         entry = object_entries[0]
-        if (
-            cls is process_ptg.PTG2Snapshot
-            and entry["status"] == process_ptg.PTG2_STATUS_BUILDING
-        ):
+        if cls is process_ptg.PTG2Snapshot and entry["status"] == process_ptg.PTG2_STATUS_BUILDING:
             return {**entry, "snapshot_claim_status": "acquired"}
         return None
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
-    monkeypatch.setattr(
-        process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
     monkeypatch.setattr(
         process_ptg,
         "_prepare_ptg_tables",
         AsyncMock(return_value={"ImportLog": object}),
     )
-    monkeypatch.setattr(
-        process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", AsyncMock()
-    )
+    monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_tables_for_manifest", AsyncMock())
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", stage_cleanup)
 
     async def create_partial_stage(stage_token, **_coordinates):
-        partially_created_tables.append(
-            process_ptg._ptg2_manifest_stage_table_name(stage_token)
-        )
+        partially_created_tables.append(process_ptg._ptg2_manifest_stage_table_name(stage_token))
         raise RuntimeError("stage creation failed")
 
     monkeypatch.setattr(
@@ -5877,27 +5341,15 @@ def test_ptg2_main_cleans_complete_stage_family_when_stage_creation_fails(monkey
         )
 
     _assert_partial_stage_family_cleanup(stage_cleanup, partially_created_tables)
-    snapshot_entries = [
-        entry for cls, entry in pushed_entries if cls is process_ptg.PTG2Snapshot
-    ]
+    snapshot_entries = [entry for cls, entry in pushed_entries if cls is process_ptg.PTG2Snapshot]
     assert snapshot_entries[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
 
 
 def _assert_all_discovered_jobs_failed(pushed_list):
     """Assert terminal state after every discovered job failed."""
-    import_run_rows = [
-        import_row
-        for cls_name, import_row in pushed_list
-        if cls_name == "PTG2ImportRun"
-    ]
-    snapshot_rows = [
-        import_row for cls_name, import_row in pushed_list if cls_name == "PTG2Snapshot"
-    ]
-    current_rows = [
-        import_row
-        for cls_name, import_row in pushed_list
-        if cls_name == "PTG2CurrentSnapshot"
-    ]
+    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
+    snapshot_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2Snapshot"]
+    current_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2CurrentSnapshot"]
     final_report = import_run_rows[-1]["report"]
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert final_report["files_processed"] in {0}
@@ -5912,9 +5364,7 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
     pushed_list = []
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed_list.extend(
-            (getattr(cls, "__name__", str(cls)), import_row) for import_row in rows
-        )
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -5930,13 +5380,9 @@ def test_ptg2_main_marks_failed_when_all_discovered_jobs_fail(monkeypatch):
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
-    monkeypatch.setattr(
-        process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
-    monkeypatch.setattr(
-        process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"})
-    )
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(
         process_ptg,
         "_create_serving_stage_table",
@@ -5995,9 +5441,7 @@ def test_parse_allowed_amounts_filters_null_service_codes(monkeypatch, tmp_path)
                             {
                                 "allowed_amount": 133.0,
                                 "billing_code_modifier": [None, "AA, bb"],
-                                "providers": [
-                                    {"billed_charge": 200.0, "npi": [1427166008]}
-                                ],
+                                "providers": [{"billed_charge": 200.0, "npi": [1427166008]}],
                             }
                         ],
                     }
@@ -6090,9 +5534,7 @@ def test_parse_allowed_amounts_persists_in_network_metadata(monkeypatch, tmp_pat
                         "payments": [
                             {
                                 "allowed_amount": 133.0,
-                                "providers": [
-                                    {"billed_charge": 200.0, "npi": [1427166008]}
-                                ],
+                                "providers": [{"billed_charge": 200.0, "npi": [1427166008]}],
                             }
                         ],
                     }
@@ -6170,23 +5612,13 @@ class _AllowedAmountBatchOrderRecorder:
 
     async def push(self, object_rows, model_class, **_kwargs):
         if model_class is ptg_allowed_amounts.PTG2AllowedAmountItem:
-            self.persisted_item_hashes.update(
-                row_by_field["allowed_item_hash"] for row_by_field in object_rows
-            )
+            self.persisted_item_hashes.update(row_by_field["allowed_item_hash"] for row_by_field in object_rows)
         if model_class is ptg_allowed_amounts.PTG2AllowedAmountPayment:
-            assert all(
-                row_by_field["allowed_item_hash"] in self.persisted_item_hashes
-                for row_by_field in object_rows
-            )
-            self.persisted_payment_hashes.update(
-                row_by_field["payment_hash"] for row_by_field in object_rows
-            )
+            assert all(row_by_field["allowed_item_hash"] in self.persisted_item_hashes for row_by_field in object_rows)
+            self.persisted_payment_hashes.update(row_by_field["payment_hash"] for row_by_field in object_rows)
             self.payment_batch_sizes.append(len(object_rows))
         if model_class is ptg_allowed_amounts.PTG2AllowedAmountProviderPayment:
-            assert all(
-                row_by_field["payment_hash"] in self.persisted_payment_hashes
-                for row_by_field in object_rows
-            )
+            assert all(row_by_field["payment_hash"] in self.persisted_payment_hashes for row_by_field in object_rows)
             self.provider_batch_sizes.append(len(object_rows))
 
 
@@ -6246,9 +5678,7 @@ def test_parse_allowed_amounts_preserves_zero_valued_payment_evidence(
     pushed_rows_by_class: dict[str, list[dict]] = {}
 
     async def record_rows(object_rows, model_class, **_kwargs):
-        pushed_rows_by_class.setdefault(model_class.__name__, []).extend(
-            copy.deepcopy(object_rows)
-        )
+        pushed_rows_by_class.setdefault(model_class.__name__, []).extend(copy.deepcopy(object_rows))
 
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", record_rows)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
@@ -6316,9 +5746,7 @@ def test_parse_allowed_amounts_flushes_item_before_large_payment_batch(
 
     assert metrics["allowed_amount_payments"] == payment_count
     assert sum(batch_recorder.payment_batch_sizes) == payment_count
-    assert max(batch_recorder.payment_batch_sizes) <= (
-        ptg_allowed_amounts.ALLOWED_AMOUNT_PAYMENT_BATCH_SIZE
-    )
+    assert max(batch_recorder.payment_batch_sizes) <= (ptg_allowed_amounts.ALLOWED_AMOUNT_PAYMENT_BATCH_SIZE)
 
 
 def test_parse_allowed_amounts_flushes_payment_before_large_provider_batch(
@@ -6369,9 +5797,7 @@ def test_parse_allowed_amounts_flushes_payment_before_large_provider_batch(
 
     assert metrics["allowed_amount_provider_payments"] == provider_count
     assert sum(batch_recorder.provider_batch_sizes) == provider_count
-    assert max(batch_recorder.provider_batch_sizes) <= (
-        ptg_allowed_amounts.ALLOWED_AMOUNT_PROVIDER_PAYMENT_BATCH_SIZE
-    )
+    assert max(batch_recorder.provider_batch_sizes) <= (ptg_allowed_amounts.ALLOWED_AMOUNT_PROVIDER_PAYMENT_BATCH_SIZE)
 
 
 def _build_allowed_only_toc_jobs() -> list[dict]:
@@ -6444,9 +5870,7 @@ def _build_allowed_only_push_recorder(
 ):
     async def fake_push(object_rows, model_class, **_kwargs):
         class_name = getattr(model_class, "__name__", str(model_class))
-        pushed_rows.extend(
-            (class_name, copy.deepcopy(row_by_field)) for row_by_field in object_rows
-        )
+        pushed_rows.extend((class_name, copy.deepcopy(row_by_field)) for row_by_field in object_rows)
         first_row_by_field = object_rows[0]
         if model_class is process_ptg.PTG2Snapshot:
             if first_row_by_field["status"] == process_ptg.PTG2_STATUS_BUILDING:
@@ -6556,23 +5980,13 @@ def _install_allowed_only_main_mocks(monkeypatch):
 
 def _assert_allowed_only_publication(import_result_by_field, pushed_rows):
     """Assert an allowed-only import published no serving-rate snapshot."""
-    snapshot_rows = [
-        row_by_field
-        for class_name, row_by_field in pushed_rows
-        if class_name == "PTG2Snapshot"
-    ]
+    snapshot_rows = [row_by_field for class_name, row_by_field in pushed_rows if class_name == "PTG2Snapshot"]
     final_snapshot = snapshot_rows[-1]
-    import_run_rows = [
-        row_by_field
-        for class_name, row_by_field in pushed_rows
-        if class_name == "PTG2ImportRun"
-    ]
+    import_run_rows = [row_by_field for class_name, row_by_field in pushed_rows if class_name == "PTG2ImportRun"]
     final_report = import_run_rows[-1]["report"]
     assert import_result_by_field["status"] == "succeeded"
     assert import_result_by_field["publish_status"] == "published_allowed_amounts"
-    assert (
-        import_result_by_field["snapshot_status"] == process_ptg.PTG2_STATUS_PUBLISHED
-    )
+    assert import_result_by_field["snapshot_status"] == process_ptg.PTG2_STATUS_PUBLISHED
     assert import_result_by_field["activation_status"] == "not_applicable"
     assert import_result_by_field["serving_rates"] == 0
     assert import_result_by_field["allowed_amount_evidence"] is True
@@ -6656,9 +6070,7 @@ def test_ptg2_main_dispatches_private_direct_allowed_amount_job(monkeypatch):
     } == {
         "type": "allowed_amounts",
         "url": allowed_url,
-        "plan_info": [
-            {"plan_id": "plan-alpha", "plan_market_type": "group"}
-        ],
+        "plan_info": [{"plan_id": "plan-alpha", "plan_market_type": "group"}],
         "_ptg_progress_label": f"direct-singleton-{intent_digest[:12]}",
         "_ptg_progress_private": True,
     }
@@ -6687,11 +6099,7 @@ def test_ptg2_allowed_current_pointer_replaces_previous_snapshot(monkeypatch):
         )
     )
 
-    final_snapshot = [
-        row_by_field
-        for class_name, row_by_field in pushed_rows
-        if class_name == "PTG2Snapshot"
-    ][-1]
+    final_snapshot = [row_by_field for class_name, row_by_field in pushed_rows if class_name == "PTG2Snapshot"][-1]
     allowed_index = final_snapshot["manifest"]["allowed_amount_index"]
     assert final_snapshot["previous_snapshot_id"] == "ptg2:202606:old-allowed"
     assert allowed_index["previous_snapshot_id"] == "ptg2:202606:old-allowed"
@@ -6732,16 +6140,8 @@ def _build_empty_allowed_amount_file_result(
 def _assert_empty_allowed_failure_rows(
     pushed_rows: list[tuple[str, dict]],
 ) -> None:
-    snapshot_rows = [
-        row_by_field
-        for class_name, row_by_field in pushed_rows
-        if class_name == "PTG2Snapshot"
-    ]
-    import_run_rows = [
-        row_by_field
-        for class_name, row_by_field in pushed_rows
-        if class_name == "PTG2ImportRun"
-    ]
+    snapshot_rows = [row_by_field for class_name, row_by_field in pushed_rows if class_name == "PTG2Snapshot"]
+    import_run_rows = [row_by_field for class_name, row_by_field in pushed_rows if class_name == "PTG2ImportRun"]
     final_report = import_run_rows[-1]["report"]
     assert [snapshot_row["status"] for snapshot_row in snapshot_rows] == [
         process_ptg.PTG2_STATUS_BUILDING,
@@ -6765,9 +6165,7 @@ def test_ptg2_allowed_only_zero_payment_fails_without_pointer_cutover(
         publish_source_pointers,
         publish_allowed_pointer,
     ) = _install_allowed_only_main_mocks(monkeypatch)
-    process_allowed_file = AsyncMock(
-        side_effect=_build_empty_allowed_amount_file_result
-    )
+    process_allowed_file = AsyncMock(side_effect=_build_empty_allowed_amount_file_result)
     monkeypatch.setattr(
         process_ptg,
         "_process_allowed_amounts_file",
@@ -6876,11 +6274,7 @@ def test_ptg2_mixed_import_fails_before_negotiated_stage_on_partial_evidence(
             )
         )
 
-    snapshot_rows = [
-        row_by_field
-        for class_name, row_by_field in pushed_rows
-        if class_name == "PTG2Snapshot"
-    ]
+    snapshot_rows = [row_by_field for class_name, row_by_field in pushed_rows if class_name == "PTG2Snapshot"]
     assert snapshot_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     manifest_stage.assert_not_awaited()
     publish_allowed_pointer.assert_not_awaited()
@@ -6900,9 +6294,7 @@ def _install_partial_publish_mocks(
     )
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed_rows.extend(
-            (getattr(cls, "__name__", str(cls)), import_row) for import_row in rows
-        )
+        pushed_rows.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -7025,16 +6417,8 @@ def test_ptg2_main_blocks_partial_publish_by_default(monkeypatch):
             )
         )
 
-    import_run_rows = [
-        import_row
-        for class_name, import_row in pushed_rows
-        if class_name == "PTG2ImportRun"
-    ]
-    current_rows = [
-        import_row
-        for class_name, import_row in pushed_rows
-        if class_name == "PTG2CurrentSnapshot"
-    ]
+    import_run_rows = [import_row for class_name, import_row in pushed_rows if class_name == "PTG2ImportRun"]
+    current_rows = [import_row for class_name, import_row in pushed_rows if class_name == "PTG2CurrentSnapshot"]
 
     assert import_run_rows[-1]["status"] == process_ptg.PTG2_STATUS_FAILED
     assert "failed 1 of 2 attempted" in import_run_rows[-1]["error"]
@@ -7062,22 +6446,16 @@ def test_ptg2_main_marks_failed_when_toc_download_fails(monkeypatch):
     pushed_list = []
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed_list.extend(
-            (getattr(cls, "__name__", str(cls)), import_row) for import_row in rows
-        )
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_toc(*_args, **_kwargs):
         raise RuntimeError("409 public access denied")
 
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
-    monkeypatch.setattr(
-        process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
-    monkeypatch.setattr(
-        process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"})
-    )
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(
         process_ptg,
         "_create_serving_stage_table",
@@ -7186,15 +6564,11 @@ def test_ptg2_rust_scanner_emits_top_level_object_bytes(tmp_path):
         "provider_references": [
             {
                 "provider_group_id": 1,
-                "provider_groups": [
-                    {"npi": [123], "tin": {"type": "ein", "value": "1"}}
-                ],
+                "provider_groups": [{"npi": [123], "tin": {"type": "ein", "value": "1"}}],
             },
             {
                 "provider_group_id": 2,
-                "provider_groups": [
-                    {"npi": [456], "tin": {"type": "ein", "value": "2"}}
-                ],
+                "provider_groups": [{"npi": [456], "tin": {"type": "ein", "value": "2"}}],
             },
         ],
         "in_network": [
@@ -7205,11 +6579,7 @@ def test_ptg2_rust_scanner_emits_top_level_object_bytes(tmp_path):
     with gzip.open(artifact, "wb") as fp:
         fp.write(json.dumps(artifact_by_field).encode("utf-8"))
 
-    object_rows = list(
-        process_ptg._iter_top_level_object_bytes_rust(
-            artifact, {"provider_references", "in_network"}
-        )
-    )
+    object_rows = list(process_ptg._iter_top_level_object_bytes_rust(artifact, {"provider_references", "in_network"}))
 
     assert [name for name, _raw in object_rows] == [
         "provider_references",
@@ -7230,9 +6600,7 @@ def test_ptg2_manifest_copy_file_reads_fifo(tmp_path, monkeypatch):
     copied_payloads = []
 
     class FakeDriver:
-        async def copy_to_table(
-            self, target_table, *, source, schema_name, columns, **copy_options
-        ):
+        async def copy_to_table(self, target_table, *, source, schema_name, columns, **copy_options):
             copied_payloads.append(
                 {
                     "target_table": target_table,
@@ -7247,9 +6615,7 @@ def test_ptg2_manifest_copy_file_reads_fifo(tmp_path, monkeypatch):
 
     class FakeAcquire:
         async def __aenter__(self):
-            return SimpleNamespace(
-                raw_connection=SimpleNamespace(driver_connection=FakeDriver())
-            )
+            return SimpleNamespace(raw_connection=SimpleNamespace(driver_connection=FakeDriver()))
 
         async def __aexit__(self, *_exc_info):
             return False
@@ -7301,18 +6667,12 @@ def test_ptg2_provider_membership_sidecar_builder_contract(tmp_path, monkeypatch
     completed = subprocess.CompletedProcess(
         args=[],
         returncode=0,
-        stdout=b"provider_membership_sidecars\t"
-        + str(len(summary_json)).encode()
-        + b"\n"
-        + summary_json
-        + b"\n",
+        stdout=b"provider_membership_sidecars\t" + str(len(summary_json)).encode() + b"\n" + summary_json + b"\n",
         stderr=b"",
     )
     run_mock = Mock(return_value=completed)
 
-    monkeypatch.setattr(
-        process_ptg, "_ptg2_rust_scanner_binary", lambda: Path("/opt/ptg2_scanner")
-    )
+    monkeypatch.setattr(process_ptg, "_ptg2_rust_scanner_binary", lambda: Path("/opt/ptg2_scanner"))
     monkeypatch.setattr(process_ptg.subprocess, "run", run_mock)
 
     summary = asyncio.run(
@@ -7344,17 +6704,11 @@ def test_ptg2_provider_membership_builder_allows_empty_scope(tmp_path, monkeypat
     completed = subprocess.CompletedProcess(
         args=[],
         returncode=0,
-        stdout=b"provider_membership_sidecars\t"
-        + str(len(summary_json)).encode()
-        + b"\n"
-        + summary_json
-        + b"\n",
+        stdout=b"provider_membership_sidecars\t" + str(len(summary_json)).encode() + b"\n" + summary_json + b"\n",
         stderr=b"",
     )
     run_mock = Mock(return_value=completed)
-    monkeypatch.setattr(
-        process_ptg, "_ptg2_rust_scanner_binary", lambda: Path("/opt/ptg2_scanner")
-    )
+    monkeypatch.setattr(process_ptg, "_ptg2_rust_scanner_binary", lambda: Path("/opt/ptg2_scanner"))
     monkeypatch.setattr(process_ptg.subprocess, "run", run_mock)
 
     summary = asyncio.run(
@@ -7380,9 +6734,7 @@ def test_ptg2_provider_membership_sidecars_round_trip_through_python_reader(tmp_
     binary = process_ptg._ptg2_rust_scanner_binary()
     if binary is None:
         pytest.skip("PTG2 Rust scanner binary is not built")
-    artifact_helpers = importlib.import_module(
-        "process.ptg_parts.ptg2_manifest_artifacts"
-    )
+    artifact_helpers = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
     member_copy = tmp_path / "provider-group-member.copy"
     member_copy.write_text(
         "00000000000000000000000000000001\t1003002106\n"
@@ -7445,9 +6797,7 @@ def _strict_v3_scanner_frame_stream(
         scanner_summary_map["factor_mode"] = factor_mode
         scanner_summary_map["provider_graph_v4_factor_mode"] = factor_mode
         if factor_mode:
-            scanner_summary_map["empty_npi_tin_only_normalization"] = (
-                _v4_empty_npi_normalization_payload(0)
-            )
+            scanner_summary_map["empty_npi_tin_only_normalization"] = _v4_empty_npi_normalization_payload(0)
     framed_payloads = (
         ("scanner_config", scanner_config_map),
         ("scanner_summary", scanner_summary_map),
@@ -7502,10 +6852,7 @@ def test_ptg2_rust_compact_uses_bounded_event_queue_default(monkeypatch, tmp_pat
 
     assert captured_env_map[process_ptg.PTG2_RUST_EVENT_QUEUE_ENV] == "128"
     assert captured_env_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"].endswith("v3-runs")
-    assert (
-        captured_env_map["HLTHPRT_PTG2_MANIFEST_SPILL_DIR"]
-        == captured_env_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"]
-    )
+    assert captured_env_map["HLTHPRT_PTG2_MANIFEST_SPILL_DIR"] == captured_env_map["HLTHPRT_PTG2_V3_SERVING_RUN_DIR"]
     assert "HLTHPRT_PTG2_MANIFEST_PROVIDER_FORWARD_SIDECAR_PATH" not in captured_env_map
     assert captured_env_map["HLTHPRT_PTG2_MANIFEST_ONLY"] == "true"
     assert ptg_rust_scanner._INVALID_PRICE_EXCLUSION_ENV not in captured_env_map
@@ -7600,9 +6947,7 @@ def test_ptg2_rust_compact_binds_exact_invalid_price_exclusion(monkeypatch, tmp_
 
     assert json.loads(captured_env_map[ptg_rust_scanner._INVALID_PRICE_EXCLUSION_ENV]) == expectation
     with pytest.raises(RuntimeError, match="unauthorized invalid-price exclusion"):
-        ptg_rust_scanner._validate_v3_scanner_summary(
-            {"invalid_price_exclusion": evidence}
-        )
+        ptg_rust_scanner._validate_v3_scanner_summary({"invalid_price_exclusion": evidence})
     with pytest.raises(RuntimeError, match="invalid invalid-price exclusion"):
         ptg_rust_scanner._validate_v3_scanner_summary(
             {"invalid_price_exclusion": {}},
@@ -7642,9 +6987,7 @@ def test_invalid_price_exclusion_publication_is_exact_and_fail_closed():
         policy,
         raw_source_sha256,
     )
-    source_evidence = ptg_invalid_price_exclusion.invalid_price_exclusion_source_evidence(
-        expectation
-    )
+    source_evidence = ptg_invalid_price_exclusion.invalid_price_exclusion_source_evidence(expectation)
     aggregate_evidence = ptg_invalid_price_exclusion.invalid_price_exclusion_evidence(policy)
 
     def source_result(observed, *, raw_sha256=raw_source_sha256):
@@ -7656,10 +6999,13 @@ def test_invalid_price_exclusion_publication_is_exact_and_fail_closed():
         }
 
     assert process_ptg._invalid_price_exclusion_publication_evidence(None, []) is None
-    assert process_ptg._invalid_price_exclusion_publication_evidence(
-        policy,
-        [{"skipped": True}, source_result(source_evidence)],
-    ) == aggregate_evidence
+    assert (
+        process_ptg._invalid_price_exclusion_publication_evidence(
+            policy,
+            [{"skipped": True}, source_result(source_evidence)],
+        )
+        == aggregate_evidence
+    )
     with pytest.raises(RuntimeError, match="did not observe every"):
         process_ptg._invalid_price_exclusion_publication_evidence(
             policy,
@@ -7681,14 +7027,15 @@ def test_invalid_price_exclusion_publication_is_exact_and_fail_closed():
             [source_result({**source_evidence, "sha256": "c" * 64})],
         )
 
-    downloaded = SimpleNamespace(
-        raw_artifact=SimpleNamespace(raw_sha256=raw_source_sha256)
-    )
+    downloaded = SimpleNamespace(raw_artifact=SimpleNamespace(raw_sha256=raw_source_sha256))
     assert process_ptg._source_invalid_price_exclusion_expectation({}, downloaded) is None
-    assert process_ptg._source_invalid_price_exclusion_expectation(
-        {"invalid_price_exclusion_policy": policy},
-        downloaded,
-    ) == expectation
+    assert (
+        process_ptg._source_invalid_price_exclusion_expectation(
+            {"invalid_price_exclusion_policy": policy},
+            downloaded,
+        )
+        == expectation
+    )
 
 
 def test_direct_frozen_params_do_not_invent_optional_policy():
@@ -7731,10 +7078,7 @@ def test_direct_source_params_accept_only_singleton_bound_policy():
     )
 
     assert normalized["invalid_price_exclusion_policy"] == policy
-    assert all(
-        field_name not in normalized
-        for field_name in process_ptg.FROZEN_RATE_FILE_REQUIRED_FIELDS
-    )
+    assert all(field_name not in normalized for field_name in process_ptg.FROZEN_RATE_FILE_REQUIRED_FIELDS)
     with pytest.raises(ValueError, match="direct and frozen multipart inputs are exclusive"):
         process_ptg._normalized_direct_frozen_params(
             {
@@ -7792,12 +7136,9 @@ def test_v4_flag_enables_rust_factor_mode(
             plan_month_id="month",
             source_trace_set_hash="trace",
             v3_serving_run_directory=tmp_path / "v3-runs",
-            manifest_provider_set_component_sidecar_path=tmp_path
-            / "set-component.ptg2sc",
-            manifest_provider_component_group_sidecar_path=tmp_path
-            / "component-group.ptg2sc",
-            manifest_provider_group_tax_identity_sidecar_path=tmp_path
-            / "provider-group-tax-identity.ptg2tax",
+            manifest_provider_set_component_sidecar_path=tmp_path / "set-component.ptg2sc",
+            manifest_provider_component_group_sidecar_path=tmp_path / "component-group.ptg2sc",
+            manifest_provider_group_tax_identity_sidecar_path=tmp_path / "provider-group-tax-identity.ptg2tax",
             manifest_only=True,
         )
     )
@@ -7853,9 +7194,7 @@ def test_ptg2_rust_compact_rejects_incomplete_v4_factor_paths(
                     tmp_path / "component-group.ptg2sc" if has_component_path else None
                 ),
                 manifest_provider_group_tax_identity_sidecar_path=(
-                    tmp_path / "provider-group-tax-identity.ptg2tax"
-                    if has_tax_identity_path
-                    else None
+                    tmp_path / "provider-group-tax-identity.ptg2tax" if has_tax_identity_path else None
                 ),
                 manifest_only=True,
             )
@@ -7906,9 +7245,7 @@ def test_v3_scanner_summary_rejects_v4_only_empty_npi_audit():
     with pytest.raises(RuntimeError, match="V4-only empty-NPI evidence"):
         ptg_rust_scanner._validate_v3_scanner_summary(
             {
-                "empty_npi_tin_only_normalization": (
-                    _v4_empty_npi_normalization_payload(0)
-                ),
+                "empty_npi_tin_only_normalization": (_v4_empty_npi_normalization_payload(0)),
             },
         )
 
@@ -7928,12 +7265,8 @@ def test_ptg2_rust_compact_retries_short_pipe_reads(monkeypatch, tmp_path):
         def wait(self, timeout=None):
             return 0
 
-    monkeypatch.setattr(
-        ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner"
-    )
-    monkeypatch.setattr(
-        ptg_rust_scanner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
-    )
+    monkeypatch.setattr(ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
 
     framed_records = list(
         process_ptg._iter_compact_serving_records_rust(
@@ -7971,9 +7304,7 @@ def test_ptg2_rust_compact_retries_short_pipe_reads(monkeypatch, tmp_path):
     ]
 
 
-def test_ptg2_rust_compact_reports_truncated_frame_process_status(
-    monkeypatch, tmp_path
-):
+def test_ptg2_rust_compact_reports_truncated_frame_process_status(monkeypatch, tmp_path):
     class FakeProcess:
         stdout = io.BytesIO(b'scanner_summary\t7\n{"x"')
         stderr = None
@@ -7984,12 +7315,8 @@ def test_ptg2_rust_compact_reports_truncated_frame_process_status(
         def wait(self, timeout=None):
             return -9
 
-    monkeypatch.setattr(
-        ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner"
-    )
-    monkeypatch.setattr(
-        ptg_rust_scanner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
-    )
+    monkeypatch.setattr(ptg_rust_scanner, "_ptg2_rust_scanner_binary", lambda: tmp_path / "ptg2_scanner")
+    monkeypatch.setattr(ptg_rust_scanner.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
 
     with pytest.raises(RuntimeError) as error:
         list(
@@ -8035,17 +7362,12 @@ def test_ptg2_manifest_artifacts_skip_disabled_provider_npi_sidecar(tmp_path):
 
     assert set(artifacts) == {"provider_forward"}
     assert artifacts["provider_forward"]["name"] == "provider_forward"
-    assert (
-        artifacts["provider_forward"]["record_format"]
-        == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
-    )
+    assert artifacts["provider_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
     assert artifacts["provider_forward"]["path"] == str(provider_forward)
     assert artifacts["provider_forward"]["owner_count"] == 1
     assert artifacts["provider_forward"]["member_count"] == 1
     assert artifacts["provider_forward"]["member_global_count"] == 1
-    assert artifacts["provider_forward"]["owner_index_fence_owners"] == [
-        owner_global_id.hex()
-    ]
+    assert artifacts["provider_forward"]["owner_index_fence_owners"] == [owner_global_id.hex()]
 
 
 def test_ptg2_manifest_artifacts_authenticate_tax_identity_sidecar(tmp_path):
@@ -8146,11 +7468,7 @@ def test_ptg2_manifest_artifacts_reject_tax_identity_summary_drift(tmp_path):
 def test_ptg2_manifest_artifacts_reject_missing_tax_identity_file(tmp_path):
     with pytest.raises(RuntimeError, match="artifact is missing"):
         process_ptg._collect_ptg2_manifest_sidecar_artifacts(
-            {
-                "provider_group_tax_identity": (
-                    tmp_path / "missing-provider-tax-identity.ptg2tax"
-                )
-            },
+            {"provider_group_tax_identity": (tmp_path / "missing-provider-tax-identity.ptg2tax")},
             provider_group_tax_identity_artifact={"final": True},
         )
 
@@ -8180,20 +7498,12 @@ def test_ptg2_manifest_artifacts_fallback_collects_from_summary_paths(tmp_path):
 
     sidecar_map = {sidecar["name"]: sidecar for sidecar in artifact_dict["sidecars"]}
     assert set(sidecar_map) == {"price_forward", "provider_forward"}
-    assert (
-        sidecar_map["price_forward"]["record_format"]
-        == process_ptg.PTG2_MANIFEST_MEMBERSHIP_FORMAT
-    )
-    assert (
-        sidecar_map["provider_forward"]["record_format"]
-        == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
-    )
+    assert sidecar_map["price_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_MEMBERSHIP_FORMAT
+    assert sidecar_map["provider_forward"]["record_format"] == process_ptg.PTG2_MANIFEST_DENSE_MEMBERSHIP_FORMAT
     assert sidecar_map["provider_forward"]["path"] == str(provider_forward)
     assert sidecar_map["provider_forward"]["owner_count"] == 0
     assert sidecar_map["provider_forward"]["member_count"] == 0
-    assert (
-        sidecar_map["provider_forward"]["source_shard_id"] == "manifest:logical-shard-a"
-    )
+    assert sidecar_map["provider_forward"]["source_shard_id"] == "manifest:logical-shard-a"
 
 
 def test_ptg2_manifest_artifacts_combine_all_logical_source_metadata():
@@ -8220,9 +7530,7 @@ def test_ptg2_manifest_artifacts_combine_all_logical_source_metadata():
 
     assert (
         artifacts["source_trace_set_hash"]
-        == process_ptg.build_source_trace_set(["trace-a", "trace-b"])[
-            "source_trace_set_hash"
-        ]
+        == process_ptg.build_source_trace_set(["trace-a", "trace-b"])["source_trace_set_hash"]
     )
     assert artifacts["network_names"] == ["network a", "network b", "network c"]
 
@@ -8247,13 +7555,8 @@ def test_direct_lean_swap_keeps_null_reported_codes(monkeypatch):
     )
 
     joined = "\n".join(status_calls)
-    assert (
-        "code_count.reported_code_system IS NOT DISTINCT FROM serving.reported_code_system"
-        in joined
-    )
-    assert (
-        "code_count.reported_code IS NOT DISTINCT FROM serving.reported_code" in joined
-    )
+    assert "code_count.reported_code_system IS NOT DISTINCT FROM serving.reported_code_system" in joined
+    assert "code_count.reported_code IS NOT DISTINCT FROM serving.reported_code" in joined
 
 
 async def _fake_postgres_binary_write_result(**kwargs):
@@ -8292,9 +7595,7 @@ def test_ptg2_automatic_candidate_activation_is_rejected(monkeypatch):
 
 
 def test_manifest_publish_materializes_components(tmp_path, monkeypatch):
-    artifact_module = importlib.import_module(
-        "process.ptg_parts.ptg2_manifest_artifacts"
-    )
+    artifact_module = importlib.import_module("process.ptg_parts.ptg2_manifest_artifacts")
     status_calls = []
     copied_by_field = {}
     provider_group_id = bytes.fromhex("00000000000000000000000000000011")
@@ -8314,9 +7615,7 @@ def test_manifest_publish_materializes_components(tmp_path, monkeypatch):
 
     async def fake_copy(copy_path, *, target_table):
         copied_by_field["target_table"] = target_table
-        copied_by_field["lines"] = (
-            Path(copy_path).read_text(encoding="ascii").splitlines()
-        )
+        copied_by_field["lines"] = Path(copy_path).read_text(encoding="ascii").splitlines()
 
     monkeypatch.setattr(ptg_manifest_publish.db, "status", fake_status)
     monkeypatch.setattr(
@@ -8340,9 +7639,7 @@ def test_manifest_publish_materializes_components(tmp_path, monkeypatch):
     joined = "\n".join(status_calls)
     assert materialized_table_name == "ptg2_provider_set_component_snap"
     assert copied_by_field["target_table"] == "ptg2_provider_set_component_snap"
-    assert copied_by_field["lines"] == [
-        "00000000-0000-0000-0000-000000000012\t00000000-0000-0000-0000-000000000011"
-    ]
+    assert copied_by_field["lines"] == ["00000000-0000-0000-0000-000000000012\t00000000-0000-0000-0000-000000000011"]
     assert "provider_set_global_id_128 uuid NOT NULL" in joined
     assert "(provider_set_global_id_128, provider_group_global_id_128)" in joined
     assert "(provider_group_global_id_128, provider_set_global_id_128)" in joined
@@ -8385,8 +7682,7 @@ def _manifest_copy_successful_files(source_files_by_kind):
             "summary": {
                 "manifest": {
                     "copy_files": {
-                        kind: [{"path": str(path), "row_count": 1}]
-                        for kind, path in source_files_by_kind.items()
+                        kind: [{"path": str(path), "row_count": 1}] for kind, path in source_files_by_kind.items()
                     }
                 }
             }
@@ -8542,13 +7838,7 @@ def test_strict_v3_annotation_failure_still_claims_completed_scratch(
         "in_network",
         "https://example.test/in-network.json.gz",
         True,
-        summary={
-            "manifest": {
-                "copy_files": {
-                    "provider_set_metadata": [{"path": str(copy_path), "row_count": 1}]
-                }
-            }
-        },
+        summary={"manifest": {"copy_files": {"provider_set_metadata": [{"path": str(copy_path), "row_count": 1}]}}},
     )
 
     def fail_annotation(*_args, **_kwargs):
@@ -8572,14 +7862,8 @@ def test_strict_v3_annotation_failure_still_claims_completed_scratch(
             {},
         )
 
-    assert pending.copy_entries_by_kind["provider_set_metadata"] == [
-        {"path": str(copy_path), "row_count": 1}
-    ]
-    assert all(
-        not entries
-        for kind, entries in pending.copy_entries_by_kind.items()
-        if kind != "provider_set_metadata"
-    )
+    assert pending.copy_entries_by_kind["provider_set_metadata"] == [{"path": str(copy_path), "row_count": 1}]
+    assert all(not entries for kind, entries in pending.copy_entries_by_kind.items() if kind != "provider_set_metadata")
     process_ptg._cleanup_manifest_copy_entries(pending.copy_entries_by_kind)
     assert not copy_path.exists()
 
@@ -8621,14 +7905,8 @@ def _assert_manifest_copy_throughput_metrics(metrics_by_name, *, expected_bytes)
 def test_manifest_copy_cleanup_removes_empty_worker_siblings(tmp_path):
     base_copy = tmp_path / "ptg2_manifest_provider_group_member_test.copy"
     empty_worker = tmp_path / "ptg2_manifest_provider_group_member_test.copy.worker0001"
-    empty_provider_ref_worker = (
-        tmp_path
-        / "ptg2_manifest_provider_group_member_test.copy.provider_refs.worker0002"
-    )
-    nonempty_provider_ref_worker = (
-        tmp_path
-        / "ptg2_manifest_provider_group_member_test.copy.provider_refs.worker0003"
-    )
+    empty_provider_ref_worker = tmp_path / "ptg2_manifest_provider_group_member_test.copy.provider_refs.worker0002"
+    nonempty_provider_ref_worker = tmp_path / "ptg2_manifest_provider_group_member_test.copy.provider_refs.worker0003"
     for path in (
         base_copy,
         empty_worker,
@@ -8648,9 +7926,7 @@ def test_manifest_copy_cleanup_removes_empty_worker_siblings(tmp_path):
 def test_manifest_copy_family_cleanup_removes_nonempty_failed_shards(tmp_path):
     base_copy = tmp_path / "ptg2_manifest_serving_failed.copy"
     worker_copy = tmp_path / "ptg2_manifest_serving_failed.copy.worker0001"
-    ready_copy = (
-        tmp_path / "ptg2_manifest_serving_failed.copy.worker0001.part000001.ready"
-    )
+    ready_copy = tmp_path / "ptg2_manifest_serving_failed.copy.worker0001.part000001.ready"
     unrelated_copy = tmp_path / "ptg2_manifest_serving_other.copy.worker0001"
     for path in (base_copy, worker_copy, ready_copy, unrelated_copy):
         path.write_text("row\n", encoding="utf-8")
@@ -8911,9 +8187,7 @@ def test_ptg2_candidate_stage_binds_layout_without_mutating_live_pointers(monkey
             }
         ]
 
-    monkeypatch.setattr(
-        ptg_source_pointers, "bind_snapshot_to_shared_layout", bind_layout
-    )
+    monkeypatch.setattr(ptg_source_pointers, "bind_snapshot_to_shared_layout", bind_layout)
     monkeypatch.setattr(ptg_source_pointers, "_source_plan_rows", fake_source_plan_rows)
     monkeypatch.setattr(
         ptg_source_pointers.db,
@@ -8950,10 +8224,7 @@ def _assert_source_pointer_publication(promotion_result, executed_list):
     assert 'UPDATE "mrf".ptg2_snapshot' in joined
     assert "ptg2_legacy_global_pointer_projection_queue" in joined
     assert "updated_global_pointer" not in joined
-    assert (
-        'DELETE FROM "mrf".ptg2_current_plan_source WHERE source_key = :source_key'
-        in joined
-    )
+    assert 'DELETE FROM "mrf".ptg2_current_plan_source WHERE source_key = :source_key' in joined
     assert 'INSERT INTO "mrf".ptg2_current_plan_source' in joined
     assert len(executed_list) == 10
     assert "pg_advisory_xact_lock_shared" in executed_list[1][0]
@@ -8998,9 +8269,7 @@ def test_ptg2_source_pointer_publish_updates_source_and_plan_rows_transactionall
             return False
 
     monkeypatch.setattr(ptg_source_pointers, "_source_plan_rows", fake_source_plan_rows)
-    monkeypatch.setattr(
-        ptg_source_pointers.db, "transaction", lambda: FakeTransaction()
-    )
+    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
     monkeypatch.setattr(
         ptg_source_pointers,
         "drain_legacy_global_projection_queue",
@@ -9027,10 +8296,7 @@ def test_pointer_stays_on_plan_failure(monkeypatch):
 
     async def fake_source_plan_rows(**_kwargs):
         assert transaction_started_map["value"] is True
-        assert any(
-            "pg_advisory_xact_lock" in statement
-            for statement, _params in executed_statements
-        )
+        assert any("pg_advisory_xact_lock" in statement for statement, _params in executed_statements)
         raise RuntimeError("plan resolution failed")
 
     class FakeSession:
@@ -9055,9 +8321,7 @@ def test_pointer_stays_on_plan_failure(monkeypatch):
             return False
 
     monkeypatch.setattr(ptg_source_pointers, "_source_plan_rows", fake_source_plan_rows)
-    monkeypatch.setattr(
-        ptg_source_pointers.db, "transaction", lambda: FakeTransaction()
-    )
+    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
 
     with pytest.raises(RuntimeError, match="plan resolution failed"):
         asyncio.run(
@@ -9074,9 +8338,7 @@ def test_pointer_stays_on_plan_failure(monkeypatch):
     assert len(executed_statements) == 5
     assert "set_config('lock_timeout'" in executed_statements[0][0]
     assert "pg_advisory_xact_lock_shared" in executed_statements[1][0]
-    assert executed_statements[1][1] == {
-        "gc_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
-    }
+    assert executed_statements[1][1] == {"gc_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY}
 
 
 def test_ptg2_global_publish_is_atomic(monkeypatch):
@@ -9101,9 +8363,7 @@ def test_ptg2_global_publish_is_atomic(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(
-        ptg_source_pointers.db, "transaction", lambda: FakeTransaction()
-    )
+    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
 
     publication_outcome = asyncio.run(
         ptg_source_pointers._publish_ptg2_global_snapshot_pointer(
@@ -9124,9 +8384,7 @@ def test_ptg2_global_publish_is_atomic(monkeypatch):
     assert "FOR UPDATE OF snapshot" in executed_statements[4][0]
     assert 'UPDATE "mrf".ptg2_snapshot' in executed_statements[5][0]
     assert 'INSERT INTO "mrf".ptg2_current_snapshot' in executed_statements[9][0]
-    assert executed_statements[1][1] == {
-        "gc_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY
-    }
+    assert executed_statements[1][1] == {"gc_lock_key": ptg_source_pointers.PTG2_SOURCE_POINTER_GC_LOCK_KEY}
 
 
 def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(
@@ -9154,9 +8412,7 @@ def test_ptg2_global_snapshot_pointer_rejects_unpublished_snapshot_after_lock(
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(
-        ptg_source_pointers.db, "transaction", lambda: FakeTransaction()
-    )
+    monkeypatch.setattr(ptg_source_pointers.db, "transaction", lambda: FakeTransaction())
 
     with pytest.raises(ValueError, match="requires a published snapshot row"):
         asyncio.run(
@@ -9203,9 +8459,7 @@ def _install_candidate_stage_mock(monkeypatch):
         candidate_attributes = ptg_source_pointers.candidate_snapshot_attributes(
             kwargs["snapshot_attributes"],
             source_key=kwargs["source_key"],
-            previous_snapshot_id=kwargs["snapshot_attributes"][
-                "previous_snapshot_id"
-            ],
+            previous_snapshot_id=kwargs["snapshot_attributes"]["previous_snapshot_id"],
         )
         return {
             "status": "validated",
@@ -9242,6 +8496,7 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
     monkeypatch.setattr(process_ptg, "_should_auto_activate_ptg2_candidates", lambda: True)
     publication = _strict_v3_publication(serving_rates)
     publish = AsyncMock(return_value=publication)
+
     @asynccontextmanager
     async def fake_transaction():
         yield object()
@@ -9277,9 +8532,7 @@ def _install_strict_v3_publish_mocks(monkeypatch, *, serving_rates: int):
             }
         ),
     )
-    monkeypatch.setattr(
-        process_ptg, "validate_owned_serving_inputs", lambda entries, **_kwargs: list(entries)
-    )
+    monkeypatch.setattr(process_ptg, "validate_owned_serving_inputs", lambda entries, **_kwargs: list(entries))
     monkeypatch.setattr(process_ptg, "publish_strict_shared_v3_layout", publish)
     _install_candidate_stage_mock(monkeypatch)
     monkeypatch.setattr(process_ptg, "_drop_ptg2_snapshot_table_names", AsyncMock())
@@ -9358,16 +8611,12 @@ def _reusable_v3_layout_manifest(provider_identifier_quarantine):
         "table": "mrf.retired_table",
     }
     if provider_identifier_quarantine is not None:
-        serving_index_by_field["provider_identifier_quarantine"] = (
-            provider_identifier_quarantine
-        )
+        serving_index_by_field["provider_identifier_quarantine"] = provider_identifier_quarantine
     return {"serving_index": serving_index_by_field}
 
 
 def test_reused_v3_serving_index_copies_only_physical_contract_fields():
-    quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
-        {-17: 2, 123_456_789: 3}
-    )
+    quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload({-17: 2, 123_456_789: 3})
 
     serving_result = process_ptg._reused_shared_v3_serving_index(
         _reusable_v3_layout_manifest(quarantine),
@@ -9470,18 +8719,14 @@ def test_reused_v4_serving_index_requires_packed_graph_contract():
 
     assert serving_result["storage_generation"] == "shared_blocks_v4"
     assert serving_result["snapshot_map"]["map_digest"] == "ab" * 32
-    assert serving_result["serving_binary"]["provider_graph_v4"]["contract"] == (
-        "ptg2_provider_graph_v4"
-    )
+    assert serving_result["serving_binary"]["provider_graph_v4"]["contract"] == ("ptg2_provider_graph_v4")
 
 
 @pytest.mark.parametrize("evidence_failure", ["missing", "tampered"])
 def test_reused_v3_serving_index_rejects_invalid_quarantine_evidence(
     evidence_failure,
 ):
-    quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload(
-        {123_456_789: 2}
-    )
+    quarantine = ptg_provider_quarantine.provider_identifier_quarantine_payload({123_456_789: 2})
     if evidence_failure == "missing":
         quarantine = None
     else:
@@ -9508,9 +8753,7 @@ def test_reused_v3_serving_index_rejects_invalid_source_witness(
     if witness_failure == "missing":
         serving_index.pop("source_witness")
     else:
-        serving_index["source_witness"][
-            "contract"
-        ] = "ptg2_v3_source_witness_payload_v1"
+        serving_index["source_witness"]["contract"] = "ptg2_v3_source_witness_payload_v1"
 
     with pytest.raises(RuntimeError, match="incompatible source witness evidence"):
         process_ptg._reused_shared_v3_serving_index(
@@ -9590,19 +8833,11 @@ def test_scanner_fingerprint_isolates_v4_sources_when_disabled(
     v4_after_v4_change = process_ptg._shared_v3_scanner_identity()
 
     assert v3_baseline["contract_version"] == 3
-    assert v3_after_v4_change["publisher_source_sha256"] == (
-        v3_baseline["publisher_source_sha256"]
-    )
-    assert v3_after_v4_change["publisher_source_bytes"] == (
-        v3_baseline["publisher_source_bytes"]
-    )
+    assert v3_after_v4_change["publisher_source_sha256"] == (v3_baseline["publisher_source_sha256"])
+    assert v3_after_v4_change["publisher_source_bytes"] == (v3_baseline["publisher_source_bytes"])
     assert v4_baseline["contract_version"] == 4
-    assert v4_after_v4_change["publisher_source_sha256"] != (
-        v4_baseline["publisher_source_sha256"]
-    )
-    assert v4_after_v4_change["publisher_source_bytes"] > (
-        v4_baseline["publisher_source_bytes"]
-    )
+    assert v4_after_v4_change["publisher_source_sha256"] != (v4_baseline["publisher_source_sha256"])
+    assert v4_after_v4_change["publisher_source_bytes"] > (v4_baseline["publisher_source_bytes"])
 
 
 def test_v4_scanner_identity_binds_inferred_taxonomy_rule_set(
@@ -9625,10 +8860,7 @@ def test_v4_scanner_identity_binds_inferred_taxonomy_rule_set(
 
     changed = process_ptg._shared_v3_scanner_identity()
 
-    assert (
-        changed["inferred_taxonomy_rule_set_sha256"]
-        != baseline["inferred_taxonomy_rule_set_sha256"]
-    )
+    assert changed["inferred_taxonomy_rule_set_sha256"] != baseline["inferred_taxonomy_rule_set_sha256"]
 
 
 def _strict_v3_downloaded_job(job):
@@ -9923,11 +9155,7 @@ def test_full_rebuild_scope_isolates_snapshot_and_audit_run_identity():
 
 
 def _reused_mixed_allowed_context():
-    allowed_result = vars(
-        _build_allowed_amount_file_result(
-            {"url": "https://example.test/allowed-amounts.json.gz"}
-        )
-    )
+    allowed_result = vars(_build_allowed_amount_file_result({"url": "https://example.test/allowed-amounts.json.gz"}))
     lane_report_by_field = {
         "files_attempted": 1,
         "files_processed": 1,
@@ -10194,13 +9422,9 @@ def test_reused_v3_mixed_auto_activation_publishes_allowed_evidence(
         auto_activate=True,
     )
 
-    candidate_manifest = lifecycle.candidate_stage.await_args.kwargs[
-        "snapshot_attributes"
-    ]["manifest"]
+    candidate_manifest = lifecycle.candidate_stage.await_args.kwargs["snapshot_attributes"]["manifest"]
     allowed_index = candidate_manifest["allowed_amount_index"]
-    source_types = {
-        version["source_type"] for version in candidate_manifest["source_file_versions"]
-    }
+    source_types = {version["source_type"] for version in candidate_manifest["source_file_versions"]}
 
     assert candidate_manifest["data_domains"] == [
         process_ptg.PTG2_DOMAIN_IN_NETWORK,
@@ -10217,10 +9441,10 @@ def test_reused_v3_mixed_auto_activation_publishes_allowed_evidence(
     assert lifecycle.allowed_state_by_name["published"] is True
     assert lifecycle.publication_by_field["activation_status"] == "activated"
     assert lifecycle.publication_by_field["allowed_amount_evidence"] is True
-    assert {
-        version["source_type"]
-        for version in lifecycle.publication_by_field["source_file_versions"]
-    } == {"in_network", "allowed_amounts"}
+    assert {version["source_type"] for version in lifecycle.publication_by_field["source_file_versions"]} == {
+        "in_network",
+        "allowed_amounts",
+    }
     completion_state = lifecycle.persist_completion.await_args.args[0]
     completion_report = completion_state.report_payload
     assert completion_report["allowed_amount_pointer"]["status"] == ("promoted")
@@ -10231,9 +9455,7 @@ def _reused_mixed_candidate_attributes(lifecycle):
     return ptg_source_pointers.candidate_snapshot_attributes(
         stage_call_by_field["snapshot_attributes"],
         source_key=stage_call_by_field["source_key"],
-        previous_snapshot_id=stage_call_by_field["snapshot_attributes"][
-            "previous_snapshot_id"
-        ],
+        previous_snapshot_id=stage_call_by_field["snapshot_attributes"]["previous_snapshot_id"],
     )
 
 
@@ -10271,14 +9493,12 @@ def test_reused_v3_mixed_deferred_activation_preserves_and_promotes_allowed(
 
     assert lifecycle.publication_by_field["activation_status"] == "deferred"
     assert lifecycle.publication_by_field["allowed_amount_evidence"] is True
-    assert (
-        candidate_manifest["allowed_amount_index"]["previous_snapshot_id"]
-        == "ptg2:202606:previous-allowed"
-    )
+    assert candidate_manifest["allowed_amount_index"]["previous_snapshot_id"] == "ptg2:202606:previous-allowed"
     assert candidate_manifest["allowed_amount_lane"]["successful_files"]
-    assert {
-        version["source_type"] for version in candidate_manifest["source_file_versions"]
-    } == {"in_network", "allowed_amounts"}
+    assert {version["source_type"] for version in candidate_manifest["source_file_versions"]} == {
+        "in_network",
+        "allowed_amounts",
+    }
     assert lifecycle.allowed_state_by_name["published"] is False
     lifecycle.activate_candidate.assert_not_awaited()
 
@@ -10290,19 +9510,17 @@ def test_reused_v3_mixed_deferred_activation_preserves_and_promotes_allowed(
     assert activation_by_field["activation_status"] == "activated"
     assert activation_by_field["allowed_amount_pointer"]["status"] == "promoted"
     assert activation_by_field["allowed_amount_provider_payments"] == 1
-    assert {
-        version["source_type"]
-        for version in activation_by_field["source_file_versions"]
-    } == {"in_network", "allowed_amounts"}
+    assert {version["source_type"] for version in activation_by_field["source_file_versions"]} == {
+        "in_network",
+        "allowed_amounts",
+    }
 
 
 def _source_report_count_callbacks(pushed_list):
     """Build deterministic callbacks for source-level count reconciliation."""
 
     async def fake_push(rows, cls, **_kwargs):
-        pushed_list.extend(
-            (getattr(cls, "__name__", str(cls)), report_row) for report_row in rows
-        )
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), report_row) for report_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         assert len(jobs) == 1
@@ -10343,16 +9561,12 @@ def _install_source_report_count_mocks(
         "_persist_plan_months_and_catalog_request",
         AsyncMock(return_value="persisted"),
     )
-    fake_push, fake_downloaded_jobs, fake_process = _source_report_count_callbacks(
-        pushed_list
-    )
+    fake_push, fake_downloaded_jobs, fake_process = _source_report_count_callbacks(pushed_list)
     monkeypatch.setattr(process_ptg, "ensure_database", AsyncMock())
     monkeypatch.setattr(process_ptg, "require_ptg2_runtime_schema_ready", AsyncMock())
     monkeypatch.setattr(process_ptg.db, "status", AsyncMock())
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", fake_push)
-    monkeypatch.setattr(
-        process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"})
-    )
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(
         process_ptg,
         "_create_serving_stage_table",
@@ -10367,9 +9581,7 @@ def _install_source_report_count_mocks(
         publish_source_dictionary,
     )
     _install_strict_v3_publish_mocks(monkeypatch, serving_rates=987)
-    monkeypatch.setattr(
-        process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(
         process_ptg,
         "_publish_ptg2_source_pointers",
@@ -10383,11 +9595,7 @@ def _assert_source_report_counts(
     publish_source_pointers,
     publish_source_dictionary,
 ):
-    import_run_rows = [
-        report_row
-        for cls_name, report_row in pushed_list
-        if cls_name == "PTG2ImportRun"
-    ]
+    import_run_rows = [report_row for cls_name, report_row in pushed_list if cls_name == "PTG2ImportRun"]
     final_report = import_run_rows[-1]["report"]
     assert final_report["serving_rates"] == 987
     assert final_report["rate_count"] == 987
@@ -10397,14 +9605,10 @@ def _assert_source_report_counts(
     assert source_set["source_count"] == 1
     assert len(source_set["raw_container_sha256_digest"]) == 64
     assert final_report["successful_files"][0]["summary"]["serving_rates"] == 111
-    published_snapshot = publish_source_pointers.await_args.kwargs[
-        "snapshot_attributes"
-    ]
+    published_snapshot = publish_source_pointers.await_args.kwargs["snapshot_attributes"]
     assert published_snapshot["manifest"]["serving_rates"] == 987
     assert published_snapshot["manifest"]["serving_index"]["source_set"] == (source_set)
-    assert publish_source_dictionary.await_args.kwargs["expected_source_set"] == (
-        source_set
-    )
+    assert publish_source_dictionary.await_args.kwargs["expected_source_set"] == (source_set)
 
 
 def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch):
@@ -10437,9 +9641,7 @@ def test_ptg2_source_scoped_report_uses_published_serving_rate_count(monkeypatch
 
 def _deferred_candidate_callbacks(state):
     async def fake_push(rows, cls, **_kwargs):
-        state.pushed_list.extend(
-            (getattr(cls, "__name__", str(cls)), import_row) for import_row in rows
-        )
+        state.pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
@@ -10530,11 +9732,7 @@ def _assert_deferred_candidate_result(import_result, state, candidate_stage):
     state.publish_source_pointers.assert_not_awaited()
     state.cleanup_old_source_tables.assert_not_awaited()
     state.address_refresh.assert_not_awaited()
-    import_run_rows = [
-        import_row
-        for cls_name, import_row in state.pushed_list
-        if cls_name == "PTG2ImportRun"
-    ]
+    import_run_rows = [import_row for cls_name, import_row in state.pushed_list if cls_name == "PTG2ImportRun"]
     final_report = import_run_rows[-1]["report"]
     assert final_report["activation_status"] == "deferred"
     assert final_report["address_refresh"] == {
@@ -10566,22 +9764,18 @@ def test_ptg2_import_defers_live_pointer_mutation_by_default(monkeypatch):
 
 def _completion_timing_callbacks(state):
     """Build callbacks that capture completion timing boundaries."""
+
     def advance(seconds: float) -> None:
         state.clock_map["seconds"] += seconds
 
     async def fake_push(rows, cls, **_kwargs):
         class_name = getattr(cls, "__name__", str(cls))
         for import_row in rows:
-            if (
-                class_name == "PTG2ImportRun"
-                and import_row.get("status") == process_ptg.PTG2_STATUS_VALIDATED
-            ):
+            if class_name == "PTG2ImportRun" and import_row.get("status") == process_ptg.PTG2_STATUS_VALIDATED:
                 state.validated_write_count_list[0] += 1
                 write_count = state.validated_write_count_list[0]
                 advance(13.0 if write_count == 1 else 2.0)
-                state.completion_events.append(
-                    (f"validated_write_{write_count}", state.clock_map["seconds"])
-                )
+                state.completion_events.append((f"validated_write_{write_count}", state.clock_map["seconds"]))
             state.pushed_list.append((class_name, copy.deepcopy(import_row)))
 
     async def fake_downloaded_jobs(jobs, **_kwargs):
@@ -10597,9 +9791,7 @@ def _completion_timing_callbacks(state):
 
     async def cleanup_old_source_tables(*_args, **_kwargs):
         advance(5.0)
-        state.completion_events.append(
-            ("old_state_cleanup", state.clock_map["seconds"])
-        )
+        state.completion_events.append(("old_state_cleanup", state.clock_map["seconds"]))
 
     async def enqueue_address_refresh(**_kwargs):
         advance(7.0)
@@ -10709,9 +9901,7 @@ def _install_completion_timing_mocks(monkeypatch, state):
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(
-        process_ptg, "_publish_shared_v3_source_dictionary", AsyncMock()
-    )
+    monkeypatch.setattr(process_ptg, "_publish_shared_v3_source_dictionary", AsyncMock())
     publish = _install_strict_v3_publish_mocks(monkeypatch, serving_rates=1)
     publication = publish.return_value
 
@@ -10727,8 +9917,7 @@ def _assert_completion_timing(import_result, state):
     validated_rows = [
         import_row
         for class_name, import_row in state.pushed_list
-        if class_name == "PTG2ImportRun"
-        and import_row["status"] == process_ptg.PTG2_STATUS_VALIDATED
+        if class_name == "PTG2ImportRun" and import_row["status"] == process_ptg.PTG2_STATUS_VALIDATED
     ]
     assert len(validated_rows) == 2
     assert "total_seconds" not in validated_rows[0]["report"]["timings"]
@@ -10736,9 +9925,7 @@ def _assert_completion_timing(import_result, state):
     timings = final_report["timings"]
     assert timings["data_seconds"] == pytest.approx(10.0)
     assert timings["publish_seconds"] == pytest.approx(20.0)
-    assert timings[
-        "post_publish_logical_candidate_and_optional_pointer_cutover_seconds"
-    ] == pytest.approx(3.0)
+    assert timings["post_publish_logical_candidate_and_optional_pointer_cutover_seconds"] == pytest.approx(3.0)
     assert "post_publish_old_state_cleanup_seconds" not in timings
     assert timings["post_publish_address_refresh_seconds"] == pytest.approx(7.0)
     assert timings["post_publish_run_state_persistence_seconds"] == pytest.approx(13.0)
@@ -10751,25 +9938,37 @@ def _assert_completion_timing(import_result, state):
     }
     assert import_result["timings"]["total_seconds"] == pytest.approx(53.0)
 
-    done_events = [
-        event
-        for event in state.completion_events
-        if event[0].startswith("PTG2_IMPORT_DONE")
-    ]
+    done_events = [event for event in state.completion_events if event[0].startswith("PTG2_IMPORT_DONE")]
     assert len(done_events) == 1
     done_total_match = re.search(r"\ttotal_seconds=([0-9.]+)", done_events[0][0])
     assert done_total_match is not None
     assert float(done_total_match.group(1)) == pytest.approx(53.0)
     completion_labels = [event[0] for event in state.completion_events]
     assert completion_labels.index("validated_write_2") < next(
-        index
-        for index, label in enumerate(completion_labels)
-        if label.startswith("PTG2_IMPORT_DONE")
+        index for index, label in enumerate(completion_labels) if label.startswith("PTG2_IMPORT_DONE")
     )
-    assert completion_labels.index("validated_write_2") < completion_labels.index(
-        "old_state_cleanup"
-    )
+    assert completion_labels.index("validated_write_2") < completion_labels.index("old_state_cleanup")
     assert done_events[0][1] == pytest.approx(60.0)
+
+
+def _terminal_completion_request():
+    """Build one completed ordinary attempt with its retained manifest stage."""
+    return process_ptg._CompletedImportPersistence(
+        import_run_id="engine-run",
+        import_month=datetime.date(2026, 8, 1),
+        started_at=datetime.datetime(2026, 8, 10),
+        options={
+            "ordinary_cutover_operation_id": "8" * 64,
+            "ordinary_cutover_member_ordinal": 7,
+        },
+        report_payload={},
+        timing_payload={},
+        import_started_monotonic=0.0,
+        post_publish_started_monotonic=5.0,
+        post_publish_stage_timer=process_ptg._StageTimer({}, 5.0),
+        snapshot_id="snapshot-terminal",
+        manifest_stage_table="manifest-stage",
+    )
 
 
 @pytest.mark.asyncio
@@ -10778,17 +9977,24 @@ async def test_completed_run_commits_terminal_pin_before_post_success_cleanup(
 ):
     """Prove terminal visibility pins its manifest before deferred cleanup."""
     session = object()
+
     @asynccontextmanager
     async def transaction():
         yield session
+
     pushed_rows = []
+    events = []
 
     async def push(rows, cls, **_kwargs):
+        events.append("run_write")
         pushed_rows.extend((cls, row) for row in rows)
+
+    prelock = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("source_fence"))
     pin = AsyncMock()
     stage_drop = AsyncMock()
     monkeypatch.setattr(process_ptg.db, "transaction", transaction)
     monkeypatch.setattr(process_ptg, "_push_ptg2_objects", push)
+    monkeypatch.setattr(process_ptg, "lock_ordinary_terminal_snapshot_pin", prelock, raising=False)
     monkeypatch.setattr(
         process_ptg,
         "insert_ordinary_terminal_snapshot_pin",
@@ -10801,25 +10007,10 @@ async def test_completed_run_commits_terminal_pin_before_post_success_cleanup(
     )
     monkeypatch.setattr(process_ptg, "_ptg2_monotonic", lambda: 10.0)
 
-    await process_ptg._persist_completed_ptg2_import_run(
-        process_ptg._CompletedImportPersistence(
-            import_run_id="engine-run",
-            import_month=datetime.date(2026, 8, 1),
-            started_at=datetime.datetime(2026, 8, 10),
-            options={
-                "ordinary_cutover_operation_id": "8" * 64,
-                "ordinary_cutover_member_ordinal": 7,
-            },
-            report_payload={},
-            timing_payload={},
-            import_started_monotonic=0.0,
-            post_publish_started_monotonic=5.0,
-            post_publish_stage_timer=process_ptg._StageTimer({}, 5.0),
-            snapshot_id="snapshot-terminal",
-            manifest_stage_table="manifest-stage",
-        )
-    )
+    await process_ptg._persist_completed_ptg2_import_run(_terminal_completion_request())
     assert len(pushed_rows) == 2
+    assert events == ["source_fence", "run_write", "run_write"]
+    assert prelock.await_args == pin.await_args
     pin.assert_awaited_once_with(
         session,
         schema_name=process_ptg.resolve_ptg2_schema(),
@@ -10860,9 +10051,7 @@ def _publish_failure_cleanup_mocks(failure_events):
 
     async def clean_stage_tables(*_args, **kwargs):
         failure_events.append(
-            "stage_storage_dropped"
-            if kwargs.get("retain_attempt_registration")
-            else "stage_attachment_released"
+            "stage_storage_dropped" if kwargs.get("retain_attempt_registration") else "stage_attachment_released"
         )
 
     return (
@@ -10888,18 +10077,18 @@ def _install_ptg2_publish_failure_mocks(monkeypatch):
     """Install one failed-publish path with ordered cleanup observations."""
 
     monkeypatch.setattr(
-        process_ptg, "_persist_plan_months_and_catalog_request",
+        process_ptg,
+        "_persist_plan_months_and_catalog_request",
         AsyncMock(return_value="persisted"),
     )
     pushed_rows = []
     failure_events = []
+
     async def fake_push(rows, cls, **_kwargs):
         pushed_rows.extend((getattr(cls, "__name__", str(cls)), row) for row in rows)
-        if (
-            getattr(cls, "__name__", "") == "PTG2ImportRun"
-            and rows[0].get("status") == process_ptg.PTG2_STATUS_FAILED
-        ):
+        if getattr(cls, "__name__", "") == "PTG2ImportRun" and rows[0].get("status") == process_ptg.PTG2_STATUS_FAILED:
             failure_events.append("failure_report_persisted")
+
     async def fake_downloaded_jobs(jobs, **_kwargs):
         for job in jobs:
             yield _strict_v3_downloaded_job(job)
@@ -10936,9 +10125,7 @@ def _install_ptg2_publish_failure_mocks(monkeypatch):
     monkeypatch.setattr(process_ptg, "_iter_downloaded_ptg_jobs", fake_downloaded_jobs)
     monkeypatch.setattr(process_ptg, "_process_in_network_file", fake_process)
     monkeypatch.setattr(process_ptg, "flush_error_log", AsyncMock())
-    monkeypatch.setattr(
-        process_ptg, "_publish_shared_v3_source_dictionary", AsyncMock()
-    )
+    monkeypatch.setattr(process_ptg, "_publish_shared_v3_source_dictionary", AsyncMock())
     publish = _install_strict_v3_publish_mocks(monkeypatch, serving_rates=1)
     publish.side_effect = RuntimeError("binary publish failed")
     abandon, stage_cleanup = _publish_failure_cleanup_mocks(failure_events)
@@ -10972,14 +10159,11 @@ def test_ptg2_publish_failure_abandons_owned_shared_layout(monkeypatch):
     failed_runs = [
         layout_row
         for cls_name, layout_row in pushed_rows
-        if cls_name == "PTG2ImportRun"
-        and layout_row["status"] == process_ptg.PTG2_STATUS_FAILED
+        if cls_name == "PTG2ImportRun" and layout_row["status"] == process_ptg.PTG2_STATUS_FAILED
     ]
     failed_report = failed_runs[-1]["report"]
     assert failed_report["shared_layout_abandoned"] is True
-    assert failed_report["timing_contract"]["total_boundary"] == (
-        "after_required_failure_state_persistence"
-    )
+    assert failed_report["timing_contract"]["total_boundary"] == ("after_required_failure_state_persistence")
     assert failed_report["timings"]["total_seconds"] >= 0
     assert failed_report["timings"]["failure_handling_seconds"] >= 0
     assert failed_report["timings"]["failure_state_persistence_seconds"] >= 0
@@ -11062,11 +10246,7 @@ def test_failed_v4_layout_abandonment_uses_exact_owned_gc_path(monkeypatch):
 
 def test_failed_v4_layout_abandonment_defers_without_retry(monkeypatch):
     progress_events: list[tuple[str, int]] = []
-    abandonment = AsyncMock(
-        side_effect=process_ptg.PTG2SharedLayoutAbandonmentDeferred(
-            "bounded cleanup timed out"
-        )
-    )
+    abandonment = AsyncMock(side_effect=process_ptg.PTG2SharedLayoutAbandonmentDeferred("bounded cleanup timed out"))
     sleep = AsyncMock()
     monkeypatch.setattr(
         process_ptg,
@@ -11080,9 +10260,7 @@ def test_failed_v4_layout_abandonment_defers_without_retry(monkeypatch):
             SimpleNamespace(snapshot_key=491, reused=False),
             build_token="owned-v4-attempt",
             expected_generation=process_ptg.PTG2_V4_SHARED_GENERATION,
-            progress_callback=lambda metric, amount: progress_events.append(
-                (metric, amount)
-            ),
+            progress_callback=lambda metric, amount: progress_events.append((metric, amount)),
         )
     )
 
@@ -11095,9 +10273,7 @@ def test_failed_v4_layout_abandonment_defers_without_retry(monkeypatch):
 
 def _manifest_push_mock(pushed_list):
     async def fake_push(rows, cls, **_kwargs):
-        pushed_list.extend(
-            (getattr(cls, "__name__", str(cls)), import_row) for import_row in rows
-        )
+        pushed_list.extend((getattr(cls, "__name__", str(cls)), import_row) for import_row in rows)
 
     return fake_push
 
@@ -11119,9 +10295,7 @@ def _manifest_download_mock(download_options_by_name):
                 stage_observer(
                     ptg_domain.PTG2ArtifactStageObservation(
                         artifact_kind=ptg_domain.PTG2_ARTIFACT_LOGICAL_JSON,
-                        identity_sha256=(
-                            downloaded_job.logical_artifact.logical_sha256
-                        ),
+                        identity_sha256=(downloaded_job.logical_artifact.logical_sha256),
                         byte_count=downloaded_job.logical_artifact.byte_count,
                     )
                 )
@@ -11133,9 +10307,7 @@ def _manifest_download_mock(download_options_by_name):
 def _manifest_process_mock(create_stage_mock):
     async def fake_process(context, *_args, **_kwargs):
         stage_token = create_stage_mock.await_args.args[0]
-        assert context.ptg2_manifest_stage_table == (
-            process_ptg._ptg2_manifest_stage_table_name(stage_token)
-        )
+        assert context.ptg2_manifest_stage_table == (process_ptg._ptg2_manifest_stage_table_name(stage_token))
         return process_ptg.PTG2FileProcessResult(
             "in_network",
             "https://example.test/rates.json.gz",
@@ -11170,9 +10342,7 @@ def _install_manifest_case_mocks(
         "_push_ptg2_objects",
         _manifest_push_mock(pushed_list),
     )
-    monkeypatch.setattr(
-        process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"})
-    )
+    monkeypatch.setattr(process_ptg, "_prepare_ptg_tables", AsyncMock(return_value={"ImportLog": "log"}))
     monkeypatch.setattr(process_ptg, "_create_serving_stage_table", create_stage_mock)
     monkeypatch.setattr(
         process_ptg,
@@ -11190,9 +10360,7 @@ def _install_manifest_case_mocks(
         "_publish_shared_v3_source_dictionary",
         AsyncMock(),
     )
-    monkeypatch.setattr(
-        process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(process_ptg, "_current_source_snapshot_id", AsyncMock(return_value=None))
     monkeypatch.setattr(process_ptg, "_publish_ptg2_source_pointers", AsyncMock())
     monkeypatch.setattr(process_ptg, "_cleanup_old_ptg2_source_tables", AsyncMock())
     return create_stage_mock, publish_mock
@@ -11233,11 +10401,7 @@ def _run_manifest_import_case(
     create_stage_mock.assert_awaited_once()
     publish_mock.assert_awaited_once()
     assert publish_mock.await_args.kwargs["consume_serving_inputs"] is True
-    import_run_rows = [
-        import_row
-        for cls_name, import_row in pushed_list
-        if cls_name == "PTG2ImportRun"
-    ]
+    import_run_rows = [import_row for cls_name, import_row in pushed_list if cls_name == "PTG2ImportRun"]
     return SimpleNamespace(
         import_result=import_result,
         import_run=import_run_rows[-1],
@@ -11256,10 +10420,7 @@ def test_ptg2_test_mode_uses_manifest_source_scoped_import(monkeypatch):
     assert "full_rebuild_scope_digest" not in run.import_run["options"]
     assert run.import_run["options"]["snapshot_arch"] == "postgres_binary_v3"
     assert run.import_run["options"]["storage_generation"] == "shared_blocks_v3"
-    assert (
-        run.create_stage_mock.await_args.kwargs["storage_generation"]
-        == "shared_blocks_v3"
-    )
+    assert run.create_stage_mock.await_args.kwargs["storage_generation"] == "shared_blocks_v3"
     assert run.import_run["options"]["test_mode"] is True
     assert run.import_run["report"]["serving_rates"] == 222
     assert "full_rebuild" not in run.import_result
@@ -11276,17 +10437,11 @@ def test_ptg2_full_rebuild_forces_fresh_manifest_source_import(monkeypatch):
 
     assert run.download_options_by_name["reuse_raw_artifacts"] is False
     assert run.download_options_by_name["keep_partial_artifacts"] is False
-    assert run.publish_mock.await_args.kwargs["full_rebuild_scope_digest"] == (
-        rebuild_scope_digest
-    )
+    assert run.publish_mock.await_args.kwargs["full_rebuild_scope_digest"] == (rebuild_scope_digest)
     assert run.import_run["options"]["reuse_raw_artifacts"] is False
     assert run.import_run["options"]["keep_partial_artifacts"] is False
-    assert run.import_run["options"]["full_rebuild_scope_digest"] == (
-        rebuild_scope_digest
-    )
-    assert run.import_run["import_run_id"].endswith(
-        f":rebuild-{rebuild_scope_digest[:24]}"
-    )
+    assert run.import_run["options"]["full_rebuild_scope_digest"] == (rebuild_scope_digest)
+    assert run.import_run["import_run_id"].endswith(f":rebuild-{rebuild_scope_digest[:24]}")
     expected_rebuild_metrics_by_name = {
         "full_rebuild": True,
         "artifacts_observed": 1,
@@ -11303,12 +10458,10 @@ def test_ptg2_full_rebuild_forces_fresh_manifest_source_import(monkeypatch):
         "shared_layout_reused_at_seal": False,
     }
     assert {
-        metric_name: run.import_run["report"][metric_name]
-        for metric_name in expected_rebuild_metrics_by_name
+        metric_name: run.import_run["report"][metric_name] for metric_name in expected_rebuild_metrics_by_name
     } == expected_rebuild_metrics_by_name
     assert {
-        metric_name: run.import_result[metric_name]
-        for metric_name in expected_rebuild_metrics_by_name
+        metric_name: run.import_result[metric_name] for metric_name in expected_rebuild_metrics_by_name
     } == expected_rebuild_metrics_by_name
 
 
@@ -11446,9 +10599,7 @@ def test_download_raw_artifact_aborts_oversize_body(monkeypatch, tmp_path):
     async def handle(request):
         if request.method == "HEAD":
             return web.Response(headers={"Content-Length": "1"})
-        return web.Response(
-            body=response_bytes, headers={"Content-Length": str(len(response_bytes))}
-        )
+        return web.Response(body=response_bytes, headers={"Content-Length": str(len(response_bytes))})
 
     async def run_download():
         app = web.Application()
@@ -11518,9 +10669,7 @@ def test_materialize_zip_when_deferred(tmp_path, monkeypatch):
             byte_count=byte_count,
         )
 
-    monkeypatch.setattr(
-        ptg_source_download, "download_raw_artifact", fake_download_raw_artifact
-    )
+    monkeypatch.setattr(ptg_source_download, "download_raw_artifact", fake_download_raw_artifact)
 
     _raw, logical = asyncio.run(
         process_ptg.materialize_json_source(
@@ -11539,12 +10688,8 @@ def test_materialize_zip_when_deferred(tmp_path, monkeypatch):
 def _serving_only_recovery_callbacks(state):
     async def fake_scanner(*_args, **kwargs):
         price_worker = Path(f"{kwargs['manifest_price_atom_copy_path']}.worker0003")
-        summary_worker = Path(
-            f"{kwargs['manifest_price_set_summary_copy_path']}.worker0003"
-        )
-        member_worker = Path(
-            f"{kwargs['manifest_provider_group_member_copy_path']}.provider_refs.worker0003"
-        )
+        summary_worker = Path(f"{kwargs['manifest_price_set_summary_copy_path']}.worker0003")
+        member_worker = Path(f"{kwargs['manifest_provider_group_member_copy_path']}.provider_refs.worker0003")
         price_worker.write_text("price-1\n")
         summary_worker.write_text("price-set-1\t1.25\n")
         member_worker.write_text("member-1\n")
@@ -11553,12 +10698,15 @@ def _serving_only_recovery_callbacks(state):
             summary=str(summary_worker),
             member=str(member_worker),
         )
-        yield "manifest_price_atom_copy_file", {
-            "path": str(price_worker),
-            "bytes": price_worker.stat().st_size,
-            "row_count": 1,
-            "final": True,
-        }
+        yield (
+            "manifest_price_atom_copy_file",
+            {
+                "path": str(price_worker),
+                "bytes": price_worker.stat().st_size,
+                "row_count": 1,
+                "final": True,
+            },
+        )
         yield "scanner_config", {"worker_count": 2}
         yield "scanner_summary", {"serving_run_rows": 2}
 
@@ -11619,12 +10767,8 @@ def _assert_serving_only_recovery(summary, state):
     recovered = state.recovered_paths_by_kind
     assert summary["serving_rates"] == 2
     assert summary["manifest"]["serving_rows"] == 2
-    assert summary["manifest"]["copy_files"]["price_atom"] == [
-        {"path": recovered["price"], "row_count": 1}
-    ]
-    assert summary["manifest"]["copy_files"]["price_set_summary"] == [
-        {"path": recovered["summary"], "row_count": 1}
-    ]
+    assert summary["manifest"]["copy_files"]["price_atom"] == [{"path": recovered["price"], "row_count": 1}]
+    assert summary["manifest"]["copy_files"]["price_set_summary"] == [{"path": recovered["summary"], "row_count": 1}]
     assert summary["manifest"]["copy_files"]["provider_group_member"] == []
     assert state.graph_input_paths == [Path(recovered["member"])]
     assert not Path(recovered["member"]).exists()
@@ -11647,9 +10791,7 @@ def _assert_serving_only_recovery(summary, state):
     }
 
 
-def test_serving_only_import_recovers_unreported_worker_copy_files(
-    tmp_path, monkeypatch
-):
+def test_serving_only_import_recovers_unreported_worker_copy_files(tmp_path, monkeypatch):
     """Count only genuinely unreported worker files during recovery."""
     state = SimpleNamespace(
         recovered_paths_by_kind={},

@@ -486,6 +486,7 @@ class RegistryPTGScopeEngineService:
     authority: RegistryPTGScopeAuthorityClient
     office_custody: object = field(default=None, repr=False)
     source_reviews_authority: object = field(default=None, repr=False)
+    source_retention_sessions: object = field(default=None, repr=False)
 
     def __post_init__(self):
         _identifier(self.schema_name)
@@ -505,6 +506,10 @@ class RegistryPTGScopeEngineService:
 
             if type(self.office_custody) is not RegistryPTGOfficeCustodyProfile:
                 raise ValueError("registry_ptg_office_profile_invalid")
+        if self.source_retention_sessions is not None:
+            from process.registry_ptg_source_retention import retention_sessions
+
+            retention_sessions(self)
 
     async def preview(self, envelope, *, deadline=None):
         """Resolve source facts with the SELECT-only scope-store reader role."""

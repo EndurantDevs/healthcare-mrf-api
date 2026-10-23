@@ -252,7 +252,7 @@ async def test_source_drift_after_candidate_validation_prevents_seal(monkeypatch
     tables, root = object(), V4GraphRoot(19, "pattern_v1", b"a" * 32)
     resolve = AsyncMock(side_effect=[(tables, root, PARAMS), (tables, root, PARAMS | {"code": "99214"})])
     monkeypatch.setattr(build, "source_identity", resolve)
-    for name in ("lock_identity", "source_pin", "_authenticate_root", "_copy", "_validate_candidate"):
+    for name in ("lock_identity", "lock_retained_source", "_authenticate_root", "_copy", "_validate_candidate"):
         monkeypatch.setattr(build, name, AsyncMock())
     monkeypatch.setattr(build, "locate", AsyncMock(return_value=None))
     monkeypatch.setattr(build, "_copy_relation", AsyncMock(return_value=dict(edge_count=0)))
@@ -266,7 +266,7 @@ async def test_source_drift_after_candidate_validation_prevents_seal(monkeypatch
     seal = AsyncMock()
     monkeypatch.setattr(build, "seal", seal)
     with pytest.raises(PTG2ManifestArtifactError, match="source changed"):
-        await build.build_in_session(session, **PARAMS)
+        await build.build_in_session(session, **PARAMS, retained_identity=PARAMS)
     seal.assert_not_awaited()
     assert [str(call.args[0]) for call in session.execute.call_args_list] == [
         f'ANALYZE "synthetic"."{table}"' for table in SPEC.table_names
@@ -292,12 +292,16 @@ async def test_worker_owns_transaction_and_propagates_build_failure(monkeypatch,
     operation = AsyncMock(return_value={"state": "ready"})
     if fail:
         operation.side_effect = PTG2ManifestArtifactError("source changed")
-    monkeypatch.setattr(build.db, "transaction", transaction)
+    monkeypatch.setattr(build, "_publisher_transaction", transaction)
+    monkeypatch.setattr(build, "prepare_source_retention", AsyncMock(return_value=PARAMS))
+    cleanup = AsyncMock()
+    monkeypatch.setattr(build, "_release_failed_retention", cleanup)
     monkeypatch.setattr(build, "build_in_session", operation)
     if fail:
         with pytest.raises(PTG2ManifestArtifactError, match="source changed"):
             await build.build_provider_membership_projection(**PARAMS)
     else:
         assert await build.build_provider_membership_projection(**PARAMS) == {"state": "ready"}
-    operation.assert_awaited_once_with(session, **PARAMS)
-    assert outcome == ["rollback" if fail else "commit"]
+    operation.assert_awaited_once_with(session, **PARAMS, retained_identity=PARAMS)
+    assert outcome == ["commit", "rollback" if fail else "commit"]
+    assert cleanup.await_count == int(fail)

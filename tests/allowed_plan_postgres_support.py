@@ -380,7 +380,7 @@ async def test_allowed_review_native_migration_writer_and_listing(
             preview = await fixture.service.preview(request)
             envelope = {name: request[name] for name in ("actor", "session_token_sha256")} | preview
             receipt = await fixture.service.approve(envelope)
-            assert await fixture.service.approve(envelope) == receipt and len(app.envelopes) == 2
+            assert await fixture.service.approve(envelope) == receipt and len(app.envelopes) == 4
             retained = await _probe_allowed_listing(fixture, request, preview, receipt)
             await _malformed_receipts(fixture, table, retained)
             await _probe_allowed_lineage_denials(fixture, request)

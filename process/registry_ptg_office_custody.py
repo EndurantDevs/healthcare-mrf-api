@@ -34,6 +34,7 @@ for _parameter, _literal in (
     (":lock_column", "'" + LOCK_COLUMN + "'"),
     (":constant_expression", "'" + LOCK_COLUMN + "=0'"),
     (":pin_writer", "FALSE"),
+    (":retention_publisher", "FALSE"),
     (":pin_columns", "ARRAY[]::text[]"),
 ):
     _PUBLISHER_LOCK_SQL = _PUBLISHER_LOCK_SQL.replace(_parameter, _literal)

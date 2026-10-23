@@ -6,9 +6,6 @@ import json
 from sqlalchemy import text
 
 from db.registry_schema import registry_schema
-from process.ptg_parts.result_archive_source_authority import (
-    commit_ptg_result_archive_source_authority,
-)
 from process.registry_company_approval_fence import (
     registry_company_approval_transaction,
     require_registry_company_approval_fence,
@@ -34,20 +31,35 @@ TABLE = "registry_ptg_published_plan_scope"
 CONTRACT = "registry_ptg_published_plan_scope.v1"
 
 
-async def resolve_published_plan(session, schema_name, intent_by_field, ownership, actor, *, pin_writer=False):
+async def resolve_published_plan(
+    session,
+    schema_name,
+    intent_by_field,
+    ownership,
+    actor,
+    *,
+    pin_writer=False,
+    retention_publisher=False,
+    source_authority=None,
+):
     """Resolve an exact real plan and complete files without company/cohort relabeling."""
     intent_by_field = validated_intent(intent_by_field)
-    await require_published_lock_privileges(session, schema_name, pin_writer=pin_writer)
+    privilege_options_by_field = {"pin_writer": pin_writer}
+    if retention_publisher:
+        privilege_options_by_field["retention_publisher"] = True
+    await require_published_lock_privileges(session, schema_name, **privilege_options_by_field)
     inventory_loader = published_plan_inventory
     if intent_by_field["review_type"] == "published_allowed_amount_plan":
         from process.registry_ptg_allowed_plan_source import allowed_plan_inventory
 
         inventory_loader = allowed_plan_inventory
+    source_options_by_field = {} if source_authority is None else {"source_authority": source_authority}
     inventory = await inventory_loader(
         session,
         schema_name,
         ownership,
         operation_id="registry_ptg_published_review_" + intent_by_field["scope_id"].replace("-", ""),
+        **source_options_by_field,
     )
     return resolved_published_plan_inventory(schema_name, intent_by_field, ownership, inventory)
 
@@ -203,7 +215,14 @@ async def _approved_association(session, table, full):
 
 
 async def approve_published_plan(service, envelope, deadline, state):
-    """Pin and append only after protected source/association and fresh app authority."""
+    """Commit source custody before the protected Approver consumes its receipt."""
+    from process.registry_ptg_source_retention import retained_review_source
+
+    async with retained_review_source(service, envelope, deadline) as source_authority:
+        return await _approve_retained_published_plan(service, envelope, deadline, state, source_authority)
+
+
+async def _approve_retained_published_plan(service, envelope, deadline, state, source_authority):
     from process.registry_ptg_scope_engine import _remaining
 
     async with registry_company_approval_transaction(
@@ -218,7 +237,7 @@ async def approve_published_plan(service, envelope, deadline, state):
             intent_by_field,
             envelope["command"]["ownership"],
             envelope["actor"],
-            pin_writer=True,
+            source_authority=source_authority,
         )
         if full != envelope["command"]:
             raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
@@ -232,12 +251,8 @@ async def approve_published_plan(service, envelope, deadline, state):
         _remaining(deadline)
         await service.authority.authorize(envelope, deadline=deadline)
         _remaining(deadline)
-        commit_source = commit_ptg_result_archive_source_authority
-        if full["review_type"] == "published_allowed_amount_plan":
-            from process.ptg_parts.result_archive_allowed_authority import commit_allowed_source_authority
-
-            commit_source = commit_allowed_source_authority
-        await commit_source(session, schema_name=service.schema_name, authority=authority)
+        if authority != source_authority:
+            raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")
         await session.execute(
             text(f"""
             INSERT INTO {table}(scope_id,scope_key,actor_key,idempotency_key,approval_sha256,approval_json)
@@ -256,7 +271,9 @@ async def approve_published_plan(service, envelope, deadline, state):
     }
 
 
-async def read_registry_ptg_published_plan_scope(session, *, scope_id, client_id, approval_sha256, store):
+async def read_registry_ptg_published_plan_scope(
+    session, *, scope_id, client_id, approval_sha256, store, retention_publisher=False
+):
     """Reconstruct an exact retained human review and original operation-owned pin."""
     from process.ptg_parts.result_archive_published_authority import (
         lock_ptg_published_result_for_clone,
@@ -267,10 +284,27 @@ async def read_registry_ptg_published_plan_scope(session, *, scope_id, client_id
     _uuid(str(scope_id))
     check_digest(approval_sha256)
     table = await _protected_store(session, store, write=False, table_name=TABLE)
-    return await _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256)
+    return await _read_protected_published_scope(
+        session,
+        table,
+        scope_id,
+        client_id,
+        approval_sha256,
+        pin_writer=retention_publisher,
+        retention_publisher=retention_publisher,
+    )
 
 
-async def _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256, *, pin_writer=False):
+async def _read_protected_published_scope(
+    session,
+    table,
+    scope_id,
+    client_id,
+    approval_sha256,
+    *,
+    pin_writer=False,
+    retention_publisher=False,
+):
     """Reconstruct the original proof after a caller verified the exact store role."""
     from process.ptg_parts.result_archive_published_authority import (
         lock_ptg_published_result_for_clone,
@@ -305,6 +339,8 @@ async def _read_protected_published_scope(session, table, scope_id, client_id, a
         full["ownership"],
         document["actor"],
         pin_writer=pin_writer,
+        retention_publisher=retention_publisher,
+        source_authority=document["evidence"]["source_authority"],
     )
     if current != full or _document(full, document["actor"], evidence) != document:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_source_changed")

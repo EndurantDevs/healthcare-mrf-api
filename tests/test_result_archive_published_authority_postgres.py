@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process.ptg_parts import result_archive_published_authority as authority
 from process.ptg_parts import result_archive_source_authority as dispatch
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2LifecycleLockDeferred, acquire_ptg2_source_lifecycle_lock
 from process.ptg_parts.result_archive_published_identity import (
     load_published_result_identity,
     load_published_result_identity_asyncpg,
@@ -188,6 +189,44 @@ async def _seed(engine, name, *, suffix="a", key=17):
                 },
             )
     return snapshot
+
+
+@pytest.mark.asyncio
+async def test_release_joins_its_source_lifetime_without_blocking_other_sources():
+    """Retention cannot disappear under an active source transition."""
+    async with _database() as (engine, name):
+        first = await _seed(engine, name)
+        second = await _seed(engine, name, suffix="b", key=18)
+        sessions = async_sessionmaker(engine)
+        async with sessions.begin() as session:
+            first_pin = await authority.capture_ptg_published_result_source_authority(
+                session, schema_name=name, operation_id="operation-first", snapshot_id=first
+            )
+            second_pin = await authority.capture_ptg_published_result_source_authority(
+                session, schema_name=name, operation_id="operation-second", snapshot_id=second
+            )
+        async with sessions.begin() as holder:
+            await acquire_ptg2_source_lifecycle_lock(holder, source_key=first_pin.source_key)
+            with pytest.raises(PTG2LifecycleLockDeferred):
+                async with sessions.begin() as release:
+                    await dispatch.reconcile_ptg_archive_source_release(
+                        release, schema_name=name, authority=first_pin.as_dict()
+                    )
+            async with sessions.begin() as unrelated:
+                assert (
+                    await dispatch.release_ptg_result_archive_source_authority(
+                        unrelated, schema_name=name, authority=second_pin.as_dict()
+                    )
+                    == 1
+                )
+            assert await holder.scalar(text(f'SELECT count(*) FROM "{name}".ptg2_snapshot_pin')) == 1
+        async with sessions.begin() as release:
+            assert (
+                await dispatch.reconcile_ptg_archive_source_release(
+                    release, schema_name=name, authority=first_pin.as_dict()
+                )
+                == "released"
+            )
 
 
 @pytest.mark.asyncio

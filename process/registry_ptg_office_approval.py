@@ -65,7 +65,7 @@ async def _approved_source_review(session, *, scope_id, client_id, approval_sha2
     from process.registry_ptg_published_plan_scope import _read_protected_published_scope
 
     table = await _protected_store(session, store, write=True, table_name=SOURCE_TABLE)
-    return await _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256, pin_writer=True)
+    return await _read_protected_published_scope(session, table, scope_id, client_id, approval_sha256)
 
 
 def _reader_roles(service):
@@ -226,6 +226,14 @@ async def _retain(session, table, document_by_field):
 
 
 async def approve_offices(service, envelope, deadline, state_by_field):
+    """Commit source retention before the independent office approval transaction."""
+    from process.registry_ptg_source_retention import retained_review_source
+
+    async with retained_review_source(service, envelope, deadline, office=True) as source_authority:
+        return await _approve_retained_offices(service, envelope, deadline, state_by_field, source_authority)
+
+
+async def _approve_retained_offices(service, envelope, deadline, state_by_field, source_authority):
     """Reverify, freshly authorize and append under one actual fenced transaction.
 
     The returned descriptive recipe binds its immutable approval and hold.
@@ -250,7 +258,7 @@ async def approve_offices(service, envelope, deadline, state_by_field):
         authority_envelope_by_field = {name: envelope[name] for name in ("actor", "session_token_sha256", "command")}
         await service.authority.authorize(authority_envelope_by_field, deadline=deadline)
         _remaining(deadline)
-        source_pin = await _pin_source(session, service.schema_name, envelope["command"])
+        source_pin = await _retained_source(session, service.schema_name, envelope["command"], source_authority)
         document_by_field = _document(envelope, descriptor, witness, source_pin)
         approval_sha256 = await _retain(session, table, document_by_field)
         hold_sha256 = await retain_registry_ptg_office_capture(
@@ -274,26 +282,20 @@ async def approve_offices(service, envelope, deadline, state_by_field):
     }
 
 
-async def _pin_source(session, schema_name, command_by_field):
-    """Retain an independent office-operation source pin after fresh authorization."""
-    from process.ptg_parts.result_archive_published_authority import prepare_ptg_published_result_source_authority
-    from process.ptg_parts.result_archive_source_authority import commit_ptg_result_archive_source_authority
+async def _retained_source(session, schema_name, command_by_field, authority):
+    """Read only the exact independent office pin committed before this transaction."""
+    from process.ptg_parts.result_archive_published_authority import lock_ptg_published_result_for_clone
 
     expected_by_field = command_by_field["source"]["evidence"]["source_authority"]
     operation_id = "registry_ptg_office_review_" + UUID(command_by_field["capture_id"]).hex
-    prepared = await prepare_ptg_published_result_source_authority(
-        session,
-        schema_name=schema_name,
-        operation_id=operation_id,
-        snapshot_id=command_by_field["source"]["snapshot_id"],
-    )
-    source_pin = prepared.as_dict()
+    retained = await lock_ptg_published_result_for_clone(session, schema_name=schema_name, authority=authority)
+    source_pin = retained.as_dict()
     if (
-        source_pin["identity"] != expected_by_field["identity"]
+        source_pin != authority
+        or source_pin["operation_id"] != operation_id
+        or source_pin["snapshot_id"] != command_by_field["source"]["snapshot_id"]
+        or source_pin["identity"] != expected_by_field["identity"]
         or source_pin["source_key"] != command_by_field["source"]["binding_source_key"]
     ):
-        raise ValueError("registry_ptg_office_source_changed")
-    retained = await commit_ptg_result_archive_source_authority(session, schema_name=schema_name, authority=source_pin)
-    if retained.as_dict() != source_pin:
         raise ValueError("registry_ptg_office_source_changed")
     return source_pin

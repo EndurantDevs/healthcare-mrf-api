@@ -8,6 +8,7 @@ import datetime
 import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
 import pytest
 
 from tests.ptg_v4_import_orchestration_support import (
@@ -17,8 +18,10 @@ from tests.ptg_v4_import_orchestration_support import (
     TaskState,
     transaction_factory,
 )
+
 process_ptg = importlib.import_module("process.ptg")
 ptg_domain = importlib.import_module("process.ptg_parts.domain")
+
 
 @pytest.mark.asyncio
 async def test_terminal_stage_names_are_returned_in_database_order(monkeypatch):
@@ -73,7 +76,11 @@ async def test_terminal_retry_requires_a_terminal_row_before_stage_drop(
     """Drop retained stages only after the terminal transition succeeds."""
 
     session = RecordingSession(
-        [FirstResult(terminal_row), AllResult([("stage_b",), ("stage_a",)])]
+        [
+            FirstResult({"options": {}}),
+            FirstResult(terminal_row),
+            AllResult([("stage_b",), ("stage_a",)]),
+        ]
     )
     stage_drop = AsyncMock()
     monkeypatch.setattr(process_ptg.db, "transaction", transaction_factory(session))
@@ -97,6 +104,48 @@ async def test_terminal_retry_requires_a_terminal_row_before_stage_drop(
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options_changed", [False, True])
+async def test_terminal_retry_fences_before_rows_and_refuses_changed_options(monkeypatch, options_changed):
+    """A raced ordinary identity cannot add a pin after row controls are held."""
+    options_by_name = {"source_key": "synthetic_source"}
+    stored_options_by_name = (
+        {**options_by_name, "ordinary_cutover_operation_id": "8" * 64} if options_changed else options_by_name
+    )
+    session = RecordingSession(
+        [
+            FirstResult({"options": options_by_name}),
+            FirstResult({"import_run_id": "run-one", "options": stored_options_by_name}),
+            AllResult([]),
+        ]
+    )
+    events = []
+    prelock = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("source_fence"))
+    row_lock = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("row_lock"))
+    pin = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("pin_write"))
+    cleanup = AsyncMock()
+    monkeypatch.setattr(process_ptg.db, "transaction", transaction_factory(session))
+    monkeypatch.setattr(process_ptg, "lock_ordinary_terminal_snapshot_pin", prelock)
+    monkeypatch.setattr(process_ptg, "lock_writable_snapshot", row_lock)
+    monkeypatch.setattr(process_ptg, "insert_ordinary_terminal_snapshot_pin", pin)
+    monkeypatch.setattr(process_ptg, "_has_cleaned_terminal_stages", cleanup)
+    retry = process_ptg._finalize_resumed_terminal_attempt(
+        {"snapshot_id": "snapshot-one", "import_run_id": "run-one"},
+        internal_run_id="run-one",
+    )
+    if options_changed:
+        with pytest.raises(RuntimeError, match="changed its run options"):
+            await retry
+        assert events == ["source_fence", "row_lock"]
+        pin.assert_not_awaited()
+        cleanup.assert_not_awaited()
+    else:
+        await retry
+        assert events == ["source_fence", "row_lock", "pin_write"]
+        cleanup.assert_awaited_once()
+    assert prelock.await_args.kwargs["options"] == options_by_name
+
+
 _CLEANUP_BOUNDARIES = (
     "_drop_ptg2_snapshot_tables_for_manifest",
     "delete_ptg2_artifacts_for_snapshot",
@@ -114,11 +163,7 @@ async def test_cleanup_continues_after_each_ordinary_boundary_failure(
     """Best-effort cleanup reaches later stores after an ordinary failure."""
 
     cleanup_by_name = {
-        name: AsyncMock(
-            side_effect=RuntimeError(f"{name} unavailable")
-            if name == failing_boundary
-            else None
-        )
+        name: AsyncMock(side_effect=RuntimeError(f"{name} unavailable") if name == failing_boundary else None)
         for name in _CLEANUP_BOUNDARIES
     }
     for name, cleanup in cleanup_by_name.items():
@@ -142,9 +187,7 @@ async def test_cleanup_translates_each_fence_and_stops_destructive_work(
     """Surface reconciliation fences instead of continuing destructive cleanup."""
 
     cleanup_by_name = {name: AsyncMock() for name in _CLEANUP_BOUNDARIES}
-    cleanup_by_name[failing_boundary].side_effect = (
-        process_ptg.StaleMetadataFenceError("reconciled")
-    )
+    cleanup_by_name[failing_boundary].side_effect = process_ptg.StaleMetadataFenceError("reconciled")
     for name, cleanup in cleanup_by_name.items():
         monkeypatch.setattr(process_ptg, name, cleanup)
 
@@ -156,9 +199,9 @@ async def test_cleanup_translates_each_fence_and_stops_destructive_work(
         )
 
     failure_index = _CLEANUP_BOUNDARIES.index(failing_boundary)
-    assert [
-        cleanup_by_name[name].await_count for name in _CLEANUP_BOUNDARIES
-    ] == [1 if index <= failure_index else 0 for index in range(4)]
+    assert [cleanup_by_name[name].await_count for name in _CLEANUP_BOUNDARIES] == [
+        1 if index <= failure_index else 0 for index in range(4)
+    ]
 
 
 @pytest.mark.asyncio
@@ -278,11 +321,7 @@ async def test_failure_persistence_distinguishes_storage_errors_from_fences(
 ):
     """Return incomplete for ordinary storage errors but rethrow a fence."""
 
-    storage_error = (
-        process_ptg.StaleMetadataFenceError("reconciled")
-        if fenced
-        else RuntimeError("database offline")
-    )
+    storage_error = process_ptg.StaleMetadataFenceError("reconciled") if fenced else RuntimeError("database offline")
     monkeypatch.setattr(process_ptg.db, "transaction", transaction_factory(object()))
     monkeypatch.setattr(
         process_ptg,

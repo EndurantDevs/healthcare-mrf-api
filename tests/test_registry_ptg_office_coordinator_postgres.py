@@ -192,7 +192,10 @@ async def _prepare_control(fixture, custom, roles):
         await connection.execute(f'GRANT SELECT,INSERT ON {table} TO "{fixture.source.roles[1]}"')
         await connection.execute(f'GRANT SELECT ON {table} TO "{fixture.source.roles[2]}"')
     await _grant_reads(
-        connection, schema, (fixture.source.roles[1], fixture.source.roles[2], roles["publisher"]), sorted(_TABLES)
+        connection,
+        schema,
+        (fixture.source.roles[1], fixture.source.roles[2], roles["publisher"], fixture.source.retention_role),
+        sorted(_TABLES),
     )
     await connection.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{roles["queue"]}"')
     await connection.execute(f'GRANT SELECT ON "{schema}".registry_publication_request TO "{roles["queue"]}"')
@@ -417,7 +420,7 @@ async def _cleanup_coordinator(fixture, custom, roles, created, resources, journ
         await resources.pool.close()
     for engine in resources.engines:
         await engine.dispose()
-    for role in (roles["queue"], fixture.source.roles[2], fixture.source.roles[1]):
+    for role in (roles["queue"], fixture.source.roles[2], fixture.source.roles[1], fixture.source.retention_role):
         await custom.connection.execute(f'REVOKE ALL ON SCHEMA "{custom.control_schema}" FROM "{role}"')
         await custom.connection.execute(f'REVOKE ALL ON ALL TABLES IN SCHEMA "{custom.control_schema}" FROM "{role}"')
         if role == roles["queue"]:

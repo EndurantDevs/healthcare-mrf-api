@@ -155,9 +155,13 @@ async def test_source_authority_absent_release_is_only_an_explicit_reconciliatio
     authority = source_authority.PtgResultArchiveSourceAuthority(
         "operation-1", "snapshot-1", "import-1", "source-a", "a" * 64, "b" * 64
     )
-    monkeypatch.setattr(source_authority, "_acquire_operation_lock", AsyncMock())
-    monkeypatch.setattr(source_authority, "_pin_rows", AsyncMock(return_value=[]))
-    session = SimpleNamespace(in_transaction=lambda: True)
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+
+    async def absent_pin_rows(*args, **kwargs):
+        assert session.execute.await_count == 5
+        return []
+
+    monkeypatch.setattr(source_authority, "_pin_rows", absent_pin_rows)
     assert (
         await source_authority._release_authority_pin(
             session,
@@ -167,6 +171,16 @@ async def test_source_authority_absent_release_is_only_an_explicit_reconciliatio
         )
         == "already_released"
     )
+    calls = session.execute.await_args_list
+    assert [call.args[1] for call in calls] == [
+        {"lock_timeout": "500ms", "statement_timeout": "5s"},
+        {"operation_lock_key": "ptg_result_archive_source_authority_v1:operation-1"},
+        {"lock_timeout": "500ms", "statement_timeout": "5s"},
+        {"gc_lock_key": "ptg2_source_pointer_gc_v1"},
+        {"source_lock_key": "ptg2_source_lifecycle_v2:source_a"},
+    ]
+    assert "pg_advisory_xact_lock_shared" in str(calls[3].args[0])
+    assert "pg_advisory_xact_lock(hashtextextended" in str(calls[4].args[0])
 
 
 def _authority() -> source_authority.PtgResultArchiveSourceAuthority:
@@ -282,16 +296,18 @@ async def test_source_authority_lock_errors_preserve_retry_classification(monkey
 @pytest.mark.asyncio
 async def test_source_authority_release_preserves_nonretryable_database_error(monkeypatch) -> None:
     expected = _authority()
+    original = RuntimeError("pin read failed")
     monkeypatch.setattr(source_authority, "_acquire_operation_lock", AsyncMock())
-    monkeypatch.setattr(source_authority, "_pin_rows", AsyncMock(side_effect=RuntimeError("pin read failed")))
+    monkeypatch.setattr(source_authority, "_pin_rows", AsyncMock(side_effect=original))
     monkeypatch.setattr(source_authority, "is_retryable_lifecycle_database_error", lambda _error: False)
-    with pytest.raises(RuntimeError, match="pin read failed"):
+    with pytest.raises(RuntimeError, match="pin read failed") as caught:
         await source_authority._release_authority_pin(
-            SimpleNamespace(in_transaction=lambda: True),
+            SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock()),
             schema_name="mrf",
             authority_by_field=expected.as_dict(),
             acknowledge_absent=False,
         )
+    assert caught.value is original
 
 
 def test_source_authority_rejects_noncanonical_operation_and_open_receipt_shape() -> None:

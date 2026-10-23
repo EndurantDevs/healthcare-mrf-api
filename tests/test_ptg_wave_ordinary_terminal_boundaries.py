@@ -18,10 +18,11 @@ from process.ptg_wave_ordinary_terminal_receipt import (
     issue_ordinary_terminal_receipt,
     ordinary_terminal_receipt_payload,
 )
-from process.ptg_wave_receipt_authority import PTGWaveReceiptAuthorityError
 from process.ptg_wave_quarantine_basis import (
     V12_PRISTINE_MATERIALIZED_CUTOVER_BASIS,
 )
+from process.ptg_wave_receipt_authority import PTGWaveReceiptAuthorityError
+from tests.ptg_blank_terminal_support import blank_ordinary_result
 from tests.ptg_wave_ordinary_terminal_receipt_support import (
     ISSUED_AT,
     OPERATION_ID,
@@ -31,7 +32,6 @@ from tests.ptg_wave_ordinary_terminal_receipt_support import (
     ordinary_result,
     v13_ordinary_result,
 )
-from tests.ptg_blank_terminal_support import blank_ordinary_result
 
 
 def _set_nested(mapping, *path_and_value):
@@ -46,9 +46,7 @@ def _set_nested(mapping, *path_and_value):
     ("mutation", "message"),
     (
         (
-            lambda state: setattr(
-                state["quarantine"], "recovery_evidence", None
-            ),
+            lambda state: setattr(state["quarantine"], "recovery_evidence", None),
             "abandonment proof is invalid",
         ),
         (
@@ -64,9 +62,7 @@ def _set_nested(mapping, *path_and_value):
             "member params are invalid",
         ),
         (
-            lambda state: state["intent"].params.pop(
-                "direct_rate_file_intent"
-            ),
+            lambda state: state["intent"].params.pop("direct_rate_file_intent"),
             "direct input is invalid|not a frozen singleton",
         ),
         (
@@ -82,9 +78,7 @@ def _set_nested(mapping, *path_and_value):
             "snapshot identity conflicts",
         ),
         (
-            lambda state: _set_nested(
-                state["run"].metrics, "status", "failed"
-            ),
+            lambda state: _set_nested(state["run"].metrics, "status", "failed"),
             "ordinary run does not match",
         ),
         (
@@ -96,15 +90,11 @@ def _set_nested(mapping, *path_and_value):
             "terminal result is unavailable",
         ),
         (
-            lambda state: setattr(
-                state["engine_snapshot"], "snapshot_id", "other"
-            ),
+            lambda state: setattr(state["engine_snapshot"], "snapshot_id", "other"),
             "durable PTG result conflicts",
         ),
         (
-            lambda state: setattr(
-                state["engine_snapshot"], "status", "published"
-            ),
+            lambda state: setattr(state["engine_snapshot"], "status", "published"),
             "durable PTG result conflicts",
         ),
     ),
@@ -158,9 +148,7 @@ def test_terminal_payload_rejects_internal_field_set_drift(
     monkeypatch.setattr(terminal_payload, field_constant, frozenset())
 
     expected_error = (
-        PTGWaveOrdinaryTerminalConflict
-        if field_constant == "ORDINARY_TERMINAL_PAYLOAD_FIELDS"
-        else AssertionError
+        PTGWaveOrdinaryTerminalConflict if field_constant == "ORDINARY_TERMINAL_PAYLOAD_FIELDS" else AssertionError
     )
     with pytest.raises(expected_error, match=message):
         ordinary_terminal_receipt_payload(**terminal_state)
@@ -291,11 +279,14 @@ def test_blank_terminal_loading_boundaries(monkeypatch):
     terminal_state = blank_ordinary_result(monkeypatch)
     run = terminal_state["run"]
     run.params = []
-    assert terminal_receipt._project_blank_metrics(
-        run,
-        terminal_state["engine_run"],
-        terminal_state["engine_snapshot"],
-    ) is None
+    assert (
+        terminal_receipt._project_blank_metrics(
+            run,
+            terminal_state["engine_run"],
+            terminal_state["engine_snapshot"],
+        )
+        is None
+    )
 
     run.params = terminal_state["intent"].params
     assert terminal_receipt._project_blank_metrics(run, None, None) is None
@@ -327,9 +318,15 @@ async def test_issue_preserves_nonretryable_database_errors(monkeypatch):
         async def execute(self, _statement, _params=None):
             raise database_error
 
+        def get_bind(self):
+            return engine
+
+    engine = SimpleNamespace()
+    engine.engine = engine
+    monkeypatch.setattr(terminal_receipt.db, "engine", SimpleNamespace(sync_engine=engine))
     monkeypatch.setattr(
         terminal_receipt.db,
-        "transaction",
+        "session_factory",
         lambda: TerminalTransaction(FailingSession()),
     )
 
@@ -355,24 +352,18 @@ def _stored_receipt(monkeypatch):
     stored_receipt = SimpleNamespace(
         wave_id=terminal_state["request"]["operation_id"],
         member_ordinal=terminal_state["request"]["member_ordinal"],
-        source_file_import_id=terminal_state["request"][
-            "source_file_import_id"
-        ],
+        source_file_import_id=terminal_state["request"]["source_file_import_id"],
         run_id=terminal_state["request"]["run_id"],
         receipt_key_id=terminal_state["request"]["key_id"],
         receipt=receipt_by_field,
         payload_digest=receipt_by_field["payload_digest"],
-        issued_at=dt.datetime.strptime(
-            ISSUED_AT, "%Y-%m-%dT%H:%M:%S.%fZ"
-        ).replace(tzinfo=dt.UTC),
+        issued_at=dt.datetime.strptime(ISSUED_AT, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=dt.UTC),
     )
     return terminal_state, receipt_keyring, receipt_payload, stored_receipt
 
 
 def test_stored_terminal_receipt_rejects_identity_and_payload_drift(monkeypatch):
-    terminal_state, receipt_keyring, receipt_payload, stored_receipt = (
-        _stored_receipt(monkeypatch)
-    )
+    terminal_state, receipt_keyring, receipt_payload, stored_receipt = _stored_receipt(monkeypatch)
     stored_receipt.wave_id = "f" * 64
     with pytest.raises(
         PTGWaveOrdinaryTerminalConflict,
@@ -401,9 +392,7 @@ def test_stored_terminal_receipt_rejects_identity_and_payload_drift(monkeypatch)
 
 def test_abandonment_signature_rejects_cryptographic_drift(monkeypatch):
     terminal_state = ordinary_result(monkeypatch)
-    terminal_state["quarantine"].abandonment_receipt = copy.deepcopy(
-        terminal_state["quarantine"].abandonment_receipt
-    )
+    terminal_state["quarantine"].abandonment_receipt = copy.deepcopy(terminal_state["quarantine"].abandonment_receipt)
     terminal_state["quarantine"].abandonment_receipt["signature"] = "0" * 512
 
     with pytest.raises(
@@ -419,18 +408,14 @@ def test_abandonment_signature_rejects_cryptographic_drift(monkeypatch):
 
 def test_process_authority_rejects_invalid_roles_and_worker_counts():
     with pytest.raises(PTGWaveReceiptAuthorityError, match="reader or signer"):
-        process_authority.receipt_authority_role(
-            {process_authority.RECEIPT_AUTHORITY_ROLE_ENV: "writer"}
-        )
+        process_authority.receipt_authority_role({process_authority.RECEIPT_AUTHORITY_ROLE_ENV: "writer"})
 
     for worker_count in (object(), "many", 0, 2):
         with pytest.raises(
             PTGWaveReceiptAuthorityError,
             match="exactly one API worker",
         ):
-            process_authority.require_receipt_authority_worker_count(
-                worker_count
-            )
+            process_authority.require_receipt_authority_worker_count(worker_count)
 
 
 def test_process_authority_rejects_reader_keys_and_absent_signer(monkeypatch):

@@ -294,9 +294,24 @@ async def test_allowed_lineage_query_uses_both_tables_and_preserves_missing_refe
     assert all("ptg2_v3" not in statement and "ptg2_v4" not in statement for statement in statements)
 
 
+def _publisher_transaction(session, approval_events):
+    """Expose the independent pin commit after its transaction body completes."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+        approval_events.append("publisher_commit")
+
+    return transaction()
+
+
 @pytest.mark.asyncio
 async def test_allowed_approval_freshly_authorizes_before_persisting_owned_pin(monkeypatch):
+    """A pin commit precedes the separately authorized approval transaction."""
     from contextlib import asynccontextmanager
+
+    from process import registry_ptg_source_retention as retention
 
     _, stored, _, inventory = allowed_case()
     command, actor = stored["document"]["command"], stored["document"]["actor"]
@@ -308,6 +323,11 @@ async def test_allowed_approval_freshly_authorizes_before_persisting_owned_pin(m
 
     monkeypatch.setattr(review, "registry_company_approval_transaction", transaction)
     monkeypatch.setattr(review, "_protected_store", AsyncMock(return_value='"registry_control".review'))
+    monkeypatch.setattr(retention, "_protected_store", AsyncMock(return_value='"registry_control".review'))
+    monkeypatch.setattr(
+        retention, "source_retention_transaction", lambda *_: _publisher_transaction(session, approval_events)
+    )
+    monkeypatch.setattr(retention, "retention_sessions", lambda _service: object())
     monkeypatch.setattr(review, "require_published_lock_privileges", AsyncMock())
     monkeypatch.setattr(source, "allowed_plan_inventory", AsyncMock(return_value=inventory))
     monkeypatch.setattr(review, "_approved_association", AsyncMock())
@@ -316,7 +336,11 @@ async def test_allowed_approval_freshly_authorizes_before_persisting_owned_pin(m
         review,
         "_existing",
         AsyncMock(
-            side_effect=[[], [{"approval_sha256": parameters["approval_sha256"], "approval_json": stored["document"]}]]
+            side_effect=[
+                [],
+                [],
+                [{"approval_sha256": parameters["approval_sha256"], "approval_json": stored["document"]}],
+            ]
         ),
     )
     approval_events = []
@@ -327,6 +351,7 @@ async def test_allowed_approval_freshly_authorizes_before_persisting_owned_pin(m
     async def pin(*args, **kwargs):
         approval_events.append("owned_pin")
         assert kwargs["authority"] == inventory["authority"]
+        return SimpleNamespace(as_dict=lambda: inventory["authority"])
 
     monkeypatch.setattr(custody, "commit_allowed_source_authority", AsyncMock(side_effect=pin))
     service = SimpleNamespace(
@@ -338,7 +363,7 @@ async def test_allowed_approval_freshly_authorizes_before_persisting_owned_pin(m
     state_by_field = {"commit_started": False}
     receipt = await review.approve_published_plan(service, {"command": command, "actor": actor}, 10**20, state_by_field)
     assert receipt["approval_sha256"] == stored["approval_sha256"] and state_by_field["commit_started"] is True
-    assert approval_events == ["fresh_authority", "owned_pin"]
+    assert approval_events == ["fresh_authority", "owned_pin", "publisher_commit", "fresh_authority"]
     assert "INSERT INTO" in str(session.execute.await_args.args[0])
 
 
