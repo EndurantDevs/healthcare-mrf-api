@@ -26,6 +26,16 @@ def _canonical(document):
 
 
 def _command(operation):
+    if operation == "publish_initial_inventory":
+        return {
+            "operation": operation,
+            "bootstrap_id": "22222222-2222-4222-8222-222222222222",
+            "bootstrap_generation_sha256": "b" * 64,
+            "expected_serving_generation": 0,
+            "expected_approved_revision": 0,
+            "reason": "Keep original reviewed reason λ",
+            "idempotency_key": "synthetic-original-key",
+        }
     command_by_name = {
         "operation": operation,
         "target_generation": 8,
@@ -118,6 +128,7 @@ async def _validate(client, operation=None):
         ("reactivate_generation", "reactivation"),
         ("prepare_source_rollback", "source-rollback"),
         ("publish_source_rollback", "source-rollback"),
+        ("publish_initial_inventory", "initial-inventory"),
     ],
 )
 async def test_exact_wire_callback_preserves_original_command_and_pool_lifecycle(operation, path):
@@ -164,8 +175,20 @@ async def test_every_validator_read_observes_fresh_policy_and_later_revocation()
     assert len(calls) == 3
 
 
+async def test_initial_inventory_full_command_has_stable_cross_transport_digest():
+    command = _command("publish_initial_inventory")
+    assert (
+        hashlib.sha256(_canonical(command)).hexdigest()
+        == "74eba5de8dee5da70ed8edefbd413f3737df6b10626baf76ce31c6b39965f302"
+    )
+    path, digest_field, body = authority._body(_SESSION, _ACTOR, None, command)
+    assert path == "/internal/v1/registry/initial-inventory/authorize" and digest_field == "command_sha256"
+    assert json.loads(body)["command"] == command
+
+
 @pytest.mark.parametrize(
-    "operation", [None, "reactivate_generation", "prepare_source_rollback", "publish_source_rollback"]
+    "operation",
+    [None, "reactivate_generation", "prepare_source_rollback", "publish_source_rollback", "publish_initial_inventory"],
 )
 @pytest.mark.parametrize("change", ["actor", "digest", "policy", "denied"])
 async def test_real_execution_validator_refuses_changed_evidence(operation, change):

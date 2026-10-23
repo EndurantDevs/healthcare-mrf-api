@@ -38,6 +38,7 @@ from process.registry_publication_queue import (
     enqueue_registry_source_rollback_preview,
     enqueue_registry_source_rollback_publication,
     read_registry_publication_request,
+    renew_registry_publication_lease,
 )
 from process.registry_record_store import RegistryActor
 from tests.test_network_address_projection_postgres import projection_db as projection_db
@@ -193,6 +194,56 @@ async def _wait_for_request_lock(fixture, pending):
             if pending.done():
                 await pending
                 raise AssertionError("worker did not wait for the request lock")
+
+
+async def test_renewal_during_first_final_lock_refreshes_snapshot_once(pipeline_db, serving_schema, monkeypatch):
+    fixture = pipeline_db
+    lease = await _claim(fixture, serving_schema[2])
+    await _approve(fixture, lease, [])
+    original_request = execution._request
+    attempts, conflicts, authority_calls = [], [], []
+
+    async def record_request(*arguments, **options):
+        if options.get("lock"):
+            attempts.append(None)
+        try:
+            return await original_request(*arguments, **options)
+        except asyncpg.SerializationError as error:
+            conflicts.append(error.sqlstate)
+            raise
+
+    monkeypatch.setattr(execution, "_request", record_request)
+    blocker = fixture.observer.transaction()
+    await blocker.start()
+    pending = None
+    try:
+        assert (
+            await renew_registry_publication_lease(
+                fixture.observer, lease["request_id"], lease["lease_id"], control_schema=fixture.control_schema
+            )
+            == lease["request_id"]
+        )
+        pending = asyncio.create_task(_complete(fixture, lease, _authority(authority_calls)))
+        await _wait_for_request_lock(fixture, pending)
+        await blocker.commit()
+        receipt = await asyncio.wait_for(pending, 15)
+        assert conflicts == ["40001"] and len(attempts) == 2
+        assert len(authority_calls) == 3 and all(call == authority_calls[0] for call in authority_calls)
+        status = await read_registry_publication_request(
+            fixture.connection, lease["request_id"], control_schema=fixture.control_schema
+        )
+        assert status["state"] == "completed" and status["result"] == receipt
+        assert receipt["serving_generation"] == (await _heads(fixture))["generation_id"]
+        assert (
+            await fixture.observer.fetchval(f'SELECT count(*) FROM "{fixture.control_schema}".network_serving_manifest')
+            == 1
+        )
+    finally:
+        if fixture.observer.is_in_transaction():
+            await blocker.rollback()
+        if pending is not None:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
 
 async def _assert_revoked_execution_unchanged(fixture, lease, before, history_count):

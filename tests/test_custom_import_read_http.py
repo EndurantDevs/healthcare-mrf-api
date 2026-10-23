@@ -1275,7 +1275,7 @@ async def test_missing_dataset_returns_closed_not_found(monkeypatch) -> None:
 
     class Session(ReaderSession):
         async def execute(self, statement, params=None):
-            if str(statement) == "SELECT session_user, current_user":
+            if str(statement).startswith("SELECT session_user, current_user"):
                 return await super().execute(statement, params)
             return Result()
 

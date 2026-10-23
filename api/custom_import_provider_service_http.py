@@ -131,7 +131,10 @@ async def _serve_legacy_service_page(request, session, parsed, verified):
     async with (
         asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000),
         signed_request_reader(
-            request, session, plan_workspace=bool(parsed.native_args.get("plan_release_id"))
+            request,
+            session,
+            plan_workspace=bool(parsed.native_args.get("plan_release_id")),
+            verified_request_id=verified.request_id,
         ) as session,
     ):
         await _prepare_service_snapshot(session, parsed.native_args)

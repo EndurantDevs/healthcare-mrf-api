@@ -578,7 +578,7 @@ class Database:
 
     @staticmethod
     def _is_pinned_read_path(path) -> bool:
-        """Preserve account, control and unrelated ordinary route ownership."""
+        """Pin pricing data and immutable code readiness while retaining other owners."""
         route, _, parameter = path.rstrip("/").rpartition("/")
         if route == "/api/v1/npi/id" and parameter != "batch":
             return False  # Detail owns a bounded Reader that closes before geocoding.
@@ -587,6 +587,7 @@ class Database:
             path in roots
             or path.startswith(tuple(root + "/" for root in roots))
             or path == "/api/v1/coverage/statistics"
+            or path.rstrip("/") == "/control/v1/plan-pricing/code-projection"
         )
 
     async def _connect_reader(self) -> Database:
@@ -657,8 +658,16 @@ class Database:
         async with scope as session:
             reader_context_token = None
             try:
-                identity_result = await session.execute(sa_text("SELECT session_user, current_user"))
-                if tuple(identity_result.first()) != (reader._reader_login[0], reader._reader_login[0]):
+                identity_result = await session.execute(
+                    sa_text(
+                        "SELECT session_user, current_user, "
+                        "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user), "
+                        "(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), "
+                        "host(inet_server_addr()), inet_server_port(), pg_backend_pid()"
+                    )
+                )
+                identity_values = tuple(identity_result.first())
+                if identity_values[:2] != (reader._reader_login[0], reader._reader_login[0]):
                     raise RuntimeError("Reader session login identity differs")
                 if prepared:
                     modes = await session.execute(
@@ -668,6 +677,13 @@ class Database:
                     )
                     if tuple(modes.first()) != ("repeatable read", "on"):
                         raise RuntimeError("Prepared Reader must remain repeatable read and read only")
+                session.info["api_reader_identity"] = dict(
+                    zip(
+                        ("role_oid", "database_oid", "server_address", "server_port", "backend_pid"),
+                        identity_values[2:],
+                        strict=True,
+                    )
+                )
                 session.info["api_reader_verified"] = True
                 if prepare_plan_workspace:
                     session.info["native_plan_workspace"] = True
@@ -681,6 +697,7 @@ class Database:
                 if reader_context_token is not None:
                     _READER.reset(reader_context_token)
                 session.info.pop("api_reader_verified", None)
+                session.info.pop("api_reader_identity", None)
                 session.info.pop("native_plan_workspace", None)
 
     async def bind_request_reader(self, request):
@@ -920,7 +937,9 @@ class Database:
 
         @app.middleware("request")
         async def _bind_session(request):
-            is_pinned_reader = self.is_api_reader_enabled() and self._is_pinned_read_path(request.path)
+            is_pinned_reader = (
+                self.is_api_reader_enabled() and self._is_pinned_read_path(request.path)
+            ) or request.path.rstrip("/") == "/control/v1/plan-pricing/code-projection"
             if is_pinned_reader:
                 scope = self.reader_session()
                 session = await scope.__aenter__()
@@ -941,7 +960,12 @@ class Database:
 
                 try:
                     await pin_claims_reader(session)
-                except RuntimeError, SQLAlchemyError:
+                except (RuntimeError, SQLAlchemyError) as failure:
+                    from api.custom_import_read_http import _log_failure
+                    from api.signed_request_reader import _remember_reader_failure
+
+                    _remember_reader_failure(failure, request, session, self, boundary="claims_pin")
+                    _log_failure(failure)
                     await self._close_request_session(request, success=False)
                     raise ServiceUnavailable("Pricing snapshot is temporarily unavailable") from None
                 except BaseException:

@@ -1802,6 +1802,7 @@ def test_import_run_migration_mirrors_model(monkeypatch):
             "import_run_registry_source_check_idempotency_idx",
             "import_run_plan_pricing_retry_census_idx",
             "import_run_ptg_membership_idempotency_idx",
+            "import_run_code_pricing_idempotency_idx",
         }
     }
     assert {name for name in recorder.indexes} == expected_model_indexes | {"import_run_active_idempotency_idx"}

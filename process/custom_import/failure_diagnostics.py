@@ -131,6 +131,17 @@ def _database_reason(error: BaseException) -> str:
     return "unknown" if has_database_error else "not_applicable"
 
 
+def database_sqlstate(error: BaseException) -> str | None:
+    """Read a bounded explicit cause chain without rendering driver attributes."""
+
+    for current in _failure_chain(error):
+        for name in ("sqlstate", "pgcode"):
+            code = _static_attribute(current, name)
+            if type(code) is str and len(code) == 5 and code.isascii() and code.isalnum() and code == code.upper():
+                return code
+    return None
+
+
 def database_failure_details(error: BaseException) -> tuple[str, bool, bool]:
     """Classify known wrappers without reading class names or invoking descriptors."""
 

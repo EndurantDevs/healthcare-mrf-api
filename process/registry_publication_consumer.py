@@ -9,7 +9,6 @@ from dataclasses import dataclass, field, replace
 import asyncpg
 
 from process.network_address_projection import _identifier
-from process.network_membership_copy import MembershipCopyTarget
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import (
@@ -21,6 +20,7 @@ from process.registry_publication_execution import (
     _fresh_authority,
     _source_rollback_address_sources,
     approve_queued_registry_publication,
+    complete_queued_registry_initial_inventory,
     complete_queued_registry_publication,
     complete_queued_registry_reactivation,
     complete_queued_registry_source_rollback_preview,
@@ -54,7 +54,7 @@ class RegistryPublicationConsumerConfig:
     loader_roles: tuple[str, ...] = ()
     reader_roles: tuple[str, ...] = ()
     composition_runtime: RegistryPublicationPTGRuntime | None = field(default=None, repr=False)
-    seal_candidate: Callable[[MembershipCopyTarget], Awaitable[None]] | None = field(default=None, repr=False)
+    seal_candidate: Callable[..., Awaitable[None]] | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.seal_candidate is not None and not callable(self.seal_candidate):
@@ -88,6 +88,15 @@ class RegistryPublicationConsumerConfig:
             name: getattr(self, name)
             for name in ("lifecycle_role", "execution_role", "api_role", "queue_owner_role", "physical_owner_role")
         }
+
+    @property
+    def custody_roles(self):
+        """Return the existing publication worker's complete ordinary role census."""
+        roles = set(self.permission_roles.values()) - {self.queue_owner_role}
+        roles.update(self.loader_roles + self.reader_roles)
+        if self.composition_runtime is not None:
+            roles.update((self.composition_runtime.store.owner_role, self.composition_runtime.store.approval_role))
+        return tuple(sorted(roles))
 
 
 async def _verify_lifecycle(connection, config):
@@ -214,7 +223,7 @@ async def _ordinary_publication(
     )
 
 
-async def _execute(
+async def _execute_publication_request(
     execution_pool, config, request_record, authorize, initial_address_sources, plan_metadata_client=None
 ):
     async with execution_pool.acquire() as connection:
@@ -228,6 +237,15 @@ async def _execute(
         if operation is None:
             return await _ordinary_publication(
                 connection, request_record, authorize, config, initial_address_sources, plan_metadata_client
+            )
+        if operation == "publish_initial_inventory":
+            return await complete_queued_registry_initial_inventory(
+                connection,
+                request_record["request_id"],
+                request_record["lease_id"],
+                authorize=authorize,
+                writer_context=config,
+                initial_address_sources=initial_address_sources,
             )
         if operation == "reactivate_generation":
             complete = complete_queued_registry_reactivation
@@ -265,7 +283,9 @@ async def _run_with_heartbeat(
         return receipt
 
     work = asyncio.create_task(
-        _execute(execution_pool, config, request_record, fresh_authorize, initial_address_sources, plan_metadata_client)
+        _execute_publication_request(
+            execution_pool, config, request_record, fresh_authorize, initial_address_sources, plan_metadata_client
+        )
     )
     heartbeat = asyncio.create_task(_heartbeat(lifecycle_pool, config, request_record))
     try:

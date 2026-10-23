@@ -14,7 +14,6 @@ from api.ptg2_rate_option_refs import encode_rate_option_ref
 from process.tin_npi_connector_security import token_policy_descriptor_sha256
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 
-
 NPI = 1234567890
 SET_ONE = "11" * 16
 SET_TWO = "22" * 16
@@ -55,16 +54,9 @@ class _RoutingSession:
         self.calls.append((sql, parameters_by_name))
         if "ptg2_provider_tax_identity_manifest" not in sql:
             return _Result([_code_metadata_row()])
-        requested_group_refs = tuple(
-            sorted(
-                bytes(value).hex()
-                for value in parameters_by_name["provider_group_refs"]
-            )
-        )
+        requested_group_refs = tuple(sorted(bytes(value).hex() for value in parameters_by_name["provider_group_refs"]))
         self.sidecar_requests.append(requested_group_refs)
-        return _Result(
-            [self.sidecar_rows[group_ref] for group_ref in requested_group_refs]
-        )
+        return _Result([self.sidecar_rows[group_ref] for group_ref in requested_group_refs])
 
 
 def _sidecar_row(group_ref: str, full_hmac: bytes) -> dict[str, Any]:
@@ -75,9 +67,7 @@ def _sidecar_row(group_ref: str, full_hmac: bytes) -> dict[str, Any]:
         "legacy_count": 1,
         "contract": "ptg2_provider_group_tax_identity_v1",
         "token_policy_id": policy_id,
-        "token_policy_descriptor_sha256": bytes.fromhex(
-            token_policy_descriptor_sha256(policy_id)
-        ),
+        "token_policy_descriptor_sha256": bytes.fromhex(token_policy_descriptor_sha256(policy_id)),
         "normalization_contract": "ein_ascii_digits_or_2_7_hyphen_v1",
         "hmac_contract": "hmac_sha256_ptg_tin_v1",
         "tax_identity_state": "matched_ein",
@@ -196,7 +186,7 @@ def _install_search_stubs(monkeypatch) -> None:
     )
 
 
-def _install_billing_stubs(monkeypatch) -> AsyncMock:
+def _install_billing_stubs(monkeypatch, representation="direct_v1") -> AsyncMock:
     monkeypatch.setattr(
         serving,
         "_provider_set_keys_for_ids",
@@ -215,8 +205,17 @@ def _install_billing_stubs(monkeypatch) -> AsyncMock:
     monkeypatch.setattr(
         serving,
         "load_v4_graph_root",
-        AsyncMock(return_value=SimpleNamespace(representation="direct_v1")),
+        AsyncMock(return_value=SimpleNamespace(representation=representation)),
     )
+    if representation == "pattern_v1":
+        member_lookup = AsyncMock(
+            side_effect=[
+                {7: (10,), 8: (20,), 9: (30,)},
+                {10: (3, 5), 20: (4, 6), 30: (7,)},
+            ]
+        )
+        monkeypatch.setattr(serving, "lookup_v4_relation_members", member_lookup)
+        return member_lookup
     intersection = AsyncMock(return_value={3: (7,), 4: (8,)})
     monkeypatch.setattr(serving, "lookup_v4_relation_intersections", intersection)
     return intersection
@@ -248,10 +247,7 @@ def _assert_public_billing_item(provider_item: dict[str, Any]) -> None:
         SET_ONE: (PRICE_ONE, PACK_ONE),
         SET_TWO: (PRICE_TWO, PACK_TWO),
     }
-    options_by_set = {
-        option["provider_set_ref"]: option
-        for option in provider_item["rate_options"]
-    }
+    options_by_set = {option["provider_set_ref"]: option for option in provider_item["rate_options"]}
     assert set(options_by_set) == set(expected_by_set)
     for set_ref, (price_ref, pack_ref) in expected_by_set.items():
         option = options_by_set[set_ref]
@@ -316,18 +312,17 @@ def _assert_no_private_payload_values(response: dict[str, Any]) -> None:
         "source_artifact_key",
     }
     assert forbidden_keys.isdisjoint(set(_payload_keys(response)))
-    assert not any(
-        isinstance(value, (bytes, bytearray, memoryview))
-        for value in _payload_values(response)
-    )
+    assert not any(isinstance(value, (bytes, bytearray, memoryview)) for value in _payload_values(response))
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("representation", ["direct_v1", "pattern_v1"])
 async def test_v4_exact_npi_search_attaches_intersected_billing_associations(
     monkeypatch,
+    representation,
 ) -> None:
     _install_search_stubs(monkeypatch)
-    intersection = _install_billing_stubs(monkeypatch)
+    graph_lookup = _install_billing_stubs(monkeypatch, representation)
     session = _RoutingSession()
 
     response = await serving._search_manifest_serving_table(
@@ -352,10 +347,14 @@ async def test_v4_exact_npi_search_attaches_intersected_billing_associations(
     _assert_public_billing_item(response["items"][0])
     _assert_no_private_payload_values(response)
     assert session.sidecar_requests == [tuple(sorted((GROUP_ONE, GROUP_TWO)))]
-    intersection.assert_awaited_once()
-    assert intersection.await_args.kwargs["relation"] == "set_groups_direct"
-    assert intersection.await_args.kwargs["owner_keys"] == (3, 4)
-    assert intersection.await_args.kwargs["allowed_member_keys"] == (7, 8, 9)
+    if representation == "pattern_v1":
+        assert [call.kwargs["relation"] for call in graph_lookup.await_args_list] == ["group_patterns", "pattern_sets"]
+        assert graph_lookup.await_args_list[0].kwargs["owner_keys"] == (7, 8, 9)
+    else:
+        graph_lookup.assert_awaited_once()
+        assert graph_lookup.await_args.kwargs["relation"] == "set_groups_direct"
+        assert graph_lookup.await_args.kwargs["owner_keys"] == (3, 4)
+        assert graph_lookup.await_args.kwargs["allowed_member_keys"] == (7, 8, 9)
 
 
 @pytest.mark.asyncio
@@ -404,20 +403,14 @@ async def test_v4_exact_npi_geo_search_preserves_billing_associations(
     geo_item = geo_response["items"][0]
     _assert_public_billing_item(geo_item)
     _assert_no_private_payload_values(geo_response)
-    assert _billing_option_fingerprint(geo_item) == _billing_option_fingerprint(
-        provider_wide_item
-    )
+    assert _billing_option_fingerprint(geo_item) == _billing_option_fingerprint(provider_wide_item)
     assert geo_item["npi"] == NPI
     assert geo_response["query"]["state"] == "ZZ"
-    assert provider_wide_session.sidecar_requests == [
-        tuple(sorted((GROUP_ONE, GROUP_TWO)))
-    ]
+    assert provider_wide_session.sidecar_requests == [tuple(sorted((GROUP_ONE, GROUP_TWO)))]
     assert geo_session.sidecar_requests == [tuple(sorted((GROUP_ONE, GROUP_TWO)))]
     assert intersection.await_count == 2
     location.assert_awaited_once()
-    assert location.await_args.kwargs["explicit_npi_scope"] == (
-        serving._ExplicitNpiGraphScope(NPI, (3, 4))
-    )
+    assert location.await_args.kwargs["explicit_npi_scope"] == (serving._ExplicitNpiGraphScope(NPI, (3, 4)))
 
 
 @pytest.mark.asyncio
@@ -462,9 +455,7 @@ async def test_v4_exact_npi_geo_no_match_skips_billing_sidecar(
     assert response["items"] == []
     assert response["pagination"]["total"] == 0
     assert response["query"]["state"] == "ZZ"
-    assert location.await_args.kwargs["explicit_npi_scope"] == (
-        serving._ExplicitNpiGraphScope(NPI, (3, 4))
-    )
+    assert location.await_args.kwargs["explicit_npi_scope"] == (serving._ExplicitNpiGraphScope(NPI, (3, 4)))
     assert session.sidecar_requests == []
     intersection.assert_not_awaited()
     billing_resolver.assert_not_awaited()

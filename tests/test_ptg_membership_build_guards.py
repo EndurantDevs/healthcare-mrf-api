@@ -50,7 +50,7 @@ async def test_root_authentication_checks_complete_cas_summary(monkeypatch, drif
         with pytest.raises(PTG2ManifestArtifactError, match="CAS mapping root"):
             await build._authenticate_root(session, object(), root)
     else:
-        await build._authenticate_root(session, object(), root)
+        assert await build._authenticate_root(session, object(), root) == 6
     summarize.assert_awaited_once_with(
         session, schema_name="synthetic", snapshot_key=19, batch_rows=32, cancel_gc_candidates=False
     )
@@ -62,7 +62,7 @@ async def test_root_authentication_checks_complete_cas_summary(monkeypatch, drif
     "changes",
     [
         {"stored_map_byte_count": 0},
-        {"stored_map_byte_count": build.MAX_MAP_BYTES + 1},
+        {"stored_map_byte_count": build._MAX_SOURCE_READ_BYTES + 1},
         {"coordinate_count": build.MAX_BUILD_EDGES + 1},
     ],
 )
@@ -77,8 +77,8 @@ async def test_root_bounds_refuse_before_cas_read(monkeypatch, changes):
     summarize.assert_not_awaited()
 
 
-def _factor(monkeypatch, *, owners=257, count=5140, members=None):
-    manifest = SimpleNamespace(owner_base=0, owner_count=owners, logical_member_count=count)
+def _factor(monkeypatch, *, owners=257, count=5140, members=None, span=256):
+    manifest = SimpleNamespace(owner_base=0, owner_count=owners, logical_member_count=count, locator_owner_span=span)
     monkeypatch.setattr(serving, "_payload_schema", lambda _tables: "synthetic")
     monkeypatch.setattr(build, "load_v4_relation_manifest", AsyncMock(return_value=manifest))
     lookup = AsyncMock(side_effect=lambda _session, **kw: {owner: tuple(range(20)) for owner in kw["owner_keys"]})
@@ -124,8 +124,8 @@ async def test_complete_factor_copies_bounded_chunks_without_losing_owner_bounda
     "members,message",
     [
         ({}, "owner coverage"),
-        ({0: (1, 1)}, "noncanonical"),
-        ({0: (2, 1)}, "noncanonical"),
+        ({0: (1, 1)}, "member allowance"),
+        ({0: (2, 1)}, "member allowance"),
         ({0: (-1,)}, "noncanonical"),
         ({0: (2**32,)}, "noncanonical"),
         ({0: ()}, "member count"),
@@ -192,13 +192,25 @@ async def test_physical_code_query_scopes_and_bounds_complete_occurrences(monkey
 @pytest.mark.asyncio
 async def test_forward_occurrence_mismatch_never_copies_code_rows(monkeypatch):
     monkeypatch.setattr(build, "_physical_code_rows", AsyncMock(return_value=[dict(code_key=7, rate_count=2)]))
-    monkeypatch.setattr(
-        serving, "_shared_forward_entries_for_code_rows", AsyncMock(return_value=[SimpleNamespace(provider_set_key=1)])
-    )
+    for name, value in (
+        ("_required_shared_snapshot_key", 19),
+        ("_required_source_count", 1),
+        ("_version_three_forward_lookup_hints", {}),
+        ("_payload_schema", "synthetic"),
+    ):
+        monkeypatch.setattr(serving, name, lambda _tables, value=value: value)
+    monkeypatch.setattr(build, "lookup_code_prefix_occurrences_from_db", AsyncMock(return_value=[(1, 0, 0)]))
     copy = AsyncMock()
     monkeypatch.setattr(build, "_copy", copy)
     with pytest.raises(PTG2ManifestArtifactError, match="occurrence coverage"):
-        await build._copy_code(object(), object(), PARAMS, object(), hashlib.sha256(), byte_allowance=1024)
+        await build._copy_code(
+            object(),
+            object(),
+            PARAMS | {"finalizer": {"state": "legacy_relational"}},
+            object(),
+            hashlib.sha256(),
+            byte_allowance=1024,
+        )
     copy.assert_not_awaited()
 
 
@@ -252,11 +264,13 @@ async def test_source_drift_after_candidate_validation_prevents_seal(monkeypatch
     tables, root = object(), V4GraphRoot(19, "pattern_v1", b"a" * 32)
     resolve = AsyncMock(side_effect=[(tables, root, PARAMS), (tables, root, PARAMS | {"code": "99214"})])
     monkeypatch.setattr(build, "source_identity", resolve)
-    for name in ("lock_identity", "source_pin", "_authenticate_root", "_copy", "_validate_candidate"):
+    for name in ("lock_identity", "source_pin", "_copy", "_validate_candidate"):
         monkeypatch.setattr(build, name, AsyncMock())
     monkeypatch.setattr(build, "locate", AsyncMock(return_value=None))
     monkeypatch.setattr(build, "_copy_relation", AsyncMock(return_value=dict(edge_count=0)))
-    monkeypatch.setattr(build, "_copy_code", AsyncMock(return_value=[]))
+    monkeypatch.setattr(build, "_authenticate_root", AsyncMock(return_value=1))
+    monkeypatch.setattr(build, "_copy_code", AsyncMock(return_value=([], (), 0)))
+    monkeypatch.setattr(build, "_copy_code_factor", AsyncMock(return_value=dict(edge_count=0)))
     monkeypatch.setattr(build, "enqueue_live_progress", Mock())
     monkeypatch.setattr(build.native, "protected_publisher_owner", AsyncMock(return_value=101))
     monkeypatch.setattr(

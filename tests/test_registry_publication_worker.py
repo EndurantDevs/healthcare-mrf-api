@@ -48,6 +48,12 @@ def configuration():
     }
 
 
+def test_publication_custody_census_matches_existing_role_contract():
+    parsed = worker.parse_registry_publication_worker_config(json.dumps(configuration()))
+    expected = ("registry_api", "registry_reader", "registry_snapshot_owner", "worker_execution", "worker_lifecycle")
+    assert parsed.consumer.custody_roles == worker._custody_roles(parsed) == expected
+
+
 @pytest.mark.parametrize("mode", [None, "require", "verify-full"])
 def test_configuration_matches_database_roles_and_tls_without_exposing_credentials(mode):
     configured = configuration()
@@ -583,6 +589,7 @@ async def test_ptg_assembly_uses_execution_url_and_disposes_genuine_single_engin
     async def consume(**arguments):
         runtime = arguments["config"].composition_runtime
         assert type(runtime) is RegistryPublicationPTGRuntime
+        assert arguments["config"].custody_roles == worker._custody_roles(config)
         assert runtime.sessions.kw["bind"] is engines[0]
         assert runtime.sessions.kw["bind"].pool.size() == 1 and runtime.sessions.kw["bind"].pool._max_overflow == 0
         if outcome == "error":

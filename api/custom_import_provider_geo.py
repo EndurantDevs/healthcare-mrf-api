@@ -178,7 +178,10 @@ async def serve_custom_import_provider_geo(request: Any, session: Any):
         cursor_secret = transport._cursor_secret()
         if is_managed_mode:
             return await _serve_managed_geo(request, parsed, verified, cursor_secret, trusted_now)
-        async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), signed_request_reader(request, session) as session:
+        async with (
+            asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000),
+            signed_request_reader(request, session, verified_request_id=verified.request_id) as session,
+        ):
             async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
                 geo_payload = await _read_geo_payload(request, session, parsed, verified, cursor_secret, trusted_now)
                 encoded = transport._canonical_json_bytes(geo_payload)

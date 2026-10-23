@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api import ptg2_serving as serving
+from api import ptg2_v4_graph as graph
 from api.ptg2_v4_graph import V4GraphRoot
 from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
 
@@ -53,9 +54,7 @@ async def test_exact_billing_groups_intersect_direct_sets(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_groups", [{3: (7,)}, {3: (9,), 4: (8,)}])
-async def test_exact_billing_groups_reject_invalid_direct_scope(
-    monkeypatch, invalid_groups
-) -> None:
+async def test_exact_billing_groups_reject_invalid_direct_scope(monkeypatch, invalid_groups) -> None:
     monkeypatch.setattr(
         serving,
         "load_v4_graph_root",
@@ -67,13 +66,11 @@ async def test_exact_billing_groups_reject_invalid_direct_scope(
         AsyncMock(return_value=invalid_groups),
     )
     with pytest.raises(serving.PTG2ManifestArtifactError, match="incomplete"):
-        await serving._v4_exact_groups_by_set(
-            object(), _tables(), provider_set_keys=(3, 4), exact_group_keys=(7, 8)
-        )
+        await serving._v4_exact_groups_by_set(object(), _tables(), provider_set_keys=(3, 4), exact_group_keys=(7, 8))
 
 
 @pytest.mark.asyncio
-async def test_exact_billing_groups_intersect_pattern_and_component_sets(
+async def test_exact_billing_groups_read_only_exact_group_incidence(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -81,34 +78,47 @@ async def test_exact_billing_groups_intersect_pattern_and_component_sets(
         "load_v4_graph_root",
         AsyncMock(return_value=V4GraphRoot(17, "pattern_v1", b"p" * 32)),
     )
+
+    async def lookup(*_args, **kwargs):
+        assert kwargs["snapshot_key"] == 17
+        if kwargs["relation"] == "group_patterns":
+            assert kwargs["owner_keys"] == (7, 8, 9)
+            return {7: (10,), 8: (20,), 9: (10,)}
+        assert kwargs["relation"] == "pattern_sets"
+        assert kwargs["owner_keys"] == (10, 20)
+        return {10: (3, 4, 5), 20: (4,)}
+
+    member_lookup = AsyncMock(side_effect=lookup)
+    monkeypatch.setattr(serving, "lookup_v4_relation_members", member_lookup)
     monkeypatch.setattr(
         serving,
-        "_load_v4_pattern_set_group_sources",
-        AsyncMock(
-            return_value=serving._V4SetGroupSources(
-                pattern_keys_by_set={3: (10,)}, component_keys_by_set={4: (20,)}
-            )
-        ),
+        "lookup_v4_relation_intersections",
+        AsyncMock(side_effect=AssertionError("must not expand unrelated pattern groups")),
     )
 
-    async def intersection(*_args, **kwargs):
-        return {10: (7,)} if kwargs["relation"] == "pattern_groups" else {20: (8,)}
-
-    intersect = AsyncMock(side_effect=intersection)
-    monkeypatch.setattr(serving, "lookup_v4_relation_intersections", intersect)
-
     assert await serving._v4_exact_groups_by_set(
-        object(), _tables(), provider_set_keys=(3, 4), exact_group_keys=(7, 8)
-    ) == {3: (7,), 4: (8,)}
-    assert [call.kwargs["max_members"] for call in intersect.await_args_list] == [
+        object(), _tables(), provider_set_keys=(4, 3), exact_group_keys=(9, 7, 8)
+    ) == {3: (7, 9), 4: (7, 8, 9)}
+    assert [call.kwargs["max_members"] for call in member_lookup.await_args_list] == [
+        2048,
         8192,
-        8191,
     ]
 
 
 @pytest.mark.asyncio
-async def test_exact_billing_groups_reject_incomplete_pattern_source_scope(
+@pytest.mark.parametrize(
+    "patterns_by_group,sets_by_pattern",
+    [
+        ({7: (10,)}, {10: (3,)}),
+        ({7: (), 8: (20,)}, {20: (4,)}),
+        ({7: (10, 20), 8: (20,)}, {10: (3,), 20: (4,)}),
+        ({7: (10,), 8: (20,)}, {10: (3,)}),
+    ],
+)
+async def test_exact_billing_groups_reject_incomplete_pattern_incidence(
     monkeypatch,
+    patterns_by_group,
+    sets_by_pattern,
 ) -> None:
     monkeypatch.setattr(
         serving,
@@ -117,27 +127,12 @@ async def test_exact_billing_groups_reject_incomplete_pattern_source_scope(
     )
     monkeypatch.setattr(
         serving,
-        "_load_v4_pattern_set_group_sources",
-        AsyncMock(
-            return_value=serving._V4SetGroupSources(
-                pattern_keys_by_set={3: (10,)}, component_keys_by_set={4: (20,)}
-            )
-        ),
-    )
-
-    async def incomplete_intersection(*_args, **kwargs):
-        return {10: (7,)} if kwargs["relation"] == "pattern_groups" else {}
-
-    monkeypatch.setattr(
-        serving,
-        "lookup_v4_relation_intersections",
-        AsyncMock(side_effect=incomplete_intersection),
+        "lookup_v4_relation_members",
+        AsyncMock(side_effect=[patterns_by_group, sets_by_pattern]),
     )
 
     with pytest.raises(serving.PTG2ManifestArtifactError, match="incomplete"):
-        await serving._v4_exact_groups_by_set(
-            object(), _tables(), provider_set_keys=(3, 4), exact_group_keys=(7, 8)
-        )
+        await serving._v4_exact_groups_by_set(object(), _tables(), provider_set_keys=(3, 4), exact_group_keys=(7, 8))
 
 
 @pytest.mark.asyncio
@@ -153,18 +148,13 @@ async def test_shared_pattern_fanout_cannot_exceed_association_edge_cap(
     )
     monkeypatch.setattr(
         serving,
-        "_load_v4_pattern_set_group_sources",
+        "lookup_v4_relation_members",
         AsyncMock(
-            return_value=serving._V4SetGroupSources(
-                pattern_keys_by_set={key: (30,) for key in provider_set_keys},
-                component_keys_by_set={},
-            )
+            side_effect=[
+                {key: (30,) for key in exact_group_keys},
+                {30: provider_set_keys},
+            ]
         ),
-    )
-    monkeypatch.setattr(
-        serving,
-        "lookup_v4_relation_intersections",
-        AsyncMock(return_value={30: exact_group_keys}),
     )
 
     with pytest.raises(serving.PTG2ManifestArtifactError, match="edge limit"):
@@ -174,6 +164,16 @@ async def test_shared_pattern_fanout_cannot_exceed_association_edge_cap(
             provider_set_keys=provider_set_keys,
             exact_group_keys=exact_group_keys,
         )
+
+
+@pytest.mark.parametrize("relation", ["group_patterns", "pattern_sets"])
+@pytest.mark.parametrize("dimension", ["owner_count", "member_count", "page_count", "byte_count"])
+def test_exact_billing_inverse_reads_keep_sealed_source_caps(relation, dimension) -> None:
+    charges_by_dimension = dict(owner_count=1, member_count=1, page_count=1, byte_count=1)
+    charges_by_dimension[dimension] = 2
+    with graph.v4_graph_hot_source_scope(maximum_owners=1, maximum_members=1, maximum_pages=1, maximum_bytes=1):
+        with pytest.raises(graph.PTG2SharedBlockError, match="sealed limit"):
+            graph._charge_v4_hot_source_work(relation, **charges_by_dimension)
 
 
 @pytest.mark.asyncio
@@ -229,7 +229,9 @@ async def test_exact_npi_billing_map_rejects_unknown_set_and_empty_groups(
     monkeypatch.setattr(serving, "_provider_set_keys_for_ids", set_dictionary)
     with pytest.raises(serving.PTG2ManifestArtifactError, match="provider set"):
         await serving._exact_npi_billing_associations_by_set(
-            object(), _tables(), npi=1234567890,
+            object(),
+            _tables(),
+            npi=1234567890,
             serving_rows=[{"provider_set_global_id_128": provider_set}],
         )
 
@@ -237,7 +239,9 @@ async def test_exact_npi_billing_map_rejects_unknown_set_and_empty_groups(
     monkeypatch.setattr(serving, "_shared_graph_members_for_id", AsyncMock(return_value=()))
     with pytest.raises(serving.PTG2ManifestArtifactError, match="no provider-group"):
         await serving._exact_npi_billing_associations_by_set(
-            object(), _tables(), npi=1234567890,
+            object(),
+            _tables(),
+            npi=1234567890,
             serving_rows=[{"provider_set_global_id_128": provider_set}],
         )
 
@@ -247,27 +251,25 @@ async def test_exact_npi_billing_map_rejects_unknown_group_and_empty_witness(
     monkeypatch,
 ) -> None:
     provider_set, group_ref = "11" * 16, "aa" * 16
-    monkeypatch.setattr(
-        serving, "_provider_set_keys_for_ids", AsyncMock(return_value={provider_set: 3})
-    )
-    monkeypatch.setattr(
-        serving, "_shared_graph_members_for_id", AsyncMock(return_value=(group_ref,))
-    )
+    monkeypatch.setattr(serving, "_provider_set_keys_for_ids", AsyncMock(return_value={provider_set: 3}))
+    monkeypatch.setattr(serving, "_shared_graph_members_for_id", AsyncMock(return_value=(group_ref,)))
     group_dictionary = AsyncMock(return_value={})
     monkeypatch.setattr(serving, "_shared_provider_group_keys_for_ids", group_dictionary)
     with pytest.raises(serving.PTG2ManifestArtifactError, match="provider group"):
         await serving._exact_npi_billing_associations_by_set(
-            object(), _tables(), npi=1234567890,
+            object(),
+            _tables(),
+            npi=1234567890,
             serving_rows=[{"provider_set_global_id_128": provider_set}],
         )
 
     group_dictionary.return_value = {group_ref: 7}
-    monkeypatch.setattr(
-        serving, "_v4_exact_groups_by_set", AsyncMock(return_value={3: ()})
-    )
+    monkeypatch.setattr(serving, "_v4_exact_groups_by_set", AsyncMock(return_value={3: ()}))
     with pytest.raises(serving.PTG2ManifestArtifactError, match="witness"):
         await serving._exact_npi_billing_associations_by_set(
-            object(), _tables(), npi=1234567890,
+            object(),
+            _tables(),
+            npi=1234567890,
             serving_rows=[{"provider_set_global_id_128": provider_set}],
         )
 
@@ -279,10 +281,7 @@ async def test_exact_npi_billing_provider_set_scope_is_bounded() -> None:
             object(),
             _tables(),
             npi=1234567890,
-            serving_rows=[
-                {"provider_set_global_id_128": f"{ordinal:032x}"}
-                for ordinal in range(1, 2050)
-            ],
+            serving_rows=[{"provider_set_global_id_128": f"{ordinal:032x}"} for ordinal in range(1, 2050)],
         )
 
 
@@ -341,12 +340,16 @@ async def test_billing_associations_are_provider_expanded_exact_npi_v4_only(
             source_count=1,
         )
     scope = serving._ExplicitNpiGraphScope(1234567890, (3,)) if has_scope else None
-    assert await serving._billing_associations_for_exact_npi_request(
-        object(), tables, include_providers=include_providers,
-        explicit_npi_scope=scope, serving_rows=(
-            {"provider_set_global_id_128": "11" * 16},
-        ),
-    ) == {}
+    assert (
+        await serving._billing_associations_for_exact_npi_request(
+            object(),
+            tables,
+            include_providers=include_providers,
+            explicit_npi_scope=scope,
+            serving_rows=({"provider_set_global_id_128": "11" * 16},),
+        )
+        == {}
+    )
     resolver.assert_not_awaited()
 
 
@@ -359,10 +362,16 @@ async def test_billing_associations_delegate_for_provider_expanded_exact_npi_req
     monkeypatch.setattr(serving, "_exact_npi_billing_associations_by_set", resolver)
     scope = serving._ExplicitNpiGraphScope(1234567890, (3,))
     serving_rows = ({"provider_set_global_id_128": "11" * 16},)
-    assert await serving._billing_associations_for_exact_npi_request(
-        object(), _tables(), include_providers=True,
-        explicit_npi_scope=scope, serving_rows=serving_rows,
-    ) == expected_by_set
+    assert (
+        await serving._billing_associations_for_exact_npi_request(
+            object(),
+            _tables(),
+            include_providers=True,
+            explicit_npi_scope=scope,
+            serving_rows=serving_rows,
+        )
+        == expected_by_set
+    )
     assert resolver.await_args.kwargs == {
         "npi": 1234567890,
         "serving_rows": serving_rows,

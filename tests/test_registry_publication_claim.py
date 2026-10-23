@@ -39,7 +39,16 @@ async def test_omitted_family_cannot_fall_back_to_unfiltered_claim():
 @pytest.mark.parametrize(
     "family,ordinary,operations",
     [
-        ("publication", True, ("reactivate_generation", "prepare_source_rollback", "publish_source_rollback")),
+        (
+            "publication",
+            True,
+            (
+                "reactivate_generation",
+                "prepare_source_rollback",
+                "publish_source_rollback",
+                "publish_initial_inventory",
+            ),
+        ),
         ("office", False, ("prepare_ptg_office_capture", "approve_ptg_office_capture")),
     ],
 )
