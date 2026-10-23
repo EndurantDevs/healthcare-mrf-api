@@ -19,6 +19,11 @@ from process.provider_directory_source_acquisition_hooks import (
 from process.provider_directory_source_acquisition_hooks import (
     _root_hook_contracts as _root_hook_contracts,
 )
+from process.provider_directory_source_builder_delegation import (
+    receipt_delegation,
+    require_delegated_access,
+    require_legacy_observation,
+)
 from process.provider_directory_source_callable_custody import (
     capture_source_callable_adoption_capability as capture_source_callable_adoption_capability,
 )
@@ -581,7 +586,7 @@ def _writer_rights(root, columns, *, history=False, loading=False):
     return tables, by_right
 
 
-def _require_relation_access(catalog, native, roles, *, legacy, root, history=False, loading=False):
+def _require_relation_access(catalog, native, roles, *, legacy, root, history=False, loading=False, delegation=None):
     from process.provider_directory_cms_control_custody import _RIGHTS
 
     owner, builder = roles["owner"], roles["builder"]
@@ -615,12 +620,21 @@ def _require_relation_access(catalog, native, roles, *, legacy, root, history=Fa
             ),
             "column_acl_changed",
         )
-    _require_effective_access(catalog["access"], columns, roles, previous, (tables, by_right))
+    _require_effective_access(catalog["access"], columns, roles, previous, (tables, by_right), delegation, native)
 
 
-def _require_effective_access(access_rows, columns, roles, previous, rights):
+def _require_effective_access(access_rows, columns, roles, previous, rights, delegation=None, native=None):
     owner, builder = roles["owner"], roles["builder"]
     tables, by_right = rights
+    if delegation is not None:
+        require_delegated_access(
+            access_rows,
+            delegation,
+            owner=owner,
+            builder=builder,
+            relation_oid=int(native["oid"]),
+            legacy_builder=previous == builder,
+        )
     for access in access_rows:
         if access["superuser"] or access["role"] in {owner, roles["publisher"], roles["migration"]}:
             continue
@@ -631,7 +645,7 @@ def _require_effective_access(access_rows, columns, roles, previous, rights):
                 expected = tables & {"SELECT", "INSERT", "UPDATE", "REFERENCES"}
                 expected.update(right for right, names in by_right.items() if columns[column - 1] in names)
                 _require(set(rights) == expected, "writer_effective_acl_changed")
-        elif access["role"] != builder and not access["builtin"]:
+        elif delegation is None and access["role"] != builder and not access["builtin"]:
             _require(
                 set(access["table"]) <= {"SELECT"}
                 and all(set(rights) <= {"SELECT"} for _, rights in access["columns"]),
@@ -978,7 +992,9 @@ def _require_acquisition_scope(expression, scope_values):
     _require(_simple_check(expression) == "check" + comparison, "scope_expression_changed")
 
 
-async def _capture_family_relation(connection, policy, name, root, callable_receipt, *, legacy, member=None):
+async def _capture_family_relation(
+    connection, policy, name, root, callable_receipt, *, legacy, member=None, delegation=None
+):
     """Capture one fixed heap without executing its data or mutable CHECK expressions."""
     from process.provider_directory_cms_callable_custody import _decoded
     from process.provider_directory_cms_control_custody import _COLUMN_SQL, _require_model_columns
@@ -1002,7 +1018,14 @@ async def _capture_family_relation(connection, policy, name, root, callable_rece
     is_history = name in HISTORY_ROOTS
     is_loading = member is not None and member["phase"] == "loading"
     _require_relation_access(
-        catalog, native, roles, legacy=legacy, root=root, history=is_history or member is not None, loading=is_loading
+        catalog,
+        native,
+        roles,
+        legacy=legacy,
+        root=root,
+        history=is_history or member is not None,
+        loading=is_loading,
+        delegation=delegation,
     )
     await _require_family_indexes(connection, policy, name, root, columns, is_loading)
     function_by_name = {entry["definition"]["proname"]: entry for entry in callable_receipt["functions"].values()}
@@ -1117,25 +1140,34 @@ def _require_metadata_layout(catalog, native):
     )
 
 
-async def capture_source_acquisition_custody(connection, policy, callable_receipt, *, legacy=False):
+async def capture_source_acquisition_custody(connection, policy, callable_receipt, *, legacy=False, delegation=None):
     """Capture exact permanent roots and deterministic current family members once per admin cut."""
     from process.provider_directory_source_cohort_custody import capture_cohort_family
 
+    delegation = receipt_delegation(callable_receipt, delegation)
+    await require_legacy_observation(connection, policy, delegation, legacy=legacy)
     native_by_name, members, acquisitions, plans = await _native_family(connection, policy)
-    cohort = await capture_cohort_family(connection, policy, callable_receipt, legacy=legacy)
+    cohort = await capture_cohort_family(connection, policy, callable_receipt, legacy=legacy, delegation=delegation)
     relation_by_name = dict(cohort["relations"])
     for name in native_by_name:
         if name in ACQUISITION_ROOTS[:2]:
             continue
         root = name.removesuffix("_legacy") if name in HISTORY_ROOTS else name
         relation_by_name[name] = await _capture_family_relation(
-            connection, policy, name, root, callable_receipt, legacy=legacy
+            connection, policy, name, root, callable_receipt, legacy=legacy, delegation=delegation
         )
         if name in HISTORY_ROOTS:
             relation_by_name[name]["scope_values"] = _partition_values(native_by_name[name]["partition_bound"]) or []
     for member in members:
         relation_by_name[member["name"]] = await _capture_family_relation(
-            connection, policy, member["name"], member["root"], callable_receipt, legacy=legacy, member=member
+            connection,
+            policy,
+            member["name"],
+            member["root"],
+            callable_receipt,
+            legacy=legacy,
+            member=member,
+            delegation=delegation,
         )
         relation_by_name[member["name"]].update(
             scope_values=[member["acquisition_id"]], attached=bool(member["parent_oid"])
@@ -1143,7 +1175,7 @@ async def capture_source_acquisition_custody(connection, policy, callable_receip
     edges = await _capture_family_foreign(
         connection, policy, native_by_name, relation_by_name, callable_receipt["roles"], legacy
     )
-    return dict(
+    receipt_by_field = dict(
         schema=policy.schema,
         relations=relation_by_name,
         roots=native_by_name,
@@ -1154,6 +1186,8 @@ async def capture_source_acquisition_custody(connection, policy, callable_receip
         cohort=cohort,
         foreign=edges,
     )
+    await require_legacy_observation(connection, policy, delegation)
+    return receipt_by_field
 
 
 async def _capture_family_foreign(connection, policy, native_by_name, relation_by_name, roles, legacy):

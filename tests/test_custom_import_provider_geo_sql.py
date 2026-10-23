@@ -304,6 +304,42 @@ async def test_imported_geo_handler_uses_one_session_and_keeps_private_next_anch
 
 
 @pytest.mark.asyncio
+async def test_imported_geo_handler_rejects_malformed_page_identity(monkeypatch):
+    session = SimpleNamespace(calls=[])
+    context = _context()
+
+    class InvalidPageIdentityProxy(_RecordingGeoProxy):
+        async def all(self, statement, **parameters):
+            provider_records = await super().all(statement, **parameters)
+            if "page_geo AS MATERIALIZED" in str(statement):
+                provider_records[1]._mapping["address_key"] = "not-an-address"
+            return provider_records
+
+    async def prepare_scope(native_entity_scope):
+        return _scoped_import_context(context, native_entity_scope)
+
+    async def prepare_cursor(**_kwargs):
+        return None
+
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", InvalidPageIdentityProxy)
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
+    monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: (_ for _ in ()).throw(AssertionError("native pool used")))
+    request = SimpleNamespace(args={}, ctx=SimpleNamespace(sa_session=session))
+    native_args = RequestParameters({"lat": ["0"], "long": ["0"], "include_total": ["true"], "limit": ["2"]})
+    with pytest.raises(RuntimeError, match="custom-import geo page identity is unavailable"):
+        await npi_module.get_near_npi(
+            request,
+            native_args=native_args,
+            import_context=context,
+            prepare_cursor=prepare_cursor,
+            native_scope_preparer=prepare_scope,
+        )
+    assert len(session.calls) == 1 and "AS _geo_total" in session.calls[0][0]
+    assert request.ctx.sa_session is session
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("anchor_count", (0, 2))
 async def test_imported_geo_handler_rejects_missing_or_nonunique_cursor_anchor(
     monkeypatch,

@@ -4,10 +4,12 @@
 import os
 from dataclasses import dataclass
 
-from api.reference_source_worker import _IMAGE, IMAGE_ENV
+from api.reference_source_worker import _IMAGE
+from api.reference_source_worker import IMAGE_ENV as REFERENCE_IMAGE_ENV
 
 PURPOSE = "provider-directory-source"
 COMMAND = ["/usr/local/bin/fhir-source-worker"]
+IMAGE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_IMAGE"
 _WORKER_CLASS = "process.ProviderDirectoryFHIR"
 _IMPORTER = "provider-directory-fhir"
 _QUEUE = "arq:ProviderDirectoryFHIR"
@@ -28,7 +30,7 @@ def admit_fhir_source_worker_launch(admitted_run):
     if admitted_run.get("importer") != _IMPORTER:
         return None
     metrics = admitted_run.get("metrics")
-    image = os.getenv(IMAGE_ENV, "")
+    image = os.getenv(IMAGE_ENV, os.getenv(REFERENCE_IMAGE_ENV, ""))
     if (
         not isinstance(metrics, dict)
         or metrics.get("queue") != _QUEUE

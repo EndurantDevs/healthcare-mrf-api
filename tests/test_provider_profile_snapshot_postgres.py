@@ -15,6 +15,7 @@ from sqlalchemy.exc import DBAPIError
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
 from db.connection import current_session
+from tests.npi_near_snapshot_postgres_support import check_near_cleanup, check_near_cutover
 from tests.provider_profile_snapshot_postgres_support import grant_profile_reader, publish_family, snapshot_database
 
 NPI = 1000000004
@@ -356,3 +357,18 @@ async def test_detail_reads_finish_before_geocoding(monkeypatch):
         assert response_by_field["provider_enrichment"]["summary"]["marker"] == "old"
         assert response_by_field["address_list"][0]["lat"] == 41
         assert await database.scalar(f'SELECT marker FROM "{schema}".entity_address_unified') == "new"
+
+
+async def test_near_read_snapshot_blocks_cutover(monkeypatch):
+    """Keep page, count, metadata and encoding on the original serving heap."""
+    await check_near_cutover(monkeypatch)
+
+
+async def test_near_read_failure_releases_snapshot(monkeypatch):
+    """A native query error must release the Reader before publication."""
+    await check_near_cleanup(monkeypatch, cancelled=False)
+
+
+async def test_near_cancellation_releases_snapshot(monkeypatch):
+    """Cancellation must release the Reader before publication."""
+    await check_near_cleanup(monkeypatch, cancelled=True)
