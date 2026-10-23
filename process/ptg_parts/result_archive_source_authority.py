@@ -626,6 +626,7 @@ async def _release_validated_authority_pin(
     _require_transaction(session)
     schema = _quote_ident(schema_name)
     await _acquire_operation_lock(session, authority.operation_id)
+    await acquire_ptg2_source_lifecycle_lock(session, source_key=authority.source_key)
     try:
         stored_pin_rows = await _pin_rows(session, schema=schema, authority=authority)
     except Exception as exc:

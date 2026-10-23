@@ -1,8 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Build a complete authenticated physical-source/code family in one transaction."""
+"""Retain the source before building one complete isolated source/code family."""
 
+import asyncio
 import hashlib
 import struct
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -17,11 +19,20 @@ from api.ptg_membership_contract import (
     MAX_FACTOR_BATCH_MEMBERS,
     MAX_MAP_BYTES,
     SPEC,
+    digest,
     encoded,
     validate_params,
 )
 from api.ptg_membership_source import source_identity
-from api.ptg_membership_storage import locate, lock_identity, receipt, seal, source_pin
+from api.ptg_membership_storage import (
+    locate,
+    lock_identity,
+    lock_retained_source,
+    prepare_source_retention,
+    receipt,
+    release_unattached_source_retention,
+    seal,
+)
 from db.connection import db
 from db.models.ptg_membership_projection import (
     PTGMembershipCode,
@@ -261,23 +272,7 @@ async def _reader_principals(session, tables):
     return rows
 
 
-async def build_in_session(session, *, source_key, snapshot_id, code_system, code):
-    """Build or adopt one complete source/code family within the caller transaction."""
-    params_by_name = dict(source_key=source_key, snapshot_id=snapshot_id, code_system=code_system, code=code)
-    validate_params(params_by_name)
-    await native.protected_publisher_owner(session)
-    tables, root, identity = await source_identity(session, **params_by_name)
-    await lock_identity(session, identity)
-    found = await locate(session, identity)
-    if found is not None:
-        return receipt(found)
-    await source_pin(session, identity, create=True)
-    enqueue_live_progress(
-        phase="membership source authentication", message="Authenticating the complete source map and CAS closure"
-    )
-    await _authenticate_root(session, tables, root)
-    ownership = await native.precreate_model_family_stage(session, SPEC, uuid4())
-    hasher = hashlib.sha256(encoded(identity).encode("ascii"))
+async def _copy_factors(session, tables, root, ownership, hasher):
     relations = (
         ("npi_patterns", "pattern_sets")
         if root.representation == "pattern_v1"
@@ -298,6 +293,33 @@ async def build_in_session(session, *, source_key, snapshot_id, code_system, cod
         )
         factors.append(factor)
         edges += factor["edge_count"]
+    return factors, edges
+
+
+async def build_in_session(session, *, source_key, snapshot_id, code_system, code, retained_identity):
+    """Consume a committed source admission within the candidate transaction."""
+    params_by_name = dict(source_key=source_key, snapshot_id=snapshot_id, code_system=code_system, code=code)
+    validate_params(params_by_name)
+    await native.protected_publisher_owner(session)
+    if not isinstance(retained_identity, dict) or any(
+        retained_identity.get(name) != selector for name, selector in params_by_name.items()
+    ):
+        raise PTG2ManifestArtifactError("membership retained source identity differs")
+    await lock_identity(session, retained_identity)
+    await lock_retained_source(session, retained_identity)
+    tables, root, identity = await source_identity(session, **params_by_name)
+    if identity != retained_identity:
+        raise PTG2ManifestArtifactError("membership retained source identity differs")
+    found = await locate(session, identity)
+    if found is not None:
+        return receipt(found)
+    enqueue_live_progress(
+        phase="membership source authentication", message="Authenticating the complete source map and CAS closure"
+    )
+    await _authenticate_root(session, tables, root)
+    ownership = await native.precreate_model_family_stage(session, SPEC, uuid4())
+    hasher = hashlib.sha256(encoded(identity).encode("ascii"))
+    factors, edges = await _copy_factors(session, tables, root, ownership, hasher)
     enqueue_live_progress(
         phase="membership procedure coverage", message="Authenticating complete requested-code occurrence coverage"
     )
@@ -322,9 +344,58 @@ async def build_in_session(session, *, source_key, snapshot_id, code_system, cod
     return receipt(await locate(session, identity))
 
 
+@asynccontextmanager
+async def _publisher_transaction():
+    """Own a real commit; Reader and borrowed transactions cannot become publishers."""
+    if db.has_reader_session():
+        raise RuntimeError("membership publication cannot use a Reader context")
+    if db._transaction_binding() is not None:
+        raise RuntimeError("membership publication requires independent transactions")
+    if db.session_factory is None:
+        await db.connect()
+    assert db.session_factory is not None
+    async with db.session_factory() as session:
+        if db.engine is None or session.get_bind().engine is not db.engine.sync_engine:
+            raise RuntimeError("membership publication database binding changed")
+        async with session.begin():
+            yield session
+
+
+async def _release_failed_retention(identity):
+    async with _publisher_transaction() as session:
+        await release_unattached_source_retention(session, identity)
+
+
+async def _drain_failed_retention(identity, error):
+    """Drain cancellation cleanup and preserve the receipt if recovery must retry."""
+    cleanup = asyncio.create_task(_release_failed_retention(identity))
+    try:
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                if cleanup.done():
+                    break
+        cleanup.result()
+    except BaseException as cleanup_error:
+        error.add_note("membership source retention requires reconciliation: " + digest(identity))
+        error.add_note("retained source identity: " + encoded(identity))
+        error.add_note("retention cleanup failed: " + type(cleanup_error).__name__)
+
+
 async def build_provider_membership_projection(*, source_key, snapshot_id, code_system, code):
-    """A lost worker rolls back its whole invisible candidate; a retry adopts ready state."""
-    async with db.transaction() as session:
-        return await build_in_session(
-            session, source_key=source_key, snapshot_id=snapshot_id, code_system=code_system, code=code
-        )
+    """Commit retention before COPY; a retry adopts ready state or resumes admission."""
+    params_by_name = dict(source_key=source_key, snapshot_id=snapshot_id, code_system=code_system, code=code)
+    validate_params(params_by_name)
+    identity = None
+    try:
+        async with _publisher_transaction() as session:
+            identity = await prepare_source_retention(session, **params_by_name)
+        async with _publisher_transaction() as session:
+            build_receipt = await build_in_session(session, **params_by_name, retained_identity=identity)
+        return build_receipt
+    except BaseException as error:
+        if identity is not None:
+            # Drain cleanup even after repeated cancellation; rollback has finished.
+            await _drain_failed_retention(identity, error)
+        raise

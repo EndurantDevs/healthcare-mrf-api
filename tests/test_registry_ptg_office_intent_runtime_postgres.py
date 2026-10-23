@@ -46,6 +46,7 @@ def _configuration(native):
         "approval_role": scope.store.approval_role,
         "reader_dsn": scope.reader_sessions.kw["bind"].url.render_as_string(hide_password=False),
         "approver_dsn": scope.approval_sessions.kw["bind"].url.render_as_string(hide_password=False),
+        "source_retention_dsn": scope.source_retention_sessions.kw["bind"].url.render_as_string(hide_password=False),
         "app_origin": scope.authority.base_url,
         "authority_token": scope.authority.token,
         "office_custody": {
@@ -73,6 +74,7 @@ async def _role_snapshot(native):
             [
                 *native.roles_by_kind.values(),
                 *native.fixture.source.roles,
+                native.fixture.source.retention_role,
                 *native.fixture.roles,
                 *native.custom.roles.values(),
             ]
@@ -87,6 +89,7 @@ async def _role_snapshot(native):
     login_roles = {
         scope.reader_sessions.kw["bind"].url.username,
         scope.store.approval_role,
+        scope.source_retention_sessions.kw["bind"].url.username,
         *native.roles_by_kind.values(),
     }
     assert all(identities_by_role[role]["rolcanlogin"] is True for role in login_roles)
@@ -113,6 +116,7 @@ async def _close_native_runtime(app, native):
             native.service.preparation.publisher_sessions,
             scope.reader_sessions,
             scope.approval_sessions,
+            scope.source_retention_sessions,
         )
     }
     for engine in engines:

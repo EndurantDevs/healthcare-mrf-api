@@ -10,13 +10,18 @@ from typing import Any, Mapping
 from sqlalchemy import text
 
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    PTG2_LIFECYCLE_LOCK_TIMEOUT,
+    PTG2_LIFECYCLE_STATEMENT_TIMEOUT,
+)
+from process.ptg_parts.source_snapshot_reference_lifetime import (
+    SnapshotReferenceIdentityError,
+    acquire_snapshot_reference_lifetime,
+)
 from process.ptg_wave_receipt_contract import ordinary_cutover_id
 
-
 ORDINARY_TERMINAL_PIN_OWNER_TYPE = "ptg-wave-ordinary-terminal"
-ORDINARY_TERMINAL_PIN_REASON = (
-    "retain snapshot manifest through ordinary terminal receipt"
-)
+ORDINARY_TERMINAL_PIN_REASON = "retain snapshot manifest through ordinary terminal receipt"
 _OPERATION_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -49,10 +54,7 @@ async def _locked_terminal_pin_rows(
             parameters_by_name,
         )
     ).all()
-    return [
-        dict(getattr(pin_record, "_mapping", pin_record))
-        for pin_record in stored_records
-    ]
+    return [dict(getattr(pin_record, "_mapping", pin_record)) for pin_record in stored_records]
 
 
 def ordinary_terminal_pin(
@@ -72,11 +74,7 @@ def ordinary_terminal_pin(
     member_ordinal = options.get("ordinary_cutover_member_ordinal")
     if not _OPERATION_ID_RE.fullmatch(operation_id):
         raise ValueError("ordinary terminal pin operation identity is invalid")
-    if (
-        isinstance(member_ordinal, bool)
-        or not isinstance(member_ordinal, int)
-        or member_ordinal < 0
-    ):
+    if isinstance(member_ordinal, bool) or not isinstance(member_ordinal, int) or member_ordinal < 0:
         raise ValueError("ordinary terminal pin member ordinal is invalid")
     if options.get("ordinary_cutover_id") != ordinary_cutover_id(operation_id):
         raise ValueError("ordinary terminal pin cutover identity is invalid")
@@ -94,6 +92,34 @@ def ordinary_terminal_pin(
     )
 
 
+async def lock_ordinary_terminal_snapshot_pin(
+    session: Any,
+    *,
+    schema_name: str,
+    snapshot_id: str,
+    internal_run_id: str,
+    options: Mapping[str, Any],
+    lock_timeout: str = PTG2_LIFECYCLE_LOCK_TIMEOUT,
+    statement_timeout: str = PTG2_LIFECYCLE_STATEMENT_TIMEOUT,
+) -> PTGWaveOrdinaryTerminalPin | None:
+    """Join the source lifetime before completion or retry takes any row locks."""
+
+    pin = ordinary_terminal_pin(options, snapshot_id=snapshot_id)
+    if pin is None:
+        return None
+    source_key = await acquire_snapshot_reference_lifetime(
+        session,
+        schema_name=schema_name,
+        snapshot_id=pin.snapshot_id,
+        internal_run_id=internal_run_id,
+        lock_timeout=lock_timeout,
+        statement_timeout=statement_timeout,
+    )
+    if "source_key" in options and options["source_key"] != source_key:
+        raise SnapshotReferenceIdentityError("ordinary terminal snapshot source identity changed")
+    return pin
+
+
 async def insert_ordinary_terminal_snapshot_pin(
     session: Any,
     *,
@@ -101,10 +127,20 @@ async def insert_ordinary_terminal_snapshot_pin(
     snapshot_id: str,
     internal_run_id: str,
     options: Mapping[str, Any],
+    lock_timeout: str = PTG2_LIFECYCLE_LOCK_TIMEOUT,
+    statement_timeout: str = PTG2_LIFECYCLE_STATEMENT_TIMEOUT,
 ) -> PTGWaveOrdinaryTerminalPin | None:
     """Insert or validate the exact pin in the terminal run transaction."""
 
-    pin = ordinary_terminal_pin(options, snapshot_id=snapshot_id)
+    pin = await lock_ordinary_terminal_snapshot_pin(
+        session,
+        schema_name=schema_name,
+        snapshot_id=snapshot_id,
+        internal_run_id=internal_run_id,
+        options=options,
+        lock_timeout=lock_timeout,
+        statement_timeout=statement_timeout,
+    )
     if pin is None:
         return None
     schema = _quote_ident(schema_name)
@@ -152,6 +188,8 @@ async def delete_ordinary_terminal_snapshot_pin(
     operation_id: str,
     member_ordinal: int,
     snapshot_id: str,
+    lock_timeout: str = PTG2_LIFECYCLE_LOCK_TIMEOUT,
+    statement_timeout: str = PTG2_LIFECYCLE_STATEMENT_TIMEOUT,
 ) -> int:
     """Delete only the pin authenticated by one receipt payload."""
 
@@ -164,6 +202,13 @@ async def delete_ordinary_terminal_snapshot_pin(
         snapshot_id=snapshot_id,
     )
     assert pin is not None
+    await acquire_snapshot_reference_lifetime(
+        session,
+        schema_name=schema_name,
+        snapshot_id=pin.snapshot_id,
+        lock_timeout=lock_timeout,
+        statement_timeout=statement_timeout,
+    )
     deletion_result = await session.execute(
         text(
             f"""
@@ -192,5 +237,6 @@ __all__ = [
     "PTGWaveOrdinaryTerminalPin",
     "delete_ordinary_terminal_snapshot_pin",
     "insert_ordinary_terminal_snapshot_pin",
+    "lock_ordinary_terminal_snapshot_pin",
     "ordinary_terminal_pin",
 ]

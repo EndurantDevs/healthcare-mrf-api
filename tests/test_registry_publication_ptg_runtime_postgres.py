@@ -86,14 +86,15 @@ async def _review_offices(native, *, select=True):
         table = await _protected_store(
             session, source_service.store, write=True, table_name="registry_ptg_published_plan_scope"
         )
-        with pytest.raises(ValueError, match="published_lock_privileges_unprotected"):
-            await _read_protected_published_scope(
-                session,
-                table,
-                native.request["selector"]["scope_id"],
-                native.request["selector"]["client_id"],
-                native.request["selector"]["scope_approval_sha256"],
-            )
+        reviewed = await _read_protected_published_scope(
+            session,
+            table,
+            native.request["selector"]["scope_id"],
+            native.request["selector"]["client_id"],
+            native.request["selector"]["scope_approval_sha256"],
+        )
+        assert reviewed["command"] == native.request["source_command"]
+        assert reviewed["approval_sha256"] == native.request["selector"]["scope_approval_sha256"]
     approval = await source_service.approve_offices({**envelope_by_name, "command": command})
     recipes = decode_registry_source_recipes(json.dumps(approval["source_recipes"]))
     approved_revision = command["source"]["approved_revision"]

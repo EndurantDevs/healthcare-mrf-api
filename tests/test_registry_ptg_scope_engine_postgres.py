@@ -329,22 +329,36 @@ def _runtime_configuration(engine, source_name, control, roles, login_password):
     }
 
 
+def _retention_factory(engine, role, login_password, role_engines):
+    """Register one genuine separate login engine before returning its factory."""
+    publisher = create_async_engine(
+        engine.url.set(username=role, password=login_password),
+        pool_size=1,
+        max_overflow=0,
+        hide_parameters=True,
+    )
+    role_engines.append(publisher)
+    return async_sessionmaker(publisher, expire_on_commit=False)
+
+
 @asynccontextmanager
 async def _native_scope(tmp_path, *, complete_graph=False):
     """Own synthetic source evidence, actual scope DDL, roles and exact cleanup."""
     # Exact cleanup inventory exists before the first schema/role mutation.
     roles = ["scope_native_" + kind + "_" + uuid4().hex for kind in ("owner", "approver", "reader")]
     owner, approver, reader = roles
+    retention_role = "scope_retention_" + uuid4().hex
+    all_roles = [*roles, retention_role]
     login_password = uuid4().hex
     control = "scope_native_" + uuid4().hex
     journal = tmp_path / "scope-cleanup-registration.json"
     created_roles, role_engines = [], []
-    journal.write_text(json.dumps({"roles": roles, "control_schema": control, "phase": "registered"}))
+    journal.write_text(json.dumps({"roles": all_roles, "control_schema": control, "phase": "registered"}))
     async with _database() as (engine, source_name):
         is_control_created = False
         runtime = None
         try:
-            await _create_roles(engine, roles, created_roles, journal, login_password)
+            await _create_roles(engine, all_roles, created_roles, journal, login_password)
             source_snapshot = await graph_fixture._seed(engine, source_name, tmp_path, include_reverse=complete_graph)
             document = _preview_document(source_snapshot)
             async with engine.begin() as connection:
@@ -371,6 +385,8 @@ async def _native_scope(tmp_path, *, complete_graph=False):
                 ambient=async_sessionmaker(ambient),
                 control=control,
                 roles=roles,
+                retention_role=retention_role,
+                retention_sessions=_retention_factory(engine, retention_role, login_password, role_engines),
             )
         finally:
             if runtime is not None:
@@ -379,7 +395,7 @@ async def _native_scope(tmp_path, *, complete_graph=False):
             journal.write_text(
                 json.dumps(
                     {
-                        "roles": roles,
+                        "roles": all_roles,
                         "control_schema": control,
                         "source_schema": source_name,
                         "phase": "cleanup_verified",
@@ -1010,6 +1026,22 @@ async def _published_source_fixture(fixture):
     }
 
 
+async def _grant_retention_writer(connection, fixture):
+    """Close the disposable Approver bypass and provision the genuine Publisher."""
+    from process.registry_ptg_published_provisioning import PIN_INSERT_COLUMNS
+    from process.registry_ptg_source_retention import source_retention_provisioning_statements
+
+    schema_name, role = fixture.service.schema_name, fixture.retention_role
+    await connection.exec_driver_sql(
+        f'REVOKE INSERT({",".join(PIN_INSERT_COLUMNS)}) ON "{schema_name}".ptg2_snapshot_pin FROM "{fixture.roles[1]}"'
+    )
+    await connection.exec_driver_sql(f'GRANT USAGE ON SCHEMA "{schema_name}","{fixture.control}" TO "{role}"')
+    for schema in (schema_name, fixture.control):
+        await connection.exec_driver_sql(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role}"')
+    for statement in source_retention_provisioning_statements(schema_name, role):
+        await connection.exec_driver_sql(statement)
+
+
 @asynccontextmanager
 async def _published_lock_provision(fixture, tmp_path):
     """Register narrow grants/constant columns before changing task-owned fixtures."""
@@ -1023,6 +1055,8 @@ async def _published_lock_provision(fixture, tmp_path):
     schema_name = fixture.service.schema_name
     owner, approver, reader = fixture.roles
     statements = published_lock_provisioning_statements(schema_name, reader, approver)
+    retention_role = fixture.retention_role
+    previous_service = fixture.service
     journal = tmp_path / "published-lock-capability-registration.json"
     journal.write_text(
         json.dumps(
@@ -1043,15 +1077,21 @@ async def _published_lock_provision(fixture, tmp_path):
             )
             for statement in statements:
                 await connection.exec_driver_sql(statement)
+            await _grant_retention_writer(connection, fixture)
+        fixture.service = replace(fixture.service, source_retention_sessions=fixture.retention_sessions)
         yield
     finally:
+        fixture.service = previous_service
         async with fixture.engine.begin() as connection:
             for table in HEADER_TABLES:
                 await connection.exec_driver_sql(
-                    f'REVOKE UPDATE({LOCK_COLUMN}) ON "{schema_name}"."{table}" FROM "{reader}","{approver}"'
+                    f'REVOKE UPDATE({LOCK_COLUMN}) ON "{schema_name}"."{table}" FROM "{reader}","{approver}","{retention_role}"'
                 )
             await connection.exec_driver_sql(
                 f'REVOKE INSERT({",".join(PIN_INSERT_COLUMNS)}) ON "{schema_name}".ptg2_snapshot_pin FROM "{approver}"'
+            )
+            await connection.exec_driver_sql(
+                f'REVOKE INSERT({",".join(PIN_INSERT_COLUMNS)}),DELETE ON "{schema_name}".ptg2_snapshot_pin FROM "{retention_role}"'
             )
         journal.write_text(json.dumps({"phase": "revoked", "source_schema": schema_name, "statements": statements}))
 
@@ -1120,18 +1160,21 @@ async def _deny_published_header_mutations(session, schema_name):
         assert constant.value.orig.sqlstate == "23514"
 
 
-async def _published_role_probe(fixture, ownership, sessions, pin_writer):
+async def _published_role_probe(fixture, ownership, sessions, pin_writer, *, retention_publisher=False):
     from process.ptg_parts.result_archive_source_authority import commit_ptg_result_archive_source_authority
     from process.registry_ptg_published_plan_source import published_plan_inventory
     from process.registry_ptg_published_provisioning import require_published_lock_privileges
 
+    operation_id = "native_immutable_slot_probe_" + sessions.kw["bind"].url.username
     async with sessions() as session, session.begin():
-        await require_published_lock_privileges(session, fixture.service.schema_name, pin_writer=pin_writer)
+        await require_published_lock_privileges(
+            session, fixture.service.schema_name, pin_writer=pin_writer, retention_publisher=retention_publisher
+        )
         before = await published_plan_inventory(
             session,
             fixture.service.schema_name,
             ownership,
-            operation_id="native_immutable_slot_probe",
+            operation_id=operation_id,
         )
         if pin_writer:
             await commit_ptg_result_archive_source_authority(
@@ -1140,12 +1183,19 @@ async def _published_role_probe(fixture, ownership, sessions, pin_writer):
             await commit_ptg_result_archive_source_authority(
                 session, schema_name=fixture.service.schema_name, authority=before["authority"]
             )
+        else:
+            with pytest.raises(DBAPIError) as denied:
+                async with session.begin_nested():
+                    await commit_ptg_result_archive_source_authority(
+                        session, schema_name=fixture.service.schema_name, authority=before["authority"]
+                    )
+            assert denied.value.orig.sqlstate == "42501"
         await _deny_published_header_mutations(session, fixture.service.schema_name)
         after = await published_plan_inventory(
             session,
             fixture.service.schema_name,
             ownership,
-            operation_id="native_immutable_slot_probe",
+            operation_id=operation_id,
         )
         assert before == after
 
@@ -1155,7 +1205,8 @@ async def test_native_published_lock_slots_deny_identity_mutation_and_preserve_h
     async with _native_scope(tmp_path) as fixture:
         ownership = await _published_source_fixture(fixture)
         async with _published_lock_provision(fixture, tmp_path):
-            await _published_role_probe(fixture, ownership, fixture.approver, True)
+            await _published_role_probe(fixture, ownership, fixture.retention_sessions, True, retention_publisher=True)
+            await _published_role_probe(fixture, ownership, fixture.approver, False)
             await _published_role_probe(fixture, ownership, fixture.reader, False)
 
 
@@ -1224,6 +1275,9 @@ async def _published_review_setup(fixture, tmp_path, ownership, network_id, appr
         await connection.exec_driver_sql(f'ALTER TABLE {table} OWNER TO "{fixture.roles[0]}"')
         await connection.exec_driver_sql(f'GRANT SELECT ON {table} TO "{fixture.roles[2]}"')
         await connection.exec_driver_sql(f'GRANT SELECT,INSERT ON {table} TO "{fixture.roles[1]}"')
+        if fixture.service.source_retention_sessions is not None:
+            retention_role = fixture.service.source_retention_sessions.kw["bind"].url.username
+            await connection.exec_driver_sql(f'GRANT SELECT ON {table} TO "{retention_role}"')
     old_intent_by_field = fixture.document["command"]
     intent_by_field = {
         name: field_value

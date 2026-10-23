@@ -94,7 +94,27 @@ def _bind_office_hold(monkeypatch, session, service, events):
     monkeypatch.setattr(retention, "retain_registry_ptg_office_capture", retain_office)
 
 
+def _bind_source_retention(monkeypatch, session, events):
+    """Model committed custody separately from the actual approval transaction."""
+    from process import registry_ptg_source_retention as source_retention
+
+    async def prepare_source(_service, envelope, _deadline, state):
+        events.append("source_commit")
+        state["authority"] = envelope["command"]["source"]["evidence"]["source_authority"]
+        return state["authority"]
+
+    async def pin_source(actual_session, schema_name, command_by_field, source_authority):
+        assert actual_session is session
+        events.append("source_recheck")
+        return source_authority
+
+    monkeypatch.setattr(approval, "_retained_source", pin_source)
+    monkeypatch.setattr(source_retention, "retain_office_review_source", prepare_source)
+    monkeypatch.setattr(source_retention, "reconcile_unapproved_review_source", AsyncMock())
+
+
 def _boundaries(monkeypatch, *, physical_error=None, authority_error=None, commit_error=None):
+    """Keep physical and external-authority boundaries distinct from owner commit."""
     events = []
     service, _ = _service()
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: "original,pg_catalog")))
@@ -140,12 +160,7 @@ def _boundaries(monkeypatch, *, physical_error=None, authority_error=None, commi
     monkeypatch.setattr(approval, "_physical_review", physical)
     monkeypatch.setattr(approval, "_retain", retain)
 
-    async def pin_source(actual_session, schema_name, command_by_field):
-        assert actual_session is session
-        events.append("source_pin")
-        return command_by_field["source"]["evidence"]["source_authority"]
-
-    monkeypatch.setattr(approval, "_pin_source", pin_source)
+    _bind_source_retention(monkeypatch, session, events)
     _bind_office_hold(monkeypatch, session, service, events)
     monkeypatch.setattr(engine.RegistryPTGScopeAuthorityClient, "authorize", authorize)
     return service, session, events
@@ -156,10 +171,11 @@ async def test_actual_service_orders_witness_auth_append_and_owner_commit(monkey
     service, session, events = _boundaries(monkeypatch)
     reply = await service.approve_offices(_envelope())
     assert reply["state"] == "reviewed" and events == [
+        "source_commit",
         "fence",
         "physical",
         "authorize",
-        "source_pin",
+        "source_recheck",
         "retain",
         "office_hold",
         "commit",
@@ -288,29 +304,23 @@ async def test_exact_whole_approval_replay_is_all_or_conflict(row_count):
 @pytest.mark.parametrize("is_changed", [False, True])
 async def test_independent_office_source_pin_requires_original_identity(monkeypatch, is_changed):
     from process.ptg_parts import result_archive_published_authority as published_source
-    from process.ptg_parts import result_archive_source_authority as source_writer
 
     command_by_field = _command()
     identity_by_field = dict(command_by_field["source"]["evidence"]["source_authority"]["identity"])
+    operation_id = "registry_ptg_office_review_" + command_by_field["capture_id"].replace("-", "")
+    expected = published_source.PtgPublishedResultSourceAuthority(operation_id, identity_by_field).as_dict()
     if is_changed:
         identity_by_field["snapshot_key"] += 1
-    operation_id = "registry_ptg_office_review_" + command_by_field["capture_id"].replace("-", "")
     source_pin = published_source.PtgPublishedResultSourceAuthority(operation_id, identity_by_field)
-    prepared = AsyncMock(return_value=source_pin)
-    committed = AsyncMock(return_value=source_pin)
-    monkeypatch.setattr(published_source, "prepare_ptg_published_result_source_authority", prepared)
-    monkeypatch.setattr(source_writer, "commit_ptg_result_archive_source_authority", committed)
+    checked = AsyncMock(return_value=source_pin)
+    monkeypatch.setattr(published_source, "lock_ptg_published_result_for_clone", checked)
     session = object()
     if is_changed:
         with pytest.raises(ValueError, match="source_changed"):
-            await approval._pin_source(session, "synthetic_ptg", command_by_field)
-        assert committed.await_count == 0
+            await approval._retained_source(session, "synthetic_ptg", command_by_field, expected)
     else:
-        assert await approval._pin_source(session, "synthetic_ptg", command_by_field) == source_pin.as_dict()
-        assert (
-            committed.await_args.args[0] is session and committed.await_args.kwargs["authority"] == source_pin.as_dict()
-        )
-    assert prepared.await_args.kwargs["operation_id"] == operation_id
+        assert await approval._retained_source(session, "synthetic_ptg", command_by_field, expected) == expected
+    checked.assert_awaited_once_with(session, schema_name="synthetic_ptg", authority=expected)
 
 
 @pytest.mark.asyncio
@@ -378,7 +388,7 @@ async def test_hold_failure_rolls_back_original_approval_and_source_pin(monkeypa
         await service.approve_offices(_envelope())
     assert caught.value is original
     assert events[-3:] == ["retain", "office_hold_failure", "rollback"]
-    assert "source_pin" in events and "commit" not in events
+    assert "source_recheck" in events and "commit" not in events
 
 
 @pytest.mark.asyncio

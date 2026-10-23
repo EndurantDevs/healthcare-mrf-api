@@ -32,13 +32,13 @@ from process.ptg_wave_ordinary_terminal_receipt import (
     ENGINE_REPORT_DIGEST_DOMAIN,
     ORDINARY_TERMINAL_PAYLOAD_FIELDS,
     ORDINARY_TERMINAL_REQUEST_SCHEMA,
-    PTGWaveOrdinaryTerminalConflict,
-    PTGWaveOrdinaryTerminalRetryable,
     RUN_METRICS_DIGEST_DOMAIN,
     RUN_PARAMS_DIGEST_DOMAIN,
     SCOPE_DIGEST_DOMAIN,
     SNAPSHOT_MANIFEST_DIGEST_DOMAIN,
     TERMINAL_RESULT_DIGEST_DOMAIN,
+    PTGWaveOrdinaryTerminalConflict,
+    PTGWaveOrdinaryTerminalRetryable,
     issue_ordinary_terminal_receipt,
     ordinary_terminal_receipt_payload,
     validate_ordinary_terminal_request,
@@ -62,17 +62,9 @@ from process.ptg_wave_state import canonical_json, sha256_digest
 from process.ptg_wave_v12_pristine_abandonment import (
     abandonment_receipt_payload,
 )
-from tests.ptg_wave_supersession_fixtures import recovery_proofs
-from tests.test_control_import_waves import (
-    _KEY,
-    _unsigned,
+from tests.ptg_blank_terminal_support import (
+    blank_ordinary_result as _blank_ordinary_result,
 )
-from tests.ptg_wave_receipt_test_keys import (
-    EPHEMERAL_RECEIPT_PRIVATE_KEY,
-    EPHEMERAL_RECEIPT_PUBLIC_MODULUS,
-)
-
-
 from tests.ptg_wave_ordinary_terminal_receipt_support import (
     CONTENT_VERSION,
     ENGINE_IMPORT_RUN_ID,
@@ -85,19 +77,76 @@ from tests.ptg_wave_ordinary_terminal_receipt_support import (
     ORDINARY_RUN_ID,
     PLAN_IDS,
     PLAN_MARKET_TYPES,
-    QueuedTerminalSession as _QueuedTerminalSession,
-    ScalarResult as _ScalarResult,
     SNAPSHOT_ID,
     SOURCE_FILE_ID,
+)
+from tests.ptg_wave_ordinary_terminal_receipt_support import (
+    QueuedTerminalSession as _QueuedTerminalSession,
+)
+from tests.ptg_wave_ordinary_terminal_receipt_support import (
+    ScalarResult as _ScalarResult,
+)
+from tests.ptg_wave_ordinary_terminal_receipt_support import (
     TerminalTransaction as _TerminalTransaction,
+)
+from tests.ptg_wave_ordinary_terminal_receipt_support import (
     direct_v6_boundary as _direct_v6_boundary,
+)
+from tests.ptg_wave_ordinary_terminal_receipt_support import (
     keyring as _keyring,
+)
+from tests.ptg_wave_ordinary_terminal_receipt_support import (
     ordinary_result as _ordinary_result,
+)
+from tests.ptg_wave_ordinary_terminal_receipt_support import (
     v13_ordinary_result as _v13_ordinary_result,
 )
-from tests.ptg_blank_terminal_support import (
-    blank_ordinary_result as _blank_ordinary_result,
+from tests.ptg_wave_receipt_test_keys import (
+    EPHEMERAL_RECEIPT_PRIVATE_KEY,
+    EPHEMERAL_RECEIPT_PUBLIC_MODULUS,
 )
+from tests.ptg_wave_supersession_fixtures import recovery_proofs
+from tests.test_control_import_waves import (
+    _KEY,
+    _unsigned,
+)
+
+
+def _stub_reference_admission(monkeypatch, state):
+    from process import ptg_wave_ordinary_terminal_receipt as terminal_module
+
+    reference = terminal_module._terminal_snapshot_reference(state)
+    monkeypatch.setattr(
+        terminal_module,
+        "_preflight_terminal_snapshot_reference",
+        AsyncMock(return_value=reference),
+    )
+    acquire_lifetime = AsyncMock(return_value=reference.source_key)
+    monkeypatch.setattr(terminal_module, "acquire_snapshot_reference_lifetime", acquire_lifetime)
+    return reference, acquire_lifetime
+
+
+def _bind_receipt_session(monkeypatch, session):
+    from process import ptg_wave_ordinary_terminal_receipt as terminal_module
+
+    engine = SimpleNamespace()
+    engine.engine = engine
+    monkeypatch.setattr(terminal_module.db, "engine", SimpleNamespace(sync_engine=engine))
+    session.get_bind = lambda: engine
+    return engine
+
+
+def _assert_lifetime_admission(acquire_lifetime, session, reference):
+    from process import ptg_wave_ordinary_terminal_receipt as terminal_module
+
+    acquire_lifetime.assert_awaited_once_with(
+        session,
+        schema_name=terminal_module.resolve_ptg2_schema(),
+        snapshot_id=reference.snapshot_id,
+        internal_run_id=reference.internal_run_id,
+        lock_timeout="250ms",
+        statement_timeout="5s",
+    )
 
 
 def test_builds_per_member_terminal_payload_from_later_ordinary_run(monkeypatch):
@@ -116,16 +165,12 @@ def test_builds_per_member_terminal_payload_from_later_ordinary_run(monkeypatch)
         "content_version": CONTENT_VERSION,
         "import_month": IMPORT_MONTH,
         "historical_source_file_import_id": "candidate-neutral-v12",
-        "direct_input_digest": state["intent"].params[
-            "direct_rate_file_intent_sha256"
-        ],
+        "direct_input_digest": state["intent"].params["direct_rate_file_intent_sha256"],
     }
     assert payload["scope"]["plan_ids"] == ORDINARY_PLAN_IDS
     assert payload["scope"]["admission_plan_ids"] == PLAN_IDS
     assert payload["terminal_result"]["engine_result_status"] == "validated"
-    assert payload["terminal_result"]["finished_at"] == (
-        "2026-08-10T13:14:15.123456Z"
-    )
+    assert payload["terminal_result"]["finished_at"] == ("2026-08-10T13:14:15.123456Z")
     assert len(payload["terminal_result_digest"]) == 64
 
 
@@ -139,9 +184,9 @@ def test_builds_authenticated_blank_terminal_payload(monkeypatch):
     assert payload["terminal_result"]["engine_result_status"] == "failed"
     assert payload["snapshot_id"] == SNAPSHOT_ID
 
-    state["engine_snapshot"].manifest["allowed_amount_lane"][
-        "successful_files"
-    ][0]["summary"]["allowed_amount_payments"] = 1
+    state["engine_snapshot"].manifest["allowed_amount_lane"]["successful_files"][0]["summary"][
+        "allowed_amount_payments"
+    ] = 1
     with pytest.raises(
         PTGWaveOrdinaryTerminalConflict,
         match="durable PTG result",
@@ -153,9 +198,7 @@ def test_builds_authenticated_blank_terminal_payload(monkeypatch):
     ("mutation", "message"),
     (
         (
-            lambda state: setattr(
-                state["run"], "run_id", state["intent"].run_id
-            ),
+            lambda state: setattr(state["run"], "run_id", state["intent"].run_id),
             "run identity|frozen V12 member",
         ),
         (
@@ -202,9 +245,7 @@ def test_rejects_wave_run_scope_result_and_abandonment_drift(
 def test_request_and_digest_domains_are_frozen(monkeypatch):
     state = _ordinary_result(monkeypatch)
     request = state["request"]
-    assert validate_ordinary_terminal_request(
-        request, operation_id=OPERATION_ID
-    ) == request
+    assert validate_ordinary_terminal_request(request, operation_id=OPERATION_ID) == request
     for domain in (
         COORDINATE_DIGEST_DOMAIN,
         SCOPE_DIGEST_DOMAIN,
@@ -217,9 +258,7 @@ def test_request_and_digest_domains_are_frozen(monkeypatch):
     ):
         assert domain.startswith("healthporta.ptg-wave-ordinary-terminal-")
         assert domain.endswith(".v1")
-    assert ORDINARY_TERMINAL_RECEIPT_SCHEMA == (
-        "healthporta.ptg-wave-ordinary-terminal-receipt.v1"
-    )
+    assert ORDINARY_TERMINAL_RECEIPT_SCHEMA == ("healthporta.ptg-wave-ordinary-terminal-receipt.v1")
 
     invalid = copy.deepcopy(request)
     invalid["extra"] = True
@@ -240,6 +279,7 @@ async def test_issue_reads_one_member_and_replays_exact_receipt(
     from process import ptg_wave_ordinary_terminal_receipt as terminal_module
 
     state = state_factory(monkeypatch)
+    reference, acquire_lifetime = _stub_reference_admission(monkeypatch, state)
     first_session = _QueuedTerminalSession(
         [
             None,
@@ -252,6 +292,7 @@ async def test_issue_reads_one_member_and_replays_exact_receipt(
         ]
     )
     transactions = [_TerminalTransaction(first_session)]
+    engine = _bind_receipt_session(monkeypatch, first_session)
     monkeypatch.setattr(
         terminal_module.db,
         "transaction",
@@ -275,6 +316,7 @@ async def test_issue_reads_one_member_and_replays_exact_receipt(
         first_session,
         release_pin,
     )
+    _assert_lifetime_admission(acquire_lifetime, first_session, reference)
     await _assert_terminal_receipt_replay(
         state,
         keyring,
@@ -282,6 +324,7 @@ async def test_issue_reads_one_member_and_replays_exact_receipt(
         release_pin,
         existing,
         receipt,
+        engine,
     )
 
 
@@ -297,9 +340,7 @@ def _assert_first_terminal_receipt_write(created, session, release_pin):
         for statement, params in session.statements
         if params is None
     ]
-    member_queries = [
-        sql for sql in statement_sql_texts if "ptg_import_wave_intent" in sql
-    ]
+    member_queries = [sql for sql in statement_sql_texts if "ptg_import_wave_intent" in sql]
     assert len(member_queries) == 1
     assert "ptg_import_wave_intent.wave_id =" in member_queries[0]
     assert "ptg_import_wave_intent.ordinal =" in member_queries[0]
@@ -314,6 +355,7 @@ async def _assert_terminal_receipt_replay(
     release_pin,
     existing,
     receipt,
+    engine,
 ) -> None:
     """Replay the persisted envelope without another write."""
     replay_session = _QueuedTerminalSession(
@@ -327,6 +369,7 @@ async def _assert_terminal_receipt_replay(
             state["engine_snapshot"],
         ]
     )
+    replay_session.get_bind = lambda: engine
     transactions.append(_TerminalTransaction(replay_session))
     replay, replay_created = await issue_ordinary_terminal_receipt(
         OPERATION_ID,
@@ -349,6 +392,7 @@ async def test_issue_bounds_database_wait_and_returns_retryable(
     from process import ptg_wave_ordinary_terminal_receipt as terminal_module
 
     state = _ordinary_result(monkeypatch)
+    _stub_reference_admission(monkeypatch, state)
 
     class DatabaseWaitExpired(Exception):
         pass
@@ -367,6 +411,7 @@ async def test_issue_bounds_database_wait_and_returns_retryable(
             return _ScalarResult(None)
 
     session = TimeoutSession()
+    _bind_receipt_session(monkeypatch, session)
     monkeypatch.setattr(
         terminal_module.db,
         "transaction",
@@ -388,9 +433,7 @@ async def test_issue_bounds_database_wait_and_returns_retryable(
     assert "set_config('statement_timeout'" in first_sql
     assert first_params == {
         "lock_timeout": terminal_module.ORDINARY_TERMINAL_LOCK_TIMEOUT,
-        "statement_timeout": (
-            terminal_module.ORDINARY_TERMINAL_STATEMENT_TIMEOUT
-        ),
+        "statement_timeout": (terminal_module.ORDINARY_TERMINAL_STATEMENT_TIMEOUT),
     }
 
 
@@ -399,9 +442,7 @@ def test_identical_coordinate_cross_operation_run_swap_is_rejected(monkeypatch):
     coordinate_before_by_field = {
         "source_key": state["run"].params["source_key"],
         "selector": state["run"].params["in_network_url"],
-        "input_digest": state["run"].params[
-            "ordinary_cutover_direct_input_digest"
-        ],
+        "input_digest": state["run"].params["ordinary_cutover_direct_input_digest"],
     }
     other_operation_id = "8" * 64
     state["run"].params.update(
@@ -411,9 +452,7 @@ def test_identical_coordinate_cross_operation_run_swap_is_rejected(monkeypatch):
     assert coordinate_before_by_field == {
         "source_key": state["run"].params["source_key"],
         "selector": state["run"].params["in_network_url"],
-        "input_digest": state["run"].params[
-            "ordinary_cutover_direct_input_digest"
-        ],
+        "input_digest": state["run"].params["ordinary_cutover_direct_input_digest"],
     }
     with pytest.raises(
         PTGWaveOrdinaryTerminalConflict,
@@ -443,9 +482,7 @@ async def test_route_returns_first_write_and_exact_replay_status(monkeypatch):
     process_keyring = object()
     request = SimpleNamespace(
         json=state["request"],
-        app=SimpleNamespace(
-            ctx=SimpleNamespace(ptg_wave_receipt_keyring=process_keyring)
-        ),
+        app=SimpleNamespace(ctx=SimpleNamespace(ptg_wave_receipt_keyring=process_keyring)),
     )
 
     first = await routes.control_issue_ordinary_terminal_receipt(
@@ -474,16 +511,12 @@ async def test_route_marks_bounded_database_wait_retryable(monkeypatch):
         routes,
         "issue_ordinary_terminal_receipt",
         AsyncMock(
-            side_effect=PTGWaveOrdinaryTerminalRetryable(
-                "ordinary terminal receipt database wait expired; retry"
-            )
+            side_effect=PTGWaveOrdinaryTerminalRetryable("ordinary terminal receipt database wait expired; retry")
         ),
     )
     request = SimpleNamespace(
         json=state["request"],
-        app=SimpleNamespace(
-            ctx=SimpleNamespace(ptg_wave_receipt_keyring=object())
-        ),
+        app=SimpleNamespace(ctx=SimpleNamespace(ptg_wave_receipt_keyring=object())),
     )
 
     with pytest.raises(SanicException) as failure:

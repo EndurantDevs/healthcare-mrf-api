@@ -75,7 +75,7 @@ def _configuration(configured):
             configured = json.loads(configured, object_pairs_hook=_unique_fields)
         except ValueError, TypeError, UnicodeError, RecursionError:
             raise _invalid() from None
-    if type(configured) is not dict or set(configured) not in (
+    if type(configured) is not dict or set(configured) - {"source_retention_dsn"} not in (
         _FIELDS,
         _FIELDS | {"office_custody"},
         _FIELDS | {"office_custody", "publisher_dsn"},
@@ -118,6 +118,8 @@ def _configuration(configured):
         ):
             raise _invalid()
         publisher = _publisher_url(configuration_by_field, reader)
+        if "source_retention_dsn" in configured:
+            configuration_by_field["source_retention_url"] = _source_retention_url(configuration_by_field, reader)
         if "office_intents" in configuration_by_field:
             configuration_by_field["office_intent_urls"] = _intent_urls(configuration_by_field, reader, publisher)
     except ValueError, TypeError, UnicodeError, SQLAlchemyError:
@@ -157,6 +159,30 @@ def _publisher_url(configured, reader):
         or publisher.username in {reader.username, configured["owner_role"], configured["approval_role"]}
         or (publisher.host, publisher.port, publisher.database, publisher.query)
         != (reader.host, reader.port, reader.database, reader.query)
+    ):
+        raise _invalid()
+    return publisher
+
+
+def _source_retention_url(configured, reader):
+    dsn = configured["source_retention_dsn"]
+    if type(dsn) is not str or not 1 <= len(dsn) <= 4096:
+        raise _invalid()
+    publisher = _database_url(dsn)
+    forbidden_roles = {reader.username, configured["owner_role"], configured["approval_role"]}
+    profile = configured.get("office_custody")
+    if profile is not None:
+        forbidden_roles |= {profile.owner_role, profile.publisher_role}
+    if publisher.username in forbidden_roles or (
+        publisher.host,
+        publisher.port,
+        publisher.database,
+        publisher.query,
+    ) != (
+        reader.host,
+        reader.port,
+        reader.database,
+        reader.query,
     ):
         raise _invalid()
     return publisher
@@ -318,6 +344,17 @@ async def _office_coordinator(preparation, urls, cleanup):
     return coordinator
 
 
+async def _check_source_retention(service):
+    """Attest the dedicated Publisher before exposing any approval route."""
+    if service.source_retention_sessions is None:
+        return
+    from process.registry_ptg_source_retention import source_retention_transaction
+
+    async with source_retention_transaction(service) as session:
+        for table in ("registry_ptg_published_plan_scope", "registry_ptg_office_approval", "registry_ptg_office_hold"):
+            await _protected_store(session, service.store, write=False, table_name=table)
+
+
 async def build_registry_ptg_scope_runtime(configured):
     """Validate the one server input and native role closure before exposure.
 
@@ -346,7 +383,13 @@ async def build_registry_ptg_scope_runtime(configured):
                 authority,
                 configured.get("office_custody"),
                 source_reviews_authority=authority.authorize_source_reviews,
+                source_retention_sessions=(
+                    _owned_sessions(configured["source_retention_url"], cleanup)
+                    if "source_retention_url" in configured
+                    else None
+                ),
             )
+            await _check_source_retention(service)
             preparation = await _office_preparation(service, publisher, cleanup)
             coordinator = await _office_coordinator(preparation, configured.get("office_intent_urls"), cleanup)
             return RegistryPTGScopeRuntime(

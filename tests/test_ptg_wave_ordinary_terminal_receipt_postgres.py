@@ -20,7 +20,6 @@ from process.ptg_wave_receipt_authority import (
 )
 from tests.test_ptg_wave_recovery_storage_postgres import _dsn, _quote
 
-
 OPERATION_ID = "9" * 64
 
 
@@ -28,12 +27,8 @@ class _SyntheticKeyring:
     def sign_receipt(self, *, schema, key_id, issued_at, receipt_payload):
         issued = issued_at
         if isinstance(issued, dt.datetime):
-            issued = issued.astimezone(dt.UTC).strftime(
-                "%Y-%m-%dT%H:%M:%S.%fZ"
-            )
-        digest = hashlib.sha256(
-            repr(sorted(receipt_payload.items())).encode()
-        ).hexdigest()
+            issued = issued.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        digest = hashlib.sha256(repr(sorted(receipt_payload.items())).encode()).hexdigest()
         return {
             "schema": schema,
             "key_id": key_id,
@@ -84,10 +79,7 @@ async def test_pool_five_cancellation_and_blocked_member_do_not_starve_peers(
     holder_transaction = await holder.begin()
     try:
         await holder.execute(
-            text(
-                f"SELECT member_ordinal FROM {quoted}.terminal_member "
-                "WHERE member_ordinal = 0 FOR UPDATE"
-            )
+            text(f"SELECT member_ordinal FROM {quoted}.terminal_member WHERE member_ordinal = 0 FOR UPDATE")
         )
         baseline_checked_out = engine.pool.checkedout()
         assert baseline_checked_out == 1
@@ -115,8 +107,7 @@ def _terminal_pool_callbacks(quoted, member_zero_waiting):
         row = (
             await session.execute(
                 text(
-                    f"SELECT receipt FROM {quoted}.terminal_receipt "
-                    "WHERE member_ordinal = :member_ordinal FOR UPDATE"
+                    f"SELECT receipt FROM {quoted}.terminal_receipt WHERE member_ordinal = :member_ordinal FOR UPDATE"
                 ),
                 {"member_ordinal": request["member_ordinal"]},
             )
@@ -131,12 +122,10 @@ def _terminal_pool_callbacks(quoted, member_zero_waiting):
             receipt_key_id=request["key_id"],
             receipt=row,
             payload_digest=row["payload_digest"],
-            issued_at=dt.datetime.fromisoformat(
-                row["issued_at"].replace("Z", "+00:00")
-            ),
+            issued_at=dt.datetime.fromisoformat(row["issued_at"].replace("Z", "+00:00")),
         )
 
-    async def load_snapshot(session, request):
+    async def load_snapshot(session, request, *, expected_reference):
         if request["member_ordinal"] == 0:
             member_zero_waiting.set()
         ordinal = (
@@ -162,6 +151,7 @@ def _terminal_pool_callbacks(quoted, member_zero_waiting):
                 "receipt": json.dumps(receipt),
             },
         )
+
     return load_existing, load_snapshot, persist
 
 
@@ -170,6 +160,18 @@ def _patch_terminal_pool(monkeypatch, local_db, callbacks) -> None:
     monkeypatch.setattr(terminal, "db", local_db)
     monkeypatch.setattr(terminal, "_load_existing_receipt", load_existing)
     monkeypatch.setattr(terminal, "_load_terminal_snapshot", load_snapshot)
+    monkeypatch.setattr(
+        terminal,
+        "_preflight_terminal_snapshot_reference",
+        AsyncMock(
+            return_value=terminal._TerminalSnapshotReference("synthetic-run", "synthetic-snapshot", "synthetic_source")
+        ),
+    )
+    monkeypatch.setattr(
+        terminal,
+        "acquire_snapshot_reference_lifetime",
+        AsyncMock(return_value="synthetic_source"),
+    )
     monkeypatch.setattr(
         terminal,
         "_verify_abandonment_signature",
@@ -197,17 +199,10 @@ async def _create_terminal_pool_schema(engine, quoted) -> None:
     async with engine.begin() as connection:
         await connection.exec_driver_sql(f"DROP SCHEMA IF EXISTS {quoted} CASCADE")
         await connection.exec_driver_sql(f"CREATE SCHEMA {quoted}")
+        await connection.exec_driver_sql(f"CREATE TABLE {quoted}.terminal_member (member_ordinal integer PRIMARY KEY)")
+        await connection.exec_driver_sql(f"INSERT INTO {quoted}.terminal_member SELECT generate_series(0, 23)")
         await connection.exec_driver_sql(
-            f"CREATE TABLE {quoted}.terminal_member ("
-            "member_ordinal integer PRIMARY KEY)"
-        )
-        await connection.exec_driver_sql(
-            f"INSERT INTO {quoted}.terminal_member "
-            "SELECT generate_series(0, 23)"
-        )
-        await connection.exec_driver_sql(
-            f"CREATE TABLE {quoted}.terminal_receipt ("
-            "member_ordinal integer PRIMARY KEY, receipt jsonb NOT NULL)"
+            f"CREATE TABLE {quoted}.terminal_receipt (member_ordinal integer PRIMARY KEY, receipt jsonb NOT NULL)"
         )
 
 
@@ -237,13 +232,16 @@ async def _assert_canceled_member_waiters_release_pool(
 
 async def _assert_peer_receipts_complete(engine, baseline_checked_out) -> None:
     peer_results = await asyncio.wait_for(
-        asyncio.gather(*(
-            terminal.issue_ordinary_terminal_receipt(
-                OPERATION_ID, _request(ordinal),
-                receipt_keyring=_SyntheticKeyring(),
+        asyncio.gather(
+            *(
+                terminal.issue_ordinary_terminal_receipt(
+                    OPERATION_ID,
+                    _request(ordinal),
+                    receipt_keyring=_SyntheticKeyring(),
+                )
+                for ordinal in range(1, 24)
             )
-            for ordinal in range(1, 24)
-        )),
+        ),
         timeout=8,
     )
     assert [receipt["payload"]["member_ordinal"] for receipt, _ in peer_results] == list(range(1, 24))
@@ -279,8 +277,6 @@ async def _assert_released_member_completes(engine, quoted) -> None:
     assert receipt["payload"]["member_ordinal"] == 0
     assert engine.pool.checkedout() == 0
     async with engine.begin() as connection:
-        assert await connection.scalar(
-            text(f"SELECT count(*) FROM {quoted}.terminal_receipt")
-        ) == 24
+        assert await connection.scalar(text(f"SELECT count(*) FROM {quoted}.terminal_receipt")) == 24
         await connection.exec_driver_sql(f"DROP SCHEMA {quoted} CASCADE")
     await engine.dispose()

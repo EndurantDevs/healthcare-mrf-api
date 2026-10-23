@@ -7,6 +7,7 @@ import re
 import secrets
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -14,6 +15,7 @@ from sqlalchemy import literal, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from api import ptg_membership_storage as storage
 from api import ptg_provider_membership_build as build
 from api.ptg2_v4_graph import V4GraphRoot, V4RelationManifest
 from api.ptg_membership_contract import CONTRACT, SPEC
@@ -58,13 +60,19 @@ async def _prepare_database(admin, url, role_names, role_password_by_name):
         await session.execute(text(f'CREATE SCHEMA hp_snapshot_retention AUTHORIZATION "{owner}"'))
         await session.execute(text(f'CREATE SCHEMA mrf AUTHORIZATION "{publisher}"'))
         await session.execute(text(f'GRANT USAGE ON SCHEMA mrf,hp_snapshot_retention TO "{reader}"'))
-        await session.execute(text("CREATE TABLE mrf.ptg2_snapshot(snapshot_id text PRIMARY KEY)"))
+        await session.execute(text("CREATE TABLE mrf.ptg2_import_run(import_run_id text PRIMARY KEY,options json)"))
+        await session.execute(
+            text("CREATE TABLE mrf.ptg2_snapshot(snapshot_id text PRIMARY KEY,import_run_id text,manifest json)")
+        )
         await session.execute(
             text(
                 "CREATE TABLE mrf.ptg2_snapshot_pin(owner_type text,owner_id text,snapshot_id text REFERENCES mrf.ptg2_snapshot(snapshot_id) ON DELETE RESTRICT,reason text,PRIMARY KEY(owner_type,owner_id,snapshot_id))"
             )
         )
-        await session.execute(text("INSERT INTO mrf.ptg2_snapshot VALUES ('synthetic-snapshot')"))
+        await session.execute(
+            text("INSERT INTO mrf.ptg2_import_run VALUES ('synthetic-run','{\"source_key\":\"synthetic_source\"}')")
+        )
+        await session.execute(text("INSERT INTO mrf.ptg2_snapshot VALUES ('synthetic-snapshot','synthetic-run','{}')"))
         for table, columns in (
             ("ptg2_current_snapshot", "slot text,snapshot_id text,previous_snapshot_id text"),
             ("ptg2_current_source_snapshot", "source_key text,snapshot_id text,previous_snapshot_id text"),
@@ -112,6 +120,7 @@ async def _cleanup_database(admin, url, role_names, stages):
             "ptg2_current_source_snapshot",
             "ptg2_current_snapshot",
             "ptg2_snapshot",
+            "ptg2_import_run",
         ):
             await session.execute(text(f"DROP TABLE IF EXISTS mrf.{name} RESTRICT"))
         await session.execute(text("DROP SCHEMA IF EXISTS mrf RESTRICT"))
@@ -143,6 +152,8 @@ async def _database(monkeypatch):
         await _prepare_database(admin, url, role_names, role_password_by_name)
         publisher_engine = create_async_engine(url.set(username=publisher, password=role_password_by_name[publisher]))
         sessions = async_sessionmaker(publisher_engine, expire_on_commit=False)
+        monkeypatch.setattr(build.db, "session_factory", sessions)
+        monkeypatch.setattr(build.db, "engine", publisher_engine)
         yield SimpleNamespace(
             admin=admin,
             sessions=sessions,
@@ -158,7 +169,7 @@ async def _database(monkeypatch):
 
 
 def _source(monkeypatch, *, fail_at=None, empty_code=False):
-    tables = SimpleNamespace(source_key="synthetic-source", snapshot_id="synthetic-snapshot", physical_binding=None)
+    tables = SimpleNamespace(source_key="synthetic_source", snapshot_id="synthetic-snapshot", physical_binding=None)
     root = V4GraphRoot(1, "pattern_v1", bytes.fromhex("ab" * 32))
     identity = make_identity(
         tables,
@@ -208,6 +219,7 @@ def _source(monkeypatch, *, fail_at=None, empty_code=False):
     from api import ptg2_serving as serving
 
     monkeypatch.setattr(build, "source_identity", source)
+    monkeypatch.setattr(storage, "source_identity", source)
     monkeypatch.setattr(build, "_authenticate_root", authenticate)
     monkeypatch.setattr(build, "load_v4_relation_manifest", manifest)
     monkeypatch.setattr(build, "lookup_v4_relation_members", members)
@@ -218,10 +230,9 @@ def _source(monkeypatch, *, fail_at=None, empty_code=False):
 
 
 async def _build(db, code="99213"):
-    async with db.sessions() as session, session.begin():
-        return await build.build_in_session(
-            session, source_key="synthetic-source", snapshot_id="synthetic-snapshot", code_system="CPT", code=code
-        )
+    return await build.build_provider_membership_projection(
+        source_key="synthetic_source", snapshot_id="synthetic-snapshot", code_system="CPT", code=code
+    )
 
 
 async def _assert_code_parity(db, schema):
@@ -412,4 +423,113 @@ async def test_sibling_code_index_pin_does_not_make_unreferenced_indexes_mutuall
             assert await locate(session, identity | {"code": "99214"}) is not None
         async with db.sessions() as session, session.begin():
             assert await retire_unreferenced(session, identity | {"code": "99214"}) is True
+            assert await session.scalar(text("SELECT count(*) FROM mrf.ptg2_snapshot_pin")) == 0
+
+
+@pytest.mark.asyncio
+async def test_copy_holds_committed_exact_retention_without_broad_or_source_fence(monkeypatch):
+    from process.ptg_parts.ptg2_lifecycle_lock import PTG2_SOURCE_POINTER_GC_LOCK_KEY, PTG2LifecycleLockDeferred
+
+    _, identity = _source(monkeypatch)
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def authenticate(*_args):
+        entered.set()
+        await finish.wait()
+
+    monkeypatch.setattr(build, "_authenticate_root", authenticate)
+    async with _database(monkeypatch) as db:
+        monkeypatch.setattr(build, "_reader_principals", AsyncMock(return_value=[]))
+        worker = asyncio.create_task(_build(db))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=10)
+            async with db.admin.begin() as session:
+                assert await session.scalar(text("SELECT count(*) FROM mrf.ptg2_snapshot_pin")) == 1
+                await session.execute(text("LOCK TABLE mrf.ptg2_snapshot_pin IN SHARE ROW EXCLUSIVE MODE NOWAIT"))
+                assert (
+                    await session.scalar(
+                        text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+                        {"key": PTG2_SOURCE_POINTER_GC_LOCK_KEY},
+                    )
+                    is True
+                )
+            async with db.sessions() as session, session.begin():
+                with pytest.raises(PTG2LifecycleLockDeferred, match="identity is busy"):
+                    await storage.release_unattached_source_retention(session, identity)
+            finish.set()
+            build_receipt = await worker
+            assert build_receipt["state"] == "ready"
+        finally:
+            finish.set()
+            if not worker.done():
+                worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_admission_is_recoverable_and_ready_projection_is_preserved(monkeypatch):
+    _, identity = _source(monkeypatch)
+    params_by_name = dict(
+        source_key="synthetic_source", snapshot_id="synthetic-snapshot", code_system="CPT", code="99213"
+    )
+    async with _database(monkeypatch) as db:
+        monkeypatch.setattr(build, "_reader_principals", AsyncMock(return_value=[]))
+        async with db.sessions() as session, session.begin():
+            assert await storage.prepare_source_retention(session, **params_by_name) == identity
+        async with db.sessions() as session, session.begin():
+            assert await storage.release_unattached_source_retention(session, identity) == 1
+        async with db.sessions() as session, session.begin():
+            assert await storage.release_unattached_source_retention(session, identity) == 0
+        async with db.sessions() as session, session.begin():
+            assert await storage.prepare_source_retention(session, **params_by_name) == identity
+        first = await _build(db)
+        assert first == await _build(db)
+        assert len(db.stages) == 1
+        async with db.sessions() as session, session.begin():
+            assert await storage.release_unattached_source_retention(session, identity) == 0
+            assert (await locate(session, identity)) is not None
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_in_handoff_gap_refuses_copy_without_losing_source(monkeypatch):
+    _, identity = _source(monkeypatch)
+    params_by_name = dict(
+        source_key="synthetic_source", snapshot_id="synthetic-snapshot", code_system="CPT", code="99213"
+    )
+    async with _database(monkeypatch) as db:
+        async with db.sessions() as session, session.begin():
+            assert await storage.prepare_source_retention(session, **params_by_name) == identity
+        async with db.sessions() as session, session.begin():
+            assert await storage.release_unattached_source_retention(session, identity) == 1
+        async with db.sessions() as session:
+            with pytest.raises(PTG2ManifestArtifactError, match="retention pin differs"):
+                async with session.begin():
+                    await build.build_in_session(session, **params_by_name, retained_identity=identity)
+        assert not db.stages
+        async with db.sessions() as session:
+            assert await session.scalar(text("SELECT count(*) FROM mrf.ptg2_snapshot")) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_sibling_retains_ready_projection_until_its_admission_is_reconciled(monkeypatch):
+    _, identity = _source(monkeypatch)
+    sibling_params_by_name = dict(
+        source_key="synthetic_source", snapshot_id="synthetic-snapshot", code_system="CPT", code="99214"
+    )
+    async with _database(monkeypatch) as db:
+        monkeypatch.setattr(build, "_reader_principals", AsyncMock(return_value=[]))
+        await _build(db)
+        async with db.sessions() as session, session.begin():
+            sibling_identity = await storage.prepare_source_retention(session, **sibling_params_by_name)
+        async with db.sessions() as session:
+            with pytest.raises(PTG2ManifestArtifactError, match="sibling retention pin is still preparing"):
+                async with session.begin():
+                    await retire_unreferenced(session, identity)
+        async with db.sessions() as session, session.begin():
+            assert (await locate(session, identity)) is not None
+            assert await storage.source_pin(session, sibling_identity) == storage._pin(sibling_identity)
+            assert await session.scalar(text("SELECT count(*) FROM mrf.ptg2_snapshot_pin")) == 2
+            assert await storage.release_unattached_source_retention(session, sibling_identity) == 1
+        async with db.sessions() as session, session.begin():
+            assert await retire_unreferenced(session, identity) is True
             assert await session.scalar(text("SELECT count(*) FROM mrf.ptg2_snapshot_pin")) == 0

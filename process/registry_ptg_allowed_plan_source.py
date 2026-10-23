@@ -167,12 +167,23 @@ async def load_allowed_plan_inventory(session, schema_name, snapshot_id):
     )
 
 
-async def allowed_plan_inventory(session, schema_name, ownership, *, operation_id):
+async def allowed_plan_inventory(session, schema_name, ownership, *, operation_id, source_authority=None):
     """Require real import ownership and complete reviewed source-file membership."""
     from process.ptg_parts.result_archive_allowed_authority import prepare_allowed_source_authority
 
-    inventory = await prepare_allowed_source_authority(session, schema_name, ownership["snapshot_id"], operation_id)
-    identity = inventory["identity"]
+    if source_authority is None:
+        inventory_by_field = await prepare_allowed_source_authority(
+            session, schema_name, ownership["snapshot_id"], operation_id
+        )
+    else:
+        from process.ptg_parts.result_archive_allowed_authority import lock_allowed_source_authority
+
+        retained = await lock_allowed_source_authority(session, schema_name=schema_name, authority=source_authority)
+        _require(retained.operation_id == operation_id and retained.as_dict() == source_authority)
+        inventory_by_field = await load_allowed_plan_inventory(session, schema_name, ownership["snapshot_id"])
+        _require(inventory_by_field["identity"] == retained.identity)
+        inventory_by_field = {**inventory_by_field, "authority": source_authority}
+    identity = inventory_by_field["identity"]
     _require(
         all(
             identity[name] == ownership[other]
@@ -188,11 +199,11 @@ async def allowed_plan_inventory(session, schema_name, ownership, *, operation_i
         sum(
             version["source_file_version_id"] == ownership["engine_source_file_version_id"]
             and version["source_identity_sha256"] == ownership["engine_source_identity_hash"]
-            for version in inventory["file_versions"]
+            for version in inventory_by_field["file_versions"]
         )
         == 1
     )
-    return inventory
+    return inventory_by_field
 
 
 async def is_allowed_snapshot(session, schema_name, snapshot_id):

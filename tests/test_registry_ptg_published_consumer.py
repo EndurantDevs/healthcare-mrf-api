@@ -10,14 +10,17 @@ from process import registry_ptg_published_provisioning as provisioning
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeError
 
 
-def test_operator_plan_grants_only_constant_lock_and_original_pin_insert_columns():
+def test_operator_plan_keeps_lock_columns_and_retires_original_pin_insert():
     statements = provisioning.published_lock_provisioning_statements("synthetic_ptg", "scope_reader", "scope_approver")
-    assert len(statements) == 13
+    assert len(statements) == 14
     assert all("UPDATE(registry_ptg_read_lock)" in statement for statement in statements if "GRANT UPDATE" in statement)
     assert not any(
         "GRANT UPDATE ON" in statement or "DELETE" in statement or "TRIGGER" in statement for statement in statements
     )
-    assert "INSERT(owner_type,owner_id,snapshot_id,reason,created_at)" in statements[-1]
+    assert not any("GRANT INSERT" in statement for statement in statements)
+    assert statements[-2:] == provisioning.published_pin_writer_revocation_statements(
+        "synthetic_ptg", "scope_reader", "scope_approver"
+    )
     for invalid in [("bad-schema", "reader", "writer"), ("schema", "same", "same")]:
         with pytest.raises(ValueError):
             provisioning.published_lock_provisioning_statements(*invalid)

@@ -7,11 +7,20 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from api.ptg_membership_contract import CONTRACT, SPEC, digest
+from api.ptg_membership_contract import CONTRACT, SPEC, digest, validate_params
+from api.ptg_membership_source import source_identity
 from process import reference_family_archive as native
 from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
+from process.ptg_parts.ptg2_lifecycle_lock import PTG2LifecycleLockDeferred
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
+from process.ptg_parts.result_archive_source_authority import _bounded_clone_lock_reads
+from process.ptg_parts.source_snapshot_reference_lifetime import (
+    _snapshot_source_identity,
+    acquire_snapshot_reference_lifetime,
+)
+
+_SOURCE_PIN_REASON = "active immutable provider membership projection"
 
 
 def attachment_name(identity):
@@ -40,8 +49,16 @@ async def protected_owner(session):
     return None if row is None else int(row[0])
 
 
-async def lock_identity(session, identity):
+async def lock_identity(session, identity, *, nowait=False):
     """Serialize builds and retirement for exactly one source/code identity."""
+    if nowait:
+        acquired = await session.scalar(
+            text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key,0))"),
+            {"key": CONTRACT + ":" + digest(identity)},
+        )
+        if acquired is not True:
+            raise PTG2LifecycleLockDeferred("membership source identity is busy; retry")
+        return
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"), {"key": CONTRACT + ":" + digest(identity)}
     )
@@ -51,20 +68,34 @@ def _pin(identity):
     return {"owner_type": CONTRACT, "owner_id": digest(identity), "snapshot_id": identity["snapshot_id"]}
 
 
-async def source_pin(session, identity, *, create=False):
-    """Verify or create the durable source-snapshot retention reference."""
+async def _source_pin_rows(session, identity, *, lock):
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    return (
+        await session.execute(
+            text(
+                f"SELECT snapshot_id,reason FROM {native._quoted(PTG2_SCHEMA)}.ptg2_snapshot_pin "
+                "WHERE owner_type=:owner_type AND owner_id=:owner_id ORDER BY snapshot_id LIMIT 2 " + lock
+            ),
+            {name: value for name, value in _pin(identity).items() if name != "snapshot_id"},
+        )
+    ).all()
+
+
+def _require_source_pin_rows(rows, identity):
+    if [tuple(row) for row in rows] != [(identity["snapshot_id"], _SOURCE_PIN_REASON)]:
+        raise PTG2ManifestArtifactError("membership index source retention pin differs")
+
+
+async def source_pin(session, identity, *, lock=False):
+    """Verify retention; a builder locks only its exact precommitted pin row."""
     from api.ptg2_serving import PTG2_SCHEMA
 
     schema = native._quoted(PTG2_SCHEMA)
     params = _pin(identity)
-    if create:
-        await session.execute(
-            text(
-                f"INSERT INTO {schema}.ptg2_snapshot_pin (owner_type,owner_id,snapshot_id,reason) "
-                "VALUES (:owner_type,:owner_id,:snapshot_id,:reason) ON CONFLICT DO NOTHING"
-            ),
-            params | {"reason": "active immutable provider membership projection"},
-        )
+    if lock:
+        _require_source_pin_rows(await _source_pin_rows(session, identity, lock="FOR SHARE"), identity)
+        return params
     exists = await session.scalar(
         text(
             f"SELECT EXISTS(SELECT 1 FROM {schema}.ptg2_snapshot_pin "
@@ -75,6 +106,80 @@ async def source_pin(session, identity, *, create=False):
     if exists is not True:
         raise PTG2ManifestArtifactError("membership index source retention pin is missing")
     return params
+
+
+async def prepare_source_retention(session, **params):
+    """Authenticate and retain one exact source; the caller must commit before COPY."""
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    validate_params(params)
+    await native.protected_publisher_owner(session)
+    source_key = await acquire_snapshot_reference_lifetime(
+        session, schema_name=PTG2_SCHEMA, snapshot_id=params["snapshot_id"]
+    )
+    if source_key != params["source_key"]:
+        raise PTG2ManifestArtifactError("membership retained source identity differs")
+    _, _, identity = await source_identity(session, **params)
+    if identity["source_key"] != source_key:
+        raise PTG2ManifestArtifactError("membership retained source identity differs")
+    rows = await _source_pin_rows(session, identity, lock="FOR SHARE")
+    if rows:
+        _require_source_pin_rows(rows, identity)
+        return identity
+    # Never wait for a long builder while retaining the global/source fence.
+    await lock_identity(session, identity, nowait=True)
+    await session.execute(
+        text(
+            f"INSERT INTO {native._quoted(PTG2_SCHEMA)}.ptg2_snapshot_pin (owner_type,owner_id,snapshot_id,reason) "
+            "VALUES (:owner_type,:owner_id,:snapshot_id,:reason) ON CONFLICT DO NOTHING"
+        ),
+        _pin(identity) | {"reason": _SOURCE_PIN_REASON},
+    )
+    await source_pin(session, identity, lock=True)
+    return identity
+
+
+async def lock_retained_source(session, identity):
+    """Recheck only retained pin/header rows without a lifecycle fence across COPY."""
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    async with _bounded_clone_lock_reads(session):
+        await source_pin(session, identity, lock=True)
+        _, _, source_key = await _snapshot_source_identity(session, PTG2_SCHEMA, identity["snapshot_id"], lock=True)
+        if source_key != identity["source_key"]:
+            raise PTG2ManifestArtifactError("membership retained source identity differs")
+
+
+async def release_unattached_source_retention(session, identity):
+    """Return the released pin count; active builders and ready projections veto it."""
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    await native.protected_publisher_owner(session)
+    source_key = await acquire_snapshot_reference_lifetime(
+        session, schema_name=PTG2_SCHEMA, snapshot_id=identity["snapshot_id"]
+    )
+    if source_key != identity["source_key"]:
+        raise PTG2ManifestArtifactError("membership retained source identity differs")
+    await lock_identity(session, identity, nowait=True)
+    if await locate(session, identity) is not None:
+        return 0
+    _, _, current = await source_identity(
+        session, **{name: identity[name] for name in ("source_key", "snapshot_id", "code_system", "code")}
+    )
+    if current != identity:
+        raise PTG2ManifestArtifactError("membership retained source identity differs")
+    pin_rows = await _source_pin_rows(session, identity, lock="FOR UPDATE")
+    if not pin_rows:
+        return 0
+    _require_source_pin_rows(pin_rows, identity)
+    await session.execute(
+        text(
+            f"DELETE FROM {native._quoted(PTG2_SCHEMA)}.ptg2_snapshot_pin "
+            "WHERE owner_type=:owner_type AND owner_id=:owner_id AND snapshot_id=:snapshot_id AND reason=:reason"
+        ),
+        _pin(identity) | {"reason": _SOURCE_PIN_REASON},
+    )
+    return 1
 
 
 async def _active_view(session, identity, owner):
@@ -204,7 +309,7 @@ async def seal(session, ownership, identity, *, reader_principals):
     await _seal_published_relation(session, view_oid, owner)
     for principal in reader_principals:
         await session.execute(text(f"GRANT SELECT ON hp_snapshot_retention.{name} TO {principal}"))
-    await source_pin(session, identity, create=True)
+    await source_pin(session, identity)
 
 
 def receipt(found):
@@ -273,6 +378,9 @@ async def _external_pins(session, identity, expected, pin_rows):
 async def _require_sibling_pin(session, identity, key):
     if re.fullmatch("[0-9a-f]{64}", key or "") is None:
         raise PTG2ManifestArtifactError("membership sibling retention pin is invalid")
+    relation = "hp_snapshot_retention." + _attachment_for_digest(key)
+    if await session.scalar(text("SELECT to_regclass(:relation)::oid"), {"relation": relation}) is None:
+        raise PTG2ManifestArtifactError("membership sibling retention pin is still preparing")
     sibling = await session.scalar(
         text(f"SELECT identity FROM hp_snapshot_retention.{native._quoted(_attachment_for_digest(key))}")
     )
