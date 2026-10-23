@@ -21,6 +21,7 @@ MANUAL_ACCEPTANCE = "20261020200000_custom_import_manual_acceptance"
 MANUAL_JOIN = "20261020210000_registry_manual_acceptance_join"
 CHECKER_EXECUTION = "20261022110000_ptg_checker_execution"
 FIRST_RETIREMENT = "20261022120000_provider_directory_first_retirement"
+CURRENT_HEAD = "20261023220000_merge_directory_pricing_controls"
 PTG_MEMBERSHIP = "20261021110000_ptg_membership_import_idempotency"
 
 
@@ -32,8 +33,14 @@ def _script():
 
 def test_join_preserves_both_completed_parent_histories():
     script = _script()
+    parents = (
+        "20261023100000_provider_directory_retirement_parent_updates",
+        "20261023110000_code_pricing_import_idempotency",
+    )
+    assert script.get_revision(CURRENT_HEAD).down_revision == parents
+    assert all(script.get_revision(parent).down_revision == FIRST_RETIREMENT for parent in parents)
     assert script.get_revision(FIRST_RETIREMENT).down_revision == CHECKER_EXECUTION
-    assert script.get_heads() == [FIRST_RETIREMENT]
+    assert script.get_heads() == [CURRENT_HEAD]
     assert script.get_revision("20261019030000_provider_directory_role_schema").down_revision == REVISION
     assert script.get_revision(REVISION).down_revision == (REGISTRY, CONTINUATION)
     assert script.get_revision(REGISTRY).down_revision == (
@@ -66,7 +73,7 @@ def test_join_upgrade_and_downgrade_require_no_database_operations():
 
 def test_staged_join_preserves_parent_histories():
     script = _script()
-    assert script.get_heads() == [FIRST_RETIREMENT]
+    assert script.get_heads() == [CURRENT_HEAD]
     assert script.get_revision(STAGED_JOIN).down_revision == (SOURCE_CHECK, STAGED_VERIFICATION)
     assert script.get_revision(STAGED_VERIFICATION).down_revision == CONTINUATION
     assert script.get_revision(SOURCE_CHECK).down_revision == "20261019140000_plan_pricing_attribution_idempotency"
@@ -123,7 +130,7 @@ def test_staged_join_uses_no_database():
 
 def test_manual_join_preserves_parent_histories_without_database_operations():
     script = _script()
-    assert script.get_heads() == [FIRST_RETIREMENT]
+    assert script.get_heads() == [CURRENT_HEAD]
     revision = script.get_revision(MANUAL_JOIN)
     assert revision.down_revision == (STAGED_JOIN, PTG_MEMBERSHIP)
     assert script.get_revision(PTG_MEMBERSHIP).down_revision == MANUAL_ACCEPTANCE

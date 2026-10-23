@@ -23,6 +23,35 @@ from process.provider_directory_generic_candidate import GenericCandidateError
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("extra_rows", [0, 1, None])
+async def test_relationship_completion_reconciles_verified_families_with_stored_rows(monkeypatch, extra_rows):
+    session = object()
+
+    @asynccontextmanager
+    async def connection():
+        yield session
+
+    expected = len(relationship.FIELDS)
+    actual = None if extra_rows is None else expected + extra_rows
+    directory = SimpleNamespace(
+        db=SimpleNamespace(session=connection, scalar=AsyncMock(return_value=actual)),
+        _schema=lambda: "synthetic",
+        _qt=lambda schema, root: f'"{schema}"."{root}"',
+    )
+    family = AsyncMock(return_value=1)
+    restored = AsyncMock()
+    monkeypatch.setattr(relationship, "_family_complete", family)
+    monkeypatch.setattr(relationship, "_raised_work_mem", AsyncMock(return_value="4MB"))
+    monkeypatch.setattr(relationship, "_restore_work_mem", restored)
+    if extra_rows == 0:
+        assert await relationship.assert_complete(directory, "candidate", "a" * 64) == expected
+    else:
+        with pytest.raises(RuntimeError, match="cms_npd_relationship_projection_incomplete"):
+            await relationship.assert_complete(directory, "candidate", "a" * 64)
+    assert [call.args[-1] for call in family.await_args_list] == list(relationship.FIELDS)
+    restored.assert_awaited_once_with(session, "4MB")
+
+
 @pytest.fixture
 def source_body(monkeypatch):
     events = []
