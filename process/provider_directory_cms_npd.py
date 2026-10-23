@@ -1471,8 +1471,10 @@ async def _stage_and_validate_candidate(fhir, directory, candidate, identity, re
                     [asyncio.create_task(stage_files()) for _ in range(workers)]
                 )
         finally:
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
+            if executor is not None:  # reap running preparations off the loop before the guard is released
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: executor.shutdown(wait=True, cancel_futures=True)
+                )
     from process.provider_directory_generic_source_adapters import completed_source_scope
     from process.provider_directory_generic_source_policy import source_transaction
 
