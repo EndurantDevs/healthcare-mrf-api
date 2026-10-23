@@ -106,7 +106,7 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
 
 def test_factorized_projection_precedes_the_unique_repository_head() -> None:
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["20261022120000_provider_directory_first_retirement"]
+    assert script.get_heads() == ["20261023220000_merge_directory_pricing_controls"]
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"

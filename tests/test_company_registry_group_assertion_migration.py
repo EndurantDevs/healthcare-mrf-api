@@ -84,7 +84,7 @@ def test_group_migration_extends_only_the_actual_current_receipt_head():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261022120000_provider_directory_first_retirement"]
+    assert script.get_heads() == ["20261023220000_merge_directory_pricing_controls"]
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"
