@@ -71,6 +71,8 @@ class Driver:
         self.tasks.append(asyncio.current_task())
         if self.failure:
             raise self.failure
+        if "AS readable" in sql:
+            return [{"readable": True} for _ in range(2)]
         if "to_regclass" in sql:
             return [{"relation_name": name, "available": self.relations_available} for name in parameters[0]]
         return self.rows
@@ -133,7 +135,7 @@ async def test_bulk_phase_reuses_one_driver_and_keeps_pricing_unknown(retained_e
     driver = Driver([_binding_row(), _binding_row(plan_release_id=second_id)])
     result = await append(driver)
     assert len(exports) == 1 and exports[0][0] is driver
-    assert len(driver.calls) == 2 and driver.calls[1][1][0] == [PLAN_RELEASE_ID, second_id]
+    assert len(driver.calls) == 3 and driver.calls[2][1][0] == [PLAN_RELEASE_ID, second_id]
     assert all(task is asyncio.current_task() for task in driver.tasks)
     assert driver.lifecycle == ["start", "release"] and driver.is_in_transaction()
     assert {key: result[key] for key in REPORT if key != "provenance"} == {
@@ -304,7 +306,7 @@ async def test_release_metadata_query_count_is_fixed(retained_export, release_co
     result = await lookup.append_pricing_binding_metadata(
         driver, report_by_field, object(), control_schema="sample_control", max_report_bytes=16 * 1024 * 1024
     )
-    assert len(exports) == 1 and len(driver.calls) == 2
+    assert len(exports) == 1 and len(driver.calls) == 3
     assert len(result["provenance"]["pricing_binding_metadata"]["release_metadata"]) == release_count
 
 

@@ -18,15 +18,18 @@ from api import plan_release_serving, plan_release_serving_resolution
 from api.plan_pricing_projection_contract import MAX_GEO_CELLS
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
-from .test_plan_pricing_projection import PROJECTION_ID, _selection, _Session
 from .test_plan_pricing_prewarm import (
     PLAN_RELEASE_ID,
     SERVICE_ORIGIN,
     SERVING_REVISION_ID,
     TEST_BEARER,
+)
+from .test_plan_pricing_prewarm import (
     _selection as prewarm_selection,
 )
+from .test_plan_pricing_projection import PROJECTION_ID, _selection, _Session
 from .test_plan_release_serving import _binding_row as release_binding_row
+from .test_plan_release_serving import _Session as ReleaseSession
 
 
 class _Result:
@@ -131,9 +134,7 @@ async def test_projection_request_errors_preserve_fallback(args, selection, erro
 )
 async def test_projection_geo_boundaries_fail_closed(args, rows, message):
     with pytest.raises(projection.PlanPricingProjectionUnsupported, match=message):
-        await projection._geo_cells(
-            _Session(rows), args, result_type="provider_cards"
-        )
+        await projection._geo_cells(_Session(rows), args, result_type="provider_cards")
 
 
 @pytest.mark.asyncio
@@ -161,9 +162,7 @@ async def test_projection_coordinate_and_empty_radius_paths_are_distinct():
     )
     assert response["result_state"] == "no_match_in_radius"
     assert response["pagination"]["total"] == 0
-    assert projection._unsupported_projection_fields({"order": "sideways"}) == (
-        "order",
-    )
+    assert projection._unsupported_projection_fields({"order": "sideways"}) == ("order",)
 
 
 @pytest.mark.parametrize(
@@ -187,12 +186,15 @@ async def test_exact_selection_accepts_current_fenced_projection(monkeypatch):
         return selection
 
     monkeypatch.setattr(prewarm, "resolve_plan_release_serving", current)
-    assert await prewarm._exact_ready_selection(
-        object(),
-        plan_release_id=PLAN_RELEASE_ID,
-        serving_revision_id=SERVING_REVISION_ID,
-        projection_id=PROJECTION_ID,
-    ) is selection
+    assert (
+        await prewarm._exact_ready_selection(
+            object(),
+            plan_release_id=PLAN_RELEASE_ID,
+            serving_revision_id=SERVING_REVISION_ID,
+            projection_id=PROJECTION_ID,
+        )
+        is selection
+    )
 
 
 @pytest.mark.asyncio
@@ -210,16 +212,12 @@ async def test_shape_selection_rejects_foreign_or_invalid_rows(updates):
     }
     row_by_field.update(updates)
     with pytest.raises(ValueError, match="foreign projection|aggregate row"):
-        await prewarm._select_shapes(
-            _ResultSession(_Result([row_by_field])), PROJECTION_ID
-        )
+        await prewarm._select_shapes(_ResultSession(_Result([row_by_field])), PROJECTION_ID)
 
 
 def test_shared_cache_rejects_non_envelope_response():
     shape = prewarm.PrewarmShape("HCPCS", "G0439", "10001", 1)
-    assert prewarm._shared_cache_result(
-        prewarm_selection(), shape, None
-    ).error["error"] == "invalid_response"
+    assert prewarm._shared_cache_result(prewarm_selection(), shape, None).error["error"] == "invalid_response"
 
 
 @pytest.mark.asyncio
@@ -258,9 +256,7 @@ async def test_transport_failure_is_receipted():
 
 def test_materialization_and_source_edges_remain_fail_closed():
     assert orjson.loads(orjson.dumps(materialize.rate_fragment(Decimal("2")))) == 2
-    stats = materialize.CardStats(
-        {"npi": 1, "zip5": "10001"}, Decimal("5"), Decimal("5"), 1
-    )
+    stats = materialize.CardStats({"npi": 1, "zip5": "10001"}, Decimal("5"), Decimal("5"), 1)
     stats.add((Decimal("2"), Decimal("8")))
     assert (stats.minimum, stats.maximum, stats.rate_count) == (
         Decimal("2"),
@@ -270,12 +266,8 @@ def test_materialization_and_source_edges_remain_fail_closed():
 
     state = materialize._ProjectedRateState()
     provider_by_field = {"npi": 1, "zip5": "10001"}
-    materialize._add_provider_rates(
-        state, [provider_by_field], (Decimal("5"),)
-    )
-    materialize._add_provider_rates(
-        state, [provider_by_field], (Decimal("2"),)
-    )
+    materialize._add_provider_rates(state, [provider_by_field], (Decimal("5"),))
+    materialize._add_provider_rates(state, [provider_by_field], (Decimal("2"),))
     assert state.cards_by_identity[("10001", 1)].rate_count == 2
 
     state = materialize._ProjectedRateState()
@@ -293,9 +285,7 @@ def test_materialization_and_source_edges_remain_fail_closed():
         def _canonical_code_metadata_row(raw_row):
             return raw_row
 
-    assert projection_source._group_code_rows(
-        [{"reported_code_system": "bad", "reported_code": ""}], Serving
-    ) == {}
+    assert projection_source._group_code_rows([{"reported_code_system": "bad", "reported_code": ""}], Serving) == {}
     provider_rows_by_npi = {}
     projection_source._append_provider_rows(
         provider_rows_by_npi,
@@ -320,9 +310,7 @@ async def test_sealed_layout_must_exist(monkeypatch):
         return None
 
     monkeypatch.setattr(serving, "_merge_manifest_code_variant_rows", no_rows)
-    binding = projection_source.BindingProjection(
-        {}, SimpleNamespace(network_names=[]), {}, 0
-    )
+    binding = projection_source.BindingProjection({}, SimpleNamespace(network_names=[]), {}, 0)
     assert await materialize.project_code(
         object(), PROJECTION_ID, ("HCPCS", "G0439"), [binding], SimpleNamespace()
     ) == (0, 0, 0)
@@ -363,17 +351,10 @@ def _release_selection_with_binding():
 @pytest.mark.asyncio
 async def test_release_resolution_contract_and_guard_reject_invalid_inputs():
     with pytest.raises(ValueError, match="invalid plan release"):
-        plan_release_serving_resolution.PlanReleaseServingResolution(
-            "ready", None
-        )
+        plan_release_serving_resolution.PlanReleaseServingResolution("ready", None)
 
     session = _Session([])
-    assert (
-        await plan_release_serving_resolution.resolve_plan_release_guard_selection(
-            session, "invalid"
-        )
-        is None
-    )
+    assert await plan_release_serving_resolution.resolve_plan_release_guard_selection(session, "invalid") is None
     assert session.statements == []
 
 
@@ -415,11 +396,9 @@ async def test_release_resolution_surfaces_failed_binding_validation(monkeypatch
         pricing_projection_id="not-a-digest",
     )
     result = await plan_release_serving_resolution.resolve_plan_release_serving_resolution(
-        _Session([row_by_field]), PLAN_RELEASE_ID
+        ReleaseSession([row_by_field]), PLAN_RELEASE_ID
     )
     assert result.state == "unavailable"
-    header = plan_release_serving._release_header_from_rows(
-        PLAN_RELEASE_ID, [row_by_field]
-    )
+    header = plan_release_serving._release_header_from_rows(PLAN_RELEASE_ID, [row_by_field])
     assert header is not None
     assert header.pricing_projection_id is None
