@@ -354,7 +354,12 @@ def _is_reviewed_index_element(index_element: object) -> bool:
         return False
 
     tokens = index_element.split()
-    if 0 < len(tokens) <= 2 and all(native._IDENTIFIER.fullmatch(token) is not None for token in tokens):
+    identifiers = tokens[:1] + tokens[1].split(".") if len(tokens) == 2 else tokens
+    if (
+        0 < len(tokens) <= 2
+        and len(identifiers) <= 3
+        and all(native._IDENTIFIER.fullmatch(identifier) is not None for identifier in identifiers)
+    ):
         return True
     return index_element in {
         "lower(synonym)",
