@@ -185,9 +185,12 @@ async def _recheck_reduced_rows(connection, policy, name, columns, validate, cou
     if count <= _RECHECK_ROWS:
         query = f"SELECT {fields} FROM {relation}"
     else:
-        # Sample about three times the rows wanted, then LIMIT; SYSTEM sampling is page-clustered.
+        # SYSTEM sampling is page-clustered and the heap is key-ordered: shuffle the sample before LIMIT.
         percent = min(100.0, max(0.01, 300.0 * _RECHECK_ROWS / count))
-        query = f"SELECT {fields} FROM {relation} TABLESAMPLE SYSTEM ({percent:.4f}) LIMIT {_RECHECK_ROWS}"
+        query = (
+            f"SELECT {fields} FROM (SELECT {fields} FROM {relation} TABLESAMPLE SYSTEM ({percent:.4f})) sampled "
+            f"ORDER BY random() LIMIT {_RECHECK_ROWS}"
+        )
     async for row in connection.cursor(query, prefetch=1024):
         validate(dict(row))
 
