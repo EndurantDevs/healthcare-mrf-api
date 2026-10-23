@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: EndurantDevs/endurant-ci
-          ref: 6f8817db1df0bbee039a9f92950e8a48e884277c
+          ref: 71c540d60cb201941fd4e10cc36cfd3ca7dac88d
           path: ci
           persist-credentials: false
       - name: Install pinned uv
