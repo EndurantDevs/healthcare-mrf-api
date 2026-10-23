@@ -8418,20 +8418,17 @@ def _uses_oversized_cost_ordered_geo_gate(
     requested_npi: int | None,
     explicit_provider_filter_requested: bool,
 ) -> bool:
-    """Identify cost lanes whose sealed size must be checked before geo work."""
+    """Preflight provider expansion; aggregate selection owns its bounded geo scan."""
 
     order_by = str(args.get("order_by") or ("total_allowed_amount" if not include_providers else "")).strip().lower()
     return bool(
         serving_tables.uses_v4_graph
         and location_filter_requested
+        and include_providers
         and not price_filter_requested
         and requested_npi is None
         and order_by in _PTG2_COST_ORDER_FIELDS
-        and not (
-            include_providers
-            and not explicit_provider_filter_requested
-            and _is_inferred_taxonomy_only_provider_filter(args)
-        )
+        and not (not explicit_provider_filter_requested and _is_inferred_taxonomy_only_provider_filter(args))
     )
 
 
@@ -14070,52 +14067,43 @@ async def _v4_pattern_exact_groups(
     snapshot_key: int,
     provider_set_keys: tuple[int, ...],
     exact_group_keys: tuple[int, ...],
-    hot_limits: _V4HotPrefixLimits,
     schema_name: str = PTG2_SCHEMA,
 ) -> dict[int, tuple[int, ...]]:
-    """Intersect pattern and component sources without unbounded fanout."""
+    """Transpose exact group incidence without expanding whole pattern groups."""
 
-    group_sources = await _load_v4_pattern_set_group_sources(
+    patterns_by_group = await lookup_v4_relation_members(
         session,
         snapshot_key=snapshot_key,
-        provider_set_keys=provider_set_keys,
-        maximum_pattern_degree=hot_limits.maximum_patterns_per_set,
-        maximum_component_degree=(hot_limits.maximum_components_per_fallback_set),
+        relation="group_patterns",
+        owner_keys=exact_group_keys,
         schema_name=schema_name,
+        max_members=_PTG2_EXACT_BILLING_MAX_PROVIDER_GROUPS,
     )
-    pattern_keys, component_keys = _v4_group_source_owner_keys(group_sources)
-    groups_by_pattern = await _v4_exact_source_groups(
-        session,
-        snapshot_key=snapshot_key,
-        relation="pattern_groups",
-        owner_keys=pattern_keys,
-        exact_group_keys=exact_group_keys,
-        maximum_projection_members=_PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES,
-        schema_name=schema_name,
-    )
-    remaining_projection_members = _PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES - sum(
-        len(group_keys) for group_keys in groups_by_pattern.values()
-    )
-    groups_by_component = await _v4_exact_source_groups(
-        session,
-        snapshot_key=snapshot_key,
-        relation="component_groups",
-        owner_keys=component_keys,
-        exact_group_keys=exact_group_keys,
-        maximum_projection_members=remaining_projection_members,
-        schema_name=schema_name,
-    )
-    if set(groups_by_pattern) != set(pattern_keys) or set(groups_by_component) != set(component_keys):
+    if set(patterns_by_group) != set(exact_group_keys) or any(
+        len(pattern_keys) != 1 for pattern_keys in patterns_by_group.values()
+    ):
         raise PTG2ManifestArtifactError("PTG2 V4 exact billing-association projection is incomplete")
-    return {
-        provider_set_key: _merge_v4_source_groups(
-            provider_set_key,
-            group_sources,
-            groups_by_pattern,
-            groups_by_component,
-        )
-        for provider_set_key in provider_set_keys
-    }
+    pattern_keys = tuple(sorted({keys[0] for keys in patterns_by_group.values()}))
+    sets_by_pattern = await lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation="pattern_sets",
+        owner_keys=pattern_keys,
+        schema_name=schema_name,
+        max_members=_PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES,
+    )
+    if set(sets_by_pattern) != set(pattern_keys):
+        raise PTG2ManifestArtifactError("PTG2 V4 exact billing-association projection is incomplete")
+    groups_by_set: dict[int, list[int]] = {key: [] for key in provider_set_keys}
+    association_edge_count = 0
+    for group_key in exact_group_keys:
+        for set_key in sets_by_pattern[patterns_by_group[group_key][0]]:
+            if set_key in groups_by_set:
+                association_edge_count += 1
+                if association_edge_count > _PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES:
+                    raise PTG2ManifestArtifactError("PTG2 exact billing association scope exceeds its edge limit")
+                groups_by_set[set_key].append(group_key)
+    return {set_key: tuple(group_keys) for set_key, group_keys in groups_by_set.items()}
 
 
 async def _v4_exact_groups_by_set(
@@ -14153,7 +14141,6 @@ async def _v4_exact_groups_by_set(
                 snapshot_key=snapshot_key,
                 provider_set_keys=normalized_set_keys,
                 exact_group_keys=normalized_group_keys,
-                hot_limits=hot_limits,
                 schema_name=_payload_schema(serving_tables),
             )
     return _validated_exact_group_keys_by_set(

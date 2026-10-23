@@ -196,7 +196,7 @@ def _install_search_stubs(monkeypatch) -> None:
     )
 
 
-def _install_billing_stubs(monkeypatch) -> AsyncMock:
+def _install_billing_stubs(monkeypatch, representation="direct_v1") -> AsyncMock:
     monkeypatch.setattr(
         serving,
         "_provider_set_keys_for_ids",
@@ -215,8 +215,17 @@ def _install_billing_stubs(monkeypatch) -> AsyncMock:
     monkeypatch.setattr(
         serving,
         "load_v4_graph_root",
-        AsyncMock(return_value=SimpleNamespace(representation="direct_v1")),
+        AsyncMock(return_value=SimpleNamespace(representation=representation)),
     )
+    if representation == "pattern_v1":
+        member_lookup = AsyncMock(
+            side_effect=[
+                {7: (10,), 8: (20,), 9: (30,)},
+                {10: (3, 5), 20: (4, 6), 30: (7,)},
+            ]
+        )
+        monkeypatch.setattr(serving, "lookup_v4_relation_members", member_lookup)
+        return member_lookup
     intersection = AsyncMock(return_value={3: (7,), 4: (8,)})
     monkeypatch.setattr(serving, "lookup_v4_relation_intersections", intersection)
     return intersection
@@ -323,11 +332,12 @@ def _assert_no_private_payload_values(response: dict[str, Any]) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("representation", ["direct_v1", "pattern_v1"])
 async def test_v4_exact_npi_search_attaches_intersected_billing_associations(
-    monkeypatch,
+    monkeypatch, representation,
 ) -> None:
     _install_search_stubs(monkeypatch)
-    intersection = _install_billing_stubs(monkeypatch)
+    graph_lookup = _install_billing_stubs(monkeypatch, representation)
     session = _RoutingSession()
 
     response = await serving._search_manifest_serving_table(
@@ -352,10 +362,16 @@ async def test_v4_exact_npi_search_attaches_intersected_billing_associations(
     _assert_public_billing_item(response["items"][0])
     _assert_no_private_payload_values(response)
     assert session.sidecar_requests == [tuple(sorted((GROUP_ONE, GROUP_TWO)))]
-    intersection.assert_awaited_once()
-    assert intersection.await_args.kwargs["relation"] == "set_groups_direct"
-    assert intersection.await_args.kwargs["owner_keys"] == (3, 4)
-    assert intersection.await_args.kwargs["allowed_member_keys"] == (7, 8, 9)
+    if representation == "pattern_v1":
+        assert [call.kwargs["relation"] for call in graph_lookup.await_args_list] == [
+            "group_patterns", "pattern_sets"
+        ]
+        assert graph_lookup.await_args_list[0].kwargs["owner_keys"] == (7, 8, 9)
+    else:
+        graph_lookup.assert_awaited_once()
+        assert graph_lookup.await_args.kwargs["relation"] == "set_groups_direct"
+        assert graph_lookup.await_args.kwargs["owner_keys"] == (3, 4)
+        assert graph_lookup.await_args.kwargs["allowed_member_keys"] == (7, 8, 9)
 
 
 @pytest.mark.asyncio
