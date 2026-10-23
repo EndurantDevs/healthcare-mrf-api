@@ -793,6 +793,7 @@ def _terminal_metrics_from_context(context: Any) -> dict[str, Any] | None:
         "support_counts",
         "refresh_mode",
         "serving_only_refresh",
+        "serving_recovery",
         "support_stage_skipped",
         "inline_source_evidence",
         "split_array_aggregates",

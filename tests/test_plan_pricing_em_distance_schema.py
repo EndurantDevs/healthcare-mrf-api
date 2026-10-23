@@ -52,7 +52,7 @@ def _assert_registry_migration_chain():
     alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
     script = ScriptDirectory.from_config(alembic_config)
-    assert script.get_heads() == ["20261023220000_merge_directory_pricing_controls"]
+    assert script.get_heads() == ["20261023100000_provider_directory_serving_recovery"]
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"

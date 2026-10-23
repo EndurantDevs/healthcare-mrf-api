@@ -26,6 +26,16 @@ class _GenerationAuthority:
 
 @pytest.fixture(autouse=True)
 def _stub_generation_publication(monkeypatch):
+    from process import provider_directory_artifact_read_access as read_access
+
+    # These SQL recorders have no native actor; separate tests verify ACL custody.
+    monkeypatch.setattr(
+        read_access,
+        "prepare_ordinary_read_access",
+        AsyncMock(side_effect=lambda _database, _schema, swaps: (object(),) * len(swaps)),
+    )
+    monkeypatch.setattr(read_access, "recheck_ordinary_read_access", AsyncMock())
+
     async def publish(database, *, schema_name):
         assert schema_name == "mrf"
         database.events.append("result generation published")

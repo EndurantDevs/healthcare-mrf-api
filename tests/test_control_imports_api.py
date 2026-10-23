@@ -2644,6 +2644,15 @@ def _provider_directory_seed_params(*source_ids, **overrides):
     return params_by_name
 
 
+def _provider_directory_recovery_params(source_id, **overrides):
+    return {
+        "provider_directory_serving_operation": "recover",
+        "provider_directory_serving_generation": "63c32ca4-f9c5-5395-9886-f075f7c0ccda",
+        "source_ids": [source_id],
+        **overrides,
+    }
+
+
 def _provider_directory_active_run(run_id, source_id, endpoint_scope):
     return {
         "run_id": run_id,
@@ -3096,6 +3105,25 @@ def test_fhir_artifact_conflicts():
     assert control_imports._provider_directory_blocking_run(overlapping_acquisition, [artifact_run]) == artifact_run
 
 
+@pytest.mark.parametrize("source_id,blocked", [("pdfhir_shared", True), ("pdfhir_other", False)])
+def test_fhir_recovery_classification_preserves_source_admission_scope(source_id, blocked):
+    params_by_name = _provider_directory_recovery_params(source_id)
+    acquisition = _provider_directory_active_run("run_acquisition", "pdfhir_shared", "https://shared.example.org/fhir")
+    recovery_run_by_field = {"run_id": "run_recovery", "params": params_by_name}
+
+    assert control_imports._provider_directory_operation(params_by_name) == (
+        control_imports._PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
+        frozenset({source_id}),
+        None,
+    )
+    assert control_imports._provider_directory_blocking_run(params_by_name, [acquisition]) == (
+        acquisition if blocked else None
+    )
+    assert control_imports._provider_directory_blocking_run(acquisition["params"], [recovery_run_by_field]) == (
+        recovery_run_by_field if blocked else None
+    )
+
+
 def test_fhir_source_local_relation_artifacts_allow_only_disjoint_parallel_work():
     relation_targets = "dataset_network_plan,dataset_affiliation_organization"
     first_params = _provider_directory_artifact_params(
@@ -3449,6 +3477,52 @@ async def test_create_import_run_blocks_overlapping_provider_directory_scope(
 
     assert created is False
     assert row == active
+
+
+@pytest.mark.asyncio
+async def test_create_import_run_blocks_recovery_during_same_source_acquisition(monkeypatch):
+    active = _provider_directory_active_run("run_acquisition", "pdfhir_shared", "https://shared.example.org/fhir")
+    database = _install_provider_admission_stubs(monkeypatch, [active])
+    enqueue = AsyncMock()
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+
+    row, created = await create_import_run(
+        {"importer": "provider-directory-fhir", "params": _provider_directory_recovery_params("pdfhir_shared")}
+    )
+
+    assert created is False
+    assert row == active
+    assert [event[0] for event in database.events] == ["acquire", "scalar", "commit"]
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"provider_directory_serving_generation": "invalid"}, "generation_invalid"),
+        ({"provider_directory_serving_operation": "rollback"}, "request_invalid"),
+        ({"import_resources": True}, "request_invalid"),
+    ],
+)
+async def test_create_import_run_rejects_malformed_recovery_before_admission(monkeypatch, overrides, error):
+    database = _ProviderAdmissionDb()
+    admit, enqueue = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(control_imports, "db", database)
+    monkeypatch.setattr(control_imports, "_admit_import_row", admit)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+
+    with pytest.raises(ValueError, match=error):
+        await create_import_run(
+            {
+                "importer": "provider-directory-fhir",
+                "params": _provider_directory_recovery_params("pdfhir_shared", **overrides),
+            }
+        )
+
+    assert database.events == []
+    admit.assert_not_awaited()
+    enqueue.assert_not_awaited()
 
 
 @pytest.mark.asyncio

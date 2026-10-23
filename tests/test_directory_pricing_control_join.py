@@ -25,6 +25,7 @@ PREDECESSOR = "20261022120000_provider_directory_first_retirement"
 DIRECTORY = "20261023100000_provider_directory_retirement_parent_updates"
 PRICING = "20261023110000_code_pricing_import_idempotency"
 JOIN = "20261023220000_merge_directory_pricing_controls"
+SERVING_RECOVERY = "20261023100000_provider_directory_serving_recovery"
 INDEX = "import_run_code_pricing_idempotency_idx"
 
 
@@ -38,7 +39,8 @@ def _config(connection=None):
 
 def test_directory_pricing_join_preserves_exact_parents_without_database_work():
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == [JOIN]
+    assert scripts.get_heads() == [SERVING_RECOVERY]
+    assert scripts.get_revision(SERVING_RECOVERY).down_revision == JOIN
     assert scripts.get_revision(JOIN).down_revision == (DIRECTORY, PRICING)
     assert scripts.get_revision(DIRECTORY).down_revision == PREDECESSOR
     assert scripts.get_revision(PRICING).down_revision == PREDECESSOR

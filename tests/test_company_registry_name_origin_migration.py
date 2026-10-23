@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261023220000_merge_directory_pricing_controls"
+CURRENT_HEAD = "20261023100000_provider_directory_serving_recovery"
 _ORIGIN_UPGRADE_REVISIONS = [
     REVISION,
     "20261013010000_registry_custom_history_events",
@@ -56,6 +56,7 @@ _ORIGIN_UPGRADE_REVISIONS = [
     "20261022120000_provider_directory_first_retirement",
     "20261023110000_code_pricing_import_idempotency",
     "20261023100000_provider_directory_retirement_parent_updates",
+    "20261023220000_merge_directory_pricing_controls",
     CURRENT_HEAD,
 ]
 

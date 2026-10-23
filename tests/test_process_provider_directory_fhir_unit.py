@@ -266,8 +266,11 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 61
+    assert len(command_signature.parameters) == 63
+    assert "provider_directory_serving_operation" not in command_signature.parameters
+    assert "provider_directory_serving_generation" not in command_signature.parameters
     assert "resource_scan_concurrency" in command_signature.parameters
+    assert "rest_page_prefetch" in command_signature.parameters
     assert "cms_npd_rollback_vector_sha256" in command_signature.parameters
     assert "cms_npd_rollback_root_run_id" in command_signature.parameters
     assert "cms_npd_retained_operation" in command_signature.parameters
@@ -10704,6 +10707,12 @@ def _stub_staged_publish_db(
 ) -> list[tuple[str, dict[str, Any]]]:
     """Install SQL-recording DB doubles for one staged publication."""
 
+    from process import provider_directory_artifact_read_access as read_access
+
+    # Native actor tests cover ACL custody; this fixture records only rotation SQL.
+    monkeypatch.setattr(read_access, "prepare_ordinary_artifact_reads", AsyncMock(return_value=()))
+    monkeypatch.setattr(read_access, "recheck_ordinary_read_access", AsyncMock())
+
     status_calls: list[tuple[str, dict[str, Any]]] = []
 
     async def fake_status(sql, **params):
@@ -15812,6 +15821,8 @@ async def test_main_forwards_publish_artifact_targets(monkeypatch):
     assert result == {"published": True}
     assert process_data_mock.await_args.args[1]["publish_artifacts_targets"] == "corroboration"
     assert process_data_mock.await_args.args[1]["bulk_export_max_pending_seconds"] == 12345
+    assert "provider_directory_serving_operation" not in process_data_mock.await_args.args[1]
+    assert "provider_directory_serving_generation" not in process_data_mock.await_args.args[1]
 
 
 @pytest.mark.asyncio

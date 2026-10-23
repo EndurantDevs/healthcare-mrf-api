@@ -17,6 +17,9 @@ from api.endpoint import npi as npi_module
 from api.network_address_scope import network_address_read_scope
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.npi_location_hydration_support import unified_location_mapping
+from tests.provider_profile_snapshot_test_support import (
+    stub_provider_profile_snapshot as stub_provider_profile_snapshot,
+)
 from tests.test_custom_import_provider_geo_sql import _context as imported_geo_context
 from tests.test_npi_api_extended import FakeAcquire
 from tests.test_npi_batch import _ResultRows

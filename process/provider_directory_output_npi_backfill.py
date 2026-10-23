@@ -251,6 +251,13 @@ async def backfill_resource_id_npis(directory, db_schema=None, *, run_id=None, s
     """Publish both exact NPI replacements together; value filters confer no authority."""
     from process.provider_directory_artifact_bundle_preparation import apply_prepared_output_bundle
     from process.provider_directory_artifact_scratch_inputs import prepared_scratch_enrichment
+    from process.provider_directory_generic_source_artifacts import prepared_npi_backfill
+
+    prepared = await prepared_npi_backfill(
+        directory, db_schema, run_id=run_id, source_ids=source_ids, seen_table=seen_table
+    )
+    if prepared is not None:
+        return prepared
 
     prepared = await prepared_scratch_enrichment(
         directory, "npi", db_schema=db_schema, run_id=run_id, source_ids=source_ids, seen_table=seen_table
