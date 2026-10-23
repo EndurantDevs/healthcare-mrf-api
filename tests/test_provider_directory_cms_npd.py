@@ -1466,11 +1466,13 @@ async def test_guard_probe_statement_timeout_counts_as_a_probe_timeout():
     """A statement cancelled by the server's statement_timeout keeps the loss-window tolerance."""
     cancelled = RuntimeError("canceling statement due to statement timeout")
     cancelled.sqlstate = "57014"
-    connection = SimpleNamespace(scalar=AsyncMock(side_effect=cancelled), execute=AsyncMock(), commit=AsyncMock())
-    with pytest.raises(RuntimeError, match="cms_npd_intake_guard_lost") as caught:
-        await cms._assert_intake_guard(connection, "synthetic-lock", 1)
-    assert isinstance(caught.value.__cause__, TimeoutError)
+    connection = SimpleNamespace(
+        scalar=AsyncMock(side_effect=cancelled), execute=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock()
+    )
+    confirmed_at = time.monotonic()
+    assert await cms._probe_intake_guard(connection, "synthetic-lock", 1, confirmed_at) == confirmed_at
     assert "statement_timeout" in str(connection.execute.await_args.args[0])
+    connection.rollback.assert_awaited_once()
 
 
 @pytest.mark.asyncio
