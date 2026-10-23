@@ -28,6 +28,7 @@ class _CleanupEngine:
         self.errors = errors
         self.state = {"retention": 42, "roles": {"owner_role", "publisher_role"}, "reassigned": []}
         self.starts, self.outcomes = [], []
+        self.cancels = 0
 
     @asynccontextmanager
     async def begin(self):
@@ -42,6 +43,10 @@ class _CleanupEngine:
 
         async def execute(statement):
             sql = str(statement)
+            if sql.startswith("SELECT pg_cancel_backend"):
+                assert not self.state["reassigned"], "autovacuum workers must be stopped before any REASSIGN"
+                self.cancels += 1
+                return
             if sql.startswith("DROP SCHEMA"):
                 self.state["retention"] = None
                 return
@@ -77,7 +82,7 @@ async def test_deadlock_restarts_complete_cleanup_after_rollback(deadlocks):
     engine = _CleanupEngine([*(_sql_error("40P01") for _ in range(deadlocks)), None])
     initial = deepcopy(engine.state)
     database = await _cleanup(engine)
-    assert engine.starts == [initial] * (deadlocks + 1)
+    assert engine.starts == [initial] * (deadlocks + 1) and engine.cancels == deadlocks + 1
     assert engine.outcomes == ["rollback"] * deadlocks + ["commit"]
     assert engine.state == {"retention": None, "roles": set(), "reassigned": ["publisher_role", "owner_role"]}
     assert database._reader_database is None
