@@ -10,6 +10,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import multiprocessing
 import os
 import tempfile
 import time
@@ -1432,7 +1433,23 @@ def _stage_executor():
         workers = int(configured) if configured else min(4, max(1, (os.process_cpu_count() or 2) - 1))
     except ValueError as error:
         raise RuntimeError("cms_npd_stage_workers_invalid") from error
-    return ProcessPoolExecutor(max_workers=workers) if workers > 0 else None
+    if workers <= 0:
+        return None
+    # Spawn everywhere: workers are direct children, so joining them reaps their usage into the publisher's.
+    return ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+
+
+async def _drain_stage_executor(executor):
+    """Reap running preparations even while a cancellation propagates; re-raise it once drained."""
+    drain = asyncio.get_running_loop().run_in_executor(None, lambda: executor.shutdown(wait=True, cancel_futures=True))
+    interrupted = None
+    while not drain.done():
+        try:
+            await asyncio.shield(drain)
+        except asyncio.CancelledError as error:
+            interrupted = error
+    if interrupted is not None:
+        raise interrupted
 
 
 def _source_stage_workers(fhir):
@@ -1471,10 +1488,8 @@ async def _stage_and_validate_candidate(fhir, directory, candidate, identity, re
                     [asyncio.create_task(stage_files()) for _ in range(workers)]
                 )
         finally:
-            if executor is not None:  # reap running preparations off the loop before the guard is released
-                await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: executor.shutdown(wait=True, cancel_futures=True)
-                )
+            if executor is not None:
+                await _drain_stage_executor(executor)
     from process.provider_directory_generic_source_adapters import completed_source_scope
     from process.provider_directory_generic_source_policy import source_transaction
 
