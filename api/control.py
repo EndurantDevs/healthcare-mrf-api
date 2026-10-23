@@ -26,6 +26,7 @@ from api.control_imports import (
     request_cancel,
     retry_import_run,
 )
+from api.control_plan_pricing_code import register_code_pricing_routes
 from api.control_ptg_membership import register_membership_projection_routes
 from api.control_ptg_source_attempt_errors import (
     register_source_attempt_error_handler,
@@ -67,6 +68,7 @@ register_source_attempt_error_handler(blueprint)
 register_source_snapshot_rollback_route(blueprint)
 register_v4_control_routes(blueprint)
 register_membership_projection_routes(blueprint)
+register_code_pricing_routes(blueprint)
 register_uhc_provider_file_catalog_routes(blueprint)
 register_profile_selection_route(blueprint)
 register_profile_capacity_preflight_route(blueprint)

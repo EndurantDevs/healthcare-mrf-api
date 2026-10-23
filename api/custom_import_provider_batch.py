@@ -143,7 +143,10 @@ async def serve_custom_import_provider_batch(request, session):
         )
         if is_managed_mode:
             return await _serve_managed_batch(request, parsed, verified)
-        async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), signed_request_reader(request, session) as session:
+        async with (
+            asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000),
+            signed_request_reader(request, session, verified_request_id=verified.request_id) as session,
+        ):
             async with (
                 _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS),
                 provider_http.provider_network_read_scope(session, parsed.provider.network_binding) as manifest,

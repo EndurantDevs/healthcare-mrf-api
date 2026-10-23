@@ -68,7 +68,10 @@ async def serve_custom_import_detail_batch(request, session):
             keyring=transport._keyring(),
             path=CUSTOM_IMPORT_DETAIL_BATCH_PATH,
         )
-        async with asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000), signed_request_reader(request, session) as session:
+        async with (
+            asyncio.timeout(DEFAULT_READ_TIMEOUT_MS / 1000),
+            signed_request_reader(request, session, verified_request_id=verified.request_id) as session,
+        ):
             async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
                 encoded = await _read_batch_payload(session, parsed, npi_values, verified)
                 return transport._response(encoded, 200)

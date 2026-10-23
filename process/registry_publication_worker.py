@@ -322,12 +322,15 @@ def _custody_config_url(value):
 
 def _custody_roles(config):
     consumer = config.consumer
-    roles = {
-        getattr(consumer, name, None)
-        for name in ("lifecycle_role", "execution_role", "api_role", "physical_owner_role", "owner_role")
-    }
-    roles.update(consumer.loader_roles)
-    roles.update(consumer.reader_roles)
+    if type(consumer) is RegistryPublicationConsumerConfig:
+        roles = set(consumer.custody_roles)
+    else:
+        roles = {
+            getattr(consumer, name, None)
+            for name in ("lifecycle_role", "execution_role", "api_role", "physical_owner_role", "owner_role")
+        }
+        roles.update(consumer.loader_roles)
+        roles.update(consumer.reader_roles)
     roles.update(getattr(config, "source_authority_roles", ()))
     store = getattr(config, "notification_store", None)
     if store is not None:
@@ -393,7 +396,7 @@ async def _custody_runtime(config, stack, consumer, execution_connection):
     pool = _BoundedPool(pool, config.sql_limits.connect_timeout_seconds)
     role = config.custody_url.username
 
-    async def seal_candidate(copy_target):
+    async def seal_candidate(copy_target, *, pre_enrolled_only=False):
         """Seal this candidate through the separately qualified operator pool."""
         async with pool.acquire() as custodian:
 
@@ -408,7 +411,12 @@ async def _custody_runtime(config, stack, consumer, execution_connection):
             # The native protected owner may also own the pricing authority store.
             runtime_roles = tuple(name for name in _custody_roles(config) if name != identity["custody_owner_role"])
             sealed = await seal_network_candidate_custody(
-                custodian, copy_target, control_schema=schema, runtime_roles=runtime_roles, authorize=is_authorized
+                custodian,
+                copy_target,
+                control_schema=schema,
+                runtime_roles=runtime_roles,
+                authorize=is_authorized,
+                pre_enrolled_only=pre_enrolled_only,
             )
             async with custodian.transaction(isolation="repeatable_read", readonly=True):
                 verified = await verify_network_candidate_custody(

@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from process.registry_publication_queue import (
+    validated_registry_initial_inventory_command,
     validated_registry_reactivation_command,
     validated_registry_source_rollback_preview_command,
     validated_registry_source_rollback_publication_command,
@@ -17,11 +18,13 @@ from process.registry_publication_queue import (
 _MAX_BYTES = 65_536
 _TIMEOUT_SECONDS = 15
 _PATHS = {
+    "publish_initial_inventory": "/internal/v1/registry/initial-inventory/authorize",
     "reactivate_generation": "/internal/v1/registry/reactivation/authorize",
     "prepare_source_rollback": "/internal/v1/registry/source-rollback/authorize",
     "publish_source_rollback": "/internal/v1/registry/source-rollback/authorize",
 }
 _COMMAND_VALIDATORS = {
+    "publish_initial_inventory": validated_registry_initial_inventory_command,
     "reactivate_generation": validated_registry_reactivation_command,
     "prepare_source_rollback": validated_registry_source_rollback_preview_command,
     "publish_source_rollback": validated_registry_source_rollback_publication_command,

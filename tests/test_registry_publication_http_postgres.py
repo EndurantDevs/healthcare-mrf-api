@@ -44,6 +44,74 @@ def _reactivation_body(**changes):
     }
 
 
+def _initial_inventory_body(**changes):
+    return {
+        key: value
+        for key, value in {
+            **_reactivation_body(),
+            "operation": "publish_initial_inventory",
+            "bootstrap_id": str(uuid4()),
+            "bootstrap_generation_sha256": "b" * 64,
+            "expected_serving_generation": 0,
+            **changes,
+        }.items()
+        if key != "target_generation"
+    }
+
+
+async def test_initial_inventory_http_queues_exact_command_and_operation_status(publication_app):
+    fixture = publication_app
+    document = _initial_inventory_body()
+    _, queued = await fixture.app.asgi_client.post(_PATH + "/initial-inventory", headers=_AUTH, json=document)
+    assert queued.status == 200 and queued.json["state"] == "queued"
+    _, replay = await fixture.app.asgi_client.post(_PATH + "/initial-inventory", headers=_AUTH, json=document)
+    assert replay.json == {**queued.json, "replayed": True}
+    _, status = await fixture.app.asgi_client.get(_PATH + "/requests/" + queued.json["request_id"], headers=_AUTH)
+    assert status.status == 200 and status.json["operation"] == "publish_initial_inventory"
+    assert status.json["result"] is None and len(status.json["command_sha256"]) == 64
+    assert status.headers["Cache-Control"] == _NO_STORE
+    assert not {"selection", "reason", "idempotency_key", "session_token_sha256"} & status.json.keys()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"expected_serving_generation": True},
+        {"expected_approved_revision": True},
+        {"selection": []},
+        {"bootstrap_generation_sha256": "B" * 64},
+        {"bootstrap_id": str(UUID(int=0))},
+        {"actor": {"kind": "client_owner", "user_id": str(uuid4()), "client_id": "system"}},
+    ],
+)
+async def test_initial_inventory_http_refuses_before_database(publication_app, change):
+    fixture = publication_app
+    checkouts = []
+    event.listen(fixture.engine.sync_engine, "checkout", lambda *arguments: checkouts.append(arguments))
+    _, invalid = await fixture.app.asgi_client.post(
+        _PATH + "/initial-inventory",
+        headers=_AUTH,
+        json=_initial_inventory_body(**change),
+    )
+    _assert_error(invalid, 400)
+    assert not checkouts
+
+
+async def test_initial_inventory_http_requires_control_auth_and_exact_body(publication_app):
+    fixture = publication_app
+    document = _initial_inventory_body()
+    _, denied = await fixture.app.asgi_client.post(_PATH + "/initial-inventory", json=document)
+    assert denied.status == 403 and denied.headers["Cache-Control"] == _NO_STORE
+    _, duplicate = await fixture.app.asgi_client.post(
+        _PATH + "/initial-inventory",
+        headers=_AUTH,
+        content=json.dumps(document)[:-1] + ',"operation":"publish_initial_inventory"}',
+    )
+    _assert_error(duplicate, 400)
+    _, query = await fixture.app.asgi_client.post(_PATH + "/initial-inventory?extra=1", headers=_AUTH, json=document)
+    _assert_error(query, 400)
+
+
 async def test_reactivation_http_queues_distinct_arm_and_retains_completed_status_shape(
     publication_app, publication_db
 ):

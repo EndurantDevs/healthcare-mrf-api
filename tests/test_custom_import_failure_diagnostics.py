@@ -55,6 +55,7 @@ def test_exact_driver_codes_are_mapped_without_sql_or_parameters(attribute, code
     setattr(driver, attribute, code)
     error = DBAPIError("synthetic SQL", {"synthetic": "parameters"}, driver)
     assert diagnostics.classify_failure(error) == ("database", reason)
+    assert diagnostics.database_sqlstate(error) == code
 
 
 @pytest.mark.parametrize("code", ["not-a-code", "57014\n", b"57014", 57014, ["57014"], None])
@@ -62,6 +63,7 @@ def test_unknown_driver_values_are_not_reflected(code):
     driver = Exception("synthetic payload")
     driver.sqlstate = code
     assert diagnostics.classify_failure(DBAPIError("synthetic SQL", {}, driver)) == ("database", "unknown")
+    assert diagnostics.database_sqlstate(driver) is None
 
 
 def test_exception_properties_rendering_and_arbitrary_attribute_hooks_are_never_called():
@@ -96,6 +98,7 @@ def test_driver_code_subclasses_cannot_run_hash_or_equality_hooks():
     error = SQLAlchemyError()
     error.sqlstate = OpaqueCode("57014")
     assert diagnostics.classify_failure(error) == ("database", "unknown")
+    assert diagnostics.database_sqlstate(error) is None
 
 
 def test_category_and_chain_checks_cannot_invoke_class_properties():
@@ -127,6 +130,7 @@ def test_cause_and_original_traversal_is_cycle_safe_and_keeps_primary_category()
     primary.__cause__ = driver
     driver.__cause__ = primary
     assert diagnostics.classify_failure(primary) == ("memory", "out_of_memory")
+    assert diagnostics.database_sqlstate(primary) == "53200"
 
 
 def test_nested_pool_timeout_is_recognized_without_relabeling_primary():
@@ -142,6 +146,16 @@ def test_driver_chain_traversal_has_a_fixed_bound():
         current = current.orig
     current.sqlstate = "57014"
     assert diagnostics.classify_failure(root) == ("database", "unknown")
+    assert diagnostics.database_sqlstate(root) is None
+
+
+def test_sqlstate_ignores_implicit_context_and_accepts_unclassified_valid_codes():
+    handled, current = RuntimeError(), RuntimeError()
+    handled.sqlstate = "42501"
+    current.__context__ = handled
+    assert diagnostics.database_sqlstate(current) is None
+    current.sqlstate = "P0001"
+    assert diagnostics.database_sqlstate(current) == "P0001"
 
 
 @pytest.mark.parametrize(

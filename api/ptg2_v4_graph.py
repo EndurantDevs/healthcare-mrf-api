@@ -75,6 +75,8 @@ PTG2_V4_HOT_SOURCE_RELATIONS = frozenset(
         "set_components",
         "pattern_groups",
         "component_groups",
+        "group_patterns",
+        "pattern_sets",
     }
 )
 

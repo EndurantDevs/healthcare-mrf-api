@@ -21,6 +21,7 @@ import asyncpg
 from db.models import EntityAddressUnified, NPIData
 from process.entity_address_result_generation import validate_entity_address_result_generation_authority
 from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_cms_registry_address_equivalence import _declared_type
 from process.network_custom_address_source import NetworkCustomAddressSourceError, _closed, _digest, _source_identity
 from process.network_membership_writer_closure import NetworkWriterClosureError, _check_roles, _transfer_and_grant
 from process.npi_result_generation import validate_npi_result_generation_authority
@@ -166,7 +167,27 @@ async def _content(connection, schema_name, table_name):
     return total_rows, digest.hexdigest()
 
 
+async def _parent_shape(connection, table_oid, model):
+    """Validate named model types while retaining the exact ordered native shape."""
+    columns, shape_sha256 = await _shape(connection, table_oid)
+    expected_type_by_name = {column.name: _declared_type(column) for column in model.__table__.columns}
+    if sorted(columns) != sorted(expected_type_by_name):
+        raise NetworkBootstrapSourceError("Parent model shape differs")
+    native_types = await connection.fetch(
+        "SELECT attname,format_type(atttypid,atttypmod) AS type FROM pg_attribute "
+        "WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+        table_oid,
+    )
+    if (
+        len(native_types) != len(columns)
+        or {column["attname"]: column["type"] for column in native_types} != expected_type_by_name
+    ):
+        raise NetworkBootstrapSourceError("Parent model type differs")
+    return shape_sha256
+
+
 async def _parent(connection, schema_name, table_name, expected_oid):
+    """Admit one exact generation-zero parent without changing its native layout."""
     authority_name = (
         "entity_address_result_generation" if table_name == "entity_address_unified" else "npi_result_generation"
     )
@@ -191,10 +212,8 @@ async def _parent(connection, schema_name, table_name, expected_oid):
         or catalog["relforcerowsecurity"]
     ):
         raise NetworkBootstrapSourceError("Exact native parent identity differs")
-    columns, shape_sha256 = await _shape(connection, expected_oid)
     model = EntityAddressUnified if table_name == "entity_address_unified" else NPIData
-    if columns != tuple(model.__table__.columns.keys()):
-        raise NetworkBootstrapSourceError("Parent model shape differs")
+    shape_sha256 = await _parent_shape(connection, expected_oid, model)
     validator = (
         validate_entity_address_result_generation_authority
         if table_name == "entity_address_unified"

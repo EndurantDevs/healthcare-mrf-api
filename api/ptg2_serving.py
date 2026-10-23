@@ -12,6 +12,7 @@ import re
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from dataclasses import replace as replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from functools import partial
@@ -8418,20 +8419,17 @@ def _uses_oversized_cost_ordered_geo_gate(
     requested_npi: int | None,
     explicit_provider_filter_requested: bool,
 ) -> bool:
-    """Identify cost lanes whose sealed size must be checked before geo work."""
+    """Preflight provider expansion; aggregate selection owns its bounded geo scan."""
 
     order_by = str(args.get("order_by") or ("total_allowed_amount" if not include_providers else "")).strip().lower()
     return bool(
         serving_tables.uses_v4_graph
         and location_filter_requested
+        and include_providers
         and not price_filter_requested
         and requested_npi is None
         and order_by in _PTG2_COST_ORDER_FIELDS
-        and not (
-            include_providers
-            and not explicit_provider_filter_requested
-            and _is_inferred_taxonomy_only_provider_filter(args)
-        )
+        and not (not explicit_provider_filter_requested and _is_inferred_taxonomy_only_provider_filter(args))
     )
 
 
@@ -14070,52 +14068,18 @@ async def _v4_pattern_exact_groups(
     snapshot_key: int,
     provider_set_keys: tuple[int, ...],
     exact_group_keys: tuple[int, ...],
-    hot_limits: _V4HotPrefixLimits,
     schema_name: str = PTG2_SCHEMA,
 ) -> dict[int, tuple[int, ...]]:
-    """Intersect pattern and component sources without unbounded fanout."""
+    """Transpose exact group incidence without expanding whole pattern groups."""
+    from api.ptg2_billing_exact_reader import transpose_exact_pattern_groups
 
-    group_sources = await _load_v4_pattern_set_group_sources(
+    return await transpose_exact_pattern_groups(
         session,
         snapshot_key=snapshot_key,
         provider_set_keys=provider_set_keys,
-        maximum_pattern_degree=hot_limits.maximum_patterns_per_set,
-        maximum_component_degree=(hot_limits.maximum_components_per_fallback_set),
-        schema_name=schema_name,
-    )
-    pattern_keys, component_keys = _v4_group_source_owner_keys(group_sources)
-    groups_by_pattern = await _v4_exact_source_groups(
-        session,
-        snapshot_key=snapshot_key,
-        relation="pattern_groups",
-        owner_keys=pattern_keys,
         exact_group_keys=exact_group_keys,
-        maximum_projection_members=_PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES,
         schema_name=schema_name,
     )
-    remaining_projection_members = _PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES - sum(
-        len(group_keys) for group_keys in groups_by_pattern.values()
-    )
-    groups_by_component = await _v4_exact_source_groups(
-        session,
-        snapshot_key=snapshot_key,
-        relation="component_groups",
-        owner_keys=component_keys,
-        exact_group_keys=exact_group_keys,
-        maximum_projection_members=remaining_projection_members,
-        schema_name=schema_name,
-    )
-    if set(groups_by_pattern) != set(pattern_keys) or set(groups_by_component) != set(component_keys):
-        raise PTG2ManifestArtifactError("PTG2 V4 exact billing-association projection is incomplete")
-    return {
-        provider_set_key: _merge_v4_source_groups(
-            provider_set_key,
-            group_sources,
-            groups_by_pattern,
-            groups_by_component,
-        )
-        for provider_set_key in provider_set_keys
-    }
 
 
 async def _v4_exact_groups_by_set(
@@ -14153,7 +14117,6 @@ async def _v4_exact_groups_by_set(
                 snapshot_key=snapshot_key,
                 provider_set_keys=normalized_set_keys,
                 exact_group_keys=normalized_group_keys,
-                hot_limits=hot_limits,
                 schema_name=_payload_schema(serving_tables),
             )
     return _validated_exact_group_keys_by_set(
@@ -15059,6 +15022,20 @@ async def _oversized_geo_local_provider_sets(
     )
 
 
+async def _indexed_geo_location_rows(session, serving_tables, args, ownership, code_keys, *, limit):
+    """Apply authenticated code membership before every raw address prefix."""
+    from api.ptg2_billing_geo_reader import query_indexed_membership_locations
+
+    return await query_indexed_membership_locations(session, serving_tables, args, ownership, code_keys, limit=limit)
+
+
+async def _indexed_oversized_geo_provider_sets(session, serving_tables, request, budget, forward_limits):
+    """Use only a complete protected source/code attachment for geographic admission."""
+    from api.ptg2_billing_geo_reader import indexed_geo_provider_sets
+
+    return await indexed_geo_provider_sets(session, serving_tables, request, budget, forward_limits)
+
+
 async def _oversized_geo_code_provider_sets(
     session,
     serving_tables: PTG2ServingTables,
@@ -15151,26 +15128,26 @@ async def _select_oversized_geo_rate_scope(
         budget.maximum_candidate_members,
         _ptg2_manifest_location_match_limit(),
     )
-    local_provider_set_keys = await _oversized_geo_local_provider_sets(
-        session,
-        serving_tables,
-        request.args,
-        budget,
-        forward_limits,
+    provider_set_keys = await _indexed_oversized_geo_provider_sets(
+        session, serving_tables, request, budget, forward_limits
     )
-    if local_provider_set_keys is None:
-        return None
-    if not local_provider_set_keys:
-        return _GeoRateSelection((), True)
-    provider_set_keys = await _oversized_geo_code_provider_sets(
-        session,
-        serving_tables,
-        code_keys,
-        local_provider_set_keys,
-        budget,
-        forward_limits.maximum_retained_memberships,
-        forward_limits.maximum_code_sets,
-    )
+    if provider_set_keys is None:
+        local_provider_set_keys = await _oversized_geo_local_provider_sets(
+            session, serving_tables, request.args, budget, forward_limits
+        )
+        if local_provider_set_keys is None:
+            return None
+        if not local_provider_set_keys:
+            return _GeoRateSelection((), True)
+        provider_set_keys = await _oversized_geo_code_provider_sets(
+            session,
+            serving_tables,
+            code_keys,
+            local_provider_set_keys,
+            budget,
+            forward_limits.maximum_retained_memberships,
+            forward_limits.maximum_code_sets,
+        )
     if not provider_set_keys:
         return _GeoRateSelection((), True)
     return await _read_oversized_geo_rate_rows(

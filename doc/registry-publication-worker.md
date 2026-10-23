@@ -106,6 +106,16 @@ cancellation. Unsupported arguments are also redacted; `--help` is available.
 Source qualification, trusted role bootstrap, deployed command registration and
 runtime acceptance remain separate from this command's local checks.
 
+For [initial inventory publication](../docs/network-initial-publication.md),
+configure both retained bootstrap pins in `initial_address_sources` and provide
+`custody_dsn`. This uses the same accepted URL format and database endpoint as
+the execution connection, with a separately authenticated identity outside the
+worker's role census. The existing native identity and ownership checks still
+apply. Initial publication requires pre-existing direct, owner-issued,
+nongrantable custody-ledger reader access; it refuses missing enrollment and
+does not restore revoked grants. The worker consumes the initial request
+through its ordinary queue and deadline lifecycle without approving saved drafts.
+
 
 The optional closed `sql_limits` object supplies six positive integer limits:
 `work_mem_bytes` (default 16777216), `maintenance_work_mem_bytes` (67108864),

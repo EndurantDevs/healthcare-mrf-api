@@ -155,6 +155,9 @@ def pagination_metadata(
 def query_metadata(code_system: str, code: str, state: str) -> dict[str, Any]:
     """Describe the closed state-scan query shape."""
 
+    from api.plan_pricing_projection_contract import current_code_projection
+
+    capability = current_code_projection()
     return {
         "code": code,
         "code_system": code_system,
@@ -163,8 +166,8 @@ def query_metadata(code_system: str, code: str, state: str) -> dict[str, Any]:
         "order": "asc",
         "view": "full",
         "include_providers": True,
-        "projection_contract": PROJECTION_CONTRACT,
-        "source": "plan_pricing_projection",
+        "projection_contract": PROJECTION_CONTRACT if capability is None else capability.identity["contract"],
+        "source": "plan_pricing_projection" if capability is None else "plan_pricing_code_projection",
     }
 
 

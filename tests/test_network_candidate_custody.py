@@ -80,6 +80,7 @@ class Connection:
         self.exists = True
         self.can_set = True
         self.nonreaders = set()
+        self.enrolled_readers = {"execution", "reader"}
         self.forbidden = set()
         self.heap_safe = True
         self.safe = True
@@ -94,12 +95,12 @@ class Connection:
     @asynccontextmanager
     async def transaction(self, **options):
         assert not self.active
-        before = copy.deepcopy((self.catalog, self.seal))
+        before = copy.deepcopy((self.catalog, self.seal, self.enrolled_readers))
         self.active = True
         try:
             yield
         except BaseException:
-            self.catalog, self.seal = before
+            self.catalog, self.seal, self.enrolled_readers = before
             raise
         finally:
             self.active = False
@@ -126,6 +127,8 @@ class Connection:
 
     async def fetchval(self, sql, *args):
         self.calls.append((sql, args))
+        if "SELECT NOT EXISTS(SELECT FROM unnest($1::text[]) configured(name)" in sql:
+            return set(args[0]) <= self.enrolled_readers
         if sql == custody._CENSUS_SQL:
             return not (set(args[0]) & self.forbidden)
         if "FROM pg_class c WHERE c.oid=ANY" in sql:
@@ -148,6 +151,8 @@ class Connection:
 
     async def execute(self, sql, *args):
         self.calls.append((sql, args))
+        if sql.startswith("GRANT SELECT ON") and ".network_candidate_custody " in sql:
+            self.enrolled_readers.add(sql.rsplit('"', 2)[1])
         if sql.startswith("ALTER SCHEMA"):
             self.catalog["namespace"]["nspowner"] = 11
         if sql.startswith("ALTER TABLE"):
@@ -202,10 +207,42 @@ async def is_authorized(connection, target):
     return True
 
 
-async def seal(connection, authorize=is_authorized):
+async def seal(connection, authorize=is_authorized, **options):
     return await custody.seal_network_candidate_custody(
-        connection, TARGET, control_schema="control", runtime_roles=("execution", "reader"), authorize=authorize
+        connection,
+        TARGET,
+        control_schema="control",
+        runtime_roles=("execution", "reader"),
+        authorize=authorize,
+        **options,
     )
+
+
+async def test_pre_enrolled_seal_never_grants_and_rechecks_existing_seal(boundary):
+    receipt = await seal(boundary, pre_enrolled_only=True)
+    assert not any("GRANT SELECT ON" in sql and ".network_candidate_custody " in sql for sql, _ in boundary.calls)
+    assert await seal(boundary, pre_enrolled_only=True) == receipt
+    boundary.enrolled_readers.remove("execution")
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary, pre_enrolled_only=True)
+    assert boundary.enrolled_readers == {"reader"}
+
+
+async def test_ordinary_seal_keeps_enrollment_and_missing_pre_enrollment_rolls_back(boundary):
+    boundary.enrolled_readers.clear()
+    before = copy.deepcopy(boundary.catalog)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary, pre_enrolled_only=True)
+    assert boundary.seal is None and boundary.catalog == before and boundary.enrolled_readers == set()
+    await seal(boundary)
+    assert boundary.enrolled_readers == {"execution", "reader"}
+
+
+@pytest.mark.parametrize("pre_enrolled_only", [None, 0, 1, "true"])
+async def test_custody_enrollment_mode_is_internal_boolean(boundary, pre_enrolled_only):
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary, pre_enrolled_only=pre_enrolled_only)
+    assert not boundary.calls
 
 
 async def verify(connection, **options):

@@ -12,13 +12,29 @@ from api.ptg2_billing_entity_source_resolution import (
 )
 from api.ptg2_billing_exact_contract import (
     MAX_PRICE_KEY as _MAX_PRICE_KEY,
+)
+from api.ptg2_billing_exact_contract import (
     BillingRateOccurrenceWitness,
+)
+from api.ptg2_billing_exact_contract import (
     ExactGroupProjection as _ExactGroupProjection,
+)
+from api.ptg2_billing_exact_contract import (
     ExactSetProjection as _ExactSetProjection,
+)
+from api.ptg2_billing_exact_contract import (
     billing_rate_occurrence_sort_key as _billing_rate_occurrence_sort_key,
+)
+from api.ptg2_billing_exact_contract import (
     canonical_ref as _canonical_ref,
+)
+from api.ptg2_billing_exact_contract import (
     distinct_dense_keys as _distinct_dense_keys,
+)
+from api.ptg2_billing_exact_contract import (
     normalized_dense_key as _normalized_dense_key,
+)
+from api.ptg2_billing_exact_contract import (
     source_groups as _source_groups,
 )
 from api.ptg2_candidate_audit_capacity import CandidateAuditDecodedRetentionBudget
@@ -39,22 +55,16 @@ def _validated_dictionary(
     expected_ids: Iterable[str],
     category: str,
 ) -> dict[str, int]:
-    expected_id_set = {
-        _canonical_ref(identifier, category=category) for identifier in expected_ids
-    }
+    expected_id_set = {_canonical_ref(identifier, category=category) for identifier in expected_ids}
     if set(values_by_id) != expected_id_set:
-        raise PTG2ManifestArtifactError(
-            f"PTG2 exact billing references an unknown {category}"
-        )
+        raise PTG2ManifestArtifactError(f"PTG2 exact billing references an unknown {category}")
     normalized_values = _distinct_dense_keys(
         values_by_id.values(),
         category=category,
         maximum_count=_MAX_ASSOCIATION_EDGES,
     )
     if len(normalized_values) != len(values_by_id):
-        raise PTG2ManifestArtifactError(
-            f"PTG2 exact billing {category} keys are inconsistent"
-        )
+        raise PTG2ManifestArtifactError(f"PTG2 exact billing {category} keys are inconsistent")
     return dict(values_by_id)
 
 
@@ -64,41 +74,28 @@ def _validated_sets_by_group(
     provider_group_refs: tuple[str, ...],
 ) -> dict[str, tuple[str, ...]]:
     if set(sets_by_group) != set(provider_group_refs):
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing group-to-set projection is incomplete"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing group-to-set projection is incomplete")
     association_edge_count = 0
     for provider_set_ids in sets_by_group.values():
         if type(provider_set_ids) is not tuple:
-            raise PTG2ManifestArtifactError(
-                "PTG2 exact billing group-to-set projection is malformed"
-            )
+            raise PTG2ManifestArtifactError("PTG2 exact billing group-to-set projection is malformed")
         association_edge_count += len(provider_set_ids)
         if association_edge_count > _MAX_ASSOCIATION_EDGES:
-            raise PTG2ManifestArtifactError(
-                "PTG2 exact billing group-to-set projection exceeds its edge limit"
-            )
+            raise PTG2ManifestArtifactError("PTG2 exact billing group-to-set projection exceeds its edge limit")
         normalized_provider_set_ids = tuple(
-            _canonical_ref(provider_set_id, category="provider set")
-            for provider_set_id in provider_set_ids
+            _canonical_ref(provider_set_id, category="provider set") for provider_set_id in provider_set_ids
         )
         if len(normalized_provider_set_ids) != len(set(normalized_provider_set_ids)):
-            raise PTG2ManifestArtifactError(
-                "PTG2 exact billing group-to-set projection contains duplicates"
-            )
+            raise PTG2ManifestArtifactError("PTG2 exact billing group-to-set projection contains duplicates")
     return dict(sets_by_group)
 
 
 def _group_refs_by_key(
     group_keys_by_id: Mapping[str, int],
 ) -> dict[int, str]:
-    group_ref_by_key = {
-        group_key: group_ref for group_ref, group_key in group_keys_by_id.items()
-    }
+    group_ref_by_key = {group_key: group_ref for group_ref, group_key in group_keys_by_id.items()}
     if len(group_ref_by_key) != len(group_keys_by_id):
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing provider-group keys are inconsistent"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing provider-group keys are inconsistent")
     return group_ref_by_key
 
 
@@ -115,9 +112,7 @@ def _validated_exact_groups_by_set(
     for provider_group_ref, provider_set_ids in sets_by_group.items():
         provider_group_key = group_keys_by_id[provider_group_ref]
         for provider_set_id in provider_set_ids:
-            expected_groups_by_set[provider_set_keys_by_id[provider_set_id]].add(
-                provider_group_key
-            )
+            expected_groups_by_set[provider_set_keys_by_id[provider_set_id]].add(provider_group_key)
     expected_group_keys_by_set = {
         provider_set_key: tuple(sorted(provider_group_keys))
         for provider_set_key, provider_group_keys in expected_groups_by_set.items()
@@ -129,22 +124,16 @@ def _validated_exact_groups_by_set(
             category="provider set",
         )
         if normalized_set_key in actual_group_keys_by_set:
-            raise PTG2ManifestArtifactError(
-                "PTG2 exact billing group-to-set projections are inconsistent"
-            )
+            raise PTG2ManifestArtifactError("PTG2 exact billing group-to-set projections are inconsistent")
         if type(provider_group_keys) is not tuple:
-            raise PTG2ManifestArtifactError(
-                "PTG2 exact billing group-to-set projections are inconsistent"
-            )
+            raise PTG2ManifestArtifactError("PTG2 exact billing group-to-set projections are inconsistent")
         actual_group_keys_by_set[normalized_set_key] = _distinct_dense_keys(
             provider_group_keys,
             category="provider group",
             maximum_count=_MAX_ASSOCIATION_EDGES,
         )
     if actual_group_keys_by_set != expected_group_keys_by_set:
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing group-to-set projections are inconsistent"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing group-to-set projections are inconsistent")
     return actual_group_keys_by_set
 
 
@@ -162,17 +151,11 @@ def _source_set_coordinates(
             for provider_set_id in sets_by_group[provider_group_ref]:
                 source_group_set_count += 1
                 if source_group_set_count > _MAX_SOURCE_GROUP_SET_EDGES:
-                    raise PTG2ManifestArtifactError(
-                        "PTG2 exact billing source/group/set scope exceeds its edge limit"
-                    )
-                set_source_coordinates.add(
-                    (provider_set_keys_by_id[provider_set_id], source_key)
-                )
+                    raise PTG2ManifestArtifactError("PTG2 exact billing source/group/set scope exceeds its edge limit")
+                set_source_coordinates.add((provider_set_keys_by_id[provider_set_id], source_key))
     coordinate_count = len(code_keys) * len(set_source_coordinates)
     if coordinate_count > _MAX_FORWARD_FILTER_COORDINATES:
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing forward filter scope exceeds its coordinate limit"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing forward filter scope exceeds its coordinate limit")
     return tuple(
         (code_key, provider_set_key, source_key)
         for code_key in code_keys
@@ -195,22 +178,16 @@ def _validated_occurrences_by_code(
         maximum_count=_MAX_CODE_KEYS,
     )
     if normalized_result_code_keys != code_keys:
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing forward occurrence projection is incomplete"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing forward occurrence projection is incomplete")
     validated_by_code: dict[int, tuple[tuple[int, int, int], ...]] = {}
     for code_key in code_keys:
         normalized_occurrences: list[tuple[int, int, int]] = []
         code_occurrences = occurrences_by_code[code_key]
         if type(code_occurrences) is not tuple:
-            raise PTG2ManifestArtifactError(
-                "PTG2 exact billing forward occurrence projection is malformed"
-            )
+            raise PTG2ManifestArtifactError("PTG2 exact billing forward occurrence projection is malformed")
         for occurrence in code_occurrences:
             if type(occurrence) is not tuple or len(occurrence) != 3:
-                raise PTG2ManifestArtifactError(
-                    "PTG2 exact billing forward occurrence is malformed"
-                )
+                raise PTG2ManifestArtifactError("PTG2 exact billing forward occurrence is malformed")
             provider_set_key = _normalized_dense_key(
                 occurrence[0],
                 category="forward occurrence provider set",
@@ -230,9 +207,7 @@ def _validated_occurrences_by_code(
                 or (provider_set_key, source_key) not in allowed_set_source_coordinates
                 or price_key >= price_item_count
             ):
-                raise PTG2ManifestArtifactError(
-                    "PTG2 exact billing forward occurrence escaped its scope"
-                )
+                raise PTG2ManifestArtifactError("PTG2 exact billing forward occurrence escaped its scope")
             normalized_occurrences.append((provider_set_key, price_key, source_key))
         validated_by_code[code_key] = tuple(sorted(normalized_occurrences))
     return validated_by_code
@@ -253,21 +228,14 @@ def _materialize_rate_witnesses(
             price_key,
             source_key,
         ) in enumerate(occurrences_by_code[code_key]):
-            exact_group_refs = {
-                group_ref_by_key[group_key]
-                for group_key in group_keys_by_set[provider_set_key]
-            }
-            for provider_group_ref in sorted(
-                exact_group_refs & set(group_refs_by_source[source_key])
-            ):
+            exact_group_refs = {group_ref_by_key[group_key] for group_key in group_keys_by_set[provider_set_key]}
+            for provider_group_ref in sorted(exact_group_refs & set(group_refs_by_source[source_key])):
                 witnesses.append(
                     BillingRateOccurrenceWitness(
                         snapshot_key=snapshot_key,
                         code_key=code_key,
                         source_key=source_key,
-                        source_record_ordinal=group_refs_by_source[source_key][
-                            provider_group_ref
-                        ],
+                        source_record_ordinal=group_refs_by_source[source_key][provider_group_ref],
                         provider_group_ref=provider_group_ref,
                         provider_set_key=provider_set_key,
                         price_key=price_key,
@@ -275,9 +243,7 @@ def _materialize_rate_witnesses(
                     )
                 )
                 if len(witnesses) > _MAX_RATE_WITNESSES:
-                    raise PTG2ManifestArtifactError(
-                        "PTG2 exact billing rate witness scope exceeds its limit"
-                    )
+                    raise PTG2ManifestArtifactError("PTG2 exact billing rate witness scope exceeds its limit")
     return tuple(sorted(witnesses, key=_billing_rate_occurrence_sort_key))
 
 
@@ -295,17 +261,11 @@ async def _load_group_projection(
         source_scope,
         snapshot_key=snapshot_key,
         source_count=source_count,
-        source_publication=(
-            serving_tables.provider_tax_identity_source_publication
-        ),
+        source_publication=(serving_tables.provider_tax_identity_source_publication),
     )
     provider_group_refs = tuple(
         sorted(
-            {
-                provider_group_ref
-                for group_refs in group_refs_by_source.values()
-                for provider_group_ref in group_refs
-            }
+            {provider_group_ref for group_refs in group_refs_by_source.values() for provider_group_ref in group_refs}
         )
     )
     sets_by_group = _validated_sets_by_group(
@@ -379,13 +339,8 @@ async def _load_set_projection(
 
 def _price_item_count(forward_lookup_hints: Mapping[str, Any]) -> int:
     price_item_count = forward_lookup_hints["price_dictionary_item_count"]
-    if (
-        type(price_item_count) is not int
-        or not 0 <= price_item_count <= _MAX_PRICE_KEY + 1
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing price dictionary size is invalid"
-        )
+    if type(price_item_count) is not int or not 0 <= price_item_count <= _MAX_PRICE_KEY + 1:
+        raise PTG2ManifestArtifactError("PTG2 exact billing price dictionary size is invalid")
     return price_item_count
 
 
@@ -416,9 +371,7 @@ async def _load_forward_occurrences(
         code_keys,
         shared_snapshot_key=group_projection.snapshot_key,
         source_count=group_projection.source_count,
-        provider_set_keys_by_code={
-            code_key: provider_set_keys for code_key in code_keys
-        },
+        provider_set_keys_by_code={code_key: provider_set_keys for code_key in code_keys},
         source_keys_by_code={code_key: source_keys for code_key in code_keys},
         occurrence_keys=occurrence_keys,
         max_occurrences=_MAX_FORWARD_OCCURRENCES,
@@ -433,15 +386,12 @@ async def _load_forward_occurrences(
             provider_set_keys=provider_set_keys,
             source_keys=source_keys,
             allowed_set_source_coordinates=frozenset(
-                (provider_set_key, source_key)
-                for _code_key, provider_set_key, source_key in occurrence_keys
+                (provider_set_key, source_key) for _code_key, provider_set_key, source_key in occurrence_keys
             ),
             price_item_count=_price_item_count(lookup_hints),
         )
     finally:
-        retained_bytes = ptg2_db_sidecars.forward_occurrence_batch_retained_bytes(
-            occurrences_by_code
-        )
+        retained_bytes = ptg2_db_sidecars.forward_occurrence_batch_retained_bytes(occurrences_by_code)
         retention_budget.release(retained_bytes)
 
 
@@ -455,9 +405,7 @@ async def load_exact_billing_rate_occurrence_witnesses(
     """Traverse one sealed billing scope to its exact code/rate occurrences."""
 
     if not serving_tables.uses_v4_graph:
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing search requires the sealed V4 provider graph"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing search requires the sealed V4 provider graph")
     normalized_code_keys = _distinct_dense_keys(
         code_keys,
         category="code",
@@ -497,3 +445,50 @@ __all__ = [
     "BillingRateOccurrenceWitness",
     "load_exact_billing_rate_occurrence_witnesses",
 ]
+
+
+async def transpose_exact_pattern_groups(
+    session,
+    *,
+    snapshot_key: int,
+    provider_set_keys: tuple[int, ...],
+    exact_group_keys: tuple[int, ...],
+    schema_name: str = ptg2_serving.PTG2_SCHEMA,
+) -> dict[int, tuple[int, ...]]:
+    """Transpose exact group incidence without expanding whole pattern groups."""
+
+    patterns_by_group = await ptg2_serving.lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation="group_patterns",
+        owner_keys=exact_group_keys,
+        schema_name=schema_name,
+        max_members=ptg2_serving._PTG2_EXACT_BILLING_MAX_PROVIDER_GROUPS,
+    )
+    if set(patterns_by_group) != set(exact_group_keys) or any(
+        len(pattern_keys) != 1 for pattern_keys in patterns_by_group.values()
+    ):
+        raise ptg2_serving.PTG2ManifestArtifactError("PTG2 V4 exact billing-association projection is incomplete")
+    pattern_keys = tuple(sorted({keys[0] for keys in patterns_by_group.values()}))
+    sets_by_pattern = await ptg2_serving.lookup_v4_relation_members(
+        session,
+        snapshot_key=snapshot_key,
+        relation="pattern_sets",
+        owner_keys=pattern_keys,
+        schema_name=schema_name,
+        max_members=ptg2_serving._PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES,
+    )
+    if set(sets_by_pattern) != set(pattern_keys):
+        raise ptg2_serving.PTG2ManifestArtifactError("PTG2 V4 exact billing-association projection is incomplete")
+    groups_by_set: dict[int, list[int]] = {key: [] for key in provider_set_keys}
+    association_edge_count = 0
+    for group_key in exact_group_keys:
+        for set_key in sets_by_pattern[patterns_by_group[group_key][0]]:
+            if set_key in groups_by_set:
+                association_edge_count += 1
+                if association_edge_count > ptg2_serving._PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES:
+                    raise ptg2_serving.PTG2ManifestArtifactError(
+                        "PTG2 exact billing association scope exceeds its edge limit"
+                    )
+                groups_by_set[set_key].append(group_key)
+    return {set_key: tuple(group_keys) for set_key, group_keys in groups_by_set.items()}

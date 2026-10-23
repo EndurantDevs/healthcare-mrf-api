@@ -90,6 +90,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
             "plan-pricing-prewarm",
             "plan-pricing-em-distance",
             "ptg-provider-membership-projection",
+            "plan-pricing-code-projection",
             "plan-pricing-em-attribution",
         ),
     ),
@@ -1749,6 +1750,7 @@ def _single_job_worker_target(
     run_id = str(payload.get("run_id") or "").strip()
     projection_job_prefix_by_importer = {
         "ptg-provider-membership-projection": "ptg_provider_membership_projection",
+        "plan-pricing-code-projection": "plan_pricing_code_projection",
         "plan-pricing-projection": "plan_pricing_projection",
         "plan-pricing-prewarm": "plan_pricing_prewarm",
         "plan-pricing-em-distance": "plan_pricing_em_distance",

@@ -3,11 +3,15 @@
 
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 import asyncpg
 
+from process import network_bootstrap_sources as bootstrap_sources
+from process import network_candidate_custody as candidate_custody
 from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_candidate_custody import verify_network_candidate_custody
 from process.network_custom_address_source import (
     _from_document as _custom_address_receipt,
 )
@@ -41,10 +45,13 @@ from process.registry_candidate_composition import (
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_publication_queue import (
     _document,
+    _initial_inventory_record,
+    _initial_inventory_result,
     _json,
     _reactivation_actor,
     _reactivation_document,
     _request_metadata,
+    _require_empty_initial_inventory,
     _retained_operation_record,
     _source_rollback_publication_record,
     _source_rollback_publication_result,
@@ -137,11 +144,31 @@ def _require_outside_transaction(connection):
         raise ValueError("registry_execution_requires_phase_owned_transactions")
 
 
-async def _fresh_retained_operation_authority(authorize, request_record, operation):
+@asynccontextmanager
+async def _locked_request_transaction(connection, request_id, lease_id, namespace):
+    """Refresh a snapshot raced by renewal before any publication work starts."""
+    _require_outside_transaction(connection)
+    for attempt in range(3):
+        has_request_lock = False
+        try:
+            async with connection.transaction(isolation="repeatable_read"):
+                request_record = await _request(connection, request_id, lease_id, namespace, lock=True)
+                has_request_lock = True
+                yield request_record
+            return
+        except asyncpg.SerializationError:
+            if has_request_lock or attempt == 2 or connection.is_in_transaction():
+                raise
+
+
+async def _fresh_operation_authority(authorize, request_record, operation):
     if not callable(authorize):
         raise ValueError("registry_publication_authority_required")
-    if operation == "publish_source_rollback":
-        command, actor = _source_rollback_publication_record(request_record)
+    if operation in {"publish_source_rollback", "publish_initial_inventory"}:
+        parse = (
+            _source_rollback_publication_record if operation == "publish_source_rollback" else _initial_inventory_record
+        )
+        command, actor = parse(request_record)
         command_by_name = command
     else:
         command, actor = _retained_operation_record(request_record, operation)
@@ -177,6 +204,11 @@ async def _fresh_retained_operation_authority(authorize, request_record, operati
     revision = receipt_by_name["policy_revision"]
     if type(revision) is not int or not 0 <= revision < 2**63:
         raise ValueError("registry_publication_authority_invalid")
+    return command, revision
+
+
+async def _fresh_retained_operation_authority(authorize, request_record, operation):
+    command, _revision = await _fresh_operation_authority(authorize, request_record, operation)
     return command
 
 
@@ -347,8 +379,7 @@ async def _finish_source_rollback_preview(
 ):
     source_pin, current_pin, result_by_name = preview_context
     namespace = _namespace(control_schema)
-    async with connection.transaction(isolation="repeatable_read"):
-        locked = await _request(connection, request_record["request_id"], lease_id, namespace, lock=True)
+    async with _locked_request_transaction(connection, request_record["request_id"], lease_id, namespace) as locked:
         if locked["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
         command = await _fresh_retained_operation_authority(authorize, locked, "prepare_source_rollback")
@@ -535,8 +566,7 @@ async def complete_queued_registry_source_rollback_publication(
     command_by_name = await _fresh_retained_operation_authority(authorize, request_record, "publish_source_rollback")
     async with connection.transaction(isolation="repeatable_read"):
         await _verify_source_rollback_publication_target(connection, command_by_name, writer_roles, control_schema)
-    async with connection.transaction(isolation="repeatable_read"):
-        locked = await _request(connection, request_id, lease_id, namespace, lock=True)
+    async with _locked_request_transaction(connection, request_id, lease_id, namespace) as locked:
         if locked["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
         command_by_name = await _fresh_retained_operation_authority(authorize, locked, "publish_source_rollback")
@@ -578,8 +608,7 @@ async def complete_queued_registry_reactivation(connection, request_id, lease_id
     namespace = _namespace(control_schema)
     request_record = await _request(connection, request_id, lease_id, namespace)
     await _fresh_reactivation_authority(authorize, request_record)
-    async with connection.transaction(isolation="repeatable_read"):
-        locked_request = await _request(connection, request_id, lease_id, namespace, lock=True)
+    async with _locked_request_transaction(connection, request_id, lease_id, namespace) as locked_request:
         if locked_request["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
         command = await _fresh_reactivation_authority(authorize, locked_request)
@@ -614,6 +643,201 @@ async def complete_queued_registry_reactivation(connection, request_id, lease_id
         }
         await finish_registry_publication_request(
             connection, request_id, lease_id, state="completed", result=result_by_name, control_schema=control_schema
+        )
+        return result_by_name
+
+
+async def _initial_inventory_bootstrap(connection, command_by_name, initial_address_sources, control_schema):
+    """Verify retained content once, outside every publication-control lock."""
+    schema_name = "network_bootstrap_" + UUID(command_by_name["bootstrap_id"]).hex
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        receipt = bootstrap_sources._decode(
+            await connection.fetchval(
+                "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
+                schema_name,
+            )
+        )
+        if (
+            bootstrap_sources._schema_name(receipt.specification) != schema_name
+            or receipt.specification.bootstrap_id != command_by_name["bootstrap_id"]
+            or receipt.generation_sha256 != command_by_name["bootstrap_generation_sha256"]
+            or initial_address_sources != RegistryCompositionAddressSources(receipt.address_source, receipt.npi_source)
+        ):
+            raise ValueError("registry_initial_inventory_source_mismatch")
+        current = await connection.fetchrow(
+            f"SELECT approved_revision,coalesce(generation_id,0) FROM {_namespace(control_schema)}.registry_revision_control "
+            f"CROSS JOIN {_namespace(control_schema)}.network_serving_control WHERE registry_revision_control.id=1 AND network_serving_control.id=1"
+        )
+        if current is None or tuple(current) != (0, 0):
+            raise RegistryApprovalConflict("registry_initial_inventory_revision_conflict")
+        await _require_empty_initial_inventory(connection, _namespace(control_schema))
+        await bootstrap_sources.verify_network_bootstrap_sources(connection, receipt)
+        return receipt
+
+
+async def _verify_initial_inventory_candidate(connection, copy_target, bootstrap, control_schema):
+    """Bind the sealed zero-accounting candidate to its exact retained address recipe."""
+    candidate_by_name = dict(await _locked_candidate(connection, copy_target, _namespace(control_schema)))
+    if (
+        candidate_by_name["state"] != "ready"
+        or any(
+            candidate_by_name[field] != 0
+            for field in (
+                "approved_custom_revision",
+                "expected_head",
+                "expected_rows",
+                "accepted_rows",
+            )
+        )
+        or _document(candidate_by_name["source_recipes_json"]) != []
+    ):
+        raise RegistryApprovalConflict("registry_initial_inventory_candidate_conflict")
+    _publication_readiness(candidate_by_name)
+    report_by_name = _document(candidate_by_name["validation_json"])
+    if any(
+        report_by_name[field] != 0
+        for field in (
+            "raw_rows",
+            "batch_rows",
+            "batch_count",
+            "membership_rows",
+            "distinct_memberships",
+            "projected_locations",
+            "orphan_bindings",
+            "unknown_network_rows",
+        )
+    ):
+        raise RegistryApprovalConflict("registry_initial_inventory_candidate_conflict")
+    address_pin = PinnedAddressSource(**report_by_name["address_source"])
+    artifact = _custom_address_receipt(
+        await connection.fetchval(
+            "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
+            address_pin.schema_name,
+        )
+    )
+    if (
+        artifact.address_source != address_pin
+        or artifact.base_source != bootstrap.address_source
+        or artifact.npi_source != bootstrap.npi_source
+        or artifact.approved_revision != 0
+        or artifact.control_schema != control_schema
+        or artifact.custom_pair_count != 0
+        or artifact.ptg_carry_sha256 is not None
+        or artifact.aca_carry_sha256 is not None
+    ):
+        raise ValueError("registry_initial_inventory_source_mismatch")
+    await verify_retained_custom_address_source(connection, artifact)
+    await bootstrap_sources._verify_capture(connection, bootstrap, verify_content=False)
+    await verify_network_candidate_custody(connection, copy_target, control_schema=control_schema, required=True)
+    return report_by_name["membership_rows"]
+
+
+async def _require_initial_custody_enrollment(connection, readers, control_schema):
+    """Require the direct ledger grants the native seal would otherwise add."""
+    await candidate_custody._require_reader_enrollment(connection, readers, control_schema)
+
+
+async def _initial_candidate_custody_enrollment(connection, copy_target, writer_context):
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        candidate = await connection.fetchrow(
+            f"SELECT * FROM {_namespace(writer_context.control_schema)}.network_membership_candidate WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
+        )
+        catalog = await candidate_custody._catalog(connection, copy_target, dict(candidate))
+        runtime_roles = tuple(role for role in writer_context.custody_roles if role != writer_context.queue_owner_role)
+        readers = await candidate_custody._existing_readers(connection, catalog, runtime_roles)
+        await _require_initial_custody_enrollment(connection, readers, writer_context.control_schema)
+
+
+async def complete_queued_registry_initial_inventory(
+    connection, request_id, lease_id, *, authorize, writer_context, initial_address_sources
+):
+    """Publish genuine bootstrap inventory with independent custody and no approval mutation."""
+    from process.registry_publication_consumer import RegistryPublicationConsumerConfig
+
+    if type(writer_context) is not RegistryPublicationConsumerConfig or not callable(writer_context.seal_candidate):
+        raise ValueError("registry_initial_inventory_custody_required")
+    _require_outside_transaction(connection)
+    control_schema = writer_context.control_schema
+    namespace = _namespace(control_schema)
+    request_record = await _request(connection, request_id, lease_id, namespace)
+    command, _revision = await _fresh_operation_authority(authorize, request_record, "publish_initial_inventory")
+    known_readers = (writer_context.execution_role, writer_context.physical_owner_role)
+    await _require_initial_custody_enrollment(
+        connection,
+        tuple(sorted(set(known_readers + writer_context.loader_roles + writer_context.reader_roles))),
+        control_schema,
+    )
+    bootstrap = await _initial_inventory_bootstrap(connection, command, initial_address_sources, control_schema)
+    compose = (
+        compose_registry_membership_candidate
+        if writer_context.composition_runtime is None
+        else writer_context.composition_runtime.compose
+    )
+    copy_target, address_source = await compose(
+        connection,
+        request_id=request_id,
+        approved_revision=0,
+        expected_head=0,
+        source_manifest=None,
+        address_sources=initial_address_sources,
+        writer_roles=writer_context.writer_roles,
+        control_schema=control_schema,
+    )
+    await prepare_network_candidate(
+        connection,
+        copy_target,
+        address_source,
+        **writer_context.writer_roles,
+        control_schema=control_schema,
+    )
+    await _fresh_operation_authority(authorize, request_record, "publish_initial_inventory")
+    await _initial_candidate_custody_enrollment(connection, copy_target, writer_context)
+    await writer_context.seal_candidate(copy_target, pre_enrolled_only=True)
+    return await _finish_initial_inventory(
+        connection,
+        request_record,
+        lease_id,
+        copy_target,
+        bootstrap,
+        authorize=authorize,
+        control_schema=control_schema,
+    )
+
+
+async def _finish_initial_inventory(
+    connection, request_record, lease_id, copy_target, bootstrap, *, authorize, control_schema
+):
+    """Fence retained evidence and commit initial manifest and queue completion together."""
+    namespace = _namespace(control_schema)
+    async with _locked_request_transaction(connection, request_record["request_id"], lease_id, namespace) as locked:
+        if locked["request_sha256"] != request_record["request_sha256"]:
+            raise RegistryApprovalConflict("registry_queue_request_changed")
+        approved, head = await _lock_publication_controls(connection, namespace)
+        if (approved, head) != (0, 0):
+            raise RegistryApprovalConflict("registry_initial_inventory_revision_conflict")
+        await _require_empty_initial_inventory(connection, namespace)
+        membership_rows = await _verify_initial_inventory_candidate(connection, copy_target, bootstrap, control_schema)
+        _command, policy_revision = await _fresh_operation_authority(authorize, locked, "publish_initial_inventory")
+        manifest = await publish_network_candidate(connection, copy_target, control_schema=control_schema)
+        result_by_name = dict(
+            operation="publish_initial_inventory",
+            candidate_id=copy_target.candidate_id,
+            previous_generation_id=head,
+            generation_id=manifest["generation_id"],
+            approved_custom_revision=approved,
+            membership_rows=membership_rows,
+            manifest_sha256=manifest["manifest_sha256"],
+            policy_revision=policy_revision,
+        )
+        _initial_inventory_result(result_by_name, _command, "completed")
+        await finish_registry_publication_request(
+            connection,
+            request_record["request_id"],
+            lease_id,
+            state="completed",
+            result=result_by_name,
+            control_schema=control_schema,
         )
         return result_by_name
 
@@ -732,8 +956,7 @@ async def complete_queued_registry_publication(
     await _fresh_authority(authorize, request_record)
     if seal_candidate is not None:
         await seal_candidate(copy_target)
-    async with connection.transaction(isolation="repeatable_read"):
-        locked_request = await _request(connection, request_id, lease_id, namespace, lock=True)
+    async with _locked_request_transaction(connection, request_id, lease_id, namespace) as locked_request:
         if locked_request["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
         await _fresh_authority(authorize, locked_request)

@@ -34,11 +34,13 @@ from process.registry_publication_queue import (
     RegistryReactivationCommand,
     _reactivation_actor,
     _reactivation_document,
+    enqueue_registry_initial_inventory,
     enqueue_registry_publication,
     enqueue_registry_reactivation,
     enqueue_registry_source_rollback_preview,
     enqueue_registry_source_rollback_publication,
     read_registry_publication_request,
+    validated_registry_initial_inventory_command,
     validated_registry_source_rollback_preview_command,
     validated_registry_source_rollback_publication_command,
 )
@@ -164,6 +166,58 @@ def _retained_operation_command(request, operation):
 
 def _reactivation_command(request):
     return _retained_operation_command(request, "reactivate_generation")
+
+
+def _initial_inventory_command(request):
+    if not request.body or len(request.body) > 4096 or request.query_string or request.args:
+        raise ValueError("registry_publication_request_invalid")
+    document = json.loads(request.body, object_pairs_hook=_unique_object)
+    if type(document) is not dict or set(document) != {
+        "operation",
+        "bootstrap_id",
+        "bootstrap_generation_sha256",
+        "expected_serving_generation",
+        "expected_approved_revision",
+        "reason",
+        "idempotency_key",
+        "actor",
+        "session_token_sha256",
+    }:
+        raise ValueError("registry_initial_inventory_command_invalid")
+    command = validated_registry_initial_inventory_command(
+        {key: value for key, value in document.items() if key not in {"actor", "session_token_sha256"}}
+    )
+    actor_document = document["actor"]
+    if type(actor_document) is not dict or set(actor_document) != {"kind", "user_id", "client_id"}:
+        raise ValueError("registry_reactivation_actor_invalid")
+    actor = RegistryActor(actor_document["kind"], _uuid(actor_document["user_id"]), actor_document["client_id"])
+    _reactivation_actor(actor)
+    session_hash = document["session_token_sha256"]
+    if type(session_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", session_hash) is None:
+        raise ValueError("registry_session_hash_invalid")
+    return command, actor, session_hash
+
+
+@blueprint.post("/initial-inventory")
+async def queue_initial_inventory(request):
+    """Queue the administrator's initial inventory without approving draft records."""
+    require_registry_auth(request)
+    try:
+        command, actor, session_hash = _initial_inventory_command(request)
+        async with request.ctx.sa_session.begin():
+            receipt = await enqueue_registry_initial_inventory(
+                await _driver(request.ctx.sa_session),
+                command,
+                actor,
+                session_token_sha256=session_hash,
+            )
+        return response.json(receipt, headers=_HEADERS)
+    except RegistryRecordConflict:
+        return _error(409)
+    except ValueError, TypeError, UnicodeError, RecursionError:
+        return _error(400)
+    except asyncpg.PostgresError, SQLAlchemyError:
+        return _error(503)
 
 
 def _source_rollback_publication_command(request):

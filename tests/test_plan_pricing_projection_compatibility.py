@@ -7,19 +7,18 @@ import importlib.util
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from api import plan_pricing_projection as projection
+
 from .test_plan_pricing_projection import _selection, _Session
 
 
 def _projection_migration():
     migration_path = (
-        Path(__file__).resolve().parents[1]
-        / "alembic"
-        / "versions"
-        / "20260825150000_plan_pricing_card_projection.py"
+        Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260825150000_plan_pricing_card_projection.py"
     )
     module_spec = importlib.util.spec_from_file_location(
         "plan_pricing_card_projection_compatibility_migration",
@@ -34,6 +33,7 @@ def _projection_migration():
 @pytest.mark.asyncio
 async def test_omitted_false_without_ready_projection_falls_back_to_legacy():
     session = _Session([])
+    session.scalar = AsyncMock(return_value=False)
     response = await projection.search_plan_pricing_projection(
         session,
         _selection(projection_id=None),
@@ -47,6 +47,7 @@ async def test_omitted_false_without_ready_projection_falls_back_to_legacy():
     )
 
     assert response is None
+    session.scalar.assert_awaited_once()
     assert session.statements == []
 
 

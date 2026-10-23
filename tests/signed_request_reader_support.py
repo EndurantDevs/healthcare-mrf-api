@@ -22,14 +22,14 @@ def _transport_session(session):
     session.info = {}
 
     async def execute(statement, params=None):
-        if str(statement) == "SELECT session_user, current_user":
+        if str(statement).startswith("SELECT session_user, current_user"):
             scope = session.begin()
             await scope.__aenter__()
             state_by_field.update(scope=scope, active=True)
             await original_execute(
                 getattr(session, "snapshot_sql", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             )
-            return _FakeResult(("reader_test", "reader_test"))
+            return _FakeResult(("reader_test", "reader_test", 12345, 23456, "192.0.2.1", 5432, 34567))
         return await original_execute(statement) if params is None else await original_execute(statement, params)
 
     async def finish(failure=None):
