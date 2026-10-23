@@ -1476,15 +1476,17 @@ async def test_guard_probe_statement_timeout_counts_as_a_probe_timeout():
 @pytest.mark.asyncio
 async def test_drain_waits_for_running_preparations_even_when_cancelled():
     executor = ThreadPoolExecutor(max_workers=1)
-    release, finished = threading.Event(), threading.Event()
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
 
     def busy():
+        started.set()
         release.wait()
         finished.set()
 
     executor.submit(busy)
-    drain = asyncio.create_task(cms._drain_stage_executor(executor))
     try:
+        assert await asyncio.to_thread(started.wait, 5)
+        drain = asyncio.create_task(cms._drain_stage_executor(executor))
         async with asyncio.timeout(5):
             while not executor._shutdown:
                 await asyncio.sleep(0.01)
