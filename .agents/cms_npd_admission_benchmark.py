@@ -27,6 +27,7 @@ import importlib
 import json
 import os
 import resource
+import sys
 import time
 from compression import zstd
 from pathlib import Path
@@ -328,12 +329,19 @@ async def test_cms_npd_admission_benchmark(monkeypatch, cms_artifact_root):
     timers.install(monkeypatch)
     async with support.intake_admission_database(monkeypatch) as database:
         before = await _capacity(database)
-        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss is bytes on macOS, KiB on Linux
+        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * rss_scale
+        children_before = resource.getrusage(resource.RUSAGE_CHILDREN)
         wall_started, cpu_started = time.monotonic(), time.process_time()
         with support.release_probe_client(directory) as probe:
             result = await cms._run_acquired({"context": {}}, {}, "benchmark-run", directory, receipt, probe)
         wall = time.monotonic() - wall_started
         cpu = time.process_time() - cpu_started
+        # Staging workers are reaped before _run_acquired returns, so their usage is complete here.
+        children_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        worker_cpu = (children_after.ru_utime + children_after.ru_stime) - (
+            children_before.ru_utime + children_before.ru_stime
+        )
         out = os.getenv(_OUT_ENV)
         if out:  # keep the timing even if a later capacity or parity query fails
             Path(out).write_text(
@@ -342,6 +350,7 @@ async def test_cms_npd_admission_benchmark(monkeypatch, cms_artifact_root):
                         "partial": True,
                         "admission_wall_seconds": round(wall, 3),
                         "admission_cpu_seconds": round(cpu, 3),
+                        "worker_cpu_seconds": round(worker_cpu, 3),
                         "phases": timers.records,
                         "timeline": timers.timeline,
                     },
@@ -376,10 +385,12 @@ async def test_cms_npd_admission_benchmark(monkeypatch, cms_artifact_root):
         "extraction_seconds": round(extraction_seconds, 3),
         "admission_wall_seconds": round(wall, 3),
         "admission_cpu_seconds": round(cpu, 3),
+        "worker_cpu_seconds": round(worker_cpu, 3),
         "resources_per_second": round(expected_resources / wall, 1),
         "database_growth_bytes": after["database_bytes"] - before["database_bytes"],
         "wal_bytes": wal_bytes,
-        "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * rss_scale,
+        "peak_worker_rss_bytes": children_after.ru_maxrss * rss_scale,
         "rss_before_bytes": rss_before,
         "phases": dict(
             sorted(

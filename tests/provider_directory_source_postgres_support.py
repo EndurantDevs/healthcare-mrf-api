@@ -552,7 +552,7 @@ async def _drop_native_source_roles(connection, created, admin):
 
 _CANCEL_AUTOVACUUM_SQL = """SELECT pg_cancel_backend(pid) FROM pg_stat_activity
 WHERE datname=current_database() AND backend_type='autovacuum worker'
-AND pg_has_role(current_user,'pg_signal_autovacuum_worker','USAGE')"""
+AND pg_has_role(current_user,to_regrole('pg_signal_autovacuum_worker'),'USAGE')"""
 
 
 async def _cleanup_native_source_component(engine, database, is_owned_reader, retention_oid, created, admin):

@@ -1412,6 +1412,9 @@ async def test_stream_persists_pool_prepared_batches_in_file_order(monkeypatch, 
 def test_stage_executor_follows_the_worker_setting(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CMS_NPD_STAGE_WORKERS", "0")
     assert cms._stage_executor() is None
+    monkeypatch.setenv("HLTHPRT_CMS_NPD_STAGE_WORKERS", "many")
+    with pytest.raises(RuntimeError, match="cms_npd_stage_workers_invalid"):
+        cms._stage_executor()
     monkeypatch.setenv("HLTHPRT_CMS_NPD_STAGE_WORKERS", "2")
     executor = cms._stage_executor()
     try:

@@ -1350,8 +1350,9 @@ async def _probe_intake_guard(connection, lock_key, backend_id, confirmed_at):
         # A slow probe is not a lost lock; a confirmed loss or a minute of timeouts is.
         if not isinstance(error.__cause__, TimeoutError) or time.monotonic() - confirmed_at >= _GUARD_LOSS_SECONDS:
             raise
-        with suppress(Exception):
-            await connection.rollback()
+        with suppress(Exception):  # a stalled rollback must not outlive the loss window either
+            async with asyncio.timeout(_GUARD_PROBE_SECONDS):
+                await connection.rollback()
         return confirmed_at
     return time.monotonic()
 
@@ -1425,8 +1426,12 @@ async def _tax_candidate_followup_status(fhir: Any, directory: Path, candidate: 
 
 
 def _stage_executor():
-    """Spare CPUs prepare batches in worker processes; 0 keeps staging on the publisher process."""
-    workers = int(os.getenv("HLTHPRT_CMS_NPD_STAGE_WORKERS") or max(1, (os.cpu_count() or 2) - 1))
+    """Spare CPUs (at most four) prepare batches in worker processes; 0 keeps staging on the publisher."""
+    configured = os.getenv("HLTHPRT_CMS_NPD_STAGE_WORKERS")
+    try:
+        workers = int(configured) if configured else min(4, max(1, (os.process_cpu_count() or 2) - 1))
+    except ValueError as error:
+        raise RuntimeError("cms_npd_stage_workers_invalid") from error
     return ProcessPoolExecutor(max_workers=workers) if workers > 0 else None
 
 
@@ -1467,7 +1472,7 @@ async def _stage_and_validate_candidate(fhir, directory, candidate, identity, re
                 )
         finally:
             if executor is not None:
-                executor.shutdown(wait=False, cancel_futures=True)
+                executor.shutdown(wait=True, cancel_futures=True)
     from process.provider_directory_generic_source_adapters import completed_source_scope
     from process.provider_directory_generic_source_policy import source_transaction
 
