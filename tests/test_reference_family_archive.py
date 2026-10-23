@@ -538,6 +538,35 @@ def test_model_index_ddl_rejects_malformed_options(index_spec):
     assert archive._is_reviewed_index_element(None) is False
 
 
+def test_model_index_ddl_accepts_the_declared_qualified_operator_class():
+    from db.models.entity_address_unified import EntityAddressUnified
+
+    index = next(
+        item for item in EntityAddressUnified.__my_additional_indexes__ if item.get("name") == "canonical_network_ids"
+    )
+    statement = archive._additional_index_sql("synthetic_stage", EntityAddressUnified, index)
+    assert " USING gin (canonical_network_ids public.gin__int_ops)" in statement
+
+
+@pytest.mark.parametrize(
+    ("element", "accepted"),
+    [
+        ("network_ids gin__int_ops", True),
+        ("network_ids public.gin__int_ops", True),
+        ("network_ids synthetic_schema.gin__int_ops", True),
+        ("network_ids public..gin__int_ops", False),
+        ("network_ids .gin__int_ops", False),
+        ("network_ids public.gin__int_ops.", False),
+        ("network_ids one.two.gin__int_ops", False),
+        ("network_ids public.gin__int_ops;SELECT", False),
+        ("network_ids public.gin__int_ops --", False),
+        ("bad-name public.gin__int_ops", False),
+    ],
+)
+def test_model_index_qualified_operator_grammar(element, accepted):
+    assert archive._is_reviewed_index_element(element) is accepted
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
