@@ -139,8 +139,10 @@ async def _active_rows(connection, policy, binding_by_field, key, columns):
         yield dict(row)
 
 
+# Only identical payloads may take the last-observation shortcut: the contract hash covers the
+# semantic subset alone, and the ordered semantic union decides between differing provenance.
 _DIVERGENCE_FIELDS = {
-    "resource_input": "payload_hash,coalesce(acquired_resource_sha256,'')",
+    "resource_input": "payload_hash,payload_json,coalesce(acquired_resource_sha256,'')",
     "witness_input": "source_id,release_id,raw_payload_sha256,normalized_payload_hash",
 }
 _SET_REDUCTION_WORK_MEM = "256MB"
