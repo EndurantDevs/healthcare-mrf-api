@@ -1,8 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Fixed control custody rejects changed authority without blocking ordinary DML."""
 
+import asyncio
 import importlib
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -22,6 +24,57 @@ def _columns(model):
         dict(name=name, type=kind, required=required, identity="", generated="")
         for name, (kind, required) in custody._model_columns(model).items()
     ]
+
+
+def _legacy_control_connection():
+    return SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchrow=AsyncMock(
+            return_value=dict(session="administrator", current="administrator", backend=1, xid="123", native_admin=True)
+        ),
+        fetch=AsyncMock(return_value=[dict(oid=901)]),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["connection", "ended", "proof_locks", "unissued"])
+async def test_control_legacy_observation_rechecks_issued_proof_scope(fault):
+    from tests.test_provider_directory_source_builder_delegation import _receipt
+
+    policy = SimpleNamespace(owner_role="owner", publisher_role="publisher", runtime_roles=("builder", "reader"))
+    connection = _legacy_control_connection()
+    actor = (await custody._admin_identity(connection, policy), asyncio.current_task())
+    proof = await custody._control_delegation(connection, policy, _receipt(), True)
+    match fault:
+        case "connection":
+            connection = _legacy_control_connection()
+        case "ended":
+            connection.is_in_transaction = lambda: False
+        case "proof_locks":
+            proof = replace(proof, locked_relations=frozenset())
+        case "unissued":
+            proof = replace(proof, legacy_observation=None)
+
+    connection.fetchrow.reset_mock()
+    connection.fetch.reset_mock()
+    with pytest.raises(ValueError, match="source_builder_delegation_legacy_(context_changed|issuer_required)"):
+        await custody._require_legacy_observation(connection, policy, actor, proof)
+    connection.fetchrow.assert_not_awaited()
+    connection.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_control_legacy_observation_preserves_actor_from_before_proof_issuance():
+    from tests.test_provider_directory_source_builder_delegation import _receipt
+
+    policy = SimpleNamespace(owner_role="owner", publisher_role="publisher", runtime_roles=("builder", "reader"))
+    connection = _legacy_control_connection()
+    actor = (await custody._admin_identity(connection, policy), asyncio.current_task())
+    connection.fetchrow.return_value = {**actor[0], "xid": "124"}
+    proof = await custody._control_delegation(connection, policy, _receipt(), True)
+
+    with pytest.raises(ValueError, match="admin_transaction_changed"):
+        await custody._require_legacy_observation(connection, policy, actor, proof)
 
 
 @pytest.mark.asyncio
@@ -117,10 +170,46 @@ def _writer_replay(monkeypatch, root, *, adopted=True):
     monkeypatch.setattr(acquisition, "canonical_acquisition_checks", AsyncMock(return_value={}))
     monkeypatch.setattr(source, "adopt_source_callable_custody", AsyncMock())
     monkeypatch.setattr(cohort, "retire_cohort_intake_guards", AsyncMock())
+    _writer_delegation_fixture(before_by_field, root)
     return (
         SimpleNamespace(is_in_transaction=lambda: True, execute=AsyncMock()),
         policy,
         before_by_field,
+    )
+
+
+def _writer_delegation_fixture(before_by_field, root):
+    """Supply complete native role/access metadata to the existing SQL replay fixture."""
+    graph = before_by_field["role_graph"]
+    graph["memberships"] = []
+    for role in graph["roles"]:
+        role.update(
+            rolcanlogin=role["oid"] in {19, 21, 23},
+            rolsuper=False,
+            rolcreaterole=False,
+            rolcreatedb=False,
+            rolreplication=False,
+            rolbypassrls=False,
+        )
+    before_by_field["source"].update(
+        roles=dict(owner=17, publisher=21, builder=19, namespace_owner=29, migration=29),
+        role_graph=graph,
+        functions={},
+    )
+    access = before_by_field["relations"][root]["catalog"]["access"]
+    access[0]["builder_reach"] = True
+    access.extend(
+        dict(
+            role=role["oid"],
+            superuser=False,
+            owner_reach=role["oid"] in {17, 21, 29},
+            builder_reach=False,
+            builtin=False,
+            table=["SELECT"],
+            columns=[[number, ["SELECT"]] for number, _ in access[0]["columns"]],
+        )
+        for role in graph["roles"]
+        if role["oid"] != 19
     )
 
 

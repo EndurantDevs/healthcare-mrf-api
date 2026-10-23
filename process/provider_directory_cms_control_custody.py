@@ -30,6 +30,12 @@ from process.provider_directory_profile_initial_custody import (
     _role_rows,
     capture_initial_callable_custody,
 )
+from process.provider_directory_source_builder_delegation import (
+    builder_delegation,
+    issue_legacy_delegation,
+    require_delegated_access,
+    require_legacy_observation,
+)
 from process.provider_directory_source_cms_epoch_control import capture_source_cms_epoch_controls
 
 CONTROL_ROOTS = (
@@ -704,7 +710,8 @@ def _expected_relation_acl(root, catalog, owner, builder):
     return table_edges, column_edges
 
 
-def _require_relation_acl(root, catalog, native, owner, builder, *, legacy):
+def _require_relation_acl(root, catalog, native, owner, builder, *, legacy, delegation=None):
+    """Preserve exact explicit grants before checking native group authority."""
     previous = int(native["relowner"])
     _require(previous in ({owner, builder} if legacy else {owner}), "relation_owner_changed")
     if previous == owner:
@@ -730,6 +737,12 @@ def _require_relation_acl(root, catalog, native, owner, builder, *, legacy):
             ),
             "legacy_relation_acl_changed",
         )
+    _require_control_effective_access(root, catalog, native, owner, builder, delegation)
+
+
+def _require_control_effective_access(root, catalog, native, owner, builder, delegation):
+    """Bound ordinary delegates while preserving the exact Builder grant."""
+    previous = int(native["relowner"])
     tables, selected = _writer_rights(
         root,
         {entry["attname"]: entry["attnum"] for entry in catalog["attributes"] if entry["attrelid"] == native["oid"]},
@@ -742,6 +755,15 @@ def _require_relation_acl(root, catalog, native, owner, builder, *, legacy):
         }
         for right, names in selected.items()
     }
+    if delegation is not None:
+        require_delegated_access(
+            catalog["access"],
+            delegation,
+            owner=owner,
+            builder=builder,
+            relation_oid=int(native["oid"]),
+            legacy_builder=previous == builder,
+        )
     for access in catalog["access"]:
         if access["superuser"] or access["role"] == owner or access["owner_reach"]:
             continue
@@ -755,7 +777,7 @@ def _require_relation_acl(root, catalog, native, owner, builder, *, legacy):
                 ),
                 "writer_effective_acl_changed",
             )
-        elif access["role"] != builder and not access["builtin"]:
+        elif delegation is None and access["role"] != builder and not access["builtin"]:
             _require(
                 set(access["table"]) <= {"SELECT"}
                 and all(set(rights) <= {"SELECT"} for _, rights in access["columns"]),
@@ -871,7 +893,9 @@ async def _capture_relation(connection, policy, root, functions, principal):
     return {"catalog": catalog, "composite": composite, "rows": dict(row_accounting)}
 
 
-async def _capture_control_relations(connection, policy, principal, hook_functions_by_name, *, legacy, family=None):
+async def _capture_control_relations(
+    connection, policy, principal, hook_functions_by_name, *, legacy, family=None, delegation=None
+):
     owner, publisher, builder, migration = principal
     relations_by_root = {
         root: await _capture_relation(
@@ -884,7 +908,9 @@ async def _capture_control_relations(connection, policy, principal, hook_functio
         for root, relation in relations_by_root.items()
     }
     for root, entry in relations_by_root.items():
-        _require_relation_acl(root, entry["catalog"], natives_by_root[root], owner, builder, legacy=legacy)
+        _require_relation_acl(
+            root, entry["catalog"], natives_by_root[root], owner, builder, legacy=legacy, delegation=delegation
+        )
     foreign_edges = [
         {key: _decoded(foreign_row[key]) for key in foreign_row.keys()}
         for foreign_row in await connection.fetch(
@@ -1035,6 +1061,45 @@ async def _capture_source_history_header(connection, policy, model, principals):
     return dict(name=name, oid=int(native["oid"]), owner=owner, catalog=catalog, columns=columns)
 
 
+async def _control_delegation(connection, policy, source_receipt, legacy):
+    """Use only this transaction's granted locks for legacy Owner observation."""
+    return (
+        await issue_legacy_delegation(connection, policy, source_receipt)
+        if legacy
+        else builder_delegation(source_receipt)
+    )
+
+
+async def _require_legacy_observation(connection, policy, actor, delegation):
+    """Keep the initial administrator scope and recheck the issued native proof."""
+    await require_legacy_observation(connection, policy, delegation, legacy=actor is not None)
+    if actor is not None:
+        _require(
+            asyncio.current_task() is actor[1] and await _admin_identity(connection, policy) == actor[0],
+            "admin_transaction_changed",
+        )
+
+
+def _control_hook_functions(source_receipt, protected, initial, epoch):
+    """Preserve all existing authenticated guard functions in the same closure."""
+    hook_functions_by_name = {entry["definition"]["proname"]: entry for entry in source_receipt["functions"].values()}
+    hook_functions_by_name.update({**protected["functions"], **initial["functions"]})
+    hook_functions_by_name.update(
+        {
+            guard["proname"]: {"definition": {"oid": str(guard["tgfoid"])}}
+            for control in epoch.values()
+            for guard in control["guards"]
+        }
+    )
+    return hook_functions_by_name
+
+
+def _control_principals(policy, role_graph):
+    """Resolve the three existing policy principals in the authenticated graph."""
+    by_name = {role["rolname"]: int(role["oid"]) for role in role_graph["roles"]}
+    return tuple(by_name[name] for name in (policy.owner_role, policy.publisher_role, policy.control_runtime_roles[0]))
+
+
 async def capture_cms_control_custody(connection, policy, *, migration_role, namespace_owner_role, legacy=False):
     """Capture the exact ten-root closure; unknown external FK ownership always refuses."""
     _require(
@@ -1045,39 +1110,37 @@ async def capture_cms_control_custody(connection, policy, *, migration_role, nam
     from process.provider_directory_source_acquisition_custody import capture_source_acquisition_custody
     from process.provider_directory_source_callable_custody import capture_source_callable_custody
 
+    actor = (await _admin_identity(connection, policy), asyncio.current_task()) if legacy else None
     await _verify_control_closure(connection, policy)
     protected = await capture_cms_callable_custody(connection, policy)
     initial = await capture_initial_callable_custody(connection, policy)
     epoch = await capture_source_cms_epoch_controls(connection, policy)
     roles = protected["role_graph"]
     by_name = {role["rolname"]: int(role["oid"]) for role in roles["roles"]}
-    owner, publisher, builder = (
-        by_name[policy.owner_role],
-        by_name[policy.publisher_role],
-        by_name[policy.control_runtime_roles[0]],
-    )
+    owner, publisher, builder = _control_principals(policy, roles)
     migration = _require_migration_identity(protected, policy, migration_role)
     source_receipt = await capture_source_callable_custody(
         connection, policy, migration_role=migration_role, namespace_owner_role=namespace_owner_role, legacy=legacy
     )
-    family = await capture_source_acquisition_custody(connection, policy, source_receipt, legacy=legacy)
-    family["source_inputs"] = await _capture_source_history_inputs(connection, policy)
-    functions = source_receipt["functions"]
-    hook_functions_by_name = {entry["definition"]["proname"]: entry for entry in functions.values()}
-    hook_functions_by_name.update({**protected["functions"], **initial["functions"]})
-    hook_functions_by_name.update(
-        {
-            guard["proname"]: {"definition": {"oid": str(guard["tgfoid"])}}
-            for control in epoch.values()
-            for guard in control["guards"]
-        }
+    delegation = await _control_delegation(connection, policy, source_receipt, legacy)
+    family = await capture_source_acquisition_custody(
+        connection, policy, source_receipt, legacy=legacy, delegation=delegation
     )
+    family["source_inputs"] = await _capture_source_history_inputs(connection, policy)
+    hook_functions_by_name = _control_hook_functions(source_receipt, protected, initial, epoch)
     relations_by_root, foreign_edges = await _capture_control_relations(
-        connection, policy, (owner, publisher, builder, migration), hook_functions_by_name, legacy=legacy, family=family
+        connection,
+        policy,
+        (owner, publisher, builder, migration),
+        hook_functions_by_name,
+        legacy=legacy,
+        family=family,
+        delegation=delegation,
     )
     foreign_edges = await _capture_complete_foreign(connection, relations_by_root, family, foreign_edges)
     owner_usage = _decoded(await connection.fetchval(_OWNER_USAGE_SQL, owner))
     _role_rows(owner_usage, set(by_name.values()), 2)
+    await _require_legacy_observation(connection, policy, actor, delegation)
     return dict(
         schema=policy.schema,
         owner=owner,
@@ -1086,7 +1149,7 @@ async def capture_cms_control_custody(connection, policy, *, migration_role, nam
         migration=migration,
         role_graph=roles,
         owner_usage=owner_usage,
-        functions=functions,
+        functions=source_receipt["functions"],
         source=source_receipt,
         acquisition=family,
         relations=relations_by_root,
@@ -1188,14 +1251,14 @@ def require_cms_control_adoption_delta(before, after, expected_checks, *, read_p
     _require(expected_foreign_rows == after["foreign"], "adoption_foreign_changed")
 
 
-async def _grant_writer(connection, policy, root, catalog, *, owner_oid, builder_oid):
+async def _grant_writer(connection, policy, root, catalog, *, owner_oid, builder_oid, delegation=None):
     table = storage_relation(policy.schema, root)
     native = next(entry for entry in catalog["classes"] if entry["relname"] == root)
     columns = tuple(entry["attname"] for entry in catalog["attributes"] if entry["attrelid"] == native["oid"])
     selected = ",".join(storage_identifier(column) for column in columns)
     builder, owner = storage_identifier(policy.control_runtime_roles[0]), storage_identifier(policy.owner_role)
     if int(native["relowner"]) == owner_oid:
-        _require_relation_acl(root, catalog, native, owner_oid, builder_oid, legacy=False)
+        _require_relation_acl(root, catalog, native, owner_oid, builder_oid, legacy=False, delegation=delegation)
         # The preceding fixed grants may add redundant Owner column entries.
         rights = ",".join(f"{right}({selected})" for right in ("SELECT", "INSERT", "UPDATE", "REFERENCES"))
         await connection.execute(f"REVOKE {rights} ON TABLE {table} FROM {owner}")
@@ -1224,6 +1287,7 @@ async def adopt_cms_control_custody(connection, policy, before):
     role_by_name = {role["rolname"]: int(role["oid"]) for role in before["role_graph"]["roles"]}
     owner_oid, builder_oid = role_by_name[policy.owner_role], role_by_name[policy.control_runtime_roles[0]]
     _require((before["owner"], before["builder"]) == (owner_oid, builder_oid), "adoption_roles_changed")
+    delegation = builder_delegation(before["source"])
     for root, entry in sorted(
         before["relations"].items(),
         key=lambda item: int(
@@ -1233,7 +1297,15 @@ async def adopt_cms_control_custody(connection, policy, before):
         await connection.execute(
             f"ALTER TABLE {storage_relation(policy.schema, root)} OWNER TO {storage_identifier(policy.owner_role)}"
         )
-        await _grant_writer(connection, policy, root, entry["catalog"], owner_oid=owner_oid, builder_oid=builder_oid)
+        await _grant_writer(
+            connection,
+            policy,
+            root,
+            entry["catalog"],
+            owner_oid=owner_oid,
+            builder_oid=builder_oid,
+            delegation=delegation,
+        )
     from process.provider_directory_source_acquisition_custody import (
         adopt_source_acquisition_custody,
         canonical_acquisition_checks,

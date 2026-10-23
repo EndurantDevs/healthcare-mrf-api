@@ -103,6 +103,7 @@ from process import provider_directory_profile_initial_contract as profile_initi
 from process import provider_directory_profile_payload_custody as profile_payload_custody
 from process import provider_directory_profile_scope_copy as profile_scope_copy
 from process import provider_directory_profile_target_wal_witness as profile_statement_wal
+from process import provider_directory_serving_recovery as serving_recovery
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
     mark_control_run,
@@ -155,6 +156,20 @@ from process.provider_directory_dataset_rehydrate import (
 from process.provider_directory_endpoint_admission import (
     ProviderDirectoryEndpointIdentityError,
     _admit_provider_directory_endpoint_components,
+)
+from process.provider_directory_fetch_types import (
+    PaginationCheckpointContext,
+    PaginationResumeState,
+    PartitionChainRequest,
+    PartitionFetchOptions,
+    PartitionFetchState,
+    PartitionPageFetchResult,
+    PartitionPageRequest,
+    ResourceFetchResult,
+    ResourceScanConcurrencyOptions,
+    RestPagePrefetchEligibility,
+    RestPagePrefetchState,
+    RestPaginationCooldownResult,
 )
 from process.provider_directory_fhir_census_binding import (
     CurrentVersionCensusContract,
@@ -378,6 +393,7 @@ from process.provider_directory_resource_hash import (
     resource_payload_sha256_for_contract,
 )
 from process.provider_directory_source_checkpoint_control import (
+    persist_control_progress,
     require_checkpoint_executor,
     source_checkpoint_transaction,
 )
@@ -1415,6 +1431,10 @@ _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION: contextvars.ContextVar[aiohttp.ClientSess
     "provider_directory_pinned_anonymous_source_http_session",
     default=None,
 )
+_REST_PAGE_PREFETCH_OVERRIDE: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "provider_directory_rest_page_prefetch_override", default=None
+)
+
 STATE_EXPECTED_NONEMPTY_RESOURCES = frozenset({"Location", "Organization", "Practitioner", "PractitionerRole"})
 IOWA_MEDICAID_EXPECTED_NONEMPTY_RESOURCES = frozenset({"Organization", "Practitioner", "PractitionerRole"})
 EXPECTED_NONEMPTY_RESOURCES_BY_BASE = {
@@ -1692,57 +1712,6 @@ class FHIRAcquisitionContext:
             raise ValueError("provider_directory_semantic_projection_as_of_invalid")
 
 
-@dataclass(frozen=True)
-class ResourceFetchResult:
-    model: type
-    rows: list[dict[str, Any]]
-    rows_fetched: int
-    rows_written: int
-    pages_fetched: int
-    complete: bool
-    row_limit_reached: bool
-    page_limit_reached: bool
-    hard_page_limit_reached: bool
-    next_url_remaining: bool
-    error: str | None = None
-    fetch_mode: str = "paged"
-    deadline_reached: bool = False
-    retry_not_before: str | None = None
-    fetch_diagnostic: dict[str, Any] | None = None
-    pagination_cooldown_retries: int = 0
-    pagination_cooldown_wait_seconds: float = 0.0
-    is_pagination_cooldown_recovered: bool = False
-    is_pagination_cooldown_exhausted: bool = False
-    is_pagination_cooldown_deadline_blocked: bool = False
-    source_fetch_elapsed_ms: int = 0
-    stream_write_elapsed_seconds: float = 0.0
-    checkpoint_persist_elapsed_seconds: float = 0.0
-    page_prefetch_eligible: bool = False
-    page_prefetch_started: int = 0
-    page_prefetch_consumed: int = 0
-    page_prefetch_discarded: int = 0
-    page_prefetch_wait_seconds: float = 0.0
-
-    @property
-    def is_bounded(self) -> bool:
-        """Return a fetch result constrained to the requested row limit."""
-        return (
-            self.row_limit_reached or self.page_limit_reached or self.hard_page_limit_reached or self.deadline_reached
-        )
-
-
-@dataclass(frozen=True)
-class RestPagePrefetchEligibility:
-    checkpoint_context: PaginationCheckpointContext | None
-    start_url_count: int
-    is_partitioned_fetch: bool
-    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
-    row_batch_size: int
-    retain_rows: bool
-    per_resource_limit: int
-    page_limit: int
-
-
 class ProviderDirectoryPaginationTerminalFailure(RuntimeError):
     """Carry only sanitized diagnostics for one non-resumable traversal."""
 
@@ -1753,43 +1722,6 @@ class ProviderDirectoryPaginationTerminalFailure(RuntimeError):
     ) -> None:
         super().__init__(details)
         self.diagnostics_by_resource = _sanitized_resource_diagnostics(diagnostics_by_resource)
-
-
-@dataclass(frozen=True)
-class ResourceScanConcurrencyOptions:
-    resource_types: tuple[str, ...]
-    requested_concurrency: int
-    per_resource_limit: int
-    page_limit: int
-    page_count: int
-    stream_batch_size: int
-    source_concurrency: int
-    linked_resource_limit: int
-    stale_cleanup: bool
-    bulk_export: bool
-    checkpointing_enabled: bool
-    deferred_materialization: bool
-
-
-@dataclass
-class RestPagePrefetchState:
-    page_url: str | None = None
-    session: aiohttp.ClientSession | None = None
-    page_task: asyncio.Task[tuple[int | None, dict[str, Any] | None, str | None, int] | None] | None = None
-    started: int = 0
-    consumed: int = 0
-    discarded: int = 0
-    wait_seconds: float = 0.0
-
-
-@dataclass(frozen=True)
-class RestPaginationCooldownResult:
-    fetch_result: tuple[int | None, dict[str, Any] | None, str | None, int]
-    retries: int = 0
-    wait_seconds: float = 0.0
-    recovered: bool = False
-    exhausted: bool = False
-    deadline_blocked: bool = False
 
 
 @dataclass(frozen=True)
@@ -1936,24 +1868,6 @@ class UHCPlanGraphCollectionState:
     seen_urls: set[str] = field(default_factory=set)
     pages_fetched: int = 0
     expected_total: int | None = None
-
-
-@dataclass(frozen=True)
-class PaginationCheckpointContext:
-    canonical_api_base: str
-    source_scope_hash: str
-    source_ids: tuple[str, ...]
-    owner_run_id: str
-    acquisition_root_run_id: str
-    retry_of_run_id: str | None = None
-    endpoint_id: str | None = None
-    dataset_id: str | None = None
-    lineage_verified: bool = False
-    restart_expired_current_census_slice: bool = True
-
-    def __post_init__(self) -> None:
-        if not self.acquisition_root_run_id.strip():
-            raise ValueError("provider_directory_pagination_root_missing")
 
 
 @dataclass
@@ -2310,17 +2224,6 @@ class LastUpdatedPartitionProofCounts:
 
 
 @dataclass(frozen=True)
-class PaginationResumeState:
-    next_url: str | None
-    pages_processed: int
-    rows_processed: int
-    recent_url_hashes: tuple[str, ...]
-    complete: bool = False
-    resumed: bool = False
-    completeness: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
 class CareSourceCensusFetch:
     count: int | None
     error: str | None = None
@@ -2382,75 +2285,6 @@ class _ResourceImportCancellation:
     async def check(self) -> None:
         """Raise before an irreversible acquisition lifecycle transition."""
         await _raise_if_resource_import_cancelled(self.context, self.task)
-
-
-@dataclass
-class PartitionFetchState:
-    """Shared counters for concurrent partitioned FHIR searches."""
-
-    result_model: type
-    retained_resource_rows: list[dict[str, Any]]
-    fetched_count: int = 0
-    written_count: int = 0
-    page_count: int = 0
-    partition_error_count: int = 0
-    error_message: str | None = None
-    hard_page_limit_reached: bool = False
-    deadline_reached: bool = False
-    next_url_remaining: bool = False
-    seen_urls: set[str] = field(default_factory=set)
-    completed_partition_identities: set[str] = field(default_factory=set)
-    pending_partition_checkpoint_rows: list[dict[str, Any]] = field(default_factory=list)
-    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    writer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    checkpoint_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
-
-
-@dataclass(frozen=True)
-class PartitionFetchOptions:
-    timeout: int
-    run_id: str | None
-    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
-    row_batch_size: int
-    retain_rows: bool
-    deadline_at: float | None
-    max_pages: int
-    cancel_ctx: dict[str, Any] | None = None
-    cancel_task: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class PartitionPageFetchResult:
-    next_url: str | None
-    outcome: str
-
-
-@dataclass(frozen=True)
-class PartitionPageRequest:
-    """Inputs shared while fetching one page in a partition URL chain."""
-
-    source_record: dict[str, Any]
-    resource_type: str
-    start_url_queue: asyncio.Queue[str]
-    state: PartitionFetchState
-    partition_start_url: str
-    current_url: str
-    is_residual_only: bool
-    pending_resource_rows: list[dict[str, Any]]
-    fetch_options: PartitionFetchOptions
-
-
-@dataclass(frozen=True)
-class PartitionChainRequest:
-    """Inputs shared while walking one independent partition cursor chain."""
-
-    source_record: dict[str, Any]
-    resource_type: str
-    start_url_queue: asyncio.Queue[str]
-    state: PartitionFetchState
-    request_url: str
-    fetch_options: PartitionFetchOptions
 
 
 @dataclass(frozen=True)
@@ -8723,6 +8557,7 @@ def _provider_directory_prepared_stage_relations(
 async def _install_provider_directory_prepared_stage(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
+    await serving_recovery.retain_overlay(sys.modules[__name__], stage)
     schema = stage.schema
     stage_ref = _qt(schema, stage.stage_table)
     target_ref = _qt(schema, stage.target_relation)
@@ -8732,21 +8567,11 @@ async def _install_provider_directory_prepared_stage(
         stage.target_relation,
         "relkind",
     )
-    await db.status(
-        _drop_address_corroboration_sql(
-            schema,
-            old_relation,
-        )
-    )
+    await db.status(_drop_address_corroboration_sql(schema, old_relation))
     if target_kind in {"r", "p"}:
         await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_relation)};")
     elif target_kind in {"v", "m"}:
-        await db.status(
-            _drop_address_corroboration_sql(
-                schema,
-                stage.target_relation,
-            )
-        )
+        await db.status(_drop_address_corroboration_sql(schema, stage.target_relation))
     elif target_kind is not None:
         raise RuntimeError(f"Unsupported Provider Directory artifact target relation kind: {target_kind!r}")
     await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(stage.target_relation)};")
@@ -8755,17 +8580,9 @@ async def _install_provider_directory_prepared_stage(
 async def _finish_provider_directory_prepared_stage(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
-    await db.status(
-        _drop_address_corroboration_sql(
-            stage.schema,
-            f"{stage.target_relation}_old",
-        )
-    )
+    await db.status(_drop_address_corroboration_sql(stage.schema, f"{stage.target_relation}_old"))
     await stage.rename_stage_indexes(stage.schema, stage.stage_table)
-    await _assert_provider_directory_logged_relation(
-        stage.schema,
-        stage.target_relation,
-    )
+    await _assert_provider_directory_logged_relation(stage.schema, stage.target_relation)
 
 
 async def _promote_provider_directory_artifact_datasets(
@@ -11821,7 +11638,9 @@ def _provider_directory_artifact_transaction_timeout_seconds(
         return PROVIDER_DIRECTORY_PROFILE_DELTA_PROMOTION_TIMEOUT_SECONDS
     if dataset_fence is not None and dataset_fence.should_select_validated_candidates:
         return PROVIDER_DIRECTORY_ARTIFACT_CANDIDATE_TRANSACTION_TIMEOUT_SECONDS
-    return PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+    return serving_recovery.preparation_timeout(
+        sys.modules[__name__], PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_TRANSACTION_TIMEOUT_SECONDS
+    )
 
 
 def _tighten_provider_directory_artifact_cutover_timeout(
@@ -11945,6 +11764,7 @@ async def _apply_locked_provider_directory_artifact_bundle(
             await _lock_artifact_cutover_fence(active_fence, profile_delta=profile_delta)
     if profile_delta is None and profile_initial.build_from_stages(sys.modules[__name__], ordered_stages) is None:
         _tighten_provider_directory_artifact_cutover_timeout(cutover_timeout, active_fence)
+    await serving_recovery.before_overlay(sys.modules[__name__])
     for stage in ordered_stages:
         await _assert_provider_directory_artifact_build_fence(stage)
     if profile_delta is not None:
@@ -20308,7 +20128,9 @@ async def _lock_and_verify_artifact_dataset_fence(
     executor: Any | None = None,
 ) -> None:
     """Fence alias and dataset identity while an artifact becomes live."""
-    if not fence.datasets:
+    from process.provider_directory_generic_source_artifacts import is_fence_held
+
+    if not fence.datasets or is_fence_held(sys.modules[__name__], fence, executor):
         return
     query_executor = executor or db
     if any(is_uhc_flex_profile_source(dataset.source_id) for dataset in fence.datasets):
@@ -21462,7 +21284,7 @@ async def _provider_directory_artifact_dataset_scope(
     resource_types: frozenset[str] | None = None,
 ) -> AsyncIterator[ProviderDirectoryArtifactDatasetFence]:
     """Materialize and clean one bounded alias-aware artifact source scope."""
-    from process.provider_directory_artifact_scratch_scope import reuse_artifact_scope
+    from process.provider_directory_generic_source_artifacts import reuse_artifact_scope
     from process.provider_directory_generic_source_policy import is_source_storage_required
 
     capacity_admission = _provider_directory_profile_capacity_admission()
@@ -24010,6 +23832,8 @@ def _has_dataset_publication_followup_trigger(
 
     if len(source_ids) != 1 or len(importable_sources) != 1:
         return False
+    if metrics.get("publish_source_dataset_only") is True:
+        return True
     resource_fetch_stats = metrics.get("resource_fetch_stats")
     if isinstance(resource_fetch_stats, Mapping) and any(
         isinstance(resource_stats, Mapping)
@@ -24597,15 +24421,15 @@ async def _publish_artifact_bundle_from_fence(
     resource_fence: ProviderDirectoryArtifactDatasetFence | None = None,
 ) -> dict[str, Any]:
     """Build one immutable serving bundle and publish it behind its fence."""
-    async with _prepare_artifact_bundle_from_fence(
+    from process.provider_directory_generic_source_artifacts import publish_bundle
+
+    return await publish_bundle(
+        sys.modules[__name__],
         fence,
         request,
         artifact_resource_types=artifact_resource_types,
         resource_fence=resource_fence,
-    ) as (artifact_bundle, publish_metrics):
-        promoted_stage_count = await artifact_bundle.promote()
-        await _refresh_bundle_profile_delta_metrics(artifact_bundle, publish_metrics)
-        return await _record_artifact_promotion_metrics(fence, publish_metrics, promoted_stage_count)
+    )
 
 
 async def _publish_selected_provider_directory_artifacts(
@@ -53530,8 +53354,18 @@ def _is_rest_page_prefetch_eligible(
         and checkpoint_context.owner_run_id == checkpoint_context.acquisition_root_run_id
     )
     is_generic_prefetch = bool(census_contract is None and _is_prefetch_base_enabled(source_api_base))
+    task_prefetch = _REST_PAGE_PREFETCH_OVERRIDE.get()
+    environment_prefetch = os.getenv(SOURCE_HTTP_PAGE_PREFETCH_ENV)
+    prefetch_enabled = bool(
+        task_prefetch is not False
+        and (
+            environment_prefetch.lower() in {"1", "true", "yes"}
+            if environment_prefetch is not None
+            else task_prefetch is True
+        )
+    )
     return bool(
-        os.getenv(SOURCE_HTTP_PAGE_PREFETCH_ENV, "false").lower() in {"1", "true", "yes"}
+        prefetch_enabled
         and (is_generic_prefetch or is_reviewed_subset_prefetch)
         and checkpoint_context is not None
         and checkpoint_context.canonical_api_base == source_api_base
@@ -53547,6 +53381,49 @@ def _is_rest_page_prefetch_eligible(
             request_url,
         )
     )
+
+
+def _report_resource_fetch_timing(
+    callback: Callable[[dict[str, Any]], None] | None,
+    fetch_mode: str,
+    **measurements: Any,
+) -> None:
+    """Publish numbers and mode coverage without adding I/O to acquisition."""
+    if callback is not None:
+        callback(
+            {
+                "fetch_mode": fetch_mode,
+                "timing_available": False,
+                "timing_scope": "unavailable",
+                **measurements,
+            }
+        )
+
+
+def _unavailable_resource_timings(
+    resource_types: list[str],
+    fetch_mode: str,
+) -> dict[str, dict[str, Any]]:
+    return {
+        resource_type: {
+            "fetch_mode": fetch_mode,
+            "timing_available": False,
+            "timing_scope": "unavailable",
+        }
+        for resource_type in resource_types
+    }
+
+
+def _record_resource_group_fetch_timing(
+    active_group: dict[str, Any],
+    resource_type: str,
+    snapshot: dict[str, Any],
+) -> None:
+    """Replace nested maps so an already published snapshot stays stable."""
+    active_group["resource_fetch_timing"] = {
+        **active_group.get("resource_fetch_timing", {}),
+        resource_type: dict(snapshot),
+    }
 
 
 async def _fetch_resource_rows(
@@ -53568,8 +53445,10 @@ async def _fetch_resource_rows(
     deadline_seconds: int = 0,
     pagination_checkpoint: PaginationCheckpointContext | None = None,
     deferred_materialization: bool = False,
+    timing_progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> ResourceFetchResult | None:
     """Fetch resource rows for provider-directory ingestion."""
+    _report_resource_fetch_timing(timing_progress_callback, "initializing")
     model = RESOURCE_MODELS_BY_TYPE.get(resource_type)
     if model is None:
         return None
@@ -53584,6 +53463,7 @@ async def _fetch_resource_rows(
     if partition_acquisition_declared:
         partition_config, partition_config_error = _last_updated_partition_config(source_record, resource_type)
         if partition_config is not None:
+            _report_resource_fetch_timing(timing_progress_callback, LAST_UPDATED_PARTITION_FETCH_MODE)
             return await _fetch_last_updated_partition_resource_rows(
                 source_record,
                 resource_type,
@@ -53638,6 +53518,7 @@ async def _fetch_resource_rows(
             start_urls,
         )
         if targeted_search_error:
+            _report_resource_fetch_timing(timing_progress_callback, "targeted_required")
             return ResourceFetchResult(
                 model=model,
                 rows=[],
@@ -53658,6 +53539,9 @@ async def _fetch_resource_rows(
         per_resource_limit=per_resource_limit,
         checkpoint_context=bulk_checkpoint_context,
     ):
+        _report_resource_fetch_timing(
+            timing_progress_callback, "checkpointed_bulk_export" if bulk_checkpoint_context else "bulk_export"
+        )
         bulk_source_lookup = {
             **source_record,
             "_bulk_export_max_pending_seconds": (bulk_export_max_pending_seconds),
@@ -53685,6 +53569,7 @@ async def _fetch_resource_rows(
         if bulk_fetch_result is not None:
             return bulk_fetch_result
     if _needs_practitioner_role_reverse_lookup(source_record, resource_type):
+        _report_resource_fetch_timing(timing_progress_callback, "source_specific_deferred")
         return ResourceFetchResult(
             model=model,
             rows=[],
@@ -53847,6 +53732,18 @@ async def _fetch_resource_rows(
                 pages_processed=resume_state.pages_processed,
                 retryable=False,
             )
+        _report_resource_fetch_timing(
+            timing_progress_callback,
+            "checkpoint_complete",
+            timing_scope="checkpoint_reuse",
+            attempt_pages_fetched=0,
+            attempt_rows_fetched=0,
+            attempt_rows_written=0,
+            resumed_pages_processed=resume_state.pages_processed,
+            resumed_rows_processed=resume_state.rows_processed,
+            lineage_pages_processed=resume_state.pages_processed,
+            lineage_rows_processed=resume_state.rows_processed,
+        )
         return ResourceFetchResult(
             model=model,
             rows=[],
@@ -53874,10 +53771,16 @@ async def _fetch_resource_rows(
     fetch_counts_by_name = {
         "rows_written": 0,
         "stream_write_elapsed_seconds": 0.0,
+        "attempt_pages_fetched": 0,
+        "attempt_rows_fetched": 0,
+        "attempt_rows_written": 0,
     }
     source_fetch_elapsed_ms = 0
     checkpoint_persist_elapsed_seconds = 0.0
     pages = resume_state.pages_processed if resume_state else 0
+    resumed_pages_processed = pages
+    resumed_rows_processed = rows_fetched
+    timing_started_at = time.monotonic() if timing_progress_callback is not None else 0.0
     seen_urls: set[str] = set()
     recent_url_hashes = list(resume_state.recent_url_hashes if resume_state else ())
     persisted_url_hashes = set(recent_url_hashes)
@@ -53922,6 +53825,7 @@ async def _fetch_resource_rows(
             cancel_ctx=cancel_ctx,
             cancel_task=cancel_task,
         )
+        _report_resource_fetch_timing(timing_progress_callback, "partitioned_paged")
         return await _fetch_partitioned_resource_rows(
             source_record,
             resource_type,
@@ -53946,6 +53850,50 @@ async def _fetch_resource_rows(
             page_limit=page_limit,
         ),
     )
+
+    def report_page_timing() -> None:
+        """Record this attempt's work without changing checkpoint accounting."""
+        if timing_progress_callback is None:
+            return
+        fetch_mode = (
+            _current_version_census_fetch_mode(
+                current_version_proof_by_field,
+                contract=current_version_census_contract(source_record),
+            )
+            if is_current_version_census_enabled
+            else (
+                CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+                if is_caresource_census_enabled
+                else ("checkpointed_paged" if checkpoint_context else "paged")
+            )
+        )
+        _report_resource_fetch_timing(
+            timing_progress_callback,
+            fetch_mode,
+            timing_available=True,
+            timing_scope="paged_acquisition_loop",
+            attempt_elapsed_seconds=max(0.0, time.monotonic() - timing_started_at),
+            attempt_pages_fetched=fetch_counts_by_name["attempt_pages_fetched"],
+            attempt_rows_fetched=fetch_counts_by_name["attempt_rows_fetched"],
+            attempt_rows_written=fetch_counts_by_name["attempt_rows_written"],
+            resumed_pages_processed=resumed_pages_processed,
+            resumed_rows_processed=resumed_rows_processed,
+            lineage_pages_processed=pages,
+            lineage_rows_processed=rows_fetched,
+            pagination_restarted=has_restart_attempted,
+            source_fetch_elapsed_ms=source_fetch_elapsed_ms,
+            stream_write_elapsed_seconds=fetch_counts_by_name["stream_write_elapsed_seconds"],
+            checkpoint_persist_elapsed_seconds=checkpoint_persist_elapsed_seconds,
+            page_prefetch_eligible=is_page_prefetch_eligible,
+            page_prefetch_started=page_prefetch_state.started,
+            page_prefetch_consumed=page_prefetch_state.consumed,
+            page_prefetch_discarded=page_prefetch_state.discarded,
+            page_prefetch_wait_seconds=page_prefetch_state.wait_seconds,
+            pagination_cooldown_retries=pagination_cooldown_retries,
+            pagination_cooldown_wait_seconds=pagination_cooldown_wait_seconds,
+        )
+
+    report_page_timing()
 
     async def fetch_prefetched_page(
         request_url: str,
@@ -54023,10 +53971,9 @@ async def _fetch_resource_rows(
         pending_rows.clear()
         write_started_at = time.monotonic()
         try:
-            fetch_counts_by_name["rows_written"] += await row_batch_handler(
-                model,
-                pending_rows_list,
-            )
+            written = await row_batch_handler(model, pending_rows_list)
+            fetch_counts_by_name["rows_written"] += written
+            fetch_counts_by_name["attempt_rows_written"] += written
         finally:
             fetch_counts_by_name["stream_write_elapsed_seconds"] += max(
                 0.0,
@@ -54279,6 +54226,7 @@ async def _fetch_resource_rows(
                     error_message = census_bundle_error
                     break
             pages += 1
+            fetch_counts_by_name["attempt_pages_fetched"] += 1
             child_urls = _uhc_adaptive_partition_child_urls(source_record, resource_type, url, response_payload)
             if child_urls:
                 is_partitioned_fetch = True
@@ -54376,6 +54324,7 @@ async def _fetch_resource_rows(
                 if parsed_model is not model:
                     continue
                 rows_fetched += 1
+                fetch_counts_by_name["attempt_rows_fetched"] += 1
                 if retain_rows:
                     retained_resource_rows.append(parsed_resource_row)
                 if row_batch_handler:
@@ -54537,6 +54486,7 @@ async def _fetch_resource_rows(
                             0.0,
                             time.monotonic() - checkpoint_started_at,
                         )
+                report_page_timing()
             except BaseException:
                 await cancel_prefetched_page()
                 raise
@@ -54667,6 +54617,7 @@ async def _fetch_resource_rows(
         and not url
         and not pending_start_urls
     )
+    report_page_timing()
     return ResourceFetchResult(
         model=model,
         rows=retained_resource_rows,
@@ -58199,7 +58150,8 @@ async def _persist_provider_directory_progress(
             metrics=metrics,
         )
     else:
-        marked = await mark_control_run(
+        marked = await persist_control_progress(
+            mark_control_run,
             run_id,
             status="running",
             phase_detail=phase,
@@ -66710,24 +66662,9 @@ async def _finalize_endpoint_dataset_candidate(
     candidate: EndpointDatasetCandidate | None,
     diagnostics: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
-    if candidate is None:
-        return None
-    if _is_endpoint_dataset_publishable(candidate, diagnostics):
-        return await _validate_endpoint_dataset_candidate(
-            candidate,
-            diagnostics,
-        )
-    status = (
-        ENDPOINT_DATASET_FAILED
-        if any(diagnostic.get("error") for diagnostic in diagnostics.values())
-        else ENDPOINT_DATASET_INCOMPLETE
-    )
-    await _mark_endpoint_dataset_candidate(candidate, status, diagnostics)
-    return {
-        "dataset_id": candidate.dataset_id,
-        "status": status,
-        "published": False,
-    }
+    from process.provider_directory_generic_source_artifacts import finalize_candidate
+
+    return await finalize_candidate(sys.modules[__name__], candidate, diagnostics)
 
 
 async def _clear_finalized_endpoint_dataset_pagination_checkpoints(
@@ -67022,6 +66959,10 @@ async def _replay_finalized_candidate_and_clear_checkpoints(
                 finalized_metadata,
             ),
         )
+    from process.provider_directory_generic_source_artifacts import publish_source_candidate
+
+    if not is_verification_mismatch:
+        await publish_source_candidate(sys.modules[__name__], candidate)
     await _clear_finalized_endpoint_dataset_pagination_checkpoints(
         candidate,
         None,
@@ -67517,6 +67458,11 @@ class ResourceGroupScanRunner:
             deadline_seconds=self.options.resource_deadline_seconds,
             pagination_checkpoint=source_record_by_field.get("_pagination_checkpoint_context"),
             deferred_materialization=self.options.deferred_materialization,
+            timing_progress_callback=partial(
+                _record_resource_group_fetch_timing,
+                self.active_group_by_key[self.group_key],
+                resource_type,
+            ),
         )
 
     async def record(
@@ -67971,6 +67917,7 @@ async def _import_resources(
                 "api_base": partition_source.get("canonical_api_base") or partition_source.get("api_base"),
                 "current_resource": None,
                 "current_resources": [],
+                "resource_fetch_timing": _unavailable_resource_timings(resources, "not_started"),
                 "started_at": _now().isoformat(timespec="seconds") + "Z",
                 "started_monotonic": time.monotonic(),
                 "resource_started_at": None,
@@ -68052,6 +67999,9 @@ async def _import_resources(
             )
 
         if _uses_alohr_graphql_connector(partition_source):
+            active_group_by_key[group_key]["resource_fetch_timing"] = _unavailable_resource_timings(
+                resources, "graphql"
+            )
             async with progress_lock:
                 active_group_by_key[group_key]["current_resource"] = "ALOHR GraphQL"
                 active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
@@ -68075,6 +68025,9 @@ async def _import_resources(
                 ),
             )
         if _uses_uhc_official_file_connector(partition_source):
+            active_group_by_key[group_key]["resource_fetch_timing"] = _unavailable_resource_timings(
+                resources, "official_files"
+            )
             async with progress_lock:
                 active_group_by_key[group_key]["current_resource"] = "Official provider files"
                 active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
@@ -68099,6 +68052,9 @@ async def _import_resources(
             per_resource_limit=per_resource_limit,
             page_limit=page_limit,
         ):
+            active_group_by_key[group_key]["resource_fetch_timing"] = _unavailable_resource_timings(
+                resources, "plan_graph"
+            )
             async with progress_lock:
                 active_group_by_key[group_key]["current_resource"] = "InsurancePlan graph"
                 active_group_by_key[group_key]["resource_started_at"] = _now().isoformat(timespec="seconds") + "Z"
@@ -68195,6 +68151,11 @@ async def _import_resources(
                 cancel_task=cancel_task,
                 bulk_export=False,
                 deadline_seconds=resource_deadline_seconds,
+                timing_progress_callback=partial(
+                    _record_resource_group_fetch_timing,
+                    active_group_by_key[group_key],
+                    "PractitionerRole",
+                ),
             )
             if retry_result is None:
                 retry_result = replace(
@@ -68576,15 +68537,17 @@ async def _import_resources(
 
 async def _import_resources_with_source_http_session(
     source_records: list[dict[str, Any]],
+    *,
+    rest_page_prefetch: bool | None = None,
+    publish_source_dataset_only: bool = False,
     **import_options: Any,
 ) -> dict[str, int]:
     """Run one resource import inside its optional anonymous HTTP session."""
-    force_session = any(current_version_census_contract(source_record) is not None for source_record in source_records)
-    async with _source_http_session_scope(
-        force=force_session,
-        require_verified_tls=force_session,
-    ):
-        return await _import_resources(source_records, **import_options)
+    from process.provider_directory_generic_source_artifacts import import_resources_with_source_session
+
+    return await import_resources_with_source_session(
+        sys.modules[__name__], source_records, rest_page_prefetch, publish_source_dataset_only, import_options
+    )
 
 
 def _dataset_rehydrate_resource_types(raw: Any) -> tuple[str, ...]:
@@ -69729,6 +69692,8 @@ async def process_provider_directory_fhir_data(
     if task_run_id is not None and control_run_id is not None and task_run_id != control_run_id:
         raise ValueError("provider_directory_task_control_run_id_mismatch")
     run_id = control_run_id or task_run_id
+    if (recovered := await serving_recovery.maybe_recover(sys.modules[__name__], ctx, task)) is not None:
+        return recovered
     retry_of_run_id = _clean_text(task.get("retry_of_run_id"))
     pagination_root_run_id = _clean_text(task.get("provider_directory_pagination_root_run_id"))
     restart_expired_current_census_slice = task.get(
@@ -69741,6 +69706,9 @@ async def process_provider_directory_fhir_data(
         task,
         census_request,
     )
+    from process.provider_directory_generic_source_artifacts import validate_source_only_task
+
+    validate_source_only_task(sys.modules[__name__], task, requested_source_ids, census_request)
     from process.provider_directory_cms_npd import validate_source_scope as validate_cms_source_scope
 
     validate_cms_source_scope(task, run_id, requested_source_ids, test_mode)
@@ -69895,6 +69863,9 @@ async def process_provider_directory_fhir_data(
         task.get("defer_typed_materialization"),
         False,
     )
+    rest_page_prefetch = task.get("rest_page_prefetch")
+    if rest_page_prefetch is not None and not isinstance(rest_page_prefetch, bool):
+        raise ValueError("provider_directory_rest_page_prefetch_invalid")
     if should_defer_typed_materialization and not import_resources:
         raise ValueError("provider_directory_deferred_typed_materialization_import_required")
     if should_defer_typed_materialization and publish_after_acquisition:
@@ -70025,6 +69996,11 @@ async def process_provider_directory_fhir_data(
             "publish_artifacts": True,
             "publish_artifacts_only": True,
             "source_ids": requested_source_ids,
+            **(
+                {serving_recovery.GENERATION_PARAM: task[serving_recovery.GENERATION_PARAM]}
+                if task.get(serving_recovery.GENERATION_PARAM) is not None
+                else {}
+            ),
         }
         if profile_execution is None:
             publish_metric_by_name = await _publish_provider_directory_dataset_artifacts(
@@ -70210,11 +70186,13 @@ async def process_provider_directory_fhir_data(
             "source_concurrency": source_concurrency,
             "resource_scan_concurrency": resource_scan_concurrency,
             "rest_http_keepalive": _is_source_http_keepalive_enabled(),
+            "rest_page_prefetch_requested": rest_page_prefetch,
             "stale_cleanup": should_cleanup_stale_rows,
             "publish_artifacts": should_publish_artifacts,
             "publish_after_acquisition": publish_after_acquisition,
             "publish_corroboration": should_publish_corroboration,
             "pagination_checkpoints_enabled": is_pagination_checkpointing_enabled,
+            "publish_source_dataset_only": task.get("publish_source_dataset_only", False),
             "defer_typed_materialization": should_defer_typed_materialization,
             "retry_of_run_id": retry_of_run_id,
             "provider_directory_pagination_root_run_id": pagination_root_run_id,
@@ -70355,6 +70333,8 @@ async def process_provider_directory_fhir_data(
             if importable:
                 metrics_by_key["resource_rows"] = await _import_resources_with_source_http_session(
                     importable,
+                    rest_page_prefetch=rest_page_prefetch,
+                    publish_source_dataset_only=task.get("publish_source_dataset_only", False),
                     resources=resources,
                     per_resource_limit=resource_limit,
                     page_limit=page_limit,
@@ -70505,8 +70485,9 @@ async def process_provider_directory_fhir_data(
                     source_ids=source_local_ids,
                     expected_acquisition_root_run_id=(pagination_root_run_id or run_id),
                 )
-                if dataset_followup is not None:
-                    metrics_by_key["dataset_followup"] = dataset_followup
+                from process.provider_directory_generic_source_artifacts import record_dataset_followup
+
+                record_dataset_followup(task, metrics_by_key, dataset_followup)
         ctx["context"]["audit"] = metrics_by_key
         ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
         print(
@@ -70593,6 +70574,8 @@ class _ProviderDirectoryFhirCommandOptions:
     publish_artifacts: bool | None = None
     publish_after_acquisition: bool = False
     defer_typed_materialization: bool = False
+    publish_source_dataset_only: bool = False
+    rest_page_prefetch: bool | None = None
     open_only: bool = True
     include_auth_required: bool = False
     credential_config_file: str | None = None

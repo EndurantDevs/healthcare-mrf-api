@@ -62,9 +62,38 @@ def test_admission_keeps_actual_observed_queue_id(admitted):
 @pytest.mark.parametrize("image", ["", "example/source-worker:latest", IMAGE[:-1] + "z"])
 def test_fhir_admission_requires_immutable_image(monkeypatch, image):
     monkeypatch.setenv(source.IMAGE_ENV, image)
+    monkeypatch.setenv(source.REFERENCE_IMAGE_ENV, ORDINARY_IMAGE)
     with pytest.raises(ValueError, match="fhir_source_worker_admission_unavailable"):
         source.admit_fhir_source_worker_launch(_recorded())
     assert source.admit_fhir_source_worker_launch({"importer": "nucc"}) is None
+
+
+def test_fhir_image_setting_takes_precedence_without_changing_reference(monkeypatch):
+    from api import reference_source_worker as reference
+
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    monkeypatch.setenv(reference.IMAGE_ENV, ORDINARY_IMAGE)
+    assert source.admit_fhir_source_worker_launch(_recorded()).image == IMAGE
+    reference_run_by_field = {
+        "run_id": RUN_ID,
+        "importer": "geo",
+        "metrics": {"queue": "arq:Geo", "function": "control_single_job_start", "job_id": "geo-job"},
+    }
+    assert reference.admit_reference_source_worker_launch(reference_run_by_field).image == ORDINARY_IMAGE
+
+
+def test_absent_fhir_image_setting_retains_reference_fallback(monkeypatch):
+    monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.setenv(source.REFERENCE_IMAGE_ENV, IMAGE)
+    assert source.admit_fhir_source_worker_launch(_recorded()).image == IMAGE
+
+
+@pytest.mark.parametrize("image", ["", "example/source-worker:latest", IMAGE[:-1] + "z"])
+def test_absent_fhir_image_setting_rejects_invalid_reference_fallback(monkeypatch, image):
+    monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.setenv(source.REFERENCE_IMAGE_ENV, image)
+    with pytest.raises(ValueError, match="fhir_source_worker_admission_unavailable"):
+        source.admit_fhir_source_worker_launch(_recorded())
 
 
 @pytest.mark.parametrize("field", ["queue", "function", "job_id", "run_id", "metrics"])
@@ -327,6 +356,7 @@ def test_source_policy_path_uses_deployment_value_only(admitted, monkeypatch):
 @pytest.mark.asyncio
 async def test_missing_paired_image_refuses_before_worker_launch(monkeypatch):
     monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.delenv(source.REFERENCE_IMAGE_ENV, raising=False)
     request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
     workers._bind_admitted_job(request, _recorded())
     result = await workers._admit_source_worker_launches(request, _recorded())

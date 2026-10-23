@@ -126,10 +126,15 @@ async def recovery_status(fhir, statement, **params):
 @asynccontextmanager
 async def cutover_transaction(fhir, kind, identity):
     """Retain the genuine existing atomic owner; inner work cannot settle it."""
-    async with fhir.profile_control_custody.transaction(
-        fhir,
-        fhir.db.transaction(),
-        identity=("artifact_cutover", kind, identity, fhir._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()),
-        enabled=_is_bounded(fhir),
+    from process.provider_directory_generic_source_artifacts import terminal_fence
+
+    async with (
+        fhir.profile_control_custody.transaction(
+            fhir,
+            fhir.db.transaction(),
+            identity=("artifact_cutover", kind, identity, fhir._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()),
+            enabled=_is_bounded(fhir),
+        ),
+        terminal_fence(fhir),
     ):
         yield

@@ -2894,6 +2894,10 @@ def _provider_directory_operation(
     params: dict[str, Any],
     metrics: dict[str, Any] | None = None,
 ) -> tuple[str, frozenset[str], str | None]:
+    from process.provider_directory_serving_recovery import is_recovery_request
+
+    if is_recovery_request("provider-directory-fhir", params):
+        return _PROVIDER_DIRECTORY_SCOPED_ARTIFACT, _provider_directory_source_ids(params["source_ids"]), None
     if _is_current_version_census_control(params):
         return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
     if any(
@@ -3476,6 +3480,9 @@ async def create_import_run(
     raw_params_by_name = (
         request_payload_map.get("params") if isinstance(request_payload_map.get("params"), dict) else {}
     )
+    from process.provider_directory_serving_recovery import is_recovery_request
+
+    is_recovery_request(importer, raw_params_by_name)
     if importer != "provider-directory-fhir" and any(
         name in raw_params_by_name
         for name in (
@@ -4093,10 +4100,16 @@ def _control_wrapped_adapter_payload(
     *,
     test_mode: bool,
 ) -> dict[str, Any]:
-    """Build a control-wrapped task payload with retry lineage."""
+    """Keep recovery requests closed and ordinary acquisition retry lineage intact."""
 
+    importer = str(import_run_values_by_name.get("importer") or "")
+    is_recovery_task = False
+    if importer == "provider-directory-fhir":
+        from process.provider_directory_serving_recovery import is_recovery_request
+
+        is_recovery_task = is_recovery_request(importer, params)
     task_payload_map = {"test_mode": test_mode, **params}
-    if import_run_values_by_name.get("importer") in {
+    if is_recovery_task or importer in {
         "registry-cms-source-worker",
         "registry-ptg-source-worker",
         "registry-aca-source-worker",
@@ -4110,10 +4123,7 @@ def _control_wrapped_adapter_payload(
             or task_payload_map.get("stage_suffix")
             or import_run_values_by_name["run_id"]
         )
-    task_lineage_fields = _TASK_LINEAGE_FIELDS_BY_IMPORTER.get(
-        str(import_run_values_by_name.get("importer") or ""),
-        (),
-    )
+    task_lineage_fields = () if is_recovery_task else _TASK_LINEAGE_FIELDS_BY_IMPORTER.get(importer, ())
     for field in task_lineage_fields:
         if import_run_values_by_name.get(field):
             task_payload_map[field] = import_run_values_by_name[field]
@@ -4894,6 +4904,16 @@ def _retry_child_params(
     retry_params_by_name: dict[str, Any],
 ) -> dict[str, Any]:
     current_params_by_name = current_run_map.get("params") if isinstance(current_run_map.get("params"), dict) else {}
+    from process.provider_directory_serving_recovery import OPERATION_PARAM, is_recovery_request
+
+    if OPERATION_PARAM in current_params_by_name:
+        is_recovery_request(str(current_run_map.get("importer") or ""), current_params_by_name)
+        if any(
+            key not in current_params_by_name or override_value != current_params_by_name[key]
+            for key, override_value in retry_params_by_name.items()
+        ):
+            raise ValueError("provider_directory_serving_recovery_retry_scope_changed")
+        return dict(current_params_by_name)
     if current_params_by_name.get("frozen_rate_file_set_protected") is True:
         raise ValueError("protected frozen runs cannot be retried through the public API")
     if current_params_by_name.get(DIRECT_RATE_FILE_PUBLIC_MARKER) is True:

@@ -40,6 +40,7 @@ from process import entity_address_candidate_preparation as candidate_preparatio
 from process import entity_address_preparation_admission as preparation_admission
 from process import entity_address_result_generation as result_generation
 from process import provider_directory_profile as profile_artifact
+from process import provider_directory_serving_recovery as serving_recovery
 from process.control_lifecycle import mark_control_run
 from process.entity_address_candidate_preparation import (
     _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE,
@@ -54,7 +55,6 @@ from process.entity_address_candidate_preparation import (
 from process.entity_address_cutover_contract import (
     EntityAddressCutoverCallbacks,
     apply_transaction_sql_settings,
-    entity_address_cutover_transaction,
     entity_address_tuned_transaction,
     postgres_sqlstate,
     require_caller_owned_cutover_transaction,
@@ -81,6 +81,7 @@ from process.ext.address_format import (
 )
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress, write_live_progress
+from process.provider_directory_generic_source_artifacts import lock_address_source_fence
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -2154,13 +2155,16 @@ async def _run_entity_address_cutover(
     )
     if require_caller_owned_transaction:
         require_caller_owned_cutover_transaction(db)
-    async with entity_address_cutover_transaction(db, lock_timeout, _sql_literal):
+    async with serving_recovery.address_transaction(db, lock_timeout, _sql_literal, context):
+        directory = importlib.import_module("process.provider_directory_fhir")
+        await lock_address_source_fence(directory, db, db_schema, context)
         await preparation_admission.read_scalar(db, address_alias_sql.alias_advisory_xact_lock_sql())
         expected_alias_generation = int(context.get("address_alias_generation") or 0)
         current_alias_generation = await _address_alias_generation(db_schema)
         if current_alias_generation != expected_alias_generation:
             raise RuntimeError("address alias generation changed during entity-address-unified build")
         await _assert_provider_directory_overlay_alias_fence(db_schema, context)
+        await serving_recovery.prepare_address(db, db_schema, swaps, context)
         await _acquire_cutover_locks(db_schema, relation_names, required_names)
         from process import entity_address_snapshot_adoption as adoption
 
@@ -2168,6 +2172,7 @@ async def _run_entity_address_cutover(
         await _assert_cutover_has_no_dependent_views(db_schema, [swap.live_cls.__main_table__ for swap in swaps])
         if callbacks is not None and callbacks.before_cutover is not None:
             await callbacks.before_cutover()
+        await serving_recovery.before_address(db, db_schema, swaps, context)
         await adoption._publish_result_swaps(db_schema, swaps, context)
         for label, statement in patch_statements:
             started = time.monotonic()
@@ -2189,6 +2194,7 @@ async def _run_entity_address_cutover(
             context["result_generation"] = generation_authority.as_dict()
         if callbacks is not None and callbacks.after_publish is not None:
             await callbacks.after_publish()
+        await serving_recovery.after_address(db, db_schema, context)
 
 
 def _entity_address_cutover_plan(*args, **kwargs):
@@ -2200,19 +2206,9 @@ def _entity_address_cutover_plan(*args, **kwargs):
 
 def _cutover_retry_settings() -> tuple[int, int, int]:
     return (
-        _env_int(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_ATTEMPTS",
-            DEFAULT_CUTOVER_RETRY_ATTEMPTS,
-            minimum=1,
-        ),
-        _env_int(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_BACKOFF_MS",
-            DEFAULT_CUTOVER_RETRY_BACKOFF_MS,
-        ),
-        _env_int(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_MAX_BACKOFF_MS",
-            DEFAULT_CUTOVER_RETRY_MAX_BACKOFF_MS,
-        ),
+        _env_int("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_ATTEMPTS", DEFAULT_CUTOVER_RETRY_ATTEMPTS, minimum=1),
+        _env_int("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_BACKOFF_MS", DEFAULT_CUTOVER_RETRY_BACKOFF_MS),
+        _env_int("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_MAX_BACKOFF_MS", DEFAULT_CUTOVER_RETRY_MAX_BACKOFF_MS),
     )
 
 
@@ -11719,6 +11715,8 @@ async def process_entity_address_unified_data(ctx, task=None):
     task = task or {}
     ctx.setdefault("context", {})
     context = ctx["context"]
+    if (resumed := await serving_recovery.resume_address(db, ctx, task)) is not None:
+        return resumed
     run_id = str(context.get("control_run_id") or ctx.get("control_run_id") or "").strip()
 
     if "test_mode" in task:
@@ -13662,22 +13660,9 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             "entity-address-unified support patch publish requires "
             "the affected group table to remain available through shutdown."
         )
-    expected_provider_directory_dataset_id = _clean_optional(context.get("partial_provider_directory_dataset_id"))
-    if expected_provider_directory_dataset_id is not None:
-        partial_source_ids = _coerce_str_list(context.get("partial_provider_directory_source_ids"))
-        expected_provider_directory_root_run_id = _clean_optional(context.get("partial_provider_directory_run_id"))
-        _validate_provider_directory_dataset_fence_scope(
-            dataset_id=expected_provider_directory_dataset_id,
-            source_ids=partial_source_ids,
-            run_id=expected_provider_directory_root_run_id,
-            partial_scope=_clean_optional(context.get("partial_provider_directory_scope")),
-        )
-        await _assert_current_provider_directory_dataset(
-            db_schema,
-            source_id=partial_source_ids[0],
-            expected_dataset_id=expected_provider_directory_dataset_id,
-            expected_root_run_id=expected_provider_directory_root_run_id,
-        )
+    from process.provider_directory_generic_source_artifacts import assert_address_source_current
+
+    await assert_address_source_current(importlib.import_module(__name__), db_schema, context)
     current_alias_generation = await _address_alias_generation(db_schema)
     if current_alias_generation != int(context.get("address_alias_generation") or 0):
         raise RuntimeError("address alias generation changed during entity-address-unified build")
@@ -13745,6 +13730,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         """Return the stable control-run metrics emitted after stage publication."""
         return {
             "rows": published_rows,
+            **serving_recovery.reported_metrics(context),
             "refresh_mode": context.get("refresh_mode") or ENTITY_ADDRESS_REFRESH_MODE_FULL,
             "partial_patched_rows": int(context.get("partial_patched_rows") or 0),
             "partial_provider_directory_affected_groups": int(

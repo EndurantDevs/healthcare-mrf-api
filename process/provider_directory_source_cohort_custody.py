@@ -9,6 +9,7 @@ from copy import deepcopy
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_directory_cms_callable_custody import _admin_identity, _decoded
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
+from process.provider_directory_source_builder_delegation import receipt_delegation, require_legacy_observation
 
 HEADER = "provider_directory_uhc_flex_npi_cohort"
 MEMBER = "provider_directory_uhc_flex_npi_member"
@@ -172,7 +173,7 @@ def _require_scope_check(entry, cohorts):
         _require(actual == expected, "history_scope_changed")
 
 
-async def _capture_member(connection, policy, name, roles, functions, header_oid, *, legacy):
+async def _capture_member(connection, policy, name, roles, functions, header_oid, *, legacy, delegation=None):
     from process.provider_directory_cms_control_custody import _TYPE_SQL
     from process.provider_directory_cms_receipt_custody import _CATALOG_SQL
     from process.provider_directory_source_acquisition_custody import (
@@ -192,7 +193,7 @@ async def _capture_member(connection, policy, name, roles, functions, header_oid
     _require_member_indexes(catalog, native, name)
     _require_member_constraints(catalog, native, name, header_oid, legacy=legacy)
     _require_hooks(catalog, _history_hooks(legacy) if name == HISTORY else {}, functions)
-    _require_relation_access(catalog, native, roles, legacy=legacy, root=MEMBER, history=True)
+    _require_relation_access(catalog, native, roles, legacy=legacy, root=MEMBER, history=True, delegation=delegation)
     from process.provider_directory_source_acquisition_custody import _EXPRESSION_DEPENDENCY_SQL
 
     dependencies = [
@@ -211,14 +212,18 @@ async def _capture_member(connection, policy, name, roles, functions, header_oid
     return dict(name=name, root=MEMBER, catalog=catalog, composite=composite, dependencies=dependencies)
 
 
-async def capture_cohort_family(connection, policy, callable_receipt, *, legacy=False):
+async def capture_cohort_family(connection, policy, callable_receipt, *, legacy=False, delegation=None):
     """Authenticate the separate cohort partition family and its exact immutable phase."""
     from process.provider_directory_source_acquisition_custody import (
         ACQUISITION_ROOTS,
         _capture_family_relation,
     )
 
-    header = await _capture_family_relation(connection, policy, HEADER, HEADER, callable_receipt, legacy=legacy)
+    delegation = receipt_delegation(callable_receipt, delegation)
+    await require_legacy_observation(connection, policy, delegation, legacy=legacy)
+    header = await _capture_family_relation(
+        connection, policy, HEADER, HEADER, callable_receipt, legacy=legacy, delegation=delegation
+    )
     native_header = next(
         catalog_row for catalog_row in header["catalog"]["classes"] if catalog_row["relname"] == HEADER
     )
@@ -235,7 +240,14 @@ async def capture_cohort_family(connection, policy, callable_receipt, *, legacy=
     relation_by_name = {HEADER: header}
     for name in (MEMBER, HISTORY):
         relation_by_name[name] = await _capture_member(
-            connection, policy, name, roles, function_by_name, int(native_header["oid"]), legacy=legacy
+            connection,
+            policy,
+            name,
+            roles,
+            function_by_name,
+            int(native_header["oid"]),
+            legacy=legacy,
+            delegation=delegation,
         )
         _require(
             next(
@@ -246,20 +258,11 @@ async def capture_cohort_family(connection, policy, callable_receipt, *, legacy=
             == native_header["relowner"],
             "mixed_adoption_phase",
         )
-    parent = next(
-        catalog_row
-        for catalog_row in relation_by_name[MEMBER]["catalog"]["classes"]
-        if catalog_row["relname"] == MEMBER
+    await _require_cohort_partition(connection, relation_by_name[MEMBER])
+    children = await _capture_cohort_children(
+        connection, policy, callable_receipt, relation_by_name, ids, legacy, delegation
     )
-    partition = await connection.fetchrow(
-        "SELECT partstrat::text AS kind,partattrs::smallint[] AS columns,partexprs::text AS expression "
-        "FROM pg_partitioned_table WHERE partrelid=$1::oid",
-        int(parent["oid"]),
-    )
-    _require(
-        partition is not None and dict(partition) == dict(kind="l", columns=[1], expression=None), "partition_changed"
-    )
-    children = await _capture_cohort_children(connection, policy, callable_receipt, relation_by_name, ids, legacy)
+    await require_legacy_observation(connection, policy, delegation)
     return dict(
         relations=relation_by_name,
         cohort_ids=ids,
@@ -269,7 +272,22 @@ async def capture_cohort_family(connection, policy, callable_receipt, *, legacy=
     )
 
 
-async def _capture_cohort_children(connection, policy, callable_receipt, relation_by_name, ids, legacy):
+async def _require_cohort_partition(connection, member):
+    """Retain the existing native single-column list partition contract."""
+    parent = next(catalog_row for catalog_row in member["catalog"]["classes"] if catalog_row["relname"] == MEMBER)
+    partition = await connection.fetchrow(
+        "SELECT partstrat::text AS kind,partattrs::smallint[] AS columns,partexprs::text AS expression "
+        "FROM pg_partitioned_table WHERE partrelid=$1::oid",
+        int(parent["oid"]),
+    )
+    _require(
+        partition is not None and dict(partition) == dict(kind="l", columns=[1], expression=None), "partition_changed"
+    )
+
+
+async def _capture_cohort_children(
+    connection, policy, callable_receipt, relation_by_name, ids, legacy, delegation=None
+):
     from process.provider_directory_source_acquisition_custody import _partition_values
 
     parent = next(
@@ -305,6 +323,7 @@ async def _capture_cohort_children(connection, policy, callable_receipt, relatio
                 function_by_name,
                 int(header["oid"]),
                 legacy=legacy,
+                delegation=delegation,
             )
             _require_scope_check(relation_by_name[child["name"]], scope_ids)
     _require(covered_ids == set(ids), "historical_coverage_changed")

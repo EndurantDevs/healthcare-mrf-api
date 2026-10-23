@@ -10443,343 +10443,346 @@ async def get_near_npi(
             MEDICATION_ALLOWED_CODE_SYSTEMS,
         )
 
-    if requested_procedure_codes or requested_medication_codes or requested_year is not None:
-        if request_session is not None:
-            filter_year, _filter_year_source = await _resolve_filter_year(
-                requested_year,
-                include_procedures=bool(requested_procedure_codes),
-                include_medications=bool(requested_medication_codes),
-                session=request_session,
-            )
-        else:
-            filter_year, _filter_year_source = await _resolve_filter_year(
-                requested_year,
-                include_procedures=bool(requested_procedure_codes),
-                include_medications=bool(requested_medication_codes),
-            )
-    else:
-        filter_year = None
-
-    procedure_internal_codes: list[int] = []
-    medication_internal_codes: list[int] = []
-    if requested_procedure_codes:
-        if request_session is not None:
-            procedure_internal_codes, _ = await _resolve_internal_filter_codes(
-                requested_procedure_codes,
-                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
-                INTERNAL_PROCEDURE_CODE_SYSTEM,
-                "procedure_codes",
-                session=request_session,
-            )
-        else:
-            procedure_internal_codes, _ = await _resolve_internal_filter_codes(
-                requested_procedure_codes,
-                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
-                INTERNAL_PROCEDURE_CODE_SYSTEM,
-                "procedure_codes",
-            )
-    if requested_medication_codes:
-        if request_session is not None:
-            medication_internal_codes, _ = await _resolve_internal_filter_codes(
-                requested_medication_codes,
-                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
-                INTERNAL_MEDICATION_CODE_SYSTEM,
-                "medication_codes",
-                session=request_session,
-            )
-        else:
-            medication_internal_codes, _ = await _resolve_internal_filter_codes(
-                requested_medication_codes,
-                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
-                INTERNAL_MEDICATION_CODE_SYSTEM,
-                "medication_codes",
-            )
-
-    unresolved_code_filter = bool(
-        (requested_procedure_codes and not procedure_internal_codes)
-        or (requested_medication_codes and not medication_internal_codes)
-    )
-    if unresolved_code_filter and import_context is None:
-        if is_pagination_requested:
-            return response.json(
-                {
-                    "items": [],
-                    "total_count": 0,
-                    "next_cursor": None,
-                    "has_more": False,
-                    "result_identity": ["npi", "address_key"],
-                },
-                default=str,
-            )
-        return response.json([], default=str)
-
-    capability_by_name = {
-        "npi_procedures_array_available": True,
-        "npi_medications_array_available": True,
-        "pricing_provider_procedure_available": False,
-        "pricing_provider_prescription_available": False,
-    }
-    if requested_procedure_codes or requested_medication_codes:
-        if request_session is not None:
-            capability_by_name = await _resolve_npi_filter_capabilities(session=request_session)
-        else:
-            capability_by_name = await _resolve_npi_filter_capabilities()
-
     _validate_section_filters(section, classification, codes)
-    # If only zip was provided, resolve to coordinates before constructing geo SQL.
-    if not has_coordinates and zip_codes and zip_codes[0]:
-        zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
-        async with _provider_list_connection(db, import_context, request_session) as conn_zip:
-            zip_rows = await conn_zip.all(text(zip_sql), zip_code=zip_codes[0])
-        for coordinate_record in zip_rows:
-            try:
-                in_long = float(coordinate_record["intptlon"])
-                in_lat = float(coordinate_record["intptlat"])
-            except Exception:
-                in_lat = float(coordinate_record[0])
-                in_long = float(coordinate_record[1])
-
-    address_table_sql = await _address_serving_table_sql(
-        _public_address_serving_column_keys(),
-        session=request_session,
+    read_scope = (
+        provider_profile_read_snapshot(db, _runtime_db_schema(), include_detail=True)
+        if import_context is None and current_network_address_scope() is None
+        else contextlib.nullcontext(request_session)
     )
-    plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
-        request_session,
-        plan_release_id_raw,
-    )
-
-    providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
-    extra_filters: list[str] = []
-    if unresolved_code_filter:
-        extra_filters.append("1=0")
-    if exclude_npi:
-        extra_filters.append("a.npi <> :exclude_npi")
-    if plan_network_ids:
-        extra_filters.append("a.plans_network_array && (:plan_network_array)")
-    if entity_type_code is not None:
-        extra_filters.append("d.entity_type_code = :entity_type_code")
-    if plan_member_sql is not None:
-        extra_filters.append(f"a.npi IN ({plan_member_sql})")
-    if provider_sex_code is not None:
-        extra_filters.append(
-            "EXISTS ("
-            "SELECT 1 FROM mrf.npi AS sex_provider "
-            "WHERE sex_provider.npi = a.npi "
-            "AND sex_provider.provider_sex_code = :provider_sex_code"
-            ")"
-        )
-    dynamic_code_parameters_by_name: dict[str, int] = {}
-    if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
-        dynamic_code_parameters_by_name["filter_year"] = int(filter_year)
-
-    procedures_array_available = bool(capability_by_name.get("npi_procedures_array_available", True))
-    medications_array_available = bool(capability_by_name.get("npi_medications_array_available", True))
-    procedure_table_available = bool(capability_by_name.get("pricing_provider_procedure_available", False))
-    medication_table_available = bool(capability_by_name.get("pricing_provider_prescription_available", False))
-
-    for idx, code in enumerate(procedure_internal_codes):
-        param = f"procedure_code_{idx}"
-        dynamic_code_parameters_by_name[param] = int(code)
-        array_clause = f"a.procedures_array @> ARRAY[:{param}]::INTEGER[]"
-        exists_clause = (
-            "EXISTS ("
-            "SELECT 1 FROM mrf.pricing_provider_procedure AS pp "
-            f"WHERE pp.npi = a.npi AND pp.procedure_code = :{param}"
-            + (" AND pp.year = :filter_year" if filter_year is not None else "")
-            + ")"
-        )
-        if procedures_array_available and procedure_table_available:
-            extra_filters.append(f"({array_clause} OR {exists_clause})")
-        elif procedures_array_available:
-            extra_filters.append(array_clause)
-        elif procedure_table_available:
-            extra_filters.append(exists_clause)
-        else:
-            extra_filters.append("1=0")
-
-    for idx, code in enumerate(medication_internal_codes):
-        param = f"medication_code_{idx}"
-        dynamic_code_parameters_by_name[param] = int(code)
-        array_clause = f"a.medications_array @> ARRAY[:{param}]::INTEGER[]"
-        exists_clause = (
-            "EXISTS ("
-            "SELECT 1 FROM mrf.pricing_provider_prescription AS pr "
-            "WHERE pr.npi = a.npi "
-            "AND pr.rx_code_system = 'HP_RX_CODE' "
-            + ("AND pr.year = :filter_year " if filter_year is not None else "")
-            + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{param}"
-            ")"
-        )
-        if medications_array_available and medication_table_available:
-            extra_filters.append(f"({array_clause} OR {exists_clause})")
-        elif medications_array_available:
-            extra_filters.append(array_clause)
-        elif medication_table_available:
-            extra_filters.append(exists_clause)
-        else:
-            extra_filters.append("1=0")
-
-    taxonomy_clauses: list[str] = []
-    if zip_codes:
-        extra_filters.append(_address_zip5_filter("a", address_table_sql, any_array=True))
-
-    if classification:
-        taxonomy_clauses.append("classification = :classification")
-    if specialization:
-        taxonomy_clauses.append("specialization = :specialization")
-    if section:
-        taxonomy_clauses.append("section = :section")
-    if display_name:
-        taxonomy_clauses.append("display_name = :display_name")
-    if codes:
-        taxonomy_clauses.append("code = ANY(:codes)")
-    ilike_clause = ""
-    q_like = None
-    if name_query:
-        q_like = f"%{name_query}%"
-        ilike_clause = f"\n            AND {_name_like_clause('d', 'q')}"
-
-    taxonomy_conditions = " AND ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
-    extra_clause = ""
-    if extra_filters:
-        extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
-
-    query_parameters_by_name: dict[str, Any] = {
-        "in_long": in_long,
-        "in_lat": in_lat,
-        "classification": classification,
-        "specialization": specialization,
-        "radius": radius,
-        "exclude_npi": exclude_npi,
-        "section": section,
-        "display_name": display_name,
-        "q": q_like,
-        "codes": codes,
-        "zip_codes": zip_codes,
-        "plan_network_array": plan_network_ids,
-        "provider_sex_code": provider_sex_code,
-        "entity_type_code": entity_type_code,
-        **plan_scope_parameters,
-        **dynamic_code_parameters_by_name,
-    }
-    query_parameters_by_name = scoped_address_parameters(query_parameters_by_name)
-    imported_statements = None
-    if import_context is not None:
-        geo_precision_clause = _exact_geo_precision_clause(address_table_sql)
-        geo_type_clause = _nearby_geo_type_clause(address_table_sql)
-        nearby_query = NearbySqlQuery(
-            taxonomy_conditions=taxonomy_conditions,
-            extra_clause=extra_clause,
-            ilike_clause=ilike_clause,
-            use_taxonomy_filter=bool(taxonomy_clauses),
-            primary_only=is_primary_only,
-            address_table_sql=address_table_sql,
-            geo_precision_clause=geo_precision_clause,
-            geo_type_clause=geo_type_clause,
-        )
-        if native_scope_preparer is not None:
-            import_context = await native_scope_preparer(native_geo_entity_scope())
-        cursor_anchor = await prepare_cursor(
-            session=request_session,
-            address_table_sql=address_table_sql,
-            query_parameters=dict(query_parameters_by_name),
-            taxonomy_conditions=taxonomy_conditions,
-            extra_clause=extra_clause,
-            ilike_clause=ilike_clause,
-            primary_only=is_primary_only,
-            use_taxonomy_filter=bool(taxonomy_clauses),
-            limit=limit,
-            geo_precision_clause=geo_precision_clause,
-            geo_type_clause=geo_type_clause,
-        )
-        imported_statements = build_imported_geo_statements(
-            import_context,
-            ImportedGeoQuery(
-                nearby=nearby_query,
-                native_parameters=query_parameters_by_name,
-                limit=limit,
-                cursor_anchor=cursor_anchor,
-            ),
-        )
-
-    async def fetch_nearby_rows() -> list[Any]:
-        """Fetch an exact imported page or enough native KNN rows for one page."""
-        if imported_statements is not None:
-            return await _fetch_imported_geo_page(
-                db,
-                import_context,
-                request_session,
-                imported_statements,
+    async with read_scope as request_session:
+        if requested_procedure_codes or requested_medication_codes or requested_year is not None:
+            filter_year, _filter_year_source = await _resolve_filter_year(
+                requested_year,
+                include_procedures=bool(requested_procedure_codes),
+                include_medications=bool(requested_medication_codes),
+                session=request_session,
             )
-        target_identities = limit + 1 if is_pagination_requested else limit
-        candidate_limit = max((target_identities + 1) * 4, 16)
-        batch_cursor = initial_cursor
-        collected_rows: list[Any] = []
-        collected_identities: set[tuple[int, str]] = set()
-        async with _provider_list_connection(db, import_context, request_session) as conn:
-            for _batch_number in range(100):
-                cursor_clause, cursor_parameters_by_name = _nearby_cursor_filter(batch_cursor)
-                batch_parameters_by_name = {
-                    **query_parameters_by_name,
-                    **cursor_parameters_by_name,
-                }
-                nearby_sql = _build_nearby_sql(
-                    taxonomy_conditions,
-                    extra_clause,
-                    ilike_clause,
-                    use_taxonomy_filter=bool(taxonomy_clauses),
-                    primary_only=is_primary_only,
-                    address_table_sql=address_table_sql,
-                    geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
-                    cursor_clause=cursor_clause,
+        else:
+            filter_year = None
+
+        procedure_internal_codes: list[int] = []
+        medication_internal_codes: list[int] = []
+        if requested_procedure_codes:
+            procedure_internal_codes, _ = await _resolve_internal_filter_codes(
+                requested_procedure_codes,
+                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
+                INTERNAL_PROCEDURE_CODE_SYSTEM,
+                "procedure_codes",
+                session=request_session,
+            )
+        if requested_medication_codes:
+            medication_internal_codes, _ = await _resolve_internal_filter_codes(
+                requested_medication_codes,
+                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
+                INTERNAL_MEDICATION_CODE_SYSTEM,
+                "medication_codes",
+                session=request_session,
+            )
+
+        unresolved_code_filter = bool(
+            (requested_procedure_codes and not procedure_internal_codes)
+            or (requested_medication_codes and not medication_internal_codes)
+        )
+        if unresolved_code_filter and import_context is None:
+            if is_pagination_requested:
+                return response.json(
+                    {
+                        "items": [],
+                        "total_count": 0,
+                        "next_cursor": None,
+                        "has_more": False,
+                        "result_identity": ["npi", "address_key"],
+                    },
+                    default=str,
                 )
-                batch_rows = await conn.all(
-                    text(nearby_sql),
-                    limit=candidate_limit,
-                    **batch_parameters_by_name,
-                )
-                if not batch_rows:
-                    break
-                collected_rows.extend(batch_rows)
-                batch_identities, last_cursor = nearby_batch_identities(batch_rows)
-                collected_identities.update(batch_identities)
+            return response.json([], default=str)
 
-                if len(collected_identities) >= target_identities:
-                    break
-                if last_cursor is None or last_cursor == batch_cursor:
-                    break
-                batch_cursor = last_cursor
-
-        return collected_rows
-
-    bbox_parameters_by_name: dict[str, float] = {}
-    bbox_clause = ""
-    if in_long is not None and in_lat is not None:
-        delta_lat = radius / 69.0
-        cos_lat = math.cos(math.radians(in_lat)) or 1e-6
-        delta_long = radius / (69.0 * cos_lat)
-        bbox_parameters_by_name = {
-            "min_lat": in_lat - delta_lat,
-            "max_lat": in_lat + delta_lat,
-            "min_long": in_long - delta_long,
-            "max_long": in_long + delta_long,
+        capability_by_name = {
+            "npi_procedures_array_available": True,
+            "npi_medications_array_available": True,
+            "pricing_provider_procedure_available": False,
+            "pricing_provider_prescription_available": False,
         }
-        bbox_clause = dedent(
-            """
+        if requested_procedure_codes or requested_medication_codes:
+            if request_session is not None:
+                capability_by_name = await _resolve_npi_filter_capabilities(session=request_session)
+            else:
+                capability_by_name = await _resolve_npi_filter_capabilities()
 
-               AND a.lat BETWEEN :min_lat AND :max_lat
-               AND a.long BETWEEN :min_long AND :max_long
-            """
-        ).rstrip()
+        # If only zip was provided, resolve to coordinates before constructing geo SQL.
+        if not has_coordinates and zip_codes and zip_codes[0]:
+            zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
+            async with _provider_list_connection(db, import_context, request_session) as conn_zip:
+                zip_rows = await conn_zip.all(text(zip_sql), zip_code=zip_codes[0])
+            for coordinate_record in zip_rows:
+                try:
+                    in_long = float(coordinate_record["intptlon"])
+                    in_lat = float(coordinate_record["intptlat"])
+                except Exception:
+                    in_lat = float(coordinate_record[0])
+                    in_long = float(coordinate_record[1])
 
-    async def fetch_exact_total() -> int:
-        """Count exact provider-address matches without the page limit."""
+        address_table_sql = await _address_serving_table_sql(
+            _public_address_serving_column_keys(),
+            session=request_session,
+        )
+        plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
+            request_session,
+            plan_release_id_raw,
+        )
 
-        if imported_statements is not None:
+        providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
+        extra_filters: list[str] = []
+        if unresolved_code_filter:
+            extra_filters.append("1=0")
+        if exclude_npi:
+            extra_filters.append("a.npi <> :exclude_npi")
+        if plan_network_ids:
+            extra_filters.append("a.plans_network_array && (:plan_network_array)")
+        if entity_type_code is not None:
+            extra_filters.append("d.entity_type_code = :entity_type_code")
+        if plan_member_sql is not None:
+            extra_filters.append(f"a.npi IN ({plan_member_sql})")
+        if provider_sex_code is not None:
+            extra_filters.append(
+                "EXISTS ("
+                "SELECT 1 FROM mrf.npi AS sex_provider "
+                "WHERE sex_provider.npi = a.npi "
+                "AND sex_provider.provider_sex_code = :provider_sex_code"
+                ")"
+            )
+        dynamic_code_parameters_by_name: dict[str, int] = {}
+        if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
+            dynamic_code_parameters_by_name["filter_year"] = int(filter_year)
+
+        procedures_array_available = bool(capability_by_name.get("npi_procedures_array_available", True))
+        medications_array_available = bool(capability_by_name.get("npi_medications_array_available", True))
+        procedure_table_available = bool(capability_by_name.get("pricing_provider_procedure_available", False))
+        medication_table_available = bool(capability_by_name.get("pricing_provider_prescription_available", False))
+
+        for idx, code in enumerate(procedure_internal_codes):
+            param = f"procedure_code_{idx}"
+            dynamic_code_parameters_by_name[param] = int(code)
+            array_clause = f"a.procedures_array @> ARRAY[:{param}]::INTEGER[]"
+            exists_clause = (
+                "EXISTS ("
+                "SELECT 1 FROM mrf.pricing_provider_procedure AS pp "
+                f"WHERE pp.npi = a.npi AND pp.procedure_code = :{param}"
+                + (" AND pp.year = :filter_year" if filter_year is not None else "")
+                + ")"
+            )
+            if procedures_array_available:
+                extra_filters.append(
+                    f"({array_clause} OR {exists_clause})" if procedure_table_available else array_clause
+                )
+            else:
+                extra_filters.append(exists_clause if procedure_table_available else "1=0")
+
+        for idx, code in enumerate(medication_internal_codes):
+            param = f"medication_code_{idx}"
+            dynamic_code_parameters_by_name[param] = int(code)
+            array_clause = f"a.medications_array @> ARRAY[:{param}]::INTEGER[]"
+            exists_clause = (
+                "EXISTS ("
+                "SELECT 1 FROM mrf.pricing_provider_prescription AS pr "
+                "WHERE pr.npi = a.npi "
+                "AND pr.rx_code_system = 'HP_RX_CODE' "
+                + ("AND pr.year = :filter_year " if filter_year is not None else "")
+                + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{param}"
+                ")"
+            )
+            if medications_array_available:
+                extra_filters.append(
+                    f"({array_clause} OR {exists_clause})" if medication_table_available else array_clause
+                )
+            else:
+                extra_filters.append(exists_clause if medication_table_available else "1=0")
+
+        taxonomy_clauses: list[str] = []
+        if zip_codes:
+            extra_filters.append(_address_zip5_filter("a", address_table_sql, any_array=True))
+
+        if classification:
+            taxonomy_clauses.append("classification = :classification")
+        if specialization:
+            taxonomy_clauses.append("specialization = :specialization")
+        if section:
+            taxonomy_clauses.append("section = :section")
+        if display_name:
+            taxonomy_clauses.append("display_name = :display_name")
+        if codes:
+            taxonomy_clauses.append("code = ANY(:codes)")
+        ilike_clause = ""
+        q_like = None
+        if name_query:
+            q_like = f"%{name_query}%"
+            ilike_clause = f"\n            AND {_name_like_clause('d', 'q')}"
+
+        taxonomy_conditions = " AND ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
+        extra_clause = ""
+        if extra_filters:
+            extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
+
+        query_parameters_by_name: dict[str, Any] = {
+            "in_long": in_long,
+            "in_lat": in_lat,
+            "classification": classification,
+            "specialization": specialization,
+            "radius": radius,
+            "exclude_npi": exclude_npi,
+            "section": section,
+            "display_name": display_name,
+            "q": q_like,
+            "codes": codes,
+            "zip_codes": zip_codes,
+            "plan_network_array": plan_network_ids,
+            "provider_sex_code": provider_sex_code,
+            "entity_type_code": entity_type_code,
+            **plan_scope_parameters,
+            **dynamic_code_parameters_by_name,
+        }
+        query_parameters_by_name = scoped_address_parameters(query_parameters_by_name)
+        imported_statements = None
+        if import_context is not None:
+            geo_precision_clause = _exact_geo_precision_clause(address_table_sql)
+            geo_type_clause = _nearby_geo_type_clause(address_table_sql)
+            nearby_query = NearbySqlQuery(
+                taxonomy_conditions=taxonomy_conditions,
+                extra_clause=extra_clause,
+                ilike_clause=ilike_clause,
+                use_taxonomy_filter=bool(taxonomy_clauses),
+                primary_only=is_primary_only,
+                address_table_sql=address_table_sql,
+                geo_precision_clause=geo_precision_clause,
+                geo_type_clause=geo_type_clause,
+            )
+            if native_scope_preparer is not None:
+                import_context = await native_scope_preparer(native_geo_entity_scope())
+            cursor_anchor = await prepare_cursor(
+                session=request_session,
+                address_table_sql=address_table_sql,
+                query_parameters=dict(query_parameters_by_name),
+                taxonomy_conditions=taxonomy_conditions,
+                extra_clause=extra_clause,
+                ilike_clause=ilike_clause,
+                primary_only=is_primary_only,
+                use_taxonomy_filter=bool(taxonomy_clauses),
+                limit=limit,
+                geo_precision_clause=geo_precision_clause,
+                geo_type_clause=geo_type_clause,
+            )
+            imported_statements = build_imported_geo_statements(
+                import_context,
+                ImportedGeoQuery(
+                    nearby=nearby_query,
+                    native_parameters=query_parameters_by_name,
+                    limit=limit,
+                    cursor_anchor=cursor_anchor,
+                ),
+            )
+
+        async def fetch_nearby_rows() -> list[Any]:
+            """Fetch an exact imported page or enough native KNN rows for one page."""
+            if imported_statements is not None:
+                return await _fetch_imported_geo_page(
+                    db,
+                    import_context,
+                    request_session,
+                    imported_statements,
+                )
+            target_identities = limit + 1 if is_pagination_requested else limit
+            candidate_limit = max((target_identities + 1) * 4, 16)
+            batch_cursor = initial_cursor
+            collected_rows: list[Any] = []
+            collected_identities: set[tuple[int, str]] = set()
+            async with _provider_list_connection(db, import_context, request_session) as conn:
+                for _batch_number in range(100):
+                    cursor_clause, cursor_parameters_by_name = _nearby_cursor_filter(batch_cursor)
+                    batch_parameters_by_name = {
+                        **query_parameters_by_name,
+                        **cursor_parameters_by_name,
+                    }
+                    nearby_sql = _build_nearby_sql(
+                        taxonomy_conditions,
+                        extra_clause,
+                        ilike_clause,
+                        use_taxonomy_filter=bool(taxonomy_clauses),
+                        primary_only=is_primary_only,
+                        address_table_sql=address_table_sql,
+                        geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
+                        cursor_clause=cursor_clause,
+                    )
+                    batch_rows = await conn.all(
+                        text(nearby_sql),
+                        limit=candidate_limit,
+                        **batch_parameters_by_name,
+                    )
+                    if not batch_rows:
+                        break
+                    collected_rows.extend(batch_rows)
+                    batch_identities, last_cursor = nearby_batch_identities(batch_rows)
+                    collected_identities.update(batch_identities)
+
+                    if len(collected_identities) >= target_identities:
+                        break
+                    if last_cursor is None or last_cursor == batch_cursor:
+                        break
+                    batch_cursor = last_cursor
+
+            return collected_rows
+
+        bbox_parameters_by_name: dict[str, float] = {}
+        bbox_clause = ""
+        if in_long is not None and in_lat is not None:
+            delta_lat = radius / 69.0
+            cos_lat = math.cos(math.radians(in_lat)) or 1e-6
+            delta_long = radius / (69.0 * cos_lat)
+            bbox_parameters_by_name = {
+                "min_lat": in_lat - delta_lat,
+                "max_lat": in_lat + delta_lat,
+                "min_long": in_long - delta_long,
+                "max_long": in_long + delta_long,
+            }
+            bbox_clause = dedent(
+                """
+
+                   AND a.lat BETWEEN :min_lat AND :max_lat
+                   AND a.long BETWEEN :min_long AND :max_long
+                """
+            ).rstrip()
+
+        async def fetch_exact_total() -> int:
+            """Count exact provider-address matches without the page limit."""
+
+            if imported_statements is not None:
+                async with _provider_list_connection(db, import_context, request_session) as conn:
+                    count_records = await conn.all(
+                        imported_statements.count,
+                        **imported_statements.parameters,
+                    )
+                if not count_records:
+                    return 0
+                count_mapping = getattr(count_records[0], "_mapping", None)
+                total_count_value = (
+                    count_mapping.get("total_count") if count_mapping is not None else count_records[0][0]
+                )
+                return int(total_count_value or 0)
+
+            count_sql = _build_nearby_count_sql(
+                taxonomy_conditions,
+                extra_clause,
+                ilike_clause,
+                use_taxonomy_filter=bool(taxonomy_clauses),
+                primary_only=is_primary_only,
+                address_table_sql=address_table_sql,
+                geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
+                bbox_clause=bbox_clause,
+            )
             async with _provider_list_connection(db, import_context, request_session) as conn:
                 count_records = await conn.all(
-                    imported_statements.count,
-                    **imported_statements.parameters,
+                    text(count_sql),
+                    **query_parameters_by_name,
+                    **bbox_parameters_by_name,
                 )
             if not count_records:
                 return 0
@@ -10787,183 +10790,160 @@ async def get_near_npi(
             total_count_value = count_mapping.get("total_count") if count_mapping is not None else count_records[0][0]
             return int(total_count_value or 0)
 
-        count_sql = _build_nearby_count_sql(
-            taxonomy_conditions,
-            extra_clause,
-            ilike_clause,
-            use_taxonomy_filter=bool(taxonomy_clauses),
-            primary_only=is_primary_only,
-            address_table_sql=address_table_sql,
-            geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
-            bbox_clause=bbox_clause,
-        )
-        async with _provider_list_connection(db, import_context, request_session) as conn:
-            count_records = await conn.all(
-                text(count_sql),
-                **query_parameters_by_name,
-                **bbox_parameters_by_name,
-            )
-        if not count_records:
-            return 0
-        count_mapping = getattr(count_records[0], "_mapping", None)
-        total_count_value = count_mapping.get("total_count") if count_mapping is not None else count_records[0][0]
-        return int(total_count_value or 0)
+        if imported_statements is not None:
+            res_q = await fetch_nearby_rows()
+            total_mapping = getattr(res_q[0], "_mapping", {}) if res_q else {}
+            if total_mapping.get("_geo_total") is None:
+                raise RuntimeError("custom-import geo count is required")
+            total_count = int(total_mapping["_geo_total"])
+        elif is_pagination_requested and current_network_address_scope() is not None:
+            res_q = await fetch_nearby_rows()
+            total_count = await fetch_exact_total()
+        elif is_pagination_requested:
+            res_q, total_count = await gather_reader_calls(db, fetch_nearby_rows(), fetch_exact_total())
+        else:
+            res_q = await fetch_nearby_rows()
+            total_count = None
 
-    if imported_statements is not None:
-        res_q = await fetch_nearby_rows()
-        total_mapping = getattr(res_q[0], "_mapping", {}) if res_q else {}
-        if total_mapping.get("_geo_total") is None:
-            raise RuntimeError("custom-import geo count is required")
-        total_count = int(total_mapping["_geo_total"])
-    elif is_pagination_requested and current_network_address_scope() is not None:
-        res_q = await fetch_nearby_rows()
-        total_count = await fetch_exact_total()
-    elif is_pagination_requested:
-        res_q, total_count = await gather_reader_calls(db, fetch_nearby_rows(), fetch_exact_total())
-    else:
-        res_q = await fetch_nearby_rows()
-        total_count = None
+        for provider_record in res_q:
+            row_mapping = getattr(provider_record, "_mapping", None)
+            if row_mapping is not None:
+                row_dict = dict(row_mapping)
+                npi_value = (
+                    row_dict.get("npi_code") or row_dict.get("npi") or row_dict.get("npi_1") or row_dict.get("npi_2")
+                )
+                if npi_value is None:
+                    continue
 
-    for provider_record in res_q:
-        row_mapping = getattr(provider_record, "_mapping", None)
-        if row_mapping is not None:
-            row_dict = dict(row_mapping)
-            npi_value = (
-                row_dict.get("npi_code") or row_dict.get("npi") or row_dict.get("npi_1") or row_dict.get("npi_2")
-            )
+                npi_value = int(npi_value)
+                address_key_value = row_dict.get("address_key")
+                if address_key_value is None:
+                    continue
+                identity = (npi_value, str(address_key_value).lower())
+                is_new_identity = identity not in providers_by_identity
+                provider_by_field = providers_by_identity.get(identity, {"taxonomy_list": []})
+                if is_new_identity:
+                    _populate_near_provider_mapping(
+                        provider_by_field,
+                        row_dict,
+                        npi_value,
+                        address_key_value,
+                        address_table_sql,
+                    )
+
+                taxonomy_by_field = {
+                    column.key: row_dict[column.key]
+                    for column in NPIDataTaxonomy.__table__.columns
+                    if column.key not in ("npi", "checksum") and column.key in row_dict
+                }
+                if taxonomy_by_field and row_dict.get("taxonomy_display") is not None:
+                    taxonomy_by_field["display"] = row_dict.get("taxonomy_display")
+                if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
+                    provider_by_field["taxonomy_list"].append(taxonomy_by_field)
+
+                providers_by_identity[identity] = provider_by_field
+                continue
+
+            # Fallback for positional row types. Keep this defensive to avoid crashes
+            # when result shape differs from model column expectations.
+            row_len = len(provider_record)
+            if row_len <= 1:
+                continue
+
+            provider_by_field = {"taxonomy_list": []}
+            count = 1
+            provider_by_field["distance"] = provider_record[count]
+
+            for column in NPIAddress.__table__.columns:
+                count += 1
+                if count >= row_len:
+                    break
+                if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                    continue
+                provider_by_field[column.key] = provider_record[count]
+            for column in NPIData.__table__.columns:
+                count += 1
+                if count >= row_len:
+                    break
+                if column.key in {
+                    "npi",
+                    "checksum",
+                    "do_business_as_text",
+                    *PUBLIC_NPI_EXCLUDED_COLUMNS,
+                }:
+                    continue
+                provider_by_field[column.key] = provider_record[count]
+
+            npi_value = provider_by_field.get("npi")
             if npi_value is None:
                 continue
-
-            npi_value = int(npi_value)
-            address_key_value = row_dict.get("address_key")
-            if address_key_value is None:
-                continue
-            identity = (npi_value, str(address_key_value).lower())
-            is_new_identity = identity not in providers_by_identity
-            provider_by_field = providers_by_identity.get(identity, {"taxonomy_list": []})
-            if is_new_identity:
-                _populate_near_provider_mapping(
-                    provider_by_field,
-                    row_dict,
-                    npi_value,
-                    address_key_value,
-                    address_table_sql,
-                )
-
+            address_key_value = provider_by_field.get("address_key")
+            identity = (int(npi_value), str(address_key_value or "").lower())
+            if identity in providers_by_identity:
+                provider_by_field = providers_by_identity[identity]
             taxonomy_by_field = {}
             for column in NPIDataTaxonomy.__table__.columns:
+                count += 1
+                if count >= row_len:
+                    break
                 if column.key in ("npi", "checksum"):
                     continue
-                if column.key in row_dict:
-                    taxonomy_by_field[column.key] = row_dict[column.key]
-            if taxonomy_by_field and row_dict.get("taxonomy_display") is not None:
-                taxonomy_by_field["display"] = row_dict.get("taxonomy_display")
+                taxonomy_by_field[column.key] = provider_record[count]
             if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
                 provider_by_field["taxonomy_list"].append(taxonomy_by_field)
 
             providers_by_identity[identity] = provider_by_field
-            continue
 
-        # Fallback for positional row types. Keep this defensive to avoid crashes
-        # when result shape differs from model column expectations.
-        row_len = len(provider_record)
-        if row_len <= 1:
-            continue
-
-        provider_by_field = {"taxonomy_list": []}
-        count = 1
-        provider_by_field["distance"] = provider_record[count]
-
-        for column in NPIAddress.__table__.columns:
-            count += 1
-            if count >= row_len:
-                break
-            if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                continue
-            provider_by_field[column.key] = provider_record[count]
-        for column in NPIData.__table__.columns:
-            count += 1
-            if count >= row_len:
-                break
-            if column.key in {
-                "npi",
-                "checksum",
-                "do_business_as_text",
-                *PUBLIC_NPI_EXCLUDED_COLUMNS,
-            }:
-                continue
-            provider_by_field[column.key] = provider_record[count]
-
-        npi_value = provider_by_field.get("npi")
-        if npi_value is None:
-            continue
-        address_key_value = provider_by_field.get("address_key")
-        identity = (int(npi_value), str(address_key_value or "").lower())
-        if identity in providers_by_identity:
-            provider_by_field = providers_by_identity[identity]
-        taxonomy_by_field = {}
-        for column in NPIDataTaxonomy.__table__.columns:
-            count += 1
-            if count >= row_len:
-                break
-            if column.key in ("npi", "checksum"):
-                continue
-            taxonomy_by_field[column.key] = provider_record[count]
-        if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
-            provider_by_field["taxonomy_list"].append(taxonomy_by_field)
-
-        providers_by_identity[identity] = provider_by_field
-
-    all_provider_results = list(providers_by_identity.values())
-    has_more = is_pagination_requested and len(all_provider_results) > limit
-    provider_results = all_provider_results[:limit]
-    next_cursor = None
-    next_import_anchor_parts = None
-    if has_more and provider_results:
-        final_result = provider_results[-1]
-        distance_value = final_result.get("_cursor_distance_meters")
-        npi_value = final_result.get("_cursor_npi")
-        address_key_value = final_result.get("_cursor_address_key")
-        if imported_statements is not None:
-            try:
-                next_import_anchor_parts = [
-                    str(int(npi_value)),
-                    str(uuid.UUID(str(address_key_value))),
-                ]
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("custom-import geo page identity is unavailable") from exc
-        elif distance_value is not None and npi_value is not None and address_key_value:
-            next_cursor = _encode_nearby_cursor(
-                cursor_scope,
-                float(distance_value),
-                int(npi_value),
-                str(address_key_value),
+        all_provider_results = list(providers_by_identity.values())
+        has_more = is_pagination_requested and len(all_provider_results) > limit
+        provider_results = all_provider_results[:limit]
+        next_cursor = None
+        next_import_anchor_parts = None
+        if has_more and provider_results:
+            final_result = provider_results[-1]
+            distance_value = final_result.get("_cursor_distance_meters")
+            npi_value = final_result.get("_cursor_npi")
+            address_key_value = final_result.get("_cursor_address_key")
+            if imported_statements is not None:
+                try:
+                    next_import_anchor_parts = [
+                        str(int(npi_value)),
+                        str(uuid.UUID(str(address_key_value))),
+                    ]
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("custom-import geo page identity is unavailable") from exc
+            elif distance_value is not None and npi_value is not None and address_key_value:
+                next_cursor = _encode_nearby_cursor(
+                    cursor_scope,
+                    float(distance_value),
+                    int(npi_value),
+                    str(address_key_value),
+                )
+        for provider_result in provider_results:
+            if isinstance(provider_result, dict):
+                provider_result.pop("_cursor_distance_meters", None)
+                provider_result.pop("_cursor_npi", None)
+                provider_result.pop("_cursor_address_key", None)
+                _add_canonical_contact_fields_to_address(provider_result)
+        if view_mode != "card":
+            provider_results = await _project_provider_network_metadata(
+                provider_results, session=request_session, include_sources=False, include_evidence=False
             )
-    for provider_result in provider_results:
-        if isinstance(provider_result, dict):
-            provider_result.pop("_cursor_distance_meters", None)
-            provider_result.pop("_cursor_npi", None)
-            provider_result.pop("_cursor_address_key", None)
-            _add_canonical_contact_fields_to_address(provider_result)
-    if view_mode != "card":
-        provider_results = await _project_provider_network_metadata(
-            provider_results, session=request_session, include_sources=False, include_evidence=False
-        )
-    _redact_internal_address_fields(provider_results)
-    if view_mode == "card":
-        provider_results = [_provider_card_from_mapping(provider_result) for provider_result in provider_results]
-    if is_pagination_requested:
-        response_by_key = {
-            "items": provider_results,
-            "total_count": int(total_count or 0),
-            "next_cursor": next_cursor,
-            "has_more": bool(has_more),
-            "result_identity": ["npi", "address_key"],
-        }
-        if imported_statements is not None:
-            response_by_key["_custom_import_next_anchor"] = next_import_anchor_parts
-        return response.json(response_by_key, default=str)
-    return response.json(provider_results, default=str)
+        _redact_internal_address_fields(provider_results)
+        if view_mode == "card":
+            provider_results = [_provider_card_from_mapping(provider_result) for provider_result in provider_results]
+        if is_pagination_requested:
+            response_by_key = {
+                "items": provider_results,
+                "total_count": int(total_count or 0),
+                "next_cursor": next_cursor,
+                "has_more": bool(has_more),
+                "result_identity": ["npi", "address_key"],
+            }
+            if imported_statements is not None:
+                response_by_key["_custom_import_next_anchor"] = next_import_anchor_parts
+            return response.json(response_by_key, default=str)
+        return response.json(provider_results, default=str)
 
 
 @blueprint.get("/id/<npi>/full_taxonomy")

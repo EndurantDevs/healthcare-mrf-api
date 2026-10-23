@@ -256,6 +256,7 @@ async def test_borrowed_session_keeps_native_cutover_and_outer_rollback_atomic(m
     async with _temporary_schema() as (database, schema):
         monkeypatch.setattr(entity_address_unified, "db", database)
         await _prepare_live_and_stage(database, schema)
+        await entity_address_unified._ensure_promoted_stage_logged(schema, _StageTable.__tablename__)
         await database.status(f"CREATE TABLE {schema}.adoption_receipt (marker text NOT NULL);")
         await database.status(
             f"""

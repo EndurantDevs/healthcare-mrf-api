@@ -12,6 +12,12 @@ from process.provider_directory_cms_control_privileges import (
     cms_control_read_edges,
     cms_control_read_oids,
 )
+from process.provider_directory_cms_receipt_policy import (
+    POLICY_SQL,
+    policy_statements,
+    require_bound_access,
+    require_receipt_policies,
+)
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
 ROOT = "provider_directory_cms_serving_receipt"
@@ -72,7 +78,7 @@ def _decoded(part_by_field):
     return json.loads(part_by_field) if type(part_by_field) is str else part_by_field
 
 
-def _receipt_heap(catalog, functions):
+def _receipt_heap(catalog, functions, *, protected=False):
     """Require the authentic fixed heap, native columns and no hidden dependent ACL."""
     classes = catalog["classes"] or []
     roots = [entry for entry in classes if entry["relname"] == ROOT]
@@ -84,10 +90,12 @@ def _receipt_heap(catalog, functions):
         and root["relpersistence"] == "p"
         and root["relam"] == "2"
         and root["relnamespace"] == str(functions["schema_oid"])
-        and not any(root[key] for key in ("relrowsecurity", "relforcerowsecurity", "relispartition"))
+        and root["relrowsecurity"] is protected
+        and not any(root[key] for key in ("relforcerowsecurity", "relispartition"))
         and root["relreplident"] == "d"
         and root["reloptions"] is None
-        and all(catalog[key] is None for key in ("rules", "policies", "inheritance")),
+        and all(catalog[key] is None for key in ("rules", "inheritance"))
+        and (protected or catalog["policies"] is None),
         "layout_changed",
     )
     attributes = [entry for entry in catalog["attributes"] if int(entry["attrelid"]) == oid]
@@ -202,8 +210,8 @@ def _require_hooks(catalog, functions):
         )
 
 
-def _require_layout(catalog, schema, functions):
-    root, attributes = _receipt_heap(catalog, functions)
+def _require_layout(catalog, schema, functions, *, protected=False):
+    root, attributes = _receipt_heap(catalog, functions, protected=protected)
     oid = int(root["oid"])
     _require_indexes(catalog["indexes"], attributes, oid)
     _require_constraints(catalog, schema, oid, attributes)
@@ -225,7 +233,7 @@ def _read_acl(catalog, old_owner, owner):
     return table_reads, columns
 
 
-def _require_acl(catalog, root, principal_oids, readers, *, legacy):
+def _require_acl_edges(catalog, root, principal_oids, readers, *, legacy):
     owner, publisher, builder, migration = principal_oids
     old_owner = int(root["relowner"])
     _require(old_owner in {owner, builder} if legacy else old_owner == owner, "owner_changed")
@@ -265,7 +273,15 @@ def _require_acl(catalog, root, principal_oids, readers, *, legacy):
             <= {tuple(entry) for entry in catalog["column_acl"]},
             "legacy_writer_missing",
         )
-    _require_effective_access(catalog["access"], old_owner, owner, publisher, builder, migration)
+
+
+def _require_acl(catalog, root, principal_oids, readers, *, legacy, role_graph=None):
+    _require_acl_edges(catalog, root, principal_oids, readers, legacy=legacy)
+    if root["relrowsecurity"]:
+        _require(role_graph is not None, "role_graph_required")
+        require_bound_access(catalog["access"], principal_oids, role_graph)
+    else:
+        _require_effective_access(catalog["access"], int(root["relowner"]), *principal_oids)
 
 
 def _require_effective_access(access_entries, old_owner, owner, publisher, builder, migration):
@@ -347,30 +363,72 @@ def _require_migration_identity(functions, policy, migration_role):
     return migration
 
 
-async def capture_cms_serving_receipt_custody(connection, policy, *, migration_role, legacy=False):
-    """Attest the fixed heap and closed native privileges, without inferring a writer from ACLs."""
-    _require(
-        type(policy) is GenericSourcePolicy and type(legacy) is bool and bool(policy.control_runtime_roles),
-        "policy_required",
-    )
+async def _capture_receipt(connection, policy, migration_role):
     functions = await capture_cms_callable_custody(connection, policy)
     migration = _require_migration_identity(functions, policy, migration_role)
     role_oid_by_name = {entry["rolname"]: int(entry["oid"]) for entry in functions["role_graph"]["roles"]}
     owner, publisher = role_oid_by_name[policy.owner_role], role_oid_by_name[policy.publisher_role]
-    # This is the existing configured Builder identity used by the original control callers.
     builder = role_oid_by_name[policy.control_runtime_roles[0]]
     catalog = _decoded(await connection.fetchval(_CATALOG_SQL, storage_relation(policy.schema, ROOT), owner, builder))
-    root = _require_layout(catalog, policy.schema, functions)
-    _require_acl(
-        catalog,
-        root,
-        (owner, publisher, builder, migration),
-        {role_oid_by_name[name] for name in policy.runtime_roles},
-        legacy=legacy,
+    roots = [entry for entry in catalog["classes"] or () if entry["relname"] == ROOT]
+    _require(len(roots) == 1, "missing")
+    catalog["receipt_policies"] = (
+        _decoded(await connection.fetchval(POLICY_SQL, int(roots[0]["oid"]))) if roots[0]["relrowsecurity"] else None
     )
     return dict(
         schema=policy.schema, owner=owner, builder=builder, migration=migration, functions=functions, catalog=catalog
     )
+
+
+def _receipt_principals(receipt, policy):
+    role_oid_by_name = {entry["rolname"]: int(entry["oid"]) for entry in receipt["functions"]["role_graph"]["roles"]}
+    return (receipt["owner"], role_oid_by_name[policy.publisher_role], receipt["builder"], receipt["migration"]), {
+        role_oid_by_name[name] for name in policy.runtime_roles
+    }
+
+
+async def capture_cms_serving_receipt_custody(connection, policy, *, migration_role, legacy=False):
+    """Attest final session-bound intake, or the unchanged strict legacy runtime boundary."""
+    _require(
+        type(policy) is GenericSourcePolicy and type(legacy) is bool and bool(policy.control_runtime_roles),
+        "policy_required",
+    )
+    receipt = await _capture_receipt(connection, policy, migration_role)
+    catalog, functions = receipt["catalog"], receipt["functions"]
+    root = _require_layout(catalog, policy.schema, functions, protected=not legacy)
+    if not legacy:
+        require_receipt_policies(catalog, root, policy.control_runtime_roles[0])
+    principals, readers = _receipt_principals(receipt, policy)
+    _require_acl(catalog, root, principals, readers, legacy=legacy, role_graph=functions["role_graph"])
+    return receipt
+
+
+_LOCK_SQL = """SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid()
+ AND relation=to_regclass($1) AND mode='AccessExclusiveLock' AND granted)"""
+
+
+async def _capture_locked_transition(connection, policy, migration_role, actor):
+    """Observe only an original-admin locked migration, never issue a legacy runtime capability."""
+    _require(await _admin_identity(connection, policy) == actor, "admin_transaction_changed")
+    _require(
+        await connection.fetchval(_LOCK_SQL, storage_relation(policy.schema, ROOT)) is True, "transition_lock_required"
+    )
+    receipt = await _capture_receipt(connection, policy, migration_role)
+    catalog, functions = receipt["catalog"], receipt["functions"]
+    protected = next(entry for entry in catalog["classes"] if entry["relname"] == ROOT)["relrowsecurity"]
+    if protected:
+        return await capture_cms_serving_receipt_custody(connection, policy, migration_role=migration_role)
+    root = _require_layout(catalog, policy.schema, functions)
+    principals, readers = _receipt_principals(receipt, policy)
+    _require_acl_edges(catalog, root, principals, readers, legacy=True)
+    require_bound_access(
+        catalog["access"],
+        principals,
+        functions["role_graph"],
+        legacy_builder=int(root["relowner"]) == receipt["builder"],
+    )
+    _require(await _admin_identity(connection, policy) == actor, "admin_transaction_changed")
+    return receipt
 
 
 def require_cms_serving_receipt_adoption_delta(before, after):
@@ -411,6 +469,14 @@ def require_cms_serving_receipt_adoption_delta(before, after):
         after["catalog"]["column_acl"],
         after["catalog"]["access"],
     )
+    role_name_by_oid = {int(role["oid"]): role["rolname"] for role in after["functions"]["role_graph"]["roles"]}
+    after_root = next(entry for entry in after["catalog"]["classes"] if entry["relname"] == ROOT)
+    require_receipt_policies(after["catalog"], after_root, role_name_by_oid[builder])
+    if root["relrowsecurity"]:
+        _require(expected["policies"] == after["catalog"]["policies"], "adoption_policy_changed")
+    root["relrowsecurity"] = True
+    expected["policies"] = after["catalog"]["policies"]
+    expected["receipt_policies"] = after["catalog"]["receipt_policies"]
     _require(expected == after["catalog"], "adoption_catalog_changed")
 
 
@@ -418,6 +484,7 @@ async def provision_cms_serving_receipt_custody(connection, policy, *, migration
     """Use one supplied genuine admin transaction; no receipt, profile, role or namespace is created."""
     _require(
         type(policy) is GenericSourcePolicy
+        and bool(policy.control_runtime_roles)
         and connection.is_in_transaction() is True
         and callable(verify_role_profile),
         "explicit_admin_required",
@@ -427,9 +494,7 @@ async def provision_cms_serving_receipt_custody(connection, policy, *, migration
         await verify_role_profile(connection, policy.schema, **policy.role_arguments())
         table = storage_relation(policy.schema, ROOT)
         await connection.execute(f"LOCK TABLE ONLY {table} IN ACCESS EXCLUSIVE MODE NOWAIT")
-        before = await capture_cms_serving_receipt_custody(
-            connection, policy, migration_role=migration_role, legacy=True
-        )
+        before = await _capture_locked_transition(connection, policy, migration_role, actor)
         if next(entry for entry in before["catalog"]["classes"] if entry["relname"] == ROOT)["relowner"] != str(
             before["owner"]
         ):
@@ -437,6 +502,10 @@ async def provision_cms_serving_receipt_custody(connection, policy, *, migration
             builder = storage_identifier(policy.control_runtime_roles[0])
             await connection.execute(f"GRANT SELECT,MAINTAIN ON TABLE {table} TO {builder}")
             await connection.execute(f"GRANT INSERT(receipt_id,payload) ON TABLE {table} TO {builder}")
+        before_root = next(entry for entry in before["catalog"]["classes"] if entry["relname"] == ROOT)
+        if not before_root["relrowsecurity"]:
+            for statement in policy_statements(table, policy.control_runtime_roles[0]):
+                await connection.execute(statement)
         after = await capture_cms_serving_receipt_custody(connection, policy, migration_role=migration_role)
         require_cms_serving_receipt_adoption_delta(before, after)
         await verify_role_profile(connection, policy.schema, **policy.role_arguments())

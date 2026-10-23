@@ -27,6 +27,46 @@ def _cms_owner_control_task():
 
 
 @pytest.mark.asyncio
+async def test_void_target_preserves_recovery_metrics(monkeypatch):
+    recovery_by_field = {"generation": "6b75740a-7c8a-556a-8e3c-21a9718c88f1", "phase": "published"}
+    writes = []
+
+    async def is_marked(_run_id, **updates_by_name):
+        writes.append(updates_by_name)
+        return True
+
+    async def target(context, _task):
+        context["context"]["rows"] = 2
+
+    async def shutdown(context):
+        context["context"]["serving_recovery"] = recovery_by_field
+        await is_marked("run_example", status="succeeded", metrics={"rows": 2, "serving_recovery": recovery_by_field})
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "0")
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", is_marked)
+    monkeypatch.setattr(control_lifecycle, "_flush_terminal_status_events", AsyncMock())
+    monkeypatch.setattr(
+        control_lifecycle, "import_module", lambda _name: SimpleNamespace(process_data=target, shutdown=shutdown)
+    )
+    outcome_by_field = await control_single_job_start(
+        {"context": {}},
+        {
+            "run_id": "run_example",
+            "importer": "entity-address-unified",
+            "target_module": "process.entity_address_unified",
+            "target_function": "process_data",
+            "call_style": "ctx_task",
+            "run_shutdown": True,
+            "task": {},
+        },
+    )
+    assert outcome_by_field["status"] == "succeeded" and outcome_by_field["result"] is None
+    assert [write["status"] for write in writes] == ["running", "succeeded", "succeeded"]
+    assert writes[-1]["attempt_id"] == writes[0]["attempt_id"]
+    assert writes[-1]["metrics"] == {"rows": 2, "serving_recovery": recovery_by_field}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("claim", [True, False, RuntimeError("claim unavailable")])
 async def test_cms_owner_binding_follows_only_a_successful_native_claim(monkeypatch, claim):
     """A skipped or failed native claim exposes no CMS bootstrap or importer work."""

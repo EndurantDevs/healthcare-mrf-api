@@ -6,6 +6,7 @@ import json
 import re
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from db.cms_registry_source_pair_slot import NATIVE_CHECK_SQL
 from process import provider_directory_cms_callable_custody as callables
 from process import provider_directory_cms_receipt_custody as custody
+from process import provider_directory_cms_receipt_policy as receipt_policy
 from tests.test_provider_directory_cms_callable_custody import catalog as catalog
 
 MIGRATION_ROLE = "source_migrator"
@@ -222,6 +224,7 @@ def _native_catalog():
 
 
 def _access(catalog):
+    inherited_access_entries = [entry for entry in catalog["access"] if entry["role"] not in {10, 17, 18, 19, 20, 21}]
     is_protected = catalog["classes"][0]["relowner"] == "17"
     catalog["access"] = [
         dict(
@@ -255,6 +258,11 @@ def _access(catalog):
         )
         for role in (10, 17, 18, 19, 21, 20)
     ]
+    builder = next(entry for entry in catalog["access"] if entry["role"] == 19)
+    for entry in inherited_access_entries:
+        if entry["builder_reach"]:
+            entry["table"], entry["columns"] = deepcopy(builder["table"]), deepcopy(builder["columns"])
+    catalog["access"].extend(inherited_access_entries)
 
 
 def _add_migration_identity(catalog):
@@ -283,16 +291,86 @@ def _add_migration_identity(catalog):
     )
 
 
+def _native_policies():
+    return [
+        dict(
+            oid=str(80 + number),
+            polname=name,
+            polrelid="50",
+            polcmd=command,
+            polpermissive=True,
+            polroles=["0"],
+            polqual="native true" if command == "r" else None,
+            polwithcheck="native identities" if command == "a" else None,
+        )
+        for number, (name, command) in enumerate(
+            ((receipt_policy.READ_POLICY, "r"), (receipt_policy.INSERT_POLICY, "a"))
+        )
+    ]
+
+
+def _policy_proofs(catalog):
+    return [
+        dict(
+            policy=deepcopy(policy),
+            using_expression="true" if policy["polcmd"] == "r" else None,
+            check_expression=receipt_policy.insert_expression("legacy_builder") if policy["polcmd"] == "a" else None,
+            native_dependencies=True,
+        )
+        for policy in catalog["policies"] or ()
+    ] or None
+
+
+def _execute_receipt(sql, native_catalog, lock_state):
+    if sql.startswith("LOCK TABLE ONLY"):
+        lock_state.is_held = True
+    if sql.startswith("ALTER TABLE") and "ENABLE ROW LEVEL SECURITY" in sql:
+        native_catalog["classes"][0]["relrowsecurity"] = True
+    if sql.startswith("CREATE POLICY"):
+        native_catalog["policies"] = [
+            *(native_catalog["policies"] or []),
+            next(policy for policy in _native_policies() if policy["polname"] == sql.split()[2]),
+        ]
+    if sql.startswith("ALTER TABLE") and "OWNER TO" in sql:
+        for entry in native_catalog["classes"]:
+            entry["relowner"] = "17"
+        native_catalog["table_acl"] = [
+            [17 if grantee == 19 else grantee, 17 if grantor == 19 else grantor, right, x]
+            for grantee, grantor, right, x in native_catalog["table_acl"]
+        ]
+        native_catalog["column_acl"] = [
+            [n, 17 if grantee == 19 else grantee, 17 if grantor == 19 else grantor, right, x]
+            for n, grantee, grantor, right, x in native_catalog["column_acl"]
+        ]
+    if sql.startswith("GRANT SELECT"):
+        native_catalog["table_acl"].extend([[19, 17, right, False] for right in ("SELECT", "MAINTAIN")])
+    if sql.startswith("GRANT INSERT"):
+        native_catalog["column_acl"].extend([[n, 19, 17, "INSERT", False] for n in (1, 2)])
+    if sql.startswith(("ALTER TABLE", "GRANT")):
+        _access(native_catalog)
+
+
 @pytest.fixture
 async def receipt_catalog(catalog):
     _add_migration_identity(catalog)
+    for role in catalog.graph["roles"]:
+        role.setdefault("rolbypassrls", False)
     await callables.provision_cms_callable_custody(catalog.driver, catalog.policy, verify_role_profile=AsyncMock())
     native_catalog = _native_catalog()
     _access(native_catalog)
     original_fetchval = catalog.driver.fetchval.side_effect
-    catalog.driver.fetchval.side_effect = lambda sql, *args: (
-        deepcopy(native_catalog) if sql == custody._CATALOG_SQL else original_fetchval(sql, *args)
-    )
+    lock_state = SimpleNamespace(is_held=False)
+
+    def fetchval(sql, *args):
+        if sql == custody._CATALOG_SQL:
+            return deepcopy(native_catalog)
+        if sql == custody._LOCK_SQL:
+            return lock_state.is_held
+        if sql == receipt_policy.POLICY_SQL:
+            return _policy_proofs(native_catalog)
+        return original_fetchval(sql, *args)
+
+    catalog.driver.fetchval.side_effect = fetchval
 
     @asynccontextmanager
     async def savepoint():
@@ -304,27 +382,8 @@ async def receipt_catalog(catalog):
             native_catalog.update(prior)
             raise
 
-    async def execute(sql):
-        if sql.startswith("ALTER TABLE"):
-            for entry in native_catalog["classes"]:
-                entry["relowner"] = "17"
-            native_catalog["table_acl"] = [
-                [17 if grantee == 19 else grantee, 17 if grantor == 19 else grantor, right, x]
-                for grantee, grantor, right, x in native_catalog["table_acl"]
-            ]
-            native_catalog["column_acl"] = [
-                [n, 17 if grantee == 19 else grantee, 17 if grantor == 19 else grantor, right, x]
-                for n, grantee, grantor, right, x in native_catalog["column_acl"]
-            ]
-        elif sql.startswith("GRANT SELECT"):
-            native_catalog["table_acl"].extend([[19, 17, right, False] for right in ("SELECT", "MAINTAIN")])
-        elif sql.startswith("GRANT INSERT"):
-            native_catalog["column_acl"].extend([[n, 19, 17, "INSERT", False] for n in (1, 2)])
-        if sql.startswith(("ALTER TABLE", "GRANT")):
-            _access(native_catalog)
-
     catalog.driver.transaction = savepoint
-    catalog.driver.execute = AsyncMock(side_effect=execute)
+    catalog.driver.execute = AsyncMock(side_effect=lambda sql: _execute_receipt(sql, native_catalog, lock_state))
     catalog.rows_receipt = native_catalog
     return catalog
 
@@ -344,8 +403,9 @@ async def test_native_owner_closure_preserves_partial_reader_and_legacy_writer(r
     assert [1, 19, 17, "INSERT", False] in after["catalog"]["column_acl"]
     assert not any(entry[0] == 9 and entry[3] == "INSERT" for entry in after["catalog"]["column_acl"])
     calls = [call.args[0] for call in case.driver.execute.await_args_list]
-    assert len(calls) == 4 and calls[0].startswith("LOCK TABLE ONLY")
-    assert not any(word in sql for sql in calls for word in ("CREATE", "DROP", "UPDATE", "DELETE", "TRUNCATE"))
+    assert len(calls) == 7 and calls[0].startswith("LOCK TABLE ONLY")
+    assert not any(word in sql for sql in calls for word in ("DROP", "UPDATE", "DELETE", "TRUNCATE"))
+    assert sum(sql.startswith("CREATE POLICY") for sql in calls) == 2
     case.driver.execute.reset_mock()
     assert (
         await custody.provision_cms_serving_receipt_custody(
@@ -367,7 +427,6 @@ async def test_native_owner_closure_preserves_partial_reader_and_legacy_writer(r
         "hook",
         "index",
         "nullable",
-        "inherited",
         "owner_reach",
         "callable_body",
         "missing_writer",
@@ -548,7 +607,9 @@ async def test_fixed_publisher_and_reader_metadata_columns_preserve_whole_receip
     case = receipt_catalog
     before, after = await _read_receipt_cut(case)
     root = next(entry for entry in after["catalog"]["classes"] if entry["relname"] == custody.ROOT)
-    custody._require_acl(after["catalog"], root, (17, 18, 19, 21), {19, 20}, legacy=False)
+    custody._require_acl(
+        after["catalog"], root, (17, 18, 19, 21), {19, 20}, legacy=False, role_graph=after["functions"]["role_graph"]
+    )
     custody.require_cms_serving_receipt_read_delta(before, after, case.policy)
     custody.require_cms_serving_receipt_read_delta(after, after, case.policy)
 
@@ -584,4 +645,172 @@ async def test_publisher_direct_read_is_limited_to_the_fixed_metadata_projection
     after["catalog"]["column_acl"].append([column, 18, 17, "SELECT", False])
     root = next(entry for entry in after["catalog"]["classes"] if entry["relname"] == custody.ROOT)
     with pytest.raises(ValueError, match="cms_receipt_column_acl_changed"):
-        custody._require_acl(after["catalog"], root, (17, 18, 19, 21), {19, 20}, legacy=False)
+        custody._require_acl(
+            after["catalog"],
+            root,
+            (17, 18, 19, 21),
+            {19, 20},
+            legacy=False,
+            role_graph=after["functions"]["role_graph"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_legacy_guard_still_refuses_inherited_writer(receipt_catalog):
+    case = receipt_catalog
+    case.rows_receipt["access"][-1]["builder_reach"] = True
+    with pytest.raises(ValueError, match="cms_receipt_inherited_writer"):
+        await custody.capture_cms_serving_receipt_custody(
+            case.driver, case.policy, migration_role=MIGRATION_ROLE, legacy=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_admin_transition_requires_its_real_lock_and_original_identity(receipt_catalog):
+    case = receipt_catalog
+    actor = await custody._admin_identity(case.driver, case.policy)
+    with pytest.raises(ValueError, match="transition_lock_required"):
+        await custody._capture_locked_transition(case.driver, case.policy, MIGRATION_ROLE, actor)
+    await case.driver.execute(
+        'LOCK TABLE ONLY "snapshot_schema"."provider_directory_cms_serving_receipt" IN ACCESS EXCLUSIVE MODE NOWAIT'
+    )
+    with pytest.raises(ValueError, match="admin_transaction_changed"):
+        await custody._capture_locked_transition(case.driver, case.policy, MIGRATION_ROLE, dict(actor, backend=99))
+
+
+@pytest.mark.asyncio
+async def test_source_owned_prepolicy_receipt_gets_only_policy_cut(receipt_catalog):
+    case = receipt_catalog
+    await custody.provision_cms_serving_receipt_custody(
+        case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+    )
+    case.rows_receipt["classes"][0]["relrowsecurity"] = False
+    case.rows_receipt["policies"] = None
+    case.driver.execute.reset_mock()
+    result = await custody.provision_cms_serving_receipt_custody(
+        case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+    )
+    statements = [call.args[0] for call in case.driver.execute.await_args_list]
+    assert result["catalog"]["classes"][0]["relrowsecurity"] is True
+    assert len(statements) == 4 and not any(
+        "OWNER TO" in statement or statement.startswith("GRANT") for statement in statements
+    )
+
+
+def _add_inheriting_actor(case, *, can_login, bypass):
+    role = deepcopy(next(entry for entry in case.graph["roles"] if entry["rolname"] == MIGRATION_ROLE))
+    role.update(oid="22", rolname="inherited_publisher", rolcanlogin=can_login, rolbypassrls=bypass)
+    case.graph["roles"].append(role)
+    access = deepcopy(next(entry for entry in case.rows_receipt["access"] if entry["role"] == 19))
+    access.update(role=22, builder_reach=True)
+    case.rows_receipt["access"].append(access)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("can_login", [False, True])
+async def test_session_bound_policy_accepts_inherited_rights_without_membership_allowlist(receipt_catalog, can_login):
+    case = receipt_catalog
+    _add_inheriting_actor(case, can_login=can_login, bypass=False)
+    with pytest.raises(ValueError, match="inherited_writer"):
+        await custody.capture_cms_serving_receipt_custody(
+            case.driver, case.policy, migration_role=MIGRATION_ROLE, legacy=True
+        )
+    result = await custody.provision_cms_serving_receipt_custody(
+        case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+    )
+    actor = next(entry for entry in result["catalog"]["access"] if entry["role"] == 22)
+    assert actor["table"] == ["SELECT", "MAINTAIN"]
+    assert actor["columns"][:2] == [[1, ["SELECT", "INSERT"]], [2, ["SELECT", "INSERT"]]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("can_login", [False, True])
+async def test_inherited_bypassrls_actor_cannot_be_admitted_even_without_login(receipt_catalog, can_login):
+    case = receipt_catalog
+    _add_inheriting_actor(case, can_login=can_login, bypass=True)
+    before = deepcopy(case.rows_receipt)
+    with pytest.raises(ValueError, match="inherited_writer"):
+        await custody.provision_cms_serving_receipt_custody(
+            case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+        )
+    assert case.rows_receipt == before
+    assert not any("OWNER TO" in call.args[0] for call in case.driver.execute.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ["expression", "grouping", "dependency", "roles", "command", "restrictive", "relation", "extra", "raw_policy"],
+)
+async def test_exact_native_policy_contract_cannot_be_substituted(receipt_catalog, mutation):
+    case = receipt_catalog
+    receipt = await custody.provision_cms_serving_receipt_custody(
+        case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+    )
+    catalog = receipt["catalog"]
+    root = catalog["classes"][0]
+    proof = next(entry for entry in catalog["receipt_policies"] if entry["policy"]["polcmd"] == "a")
+    raw = next(entry for entry in catalog["policies"] if entry["polcmd"] == "a")
+    if mutation in {"expression", "grouping"}:
+        proof["check_expression"] = "true" if mutation == "expression" else "(" + proof["check_expression"] + ")"
+    elif mutation == "dependency":
+        proof["native_dependencies"] = False
+    elif mutation == "extra":
+        catalog["policies"].append(deepcopy(raw))
+    elif mutation == "raw_policy":
+        proof["policy"]["polwithcheck"] = "substituted"
+    else:
+        key, value = {
+            "roles": ("polroles", ["19"]),
+            "command": ("polcmd", "*"),
+            "restrictive": ("polpermissive", False),
+            "relation": ("polrelid", "999"),
+        }[mutation]
+        raw[key] = proof["policy"][key] = value
+    with pytest.raises(ValueError, match="cms_receipt_polic"):
+        receipt_policy.require_receipt_policies(catalog, root, case.policy.control_runtime_roles[0])
+
+
+@pytest.mark.asyncio
+async def test_policy_failure_rolls_back_the_complete_admin_transition(receipt_catalog):
+    case = receipt_catalog
+    before = deepcopy(case.rows_receipt)
+    execute = case.driver.execute.side_effect
+
+    def substituted_policy(sql):
+        execute(sql)
+        if sql.startswith("CREATE POLICY " + receipt_policy.INSERT_POLICY):
+            case.rows_receipt["policies"][-1]["polroles"] = ["19"]
+
+    case.driver.execute.side_effect = substituted_policy
+    with pytest.raises(ValueError, match="cms_receipt_policy_changed"):
+        await custody.provision_cms_serving_receipt_custody(
+            case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+        )
+    assert case.rows_receipt == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["force", "roles", "extra"])
+async def test_idempotent_replay_refuses_policy_drift_before_any_repair(receipt_catalog, mutation):
+    case = receipt_catalog
+    await custody.provision_cms_serving_receipt_custody(
+        case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+    )
+    if mutation == "force":
+        case.rows_receipt["classes"][0]["relforcerowsecurity"] = True
+    elif mutation == "roles":
+        case.rows_receipt["policies"][-1]["polroles"] = ["19"]
+    else:
+        case.rows_receipt["policies"].append(deepcopy(case.rows_receipt["policies"][0]))
+    before = deepcopy(case.rows_receipt)
+    case.driver.execute.reset_mock()
+    with pytest.raises(ValueError, match="cms_receipt_(layout|polic)"):
+        await custody.provision_cms_serving_receipt_custody(
+            case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+        )
+    assert case.rows_receipt == before and case.driver.execute.await_count == 1
+
+
+def test_policy_shared_dependencies_are_scoped_to_the_current_database():
+    assert "d.dbid=(SELECT oid FROM pg_database WHERE datname=current_database())" in receipt_policy.POLICY_SQL
