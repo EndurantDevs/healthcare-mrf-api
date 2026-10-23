@@ -2225,15 +2225,15 @@ async def _materialize_forward_prefix(
     )
 
 
-async def lookup_code_prefix_rows_from_db(
+async def lookup_code_prefix_occurrences_from_db(
     session: Any,
     code_key: int,
     *,
     limit: int,
     descending: bool = False,
     **read_options: Any,
-) -> tuple[PTG2ServingBinaryRow, ...]:
-    """Return the exact best bounded prefix while validating the full code block."""
+) -> list[tuple[int, int, int]]:
+    """Return dense occurrences while validating every complete forward fragment."""
 
     if isinstance(limit, bool) or int(limit) <= 0:
         raise ValueError("PTG2 serving binary prefix limit must be positive")
@@ -2247,7 +2247,7 @@ async def lookup_code_prefix_rows_from_db(
     )
     block_keys = shard_keys_by_code[normalized_code_key]
     if not block_keys:
-        return ()
+        return []
     collector = _forward_prefix_collector(
         options,
         normalized_code_key,
@@ -2263,13 +2263,28 @@ async def lookup_code_prefix_rows_from_db(
         require_all,
         collector,
     )
-    decoded_keys = collector.selected_keys()
+    return collector.selected_keys()
+
+
+async def lookup_code_prefix_rows_from_db(
+    session: Any,
+    code_key: int,
+    *,
+    limit: int,
+    descending: bool = False,
+    **read_options: Any,
+) -> tuple[PTG2ServingBinaryRow, ...]:
+    """Return the exact best bounded prefix while validating the full code block."""
+
+    decoded_keys = await lookup_code_prefix_occurrences_from_db(
+        session, code_key, limit=limit, descending=descending, **read_options
+    )
     if not decoded_keys:
         return ()
     return await _materialize_forward_prefix(
         session,
-        options,
-        normalized_code_key,
+        _ForwardLookupOptions(**read_options),
+        _normalized_code_key(code_key),
         decoded_keys,
         bool(descending),
     )
