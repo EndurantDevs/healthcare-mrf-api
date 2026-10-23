@@ -1476,19 +1476,22 @@ async def test_guard_probe_statement_timeout_counts_as_a_probe_timeout():
 @pytest.mark.asyncio
 async def test_drain_waits_for_running_preparations_even_when_cancelled():
     executor = ThreadPoolExecutor(max_workers=1)
-    finished = threading.Event()
+    release, finished = threading.Event(), threading.Event()
 
     def busy():
-        time.sleep(0.3)
+        release.wait()
         finished.set()
 
     executor.submit(busy)
     drain = asyncio.create_task(cms._drain_stage_executor(executor))
-    await asyncio.sleep(0.05)
+    async with asyncio.timeout(5):
+        while not executor._shutdown:
+            await asyncio.sleep(0.01)
     drain.cancel()
+    release.set()
     with pytest.raises(asyncio.CancelledError):
         await drain
-    assert finished.is_set() and executor._shutdown
+    assert finished.is_set()
 
 
 def test_prepare_source_lines_rejects_a_family_mismatch(monkeypatch):
