@@ -7,6 +7,7 @@ import hashlib
 import os
 import time
 from functools import lru_cache
+from contextlib import nullcontext
 from typing import Any, Mapping
 
 from sanic.exceptions import InvalidUsage
@@ -31,6 +32,8 @@ from api.plan_pricing_projection_contract import (
     PlanPricingProjectionUnsupported,
     canonical_json,
     row_mapping,
+    current_code_projection,
+    code_projection_scope,
 )
 from api.plan_pricing_state_scan_contract import (
     STATE_SCAN_MAX_LIMIT,
@@ -339,7 +342,14 @@ def _validate_search_request(
     if (
         selection is None
         or not selection.pricing_projection_id
-        or selection.pricing_projection_contract != PROJECTION_CONTRACT
+        or (
+            selection.pricing_projection_contract != PROJECTION_CONTRACT
+            and not (
+                current_code_projection() is not None
+                and selection.pricing_projection_id == current_code_projection().projection_id
+                and selection.pricing_projection_contract == current_code_projection().identity["contract"]
+            )
+        )
     ):
         raise PlanPricingProjectionUnavailable("the selected release has no ready state-scan projection")
     if not 1 <= int(pagination.limit) <= STATE_SCAN_MAX_LIMIT:
@@ -541,6 +551,13 @@ async def search_plan_pricing_state_scan(
 ) -> dict[str, Any]:
     """Return one fixed-work NPI keyset page from an exact v4 release."""
 
+    if selection is not None and not selection.pricing_projection_id:
+        from api.plan_pricing_code_read import resolve_code_pricing
+
+        capability = await resolve_code_pricing(session, selection, args)
+        if capability is not None:
+            with code_projection_scope(capability):
+                return await search_plan_pricing_state_scan(session, capability.selection(selection), args, pagination)
     code_system, code, state, cursor = _validate_search_request(selection, args, pagination)
     requested_limit = int(pagination.limit)
     cursor_context = _search_cursor_context(
@@ -558,28 +575,30 @@ async def search_plan_pricing_state_scan(
         contributing_bindings = await admitted_plan_release_bindings(session, selection)
         selection = await prepare_plan_release_bindings(session, selection, contributing_bindings)
         options_by_name["binding_ordinals"] = tuple(binding.binding_ordinal for binding in contributing_bindings)
-    provider_page = (
-        await _read_state_npis(
-            session,
-            selection.pricing_projection_id,
-            state,
-            cursor_context[3],
-            requested_limit,
-            **options_by_name,
+    scope = current_code_projection()
+    with code_projection_scope(scope.contributors(contributing_bindings)) if scope is not None else nullcontext():
+        provider_page = (
+            await _read_state_npis(
+                session,
+                selection.pricing_projection_id,
+                state,
+                cursor_context[3],
+                requested_limit,
+                **options_by_name,
+            )
+            if contributing_bindings != ()
+            else ((), {}, False)
         )
-        if contributing_bindings != ()
-        else ((), {}, False)
-    )
-    return await _adaptive_page_response(
-        session,
-        selection,
-        args,
-        (code_system, code, state),
-        provider_page,
-        cursor_context,
-        requested_limit,
-        contributing_bindings=contributing_bindings,
-    )
+        return await _adaptive_page_response(
+            session,
+            selection,
+            args,
+            (code_system, code, state),
+            provider_page,
+            cursor_context,
+            requested_limit,
+            contributing_bindings=contributing_bindings,
+        )
 
 
 __all__ = [
