@@ -19,6 +19,14 @@ worker jobs, and shutdown. It must use separately issued publisher credentials,
 the verified role policy and runtime manifest; ordinary database credentials are
 not a fallback.
 
+Retained ordinary acquisition and control operations use the configured Builder
+role's native delegation model.
+Enrollment validates the complete admitted role
+graph, exact table and column grants, callable custody and privilege boundaries.
+Required preparation-role memberships retain only the existing Builder
+capability. Immutable Source payload writes still require the separately issued
+Source Publisher and Owner; a legacy catalog observation issues no authority.
+
 Before native-input registration and signed CMS preparation, the canonical
 `address_archive_v2` table must be enrolled under the declared Source Owner,
 with only SELECT access for ordinary runtime roles. Preserve its exact native
@@ -41,10 +49,67 @@ Ordinary API and scheduled launches require a native stored-job admission for
 the exact Provider Directory importer, queue, function and enqueue ID. That
 server-held capability selects the fixed Source worker purpose and immutable
 paired image; serialized request fields cannot select its credentials or
-command. Publisher secret selectors must name only that exact purpose,
+command. Set `HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_IMAGE` to the immutable
+FHIR Source image. When that setting is absent, the existing
+`HLTHPRT_REFERENCE_SOURCE_WORKER_IMAGE` remains the fallback. An explicitly empty
+or invalid FHIR image setting refuses admission; it does not use the fallback.
+The FHIR setting does not change the reference worker's image selection.
+Publisher secret selectors must name only that exact purpose,
 importer and worker class. Missing image configuration or an existing worker
 with changed purpose, target or process isolation is refused. The separately
 signed CMS Registry launch retains precedence and its own admission boundary.
+
+The boolean task parameter `publish_source_dataset_only=true` selects a
+single-source REST refresh under that issued factory. It requires
+`import_resources=true`, `defer_typed_materialization=true`,
+`publish_artifacts=false` and `bulk_export=false`. The source must use the
+ordinary REST connector; specialized connectors and CMS preparation keep their
+existing contracts. The default remains false. A successful request validates
+the complete candidate, atomically publishes its Source dataset, and returns the
+exact `dataset_followup` descriptor. Missing follow-up identity fails the request.
+
+The descriptor supports a separate `address_overlay` follow-up and then the
+ordinary partial Address job. The overlay reads the issued immutable Source
+through bounded COPY into private scratch tables, completes indexes and
+set-based parity checks, and uses the existing atomic artifact publication.
+Source metadata locks remain held by the ordinary committing transaction, so a
+concurrent source refresh cannot invalidate its selected dataset during cutover.
+The partial Address job retains the same source fence through its own commit.
+Other sources remain available while that replacement is prepared.
+
+Ordinary nearby-provider queries keep page results, totals, late metadata reads
+and response encoding inside one authenticated read-only snapshot. Publication
+waits for that request's serving-table locks; the next request can then use the
+replacement. Source publication, Address publication and public search acceptance
+remain separate checks. None of these steps creates canonical network aliases.
+
+Source-only publication also returns `dataset_followup.serving_recovery_generation`.
+The existing overlay and partial Address follow-ups carry that identifier as
+`provider_directory_serving_generation`. Their ordinary publication transactions
+retain the previous heaps and indexes and append a fixed native recovery journal.
+Complete content receipts are prepared under reader-compatible locks before the
+short exclusive cutover. The preparation budget is bounded separately from the
+two-second cutover and commit budget; it is not an expected refresh duration.
+
+An authorized Import Control `provider-directory-fhir` run can request recovery
+with exactly these parameters:
+
+```json
+{
+  "provider_directory_serving_operation": "recover",
+  "provider_directory_serving_generation": "6b75740a-7c8a-556a-8e3c-21a9718c88f1",
+  "source_ids": ["source_example"]
+}
+```
+
+Use the actual identifier and source returned by the completed publication.
+Recovery restores the verified previous serving heaps while advancing the Address
+generation. The latest acquired Source dataset stays current and immutable.
+The result reports `serving_recovery`, without scheduling another forward
+`dataset_followup`. Repeating the same recovery resolves its committed result;
+changing its parameters is refused. Unrelated serving or Source changes also
+refuse recovery. Existing populated common-receipt guards still apply: the
+generic overlay does not supply the attested Profile delta required by that path.
 
 ## Support Documentation Lifecycle
 
@@ -1249,9 +1314,39 @@ optionally bounds the linked fallback per source so a slow remote endpoint does
 not hold the whole import chain after the direct resource collections have been
 captured.
 
-The REST page-prefetch pilot is default-off. Enable it only with both
-`HLTHPRT_PROVIDER_DIRECTORY_REST_KEEPALIVE=true` and
-`HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH=true`. It is fail-closed to the
+During REST acquisition, each active source group's `resource_fetch_timing` map
+contains a snapshot per resource type. Check `timing_available`, `fetch_mode` and
+`timing_scope` before using numeric fields. Generic page-loop snapshots expose
+current-attempt elapsed time, fetched pages/rows, written rows, HTTP duration,
+write/checkpoint duration, prefetch and cooldown counters. Resumed offsets and
+lineage totals are separate: work retained by a previous attempt must not inflate
+the current attempt's throughput. Attempt work remains cumulative if an expired
+cursor causes a traversal restart. These snapshots use the existing throttled
+progress updates and add no per-page status writes.
+
+For `paged_acquisition_loop`, `attempt_elapsed_seconds` starts after initial
+resume/census setup and includes traversal and terminal completion, including
+post-counts and proof/checkpoint work. `source_fetch_elapsed_ms` covers page HTTP
+calls; it excludes census requests and retry backoff sleeps.
+`checkpoint_persist_elapsed_seconds` measures in-loop page persistence, including
+its page writes; it excludes deferred terminal census/checkpoint work.
+`stream_write_elapsed_seconds` includes terminal writes and each write's progress
+callback. Prefetch can overlap HTTP and persistence, so these durations must not
+be added together. Bulk export, partitioned scans, GraphQL and official
+file connectors explicitly report timing as unavailable where equivalent
+measurements are not implemented; unavailable values do not mean zero cost.
+Compare complete acquisition, validation and publication on identical data
+before claiming an end-to-end speed improvement.
+
+The REST page-prefetch pilot is default-off. It requires
+`HLTHPRT_PROVIDER_DIRECTORY_REST_KEEPALIVE=true` and either
+`HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH=true` or the boolean task parameter
+`rest_page_prefetch=true`. An explicitly false or invalid global prefetch setting
+disables it for every task. A task setting of `false` disables it for that task;
+an absent or `null` task setting preserves the environment default. Request settings
+are task-local and restored after completion, failure or cancellation. Persist
+source-qualified settings with the request so retries retain their original profile.
+It is fail-closed to the
 pilot source allowlist and only a generic, single-start, checkpointed, unbounded
 streaming scan that does not retain rows. Any declared or configured credential,
 partitions, bounded scans, and specialized acquisition paths stay sequential
@@ -1275,7 +1370,8 @@ for the campaign's single fresh root. The overlap changes only
 request timing: the next
 validated source-issued GET may run while the current page's rows, proof shard,
 and checkpoint are committed, but it is never parsed or consumed before that
-commit succeeds. Unset either prefetch switch to restore sequential transport;
+commit succeeds. Disable the subset switch or set the global prefetch switch to
+`false` to restore sequential transport;
 no proof, checkpoint, or campaign identity changes.
 
 After the pilot is verified, set
@@ -1290,7 +1386,8 @@ expansion can be enabled or rolled back without changing the pilot.
 To roll back only the deterministic expansion, unset
 `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC` or set it to
 `false` and restart the worker; the pilot remains enabled. To disable both,
-unset `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH` or set it to `false`.
+set `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH=false`. Unsetting it restores
+the request's setting, which may still enable the qualified pilot.
 No schema or checkpoint-format change is involved, so the existing durable
 checkpoint resumes on the sequential path.
 

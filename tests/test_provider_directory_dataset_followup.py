@@ -53,9 +53,7 @@ async def test_dataset_fence_matches_current_publication(monkeypatch):
     current_dataset = AsyncMock(return_value={"dataset_id": "dataset-current"})
     ensure_alias = AsyncMock()
     monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
-    monkeypatch.setattr(
-        importer, "ensure_provider_directory_published_source_alias", ensure_alias
-    )
+    monkeypatch.setattr(importer, "ensure_provider_directory_published_source_alias", ensure_alias)
 
     await entity_address_unified._assert_current_provider_directory_dataset(
         "mrf",
@@ -106,9 +104,7 @@ async def test_dataset_fence_repairs_exact_orphaned_alias(monkeypatch):
     current_dataset = AsyncMock(return_value={"dataset_id": "dataset-current"})
     ensure_alias = AsyncMock()
     monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
-    monkeypatch.setattr(
-        importer, "ensure_provider_directory_published_source_alias", ensure_alias
-    )
+    monkeypatch.setattr(importer, "ensure_provider_directory_published_source_alias", ensure_alias)
 
     await entity_address_unified._assert_current_provider_directory_dataset(
         "mrf",
@@ -128,13 +124,9 @@ async def test_dataset_fence_repairs_exact_orphaned_alias(monkeypatch):
 @pytest.mark.asyncio
 async def test_dataset_fence_rejects_alias_reconciliation_failure(monkeypatch):
     current_dataset = AsyncMock(return_value={"dataset_id": "dataset-current"})
-    ensure_alias = AsyncMock(
-        side_effect=RuntimeError("published source alias fence changed")
-    )
+    ensure_alias = AsyncMock(side_effect=RuntimeError("published source alias fence changed"))
     monkeypatch.setattr(entity_address_unified.db, "first", current_dataset)
-    monkeypatch.setattr(
-        importer, "ensure_provider_directory_published_source_alias", ensure_alias
-    )
+    monkeypatch.setattr(importer, "ensure_provider_directory_published_source_alias", ensure_alias)
 
     with pytest.raises(RuntimeError, match="dataset fence changed"):
         await entity_address_unified._assert_current_provider_directory_dataset(
@@ -148,9 +140,7 @@ async def test_dataset_fence_rejects_alias_reconciliation_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_exact_followup_reconciles_only_matching_publication(monkeypatch):
     resolve_fence = AsyncMock(
-        return_value=importer.ProviderDirectoryArtifactDatasetFence(
-            (_published_artifact_dataset(),)
-        )
+        return_value=importer.ProviderDirectoryArtifactDatasetFence((_published_artifact_dataset(),))
     )
     lock_fence = AsyncMock()
     cutover_alias = AsyncMock()
@@ -159,15 +149,9 @@ async def test_exact_followup_reconciles_only_matching_publication(monkeypatch):
     async def transaction():
         yield
 
-    monkeypatch.setattr(
-        importer, "_resolve_provider_directory_artifact_datasets", resolve_fence
-    )
-    monkeypatch.setattr(
-        importer, "_lock_and_verify_artifact_dataset_fence", lock_fence
-    )
-    monkeypatch.setattr(
-        importer, "_cutover_provider_directory_artifact_sources", cutover_alias
-    )
+    monkeypatch.setattr(importer, "_resolve_provider_directory_artifact_datasets", resolve_fence)
+    monkeypatch.setattr(importer, "_lock_and_verify_artifact_dataset_fence", lock_fence)
+    monkeypatch.setattr(importer, "_cutover_provider_directory_artifact_sources", cutover_alias)
     monkeypatch.setattr(importer.db, "transaction", transaction)
 
     await importer.ensure_provider_directory_published_source_alias(
@@ -175,9 +159,7 @@ async def test_exact_followup_reconciles_only_matching_publication(monkeypatch):
         expected_dataset_id="dataset-current",
         expected_root_run_id="run-root",
     )
-    resolve_fence.assert_awaited_once_with(
-        ["source-current"], should_select_validated_candidates=False
-    )
+    resolve_fence.assert_awaited_once_with(["source-current"], should_select_validated_candidates=False)
     lock_fence.assert_awaited_once_with(resolve_fence.return_value)
     cutover_alias.assert_awaited_once_with(resolve_fence.return_value)
 
@@ -217,9 +199,7 @@ def test_dataset_followup_descriptor_binds_exact_publication():
         "dataset_id": "dataset-current",
         "dataset_hash": "a" * 64,
         "parent_run_id": "run-root",
-        "idempotency_key": (
-            "provider-directory-dataset-followup:dataset-current"
-        ),
+        "idempotency_key": ("provider-directory-dataset-followup:dataset-current"),
         "triggered_by": "pd_dataset_followup",
     }
 
@@ -273,12 +253,34 @@ def test_followup_trigger_requires_atomic_publication_metrics():
     )
 
 
+@pytest.mark.parametrize(
+    "source_count,importable_count",
+    ((0, 0), (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1), (2, 2)),
+)
+def test_complete_source_followup_requires_one_source_and_one_importable_source(source_count, importable_count):
+    source_ids = ["source-current", "source-other"]
+    source_rows = [{"source_id": source_id} for source_id in source_ids]
+
+    assert not importer._has_dataset_publication_followup_trigger(
+        {"publish_source_dataset_only": True},
+        source_ids[:source_count],
+        source_rows[:importable_count],
+    )
+
+
+def test_complete_source_followup_accepts_one_source_and_one_importable_source():
+    assert importer._has_dataset_publication_followup_trigger(
+        {"publish_source_dataset_only": True},
+        ["source-current"],
+        [{"source_id": "source-current"}],
+    )
+
+
 @pytest.mark.asyncio
 async def test_dataset_followup_requires_one_exact_current_dataset(monkeypatch):
+    """Reject incomplete and mismatched publications before returning an exact replay."""
     current_dataset = AsyncMock(
-        return_value=importer.ProviderDirectoryArtifactDatasetFence(
-            (_published_artifact_dataset(),)
-        )
+        return_value=importer.ProviderDirectoryArtifactDatasetFence((_published_artifact_dataset(),))
     )
     monkeypatch.setattr(
         importer,
@@ -286,32 +288,32 @@ async def test_dataset_followup_requires_one_exact_current_dataset(monkeypatch):
         current_dataset,
     )
 
-    assert await importer._source_local_dataset_followup_if_current(
-        source_ids=[], expected_acquisition_root_run_id="run-root"
-    ) is None
-    assert await importer._source_local_dataset_followup_if_current(
-        source_ids=["source-current", "source-other"],
-        expected_acquisition_root_run_id="run-root",
-    ) is None
-    current_dataset.return_value = importer.ProviderDirectoryArtifactDatasetFence(())
-    assert await importer._source_local_dataset_followup_if_current(
-        source_ids=["source-current"],
-        expected_acquisition_root_run_id="run-root",
-    ) is None
-    current_dataset.return_value = importer.ProviderDirectoryArtifactDatasetFence(
-        (_published_artifact_dataset(endpoint_id=""),)
+    assert (
+        await importer._source_local_dataset_followup_if_current(
+            source_ids=[], expected_acquisition_root_run_id="run-root"
+        )
+        is None
     )
-    assert await importer._source_local_dataset_followup_if_current(
-        source_ids=["source-current"],
-        expected_acquisition_root_run_id="run-root",
-    ) is None
-    current_dataset.return_value = importer.ProviderDirectoryArtifactDatasetFence(
-        (_published_artifact_dataset(),)
+    assert (
+        await importer._source_local_dataset_followup_if_current(
+            source_ids=["source-current", "source-other"],
+            expected_acquisition_root_run_id="run-root",
+        )
+        is None
     )
-    assert await importer._source_local_dataset_followup_if_current(
-        source_ids=["source-current"],
-        expected_acquisition_root_run_id="run-other",
-    ) is None
+    for fence, expected_root in (
+        (importer.ProviderDirectoryArtifactDatasetFence(()), "run-root"),
+        (importer.ProviderDirectoryArtifactDatasetFence((_published_artifact_dataset(endpoint_id=""),)), "run-root"),
+        (importer.ProviderDirectoryArtifactDatasetFence((_published_artifact_dataset(),)), "run-other"),
+    ):
+        current_dataset.return_value = fence
+        assert (
+            await importer._source_local_dataset_followup_if_current(
+                source_ids=["source-current"],
+                expected_acquisition_root_run_id=expected_root,
+            )
+            is None
+        )
 
     replay = await importer._source_local_dataset_followup_if_current(
         source_ids=["source-current"],
