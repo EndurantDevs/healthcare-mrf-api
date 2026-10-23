@@ -161,6 +161,7 @@ ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
         "ptg-provider-membership-projection",
+        "plan-pricing-code-projection",
         EM_ATTRIBUTION_IMPORTER,
     }
 )
@@ -207,6 +208,14 @@ class _ImportRunEnsureState:
 _IMPORT_RUN_ENSURE_STATE = _ImportRunEnsureState()
 
 _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
+    "plan-pricing-code-projection": {
+        "queue": "arq:PTGCandidateAudit",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped_kwargs",
+        "target_module": "api.plan_pricing_code_build",
+        "target_function": "build_plan_pricing_code_projection",
+        "job_prefix": "plan_pricing_code_projection",
+    },
     "ptg-provider-membership-projection": {
         "queue": "arq:PTGCandidateAudit",
         "function": "control_single_job_start",
@@ -909,6 +918,28 @@ def _membership_projection_registry_entry() -> dict[str, Any]:
     return entry
 
 
+def _code_pricing_registry_entry() -> dict[str, Any]:
+    entry = _membership_projection_registry_entry()
+    entry["name"] = "plan-pricing-code-projection"
+    for field, name in zip(entry["params_schema"][:2], ("plan_release_id", "serving_revision_id"), strict=True):
+        field.update(
+            name=name, opts=["--" + name.replace("_", "-")], help="Exact current immutable release coordinate."
+        )
+    entry["params_schema"].append(
+        {
+            "name": "expected_identity_digest",
+            "opts": ["--expected-identity-digest"],
+            "required": True,
+            "multiple": False,
+            "is_flag": False,
+            "type": "string",
+            "default": None,
+            "help": "Exact complete identity digest reported by readiness.",
+        }
+    )
+    return entry
+
+
 def importer_registry() -> list[dict[str, Any]]:
     """Describe the importer commands exposed by the public control API."""
 
@@ -950,6 +981,7 @@ def importer_registry() -> list[dict[str, Any]]:
             _plan_pricing_prewarm_registry_entry(),
             _plan_pricing_em_distance_registry_entry(),
             _membership_projection_registry_entry(),
+            _code_pricing_registry_entry(),
             em_attribution_registry_entry(ENGINE_NAME),
         )
     )
@@ -974,6 +1006,7 @@ def _importer_family(importer: str) -> str:
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
         "ptg-provider-membership-projection",
+        "plan-pricing-code-projection",
         EM_ATTRIBUTION_IMPORTER,
         "mrf",
         "mrf-source-discovery",
@@ -3483,6 +3516,10 @@ async def create_import_run(
     )
     if importer == "ptg-provider-membership-projection":
         from api.ptg_membership_contract import validate_params
+
+        validate_params(effective_params_by_name)
+    if importer == "plan-pricing-code-projection":
+        from api.plan_pricing_code_contract import validate_params
 
         validate_params(effective_params_by_name)
     validate_em_attribution_params(importer, effective_params_by_name)
