@@ -7,6 +7,7 @@ import re
 from sqlalchemy import text
 
 from alembic import op
+from db.migration_registry_preparation import can_adopt_prepared_registry_table
 
 revision = "20261017010000_registry_cms_source_notifications"
 down_revision = "20261016070000_registry_allowed_plan_scope"
@@ -40,9 +41,16 @@ def _ddl(schema):
     )
 
 
+def _postimage(schema):
+    return (_ddl(schema)[0],)
+
+
 def upgrade():
     """Create frozen native storage; explicit operator configuration owns runtime grants."""
-    for statement in _ddl(_schema()):
+    schema = _schema()
+    if can_adopt_prepared_registry_table(op, schema, "registry_cms_source_notification", _postimage):
+        return
+    for statement in _ddl(schema):
         op.execute(statement)
 
 

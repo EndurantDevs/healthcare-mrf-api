@@ -294,7 +294,7 @@ async def _ptg_readers(connection, schema_oid, owner_role, api_role):
     )
 
 
-async def _verify_table_privileges(connection, tables, api_role):
+async def _verify_table_privileges(connection, tables, api_role, *, office_recipe_pending=False):
     """Require the exact API column policy and read-only retained tables."""
     for table in tables:
         for privilege, permitted in (("INSERT", _INSERT_COLUMNS), ("UPDATE", _UPDATE_COLUMNS), ("REFERENCES", {})):
@@ -305,9 +305,10 @@ async def _verify_table_privileges(connection, tables, api_role):
                 table["oid"],
                 privilege,
             )
-            if {column["attname"] for column in actual if column["allowed"]} != set(
-                permitted.get(table["relname"], ())
-            ):
+            expected_columns = set(permitted.get(table["relname"], ()))
+            if office_recipe_pending and table["relname"] == "registry_network_binding":
+                expected_columns.discard("office_recipe_json")
+            if {column["attname"] for column in actual if column["allowed"]} != expected_columns:
                 raise RegistryManagementPermissionError(
                     "Effective registry column privileges differ from the draft policy"
                 )
@@ -379,7 +380,7 @@ async def _aca_readers(connection, namespace, controls):
     return [dict(row) for row in rows]
 
 
-async def _verify(connection, namespace, api_role, owner_role):
+async def _verify(connection, namespace, api_role, owner_role, *, office_recipe_pending=False):
     """Compare native ownership and effective privileges to the explicit draft policy."""
     schema = await _roles(connection, namespace, api_role, owner_role)
     if not await connection.fetchval("SELECT has_schema_privilege($1,$2::oid,'USAGE')", api_role, schema["oid"]):
@@ -399,7 +400,7 @@ async def _verify(connection, namespace, api_role, owner_role):
         raise RegistryManagementPermissionError("Registry object ownership is not protected")
     await _check_direct_grants(connection, schema["oid"], api_role)
     await _reject_inherited_grants(connection, schema["oid"], api_role)
-    await _verify_table_privileges(connection, tables, api_role)
+    await _verify_table_privileges(connection, tables, api_role, office_recipe_pending=office_recipe_pending)
     for sequence in sequences:
         is_permitted = sequence["relname"] == "network_registry_identity_network_id_seq"
         if await connection.fetchval(
@@ -423,6 +424,41 @@ async def _verify(connection, namespace, api_role, owner_role):
 async def verify_registry_management_permissions(connection, *, api_role, owner_role, control_schema=None):
     """Read exact native owners, ACLs and effective column privileges without DDL."""
     return await _verify(connection, _control_namespace(control_schema)[1:-1], api_role, owner_role)
+
+
+async def install_registry_office_recipe_permissions(connection, *, api_role, owner_role, control_schema=None):
+    """Enroll only the new binding column after every existing draft privilege matches."""
+    if not connection.is_in_transaction():
+        raise RegistryManagementPermissionError("Permission installation requires a caller-owned transaction")
+    namespace = _control_namespace(control_schema)[1:-1]
+    async with connection.transaction():
+        if not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", owner_role):
+            raise RegistryManagementPermissionError("Installer must be able to assume the protected owner")
+        try:
+            return await _verify(connection, namespace, api_role, owner_role)
+        except RegistryManagementPermissionError:
+            receipt = await _verify(connection, namespace, api_role, owner_role, office_recipe_pending=True)
+        initial_grants = {tuple(grant.values()) for grant in await _acls(connection, receipt["schema_oid"])}
+        caller = await connection.fetchval("SELECT quote_ident(current_user)")
+        await connection.execute(f"SET LOCAL ROLE {_identifier(owner_role)}")
+        try:
+            relation = f"{_identifier(namespace)}.registry_network_binding"
+            await connection.execute(f"LOCK TABLE {relation} IN ACCESS EXCLUSIVE MODE NOWAIT")
+            await _verify(connection, namespace, api_role, owner_role, office_recipe_pending=True)
+            await connection.execute(
+                f"GRANT INSERT(office_recipe_json),UPDATE(office_recipe_json) ON {relation} TO {_identifier(api_role)}"
+            )
+        finally:
+            await connection.execute(f"SET LOCAL ROLE {caller}")
+        updated_grants = {tuple(grant.values()) for grant in await _acls(connection, receipt["schema_oid"])}
+        api_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", api_role)
+        required_grants = {
+            ("registry_network_binding", "office_recipe_json", api_oid, privilege, False)
+            for privilege in ("INSERT", "UPDATE")
+        }
+        if updated_grants != initial_grants | required_grants:
+            raise RegistryManagementPermissionError("Office recipe enrollment changed unrelated privileges")
+        return await _verify(connection, namespace, api_role, owner_role)
 
 
 async def install_registry_management_permissions(connection, *, api_role, owner_role, control_schema=None):

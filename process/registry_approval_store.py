@@ -112,6 +112,8 @@ def _selected_history_json_sql():
             THEN history.record_json||jsonb_build_object('network_assertions','[]'::jsonb)
             WHEN selected.record_kind='network' AND NOT history.record_json ? 'catalog_evidence_json'
             THEN history.record_json||jsonb_build_object('catalog_evidence_json',NULL)
+            WHEN selected.record_kind='network_binding' AND NOT history.record_json ? 'office_recipe_json'
+            THEN history.record_json||jsonb_build_object('office_recipe_json',NULL)
             ELSE history.record_json END"""
 
 

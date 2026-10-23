@@ -6,6 +6,7 @@ import re
 from sqlalchemy import text
 
 from alembic import op
+from db.migration_registry_preparation import can_adopt_prepared_registry_table
 from db.registry_aca_source_notification import CREATE_TABLE_SQL, INSERT_COLUMNS, TABLE
 from db.registry_schema import registry_schema
 
@@ -21,10 +22,21 @@ def _identifier(value):
     return '"' + value + '"'
 
 
+def _postimage(schema):
+    return (CREATE_TABLE_SQL.format(namespace=_identifier(schema)),)
+
+
 def upgrade():
     """Create closed storage; runtime grants require the separate operator plan."""
     bind = op.get_bind()
     schema = registry_schema()
+    if can_adopt_prepared_registry_table(op, schema, TABLE, _postimage):
+        return
+    _create(bind, schema)
+
+
+def _create(bind, schema):
+    """Keep the owner-phase DDL identical to the ordinary fresh-install definition."""
     namespace = _identifier(schema)
     owner = (
         bind.execute(
