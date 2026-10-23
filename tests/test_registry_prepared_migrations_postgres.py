@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from db.migration_network_candidate_custody import validate_prepared_candidate_custody
 from db.migration_registry_preparation import registry_migration, validate_prepared_registry_table
 from process.registry_approval_preview import preview_registry_approval
 from process.registry_approval_store import RegistryApprovalConflict, approve_registry_records
@@ -32,6 +33,7 @@ _CHANGES = (
     ("20261016070000_registry_allowed_plan_scope", "registry_ptg_published_plan_scope"),
     ("20261017010000_registry_cms_source_notifications", "registry_cms_source_notification"),
     ("20261017030000_registry_ptg_office_recipe_selection", "registry_network_binding"),
+    ("20261018011000_network_candidate_custody", "network_candidate_custody"),
     ("20261018040000_registry_aca_source_notifications", "registry_aca_source_notification"),
 )
 
@@ -55,6 +57,7 @@ async def prepared_db(permissions_db, monkeypatch):
             f'ON "{fixture.schema}".registry_network_binding TO "{fixture.roles_by_kind["api"]}"'
         )
     await fixture.connection.execute(f'DROP TABLE "{fixture.schema}".registry_aca_source_notification')
+    await fixture.connection.execute(f'DROP TABLE "{fixture.schema}".network_candidate_custody')
     await fixture.connection.execute(
         f'INSERT INTO "{fixture.schema}".registry_network_binding '
         "(binding_id,source_system,source_id,dataset_schema,dataset_id,producer_id,edition_id,source_key,"
@@ -83,7 +86,10 @@ async def _upgrade(fixture, revision, role, *, validate=False):
                     migration.upgrade()
                 if validate:
                     table = dict(_CHANGES)[revision]
-                    validate_prepared_registry_table(sync_connection, fixture.schema, table, migration._postimage)
+                    if table == "network_candidate_custody":
+                        validate_prepared_candidate_custody(sync_connection, fixture.schema)
+                    else:
+                        validate_prepared_registry_table(sync_connection, fixture.schema, table, migration._postimage)
 
             await connection.run_sync(run)
             assert await connection.scalar(text("SELECT current_user")) == role
@@ -93,7 +99,7 @@ async def _upgrade(fixture, revision, role, *, validate=False):
                 await connection.scalar(
                     text(
                         "SELECT count(*) FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
-                        "AND relname LIKE 'registry_%'"
+                        "AND (relname LIKE 'registry_%' OR relname='network_candidate_custody')"
                     )
                 )
                 == 0
@@ -187,7 +193,7 @@ async def test_binding_adoption_refuses_native_or_acl_drift(prepared_db, damage)
     assert await _acl(fixture) == before
 
 
-@pytest.mark.parametrize("revision,table", (_CHANGES[1], _CHANGES[3]))
+@pytest.mark.parametrize("revision,table", (_CHANGES[1], _CHANGES[4]))
 async def test_notification_adoption_refuses_nonpublic_default_grants(prepared_db, revision, table):
     fixture = prepared_db
     await _upgrade(fixture, revision, fixture.roles_by_kind["owner"], validate=True)
@@ -323,7 +329,7 @@ async def test_owner_preparation_refuses_active_company_fence(prepared_db):
 @pytest.mark.parametrize("change", ["missing", "foreign_owner"])
 async def test_aca_adoption_retains_serving_owner_prerequisite(prepared_db, change):
     fixture = prepared_db
-    revision = _CHANGES[3][0]
+    revision = _CHANGES[4][0]
     await _upgrade(fixture, revision, fixture.roles_by_kind["owner"], validate=True)
     table = f'"{fixture.schema}".network_serving_control'
     if change == "missing":
