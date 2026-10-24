@@ -335,7 +335,9 @@ def _validate_lineage(
         ):
             raise TerminalRootRetirementError("evidence_invalid")
         previous_run_id = str(run.get("run_id") or "")
-    if previous_run_id != request.owner_run_id:
+    if not any(run["run_id"] == request.owner_run_id for run in lineage) or (
+        not request.expect_no_current_dataset and previous_run_id != request.owner_run_id
+    ):
         raise TerminalRootRetirementError("evidence_invalid")
 
 
