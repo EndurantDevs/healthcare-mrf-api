@@ -2,17 +2,25 @@
 """Closed retention identity and outcome vocabulary at the application boundary."""
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
 
+from process import plan_release_preparation_pin_retirement as history
+from process import plan_release_preparation_pins as pins
 from process.plan_release_preparation_pin_contract import (
+    PlanReleaseHistoryAuthority,
+    PlanReleasePublication,
     PreparationPinAdmission,
     PreparationPinAuthority,
     PreparationPinHeap,
     PreparationPinReceipt,
     PreparationPinScope,
+    digest,
     preparation_pin_receipt_from_payload,
     preparation_pin_scope_from_payload,
 )
@@ -97,3 +105,241 @@ def test_protected_images_and_receipt_inventory_are_mandatory():
         replace(witness(), registered_receipt=receipt, detached_receipts=(receipt,)).validate(identity)
     with pytest.raises(ValueError, match="receipt_inventory_conflict"):
         replace(witness(), detached_receipts=(receipt,), cleaned_receipts=(receipt,)).validate(identity)
+
+
+def publication():
+    return PlanReleasePublication(
+        REVISION,
+        "hprelease_" + "1" * 26,
+        "hpplan_" + "2" * 26,
+        None,
+        "2026-10",
+        1,
+        "c" * 64,
+        {"contract": "synthetic-release", "authority": {"source": "synthetic_source"}},
+    ).validate()
+
+
+def test_unneeded_pricing_is_truthful_and_remains_retained():
+    state = replace(admission(status="not_required"), dispatch_count=0, engine_run_id=None).validate()
+    assert witness(state=state).require_settled() == (REVISION,)
+
+
+@pytest.mark.parametrize(
+    "changes", [{"dispatch_count": 1}, {"engine_run_id": "real-run"}, {"remaining_work": 1}, {"retryable": True}]
+)
+def test_unneeded_pricing_cannot_hide_dispatched_or_pending_work(changes):
+    state = replace(admission(status="not_required"), dispatch_count=0, engine_run_id=None)
+    with pytest.raises(ValueError, match="unneeded_admission_has_work"):
+        replace(state, **changes).validate()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"serving_revision_id": "not-a-revision"},
+        {"plan_release_id": "hprelease_bad"},
+        {"healthporta_plan_id": "hpplan_bad"},
+        {"plan_version_id": "hpversion_bad"},
+        {"release_month": "2026-13"},
+        {"expected_binding_count": True},
+        {"expected_binding_count": 0},
+        {"expected_binding_count": 2_147_483_648},
+        {"binding_set_digest": "A" * 64},
+        {"source_manifest": []},
+        {"source_manifest": {"value": float("nan")}},
+        {"source_manifest": {"value": (1, 2)}},
+        {"source_manifest": {1: "noncanonical-key"}},
+    ],
+)
+def test_publication_rejects_invalid_native_header_or_manifest(changes):
+    with pytest.raises(ValueError):
+        replace(publication(), **changes).validate()
+
+
+def test_publication_payload_preserves_and_copies_exact_manifest():
+    header = publication()
+    payload = header.payload()
+    assert payload["source_manifest"] == header.source_manifest
+    payload["source_manifest"]["authority"]["source"] = "other_source"
+    assert header.source_manifest["authority"]["source"] == "synthetic_source"
+
+
+def publication_case(monkeypatch):
+    header = publication()
+    binding = replace(heap(), name="binding_cohort", oid=7)
+    inputs = pins.PreparationPinInputs(binding, heap())
+    receipt = PreparationPinReceipt(scope(), heap(), 4, 5, (REVISION,)).validate()
+    before = replace(
+        witness(), registered_receipt=receipt, binding_heap=binding, publication_digest=digest(header.payload())
+    )
+    after = replace(before, preparation_status="published", writers_closed=True)
+    events = []
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("savepoint")
+        try:
+            yield
+        except BaseException:
+            events.append("rollback")
+            raise
+        else:
+            events.append("release")
+
+    connection = SimpleNamespace(transaction=transaction, is_in_transaction=lambda: True)
+    for name in (
+        "require_preparation_pins",
+        "_publish_native_binding",
+        "_require_published_header",
+        "_require_published_inventory",
+        "_publisher",
+    ):
+        monkeypatch.setattr(pins, name, AsyncMock())
+    monkeypatch.setattr(
+        pins, "_original_publisher_identity", AsyncMock(return_value=(2, 3, "4", "publisher", "publisher"))
+    )
+    monkeypatch.setattr(pins, "_authorize", AsyncMock(side_effect=(before, after)))
+    return SimpleNamespace(
+        header=header, inputs=inputs, receipt=receipt, connection=connection, events=events, before=before, after=after
+    )
+
+
+async def publish_case(case):
+    await pins.publish_prepared_plan_release(
+        case.connection,
+        "storage",
+        case.header,
+        inputs=case.inputs,
+        receipt=case.receipt,
+        expected_current=None,
+        owner_role="storage_owner",
+        publisher_role="publisher",
+        reader_roles=("reader",),
+        authority=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_publication_authorizes_exact_header_before_and_after_native_cut(monkeypatch):
+    case = publication_case(monkeypatch)
+    await publish_case(case)
+    assert case.events == ["savepoint", "release"]
+    pins._publish_native_binding.assert_awaited_once()
+    pins._require_published_inventory.assert_awaited_once()
+    pins._publisher.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["header", "inventory", "state", "count"])
+async def test_publication_refuses_unbound_header_or_custody_before_writes(monkeypatch, damage):
+    case = publication_case(monkeypatch)
+    changes_by_damage = {
+        "header": {"publication_digest": "f" * 64},
+        "inventory": {"registered_receipt": None},
+        "state": {"preparation_status": "published"},
+        "count": {"binding_heap": replace(case.inputs.binding_heap, row_count=2)},
+    }
+    pins._authorize.side_effect = (replace(case.before, **changes_by_damage[damage]),)
+    with pytest.raises(ValueError):
+        await publish_case(case)
+    pins._publish_native_binding.assert_not_awaited()
+    assert case.events == ["savepoint", "rollback"]
+    pins._publisher.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before", "after"])
+async def test_publication_rejects_changed_physical_transaction_and_restores_role(monkeypatch, phase):
+    case = publication_case(monkeypatch)
+    original = (2, 3, "4", "publisher", "publisher")
+    changed = (2, 3, "5", "publisher", "publisher")
+    pins._original_publisher_identity.side_effect = [original] + ([original] if phase == "after" else []) + [changed]
+    with pytest.raises(ValueError, match="original_transaction_changed"):
+        await publish_case(case)
+    assert case.events == ["savepoint", "rollback"]
+    assert pins._publish_native_binding.await_count == (phase == "after")
+    pins._publisher.assert_awaited_once()
+
+
+def history_cut():
+    header_by_field = {
+        **publication().payload(),
+        "is_current": True,
+        "release_status": "published",
+        "serving_status": "published",
+    }
+    return history.PlanReleaseHistoryCut(
+        "storage",
+        publication(),
+        header_by_field,
+        replace(heap(), name="binding", oid=7),
+        heap(),
+        (REVISION, OTHER_REVISION),
+        True,
+        4,
+        5,
+        6,
+        (2, 3, "4", "publisher", "publisher"),
+    )
+
+
+@pytest.mark.parametrize("operation", ["repair", "withdraw", "detach", "reactivate"])
+def test_history_intent_preserves_exact_publication_identity(operation):
+    cut = history_cut()
+    history._require_history_intent(cut, operation, cut.publication)
+    with pytest.raises(ValueError, match="history_publication_changed"):
+        history._require_history_intent(
+            cut, operation, replace(cut.publication, plan_release_id="hprelease_" + "3" * 26)
+        )
+    changed = replace(cut.publication, source_manifest={"projection": "verified"})
+    if operation == "repair":
+        history._require_history_intent(cut, operation, changed)
+    else:
+        with pytest.raises(ValueError, match="history_publication_changed"):
+            history._require_history_intent(cut, operation, changed)
+
+
+def test_history_repair_requires_current_published_header():
+    cut = history_cut()
+    cut.header["is_current"] = False
+    with pytest.raises(ValueError, match="history_repair_not_current"):
+        history._require_history_intent(cut, "repair", cut.publication)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["cut", "publication", "operation", "pointer", "cohort", "pin"])
+async def test_history_authority_binds_the_whole_child_and_exact_pointer(damage):
+    cut = history_cut()
+    expected = (REVISION, "c" * 64)
+    witness = PlanReleaseHistoryAuthority(
+        digest(cut.payload()), digest(cut.publication.payload()), "detach", expected, cut.pin_revision_ids
+    )
+    changes_by_damage = {
+        "cut": {"cut_digest": "f" * 64},
+        "publication": {"publication_digest": "f" * 64},
+        "operation": {"operation": "withdraw"},
+        "pointer": {"expected_current": None},
+        "cohort": {"eligible_revision_ids": (REVISION,)},
+        "pin": {"detached_pin_heap": heap()},
+    }
+    authority = AsyncMock(return_value=replace(witness, **changes_by_damage[damage]))
+    with pytest.raises(ValueError, match="history_authority_changed"):
+        await history._authorize_history(None, cut, authority, ("detach", cut.publication, expected), phase="before")
+
+
+@pytest.mark.asyncio
+async def test_history_detachment_requires_persisted_actual_receipt():
+    cut = history_cut()
+    expected = (REVISION, "c" * 64)
+    witness = PlanReleaseHistoryAuthority(
+        digest(cut.payload()), digest(cut.publication.payload()), "detach", expected, cut.pin_revision_ids
+    )
+    authority = AsyncMock(return_value=witness)
+    with pytest.raises(ValueError, match="history_authority_changed"):
+        await history._authorize_history(None, cut, authority, ("detach", cut.publication, expected), phase="after")
+    authority.return_value = replace(witness, detached_pin_heap=cut.pin_heap)
+    assert (
+        await history._authorize_history(None, cut, authority, ("detach", cut.publication, expected), phase="after")
+        == authority.return_value
+    )

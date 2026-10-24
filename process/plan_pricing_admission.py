@@ -13,7 +13,11 @@ from process.plan_pricing_control import (
     projection_retry_key,
     require_pricing_replay,
 )
-from process.plan_pricing_control_policy import load_pricing_control_policy, pricing_control_schema
+from process.plan_pricing_control_policy import (
+    is_qualified_historical_revision,
+    load_pricing_control_policy,
+    pricing_control_schema,
+)
 from process.plan_release_storage_custody import _document, storage_roles, verify_storage_family
 
 CONTROL_NAMES = ("catalog_release_preparation", "catalog_release_admission_attempt")
@@ -43,8 +47,8 @@ def is_reserved_pricing_key(key):
     return type(key) is str and key.startswith(("plan-pricing-projection:", "plan-pricing-projection-retry:"))
 
 
-async def is_managed_storage_installed(connection):
-    """A historical scalar installation never becomes managed by table inference."""
+async def pricing_control_layout(connection):
+    """Read the exact qualified layout without inferring a producer from table names."""
     schema = pricing_control_schema()
     names = [storage_relation(schema, name) for name in (*CONTROL_NAMES, "alembic_version")]
     present = await connection.fetch("SELECT to_regclass(name)::oid AS oid FROM unnest($1::text[]) names(name)", names)
@@ -59,9 +63,16 @@ async def is_managed_storage_installed(connection):
     require(len(revisions) == 1, "schema_revision_invalid")
     if revisions[0] in HISTORICAL_REVISIONS:
         require(not any(controls), "partial_storage")
-        return False
+        return schema, revisions[0], False
+    if revisions[0] != BULK_REVISION and not any(controls) and is_qualified_historical_revision(schema, revisions[0]):
+        return schema, revisions[0], False
     require(revisions == (BULK_REVISION,) and all(controls), "schema_revision_invalid")
-    return True
+    return schema, revisions[0], True
+
+
+async def is_managed_storage_installed(connection):
+    """A historical scalar installation never becomes managed by table inference."""
+    return (await pricing_control_layout(connection))[2]
 
 
 def _dispatches(record_by_field, request):

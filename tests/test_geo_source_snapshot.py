@@ -222,6 +222,7 @@ def _cut_case(monkeypatch):
     monkeypatch.setattr(snapshot, "bound_publisher", lambda: publisher)
 
     async def shape(_session, **options):
+        assert options.get("is_incumbent", False) == ("expected_oid" in options)
         events.append("shape")
         return 11 if "expected_oid" in options else 22
 
@@ -279,6 +280,22 @@ async def test_loading_raw_and_final_heaps_never_receive_reader_access(monkeypat
         (publisher.connection, publisher.policy, candidate.stage),
     ]
     assert all(call.kwargs == {} for call in close.await_args_list)
+    snapshot.require_geo_storage.assert_awaited_once_with(
+        snapshot.require_geo_storage.await_args.args[0], schema_name="mrf", is_incumbent=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_geo_candidate_rejects_historical_indexes(monkeypatch):
+    monkeypatch.setattr(storage, "_owner", AsyncMock(return_value=7))
+    custody = AsyncMock()
+    monkeypatch.setattr(storage, "_heap_custody", custody)
+    session = SimpleNamespace(scalar=AsyncMock(return_value=17))
+    with pytest.raises(RuntimeError, match="incumbent_scope_changed"):
+        await storage.require_geo_storage(
+            session, schema_name="mrf", relation_name="geo_candidate_example", is_incumbent=True
+        )
+    custody.assert_not_awaited()
 
 
 @pytest.mark.asyncio

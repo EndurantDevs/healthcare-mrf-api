@@ -9,6 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import asyncpg
 import pytest
@@ -117,6 +118,23 @@ def _legacy_migration(connection, schema):
     migration.upgrade()
 
 
+def _em_control_tables(connection, schema):
+    """Use both real control-table definitions; this is not full-history proof."""
+    path = Path(__file__).resolve().parents[1] / "alembic/versions/20260901103000_plan_pricing_em_distance.py"
+    spec = importlib.util.spec_from_file_location("plan_pricing_em_controls", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    migration._schema = lambda: schema
+    statements = []
+    migration.op = SimpleNamespace(execute=statements.append)
+    migration.upgrade()
+    for name in ("plan_pricing_em_distance_candidate", "plan_pricing_em_distance_attachment"):
+        prefix = f"CREATE TABLE {migration._table(schema, name)} ("
+        definitions = [statement for statement in statements if statement.lstrip().startswith(prefix)]
+        assert len(definitions) == 1
+        connection.exec_driver_sql(definitions[0])
+
+
 def install_legacy_guards(connection, schema):
     """Install unchanged historical guard definitions, without a new test policy."""
     path = Path(__file__).resolve().parents[1] / "alembic/versions/20260724100000_ptg2_v4_attempt_fence.py"
@@ -139,6 +157,7 @@ async def _create_legacy(case):
             f"CREATE TABLE {case.schema}.ptg2_snapshot(snapshot_id varchar(128) PRIMARY KEY,status text,manifest jsonb DEFAULT '{{}}')"
         )
         await connection.run_sync(lambda native: _legacy_migration(native, case.schema))
+        await connection.run_sync(lambda native: _em_control_tables(native, case.schema))
         await connection.exec_driver_sql(
             f"CREATE TABLE {case.schema}.ptg2_v3_snapshot_plan_scope(snapshot_id text,plan_id text,plan_market_type text)"
         )
