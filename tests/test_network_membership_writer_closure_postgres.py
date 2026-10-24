@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -98,6 +99,31 @@ async def _verify(fixture):
         await fixture.connection.execute("RESET ROLE")
 
 
+async def _assert_closed_writes(fixture, observer):
+    namespace = f'"{fixture.copy_target.schema_name}"'
+    assert await observer.fetchval(f"SELECT count(*) FROM {namespace}.network_membership") == 4
+    assert await observer.fetchval(f"SELECT count(*) FROM {namespace}.provider_location_binding") == 3
+    statements = [
+        f"INSERT INTO {namespace}.network_membership SELECT * FROM {namespace}.network_membership",
+        f"UPDATE {namespace}.network_membership SET network_id=7",
+        f"DELETE FROM {namespace}.network_membership",
+        f"TRUNCATE {namespace}.network_membership",
+        f"CREATE TABLE {namespace}.extra(id integer)",
+        f"ALTER TABLE {namespace}.network_membership ADD COLUMN extra integer",
+    ]
+    for statement in statements:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError) as error:
+            await observer.execute(statement)
+        assert error.value.sqlstate == "42501"
+    with pytest.raises(asyncpg.InsufficientPrivilegeError) as error:
+        await observer.copy_records_to_table(
+            "network_membership",
+            schema_name=fixture.copy_target.schema_name,
+            records=[(42, "npi", "provider-a", fixture.location_ids[0], "evidence")],
+        )
+    assert error.value.sqlstate == "42501"
+
+
 async def test_freeze_closes_copy_dml_ddl_and_preserves_select(writer_db):
     fixture = writer_db
     namespace = f'"{fixture.copy_target.schema_name}"'
@@ -118,23 +144,7 @@ async def test_freeze_closes_copy_dml_ddl_and_preserves_select(writer_db):
     observer = fixture.observer
     await observer.execute(f'SET ROLE "{fixture.roles["loader"]}"')
     assert await observer.fetchval(f"SELECT count(*) FROM {namespace}.network_membership") == 4
-    statements = [
-        f"INSERT INTO {namespace}.network_membership SELECT * FROM {namespace}.network_membership",
-        f"UPDATE {namespace}.network_membership SET network_id=7",
-        f"DELETE FROM {namespace}.network_membership",
-        f"TRUNCATE {namespace}.network_membership",
-        f"CREATE TABLE {namespace}.extra(id integer)",
-        f"ALTER TABLE {namespace}.network_membership ADD COLUMN extra integer",
-    ]
-    for statement in statements:
-        with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await observer.execute(statement)
-    with pytest.raises(asyncpg.InsufficientPrivilegeError):
-        await observer.copy_records_to_table(
-            "network_membership",
-            schema_name=fixture.copy_target.schema_name,
-            records=[(42, "npi", "provider-a", fixture.location_ids[0], "evidence")],
-        )
+    await _assert_closed_writes(fixture, observer)
     await observer.execute("RESET ROLE")
     await observer.execute(f'SET ROLE "{fixture.roles["reader"]}"')
     assert await observer.fetchval(f"SELECT count(*) FROM {namespace}.provider_location_binding") == 3
@@ -145,6 +155,62 @@ async def test_freeze_closes_copy_dml_ddl_and_preserves_select(writer_db):
         )
         == source_indexes
     )
+
+
+async def test_authenticated_publisher_freezes_and_loader_reader_cannot_write(
+    writer_db, serving_schema, record_property
+):
+    """Freeze through authenticated publication and deny sealed runtime writes."""
+    fixture = writer_db
+    namespace = f'"{fixture.copy_target.schema_name}"'
+    connections_by_kind = {}
+    async with AsyncExitStack() as cleanup:
+        for kind in ("publisher", "loader", "reader"):
+            role, password = fixture.roles[kind], uuid4().hex
+            cleanup.push_async_callback(fixture.connection.execute, f'ALTER ROLE "{role}" NOLOGIN PASSWORD NULL')
+            await fixture.connection.execute(f"""ALTER ROLE "{role}" LOGIN PASSWORD '{password}'""")
+            url = serving_schema[2].url.set(drivername="postgresql", username=role, password=password)
+            actor = await asyncpg.connect(url.render_as_string(hide_password=False))
+            cleanup.push_async_callback(actor.close)
+            connections_by_kind[kind] = actor
+            assert tuple(await actor.fetchrow("SELECT session_user,current_user,current_setting('role')")) == (
+                role,
+                role,
+                "none",
+            )
+        assert (
+            await fixture.connection.fetchval(
+                "SELECT rolcanlogin FROM pg_roles WHERE rolname=$1", fixture.roles["owner"]
+            )
+            is False
+        )
+        await fixture.connection.execute(f"GRANT ALL ON SCHEMA {namespace} TO PUBLIC")
+        await fixture.connection.execute(f"GRANT ALL ON {namespace}.network_membership TO PUBLIC")
+        await fixture.connection.execute(
+            f'GRANT UPDATE(network_id) ON {namespace}.network_membership TO "{fixture.roles["outsider"]}"'
+        )
+        publisher = connections_by_kind["publisher"]
+        async with publisher.transaction():
+            receipt = await freeze_network_candidate_writers(publisher, fixture.copy_target, **_arguments(fixture))
+            await publisher.execute(
+                f'UPDATE "{fixture.control_schema}".network_membership_candidate '
+                "SET validation_json=jsonb_build_object('writer_closure',$1::jsonb) WHERE candidate_id=$2",
+                json.dumps(receipt),
+                fixture.copy_target.candidate_id,
+            )
+        async with publisher.transaction():
+            assert (
+                await verify_network_candidate_writer_closure(publisher, fixture.copy_target, **_arguments(fixture))
+                == receipt
+            )
+        for kind in ("loader", "reader"):
+            await _assert_closed_writes(fixture, connections_by_kind[kind])
+        for kind, actor in connections_by_kind.items():
+            role = fixture.roles[kind]
+            identity_fields = tuple(await actor.fetchrow("SELECT session_user,current_user,current_setting('role')"))
+            assert identity_fields == (role, role, "none")
+            record_property(kind + "_login_identity", json.dumps(identity_fields))
+        assert await _verify(fixture) == receipt
 
 
 async def test_strict_replay_has_no_ddl(writer_db):
