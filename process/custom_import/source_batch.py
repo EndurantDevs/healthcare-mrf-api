@@ -37,8 +37,8 @@ from process.custom_import.snowflake_bundle_replay import (
     _stream_fields,
     _validate_replay_partition_schema,
 )
-from process.custom_import.snowflake_source_binding import load_snowflake_source_binding
 from process.custom_import.source_authorization import PERMIT_CONTRACT, SOURCE_PATH, SourcePermit
+from process.custom_import.source_binding_store import LoadedObjectSourceBinding, load_source_binding
 from process.custom_import.source_finalize_sql import finalize_source_batch
 from process.custom_import.storage_layout import snapshot_models
 
@@ -112,6 +112,25 @@ def _same_digest(actual, expected):
     )
 
 
+async def _load_prepared_request(session, loaded, execution, bundle, build, fence, lease_token, source_permit):
+    """Bind prepared input to the retained build before accepting its SOURCE cursor."""
+    from process.custom_import.prepared_source_build import build_request
+    from process.custom_import.prepared_source_reader import retained_context, sealed_header
+
+    context = await retained_context(
+        session, loaded, execution, bundle, fence=fence, token=lease_token, permit=source_permit
+    )
+    request = build_request(
+        context,
+        expected_base_generation_id=build.base_generation_id,
+        expected_pointer_version=build.base_pointer_version,
+        complete_scope=build.complete_scope,
+    )
+    staging._assert_build_identity(build, request, execution)
+    await sealed_header(session, context)
+    return request, context.policy, build.capture_bundle_id
+
+
 async def _load_request(session, execution_id, build_id, fence, lease_token, source_permit):
     """Load immutable definition/binding/bounds; no caller-supplied policy."""
 
@@ -119,12 +138,16 @@ async def _load_request(session, execution_id, build_id, fence, lease_token, sou
     execution = await session.get(CustomImportExecution, execution_id)
     if build is None or execution is None or build.execution_id != execution_id:
         raise CandidateRunnerError("SOURCE execution/build binding is unavailable")
-    loaded = await load_snowflake_source_binding(
+    loaded = await load_source_binding(
         session,
         definition_revision_id=build.definition_revision_id,
         source_binding_revision_id=execution.source_binding_revision_id,
     )
     bundle = await session.get(CustomImportCaptureBundle, build.capture_bundle_id)
+    if isinstance(loaded, LoadedObjectSourceBinding):
+        return await _load_prepared_request(
+            session, loaded, execution, bundle, build, fence, lease_token, source_permit
+        )
     policy = loaded.binding.processing_policy
     if (
         policy is None
@@ -239,6 +262,10 @@ async def _page(session_factory, request, build_id, source_permit):
     async with staging._page_session(session_factory, request, build_id) as (session, build):
         await session.execute(text("SELECT pg_catalog.set_config('search_path', 'pg_catalog', true)"))
         await _verify_source_permit(session, request, source_permit)
+        from process.custom_import.prepared_source_build import PreparedSourceBuildRequest, require_build_scope
+
+        if isinstance(request, PreparedSourceBuildRequest):
+            await require_build_scope(session, request)
         yield session, build
 
 
@@ -382,17 +409,22 @@ async def _prepare_part(session_factory, context, part, policy, cursor, source_p
     """
     if budget is None:
         budget = MAX_BATCH_ROWS, MAX_BATCH_BYTES, deadline
-    _verify_part(context, part, policy, cursor)
-    pages = staging._hosted_source_pages(
-        context,
-        part,
-        policy,
-        (
-            cursor.next_part_ordinal,
-            cursor.next_part_row_ordinal,
-            cursor.next_source_ordinal - cursor.next_part_row_ordinal,
-        ),
-    )
+    from process.custom_import.prepared_source_reader import PreparedReplayPart, source_pages
+
+    if isinstance(part, PreparedReplayPart):
+        pages = source_pages(context, part, policy, cursor)
+    else:
+        _verify_part(context, part, policy, cursor)
+        pages = staging._hosted_source_pages(
+            context,
+            part,
+            policy,
+            (
+                cursor.next_part_ordinal,
+                cursor.next_part_row_ordinal,
+                cursor.next_source_ordinal - cursor.next_part_row_ordinal,
+            ),
+        )
     prepared_pages, row_count, byte_count, has_eof = [], 0, 0, False
     primary = None
     try:
@@ -483,6 +515,11 @@ async def _commit(session_factory, context, pages, closed_parts, expected, bundl
         for ordinal in closed_parts:
             if ordinal < last_promoted_part:
                 continue  # The same finalization atomically proved these earlier parts.
+            from process.custom_import.prepared_source_build import PreparedSourceBuildRequest, finish_part
+
+            if isinstance(context.request, PreparedSourceBuildRequest):
+                await finish_part(session, context.request, build, stream, ordinal)
+                continue
             await staging._call(
                 session,
                 "finish_custom_import_build_source_part",
@@ -558,6 +595,18 @@ async def _fetch_closed_part(session_factory, identity_by_field, context, cursor
     """Return immutable bytes only after result/read transaction cleanup succeeds."""
     async with _read_session(session_factory) as session:
         await _read_timeout(session, context.request, deadline)
+        from process.custom_import.prepared_source_build import PreparedSourceBuildRequest
+        from process.custom_import.prepared_source_reader import open_prepared_cursor_part
+
+        if isinstance(context.request, PreparedSourceBuildRequest):
+            part = await open_prepared_cursor_part(
+                session,
+                request=context.request,
+                stream_slot=context.stream_slot,
+                expected_cursor=cursor,
+                deadline=deadline,
+            )
+            return part, None
         if headers is None:
             headers = await load_segmented_cursor_headers(session, **identity_by_field, stream_slot=context.stream_slot)
         async with open_segmented_cursor_part(
@@ -574,6 +623,12 @@ async def _fetch_closed_part(session_factory, identity_by_field, context, cursor
 async def _verify_metadata(session_factory, identity_by_field, context, deadline):
     async with _read_session(session_factory) as session:
         await _read_timeout(session, context.request, deadline)
+        from process.custom_import.prepared_source_build import PreparedSourceBuildRequest
+        from process.custom_import.prepared_source_reader import verify_stream_metadata
+
+        if isinstance(context.request, PreparedSourceBuildRequest):
+            await verify_stream_metadata(session, context.request, context.stream_slot, deadline)
+            return
         await verify_segmented_stream_metadata(
             session, **identity_by_field, stream_slot=context.stream_slot, deadline=deadline
         )
@@ -611,7 +666,13 @@ async def _read_parts(session_factory, context, policy, bundle_id, cursor, sourc
             deadline,
             (MAX_BATCH_ROWS - row_count, MAX_BATCH_BYTES - byte_count, soft_deadline),
         )
-        is_final = part.ordinal == json.loads(part.receipt.canonical_manifest)["part_count"]
+        from process.custom_import.prepared_source_reader import PreparedReplayPart
+
+        is_final = part.ordinal == (
+            part.part_count
+            if isinstance(part, PreparedReplayPart)
+            else json.loads(part.receipt.canonical_manifest)["part_count"]
+        )
         del part
         # No EOF/earlier-part evidence until decode AND reader cleanup succeed.
         pages.extend(new_pages)

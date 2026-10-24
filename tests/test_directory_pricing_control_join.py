@@ -25,7 +25,8 @@ PREDECESSOR = "20261022120000_provider_directory_first_retirement"
 DIRECTORY = "20261023100000_provider_directory_retirement_parent_updates"
 PRICING = "20261023110000_code_pricing_import_idempotency"
 JOIN = "20261023220000_merge_directory_pricing_controls"
-HEAD = "20261024050000_provider_directory_first_retirement_owner_lineage"
+OWNER_LINEAGE = "20261024050000_provider_directory_first_retirement_owner_lineage"
+CURRENT_HEAD = "20261023010000_custom_import_prepared_source"
 INDEX = "import_run_code_pricing_idempotency_idx"
 
 
@@ -39,8 +40,9 @@ def _config(connection=None):
 
 def test_directory_pricing_join_preserves_exact_parents_without_database_work():
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == [HEAD]
-    assert scripts.get_revision(HEAD).down_revision == JOIN
+    assert scripts.get_heads() == [CURRENT_HEAD]
+    assert scripts.get_revision(CURRENT_HEAD).down_revision == OWNER_LINEAGE
+    assert scripts.get_revision(OWNER_LINEAGE).down_revision == JOIN
     assert scripts.get_revision(JOIN).down_revision == (DIRECTORY, PRICING)
     assert scripts.get_revision(DIRECTORY).down_revision == PREDECESSOR
     assert scripts.get_revision(PRICING).down_revision == PREDECESSOR

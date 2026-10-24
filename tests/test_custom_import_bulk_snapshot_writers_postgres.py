@@ -38,6 +38,35 @@ from process.custom_import.execution import lease_token_sha256
 from process.custom_import.storage_layout import snapshot_models, snapshot_schema
 from tests import test_custom_import_build_output_postgres as output_fixture
 from tests.custom_import_postgres_support import _migration, isolated_publication_case
+from tests.custom_import_prepared_source_build_postgres_cases import (
+    test_native_begin_owner_must_match_even_when_source_owners_match as test_native_begin_owner_must_match_even_when_source_owners_match,
+)
+from tests.custom_import_prepared_source_build_postgres_cases import (
+    test_native_begin_refuses_unsealed_and_changed_bounds_without_creating_build as test_native_begin_refuses_unsealed_and_changed_bounds_without_creating_build,
+)
+from tests.custom_import_prepared_source_build_postgres_cases import (
+    test_native_copy_rollback_and_false_eof_preserve_cursor as test_native_copy_rollback_and_false_eof_preserve_cursor,
+)
+
+# Prepared-source cases share this native suite's collection entry point.
+from tests.custom_import_prepared_source_build_postgres_cases import (
+    test_native_generic_begin_source_admission_and_exact_replay as test_native_generic_begin_source_admission_and_exact_replay,
+)
+from tests.custom_import_prepared_source_build_postgres_cases import (
+    test_native_generic_pipeline_seals_publishes_and_reads_real_source as test_native_generic_pipeline_seals_publishes_and_reads_real_source,
+)
+from tests.custom_import_prepared_source_build_postgres_cases import (
+    test_native_new_fence_build_reuses_seal_without_resetting_deadline as test_native_new_fence_build_reuses_seal_without_resetting_deadline,
+)
+from tests.custom_import_prepared_source_build_postgres_cases import (
+    test_native_partial_part_resume_rejects_stale_ack as test_native_partial_part_resume_rejects_stale_ack,
+)
+from tests.custom_import_prepared_source_build_postgres_cases import (
+    test_native_prepared_corruption_refuses_source_before_progress as test_native_prepared_corruption_refuses_source_before_progress,
+)
+from tests.custom_import_prepared_source_lineage_postgres_cases import (
+    test_prepared_checkpoint_guards_and_installed_body as test_prepared_checkpoint_guards_and_installed_body,
+)
 from tests.test_custom_import_build_output_postgres import (
     _assert_sealed_materialization,
     _complete,

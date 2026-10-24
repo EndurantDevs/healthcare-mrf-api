@@ -30,8 +30,8 @@ from db.models.custom_import import (
 )
 from process.custom_import.admission_launch import load_admission_launch
 from process.custom_import.cli import _MISSING, _read_stdin, _receipt_only_database_output, _set_engine_echo
-from process.custom_import.definition import CustomImportDefinition, canonical_json, load_json_definition
-from process.custom_import.definition_store import DefinitionRegistrationError, _normalized_dataset_key
+from process.custom_import.definition import CustomImportDefinition, load_json_definition
+from process.custom_import.definition_store import DefinitionRegistrationError
 from process.custom_import.execution import IdempotencyConflict, lookup_execution_request
 from process.custom_import.failure_diagnostics import (
     FailurePhase,
@@ -40,6 +40,8 @@ from process.custom_import.failure_diagnostics import (
     failure_phase,
 )
 from process.custom_import.family import RootFamily
+from process.custom_import.object_source_binding import ObjectSourceBinding, ObjectSourceBindingError
+from process.custom_import.registration_authority import _registration
 from process.custom_import.registration_authority_operator import register_authority
 from process.custom_import.runner import CandidateRunResult
 from process.custom_import.runner_registry import database_now
@@ -78,7 +80,11 @@ from process.custom_import.snowflake_source_binding import (
     SnowflakeSourceBindingReceipt,
     SnowflakeSourceBindingUnavailableError,
     load_snowflake_source_binding,
-    register_snowflake_source_binding,
+)
+from process.custom_import.source_binding_store import (
+    ObjectSourceBindingReceipt,
+    load_source_binding,
+    register_source_binding,
 )
 
 FIXED_CREDENTIAL_DIRECTORY = Path("/run/custom-import-operator")
@@ -180,35 +186,29 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _registration_from_stdin(stream: Any | None = None) -> tuple[str, CustomImportDefinition, SnowflakeSourceBinding]:
+def _registration_from_stdin(
+    stream: Any | None = None,
+) -> tuple[str, CustomImportDefinition, ObjectSourceBinding | SnowflakeSourceBinding]:
     """Read only dataset_key, definition, and source_binding within the stdin budget."""
 
     try:
-        document = load_json_definition(_read_stdin(stream))
-        if not isinstance(document, dict) or set(document) != {"dataset_key", "definition", "source_binding"}:
-            raise SnowflakeSourceBindingError("registration envelope is invalid")
-        dataset_key = _normalized_dataset_key(document["dataset_key"])
-        definition = CustomImportDefinition.from_mapping(document["definition"])
-        binding = SnowflakeSourceBinding.from_mapping(document["source_binding"])
-        if (
-            canonical_json(document["definition"]) != definition.canonical
-            or canonical_json(document["source_binding"]) != binding.canonical
-        ):
-            raise SnowflakeSourceBindingError("registration documents are not canonical")
-        binding.bundle_components(definition)
-        return dataset_key, definition, binding
+        prepared = _registration(load_json_definition(_read_stdin(stream)))
+        return prepared.dataset_key, prepared.definition, prepared.binding
     except OSError, TypeError, ValueError:
         raise SnowflakeSourceBindingError("registration input is invalid") from None
 
 
 def _registration_receipt(
-    registration: SnowflakeSourceBindingReceipt,
+    registration: ObjectSourceBindingReceipt | SnowflakeSourceBindingReceipt,
     definition: CustomImportDefinition,
-    binding: SnowflakeSourceBinding,
+    binding: ObjectSourceBinding | SnowflakeSourceBinding,
 ) -> str:
     """Render only validated numeric identifiers and canonical digests."""
 
-    if not isinstance(registration, SnowflakeSourceBindingReceipt):
+    receipt_type = (
+        ObjectSourceBindingReceipt if isinstance(binding, ObjectSourceBinding) else SnowflakeSourceBindingReceipt
+    )
+    if not isinstance(registration, receipt_type):
         raise ValueError("operator registration result is invalid")
     identifier_by_field = {
         "dataset_id": registration.dataset_id,
@@ -241,13 +241,13 @@ async def _committed_registration_receipt(
     session: AsyncSession,
     *,
     dataset_key: str,
-    registration: SnowflakeSourceBindingReceipt,
+    registration: ObjectSourceBindingReceipt | SnowflakeSourceBindingReceipt,
     definition: CustomImportDefinition,
-    binding: SnowflakeSourceBinding,
+    binding: ObjectSourceBinding | SnowflakeSourceBinding,
 ) -> str:
     """Verify one committed registration in a fresh session before reporting it."""
 
-    loaded = await load_snowflake_source_binding(
+    loaded = await load_source_binding(
         session,
         definition_revision_id=registration.definition_revision_id,
         source_binding_revision_id=registration.source_binding_revision_id,
@@ -297,7 +297,7 @@ async def _register_snowflake_binding(*, stream: Any | None = None, database=db)
             previous_echo = getattr(engine, "echo", _MISSING)
             _set_engine_echo(database, False)
             async with database.session() as session, session.begin():
-                registration = await register_snowflake_source_binding(
+                registration = await register_source_binding(
                     session,
                     dataset_key=dataset_key,
                     definition=definition,
@@ -1100,7 +1100,7 @@ def _run_command(arguments, *, stream, diagnostic):
     except SnowflakeInspectionError as exc:
         print(_command_error_json(exc.code, parsed.command, exc, diagnostic), file=sys.stderr)
         return 1
-    except (DefinitionRegistrationError, SnowflakeSourceBindingError) as error:
+    except (DefinitionRegistrationError, ObjectSourceBindingError, SnowflakeSourceBindingError) as error:
         code = (
             "invalid_registration"
             if parsed.command in {"register", "register-authority"}

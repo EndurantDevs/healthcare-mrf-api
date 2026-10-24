@@ -8,19 +8,25 @@ import datetime as dt
 import hashlib
 import json
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import process.custom_import.registration_authority as authority
 from process.custom_import.definition import canonical_json
-from process.custom_import.snowflake_source_binding import SnowflakeSourceBindingReceipt
-from tests.test_custom_import_snowflake_operator_cli import _loaded_binding
+from process.custom_import.object_source_binding import ObjectSourceBindingError
+from process.custom_import.source_binding_store import ObjectSourceBindingUnavailableError
+from tests.test_custom_import_snowflake_operator_cli import (
+    _binding_receipt,
+    _configured_loaded_binding,
+    _loaded_binding,
+)
 
 
-def _document_by_name() -> dict[str, object]:
+def _document_by_name(connector=None) -> dict[str, object]:
     """Build existing synthetic connector metadata without a capability."""
 
-    loaded = _loaded_binding()
+    loaded = _loaded_binding(connector)
     return {
         "dataset_key": "synthetic_authority",
         "definition": json.loads(loaded.definition.canonical),
@@ -28,22 +34,15 @@ def _document_by_name() -> dict[str, object]:
     }
 
 
-def _receipt() -> SnowflakeSourceBindingReceipt:
-    """Provide one redacted result from the existing synthetic source contract."""
+def _receipt(connector=None):
+    """Provide one redacted result from the selected synthetic source contract."""
 
-    return SnowflakeSourceBindingReceipt(
-        dataset_id=1,
-        definition_revision_id=2,
-        schema_revision_id=3,
-        source_binding_revision_id=4,
-        revision_number=1,
-        source_binding_sha256=bytes.fromhex(_loaded_binding().binding.digest),
-        created=True,
-    )
+    return _binding_receipt(_loaded_binding(connector))
 
 
-def test_input_digest_covers_the_full_reconstructed_envelope():
-    document_by_name = _document_by_name()
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+def test_input_digest_covers_the_full_reconstructed_envelope(connector):
+    document_by_name = _document_by_name(connector)
     prepared = authority._registration(document_by_name)
 
     assert prepared.input_sha256 == hashlib.sha256(canonical_json(document_by_name).encode("utf-8")).digest()
@@ -102,9 +101,10 @@ def test_graph_result_rejects_nonredacted_or_invalid_identity(change_by_name):
         authority._graph_receipt(replace(_receipt(), **change_by_name), authority._registration(_document_by_name()))
 
 
-def test_graph_result_has_the_existing_closed_redacted_shape():
-    prepared = authority._registration(_document_by_name())
-    rendered = authority._graph_receipt(_receipt(), prepared)
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+def test_graph_result_has_the_existing_closed_redacted_shape(connector):
+    prepared = authority._registration(_document_by_name(connector))
+    rendered = authority._graph_receipt(_receipt(connector), prepared)
     receipt_by_name = json.loads(rendered)
 
     assert set(receipt_by_name) == {
@@ -194,3 +194,62 @@ def test_graph_result_rejects_a_receipt_for_a_different_source_binding():
 
     with pytest.raises(authority.RegistrationAuthorityError, match="receipt binding is invalid"):
         authority._graph_receipt(replace(_receipt(), source_binding_sha256=b"x" * 32), prepared)
+
+
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+def test_registration_reconstructs_exact_canonical_bytes(connector):
+    loaded = _loaded_binding(connector) if connector is not None else _configured_loaded_binding()
+    document = _document_by_name(connector)
+    document["source_binding"] = json.loads(loaded.binding.canonical)
+    prepared = authority._registration(document)
+
+    assert type(prepared.binding) is type(loaded.binding)
+    assert prepared.binding.canonical == loaded.binding.canonical
+    assert prepared.binding.digest == loaded.binding.digest
+    assert (
+        prepared.binding.digest
+        == hashlib.sha256(
+            loaded.binding.contract.encode("ascii") + b":" + loaded.binding.canonical.encode("utf-8")
+        ).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("contract", "custom-import/source-binding/v4"),
+        ("connector", "snowflake_bundle"),
+        ("definition_sha256", "0" * 64),
+        ("processing_policy", None),
+        ("streams", [{"stream_id": "undeclared_source", "url": "https://example.test/data"}]),
+        ("owner", "synthetic_owner"),
+    ),
+)
+def test_object_registration_refuses_crossed_or_incomplete_documents(field, value):
+    document = _document_by_name("https")
+    document["source_binding"][field] = value
+    with pytest.raises(authority.RegistrationAuthorityError):
+        authority._registration(document)
+
+
+@pytest.mark.parametrize("connector", (None, "https"))
+def test_graph_receipt_requires_the_selected_binding_variant(connector):
+    prepared = authority._registration(_document_by_name(connector))
+    crossed = replace(
+        _receipt("https" if connector is None else None), source_binding_sha256=bytes.fromhex(prepared.binding.digest)
+    )
+    with pytest.raises(authority.RegistrationAuthorityError, match="receipt is invalid"):
+        authority._graph_receipt(crossed, prepared)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable", (False, True))
+async def test_object_graph_errors_preserve_unavailable_boundary(monkeypatch, unavailable):
+    prepared = authority._registration(_document_by_name("https"))
+    failure = (ObjectSourceBindingUnavailableError if unavailable else ObjectSourceBindingError)("synthetic failure")
+    monkeypatch.setattr(authority, "register_source_binding", AsyncMock(side_effect=failure))
+    expected = ObjectSourceBindingUnavailableError if unavailable else authority.RegistrationAuthorityError
+    with pytest.raises(expected) as caught:
+        await authority._register_graph(object(), prepared)
+    if unavailable:
+        assert caught.value is failure

@@ -58,7 +58,7 @@ from db.models.custom_import import (
     CustomImportWinner,
 )
 from process.custom_import import materialization as material
-from process.custom_import import publication, scalar_digest
+from process.custom_import import prepared_source_lineage, publication, scalar_digest
 from process.custom_import.build_graph import (
     _build_storage_models,
     _call,
@@ -596,6 +596,12 @@ def _verify_page(session, request, build_id):
     with _read_transaction(session, request, build_id) as (_build, deadline):
         _build_storage_models(session, build_id)
         _prepare_read(session, request, deadline)
+        prepared_state = prepared_source_lineage.verify_prepared_source_lineage(
+            session, request, build_id, deadline=deadline
+        )
+        if prepared_state is not None:
+            _require_budget(deadline)
+            return prepared_state
         declared_schema = CustomImportBuildAttempt.__table__.schema
         schema_map = session.connection().get_execution_options().get("schema_translate_map") or {}
         schema = schema_map.get(declared_schema, declared_schema)

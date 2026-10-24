@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Portable aggregate quota checks for mixed original and Parquet captures."""
+"""Portable aggregate quota checks for original, Parquet and prepared captures."""
 
 from decimal import Decimal
 from types import SimpleNamespace
@@ -71,6 +71,12 @@ def retained_session():
             Column("dataset_id", BigInteger),
             Column("byte_count", BigInteger),
         ),
+        "prepared": Table(
+            "custom_import_prepared_source",
+            metadata,
+            Column("dataset_id", BigInteger),
+            Column("retained_byte_count", BigInteger),
+        ),
     }
     try:
         with engine.connect() as connection:
@@ -117,15 +123,25 @@ def _seed_mixed_history(session, tables_by_kind):
             {"dataset_id": 4, "byte_count": 1000},
         ],
     )
+    session.connection.execute(
+        tables_by_kind["prepared"].insert(),
+        [
+            {"dataset_id": 3, "retained_byte_count": 13},
+            {"dataset_id": 3, "retained_byte_count": 17},
+            {"dataset_id": 4, "retained_byte_count": 1000},
+        ],
+    )
 
 
 async def test_read_access_checks_only_accounting_columns_without_rows(retained_session):
     session, tables_by_kind = retained_session
     _seed_mixed_history(session, tables_by_kind)
     await require_capture_retention_read_access(session)
-    assert len(session.statements) == 2
+    assert len(session.statements) == 3
     for statement, columns in zip(
-        session.statements, (("dataset_id", "retained_bytes"), ("dataset_id", "byte_count")), strict=True
+        session.statements,
+        (("dataset_id", "retained_bytes"), ("dataset_id", "byte_count"), ("dataset_id", "retained_byte_count")),
+        strict=True,
     ):
         assert tuple(statement.selected_columns.keys()) == columns
         sql = str(statement.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
@@ -134,7 +150,7 @@ async def test_read_access_checks_only_accounting_columns_without_rows(retained_
         assert all(excluded not in sql for excluded in ("payload", "sum(", "UPDATE", "FOR UPDATE"))
 
 
-@pytest.mark.parametrize("counter,expected", [(None, 88), (50, 73), (0, 23)])
+@pytest.mark.parametrize("counter,expected", [(None, 118), (50, 103), (0, 53)])
 async def test_combined_total_uses_counter_or_complete_fallback(retained_session, counter, expected):
     session, tables_by_kind = retained_session
     _seed_mixed_history(session, tables_by_kind)
@@ -157,14 +173,15 @@ async def test_total_is_fresh_and_empty_missing_counter_is_not_an_error(retained
     assert len(session.statements) == 2
 
 
-async def test_one_postgresql_statement_scopes_all_three_totals_to_dataset(retained_session):
+async def test_one_postgresql_statement_scopes_all_four_totals_to_dataset(retained_session):
     session, _ = retained_session
     await validate_dataset_retained_bytes(session, dataset_id=3, new_byte_count=5, maximum_retained_bytes=5)
     assert len(session.statements) == 1
     sql = str(session.statements[0].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
-    assert sql.count(".dataset_id = 3") == 3
+    assert sql.count(".dataset_id = 3") == 4
     assert "coalesce((SELECT" in sql
     assert "custom_import_capture_usage.retained_bytes" in sql
+    assert "custom_import_prepared_source.retained_byte_count" in sql
     assert "JOIN" in sql and "capture_bundle_id =" in sql
     assert "octet_length(convert_to(" in sql and "'UTF8'" in sql
     assert "sum(CAST(" in sql and " AS NUMERIC)" in sql
@@ -172,6 +189,8 @@ async def test_one_postgresql_statement_scopes_all_three_totals_to_dataset(retai
         "capture_state",
         "definition_revision_id",
         "schema_revision_id",
+        "custom_import_prepared_source_part",
+        "custom_import_execution",
         ".payload",
         "UPDATE",
         "FOR UPDATE",
