@@ -135,6 +135,21 @@ def test_source_type_retains_real_and_never_fabricates_fixed_precision(source_ty
     assert _source_type(SimpleNamespace(type_code=1), field_types=(None, SimpleNamespace(name="REAL"))) == "REAL"
 
 
+def test_sparse_driver_type_map_preserves_exact_fixed_metadata():
+    field_type_by_code = {0: "FIXED", 7: "TEXT"}
+    assert _source_type(SimpleNamespace(type_code=7), field_types=field_type_by_code) == "TEXT"
+    assert (
+        _source_type(SimpleNamespace(type_code=0, precision=38, scale=12), field_types=field_type_by_code)
+        == "FIXED(38,12)"
+    )
+
+
+@pytest.mark.parametrize("type_code", (True, False, -1, 1, 99, None, "7"))
+def test_driver_type_map_refuses_missing_or_invalid_codes(type_code):
+    with pytest.raises(SnowflakeConnectorError, match="type is unavailable"):
+        _source_type(SimpleNamespace(type_code=type_code), field_types={7: "TEXT"})
+
+
 @pytest.mark.parametrize("invalid", [None, {}, [], {"score": "round"}, {"missing": FLOAT_DECIMAL_CONVERSION}])
 def test_binding_rejects_invalid_present_conversion_map(invalid):
     definition, binding = _binding(opted_in=False)

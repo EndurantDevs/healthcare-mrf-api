@@ -369,6 +369,25 @@ def test_duplicate_and_missing_headers_are_rejected_without_mapping_loss(name):
 
 
 @pytest.mark.parametrize(
+    "pair",
+    [
+        None,
+        ("Content-Type",),
+        ("Content-Type", "application/octet-stream", "extra"),
+        (None, "application/octet-stream"),
+        ("x" * 65, "application/octet-stream"),
+        ("Content-Typé", "application/octet-stream"),
+    ],
+)
+def test_malformed_header_pairs_are_rejected_before_context_parsing(monkeypatch, pair):
+    def unread(*_args, **_kwargs):
+        raise AssertionError("malformed headers must not reach permit parsing")
+
+    monkeypatch.setattr(auth, "_permit", unread)
+    rejected(verify, headers=[pair, *signed_headers()[1:]])
+
+
+@pytest.mark.parametrize(
     "name,value",
     [
         ("Content-Type", "application/json"),

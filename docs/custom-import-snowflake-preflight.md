@@ -12,6 +12,13 @@ approved relation and column mapping, then calls the connector's
 `prepare_request` and `build_statement` methods before generating one separate
 preview-only `SELECT`. It never changes the production bundle statement.
 
+The Python adapter keeps certificate and revocation verification enabled.
+Revoked certificates and unavailable or invalid certificate revocation lists
+refuse the connection; certificates without a CRL distribution URL remain
+allowed. This deliberately replaces the earlier fail-open behavior when a
+revocation service is unavailable. Login, query, request and CRL timeouts remain
+bounded, and temporary credential caching is disabled.
+
 ## Standalone local operator
 
 An authorized local operator can run one retained binding by revision IDs:
