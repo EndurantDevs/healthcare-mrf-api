@@ -4,10 +4,13 @@
 from db.plan_release_storage import BINDING_TABLE, PIN_TABLE, REVISION_TABLE, storage_identifier, storage_relation
 from process.plan_release_preparation_pin_catalog import require_preparation_pin_heap
 from process.plan_release_preparation_pin_contract import (
+    PlanReleasePublication,
     PreparationPinAuthority,
     PreparationPinInputs,
     PreparationPinReceipt,
     PreparationPinScope,
+    canonical_json,
+    digest,
     require,
 )
 from process.plan_release_storage_custody import require_plan_release_storage_custody
@@ -239,3 +242,190 @@ async def require_preparation_pins(
         require(after.registered_receipt == receipt, "pin_serving_custody_changed")
         await _post_storage(connection, storage_schema, roles, root_oid, owner_oid)
         return receipt
+
+
+def _publication_options(options_by_name):
+    required_names = {"owner_role", "publisher_role", "reader_roles", "authority"}
+    require(
+        required_names <= set(options_by_name) <= required_names | {"control_reader_roles"},
+        "publication_options_invalid",
+    )
+    roles = _roles(
+        *(options_by_name[name] for name in ("owner_role", "publisher_role", "reader_roles")),
+        options_by_name.get("control_reader_roles", ()),
+    )
+    require(callable(options_by_name["authority"]), "native_authority_required")
+    return roles, options_by_name["authority"]
+
+
+async def _original_publisher_identity(connection, roles):
+    require(connection.is_in_transaction(), "caller_transaction_required")
+    identity = await connection.fetchrow(
+        "SELECT (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,"
+        "pg_backend_pid() AS backend_pid,pg_current_xact_id()::text AS transaction_id,"
+        "session_user::text AS session,current_user::text AS current"
+    )
+    require(identity["session"] == identity["current"] == roles["publisher_role"], "original_publisher_required")
+    return tuple(identity[name] for name in ("database_oid", "backend_pid", "transaction_id", "session", "current"))
+
+
+def _publication_witness(witness, publication, inputs, receipt, *, published):
+    require(
+        witness.publication_digest == digest(publication.payload())
+        and publication.binding_set_digest == receipt.scope.binding_inputs_digest,
+        "publication_authority_changed",
+    )
+    require(
+        witness.registered_receipt == receipt
+        and witness.binding_heap == inputs.binding_heap
+        and witness.prepared_pin_heap == inputs.pin_heap
+        and receipt.heap == inputs.pin_heap,
+        "publication_inventory_changed",
+    )
+    require(
+        witness.preparation_status == ("published" if published else "sealed")
+        and (not published or witness.writers_closed)
+        and witness.require_settled() == receipt.retained_revision_ids == (publication.serving_revision_id,)
+        and receipt.scope.revision_ids == (publication.serving_revision_id,)
+        and inputs.binding_heap.row_count == publication.expected_binding_count,
+        "publication_cohort_changed",
+    )
+
+
+async def _lock_current_header(connection, storage_schema, publication, expected_current):
+    """Fence absent headers as well as rows against native header writers.
+
+    This serializes plans in the same schema through the caller's transaction.
+    Native binding ATTACH also serializes publication on its shared parent.
+    """
+    require(
+        expected_current is None
+        or type(expected_current) is tuple
+        and len(expected_current) == 2
+        and all(type(value) is str for value in expected_current),
+        "current_header_identity_invalid",
+    )
+    relation = storage_relation(storage_schema, REVISION_TABLE)
+    await connection.execute(f"LOCK TABLE {relation} IN SHARE ROW EXCLUSIVE MODE")
+    headers = await connection.fetch(
+        f"SELECT serving_revision_id,binding_set_digest FROM {relation} WHERE healthporta_plan_id=$1 AND is_current FOR UPDATE",
+        publication.healthporta_plan_id,
+    )
+    actual = (
+        tuple(headers[0][name] for name in ("serving_revision_id", "binding_set_digest")) if len(headers) == 1 else None
+    )
+    require(len(headers) <= 1 and actual == expected_current, "current_header_changed")
+
+
+async def _write_publication_header(connection, storage_schema, publication):
+    relation = storage_relation(storage_schema, REVISION_TABLE)
+    await connection.execute(
+        f"UPDATE {relation} SET release_status=CASE WHEN plan_release_id<>$2 THEN 'superseded' ELSE release_status END,"
+        "is_current=false,serving_status='retired',retired_at=coalesce(retired_at,transaction_timestamp()) "
+        "WHERE healthporta_plan_id=$1 AND is_current",
+        publication.healthporta_plan_id,
+        publication.plan_release_id,
+    )
+    await connection.execute(
+        f"INSERT INTO {relation}(serving_revision_id,plan_release_id,healthporta_plan_id,plan_version_id,release_month,"
+        "expected_binding_count,binding_set_digest,source_manifest,release_status,serving_status,is_current,published_at) "
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'published','published',true,transaction_timestamp())",
+        publication.serving_revision_id,
+        publication.plan_release_id,
+        publication.healthporta_plan_id,
+        publication.plan_version_id,
+        publication.release_month,
+        publication.expected_binding_count,
+        publication.binding_set_digest,
+        canonical_json(publication.source_manifest),
+    )
+
+
+async def _publish_native_binding(connection, storage_schema, publication, inputs, receipt, expected_current, roles):
+    await _owner(connection, roles)
+    await _heap(connection, storage_schema, inputs.binding_heap, roles, pin=False)
+    await _planned_inputs(connection, storage_schema, receipt.scope, inputs.binding_heap, receipt.heap)
+    await _lock_current_header(connection, storage_schema, publication, expected_current)
+    await connection.execute(
+        f"ALTER TABLE {storage_relation(storage_schema, BINDING_TABLE)} ATTACH PARTITION "
+        f"{storage_relation(inputs.binding_heap.schema, inputs.binding_heap.name)} "
+        f"FOR VALUES IN ({_bounds(receipt.retained_revision_ids)})"
+    )
+    await _write_publication_header(connection, storage_schema, publication)
+    await _publisher(connection, roles)
+
+
+async def _require_published_header(connection, storage_schema, publication, roles):
+    await _owner(connection, roles)
+    row = await connection.fetchrow(
+        f"SELECT serving_revision_id,plan_release_id,healthporta_plan_id,plan_version_id,release_month,"
+        f"expected_binding_count,binding_set_digest,source_manifest FROM {storage_relation(storage_schema, REVISION_TABLE)} "
+        "WHERE serving_revision_id=$1 AND is_current AND release_status='published' AND serving_status='published' "
+        "AND published_at IS NOT NULL AND retired_at IS NULL",
+        publication.serving_revision_id,
+    )
+    await _publisher(connection, roles)
+    require(row is not None, "published_header_changed")
+    from process.plan_release_storage_custody import _document
+
+    actual_by_field = dict(row)
+    actual_by_field["source_manifest"] = _document(actual_by_field["source_manifest"])
+    require(actual_by_field == publication.payload(), "published_header_changed")
+
+
+async def _require_published_inventory(connection, storage_schema, inputs, receipt, roles):
+    await _owner(connection, roles)
+    binding_root = await connection.fetchval(
+        "SELECT to_regclass($1)::oid", storage_relation(storage_schema, BINDING_TABLE)
+    )
+    await _heap(connection, storage_schema, inputs.binding_heap, roles, pin=False, parent_oid=binding_root)
+    await _heap(connection, storage_schema, receipt.heap, roles, pin=True, parent_oid=receipt.root_oid)
+    await _publisher(connection, roles)
+    await _post_storage(connection, storage_schema, roles, receipt.root_oid, receipt.owner_oid)
+
+
+async def publish_prepared_plan_release(
+    connection, storage_schema, publication, *, inputs, receipt, expected_current, **publication_options
+):
+    """Attach one authorized binding and header atomically with caller-owned metadata.
+
+    Header writes serialize across plans. Lock waits are capped at 500 ms and
+    each SQL statement at 5 s; neither bounds callbacks or the outer transaction.
+    Keep that transaction short, with no network work. After a lock timeout,
+    roll it back and retry with freshly authorized current-header state in a
+    new original Publisher transaction, not just a new helper savepoint.
+    """
+    require(type(publication) is PlanReleasePublication, "publication_required")
+    require(
+        type(inputs) is PreparationPinInputs and type(receipt) is PreparationPinReceipt, "native_heap_receipts_required"
+    )
+    publication.validate()
+    inputs.validate()
+    receipt.validate()
+    roles, authority = _publication_options(publication_options)
+    original = await _original_publisher_identity(connection, roles)
+    publication_digest = digest(publication.payload())
+    try:
+        async with connection.transaction():
+            await require_preparation_pins(connection, storage_schema, receipt, authority=authority, **roles)
+            before = await _authorize(
+                connection, receipt.scope, authority, action="publish", phase="before", observed=receipt
+            )
+            require(await _original_publisher_identity(connection, roles) == original, "original_transaction_changed")
+            _publication_witness(before, publication, inputs, receipt, published=False)
+            require(digest(publication.payload()) == publication_digest, "publication_header_changed")
+            await _publish_native_binding(
+                connection, storage_schema, publication, inputs, receipt, expected_current, roles
+            )
+            after = await _authorize(
+                connection, receipt.scope, authority, action="publish", phase="after", observed=receipt
+            )
+            require(await _original_publisher_identity(connection, roles) == original, "original_transaction_changed")
+            _publication_witness(after, publication, inputs, receipt, published=True)
+            require(digest(publication.payload()) == publication_digest, "publication_header_changed")
+            await _require_published_header(connection, storage_schema, publication, roles)
+            await _require_published_inventory(connection, storage_schema, inputs, receipt, roles)
+            require(await _original_publisher_identity(connection, roles) == original, "original_transaction_changed")
+    finally:
+        if connection.is_in_transaction():
+            await _publisher(connection, roles)

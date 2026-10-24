@@ -51,13 +51,12 @@ from process.geo_source_archive import (
     create_model_family_archive_schema,
     create_model_family_export_clone,
     create_model_family_predecessor_schema,
+    has_compatible_geo_indexes,
     model_family_publisher_owner,
     preserve_geo_cut_reads,
     seal_model_family_relation,
 )
-from process.geo_source_archive import (
-    geo_cut_savepoint as _doctors_cut_savepoint,
-)
+from process.geo_source_archive import geo_cut_savepoint as _doctors_cut_savepoint
 from process.mrf_address_publication import (
     MODEL_CLOSURE_CONTRACT,
     STAGE_TABLE,
@@ -1431,7 +1430,7 @@ async def _capture_reference_family_source(
         if spec.importer_id == "geo":
             from process.geo_source_storage import require_geo_storage
 
-            await require_geo_storage(session, schema_name=schema)
+            await require_geo_storage(session, schema_name=schema, is_incumbent=True)
             if source_capture_contract not in (None, IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT):
                 raise ReferenceFamilyArchiveError("Geo capture requires immutable native storage")
             source_capture_contract = IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT
@@ -2185,6 +2184,8 @@ def _is_legacy_cms_manifest(manifest: ReferenceFamilyManifest) -> bool:
 
 
 def _has_matching_manifest_stage_tables(manifest, tables) -> bool:
+    if manifest.importer_id == "geo":
+        return has_compatible_geo_indexes(manifest, tables)
     if not _is_legacy_cms_manifest(manifest):
         return tables == manifest.tables or _has_compatible_cms_group_indexes(manifest, tables)
     return (
@@ -2198,12 +2199,9 @@ def _has_matching_manifest_stage_tables(manifest, tables) -> bool:
 
 def _has_compatible_cms_group_indexes(manifest, tables) -> bool:
     """Allow only the reviewed address-index addition on an otherwise exact CMS family."""
-    if (
-        manifest.importer_id != "cms-doctors"
-        or len(manifest.tables) != 3
-        or len(tables) != 3
-        or tables[:2] != manifest.tables[:2]
-    ):
+    if manifest.importer_id != "cms-doctors" or len(manifest.tables) != 3 or len(tables) != 3:
+        return False
+    if tables[:2] != manifest.tables[:2]:
         return False
     expected, observed = manifest.tables[2], tables[2]
     expected_fields, observed_fields = expected.as_dict(), observed.as_dict()
@@ -2215,9 +2213,11 @@ def _has_compatible_cms_group_indexes(manifest, tables) -> bool:
 
 
 def _has_matching_family_manifest(manifest, observed) -> bool:
-    """Keep exact manifest identity except the reviewed CMS lookup-index transition."""
+    """Keep exact manifest identity except the reviewed CMS and Geo index transitions."""
     expected_fields, observed_fields = manifest.as_dict(), observed.as_dict()
-    if _has_compatible_cms_group_indexes(manifest, observed.tables):
+    if manifest.importer_id == "geo" and not has_compatible_geo_indexes(manifest, observed.tables):
+        return False
+    if manifest.importer_id == "geo" or _has_compatible_cms_group_indexes(manifest, observed.tables):
         observed_fields["tables"] = expected_fields["tables"]
         observed_fields["schema_sha256"] = expected_fields["schema_sha256"]
     return expected_fields == observed_fields

@@ -253,7 +253,7 @@ def _column_shape(model):
     return sorted(columns)
 
 
-async def _shape(session, model, oid, *, indexed, is_legacy_group=False):
+async def _shape(session, model, oid, *, indexed, is_legacy_group=False, is_geo_incumbent=False):
     columns = (
         await session.execute(
             text(
@@ -288,13 +288,25 @@ async def _shape(session, model, oid, *, indexed, is_legacy_group=False):
             )
         ).all()
         actual_keys = {(unique, tuple(names)) for unique, names in indexes}
+        from db.models import GeoZipLookup
+
+        if model is GeoZipLookup:
+            _require(len(indexes) == len(actual_keys), "indexes_duplicated")
         required = {(True, keys)} | {
             (False, tuple(index["index_elements"])) for index in getattr(model, "__my_additional_indexes__", ())
         }
-        _require(_index_shape_matches(model, required, actual_keys, is_legacy_group), "indexes_incomplete")
+        _require(
+            _index_shape_matches(model, required, actual_keys, is_legacy_group, is_geo_incumbent), "indexes_incomplete"
+        )
 
 
-def _index_shape_matches(model, required, actual, is_legacy_group):
+def _index_shape_matches(model, required, actual, is_legacy_group, is_geo_incumbent=False):
+    from db.models import GeoZipLookup
+
+    if is_geo_incumbent and model is GeoZipLookup:
+        from process.geo_source_storage import GEO_LEGACY_INDEX_PROFILES
+
+        return actual == required or actual in GEO_LEGACY_INDEX_PROFILES
     return actual == required or (
         is_legacy_group and model is _models()[2] and actual == required - {(False, ("adrs_id",))}
     )
@@ -385,7 +397,7 @@ async def _require_read_pointer(session, schema, pairs):
     )
 
 
-async def _heap_custody(session, model, schema, name, oid, owner, *, is_legacy_group=False):
+async def _heap_custody(session, model, schema, name, oid, owner, *, is_legacy_group=False, is_geo_incumbent=False):
     """Authenticate native identity before inspecting a fixed model or its payload."""
     relation = storage_relation(schema, name)
     await session.execute(text(f"LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE NOWAIT"))
@@ -415,7 +427,7 @@ async def _heap_custody(session, model, schema, name, oid, owner, *, is_legacy_g
         {"oid": oid, "owner": owner, "relation": relation},
     )
     _require(safe is True, "storage_changed")
-    await _shape(session, model, oid, indexed=True, is_legacy_group=is_legacy_group)
+    await _shape(session, model, oid, indexed=True, is_legacy_group=is_legacy_group, is_geo_incumbent=is_geo_incumbent)
 
 
 async def _legacy_hooks(session, schema, oids):

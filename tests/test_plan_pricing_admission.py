@@ -44,6 +44,36 @@ async def test_only_exact_complete_bulk_revision_activates(revision, controls, m
             await is_managed_storage_installed(connection)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("controls", [(None, None), (1, None), (None, 2), (1, 2)])
+@pytest.mark.parametrize(
+    "revisions", [("scalar_successor",), ("unknown_revision",), (BULK_REVISION,), ("scalar_successor", "other")]
+)
+async def test_qualified_historical_layout_never_confers_managed_admission(tmp_path, monkeypatch, controls, revisions):
+    from process import plan_pricing_control_policy as policy
+
+    path = tmp_path / "historical.json"
+    path.write_text(
+        json.dumps(
+            {"contract": policy.HISTORICAL_POLICY_CONTRACT, "schema": "control_catalog", "revision": "scalar_successor"}
+        )
+    )
+    monkeypatch.setattr(policy, "HISTORICAL_POLICY_PATH", path)
+    monkeypatch.setenv("HLTHPRT_PLAN_PRICING_CONTROL_SCHEMA", "control_catalog")
+    connection = AsyncMock()
+    connection.fetch.side_effect = (
+        [{"oid": value} for value in (*controls, 3)],
+        [{"version_num": value} for value in revisions],
+    )
+    if not any(controls) and revisions == ("scalar_successor",):
+        assert await is_managed_storage_installed(connection) is False
+    elif all(controls) and revisions == (BULK_REVISION,):
+        assert await is_managed_storage_installed(connection) is True
+    else:
+        with pytest.raises(ValueError, match="schema_revision_invalid"):
+            await is_managed_storage_installed(connection)
+
+
 @pytest.fixture(params=(None, "parent-run"), ids=("reserved", "retry"))
 def missing_control_storage(monkeypatch, request):
     from db.models import db
@@ -247,6 +277,145 @@ def test_managed_worker_receives_same_trusted_schema_only(monkeypatch):
     monkeypatch.delenv("HLTHPRT_PLAN_PRICING_CONTROL_SCHEMA")
     with pytest.raises(ValueError):
         pricing_worker_policy_environment(worker_payload)
+
+
+def historical_worker(tmp_path, monkeypatch, *, revision="scalar_successor"):
+    from api.plan_pricing_worker_policy import HistoricalPricingWorkerPolicy
+    from process import plan_pricing_control_policy as policy
+
+    path = tmp_path / "historical.json"
+    path.write_text(
+        json.dumps({"contract": policy.HISTORICAL_POLICY_CONTRACT, "schema": "control_catalog", "revision": revision})
+    )
+    monkeypatch.setattr(policy, "HISTORICAL_POLICY_PATH", path)
+    monkeypatch.setenv("HLTHPRT_PLAN_PRICING_CONTROL_SCHEMA", "control_catalog")
+    monkeypatch.setenv("HLTHPRT_PLAN_PRICING_HISTORICAL_CONFIGMAP", "historical-policy")
+    spec, worker_payload = _worker()
+    worker_payload.pricing_control_admission = None
+    worker_payload.historical_pricing_policy = HistoricalPricingWorkerPolicy("control_catalog", revision, "exact-run")
+    return spec, worker_payload, path
+
+
+def test_historical_worker_receives_only_qualified_scalar_policy(tmp_path, monkeypatch):
+    from api.plan_pricing_worker_policy import pricing_worker_policy_environment
+
+    spec, worker_payload, _path = historical_worker(tmp_path, monkeypatch)
+    worker_payload.update(revision="request_revision", policy_path="/untrusted", configmap="request-map")
+    assert pricing_worker_policy_volumes(spec, worker_payload) == [
+        {
+            "volume": {
+                "name": "pricing-control-policy",
+                "projected": {
+                    "defaultMode": 292,
+                    "sources": [
+                        {
+                            "configMap": {
+                                "name": "historical-policy",
+                                "optional": False,
+                                "items": [{"key": "historical.json", "path": "historical.json"}],
+                            }
+                        }
+                    ],
+                },
+            },
+            "volumeMount": {"name": "pricing-control-policy", "mountPath": "/etc/pricing-control", "readOnly": True},
+        }
+    ]
+    assert pricing_worker_policy_environment(worker_payload) == [
+        {"name": "HLTHPRT_PLAN_PRICING_CONTROL_SCHEMA", "value": "control_catalog"}
+    ]
+    assert pricing_worker_policy_volumes(spec, dict(worker_payload)) == []
+    assert pricing_worker_policy_environment(dict(worker_payload)) == []
+    assert worker_payload.pricing_control_admission is None
+
+
+@pytest.mark.parametrize("damage", ["run", "importer", "queue", "missing", "changed", "reference"])
+def test_historical_worker_refuses_changed_identity_or_policy(tmp_path, monkeypatch, damage):
+    spec, worker_payload, path = historical_worker(tmp_path, monkeypatch)
+    match damage:
+        case "run":
+            worker_payload["run_id"] = "foreign-run"
+        case "importer":
+            worker_payload["importer"] = "unrelated-importer"
+        case "queue":
+            spec = WorkerSpec("arq:other", "process.Other", ("plan-pricing-projection",))
+        case "missing":
+            path.unlink()
+        case "changed":
+            declared = json.loads(path.read_text())
+            declared["revision"] = "changed_revision"
+            path.write_text(json.dumps(declared))
+        case "reference":
+            monkeypatch.delenv("HLTHPRT_PLAN_PRICING_HISTORICAL_CONFIGMAP")
+    with pytest.raises(ValueError):
+        pricing_worker_policy_volumes(spec, worker_payload)
+
+
+def test_builtin_historical_worker_preserves_serialized_policy(tmp_path, monkeypatch):
+    from api.plan_pricing_worker_policy import pricing_worker_policy_environment
+
+    spec, worker_payload, path = historical_worker(tmp_path, monkeypatch, revision=min(HISTORICAL_REVISIONS))
+    path.unlink()
+    assert pricing_worker_policy_volumes(spec, worker_payload) == []
+    assert pricing_worker_policy_environment(worker_payload) == [
+        {"name": "HLTHPRT_PLAN_PRICING_CONTROL_SCHEMA", "value": "control_catalog"}
+    ]
+    assert worker_payload.pricing_control_admission is None
+
+
+@pytest.mark.asyncio
+async def test_server_qualifies_historical_worker_without_managed_grant(monkeypatch):
+    from api import plan_pricing_worker_policy as workers
+
+    _spec, worker_payload = _worker()
+    worker_payload.pricing_control_admission = None
+    connection = AsyncMock()
+    connection.fetchrow.return_value = {
+        "importer": "plan-pricing-projection",
+        "params": {},
+        "idempotency_key": "plan-pricing-projection:" + "a" * 64,
+    }
+    monkeypatch.setattr(workers, "require_managed_pricing_admission", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        workers, "pricing_control_layout", AsyncMock(return_value=("control_catalog", "scalar_successor", False))
+    )
+    assert await workers.admit_pricing_worker(connection, "exact-run", worker_payload) is None
+    assert worker_payload.historical_pricing_policy == workers.HistoricalPricingWorkerPolicy(
+        "control_catalog", "scalar_successor", "exact-run"
+    )
+
+
+def test_job_container_includes_historical_policy_and_schema(tmp_path, monkeypatch):
+    from api import control_workers
+
+    spec, worker_payload, _path = historical_worker(tmp_path, monkeypatch)
+    container, volumes, run_id = control_workers._worker_job_container(
+        spec, worker_payload, "registry.example/worker:synthetic"
+    )
+    assert run_id == "exact-run"
+    assert {"name": "HLTHPRT_PLAN_PRICING_CONTROL_SCHEMA", "value": "control_catalog"} in container["env"]
+    selected_volumes = [volume for volume in volumes if volume["volume"]["name"] == "pricing-control-policy"]
+    assert selected_volumes == pricing_worker_policy_volumes(spec, worker_payload)
+    assert selected_volumes[0]["volumeMount"] in container["volumeMounts"]
+
+
+def test_process_worker_inherits_qualified_schema_and_fixed_policy(tmp_path, monkeypatch):
+    from api import control_workers
+
+    spec, worker_payload, path = historical_worker(tmp_path, monkeypatch)
+    monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
+    started_environments = []
+
+    def start(_command, **options):
+        started_environments.append(options["env"])
+        return SimpleNamespace(pid=42)
+
+    monkeypatch.setattr(control_workers.subprocess, "Popen", start)
+    assert control_workers._start_process(spec, worker_payload) == 42
+    assert started_environments[0]["HLTHPRT_PLAN_PRICING_CONTROL_SCHEMA"] == "control_catalog"
+    assert started_environments[0]["HLTHPRT_CONTROL_RUN_ID"] == "exact-run"
+    assert path.exists()
 
 
 @pytest.mark.asyncio

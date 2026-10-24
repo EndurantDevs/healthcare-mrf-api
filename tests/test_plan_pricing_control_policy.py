@@ -90,3 +90,38 @@ def test_control_schema_requires_explicit_bounded_deployment_identifier(monkeypa
 def test_control_schema_has_no_request_or_default_fallback(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PLAN_PRICING_CONTROL_SCHEMA", "pricing_control")
     assert policy.pricing_control_schema() == "pricing_control"
+
+
+def _historical_document():
+    return {"contract": policy.HISTORICAL_POLICY_CONTRACT, "schema": "control_catalog", "revision": "scalar_successor"}
+
+
+def test_historical_policy_qualifies_only_exact_independent_identity(tmp_path, monkeypatch):
+    path = tmp_path / "historical.json"
+    path.write_text(json.dumps(_historical_document()))
+    monkeypatch.setattr(policy, "HISTORICAL_POLICY_PATH", path)
+    assert policy.is_qualified_historical_revision("control_catalog", "scalar_successor")
+    assert not policy.is_qualified_historical_revision("other_catalog", "scalar_successor")
+    assert not policy.is_qualified_historical_revision("control_catalog", "other_revision")
+    path.unlink()
+    monkeypatch.setenv("HLTHPRT_PLAN_PRICING_HISTORICAL_REVISION", "scalar_successor")
+    assert not policy.is_qualified_historical_revision("control_catalog", "scalar_successor")
+
+
+@pytest.mark.parametrize("damage", ["contract", "schema", "revision", "extra", "duplicate", "oversized"])
+def test_historical_policy_is_closed_bounded_and_unambiguous(tmp_path, monkeypatch, damage):
+    document = _historical_document()
+    if damage in {"contract", "schema", "revision"}:
+        document[damage] = "invalid value"
+    elif damage == "extra":
+        document["managed"] = True
+    encoded = json.dumps(document)
+    if damage == "duplicate":
+        encoded = '{"revision":"first",' + encoded[1:]
+    elif damage == "oversized":
+        encoded = encoded.ljust(8193)
+    path = tmp_path / "historical.json"
+    path.write_text(encoded)
+    monkeypatch.setattr(policy, "HISTORICAL_POLICY_PATH", path)
+    with pytest.raises(ValueError, match="historical policy is unavailable or invalid"):
+        policy.is_qualified_historical_revision("control_catalog", "scalar_successor")

@@ -56,7 +56,9 @@ async def provision_geo_source_storage(
         require(type(oid) is int and oid > 0, "relation_changed")
         await verify_legacy_guards(native, policy, oid)
         await _close_geo_access(session, native, policy, oid)
-        await require_geo_storage(session, schema_name=policy.schema, legacy=True, native_policy=policy)
+        await require_geo_storage(
+            session, schema_name=policy.schema, legacy=True, native_policy=policy, is_incumbent=True
+        )
         select = ",".join(storage_identifier(name) for name in GENERATION_SELECT)
         update = ",".join(storage_identifier(name) for name in GENERATION_UPDATE)
         await native.execute(
@@ -78,7 +80,8 @@ async def provision_geo_source_storage(
         )
         require(changed == "geo", "generation_unavailable")
         require(
-            await require_geo_storage(session, schema_name=policy.schema, native_policy=policy) == oid,
+            await require_geo_storage(session, schema_name=policy.schema, native_policy=policy, is_incumbent=True)
+            == oid,
             "relation_changed",
         )
         await verify_role_profile(native, policy.schema, **policy.role_arguments())

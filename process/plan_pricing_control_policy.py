@@ -12,6 +12,8 @@ from process.source_profile_result_pins import _policy_object, _role_policy
 
 NAMESPACE_POLICY_PATH = Path("/etc/pricing-control/namespace-role-policy.json")
 PREPARATION_POLICY_PATH = Path("/etc/pricing-control/preparation.json")
+HISTORICAL_POLICY_PATH = Path("/etc/pricing-control/historical.json")
+HISTORICAL_POLICY_CONTRACT = "plan-pricing-historical-control-v1"
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,27 @@ def load_pricing_control_policy():
         )
     except OSError, TypeError, ValueError:
         raise ValueError("pricing control policy is unavailable or invalid") from None
+
+
+def is_qualified_historical_revision(schema, revision):
+    """Match one independently qualified scalar layout without granting managed authority."""
+    try:
+        declared = _read_policy_file(HISTORICAL_POLICY_PATH)
+        if type(declared) is not dict or set(declared) != {"contract", "schema", "revision"}:
+            raise ValueError("invalid historical policy")
+        if (
+            declared["contract"] != HISTORICAL_POLICY_CONTRACT
+            or type(declared["schema"]) is not str
+            or re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", declared["schema"]) is None
+            or type(declared["revision"]) is not str
+            or re.fullmatch(r"[A-Za-z0-9_]{1,64}", declared["revision"]) is None
+        ):
+            raise ValueError("invalid historical policy")
+        return declared["schema"] == schema and declared["revision"] == revision
+    except FileNotFoundError:
+        return False
+    except OSError, TypeError, ValueError:
+        raise ValueError("pricing historical policy is unavailable or invalid") from None
 
 
 def pricing_control_schema():

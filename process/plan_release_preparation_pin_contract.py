@@ -13,7 +13,9 @@ from process.ptg_parts.snapshot_tables import _normalize_source_key
 CONTRACT = "plan-release-preparation-pins-v1"
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^hpserve_[0-9A-HJKMNP-TV-Z]{26}$")
-ADMISSION_STATUSES = frozenset({"reserved", "dispatching", "accepted", "ready", "unavailable", "failed"})
+ADMISSION_STATUSES = frozenset(
+    {"reserved", "dispatching", "accepted", "ready", "unavailable", "failed", "not_required"}
+)
 
 
 def require(condition, code):
@@ -37,6 +39,59 @@ def _is_ordered(values, *, maximum=100_000):
         return type(values) is tuple and 0 < len(values) <= maximum and tuple(sorted(set(values))) == values
     except TypeError, ValueError:
         return False
+
+
+@dataclass(frozen=True)
+class PlanReleasePublication:
+    serving_revision_id: str
+    plan_release_id: str
+    healthporta_plan_id: str
+    plan_version_id: str | None
+    release_month: str
+    expected_binding_count: int
+    binding_set_digest: str
+    source_manifest: dict
+
+    def validate(self):
+        """Bind a canonical header to the existing native model constraints."""
+        for prefix, registry_id in (
+            ("hpserve", self.serving_revision_id),
+            ("hprelease", self.plan_release_id),
+            ("hpplan", self.healthporta_plan_id),
+            ("hpversion", self.plan_version_id),
+        ):
+            if prefix == "hpversion" and registry_id is None:
+                continue
+            require(
+                type(registry_id) is str and re.fullmatch(prefix + r"_[0-9A-HJKMNP-TV-Z]{26}", registry_id),
+                "publication_identity_invalid",
+            )
+        require(
+            type(self.release_month) is str and re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", self.release_month),
+            "publication_month_invalid",
+        )
+        require(
+            type(self.expected_binding_count) is int and 0 < self.expected_binding_count <= 2_147_483_647,
+            "publication_count_invalid",
+        )
+        require(
+            type(self.binding_set_digest) is str and _HEX.fullmatch(self.binding_set_digest),
+            "publication_digest_invalid",
+        )
+        try:
+            encoded = json.dumps(self.source_manifest, allow_nan=False)
+            require(
+                type(self.source_manifest) is dict and json.loads(encoded) == self.source_manifest,
+                "publication_manifest_invalid",
+            )
+        except TypeError, ValueError, OverflowError, RecursionError:
+            raise ValueError("plan_release_preparation_pin_publication_manifest_invalid") from None
+        return self
+
+    def payload(self):
+        """Return the exact header authorized by the protected publication cut."""
+        self.validate()
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -154,6 +209,46 @@ class PreparationPinInputs:
 
 
 @dataclass(frozen=True)
+class PlanReleaseHistoryAuthority:
+    cut_digest: str
+    publication_digest: str
+    operation: str
+    expected_current: tuple[str, str] | None
+    eligible_revision_ids: tuple[str, ...]
+    detached_pin_heap: PreparationPinHeap | None = None
+
+    def validate(self):
+        """Authorize one fixed operation on actual retained native history."""
+        require(
+            all(type(value) is str and _HEX.fullmatch(value) for value in (self.cut_digest, self.publication_digest)),
+            "history_authority_invalid",
+        )
+        require(
+            type(self.operation) is str and self.operation in {"repair", "withdraw", "detach", "reactivate"},
+            "history_operation_invalid",
+        )
+        require(
+            _is_ordered(self.eligible_revision_ids)
+            and all(type(value) is str and _REVISION.fullmatch(value) for value in self.eligible_revision_ids),
+            "history_revision_identity_invalid",
+        )
+        require(
+            self.expected_current is None
+            or type(self.expected_current) is tuple
+            and len(self.expected_current) == 2
+            and type(self.expected_current[0]) is str
+            and _REVISION.fullmatch(self.expected_current[0])
+            and type(self.expected_current[1]) is str
+            and _HEX.fullmatch(self.expected_current[1]),
+            "current_header_identity_invalid",
+        )
+        if self.detached_pin_heap is not None:
+            require(type(self.detached_pin_heap) is PreparationPinHeap, "history_pin_identity_invalid")
+            self.detached_pin_heap.validate()
+        return self
+
+
+@dataclass(frozen=True)
 class PreparationPinReceipt:
     scope: PreparationPinScope
     heap: PreparationPinHeap
@@ -225,6 +320,14 @@ class PreparationPinAdmission:
             self.engine_run_id is None or type(self.engine_run_id) is str and 0 < len(self.engine_run_id) <= 128,
             "admission_run_invalid",
         )
+        require(
+            self.status != "not_required"
+            or self.dispatch_count == 0
+            and self.engine_run_id is None
+            and self.remaining_work == 0
+            and not self.retryable,
+            "unneeded_admission_has_work",
+        )
         return self
 
 
@@ -240,6 +343,7 @@ class PreparationPinAuthority:
     binding_heap: PreparationPinHeap | None = None
     prepared_pin_heap: PreparationPinHeap | None = None
     cleaned_receipts: tuple[PreparationPinReceipt, ...] = ()
+    publication_digest: str | None = None
 
     def validate(self, scope):
         """Require the complete native protected owner and admission witness."""
@@ -275,12 +379,11 @@ class PreparationPinAuthority:
         self.binding_heap.validate()
         self.prepared_pin_heap.validate()
         require(type(self.writers_closed) is bool, "writer_custody_invalid")
-        require(
-            self.terminal_intent_digest is None
-            or type(self.terminal_intent_digest) is str
-            and _HEX.fullmatch(self.terminal_intent_digest),
-            "terminal_intent_invalid",
-        )
+        for digest_value, code in (
+            (self.publication_digest, "authority_publication_invalid"),
+            (self.terminal_intent_digest, "terminal_intent_invalid"),
+        ):
+            require(digest_value is None or type(digest_value) is str and _HEX.fullmatch(digest_value), code)
         require(type(self.detached_receipts) is tuple, "detached_receipt_invalid")
         require(type(self.cleaned_receipts) is tuple, "cleaned_receipt_invalid")
         for receipt in (*self.detached_receipts, *self.cleaned_receipts):
@@ -303,7 +406,7 @@ class PreparationPinAuthority:
         """Keep unavailable results and refuse unresolved or retryable work."""
         require(
             all(
-                admission.status in {"ready", "unavailable", "failed"}
+                admission.status in {"ready", "unavailable", "failed", "not_required"}
                 and admission.remaining_work == 0
                 and not admission.retryable
                 for admission in self.admissions
@@ -314,7 +417,7 @@ class PreparationPinAuthority:
             sorted(
                 admission.serving_revision_id
                 for admission in self.admissions
-                if admission.status in {"ready", "unavailable"}
+                if admission.status in {"ready", "unavailable", "not_required"}
             )
         )
 

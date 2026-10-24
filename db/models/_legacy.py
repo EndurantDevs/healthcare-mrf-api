@@ -738,8 +738,8 @@ class GeoZipLookup(Base, JSONOutputMixin):
         {"index_elements": ("city_lower", "state"), "name": "geo_zip_lookup_city_state_idx"},
         {"index_elements": ("city_lower",), "name": "geo_zip_lookup_city_idx"},
         {"index_elements": ("latitude", "longitude"), "name": "geo_zip_lookup_lat_lng_idx"},
+        {"index_elements": ("latitude", "longitude", "zip_code"), "name": "geo_zip_lookup_coordinates_idx"},
     ]
-
     zip_code = Column(String(5), nullable=False)
     city = Column(String(128))
     city_lower = Column(String(128))
