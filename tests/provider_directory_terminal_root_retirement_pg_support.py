@@ -493,20 +493,28 @@ async def _adopt_checkpoint_fixture(scenario: RetirementPostgres, component: Any
     """Give the issued Source owner the declared fixture corpus, then attest it."""
     owner = quote(component.owner)
     async with scenario.connection.transaction():
-        for root in RELATION_ORDERS:
-            await scenario.connection.execute(f"ALTER TABLE {scenario.schema}.{quote(root)} OWNER TO {owner}")
+        statements = [f"ALTER TABLE {scenario.schema}.{quote(root)} OWNER TO {owner}" for root in RELATION_ORDERS]
         signatures = (
             *scenario.migration._function_signatures(scenario.schema_name),
             f'{scenario.schema}."guard_provider_directory_subset_abandonment_checkpoint"()',
         )
         for signature in signatures:
-            await scenario.connection.execute(f"ALTER FUNCTION {signature} OWNER TO {owner}")
-            await scenario.connection.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+            statements.extend(
+                (
+                    f"ALTER FUNCTION {signature} OWNER TO {owner}",
+                    f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC",
+                )
+            )
         closed_roles = ",".join(quote(role) for role in (component.publisher, *component.policy.runtime_roles))
         for root in CHECKPOINT_LAYOUTS:
             relation = f"{scenario.schema}.{quote(root)}"
-            await scenario.connection.execute(f"REVOKE ALL ON TABLE {relation} FROM PUBLIC, {closed_roles}")
-            await scenario.connection.execute(f"GRANT SELECT ON TABLE {relation} TO {quote(component.reader)}")
+            statements.extend(
+                (
+                    f"REVOKE ALL ON TABLE {relation} FROM PUBLIC, {closed_roles}",
+                    f"GRANT SELECT ON TABLE {relation} TO {quote(component.reader)}",
+                )
+            )
+        await scenario.connection.execute(";\n".join(statements))
     async with source_transaction(component.database, isolation="read committed"):
         publisher = bound_publisher()
         assert publisher.policy is component.policy

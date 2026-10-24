@@ -20,6 +20,7 @@ from process import provider_directory_profile as profile
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_capacity_attestation as lease
 from process import provider_directory_profile_runtime_observation as runtime
+from tests import provider_directory_profile_delta_test_support as delta_support
 from tests.provider_directory_profile_delta_schema_fixtures import (
     _create_delta_contract_tables,
 )
@@ -34,6 +35,52 @@ from tests.test_provider_directory_profile_capacity_preflight_postgres import (
 )
 
 _ALEMBIC_ADOPTION_BASE_REVISION = "20260610143000_address_checksums_bigint"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_cleanup_failing", [False, True])
+async def test_delta_schema_cleanup_is_scoped_and_always_disconnects(monkeypatch, is_cleanup_failing):
+    """Drop owned tables separately and close even when cleanup fails."""
+    statements = []
+
+    async def record_status(statement):
+        """Record cleanup and simulate a failed table drop."""
+        statements.append(statement)
+        if is_cleanup_failing and statement.startswith("DROP TABLE"):
+            raise RuntimeError("cleanup failed")
+
+    database = types.SimpleNamespace(
+        connect=AsyncMock(),
+        scalar=AsyncMock(return_value="profile_delta_test"),
+        all=AsyncMock(return_value=[('leaf"table',), ("parent",)]),
+        status=AsyncMock(side_effect=record_status),
+        disconnect=AsyncMock(),
+    )
+    monkeypatch.setattr(delta_support, "Database", lambda: database)
+    if is_cleanup_failing:
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            async with _delta_database(monkeypatch) as (yielded_database, schema):
+                assert yielded_database is database
+    else:
+        async with _delta_database(monkeypatch) as (yielded_database, schema):
+            assert yielded_database is database
+    query = database.all.await_args.args[0]
+    assert "WHERE n.nspname = :schema" in query
+    assert "ORDER BY c.relkind DESC, c.oid" in query
+    assert database.all.await_args.kwargs == {"schema": schema}
+    expected_statements = [
+        f"CREATE SCHEMA {profile.quote_identifier(schema)};",
+        f"DROP TABLE IF EXISTS {profile.qualified_table(schema, 'leaf"table')} CASCADE;",
+    ]
+    if not is_cleanup_failing:
+        expected_statements.extend(
+            [
+                f"DROP TABLE IF EXISTS {profile.qualified_table(schema, 'parent')} CASCADE;",
+                f"DROP SCHEMA IF EXISTS {profile.quote_identifier(schema)} CASCADE;",
+            ]
+        )
+    assert statements == expected_statements
+    database.disconnect.assert_awaited_once_with()
 
 
 def _install_invalid_lease_admission_stubs(monkeypatch, virtual_state):
