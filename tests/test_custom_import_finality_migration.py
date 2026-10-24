@@ -91,6 +91,7 @@ _SEALED_APPEND_UPGRADE_TAIL = (
     "20261023110000_code_pricing_import_idempotency",
     "20261023100000_provider_directory_retirement_parent_updates",
     "20261023220000_merge_directory_pricing_controls",
+    "20261023100000_provider_directory_serving_recovery",
 )
 
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
@@ -267,7 +268,7 @@ def _assert_custom_import_manual_acceptance_lineage(script):
 
 def _assert_finality_migration_chain(script):
     """Keep the exact accepted migration head and predecessor assertions."""
-    assert script.get_heads() == ["20261023220000_merge_directory_pricing_controls"]
+    assert script.get_heads() == ["20261023100000_provider_directory_serving_recovery"]
     _assert_custom_import_manual_acceptance_lineage(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision

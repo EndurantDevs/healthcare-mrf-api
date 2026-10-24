@@ -1,11 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Original-session authority and bounded parent fences for batch checkpoints."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
 from db.connection import ConnectionProxy, Database
 from db.plan_release_storage import storage_relation
+from process import provider_directory_generic_source_policy as source
 from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session, source_transaction
 from process.provider_directory_generic_source_storage import HEADER, _require
 from process.provider_directory_projection_stage import _copy_driver
@@ -24,6 +26,18 @@ _BULK_IDENTITY_FIELDS = (
     "dataset_id",
     "start_url_hash",
 )
+
+
+async def persist_control_progress(marker, *args, **kwargs):
+    """Keep ordinary run-control writes outside an active Source transaction."""
+    if source._PUBLISHER.get() is None:
+        return await marker(*args, **kwargs)
+    bound_publisher()
+    from process.provider_directory_profile_source_inputs import _child_context
+
+    context = _child_context()
+    context.run(source._FACTORY.set, None)
+    return await asyncio.create_task(marker(*args, **kwargs), context=context)
 
 
 def _coordinates(values, limit):

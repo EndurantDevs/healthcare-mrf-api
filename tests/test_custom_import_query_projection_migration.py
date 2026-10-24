@@ -92,6 +92,7 @@ def _assert_projection_upgrade_order(script, module):
         "20261023110000_code_pricing_import_idempotency",
         "20261023100000_provider_directory_retirement_parent_updates",
         "20261023220000_merge_directory_pricing_controls",
+        "20261023100000_provider_directory_serving_recovery",
     ]
 
 
@@ -103,7 +104,7 @@ def test_projection_migration_extends_the_single_installed_head():
     script = ScriptDirectory.from_config(config)
     module = migration()
     assert module.down_revision == "20261013010000_registry_custom_history_events"
-    assert script.get_heads() == ["20261023220000_merge_directory_pricing_controls"]
+    assert script.get_heads() == ["20261023100000_provider_directory_serving_recovery"]
     _assert_custom_import_manual_acceptance_lineage(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision

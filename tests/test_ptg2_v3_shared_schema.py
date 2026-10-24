@@ -123,7 +123,7 @@ def test_repository_has_single_alembic_head():
     config = Config(str(root / "alembic.ini"))
 
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261023220000_merge_directory_pricing_controls"]
+    assert script.get_heads() == ["20261023100000_provider_directory_serving_recovery"]
     assert (
         script.get_revision("20261019150000_registry_source_check_idempotency").down_revision
         == "20261019140000_plan_pricing_attribution_idempotency"
