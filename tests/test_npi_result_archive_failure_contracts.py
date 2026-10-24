@@ -1283,33 +1283,59 @@ async def test_shielded_cleanup_finishes_once_before_forwarding_cancellation(mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_access_fails", [False, True])
-async def test_received_npi_replays_six_reads_before_any_activation_mutation(monkeypatch, read_access_fails):
+@pytest.mark.parametrize("expected_owner", [501, 502])
+async def test_received_npi_replays_six_reads_before_any_activation_mutation(
+    monkeypatch, read_access_fails, expected_owner
+):
     from process import native_publication_read_access
 
     ownership = _ownership()
+    manifest = _manifest()
     incumbent = archive.NpiIncumbent(
         "canonical", tuple((name, index) for index, name in enumerate(generation.RELATION_NAMES, 1))
     )
     driver = object()
     session = SimpleNamespace(
+        in_transaction=lambda: True,
         connection=AsyncMock(
             return_value=SimpleNamespace(
                 get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver))
             )
-        )
+        ),
     )
     preserved = AsyncMock(side_effect=RuntimeError("read ACL denied") if read_access_fails else None)
     mutation = AsyncMock(side_effect=RuntimeError("stop before mutation"))
     monkeypatch.setattr(native_publication_read_access, "preserve_publication_reads", preserved)
     monkeypatch.setattr(archive, "_remove_npi_clone_freeze", mutation)
+    for name in (
+        "_lock_and_verify_activation",
+        "_advance_and_verify_stage_sequences",
+        "read_npi_result_generation_authority",
+    ):
+        monkeypatch.setattr(archive, name, AsyncMock())
+    owner_check = AsyncMock()
+    monkeypatch.setattr(archive, "_verify_stage_owner", owner_check)
     with pytest.raises(RuntimeError, match="read ACL denied" if read_access_fails else "stop before mutation"):
-        await archive._activate_npi_relations(
-            session, ownership=ownership, incumbent=incumbent, manifest=_manifest(), validation=None
+        await archive.activate_validated_npi_stage(
+            session,
+            ownership=ownership,
+            incumbent=incumbent,
+            manifest=manifest,
+            validation_receipt=_validation(ownership, manifest),
+            cutover=archive.NpiCutoverAuthority("c" * 64, 501, expected_owner, "manual"),
+            on_activated=AsyncMock(),
         )
+    owner_check.assert_awaited_once_with(session, ownership, expected_owner)
     expected = generation.RELATION_NAMES[:1] if read_access_fails else generation.RELATION_NAMES
     assert [call.args[0] for call in preserved.await_args_list] == [driver] * len(expected)
     assert [call.kwargs for call in preserved.await_args_list] == [
-        dict(schema="canonical", live_table=name, stage_schema=ownership.schema_name, stage_table=name)
+        dict(
+            schema="canonical",
+            live_table=name,
+            stage_schema=ownership.schema_name,
+            stage_table=name,
+            expected_stage_owner_oid=expected_owner,
+        )
         for name in expected
     ]
     if read_access_fails:

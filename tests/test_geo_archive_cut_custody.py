@@ -51,18 +51,28 @@ async def test_cut_replays_reads_only_after_both_heap_custody_and_exact_locks(mo
 
     connection = SimpleNamespace(scalar=has_cut_locks)
     replay = AsyncMock()
-    monkeypatch.setattr(geo, "_writer", AsyncMock(return_value=17))
+    writer = AsyncMock(return_value=17)
+    monkeypatch.setattr(geo, "_archive_writer", writer)
     monkeypatch.setattr(storage, "require_geo_storage", old_custody)
     monkeypatch.setattr(geo, "_heap_custody", new_custody)
     monkeypatch.setattr(geo, "replay_geo_reads", replay)
     if damage:
-        with pytest.raises(RuntimeError):
+        refusal = {
+            "family": "geo_source_family_changed",
+            "same_oid": "geo_source_incumbent_changed",
+            "unlocked": "geo_source_cut_locks_required",
+            "old_custody": "old changed",
+            "new_custody": "new changed",
+        }[damage]
+        with pytest.raises(RuntimeError, match="^" + refusal + "$"):
             await geo.preserve_geo_cut_reads(connection, successor, incumbent)
         replay.assert_not_awaited()
     else:
         await geo.preserve_geo_cut_reads(connection, successor, incumbent)
         assert events == ["old-custody", "new-custody", "locks"]
         replay.assert_awaited_once_with(connection, 41, '"next_geo"."geo_zip_lookup"')
+
+    writer.assert_awaited_once_with(connection, "geo", "old_geo")
 
 
 @pytest.mark.asyncio

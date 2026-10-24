@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Preserve established reads during an ordinary owner's canonical heap swap."""
+"""Preserve reads during ordinary publication or an owner-bound validated heap swap."""
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.entity_address_cutover_contract import lock_live_serving_relations
@@ -11,6 +11,7 @@ _RELATIONS_SQL = """SELECT requested.name,c.oid::bigint,c.relowner::bigint,
  ON c.oid=to_regclass(format('%I.%I',$1::text,requested.name)) ORDER BY requested.name"""
 _CROSS_RELATIONS_SQL = """SELECT requested.namespace,requested.name,c.oid::bigint,c.relowner::bigint,
  c.relowner=current_user::regrole::oid AS owned,c.relkind::text,c.relpersistence::text,
+ pg_catalog.pg_has_role(current_user,c.relowner,'USAGE') AS owner_access,
  c.relrowsecurity,c.relforcerowsecurity,c.relispartition,
  EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited
  FROM unnest($1::text[],$2::text[]) requested(namespace,name) LEFT JOIN pg_class c
@@ -26,16 +27,29 @@ _READS_SQL = """SELECT NULL::text AS column_name,r.rolname,a.grantee,a.grantor,
  WHERE col.attrelid=$1::oid AND col.attnum>0 AND NOT col.attisdropped AND a.privilege_type='SELECT'"""
 
 
-async def preserve_publication_reads(connection, *, schema, live_table, stage_table, stage_schema=None):
+async def preserve_publication_reads(
+    connection, *, schema, live_table, stage_table, stage_schema=None, expected_stage_owner_oid=None
+):
     """Replay only SELECT/MAINTAIN while both exact heaps remain locked in this transaction."""
     storage_identifier(schema)
     storage_identifier(live_table)
     storage_identifier(stage_table)
+    if expected_stage_owner_oid is not None and (
+        type(expected_stage_owner_oid) is not int
+        or not 0 < expected_stage_owner_oid < 2**32
+        or stage_schema in (None, schema)
+    ):
+        raise RuntimeError("publication_read_access_custody_changed")
     if stage_schema is not None:
         storage_identifier(stage_schema)
         if stage_schema != schema:
             return await _preserve_cross_schema_reads(
-                connection, schema=schema, live_table=live_table, stage_schema=stage_schema, stage_table=stage_table
+                connection,
+                schema=schema,
+                live_table=live_table,
+                stage_schema=stage_schema,
+                stage_table=stage_table,
+                expected_stage_owner_oid=expected_stage_owner_oid,
             )
     if not connection.is_in_transaction() or live_table == stage_table:
         raise RuntimeError("publication_read_access_transaction_required")
@@ -64,7 +78,9 @@ async def preserve_publication_reads(connection, *, schema, live_table, stage_ta
         await _replay_reads(connection, storage_relation(schema, stage_table), prior["relowner"], grants)
 
 
-async def _preserve_cross_schema_reads(connection, *, schema, live_table, stage_schema, stage_table):
+async def _preserve_cross_schema_reads(
+    connection, *, schema, live_table, stage_schema, stage_table, expected_stage_owner_oid
+):
     if not connection.is_in_transaction():
         raise RuntimeError("publication_read_access_transaction_required")
     namespaces, names = [schema, stage_schema], [live_table, stage_table]
@@ -76,9 +92,13 @@ async def _preserve_cross_schema_reads(connection, *, schema, live_table, stage_
     prior = by_identity[schema, live_table]
     if stage["oid"] is None or stage["oid"] == prior["oid"]:
         raise RuntimeError("publication_read_access_relations_changed")
+    if expected_stage_owner_oid is not None and stage["relowner"] != expected_stage_owner_oid:
+        raise RuntimeError("publication_read_access_custody_changed")
+    # Only a validated cross-schema cutover may use inherited ownership.
+    owner_field = "owned" if expected_stage_owner_oid is None else "owner_access"
     for entry in before_relations:
         if entry["oid"] is not None and (
-            not entry["owned"]
+            not entry[owner_field]
             or entry["relkind"] != "r"
             or entry["relpersistence"] != "p"
             or entry["relrowsecurity"]

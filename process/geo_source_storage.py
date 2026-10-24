@@ -9,10 +9,13 @@ from db.models import GeoZipLookup
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import reference_family_result_generation as generation
 from process.cms_doctors_immutable import (
+    _archive_writer,
     _executable_subjects,
     _heap_custody,
     _legacy_contracts,
-    _owner,
+    _protected_reference_writer,
+    _ProtectedReferencePublication,
+    _storage_owner,
     _validate_legacy_hooks,
     _writer,
 )
@@ -115,7 +118,7 @@ async def require_geo_storage(
     relation = storage_relation(schema, relation_name)
     oid = await session.scalar(text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": relation})
     require(type(oid) is int and oid > 0 and (expected_oid is None or expected_oid == oid), "relation_changed")
-    owner = await _owner(session, schema, native_policy=native_policy)
+    owner = await _storage_owner(session, "geo", schema, ((relation_name, oid),), native_policy=native_policy)
     require(not is_incumbent or relation_name == ROOT, "incumbent_scope_changed")
     await _heap_custody(session, GeoZipLookup, schema, relation_name, oid, owner, is_geo_incumbent=is_incumbent)
     hooks = await session.scalar(
@@ -151,10 +154,9 @@ async def capture_geo_generation(session, schema):
 
 async def _retained_geo_identity(session, schema, oid, relfilenode, owner):
     """Require this exact locked physical heap on the original writable backend and top transaction."""
-    from process.provider_directory_generic_source_policy import bound_publisher
     from process.provider_directory_projection_stage import _copy_driver
 
-    publisher = bound_publisher()
+    publisher = await _geo_archive_publisher(session)
     require(await _copy_driver(session) is publisher.connection, "retained_connection_changed")
     observed = (
         await session.execute(
@@ -183,6 +185,17 @@ async def _retained_geo_identity(session, schema, oid, relfilenode, owner):
         "retained_identity_changed",
     )
     return publisher, tuple(observed[:4]), tuple(observed[7] or ())
+
+
+async def _geo_archive_publisher(session):
+    from process.provider_directory_generic_source_policy import bound_publisher
+
+    protected = await _protected_reference_writer(session, "geo")
+    return bound_publisher() if protected is None else protected
+
+
+def _publication_schema(publisher):
+    return publisher.schema_name if type(publisher) is _ProtectedReferencePublication else publisher.policy.schema
 
 
 async def _retained_geo_catalog(session, schema, oid, owner):
@@ -221,11 +234,11 @@ async def capture_geo_retained_cut(session, *, schema_name, expected_relation_oi
         and expected_relfilenode > 0,
         "retained_identity_changed",
     )
-    schema, owner = generation._schema_name(schema_name), await _writer(session)
+    schema, owner = generation._schema_name(schema_name), await _archive_writer(session, "geo")
     publisher, transaction, index_oids = await _retained_geo_identity(
         session, schema, expected_relation_oid, expected_relfilenode, owner
     )
-    require(schema != publisher.policy.schema, "retained_location_changed")
+    require(schema != _publication_schema(publisher), "retained_location_changed")
     receipt, profile = await _retained_geo_catalog(session, schema, expected_relation_oid, owner)
     known_hashes = {digest for pair in geo_index_schema_hashes() for digest in pair}
     require(
@@ -271,12 +284,10 @@ def require_geo_retained_manifest(cut, manifest, live_pairs):
 
 async def _consume_geo_retained_cut(session, schema, source_generation, cut):
     """Recheck physical identity, indexes and provenance after the locked schema exchange."""
-    from process.provider_directory_generic_source_policy import bound_publisher
-
     require(type(cut) is GeoRetainedCut and cut.session is session, "retained_cut_required")
-    publisher = bound_publisher()
-    require(publisher is cut.publisher and schema == publisher.policy.schema, "retained_publisher_changed")
-    require(await _writer(session) == cut.owner_oid, "retained_owner_changed")
+    publisher = await _geo_archive_publisher(session)
+    require(publisher is cut.publisher and schema == _publication_schema(publisher), "retained_publisher_changed")
+    require(await _archive_writer(session, "geo", schema) == cut.owner_oid, "retained_owner_changed")
     origin = (
         None
         if source_generation is None
@@ -301,7 +312,10 @@ async def publish_geo_generation(
     session, *, schema_name, expected_authority, source_generation=None, local=True, geo_retained_cut=None
 ):
     """CAS the existing generation row inside the original authenticated heap cut."""
-    await _writer(session)
+    if local:
+        await _writer(session)
+    else:
+        await _archive_writer(session, "geo", schema_name)
     if geo_retained_cut is None:
         oid = await require_geo_storage(session, schema_name=schema_name)
     else:
@@ -364,7 +378,7 @@ async def replay_geo_reads(session, oid, relation, *, exclude_owner=True):
 
 async def capture_geo_predecessor(session, schema, pairs):
     """Authenticate an actual complete or empty incumbent before archive rotation."""
-    await _writer(session)
+    await _archive_writer(session, "geo", schema)
     require(tuple(name for name, _oid in pairs) == (ROOT,), "family_changed")
     oid = pairs[0][1]
     if oid is not None:
