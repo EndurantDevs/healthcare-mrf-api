@@ -31,6 +31,12 @@ Before previewing, prove all of the following:
 - the named predecessor is the sole current published dataset, or explicit
   first-acquisition mode proves there is no publication history for the endpoint.
 
+The owner-lineage migration replaces two existing routine bodies. Deploy
+compatible retained-CMS custody consumers before applying it, then recapture
+affected catalog-bound custody receipts through their owning path before reuse.
+Preserving routine OIDs does not preserve those catalog digests. Never rewrite
+an existing receipt to conceal the change.
+
 Keep the gate disabled except for the single preview/apply session:
 
 The command must run through a trusted launcher that binds the issued SOURCE
@@ -108,6 +114,11 @@ a different hash profile fails closed. The first-acquisition path requires the
 additive guard migration and checks that the endpoint has never published a
 dataset. The candidate's null predecessor is preserved; the evidence binds its
 absence using the digest of JSON `null`.
+
+The recorded owner may precede later terminal retries in the complete linear
+history without transferring the candidate's ownership. This exception applies
+only to first acquisition; retirement with a published predecessor still
+requires the recorded owner to be the final retry.
 
 This mode locks the exact endpoint, dataset, terminal lineage and checkpoint
 controls instead of whole payload tables. Every lineage run must have no

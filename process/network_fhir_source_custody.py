@@ -746,6 +746,12 @@ async def _guards(connection, schema, owner_oid, relations, *, partitioned=False
     ]
 
 
+_FIRST_OWNER_LINEAGE_BODY_HASHES = {
+    "provider_directory_terminal_root_retirement_evidence": "343b3eb1ab437f0b9402ea3633f49aff0831f3fd684c0ea82dc9b989c821663e",
+    "provider_directory_terminal_root_retirement_eligible": "e580421dda5707c43a1ded063494ccb9f3197efa016b71ad1ff86ac47a80af92",
+}
+
+
 def _require_function(function_record, schema, owner_oid):
     """Recognize only the actual source-rendered reachable routine contract."""
     expected = _REACHABLE_FUNCTIONS.get(function_record["proname"])
@@ -760,7 +766,12 @@ def _require_function(function_record, schema, owner_oid):
         function_record["prosecdef"],
         None if function_record["proconfig"] is None else tuple(function_record["proconfig"]),
     )
-    if expected is None or actual != expected or function_record["proowner"] != owner_oid:
+    is_matching = (
+        expected is not None
+        and actual[1:] == expected[1:]
+        and actual[0] in (expected[0], _FIRST_OWNER_LINEAGE_BODY_HASHES.get(function_record["proname"]))
+    )
+    if not is_matching or function_record["proowner"] != owner_oid:
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
 
 

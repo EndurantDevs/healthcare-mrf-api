@@ -36,6 +36,25 @@ from process.provider_directory_terminal_root_retirement_profile import SEMANTIC
 from process.provider_directory_terminal_root_retirement_selection import (
     selected_terminal_root_retirement,
 )
+from tests.provider_directory_first_retirement_owner_lineage_pg_support import _migrate as _migrate_owner_lineage
+from tests.provider_directory_first_retirement_owner_lineage_pg_support import (
+    test_first_owner_ancestor_rejects_invalid_history as test_first_owner_ancestor_rejects_invalid_history,
+)
+from tests.provider_directory_first_retirement_owner_lineage_pg_support import (
+    test_first_owner_ancestor_retains_complete_evidence_and_replays as test_first_owner_ancestor_retains_complete_evidence_and_replays,
+)
+from tests.provider_directory_first_retirement_owner_lineage_pg_support import (
+    test_owner_lineage_downgrade_serializes_header_and_refuses_retired_ancestor as test_owner_lineage_downgrade_serializes_header_and_refuses_retired_ancestor,
+)
+from tests.provider_directory_first_retirement_owner_lineage_pg_support import (
+    test_owner_lineage_migration_refuses_unknown_controls as test_owner_lineage_migration_refuses_unknown_controls,
+)
+from tests.provider_directory_first_retirement_owner_lineage_pg_support import (
+    test_owner_lineage_migration_roundtrip_preserves_catalog_and_data as test_owner_lineage_migration_roundtrip_preserves_catalog_and_data,
+)
+from tests.provider_directory_first_retirement_owner_lineage_pg_support import (
+    test_published_predecessor_still_requires_leaf_owner as test_published_predecessor_still_requires_leaf_owner,
+)
 from tests.provider_directory_terminal_root_retirement_pg_support import (
     CURRENT_DATASET_ID,
     ENDPOINT_ID,
@@ -682,9 +701,12 @@ async def test_standalone_first_retirement_rejects_changed_guards(monkeypatch, c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_lineage", [False, True], ids=["original-lineage", "owner-lineage"])
 @pytest.mark.parametrize("semantic_v4", [False, True], ids=["v1", "v2"])
-async def test_published_predecessor_retirement_still_applies_and_replays(monkeypatch, semantic_v4):
+async def test_published_predecessor_retirement_still_applies_and_replays(monkeypatch, semantic_v4, owner_lineage):
     async with _scenario(monkeypatch) as scenario:
+        if owner_lineage:
+            await _migrate_owner_lineage(scenario)
         if semantic_v4:
             await scenario.connection.execute(
                 f"UPDATE {scenario.schema}.provider_directory_endpoint_dataset SET resource_count=0,"
