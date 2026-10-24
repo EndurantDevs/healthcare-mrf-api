@@ -287,7 +287,7 @@ async def test_loading_raw_and_final_heaps_never_receive_reader_access(monkeypat
 
 @pytest.mark.asyncio
 async def test_geo_candidate_rejects_historical_indexes(monkeypatch):
-    monkeypatch.setattr(storage, "_owner", AsyncMock(return_value=7))
+    monkeypatch.setattr(storage, "_storage_owner", AsyncMock(return_value=7))
     custody = AsyncMock()
     monkeypatch.setattr(storage, "_heap_custody", custody)
     session = SimpleNamespace(scalar=AsyncMock(return_value=17))

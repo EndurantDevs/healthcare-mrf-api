@@ -128,6 +128,34 @@ async def _require_no_untrusted_mutation(session, relation_oids, owner_oid, *, s
     _require(unsafe is False, "ordinary mutation is available")
 
 
+async def _mutation_acl_principals(session, relation_oid, owner_oid, *, sequence=False):
+    """Restrict role-name DDL to write grantees of this locked relation."""
+    privileges = (
+        ("USAGE", "UPDATE") if sequence else ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
+    )
+    grantees = (
+        "SELECT acl.grantee FROM pg_class c,LATERAL aclexplode(c.relacl) acl "
+        "WHERE c.oid=:oid AND acl.privilege_type=ANY(CAST(:privileges AS text[]))"
+    )
+    if not sequence:
+        grantees += (
+            " UNION SELECT acl.grantee FROM pg_attribute a,LATERAL aclexplode(a.attacl) acl "
+            "WHERE a.attrelid=:oid AND a.attnum>0 AND NOT a.attisdropped "
+            "AND acl.privilege_type=ANY(CAST(:privileges AS text[]))"
+        )
+    principal_rows = await session.execute(
+        text(
+            "SELECT DISTINCT quote_ident(principal.rolname) FROM ("
+            + grantees
+            + ") mutation JOIN pg_roles principal ON principal.oid=mutation.grantee WHERE "
+            + _ORDINARY_PRINCIPAL_SQL
+            + " ORDER BY 1"
+        ),
+        {"oid": relation_oid, "owner_oid": owner_oid, "privileges": list(privileges)},
+    )
+    return principal_rows.scalars().all()
+
+
 async def _seal_published_relation(session, relation_oid, owner_oid):
     """Preserve read grants while closing effective ordinary DML and ownership bypasses."""
     _require(await _publisher_authority(session) == owner_oid, "publisher owner differs")
@@ -161,28 +189,11 @@ async def _seal_published_relation(session, relation_oid, owner_oid):
                 f"ON {relation['name']} TO {relation['previous_owner']}"
             )
         )
-    principal_rows = await session.execute(
-        text("SELECT quote_ident(principal.rolname) FROM pg_roles principal WHERE " + _ORDINARY_PRINCIPAL_SQL),
-        {"owner_oid": owner_oid},
-    )
-    principals = principal_rows.scalars().all()
-    column_rows = await session.execute(
-        text(
-            "SELECT quote_ident(attname) FROM pg_attribute WHERE attrelid=:oid AND attnum>0 AND NOT attisdropped ORDER BY attnum"
-        ),
-        {"oid": relation_oid},
-    )
-    columns = column_rows.scalars().all()
+    principals = await _mutation_acl_principals(session, relation_oid, owner_oid)
     for principal in ("PUBLIC", *principals):
+        # A table REVOKE also removes corresponding column grants in the same statement.
         await session.execute(
             text(f"REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER ON {relation['name']} FROM {principal}")
-        )
-        column_names = ",".join(columns)
-        await session.execute(
-            text(
-                f"REVOKE INSERT ({column_names}),UPDATE ({column_names}),REFERENCES ({column_names}) "
-                f"ON {relation['name']} FROM {principal}"
-            )
         )
     await _require_no_untrusted_mutation(session, [relation_oid], owner_oid)
     await _seal_owned_sequences(session, relation_oid, owner_oid, relation["owner"])
@@ -205,18 +216,9 @@ async def _seal_owned_sequences(session, relation_oid, owner_oid, quoted_owner):
         .mappings()
         .all()
     )
-    principals = (
-        (
-            await session.execute(
-                text("SELECT quote_ident(principal.rolname) FROM pg_roles principal WHERE " + _ORDINARY_PRINCIPAL_SQL),
-                {"owner_oid": owner_oid},
-            )
-        )
-        .scalars()
-        .all()
-    )
     for sequence in sequences:
         await session.execute(text(f"ALTER SEQUENCE {sequence['name']} OWNER TO {quoted_owner}"))
+        principals = await _mutation_acl_principals(session, sequence["oid"], owner_oid, sequence=True)
         for principal in ("PUBLIC", *principals):
             await session.execute(text(f"REVOKE USAGE,UPDATE ON SEQUENCE {sequence['name']} FROM {principal}"))
     await _require_no_untrusted_mutation(session, [sequence["oid"] for sequence in sequences], owner_oid, sequence=True)

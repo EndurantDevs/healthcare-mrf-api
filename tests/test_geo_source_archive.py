@@ -94,7 +94,7 @@ async def test_geo_rotation_failure_rolls_back_even_when_outer_caller_catches(mo
         else:
             events.append("commit")
 
-    monkeypatch.setattr(geo, "_writer", AsyncMock())
+    monkeypatch.setattr(geo, "_archive_writer", AsyncMock())
     session = SimpleNamespace(begin_nested=savepoint)
     with pytest.raises(RuntimeError, match="after_rotation"):
         async with geo.geo_cut_savepoint(session, "geo"):
@@ -180,7 +180,7 @@ async def retained_geo(monkeypatch):
     transaction = (21, "34", "5/6", 7)
     identity = AsyncMock(return_value=(publisher, transaction, (11, 12)))
     catalog = AsyncMock(return_value=(table, "a" * 64))
-    monkeypatch.setattr(storage, "_writer", AsyncMock(return_value=8))
+    monkeypatch.setattr(storage, "_archive_writer", AsyncMock(return_value=8))
     monkeypatch.setattr(storage, "_retained_geo_identity", identity)
     monkeypatch.setattr(storage, "_retained_geo_catalog", catalog)
     monkeypatch.setattr(policy, "bound_publisher", lambda: publisher)
@@ -265,7 +265,7 @@ async def test_retained_consumption_rechecks_cut(retained_geo, monkeypatch, dama
     if damage == "publisher":
         cut = replace(cut, publisher=object())
     if damage == "owner":
-        monkeypatch.setattr(storage, "_writer", AsyncMock(return_value=9))
+        monkeypatch.setattr(storage, "_archive_writer", AsyncMock(return_value=9))
     if damage in {"backend", "transaction", "index_oid"}:
         identity = (99, *observed.transaction[1:]) if damage == "backend" else (21, "35", "5/6", 7)
         observed.identity.return_value = (
@@ -322,6 +322,7 @@ async def test_retained_adoption_binds_manifest_inventory(retained_geo, monkeypa
 @pytest.mark.asyncio
 async def test_retained_refusal_precedes_generation_write(retained_geo, monkeypatch):
     first = AsyncMock()
+    monkeypatch.setattr(storage, "_writer", AsyncMock(return_value=8))
     monkeypatch.setattr(generation, "_first", first)
     with pytest.raises(RuntimeError, match="retained_local_publication_forbidden"):
         await storage.publish_geo_generation(

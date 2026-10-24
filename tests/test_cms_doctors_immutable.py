@@ -1,13 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Fixed-family application boundaries; native catalog/role proof is separate."""
 
+import asyncio
 import datetime
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
+from uuid import UUID
 
 import pytest
 
 from process import cms_doctors_immutable as immutable
+from process import native_publication_read_access as access
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process import reference_source_generation as revisions
@@ -494,6 +498,278 @@ async def test_read_only_custody_requires_exact_canonical_pointer(monkeypatch, c
         await immutable._require_read_pointer(object(), "source_schema", pairs)
 
 
+@pytest.fixture
+def protected_publication(monkeypatch):
+    from process import provider_directory_projection_stage as stage
+
+    identity = (11, "21", 31, 41, True)
+    events = []
+
+    @asynccontextmanager
+    async def savepoint():
+        events.append("savepoint")
+        try:
+            yield
+        except BaseException:
+            events.append("rollback")
+            raise
+        else:
+            events.append("release")
+
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        begin_nested=savepoint,
+        execute=AsyncMock(return_value=SimpleNamespace(one=lambda: identity)),
+    )
+    connection = AsyncMock(return_value=object())
+    owner = AsyncMock(return_value=29)
+    monkeypatch.setattr(stage, "_copy_driver", connection)
+    monkeypatch.setattr(archive, "protected_publisher_owner", owner)
+    return SimpleNamespace(session=session, connection=connection, owner=owner, identity=identity, events=events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ("geo", "cms-doctors"))
+async def test_protected_publication_keeps_source_writer_unavailable(protected_publication, importer):
+    session = protected_publication.session
+    async with archive.protected_reference_family_publication(
+        session, importer_id=importer, schema_name="mrf", expected_owner_oid=29
+    ):
+        assert await immutable._archive_writer(session, importer, "mrf") == 29
+        with pytest.raises(ValueError, match="publisher_connection_required"):
+            await immutable._writer(session)
+    assert immutable._PROTECTED_PUBLICATION.get() is None
+    assert protected_publication.events == ["savepoint", "release"]
+    with pytest.raises(ValueError, match="publisher_connection_required"):
+        await immutable._archive_writer(session, importer, "mrf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ("session", "connection", "task", "transaction", "owner", "exit_owner", "importer", "schema")
+)
+async def test_protected_publication_rechecks_exact_authority(protected_publication, change):
+    observed = protected_publication
+    with pytest.raises(RuntimeError, match="protected_(scope|authority)_changed"):
+        async with archive.protected_reference_family_publication(
+            observed.session, importer_id="geo", schema_name="mrf", expected_owner_oid=29
+        ):
+            if change == "connection":
+                observed.connection.return_value = object()
+            if change in {"owner", "exit_owner"}:
+                observed.owner.return_value = 30
+            if change == "transaction":
+                observed.session.execute.return_value = SimpleNamespace(one=lambda: (11, "22", 31, 41, True))
+            if change != "exit_owner":
+                call = immutable._archive_writer(
+                    object() if change == "session" else observed.session,
+                    "cms-doctors" if change == "importer" else "geo",
+                    "other" if change == "schema" else "mrf",
+                )
+                await (asyncio.create_task(call) if change == "task" else call)
+    assert immutable._PROTECTED_PUBLICATION.get() is None
+    assert observed.events == ["savepoint", "rollback"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (RuntimeError, asyncio.CancelledError))
+async def test_protected_publication_restores_scope_on_failure(protected_publication, failure):
+    with pytest.raises(failure):
+        async with archive.protected_reference_family_publication(
+            protected_publication.session, importer_id="geo", schema_name="mrf", expected_owner_oid=29
+        ):
+            raise failure("publication stopped")
+    assert immutable._PROTECTED_PUBLICATION.get() is None
+    assert protected_publication.events == ["savepoint", "rollback"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (None, "reads", "move", "owner", "connection"))
+async def test_received_doctors_preserves_all_reads_before_rotation_or_rolls_back(
+    protected_publication, monkeypatch, failure
+):
+    """Read replay precedes every move, and failures roll back the complete publication scope."""
+    observed, events, driver = protected_publication, [], object()
+    spec = archive.reference_family_spec("cms-doctors")
+    stage = SimpleNamespace(dataset_id=UUID(int=1), schema_name="incoming")
+    incumbent = SimpleNamespace(schema_name="mrf", relation_oids=tuple(zip(spec.table_names, (11, 12, 13))))
+
+    async def preserve(actual, **fields):
+        assert actual is driver
+        name = fields["live_table"]
+        assert fields == dict(
+            schema="mrf", live_table=name, stage_schema="incoming", stage_table=name, expected_stage_owner_oid=29
+        )
+        events.append(("reads", name))
+        if failure == "reads" and len(events) == 2:
+            raise RuntimeError("read grant refused")
+
+    async def execute(statement, *args, **kwargs):
+        sql = str(statement)
+        if sql.startswith(("CREATE", "ALTER")):
+            events.append(("move", sql))
+            if failure == "move" and sql.startswith("ALTER"):
+                raise RuntimeError("heap move refused")
+        return SimpleNamespace(one=lambda: observed.identity)
+
+    observed.session.execute.side_effect = execute
+    observed.session.scalar = AsyncMock(return_value='"retained_owner"')
+    monkeypatch.setattr(access, "preserve_publication_reads", preserve)
+    monkeypatch.setattr(archive, "_native_model_copy_driver", AsyncMock(return_value=driver))
+
+    async def rotate():
+        async with archive.protected_reference_family_publication(
+            observed.session, importer_id="cms-doctors", schema_name="mrf", expected_owner_oid=29
+        ):
+            if failure == "owner":
+                observed.owner.return_value = 30
+            if failure == "connection":
+                observed.connection.return_value = object()
+            await archive._rotate_family_relations(observed.session, spec, stage, incumbent)
+
+    if failure:
+        with pytest.raises(RuntimeError, match="refused|protected_authority_changed"):
+            await rotate()
+    else:
+        await rotate()
+    expected_reads = list(spec.table_names[:2] if failure == "reads" else spec.table_names)
+    assert [name for kind, name in events if kind == "reads"] == (
+        [] if failure in {"owner", "connection"} else expected_reads
+    )
+    if failure in {"reads", "owner", "connection"}:
+        assert not any(kind == "move" for kind, _value in events)
+    else:
+        assert events[:3] == [("reads", name) for name in spec.table_names]
+        assert len(events[3:]) == (2 if failure == "move" else 7)
+    assert observed.events == ["savepoint", "rollback" if failure else "release"]
+    assert immutable._PROTECTED_PUBLICATION.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", (None, True, 0, 2**32, 30))
+async def test_protected_publication_refuses_unverified_owner(protected_publication, owner):
+    with pytest.raises(RuntimeError, match="protected_(scope_invalid|owner_changed)"):
+        async with archive.protected_reference_family_publication(
+            protected_publication.session, importer_id="geo", schema_name="mrf", expected_owner_oid=owner
+        ):
+            pytest.fail("unverified custody entered")
+    assert immutable._PROTECTED_PUBLICATION.get() is None
+
+
+@pytest.mark.asyncio
+async def test_protected_publication_refuses_nested_or_source_scope(protected_publication):
+    from process import provider_directory_generic_source_policy as source
+
+    session = protected_publication.session
+    async with archive.protected_reference_family_publication(
+        session, importer_id="geo", schema_name="mrf", expected_owner_oid=29
+    ):
+        current = immutable._PROTECTED_PUBLICATION.get()
+        with pytest.raises(RuntimeError, match="protected_scope_invalid"):
+            async with archive.protected_reference_family_publication(
+                session, importer_id="geo", schema_name="mrf", expected_owner_oid=29
+            ):
+                pytest.fail("nested authority entered")
+        assert immutable._PROTECTED_PUBLICATION.get() is current
+    token = source._PUBLISHER.set(object())
+    try:
+        with pytest.raises(RuntimeError, match="protected_scope_invalid"):
+            async with archive.protected_reference_family_publication(
+                session, importer_id="geo", schema_name="mrf", expected_owner_oid=29
+            ):
+                pytest.fail("SOURCE authority entered retained scope")
+    finally:
+        source._PUBLISHER.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", (None, "owner", "pointer", "name"))
+async def test_retained_read_custody_requires_protected_owner_and_native_pointer(monkeypatch, change):
+    owner = 31 if change == "owner" else 29
+    session = SimpleNamespace(scalar=AsyncMock(side_effect=[owner, change != "owner"]))
+    monkeypatch.setattr(immutable, "_physical_owner", AsyncMock(return_value=17))
+    authority = _authority()
+    monkeypatch.setattr(
+        generation, "read_reference_family_result_generation_authority", AsyncMock(return_value=authority)
+    )
+    pairs = tuple(
+        zip(generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"], (11, 12, 99 if change == "pointer" else 13))
+    )
+    if change == "name":
+        pairs = (("other", 11), *pairs[1:])
+    if change:
+        with pytest.raises(RuntimeError, match="protected_owner_changed|read_pointer_changed"):
+            await immutable._storage_owner(session, "cms-doctors", "mrf", pairs)
+    else:
+        assert await immutable._storage_owner(session, "cms-doctors", "mrf", pairs) == 29
+    statement = str(session.scalar.await_args_list[1].args[0])
+    assert "hp_snapshot_retention" in statement and "elevated" in statement
+
+
+@pytest.mark.asyncio
+async def test_protected_adoption_does_not_authorize_local_source_generation(protected_publication):
+    session = protected_publication.session
+    async with archive.protected_reference_family_publication(
+        session, importer_id="cms-doctors", schema_name="mrf", expected_owner_oid=29
+    ):
+        with pytest.raises(ValueError, match="publisher_connection_required"):
+            await immutable.publish_doctors_generation(session, schema_name="mrf", expected_authority=_authority())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ("geo", "cms-doctors", "label"))
+@pytest.mark.parametrize("owner_valid", (False, True))
+async def test_validated_cut_enters_protected_scope_only_after_custody(
+    protected_publication, monkeypatch, importer, owner_valid
+):
+    events = []
+    spec = SimpleNamespace(importer_id=importer)
+    incumbent, cutover = SimpleNamespace(schema_name="mrf"), SimpleNamespace(expected_stage_owner_oid=29)
+    monkeypatch.setattr(archive, "_validated_activation_inputs", lambda *args: ("manifest", "validation", spec))
+    monkeypatch.setattr(
+        archive, "_lock_and_verify_activation", AsyncMock(side_effect=lambda *args, **kwargs: events.append("locks"))
+    )
+
+    async def verify_owner(*args):
+        events.append("owner")
+        if not owner_valid:
+            raise archive.ReferenceFamilyArchiveError("owner changed")
+
+    async def activate(session, *args):
+        publication = immutable._PROTECTED_PUBLICATION.get()
+        assert (publication is not None) == (importer != "label")
+        if publication is not None:
+            assert publication.session is session and publication.owner_oid == 29
+        events.append("activate")
+        return "receipt"
+
+    monkeypatch.setattr(archive, "_verify_stage_owner", verify_owner)
+    monkeypatch.setattr(archive, "_activate_verified_reference_family", activate)
+    activation_by_field = dict(
+        ownership=object(),
+        manifest=object(),
+        expected_incumbent=incumbent,
+        validation_receipt=object(),
+        cutover=cutover,
+    )
+    if owner_valid:
+        assert (
+            await archive.activate_validated_reference_family_stage(
+                protected_publication.session, **activation_by_field
+            )
+            == "receipt"
+        )
+    else:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="owner changed"):
+            await archive.activate_validated_reference_family_stage(
+                protected_publication.session, **activation_by_field
+            )
+    assert events == (["locks", "owner", "activate"] if owner_valid else ["locks", "owner"])
+    assert immutable._PROTECTED_PUBLICATION.get() is None
+    if not owner_valid or importer == "label":
+        protected_publication.owner.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_other_model_family_seal_preserves_existing_retention_authority(monkeypatch):
     from process import entity_address_snapshot_preparation as retained
@@ -522,3 +798,49 @@ async def test_source_archive_seal_refuses_wrong_physical_owner_before_grant_cha
     finally:
         source._PUBLISHER.reset(token)
     close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_matches", [False, True])
+async def test_protected_storage_owner_matches_custody(protected_publication, monkeypatch, owner_matches):
+    """A retained heap must match its active publication's exact sealed owner."""
+    session = protected_publication.session
+    session.scalar = AsyncMock(side_effect=[29 if owner_matches else 31, True])
+    monkeypatch.setattr(immutable, "_physical_owner", AsyncMock(return_value=17))
+    reader = AsyncMock()
+    monkeypatch.setattr(generation, "read_reference_family_result_generation_authority", reader)
+    pairs = tuple(zip(generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"], (11, 12, 13)))
+    async with archive.protected_reference_family_publication(
+        session, importer_id="cms-doctors", schema_name="mrf", expected_owner_oid=29
+    ):
+        if owner_matches:
+            assert await immutable._storage_owner(session, "cms-doctors", "mrf", pairs) == 29
+        else:
+            with pytest.raises(RuntimeError, match="protected_owner_changed"):
+                await immutable._storage_owner(session, "cms-doctors", "mrf", pairs)
+    reader.assert_not_awaited()
+    assert session.scalar.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_geo_predecessor_retains_owner_authority(protected_publication, monkeypatch):
+    """Protected predecessor creation must retain custody without source-writer fallback."""
+    from process import geo_source_archive as geo
+
+    session = protected_publication.session
+    session.scalar = AsyncMock(return_value='"fixture_owner"')
+    writer, publisher = AsyncMock(), Mock()
+    monkeypatch.setattr(geo, "_writer", writer)
+    monkeypatch.setattr(geo, "source_publisher_body", publisher)
+    schema = archive.reference_family_predecessor_schema(UUID(int=1))
+    async with archive.protected_reference_family_publication(
+        session, importer_id="geo", schema_name="mrf", expected_owner_oid=29
+    ):
+        await geo.create_geo_predecessor_schema(session, schema)
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert [sql for sql in statements if sql.startswith("CREATE SCHEMA")] == [
+        f'CREATE SCHEMA "{schema}" AUTHORIZATION "fixture_owner"'
+    ]
+    assert session.scalar.await_args.args[1] == {"owner": 29}
+    writer.assert_not_awaited()
+    publisher.assert_not_called()

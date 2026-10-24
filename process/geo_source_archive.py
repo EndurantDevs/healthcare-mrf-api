@@ -9,7 +9,12 @@ from sqlalchemy import text
 
 from db.models import GeoZipLookup
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.cms_doctors_immutable import _heap_custody, _writer
+from process.cms_doctors_immutable import (
+    _archive_writer,
+    _create_protected_predecessor_schema,
+    _heap_custody,
+    _writer,
+)
 from process.geo_source_storage import ROOT, replay_geo_reads, require
 from process.provider_directory_generic_source_policy import _PUBLISHER, bound_publisher, source_publisher_body
 
@@ -81,6 +86,8 @@ async def create_geo_predecessor_schema(session, schema):
         schema == reference_family_predecessor_schema(UUID(schema.removeprefix(_PREDECESSOR_PREFIX))),
         "predecessor_scope_changed",
     )
+    if await _create_protected_predecessor_schema(session, "geo", schema):
+        return
     await _writer(session)
     async with source_publisher_body(session) as publisher:
         await session.execute(
@@ -94,7 +101,7 @@ async def preserve_geo_cut_reads(session, ownership, incumbent):
     """Replay only actual incumbent SELECT on the exact locked private successor."""
     from process.geo_source_storage import require_geo_storage
 
-    owner = await _writer(session)
+    owner = await _archive_writer(session, "geo", incumbent.schema_name)
     require(ownership.importer_id == incumbent.importer_id == "geo", "family_changed")
     old_oid, new_oid = dict(incumbent.relation_oids)[ROOT], dict(ownership.relation_oids)[ROOT]
     require(type(old_oid) is int and old_oid != new_oid, "incumbent_changed")
@@ -219,7 +226,7 @@ def _geo_catalog_indexes(columns):
 async def geo_cut_savepoint(session, importer):
     """A caught physical Geo cut failure cannot commit its partial rotation."""
     if importer == "geo":
-        await _writer(session)
+        await _archive_writer(session, "geo")
         async with session.begin_nested():
             yield
     else:

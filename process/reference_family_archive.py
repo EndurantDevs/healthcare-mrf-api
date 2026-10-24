@@ -45,6 +45,9 @@ from process.cms_doctors_immutable import (
     doctors_manifest_spec,
     require_doctors_storage,
 )
+from process.cms_doctors_immutable import (
+    protected_reference_family_publication as protected_reference_family_publication,
+)
 from process.entity_address_snapshot_receipt import _projected_row_identity
 from process.ext.address_canon import archive_table_name
 from process.geo_source_archive import (
@@ -189,6 +192,9 @@ from process.reference_family_result_generation import (
     TABLE_NAME as GENERATION_TABLE,
 )
 from process.reference_family_result_generation import (
+    _activate_verified_reference_family as _activate_verified_reference_family,
+)
+from process.reference_family_result_generation import (
     _adopt_validated_family_generation as _adopt_validated_family_generation,
 )
 from process.reference_family_result_generation import (
@@ -208,6 +214,9 @@ from process.reference_family_result_generation import (
 )
 from process.reference_family_result_generation import (
     _require_nucc_precreated_handoff_binding as _require_nucc_precreated_handoff_binding,
+)
+from process.reference_family_result_generation import (
+    _rotate_family_relations as _rotate_family_relations,
 )
 from process.reference_family_source_capture_contract import _validate_source_capture_contract
 
@@ -4379,45 +4388,6 @@ async def _lock_and_verify_activation(
         await _verify_incumbent(session, expected_incumbent)
 
 
-async def _rotate_family_relations(
-    session: Any,
-    spec: ReferenceFamilySpec,
-    ownership: ReferenceFamilyStageOwnership,
-    expected_incumbent: ReferenceFamilyIncumbent,
-) -> str | None:
-    if spec.importer_id == "mrf":
-        ordinary_predecessors = ", ".join(
-            f"{_quoted(expected_incumbent.schema_name)}.{_quoted(table_name + '_old')}"
-            for table_name in spec.table_names
-        )
-        await session.execute(text(f"DROP TABLE IF EXISTS {ordinary_predecessors} RESTRICT"))
-    incumbent_oids_by_name = dict(expected_incumbent.relation_oids)
-    predecessor_schema = None
-    if any(oid is not None for oid in incumbent_oids_by_name.values()):
-        predecessor_schema = reference_family_predecessor_schema(ownership.dataset_id)
-        if spec.importer_id == "geo":
-            await preserve_geo_cut_reads(session, ownership, expected_incumbent)
-        # Never infer ownership from a UUID-shaped name or replace content
-        # already present there: CREATE is the collision/CAS fence.
-        await create_model_family_predecessor_schema(session, spec.importer_id, predecessor_schema)
-    for table_name in spec.table_names:
-        incumbent_oid = incumbent_oids_by_name[table_name]
-        if incumbent_oid is not None:
-            await session.execute(
-                text(
-                    f"ALTER TABLE {_quoted(expected_incumbent.schema_name)}.{_quoted(table_name)} "
-                    f"SET SCHEMA {_quoted(predecessor_schema)}"
-                )
-            )
-        await session.execute(
-            text(
-                f"ALTER TABLE {_quoted(ownership.schema_name)}.{_quoted(table_name)} "
-                f"SET SCHEMA {_quoted(expected_incumbent.schema_name)}"
-            )
-        )
-    return predecessor_schema
-
-
 async def _validate_mrf_canonical_address_merge(session, stage, archive) -> None:
     """Reject mutable or mismatched canonical-address contributions before merge."""
 
@@ -4984,40 +4954,33 @@ async def activate_validated_reference_family_stage(
         wait_for_readers=spec.importer_id not in {"mrf", "facility-anchors"},
     )
     await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
-    immutable_predecessor = await _read_immutable_activation_predecessor(
-        session, validated_manifest, expected_incumbent
-    )
-    incoming_generation = _activation_source_generation(validated_manifest, cutover)
-    if cutover.authority == "automatic":
-        await _require_automatic_cutover_generation(
-            session,
-            spec,
-            expected_incumbent,
-            incoming_generation,
-            source_capture_contract=validated_manifest.source_capture_contract,
-        )
-    async with _doctors_cut_savepoint(session, spec.importer_id):
-        await _apply_validated_contribution(session, ownership, expected_incumbent, contribution_effect_receipt)
-        predecessor_schema_name, live_pairs, canonical_publication = await _complete_validated_stage_activation(
+    async with _validated_reference_publication(session, spec, expected_incumbent, cutover):
+        return await _activate_verified_reference_family(
             session,
             spec,
             ownership,
             expected_incumbent,
             validated_manifest,
+            validation,
+            cutover,
+            contribution_effect_receipt,
         )
-        published_authority = await _adopt_validated_family_generation(
-            session, validated_manifest, expected_incumbent, incoming_generation, live_pairs, immutable_predecessor
-        )
-    return ReferenceFamilyActivationReceipt(
-        spec.importer_id,
-        validated_manifest.source_metadata_sha256,
-        tuple((name, int(relation_oid)) for name, relation_oid in live_pairs),
-        expected_incumbent.relation_oids,
-        predecessor_schema_name,
-        validation.tables,
-        canonical_publication,
-        published_authority.as_dict() if immutable_predecessor is not None else None,
-    )
+
+
+@asynccontextmanager
+async def _validated_reference_publication(session, spec, incumbent, cutover):
+    from process.provider_directory_generic_source_policy import _PUBLISHER
+
+    if spec.importer_id not in {"geo", "cms-doctors"} or _PUBLISHER.get() is not None:
+        yield
+        return
+    async with protected_reference_family_publication(
+        session,
+        importer_id=spec.importer_id,
+        schema_name=incumbent.schema_name,
+        expected_owner_oid=cutover.expected_stage_owner_oid,
+    ):
+        yield
 
 
 def _require_terminal_manual_cutover(spec, manifest, cutover):
@@ -5212,6 +5175,7 @@ __all__ = [
     "ReferenceTableReceipt",
     "activate_reference_family_stage",
     "activate_validated_reference_family_stage",
+    "protected_reference_family_publication",
     "capture_reference_family_incumbent",
     "capture_reference_family_source",
     "capture_reference_family_stage_ownership",
