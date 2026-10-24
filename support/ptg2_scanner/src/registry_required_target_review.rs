@@ -20,7 +20,7 @@ pub const MAX_COPY_BYTES: usize = MAX_DOCUMENT_BYTES + 1_024;
 pub const MAX_DECISIONS: usize = 5_000;
 pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 pub const COMPONENT: &str = "registry_required_target_review";
-pub const PARSER_VERSION: &str = "registry-target-review-v1";
+pub const PARSER_VERSION: &str = "registry-target-review-v2";
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct RegistryRequiredTargetReviewError {
@@ -69,7 +69,7 @@ struct Ledger {
 #[serde(deny_unknown_fields)]
 struct LedgerObservation {
     source_row_ordinal: usize,
-    raw_cells: [String; 8],
+    raw_cells: [String; 7],
     target_keys: Vec<String>,
 }
 
@@ -79,8 +79,6 @@ struct LedgerTarget {
     target_key: String,
     #[serde(deserialize_with = "required_option")]
     fc_network_id: Option<String>,
-    #[serde(deserialize_with = "required_option")]
-    ribbon_id: Option<String>,
     source_row_ordinals: Vec<usize>,
 }
 
@@ -271,6 +269,7 @@ fn ledger_targets(
         return Err(invalid());
     }
     let mut keys = BTreeSet::new();
+    let mut source_ids = BTreeMap::new();
     let mut relations = BTreeMap::<&str, Vec<usize>>::new();
     for target in &ledger.ledger.targets {
         if target.target_key.is_empty()
@@ -291,45 +290,35 @@ fn ledger_targets(
                     || value.starts_with('0')
                     || !value.bytes().all(|byte| byte.is_ascii_digit())
             })
-            || target
-                .ribbon_id
-                .as_ref()
-                .is_some_and(|value| !canonical_uuid(value))
         {
             return Err(invalid());
         }
+        source_ids.insert(target.target_key.as_str(), target.fc_network_id.as_deref());
         relations.insert(&target.target_key, Vec::new());
     }
     for (index, observation) in ledger.ledger.observations.iter().enumerate() {
         if observation.source_row_ordinal != index + 1
-            || observation.target_keys.is_empty()
-            || observation.target_keys.len() > registry_target_ledger::MAX_RIBBON_IDS
-            || observation
-                .target_keys
-                .windows(2)
-                .any(|keys| keys[0] >= keys[1])
-            || observation
-                .raw_cells
-                .iter()
-                .enumerate()
-                .any(|(field, cell)| {
-                    cell.contains('\0')
-                        || cell.len()
-                            > if field == 7 {
-                                registry_target_ledger::MAX_RIBBON_BYTES
-                            } else {
-                                registry_target_ledger::MAX_FIELD_BYTES
-                            }
-                })
+            || observation.target_keys.len() != 1
+            || observation.raw_cells.iter().any(|cell| cell.contains('\0'))
         {
             return Err(invalid());
         }
-        for key in &observation.target_keys {
-            relations
-                .get_mut(key.as_str())
-                .ok_or_else(invalid)?
-                .push(index + 1);
+        let fc = registry_target_ledger::source_id(&observation.raw_cells, index + 1)
+            .map_err(|_| invalid())?;
+        if observation.target_keys[0]
+            != registry_target_ledger::target_key(
+                fc.as_deref(),
+                &ledger.ledger.source_sha256,
+                index + 1,
+            )
+            || source_ids.get(observation.target_keys[0].as_str()) != Some(&fc.as_deref())
+        {
+            return Err(invalid());
         }
+        relations
+            .get_mut(observation.target_keys[0].as_str())
+            .ok_or_else(invalid)?
+            .push(index + 1);
     }
     for target in &ledger.ledger.targets {
         if relations[&target.target_key.as_str()] != target.source_row_ordinals {
@@ -468,7 +457,7 @@ pub fn encode_registry_required_target_review_artifact(
     let snapshot = uuid_bytes(snapshot_id).expect("validated review UUID");
     let fields: [&[u8]; 6] = [
         &snapshot,
-        b"review:v1",
+        b"review:v2",
         &1i32.to_be_bytes(),
         b"accepted",
         &jsonb,

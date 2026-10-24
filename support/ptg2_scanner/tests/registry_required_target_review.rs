@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 const LEDGER: &str = "34567890-3456-7890-8345-34567890abcd";
 const REVIEW: &str = "45678901-4567-8901-8456-45678901abcd";
-const RIBBON: &str = "12345678-1234-5678-8123-123456789abc";
+const SOURCE_UUID: &str = "12345678-1234-5678-8123-123456789abc";
 
 fn sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -43,16 +43,9 @@ fn fields(copy: &[u8]) -> Vec<&[u8]> {
 fn ledger(fc: &str) -> Value {
     let mut csv = csv::Writer::from_writer(Vec::new());
     csv.write_record(HEADERS).unwrap();
-    for ribbon in [RIBBON, "23456789-2345-6789-8234-23456789abcd"] {
+    for requested in [fc, if fc == "2" { "1" } else { "2" }] {
         csv.write_record([
-            "Example",
-            "Company",
-            "Plan",
-            "PPO",
-            "Carrier",
-            "Network",
-            fc,
-            &json!([ribbon]).to_string(),
+            "Example", "Company", "Plan", "PPO", "Carrier", "Network", requested,
         ])
         .unwrap();
     }
@@ -67,7 +60,7 @@ fn binding(system: &str) -> Value {
             json!({"issuer_id":"12345","state":"CA","plan_year":2026,"plan_id":"12345CA0000001","checksum_network":-17})
         }
         "fhir" => {
-            json!({"organization_id":"Organization-1","legacy_uuid":RIBBON,"alias_scope":"alias-one"})
+            json!({"organization_id":"Organization-1","legacy_uuid":SOURCE_UUID,"alias_scope":"alias-one"})
         }
         _ => {
             json!({"cohort_id":"cohort-one","snapshot_id":"snapshot-one","company_key":"company-one"})
@@ -126,7 +119,7 @@ fn typed_copy_and_exact_canonical_hashes_preserve_partial_review() {
             0xab, 0xcd
         ]
     );
-    assert_eq!(fields[1], b"review:v1");
+    assert_eq!(fields[1], b"review:v2");
     assert_eq!(fields[2], &1i32.to_be_bytes());
     assert_eq!(fields[3], b"accepted");
     assert_eq!(fields[4][0], 1);
@@ -135,7 +128,7 @@ fn typed_copy_and_exact_canonical_hashes_preserve_partial_review() {
     assert_eq!(document.as_object().unwrap().len(), 8);
     assert_eq!(document["component"], "registry_required_target_review");
     assert_eq!(document["revision"], 1);
-    assert_eq!(document["parser_version"], "registry-target-review-v1");
+    assert_eq!(document["parser_version"], "registry-target-review-v2");
     assert_eq!(document["source_sha256"], sha(&source));
     assert_eq!(
         document["ledger_source_sha256"],
@@ -349,13 +342,11 @@ fn both_snapshot_ids_are_canonical_lowercase_nonzero_uuid() {
 fn ledger_metadata_counts_relations_and_maximum_fc_target_are_checked() {
     let ledger = ledger(&"9".repeat(128));
     let input = review(&ledger);
-    assert!(
-        ledger["ledger"]["targets"][0]["target_key"]
-            .as_str()
-            .unwrap()
-            .len()
-            > 128
-    );
+    assert!(ledger["ledger"]["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|target| target["target_key"].as_str().unwrap().len() > 128));
     encode_values(&input, &ledger);
     for (pointer, value) in [
         ("/component", json!("other")),
@@ -364,7 +355,7 @@ fn ledger_metadata_counts_relations_and_maximum_fc_target_are_checked() {
         ("/ledger/source_sha256", json!("x")),
         ("/ledger/row_count", json!(3)),
         ("/ledger/observations/1/source_row_ordinal", json!(1)),
-        ("/ledger/targets/0/source_row_ordinals", json!([2])),
+        ("/ledger/targets/0/source_row_ordinals", json!([1])),
         ("/ledger/targets/0/target_key", json!("x".repeat(193))),
     ] {
         let mut changed = ledger.clone();
@@ -537,7 +528,6 @@ fn maximum_decision_count_is_complete_and_one_extra_refuses() {
             "Carrier",
             "Network",
             &network.to_string(),
-            "[]",
         ])
         .unwrap();
     }
@@ -722,4 +712,58 @@ fn standalone_ledger_preserves_jsonb_input_and_canonical_document_limits() {
         validate_ledger_artifact(&bytes).unwrap_err().code,
         "registry_target_review_limit"
     );
+}
+
+#[test]
+fn requested_identity_and_exact_seven_cell_provenance_cannot_be_substituted() {
+    let ledger = ledger("123");
+    let input = review(&ledger);
+    let reject_invalid = |changed: &Value| {
+        let error = encode(
+            &serde_json::to_vec(&input).unwrap(),
+            &serde_json::to_vec(changed).unwrap(),
+            REVIEW,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "registry_target_review_ledger_invalid");
+    };
+    for (pointer, value) in [
+        ("/ledger/targets/0/fc_network_id", json!("456")),
+        ("/ledger/observations/0/raw_cells/6", json!("456")),
+        (
+            "/ledger/observations/0/target_keys",
+            json!(["fc:123", "fc:2"]),
+        ),
+        ("/parser_version", json!("registry-target-ledger-v1")),
+    ] {
+        let mut changed = ledger.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        reject_invalid(&changed);
+    }
+    let mut changed = ledger.clone();
+    changed["ledger"]["observations"][0]["raw_cells"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("extra"));
+    reject_invalid(&changed);
+}
+
+#[test]
+fn review_retains_missing_requested_id_row_fallbacks() {
+    let ledger = ledger("");
+    let input = review(&ledger);
+    encode_values(&input, &ledger);
+    let key = ledger["ledger"]["observations"][0]["target_keys"][0]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        key,
+        format!(
+            "csv:{}:row:1",
+            ledger["ledger"]["source_sha256"].as_str().unwrap()
+        )
+    );
+    let mut changed = ledger.clone();
+    changed["ledger"]["observations"][0]["target_keys"][0] = json!(key.replace(":row:1", ":row:2"));
+    reject(&input, &changed);
 }

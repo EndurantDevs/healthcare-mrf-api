@@ -347,7 +347,49 @@ def _custody_roles(config):
     return tuple(sorted(roles))
 
 
-def _verify_custody_config(config):
+def _custody_actor_roles(config, consumer=None):
+    """Retain original and effective actors independently of protected ownership metadata."""
+    consumer = config.consumer if consumer is None else consumer
+    roles = set()
+    for current in (config.consumer, consumer):
+        roles.update(
+            getattr(current, name, None)
+            for name in ("lifecycle_role", "execution_role", "api_role", "physical_owner_role", "owner_role")
+        )
+        roles.update(current.loader_roles)
+        roles.update(current.reader_roles)
+        roles.update(getattr(current, "source_authority_roles", ()))
+        store = getattr(getattr(current, "composition_runtime", None), "store", None)
+        roles.add(getattr(store, "approval_role", None))
+    roles.update(getattr(config, "source_authority_roles", ()))
+    store = getattr(config, "notification_store", None)
+    if store is not None:
+        roles.update((getattr(store, "publisher_role", None), getattr(store, "approval_role", None)))
+        roles.update(getattr(store, "reader_roles", ()))
+    roles.add(getattr(config, "reader_role", None))
+    roles.add(getattr(getattr(config.ptg, "store", None), "approval_role", None))
+    roles.discard(None)
+    if len(roles) > 128:
+        _invalid()
+    return tuple(sorted(roles))
+
+
+def _custody_runtime_roles(config, identity, consumer=None):
+    """Exclude only authenticated owners that have no runtime actor occurrence."""
+    consumer = config.consumer if consumer is None else consumer
+    actors = set(_custody_actor_roles(config, consumer))
+    roles = set(_custody_roles(config)) | actors
+    for current in (config.consumer, consumer):
+        store = getattr(getattr(current, "composition_runtime", None), "store", None)
+        roles.add(getattr(store, "owner_role", None))
+    roles.discard(None)
+    roles -= {identity["schema_owner_role"], identity["custody_owner_role"]} - actors
+    if len(roles) > 128:
+        _invalid()
+    return tuple(sorted(roles))
+
+
+def _verify_custody_config(config, consumer=None):
     if config.custody_url is None:
         return
     if type(config.custody_url) is not URL:
@@ -355,7 +397,16 @@ def _verify_custody_config(config):
     url = _database_url(config.custody_url.render_as_string(hide_password=False))
     execution = config.execution_url
     endpoint = lambda item: (item.host.lower(), item.port or 5432, item.database, dict(item.query))
-    forbidden_roles = {*_custody_roles(config), getattr(config.consumer, "queue_owner_role", None)}
+    consumer = config.consumer if consumer is None else consumer
+    forbidden_roles = {
+        *_custody_roles(config),
+        *_custody_actor_roles(config, consumer),
+        getattr(config.consumer, "queue_owner_role", None),
+        getattr(consumer, "queue_owner_role", None),
+    }
+    for current in (config.consumer, consumer):
+        store = getattr(getattr(current, "composition_runtime", None), "store", None)
+        forbidden_roles.add(getattr(store, "owner_role", None))
     if endpoint(url) != endpoint(execution) or url.username in forbidden_roles:
         _invalid()
 
@@ -365,19 +416,34 @@ async def _custody_identity(connection, schema, role):
     from process.registry_cms_source_worker import _IDENTITY_SQL
 
     identity_sql = (
-        "SELECT native.*,owner.oid::bigint AS custody_owner_oid,owner.rolname::text AS custody_owner_role "
+        "SELECT native.*,owner.oid::bigint AS custody_owner_oid,owner.rolname::text AS custody_owner_role,"
+        "n.nspowner::bigint AS schema_owner_oid,schema_owner.rolname::text AS schema_owner_role,"
+        "candidate.oid::bigint AS candidate_table_oid,candidate.relowner::bigint AS candidate_owner_oid,"
+        "ledger.oid::bigint AS seal_table_oid,"
+        "(pg_has_role(current_user,n.nspowner,'SET') OR pg_has_role(current_user,n.nspowner,'USAGE') "
+        "OR pg_has_role(current_user,n.nspowner,'MEMBER')) "
+        "AS can_assume_schema_owner "
         "FROM (" + _IDENTITY_SQL + ") native JOIN pg_namespace n ON n.oid::bigint=native.control_oid "
-        "JOIN pg_roles owner ON owner.oid=n.nspowner"
+        "JOIN pg_roles schema_owner ON schema_owner.oid=n.nspowner "
+        "JOIN pg_class candidate ON candidate.relnamespace=n.oid AND candidate.relname='network_membership_candidate' "
+        "JOIN pg_class ledger ON ledger.relnamespace=n.oid AND ledger.relname='network_candidate_custody' "
+        "JOIN pg_roles owner ON owner.oid=ledger.relowner"
     )
-    record = await connection.fetchrow(identity_sql, schema, schema)
-    if record is None:
+    identity_record = await connection.fetchrow(identity_sql, schema, schema)
+    if identity_record is None:
         raise ValueError("registry_candidate_custody_connection_invalid")
-    identity_by_name = dict(record)
+    identity_by_name = dict(identity_record)
+    can_assume_schema_owner = identity_by_name.pop("can_assume_schema_owner")
     if (
         identity_by_name.pop("safe_login") is not True
         or identity_by_name.pop("current_role") != role
         or identity_by_name.pop("session_role") != role
         or identity_by_name.get("control_oid") is None
+        or identity_by_name["candidate_owner_oid"] != identity_by_name["schema_owner_oid"]
+        or (
+            identity_by_name["custody_owner_oid"] != identity_by_name["schema_owner_oid"]
+            and can_assume_schema_owner is not False
+        )
     ):
         raise ValueError("registry_candidate_custody_connection_invalid")
     return identity_by_name
@@ -386,11 +452,16 @@ async def _custody_identity(connection, schema, role):
 async def _custody_runtime(config, stack, consumer, execution_connection):
     if config.custody_url is None:
         return consumer
-    from process.network_candidate_custody import seal_network_candidate_custody, verify_network_candidate_custody
+    from process.network_candidate_custody import (
+        _q_reach_closed,
+        seal_network_candidate_custody,
+        verify_network_candidate_custody,
+    )
 
-    _verify_custody_config(config)
+    _verify_custody_config(config, consumer)
     schema = consumer.control_schema
     identity = await _custody_identity(execution_connection, schema, consumer.execution_role)
+    await _q_reach_closed(execution_connection, identity, _custody_runtime_roles(config, identity, consumer))
     pool = await asyncpg.create_pool(**_pool_options(config.custody_url, 1, config.sql_limits))
     stack.push_async_callback(_close_pool, pool)
     pool = _BoundedPool(pool, config.sql_limits.connect_timeout_seconds)
@@ -408,8 +479,7 @@ async def _custody_runtime(config, stack, consumer, execution_connection):
                     and await _custody_identity(connection, schema, role) == identity
                 )
 
-            # The native protected owner may also own the pricing authority store.
-            runtime_roles = tuple(name for name in _custody_roles(config) if name != identity["custody_owner_role"])
+            runtime_roles = _custody_runtime_roles(config, identity, consumer)
             sealed = await seal_network_candidate_custody(
                 custodian,
                 copy_target,

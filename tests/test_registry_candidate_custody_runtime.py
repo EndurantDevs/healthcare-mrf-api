@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -108,6 +108,241 @@ def test_bound_source_authority_roles_are_forbidden_without_expanding_loader_rol
     assert not set(source_roles).intersection(parsed.consumer.reader_roles)
 
 
+@pytest.mark.parametrize(
+    "field", ("lifecycle_role", "execution_role", "api_role", "physical_owner_role", "loader_roles", "reader_roles")
+)
+@pytest.mark.parametrize("alias", ("schema_owner", "ledger_owner", "sealed_operator"))
+def test_runtime_actor_aliases_survive_queue_aggregation_and_owner_filtering(field, alias):
+    parsed = publication.parse_registry_publication_worker_config(json.dumps(_configured(publication_configuration)[0]))
+    value = (alias,) if field.endswith("roles") else alias
+    consumer = replace(parsed.consumer, queue_owner_role=alias, **{field: value})
+    config = SimpleNamespace(**{**vars(parsed), "consumer": consumer})
+    identity_by_name = dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+    assert alias in publication._custody_actor_roles(config)
+    assert alias in publication._custody_runtime_roles(config, identity_by_name)
+    with pytest.raises(ValueError, match="invalid") if alias == "sealed_operator" else nullcontext():
+        publication._verify_custody_config(config)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "lifecycle_role",
+        "execution_role",
+        "api_role",
+        "physical_owner_role",
+        "loader_roles",
+        "reader_roles",
+        "owner_role",
+    ),
+)
+@pytest.mark.parametrize("alias", ("schema_owner", "ledger_owner", "sealed_operator"))
+def test_original_actor_cannot_disappear_when_effective_consumer_changes(field, alias):
+    parser, factory = WORKERS[2 if field == "owner_role" else 0]
+    parsed = parser(json.dumps(_configured(factory)[0]))
+    value = (alias,) if field.endswith("roles") else alias
+    original = replace(parsed.consumer, **{field: value})
+    if field != "owner_role":
+        original = replace(original, queue_owner_role=alias)
+    effective = replace(original, **{field: ("safe_actor",) if field.endswith("roles") else "safe_actor"})
+    config = SimpleNamespace(**{**vars(parsed), "consumer": original})
+    identity_by_name = dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+    actors = publication._custody_actor_roles(config, effective)
+    assert {alias, "safe_actor"} <= set(actors)
+    assert {alias, "safe_actor"} <= set(publication._custody_runtime_roles(config, identity_by_name, effective))
+    if alias == "sealed_operator":
+        with pytest.raises(ValueError, match="invalid"):
+            publication._verify_custody_config(config, effective)
+
+
+def test_source_physical_owner_and_bound_source_census_are_runtime_actors():
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+
+    parsed = ptg.parse_registry_ptg_source_worker_config(json.dumps(_configured(ptg_configuration)[0]))
+    store = RegistryPTGProducerScopeStore("schema_owner", "scope_approver", parsed.consumer.control_schema)
+    source_roles = ("ledger_owner", "schema_owner", "source_publisher")
+    consumer = replace(parsed.consumer, owner_role="ledger_owner")
+    config = SimpleNamespace(
+        **{
+            **vars(parsed),
+            "consumer": consumer,
+            "source_authority_roles": source_roles,
+            "ptg": publication._PTGWorkerConfig(store, parsed.ptg.read_budget),
+            "notification_store": store,
+        }
+    )
+    actors = publication._custody_actor_roles(config)
+    roles = publication._custody_runtime_roles(
+        config, dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+    )
+    assert set(source_roles) | {consumer.owner_role, "scope_approver", parsed.reader_role} <= set(actors)
+    assert set(actors) <= set(roles)
+
+
+@pytest.mark.parametrize("alias", ("schema_owner", "ledger_owner", "sealed_operator"))
+def test_original_and_effective_aca_source_authorities_both_remain_actors(alias):
+    from process.registry_aca_source_consumer import RegistryACASourceConsumerConfig
+
+    parsed = publication.parse_registry_publication_worker_config(json.dumps(_configured(publication_configuration)[0]))
+    original = RegistryACASourceConsumerConfig(
+        parsed.consumer.control_schema,
+        parsed.consumer.execution_role,
+        parsed.consumer.physical_owner_role,
+        source_id="synthetic_source",
+        producer_id="synthetic_producer",
+        issuer_id=1,
+        year=2026,
+        source_authority_roles=("original_source_actor",),
+    )
+    effective = replace(original, source_authority_roles=(alias,))
+    config = SimpleNamespace(
+        **{**vars(parsed), "consumer": original, "source_authority_roles": original.source_authority_roles}
+    )
+    identity_by_name = dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+    expected_roles = {"original_source_actor", alias}
+    assert expected_roles <= set(publication._custody_actor_roles(config, effective))
+    assert expected_roles <= set(publication._custody_runtime_roles(config, identity_by_name, effective))
+    if alias == "sealed_operator":
+        with pytest.raises(ValueError, match="invalid"):
+            publication._verify_custody_config(config, effective)
+
+
+@pytest.mark.parametrize("owner", ("schema_owner", "ledger_owner", "unmatched_owner"))
+def test_only_native_bound_metadata_owners_are_omitted(owner):
+    parsed = ptg.parse_registry_ptg_source_worker_config(json.dumps(_configured(ptg_configuration)[0]))
+    store = replace(parsed.ptg.store, owner_role=owner)
+    config = SimpleNamespace(**{**vars(parsed), "ptg": replace(parsed.ptg, store=store), "notification_store": store})
+    identity_by_name = dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+    assert owner not in publication._custody_actor_roles(config)
+    assert (owner in publication._custody_runtime_roles(config, identity_by_name)) is (owner == "unmatched_owner")
+
+
+def test_runtime_role_bound_is_applied_to_the_complete_actor_union():
+    parsed = publication.parse_registry_publication_worker_config(json.dumps(publication_configuration()))
+    ordinary_roles = set(publication._custody_actor_roles(parsed))
+    config = SimpleNamespace(
+        **{**vars(parsed), "source_authority_roles": tuple(f"source_{i}" for i in range(128 - len(ordinary_roles)))}
+    )
+    identity_by_name = dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+    assert len(publication._custody_runtime_roles(config, identity_by_name)) == 128
+    config.source_authority_roles += ("one_more_source_actor",)
+    with pytest.raises(ValueError, match="invalid"):
+        publication._custody_runtime_roles(config, identity_by_name)
+
+
+@pytest.mark.parametrize(
+    "actor_field",
+    ("publisher_role", "reader_roles", "approval_role", "reader_role", "ptg_approval", "source_authority_roles"),
+)
+@pytest.mark.parametrize("alias", ("schema_owner", "ledger_owner", "sealed_operator"))
+def test_notification_and_source_actor_aliases_cannot_be_metadata_exempted(actor_field, alias):
+    parser, factory = WORKERS[1 if actor_field in {"publisher_role", "reader_roles"} else 2]
+    parsed = parser(json.dumps(_configured(factory)[0]))
+    config = SimpleNamespace(**vars(parsed))
+    if actor_field in {"publisher_role", "reader_roles", "approval_role"}:
+        config.notification_store = replace(
+            parsed.notification_store, **{actor_field: (alias,) if actor_field == "reader_roles" else alias}
+        )
+    elif actor_field == "ptg_approval":
+        config.ptg = replace(parsed.ptg, store=replace(parsed.ptg.store, approval_role=alias))
+    else:
+        setattr(config, actor_field, (alias,) if actor_field == "source_authority_roles" else alias)
+    identity_by_name = dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+    assert alias in publication._custody_actor_roles(config)
+    assert alias in publication._custody_runtime_roles(config, identity_by_name)
+    if alias == "sealed_operator":
+        with pytest.raises(ValueError, match="invalid"):
+            publication._verify_custody_config(config)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ("schema_owner", "ledger_owner", "sealed_operator"))
+async def test_effective_composition_approval_actor_is_not_lost(monkeypatch, alias):
+    from contextlib import AsyncExitStack
+
+    config = ptg.parse_registry_ptg_source_worker_config(json.dumps(_configured(ptg_configuration)[0]))
+    async with AsyncExitStack() as stack:
+        consumer = publication._ptg_runtime(config, stack)
+        runtime = replace(consumer.composition_runtime, store=replace(config.ptg.store, approval_role=alias))
+        consumer = replace(consumer, composition_runtime=runtime)
+        identity_by_name = dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+        assert alias not in publication._custody_roles(config)
+        assert alias in publication._custody_actor_roles(config, consumer)
+        assert alias in publication._custody_runtime_roles(config, identity_by_name, consumer)
+        if alias == "sealed_operator":
+            case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
+            with pytest.raises(ValueError, match="invalid"):
+                await publication._custody_runtime(config, stack, consumer, case.execution)
+            create.assert_not_awaited()
+            finalizer.assert_not_awaited()
+            verifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_effective_composition_metadata_owner_cannot_alias_custodian(monkeypatch):
+    from contextlib import AsyncExitStack
+
+    config = ptg.parse_registry_ptg_source_worker_config(json.dumps(_configured(ptg_configuration)[0]))
+    async with AsyncExitStack() as stack:
+        consumer = publication._ptg_runtime(config, stack)
+        runtime = replace(consumer.composition_runtime, store=replace(config.ptg.store, owner_role="sealed_operator"))
+        consumer = replace(consumer, composition_runtime=runtime)
+        assert "sealed_operator" not in publication._custody_actor_roles(config, consumer)
+        case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
+        with pytest.raises(ValueError, match="invalid"):
+            await publication._custody_runtime(config, stack, consumer, case.execution)
+        create.assert_not_awaited()
+        finalizer.assert_not_awaited()
+        verifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ("schema_owner", "ledger_owner", "sealed_operator"))
+async def test_original_composition_approval_actor_survives_replaced_runtime(monkeypatch, alias):
+    from contextlib import AsyncExitStack
+
+    parsed = ptg.parse_registry_ptg_source_worker_config(json.dumps(_configured(ptg_configuration)[0]))
+    async with AsyncExitStack() as stack:
+        effective = publication._ptg_runtime(parsed, stack)
+        original_runtime = replace(effective.composition_runtime, store=replace(parsed.ptg.store, approval_role=alias))
+        original = replace(parsed.consumer, composition_runtime=original_runtime)
+        config = SimpleNamespace(**{**vars(parsed), "consumer": original})
+        identity_by_name = dict(schema_owner_role="schema_owner", custody_owner_role="ledger_owner")
+        assert alias not in publication._custody_roles(config)
+        assert {alias, parsed.ptg.store.approval_role} <= set(publication._custody_actor_roles(config, effective))
+        assert alias in publication._custody_runtime_roles(config, identity_by_name, effective)
+        if alias == "sealed_operator":
+            case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
+            with pytest.raises(ValueError, match="invalid"):
+                await publication._custody_runtime(config, stack, effective, case.execution)
+            create.assert_not_awaited()
+            finalizer.assert_not_awaited()
+            verifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_original_composition_metadata_owner_remains_custodian_forbidden(monkeypatch):
+    from contextlib import AsyncExitStack
+
+    parsed = ptg.parse_registry_ptg_source_worker_config(json.dumps(_configured(ptg_configuration)[0]))
+    async with AsyncExitStack() as stack:
+        effective = publication._ptg_runtime(parsed, stack)
+        original_runtime = replace(
+            effective.composition_runtime, store=replace(parsed.ptg.store, owner_role="sealed_operator")
+        )
+        config = SimpleNamespace(
+            **{**vars(parsed), "consumer": replace(parsed.consumer, composition_runtime=original_runtime)}
+        )
+        assert "sealed_operator" not in publication._custody_roles(config)
+        assert "sealed_operator" not in publication._custody_actor_roles(config, effective)
+        case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
+        with pytest.raises(ValueError, match="invalid"):
+            await publication._custody_runtime(config, stack, effective, case.execution)
+        create.assert_not_awaited()
+        finalizer.assert_not_awaited()
+        verifier.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("parser,factory", WORKERS)
 async def test_absent_custody_runtime_preserves_consumer_without_connections_or_cleanup(monkeypatch, parser, factory):
@@ -130,15 +365,44 @@ class _CustodyConnection:
     def __init__(self, role, config, outcome, events, identity_by_name):
         self.config, self.outcome, self.events, self.identity_by_name = config, outcome, events, identity_by_name
         self.role, self.active, self.identity_reads = role, False, 0
+        self.catalog_roles = set(publication._custody_roles(config)) | {
+            identity_by_name["schema_owner_role"],
+            identity_by_name["custody_owner_role"],
+            role,
+        }
+        self.q_reaching_roles = set()
+
+    async def fetchval(self, sql, *args):
+        assert sql == foundation._Q_REACH_SQL
+        names, owner_oid = args
+        assert type(names) is list and owner_oid == self.identity_by_name["schema_owner_oid"]
+        self.events.append("q reach")
+        return all(
+            name in self.catalog_roles
+            and name != self.identity_by_name["schema_owner_role"]
+            and name not in self.q_reaching_roles
+            for name in names
+        )
 
     async def fetchrow(self, sql, *args):
         assert "safe_login" in sql and args == (self.config.consumer.control_schema,) * 2
         self.identity_reads += 1
         identity_record_by_name = dict(
-            self.identity_by_name, safe_login=True, current_role=self.role, session_role=self.role
+            self.identity_by_name,
+            safe_login=True,
+            current_role=self.role,
+            session_role=self.role,
+            can_assume_schema_owner=self.identity_by_name["schema_owner_oid"]
+            == self.identity_by_name["custody_owner_oid"],
         )
         if self.role == self.config.custody_url.username and self.outcome == "identity":
             identity_record_by_name["database_oid"] += 1
+        if self.role == self.config.custody_url.username and self.outcome in {
+            "assume_schema_owner",
+            "inherit_schema_owner",
+            "member_schema_owner",
+        }:
+            identity_record_by_name["can_assume_schema_owner"] = True
         return identity_record_by_name
 
     @asynccontextmanager
@@ -200,9 +464,7 @@ def _custody_finalizer(config, case):
         assert case.execution_pool.active and case.custody_pool.active
         assert pre_enrolled_only is case.pre_enrolled_only
         assert control_schema == config.consumer.control_schema
-        assert runtime_roles == tuple(
-            role for role in publication._custody_roles(config) if role != case.identity_by_name["custody_owner_role"]
-        )
+        assert runtime_roles == publication._custody_runtime_roles(config, case.identity_by_name)
         if case.protected_store_owner:
             assert config.ptg.store.owner_role not in runtime_roles
             assert config.consumer.owner_role in runtime_roles
@@ -253,6 +515,11 @@ def _runtime_custody_case(monkeypatch, config, outcome, protected_store_owner):
         inbox_oid=200,
         custody_owner_oid=300,
         custody_owner_role=config.ptg.store.owner_role if protected_store_owner else "protected_control_owner",
+        schema_owner_oid=300,
+        schema_owner_role=config.ptg.store.owner_role if protected_store_owner else "protected_control_owner",
+        candidate_table_oid=301,
+        candidate_owner_oid=300,
+        seal_table_oid=302,
     )
     copy_target = MembershipCopyTarget(
         *(str(UUID(int=i)) for i in (1, 2, 3, 4)), "network_candidate_" + UUID(int=4).hex
@@ -297,7 +564,7 @@ def _runtime_custody_case(monkeypatch, config, outcome, protected_store_owner):
 
 
 async def _exercise_runtime_custody_callback(
-    monkeypatch, parser, factory, outcome, *, protected_store_owner=False, pre_enrolled_only=False
+    monkeypatch, parser, factory, outcome, *, protected_store_owner=False, pre_enrolled_only=False, split_owner=False
 ):
     import asyncio
     from contextlib import AsyncExitStack
@@ -307,6 +574,15 @@ async def _exercise_runtime_custody_callback(
     case, create_pool, finalizer, verifier, completions = _runtime_custody_case(
         monkeypatch, config, outcome, protected_store_owner
     )
+    if split_owner:
+        schema_owner = config.ptg.store.owner_role if protected_store_owner else "schema_owner"
+        case.identity_by_name.update(schema_owner_oid=400, schema_owner_role=schema_owner, candidate_owner_oid=400)
+        case.execution.catalog_roles.add(schema_owner)
+        case.custodian.catalog_roles.add(schema_owner)
+        if protected_store_owner:
+            case.identity_by_name["custody_owner_role"] = "ledger_owner"
+            case.execution.catalog_roles.add("ledger_owner")
+            case.custodian.catalog_roles.add("ledger_owner")
     case.pre_enrolled_only = pre_enrolled_only
     execution_pool, custody_pool = case.execution_pool, case.custody_pool
     execution, copy_target, events = case.execution, case.copy_target, case.events
@@ -328,7 +604,7 @@ async def _exercise_runtime_custody_callback(
             asyncio.CancelledError
             if outcome.endswith("cancel")
             else ValueError
-            if outcome in {"mismatch", "identity"}
+            if outcome in {"mismatch", "identity", "assume_schema_owner", "inherit_schema_owner", "member_schema_owner"}
             else RuntimeError
         )
         with pytest.raises(error):
@@ -339,6 +615,7 @@ async def _exercise_runtime_custody_callback(
     assert create_pool.await_count == execution_pool.checkouts == custody_pool.checkouts == 1
     assert execution.identity_reads == 1 and custody_pool.closes == 1
     assert events.index("custody created") < events.index("custody acquire") < events.index("custody close")
+    assert events.index("q reach") < events.index("custody created")
     assert events[-1] == "custody close" and not execution_pool.active and not custody_pool.active
 
 
@@ -364,5 +641,80 @@ async def test_runtime_callback_failures_cancel_completion_and_close_registered_
 @pytest.mark.asyncio
 async def test_native_protected_control_owner_can_also_own_the_pricing_authority_store(monkeypatch):
     await _exercise_runtime_custody_callback(
-        monkeypatch, WORKERS[2][0], WORKERS[2][1], "complete", protected_store_owner=True
+        monkeypatch, WORKERS[2][0], WORKERS[2][1], "complete", protected_store_owner=True, split_owner=True
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parser,factory", WORKERS)
+async def test_split_runtime_binds_both_owners_without_assuming_schema_owner(monkeypatch, parser, factory):
+    await _exercise_runtime_custody_callback(monkeypatch, parser, factory, "complete", split_owner=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["assume_schema_owner", "inherit_schema_owner", "member_schema_owner"])
+async def test_split_runtime_refuses_custodian_that_can_assume_schema_owner(monkeypatch, outcome):
+    await _exercise_runtime_custody_callback(monkeypatch, WORKERS[0][0], WORKERS[0][1], outcome, split_owner=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reach", ("self", "member", "missing", "original_actor"))
+async def test_complete_actor_q_refusal_precedes_custodian_pool_creation(monkeypatch, reach):
+    from contextlib import AsyncExitStack
+
+    parsed = publication.parse_registry_publication_worker_config(json.dumps(_configured(publication_configuration)[0]))
+    actor = parsed.consumer.queue_owner_role if reach in {"self", "original_actor"} else parsed.consumer.api_role
+    consumer = replace(parsed.consumer, api_role=actor)
+    config = SimpleNamespace(**{**vars(parsed), "consumer": consumer})
+    case, create, finalizer, verifier, completions = _runtime_custody_case(monkeypatch, config, "complete", False)
+    case.identity_by_name.update(
+        schema_owner_oid=400, schema_owner_role=parsed.consumer.queue_owner_role, candidate_owner_oid=400
+    )
+    case.execution.catalog_roles.add(parsed.consumer.queue_owner_role)
+    if reach == "original_actor":
+        consumer = replace(consumer, api_role="safe_api")
+        case.execution.catalog_roles.add("safe_api")
+    if reach == "member":
+        case.execution.q_reaching_roles.add(actor)
+    elif reach == "missing":
+        case.execution.catalog_roles.remove(actor)
+    async with AsyncExitStack() as stack:
+        async with case.execution_pool.acquire(timeout=config.sql_limits.connect_timeout_seconds) as original:
+            with pytest.raises(foundation.NetworkCandidateCustodyError):
+                await publication._custody_runtime(config, stack, consumer, original)
+        assert not stack._exit_callbacks
+    create.assert_not_awaited()
+    finalizer.assert_not_awaited()
+    verifier.assert_not_awaited()
+    assert not completions and case.custody_pool.closes == case.custody_pool.checkouts == 0
+    assert case.execution.identity_reads == 1
+    assert case.events == ["execution acquire", "q reach", "execution release"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["candidate_owner_oid", "safe_login", "session_role", "current_role"])
+async def test_runtime_identity_refuses_changed_native_owner_or_original_login(drift):
+    identity_by_name = dict(
+        safe_login=True,
+        current_role="custodian",
+        session_role="custodian",
+        control_oid=10,
+        schema_owner_oid=11,
+        schema_owner_role="schema_owner",
+        custody_owner_oid=12,
+        custody_owner_role="custody_owner",
+        candidate_owner_oid=11,
+        candidate_table_oid=13,
+        seal_table_oid=14,
+        can_assume_schema_owner=False,
+    )
+    identity_by_name[drift] = (
+        99 if drift == "candidate_owner_oid" else False if drift == "safe_login" else "another_role"
+    )
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=identity_by_name))
+    with pytest.raises(ValueError, match="connection_invalid"):
+        await publication._custody_identity(connection, "control", "custodian")
+    sql = connection.fetchrow.await_args.args[0]
+    assert "owner.oid=ledger.relowner" in sql
+    for privilege in ("MEMBER", "USAGE", "SET"):
+        assert f"pg_has_role(current_user,n.nspowner,'{privilege}')" in sql

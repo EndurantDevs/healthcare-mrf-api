@@ -4,7 +4,7 @@
 use crate::network_membership_codec::{uuid_bytes, write_field, COPY_HEADER};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -13,13 +13,11 @@ pub const MAX_ROWS: usize = 50_000;
 pub const MAX_TARGETS: usize = 5_000;
 pub const MAX_FIELD_BYTES: usize = 4_096;
 pub const MAX_FC_BYTES: usize = 128;
-pub const MAX_RIBBON_BYTES: usize = 65_536;
-pub const MAX_RIBBON_IDS: usize = 100;
 pub const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_COPY_BYTES: usize = MAX_OUTPUT_BYTES + 1_024;
-pub const PARSER_VERSION: &str = "registry-target-ledger-v1";
+pub const PARSER_VERSION: &str = "registry-target-ledger-v2";
 pub const COMPONENT: &str = "registry_required_target_ledger";
-pub const HEADERS: [&str; 8] = [
+pub const HEADERS: [&str; 7] = [
     "COMPANY_ALIAS",
     "COMPANY_NAME",
     "PLAN_NAME",
@@ -27,13 +25,12 @@ pub const HEADERS: [&str; 8] = [
     "PLAN_CARRIER",
     "FIND_CARE_NETWORK_NAME",
     "NETWORK_FC_ID",
-    "RIBBON_IDS",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RegistryTargetLedgerObservation {
     pub source_row_ordinal: usize,
-    pub raw_cells: [String; 8],
+    pub raw_cells: [String; 7],
     pub target_keys: Vec<String>,
 }
 
@@ -41,7 +38,6 @@ pub struct RegistryTargetLedgerObservation {
 pub struct RegistryTargetLedgerTarget {
     pub target_key: String,
     pub fc_network_id: Option<String>,
-    pub ribbon_id: Option<String>,
     pub source_row_ordinals: Vec<usize>,
 }
 
@@ -185,19 +181,12 @@ fn finish_record_count(
         .ok_or_else(|| failure("invalid_headers", None))
 }
 
-fn source_ids(
-    cells: &[String; 8],
+pub(crate) fn source_id(
+    cells: &[String; 7],
     row: usize,
-) -> Result<(Option<String>, BTreeSet<String>), RegistryTargetLedgerError> {
-    for (index, cell) in cells.iter().enumerate() {
-        let limit = if index == 7 {
-            MAX_RIBBON_BYTES
-        } else {
-            MAX_FIELD_BYTES
-        };
-        if cell.len() > limit {
-            return Err(failure("field_limit", Some(row)));
-        }
+) -> Result<Option<String>, RegistryTargetLedgerError> {
+    if cells.iter().any(|cell| cell.len() > MAX_FIELD_BYTES) {
+        return Err(failure("field_limit", Some(row)));
     }
     let fc = &cells[6];
     if !fc.is_empty()
@@ -207,49 +196,14 @@ fn source_ids(
     {
         return Err(failure("invalid_fc_id", Some(row)));
     }
-    let ribbons: Vec<String> = if cells[7].is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(&cells[7]).map_err(|_| failure("invalid_ribbon_json", Some(row)))?
-    };
-    if ribbons.len() > MAX_RIBBON_IDS {
-        return Err(failure("ribbon_id_limit", Some(row)));
-    }
-    if ribbons
-        .iter()
-        .any(|id| uuid_bytes(id).is_none() || id.bytes().any(|byte| byte.is_ascii_uppercase()))
-    {
-        return Err(failure("invalid_ribbon_id", Some(row)));
-    }
-    Ok((
-        (!fc.is_empty()).then(|| fc.clone()),
-        ribbons.into_iter().collect(),
-    ))
+    Ok((!fc.is_empty()).then(|| fc.clone()))
 }
 
-fn row_targets(
-    fc: Option<&str>,
-    ribbons: &BTreeSet<String>,
-    digest: &str,
-    row: usize,
-) -> Vec<(String, Option<String>)> {
-    if ribbons.is_empty() {
-        let key = fc.map_or_else(
-            || format!("csv:{digest}:row:{row}"),
-            |id| format!("fc:{id}:ribbon:missing"),
-        );
-        return vec![(key, None)];
-    }
-    ribbons
-        .iter()
-        .map(|ribbon| {
-            let key = fc.map_or_else(
-                || format!("ribbon:{ribbon}:fc:missing"),
-                |id| format!("fc:{id}:ribbon:{ribbon}"),
-            );
-            (key, Some(ribbon.clone()))
-        })
-        .collect()
+pub(crate) fn target_key(fc: Option<&str>, digest: &str, row: usize) -> String {
+    fc.map_or_else(
+        || format!("csv:{digest}:row:{row}"),
+        |id| format!("fc:{id}"),
+    )
 }
 
 struct OutputCounter(usize);
@@ -279,29 +233,23 @@ fn decode_observation(
         return Err(failure("invalid_csv", Some(row)));
     }
     let raw_cells = std::array::from_fn(|index| record[index].to_owned());
-    let (fc, ribbons) = source_ids(&raw_cells, row)?;
-    let mut target_keys = Vec::new();
-    for (target_key, ribbon_id) in row_targets(fc.as_deref(), &ribbons, digest, row) {
-        let target =
-            targets
-                .entry(target_key.clone())
-                .or_insert_with(|| RegistryTargetLedgerTarget {
-                    target_key: target_key.clone(),
-                    fc_network_id: fc.clone(),
-                    ribbon_id,
-                    source_row_ordinals: Vec::new(),
-                });
-        target.source_row_ordinals.push(row);
-        target_keys.push(target_key);
-    }
+    let fc = source_id(&raw_cells, row)?;
+    let key = target_key(fc.as_deref(), digest, row);
+    let target = targets
+        .entry(key.clone())
+        .or_insert_with(|| RegistryTargetLedgerTarget {
+            target_key: key.clone(),
+            fc_network_id: fc,
+            source_row_ordinals: Vec::new(),
+        });
+    target.source_row_ordinals.push(row);
     if targets.len() > MAX_TARGETS {
         return Err(failure("target_limit", Some(row)));
     }
-    target_keys.sort();
     Ok(RegistryTargetLedgerObservation {
         source_row_ordinal: row,
         raw_cells,
-        target_keys,
+        target_keys: vec![key],
     })
 }
 
@@ -409,7 +357,7 @@ pub fn encode_registry_target_ledger_artifact(
     observation_json.extend_from_slice(&artifact);
     let fields: [&[u8]; 6] = [
         &snapshot,
-        b"ledger:v1",
+        b"ledger:v2",
         &1i32.to_be_bytes(),
         b"accepted",
         &observation_json,

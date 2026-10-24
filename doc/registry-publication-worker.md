@@ -116,6 +116,36 @@ nongrantable custody-ledger reader access; it refuses missing enrollment and
 does not restore revoked grants. The worker consumes the initial request
 through its ordinary queue and deadline lifecycle without approving saved drafts.
 
+The custody ledger may have a protected owner separate from the registry schema
+owner. The schema, source-admission records, approval controls, candidate metadata,
+queue and serving head keep their existing owner. Only `network_candidate_custody`
+and sealed candidate storage use the separate owner. The two owners must have no
+membership relationship. Existing source receipts keep their original identities.
+
+Complete the existing custody migration and adoption before this handoff. In a
+caller-owned maintenance transaction, `split_registry_candidate_custody` validates
+the exact native layout, foreign key and reader grants, then transfers only an
+empty ledger. It requires the original LOGIN superuser, empty candidate and
+manifest tables, and the original unset serving head. Its locks remain held until
+the caller commits or rolls back. The new owner must already have registry
+`USAGE` without `CREATE`; the handoff preserves the schema ACL. It does not attest
+migration history or repair unexpected ownership. Repeating it after the split
+refuses rather than reinterpreting retained state.
+
+Ordinary custody continues through `custody_dsn`, never the maintenance login.
+The custodian inherits the execution role's bounded reads and loading ownership,
+and can assume the loading and custody owners. It must have no membership,
+inherited privileges or role-assumption path to the registry schema owner.
+Existing database `CREATE` prerequisites for candidate ownership transfer still
+apply. Temporary candidate-schema access is removed before the final closure;
+the worker installs no roles or memberships.
+
+Split ownership emits revision-three seals binding both native owners. Revision
+one and two seals retain their original single-owner meaning, so an existing
+seal forbids this handoff. Older binaries reject the split. After activation,
+rollback must retain a split-aware image and the retained serving snapshot;
+transferring a populated ledger back is not a supported rollback.
+
 
 The optional closed `sql_limits` object supplies six positive integer limits:
 `work_mem_bytes` (default 16777216), `maintenance_work_mem_bytes` (67108864),

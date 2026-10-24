@@ -23,7 +23,6 @@ _HEADERS = (
     "PLAN_CARRIER",
     "FIND_CARE_NETWORK_NAME",
     "NETWORK_FC_ID",
-    "RIBBON_IDS",
 )
 
 
@@ -41,7 +40,6 @@ def _input(rows=2, suffix=""):
                 "Example Carrier",
                 "Example Network",
                 "123",
-                '["12345678-1234-5678-8123-123456789abc"]',
             )
         )
     return output.getvalue().encode()

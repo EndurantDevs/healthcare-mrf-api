@@ -11,6 +11,7 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import asyncpg
@@ -75,14 +76,14 @@ def _wire(input_bytes):
         {
             "component": "registry_required_target_review",
             "revision": 1,
-            "parser_version": "registry-target-review-v1",
+            "parser_version": "registry-target-review-v2",
             "source_sha256": hashlib.sha256(input_bytes).hexdigest(),
             "ledger_snapshot_id": str(LEDGER_ID),
             "ledger_artifact_sha256": "a" * 64,
             "ledger_source_sha256": "b" * 64,
             "decisions": [
                 {
-                    "target_key": "fc:1:ribbon:missing",
+                    "target_key": "fc:1",
                     "resolution_status": "unresolved",
                     "network_id": None,
                     "source_binding": None,
@@ -95,13 +96,13 @@ def _wire(input_bytes):
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    fields = (REVIEW_ID.bytes, b"review:v1", struct.pack(">i", 1), b"accepted", b"\x01" + artifact, b"\x01[]")
+    fields = (REVIEW_ID.bytes, b"review:v2", struct.pack(">i", 1), b"accepted", b"\x01" + artifact, b"\x01[]")
     copy = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0" + struct.pack(">h", 6)
     copy += b"".join(struct.pack(">i", len(field)) + field for field in fields) + struct.pack(">h", -1)
     descriptor_by_field = {
         "component": "registry_required_target_review",
         "revision": 1,
-        "parser_version": "registry-target-review-v1",
+        "parser_version": "registry-target-review-v2",
         "snapshot_id": str(REVIEW_ID),
         "source_sha256": hashlib.sha256(input_bytes).hexdigest(),
         "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
@@ -618,3 +619,89 @@ def test_actual_cli_module_preflight_advertises_protected_owner_role(tmp_path):
     )
     assert completed.returncode == 0 and completed.stderr == b""
     assert b"--protected-owner-role" in completed.stdout
+
+
+@pytest.mark.parametrize("failure", ["edition_type", "ledger_type", "ledger_zero", "digest"])
+def test_invalid_review_precedes_all_io(monkeypatch, failure):
+    source = b"source"
+    edition, ledger_id = _edition(source), LEDGER_ID
+    if failure == "edition_type":
+        edition = SimpleNamespace(**vars(edition))
+    elif failure == "ledger_type":
+        ledger_id = str(ledger_id)
+    elif failure == "ledger_zero":
+        ledger_id = UUID(int=0)
+    else:
+        source += b"changed final byte"
+    encode = Mock(side_effect=AssertionError("Invalid review must not invoke native encoding"))
+    monkeypatch.setattr(store, "_encode", encode)
+    with pytest.raises(RegistryRequiredTargetError, match="^registry_required_target_review_input_invalid$"):
+        asyncio.run(store.admit_registry_required_target_review(None, source, edition, ledger_id))
+    encode.assert_not_called()
+
+
+def test_review_requires_transaction_before_read(monkeypatch):
+    source = b"source"
+    connection = SimpleNamespace(is_in_transaction=lambda: False, fetchrow=AsyncMock())
+    encode = Mock(side_effect=AssertionError("No native work without caller transaction"))
+    monkeypatch.setattr(store, "_encode", encode)
+    with pytest.raises(RegistryRequiredTargetError, match="^registry_required_target_review_transaction_required$"):
+        asyncio.run(store.admit_registry_required_target_review(connection, source, _edition(source), LEDGER_ID))
+    connection.fetchrow.assert_not_awaited()
+    encode.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["status", "short_stream"])
+def test_incomplete_review_copy_rolls_back(monkeypatch, failure):
+    input_bytes = b"source"
+    copy, descriptor = _wire(input_bytes)
+    connection = _FailureDatabase("landing")
+    connection.execute = AsyncMock()
+    connection.fetchval = AsyncMock(side_effect=AssertionError("Incomplete COPY must not validate landing"))
+
+    async def copy_to_table(_table, **options):
+        assert options["schema_name"] == "pg_temp" and options["format"] == "binary"
+        expected = len(copy) - (failure == "short_stream")
+        assert options["source"].read(expected) == copy[:expected]
+        return "COPY 0" if failure == "status" else "COPY 1"
+
+    connection.copy_to_table = AsyncMock(side_effect=copy_to_table)
+    retain = AsyncMock(side_effect=AssertionError("Incomplete review must not be retained"))
+    monkeypatch.setattr(store, "_encode", lambda *_arguments: (copy, descriptor))
+    monkeypatch.setattr(store, "_is_replay_after_retention", retain)
+
+    async def admit():
+        async with connection.transaction():
+            await store.admit_registry_required_target_review(connection, input_bytes, _edition(input_bytes), LEDGER_ID)
+
+    with pytest.raises(RegistryRequiredTargetError, match="^registry_required_target_review_copy_incomplete$"):
+        asyncio.run(admit())
+    assert connection.events == ["begin:1", "begin:2", "read", "rollback:2", "rollback:1"]
+    assert connection.depth == 0 and len(connection.queries) == 1
+    connection.copy_to_table.assert_awaited_once()
+    connection.fetchval.assert_not_awaited()
+    retain.assert_not_awaited()
+    assert connection.execute.await_count == 1
+    assert connection.execute.await_args.args[0].startswith("CREATE TEMP TABLE")
+
+
+@pytest.mark.parametrize("failure", ["no_references", "missing_bundle", "oversize"])
+def test_review_reference_bounds_precede_verification(monkeypatch, failure):
+    entry_by_field = {"references_valid": True, "reference_count": 0, "bundle": None}
+    if failure != "no_references":
+        entry_by_field["reference_count"] = 1
+    if failure == "oversize":
+        entry_by_field["bundle"] = "é" * (references.MAX_BUNDLE_BYTES // 2 + 1)
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry_by_field))
+    verify = Mock(side_effect=AssertionError("No native verification without a bounded referenced bundle"))
+    monkeypatch.setattr(references, "_verify_bundle", verify)
+    operation = references.require_required_target_review_references(connection, '"synthetic_registry"', '"landing"')
+    if failure == "no_references":
+        assert asyncio.run(operation) is None
+    else:
+        with pytest.raises(ValueError, match="^registry_source_binding_review_limit$"):
+            asyncio.run(operation)
+    verify.assert_not_called()
+    connection.fetchrow.assert_awaited_once()
+    query, limit = connection.fetchrow.await_args.args
+    assert "FOR SHARE OF snapshot,observation" in query and limit == references.MAX_BUNDLE_BYTES

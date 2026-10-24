@@ -28,26 +28,35 @@ def _candidate_catalog():
     }
 
 
+def _control_catalog():
+    return dict(
+        schema_oid=10,
+        owner_oid=11,
+        rolname="control_owner",
+        schema_owner_oid=11,
+        schema_owner_role="control_owner",
+        candidate_owner_oid=11,
+        candidate_owner_role="control_owner",
+        database_oid=12,
+        database_name="synthetic",
+        candidate_table_oid=13,
+        seal_table_oid=14,
+        owned=True,
+        closed=True,
+        **{
+            k: False
+            for k in ("rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+        },
+    )
+
+
 class Connection:
     def __init__(self):
+        """Create mutable synthetic custody state with closed native defaults."""
         self.active = False
         self.calls = []
         self.isolation = "repeatable read"
-        self.control = dict(
-            schema_oid=10,
-            owner_oid=11,
-            rolname="control_owner",
-            database_oid=12,
-            database_name="synthetic",
-            candidate_table_oid=13,
-            seal_table_oid=14,
-            owned=True,
-            closed=True,
-            **{
-                k: False
-                for k in ("rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-            },
-        )
+        self.control = _control_catalog()
         self.actor = dict(
             session="operator",
             current="operator",
@@ -79,12 +88,18 @@ class Connection:
         self.seal = None
         self.exists = True
         self.can_set = True
+        self.forbidden_set = set()
+        self.memberships = set()
+        self.current_role = "operator"
+        self.metadata_lock_roles = []
         self.nonreaders = set()
         self.enrolled_readers = {"execution", "reader"}
         self.forbidden = set()
+        self.q_forbidden = set()
         self.heap_safe = True
         self.safe = True
         self.inherit = True
+        self.noninherited = set()
         self.index = "b" * 64
         self.proofs = 0
         self.unknown_commit = False
@@ -115,6 +130,8 @@ class Connection:
         if sql == custody._IDENTITY_SQL:
             return copy.deepcopy(self.actor)
         if "network_membership_candidate WHERE" in sql:
+            if sql.endswith(" FOR UPDATE"):
+                self.metadata_lock_roles.append(self.current_role)
             return copy.deepcopy(self.candidate)
         if "receipt_json::text" in sql:
             return copy.deepcopy(self.seal)
@@ -131,6 +148,8 @@ class Connection:
             return set(args[0]) <= self.enrolled_readers
         if sql == custody._CENSUS_SQL:
             return not (set(args[0]) & self.forbidden)
+        if sql == custody._Q_REACH_SQL:
+            return not (set(args[0]) & self.q_forbidden)
         if "FROM pg_class c WHERE c.oid=ANY" in sql:
             return self.heap_safe
         if "to_regclass" in sql:
@@ -140,9 +159,11 @@ class Connection:
         if "SELECT rolname FROM pg_roles" in sql:
             return "control_owner" if args[0] == 11 else "loading_owner"
         if "pg_has_role" in sql and "USAGE" in sql:
-            return self.inherit
+            return self.inherit and not set(args).intersection(self.noninherited)
+        if "pg_has_role" in sql and "MEMBER" in sql:
+            return bool(set(args).intersection(self.memberships))
         if "pg_has_role" in sql or "has_database_privilege" in sql:
-            return self.can_set
+            return self.can_set and not set(args).intersection(self.forbidden_set)
         if "quote_ident(current_user)" in sql:
             return '"operator"'
         if "SELECT oid::bigint" in sql:
@@ -151,6 +172,8 @@ class Connection:
 
     async def execute(self, sql, *args):
         self.calls.append((sql, args))
+        if sql.startswith("SET LOCAL ROLE"):
+            self.current_role = sql.rsplit('"', 2)[1]
         if sql.startswith("GRANT SELECT ON") and ".network_candidate_custody " in sql:
             self.enrolled_readers.add(sql.rsplit('"', 2)[1])
         if sql.startswith("ALTER SCHEMA"):
@@ -218,6 +241,65 @@ async def seal(connection, authorize=is_authorized, **options):
     )
 
 
+async def test_q_census_uses_control_owner_without_changing_candidate_census(boundary):
+    boundary.control["schema_owner_oid"] = 17
+    await custody._census_closed(boundary, boundary.control, boundary.catalog, ("execution", "reader"))
+    assert (custody._Q_REACH_SQL, (["execution", "reader"], 17)) in boundary.calls
+    assert (custody._CENSUS_SQL, (["execution", "reader"], 11, 30, [40, 41, 42])) in boundary.calls
+
+
+@pytest.mark.parametrize("role", ["execution", "reader"])
+async def test_every_actor_with_q_reach_refuses_before_candidate_mutation(boundary, role):
+    before = copy.deepcopy(boundary.catalog)
+    boundary.q_forbidden.add(role)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.catalog == before and boundary.seal is None and boundary.proofs == 0
+
+
+async def test_q_reach_is_rechecked_after_transfer_before_storing_seal(boundary, monkeypatch):
+    original = custody._transfer
+    before = copy.deepcopy(boundary.catalog)
+
+    async def transfer_then_change_reach(*arguments):
+        await original(*arguments)
+        boundary.q_forbidden.add("reader")
+
+    monkeypatch.setattr(custody, "_transfer", transfer_then_change_reach)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.catalog == before and boundary.seal is None
+    assert not any(sql.startswith("INSERT INTO") for sql, _ in boundary.calls)
+
+
+async def test_q_reach_is_rechecked_after_final_authorization(boundary):
+    before = copy.deepcopy(boundary.catalog)
+    calls = []
+
+    async def is_authorized_then_change_reach(connection, target):
+        calls.append(target)
+        if len(calls) == 2:
+            connection.q_forbidden.add("reader")
+        return True
+
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary, authorize=is_authorized_then_change_reach)
+    assert len(calls) == 2 and boundary.catalog == before and boundary.seal is None
+
+
+@pytest.mark.parametrize("operation", ["seal", "verify"])
+async def test_existing_seal_refuses_later_q_reach(boundary, operation):
+    await seal(boundary)
+    before = copy.deepcopy(boundary.seal)
+    boundary.q_forbidden.add("reader")
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        if operation == "seal":
+            await seal(boundary)
+        else:
+            await verify(boundary)
+    assert boundary.seal == before
+
+
 async def test_pre_enrolled_seal_never_grants_and_rechecks_existing_seal(boundary):
     receipt = await seal(boundary, pre_enrolled_only=True)
     assert not any("GRANT SELECT ON" in sql and ".network_candidate_custody " in sql for sql, _ in boundary.calls)
@@ -268,6 +350,22 @@ async def test_seal_transfers_only_registered_candidate_and_replay_does_not_reva
     assert await verify(connection) == result
     assert all(f'FROM "{TARGET.schema_name}".' not in sql for sql, _ in connection.calls)
     assert any("ACCESS SHARE MODE NOWAIT" in sql for sql, _ in connection.calls)
+
+
+async def test_transfer_retains_namespace_access_until_final_owner_closes_grants(boundary, monkeypatch):
+    async def remove_grants(connection, namespace, catalog, owner_oid):
+        connection.calls.append(("close_grants", (connection.current_role,)))
+
+    monkeypatch.setattr(custody, "_remove_grants", remove_grants)
+    await seal(boundary)
+    statements = [sql for sql, _ in boundary.calls]
+    bridge = statements.index(f'GRANT USAGE ON SCHEMA "{TARGET.schema_name}" TO "operator"')
+    transfers = [index for index, sql in enumerate(statements) if sql.startswith("ALTER TABLE")]
+    assert statements[bridge - 1] == 'SET LOCAL ROLE "control_owner"'
+    assert statements[bridge + 1] == 'SET LOCAL ROLE "operator"'
+    assert bridge < min(transfers) <= max(transfers) < statements.index("close_grants")
+    assert boundary.calls[statements.index("close_grants")][1] == ("control_owner",)
+    assert boundary.current_role == "operator"
 
 
 @pytest.mark.parametrize(
@@ -361,11 +459,22 @@ async def test_sealed_verification_requires_repeatable_read(boundary):
 
 
 async def test_safe_set_only_operator_restores_role_and_replays(boundary):
-    boundary.inherit = False
+    boundary.noninherited = {11}
     result = await seal(boundary)
     assert await seal(boundary) == result
-    assert any('SET LOCAL ROLE "loading_owner"' == sql for sql, _ in boundary.calls)
+    assert any('SET LOCAL ROLE "control_owner"' == sql for sql, _ in boundary.calls)
     assert any('SET LOCAL ROLE "operator"' == sql for sql, _ in boundary.calls)
+
+
+async def test_set_only_loading_owner_refuses_before_native_transfer(boundary):
+    boundary.inherit = False
+    before = copy.deepcopy(boundary.catalog)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.catalog == before and boundary.seal is None
+    assert any('SET LOCAL ROLE "loading_owner"' == sql for sql, _ in boundary.calls)
+    assert boundary.current_role == "operator"
+    assert not any(sql.startswith("ALTER ") for sql, _ in boundary.calls)
 
 
 async def test_complete_128_role_census_is_not_truncated(boundary):
@@ -682,3 +791,117 @@ async def test_aca_assertion_rejects_changed_or_unclosed_native_header(boundary,
     with pytest.raises(custody.NetworkCandidateCustodyError):
         await seal(boundary)
     assert boundary.seal is None
+
+
+def _split_control(connection):
+    connection.control.update(
+        schema_owner_oid=15,
+        schema_owner_role="schema_owner",
+        candidate_owner_oid=15,
+        candidate_owner_role="schema_owner",
+    )
+    connection.forbidden_set.add(15)
+    connection.noninherited.add(15)
+
+
+@pytest.mark.parametrize("kind", [None, "cms", "ptg", "aca"])
+async def test_split_seal_binds_owners_and_original_metadata_locker(boundary, kind):
+    _split_control(boundary)
+    report = boundary.candidate["validation_json"]
+    if kind is not None:
+        assertion = _event_assertion(kind)
+        report[custody.SOURCE_EVENT_ASSERTION] = assertion
+    sealed = await seal(boundary)
+    assert sealed["receipt"]["revision"] == 3
+    assert sealed["receipt"]["control"] == {
+        "database_oid": 12,
+        "database_name": "synthetic",
+        "schema_oid": 10,
+        "owner_oid": 11,
+        "owner_role": "control_owner",
+        "candidate_table_oid": 13,
+        "seal_table_oid": 14,
+        "schema_owner_oid": 15,
+        "schema_owner_role": "schema_owner",
+        "candidate_owner_oid": 15,
+        "candidate_owner_role": "schema_owner",
+    }
+    assert await seal(boundary) == sealed
+    assert boundary.metadata_lock_roles == ["operator", "operator"]
+    assert not any(sql == 'SET LOCAL ROLE "schema_owner"' for sql, _ in boundary.calls)
+    if kind is not None:
+        report[custody._SOURCE_CHECKPOINTS[kind]] = copy.deepcopy(assertion["checkpoint"])
+    boundary.candidate["state"] = "published"
+    assert await verify(boundary) == sealed
+    assert boundary.proofs == 1
+    if kind is not None:
+        del report[custody._SOURCE_CHECKPOINTS[kind]]
+        with pytest.raises(custody.NetworkCandidateCustodyError):
+            await verify(boundary)
+
+
+async def test_split_owner_refuses_ordinary_operator_that_can_assume_schema_owner(boundary):
+    _split_control(boundary)
+    boundary.forbidden_set.clear()
+    before = copy.deepcopy(boundary.catalog)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.catalog == before and boundary.seal is None
+
+
+async def test_split_owner_refuses_inherited_schema_owner_even_without_set_privilege(boundary):
+    _split_control(boundary)
+    boundary.noninherited.clear()
+    before = copy.deepcopy(boundary.catalog)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.catalog == before and boundary.seal is None
+
+
+async def test_split_owner_refuses_membership_only_schema_owner_path(boundary):
+    _split_control(boundary)
+    boundary.memberships.add(15)
+    before = copy.deepcopy(boundary.catalog)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.catalog == before and boundary.seal is None
+
+
+async def test_split_owner_preserves_original_superuser_maintenance_path(boundary):
+    _split_control(boundary)
+    boundary.actor["rolsuper"] = True
+    boundary.forbidden_set.clear()
+    assert (await seal(boundary))["receipt"]["revision"] == 3
+
+
+@pytest.mark.parametrize("revision", [1, 2])
+async def test_old_seals_never_reinterpret_single_owner_after_ledger_transfer(boundary, revision):
+    if revision == 2:
+        boundary.candidate["validation_json"][custody.SOURCE_EVENT_ASSERTION] = _event_assertion("cms")
+    sealed = await seal(boundary)
+    assert sealed["receipt"]["revision"] == revision
+    _split_control(boundary)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(boundary)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "schema_owner_oid",
+        "schema_owner_role",
+        "candidate_owner_oid",
+        "candidate_owner_role",
+        "owner_oid",
+        "rolname",
+        "candidate_table_oid",
+        "seal_table_oid",
+    ],
+)
+async def test_split_seal_rejects_owner_or_relation_identity_drift(boundary, field):
+    _split_control(boundary)
+    await seal(boundary)
+    original = boundary.control[field]
+    boundary.control[field] = original + 1 if type(original) is int else original + "_changed"
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(boundary)

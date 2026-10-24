@@ -380,6 +380,34 @@ async def _aca_readers(connection, namespace, controls):
     return [dict(row) for row in rows]
 
 
+async def _custody_ledger_owner(connection, namespace, tables, owner_role, *, allow_uniform_transfer=False):
+    """Validate the sole separate owner without reinterpreting retained custody."""
+    owner_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", owner_role)
+    ledger = next(table for table in tables if table["relname"] == "network_candidate_custody")
+    if ledger["relowner"] == owner_oid:
+        return None
+    if allow_uniform_transfer and all(table["relowner"] == ledger["relowner"] for table in tables):
+        if await connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM {_identifier(namespace)}.network_candidate_custody) "
+            f"OR EXISTS(SELECT FROM {_identifier(namespace)}.registry_source_admission_receipt)"
+        ):
+            raise RegistryManagementPermissionError("Retained owner-bound evidence cannot change ownership")
+        return None
+    from process.network_candidate_custody import NetworkCandidateCustodyError, _control
+
+    try:
+        control = await _control(connection, namespace)
+    except NetworkCandidateCustodyError:
+        raise RegistryManagementPermissionError("Separate candidate custody ownership is unsafe") from None
+    if (
+        control["seal_table_oid"] != ledger["oid"]
+        or control["owner_oid"] != ledger["relowner"]
+        or control["schema_owner_oid"] != owner_oid
+    ):
+        raise RegistryManagementPermissionError("Separate candidate custody ownership differs")
+    return control["rolname"]
+
+
 async def _verify(connection, namespace, api_role, owner_role, *, office_recipe_pending=False):
     """Compare native ownership and effective privileges to the explicit draft policy."""
     schema = await _roles(connection, namespace, api_role, owner_role)
@@ -396,7 +424,11 @@ async def _verify(connection, namespace, api_role, owner_role, *, office_recipe_
     controls = await _aca_controls(connection, namespace)
     tables, sequences = await _catalog(connection, schema["oid"])
     owner_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", owner_role)
-    if any(relation["relowner"] != owner_oid for relation in tables + sequences + controls):
+    custody_owner = await _custody_ledger_owner(connection, namespace, tables, owner_role)
+    if any(
+        relation["relowner"] != owner_oid and not (custody_owner and relation["relname"] == "network_candidate_custody")
+        for relation in tables + sequences + controls
+    ):
         raise RegistryManagementPermissionError("Registry object ownership is not protected")
     await _check_direct_grants(connection, schema["oid"], api_role)
     await _reject_inherited_grants(connection, schema["oid"], api_role)
@@ -472,6 +504,14 @@ async def install_registry_management_permissions(connection, *, api_role, owner
             raise RegistryManagementPermissionError("Installer must be able to assume the protected owner")
         tables, sequences = await _catalog(connection, schema["oid"])
         controls = await _aca_controls(connection, namespace)
+        custody_owner = await _custody_ledger_owner(
+            connection, namespace, tables, owner_role, allow_uniform_transfer=True
+        )
+        if custody_owner and any(
+            relation["relowner"] != schema["nspowner"] and relation["relname"] != "network_candidate_custody"
+            for relation in tables + sequences + controls
+        ):
+            raise RegistryManagementPermissionError("Only the candidate custody ledger may have a separate owner")
         await _reject_inherited_grants(connection, schema["oid"], api_role)
         try:
             existing = await _verify(connection, namespace, api_role, owner_role)
@@ -479,30 +519,43 @@ async def install_registry_management_permissions(connection, *, api_role, owner
             existing = None
         if existing is not None:
             return existing
+        if custody_owner and not await connection.fetchval(
+            "SELECT pg_has_role(current_user,$1::name,'SET')", custody_owner
+        ):
+            raise RegistryManagementPermissionError("Installer cannot assume the candidate custody owner")
         for table in tables + controls:
+            caller = await connection.fetchval("SELECT quote_ident(current_user)")
+            if custody_owner and table["relname"] == "network_candidate_custody":
+                await connection.execute(f"SET LOCAL ROLE {_identifier(custody_owner)}")
             await connection.execute(
                 f"LOCK TABLE {_identifier(namespace)}.{_identifier(table['relname'])} IN ACCESS EXCLUSIVE MODE NOWAIT"
             )
+            await connection.execute(f"SET LOCAL ROLE {caller}")
         if (
             await _catalog(connection, schema["oid"]) != (tables, sequences)
             or await _aca_controls(connection, namespace) != controls
         ):
             raise RegistryManagementPermissionError("Native registry objects changed while locking")
         for table in tables + controls:
+            if custody_owner and table["relname"] == "network_candidate_custody":
+                continue
             await connection.execute(
                 f"ALTER TABLE {_identifier(namespace)}.{_identifier(table['relname'])} OWNER TO {_identifier(owner_role)}"
             )
         caller = await connection.fetchval("SELECT quote_ident(current_user)")
         await connection.execute(f"SET LOCAL ROLE {_identifier(owner_role)}")
-        await _grant_drafts(connection, namespace, api_role, tables, sequences)
+        await _grant_drafts(connection, namespace, api_role, tables, sequences, custody_owner_role=custody_owner)
         await connection.execute(f"SET LOCAL ROLE {caller}")
         return await _verify(connection, namespace, api_role, owner_role)
 
 
-async def _grant_drafts(connection, namespace, api_role, tables, sequences):
+async def _grant_drafts(connection, namespace, api_role, tables, sequences, *, custody_owner_role=None):
     """Revoke direct bypasses and grant only bounded draft columns as the protected owner."""
     await connection.execute(f"REVOKE ALL ON SCHEMA {_identifier(namespace)} FROM {_identifier(api_role)} CASCADE")
     for relation in tables + sequences:
+        caller = await connection.fetchval("SELECT quote_ident(current_user)")
+        if custody_owner_role and relation["relname"] == "network_candidate_custody":
+            await connection.execute(f"SET LOCAL ROLE {_identifier(custody_owner_role)}")
         qualified = f"{_identifier(namespace)}.{_identifier(relation['relname'])}"
         kind = "SEQUENCE" if relation["relname"] in _SEQUENCES else "TABLE"
         await connection.execute(f"REVOKE ALL ON {kind} {qualified} FROM PUBLIC,{_identifier(api_role)} CASCADE")
@@ -515,6 +568,7 @@ async def _grant_drafts(connection, namespace, api_role, tables, sequences):
             if relation["relname"] in policy:
                 columns = ",".join(_identifier(column) for column in policy[relation["relname"]])
                 await connection.execute(f"GRANT {privilege}({columns}) ON {qualified} TO {_identifier(api_role)}")
+        await connection.execute(f"SET LOCAL ROLE {caller}")
     await connection.execute(f"GRANT USAGE ON SCHEMA {_identifier(namespace)} TO {_identifier(api_role)}")
     await connection.execute(
         f"GRANT USAGE ON SEQUENCE {_identifier(namespace)}.network_registry_identity_network_id_seq TO {_identifier(api_role)}"

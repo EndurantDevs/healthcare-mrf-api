@@ -39,9 +39,9 @@ _LEDGER_SQL = """SELECT snapshot.snapshot_id,snapshot.source_system,snapshot.sou
   CASE WHEN octet_length(observation.observation_json::text)<=$2
     THEN observation.observation_json::text END AS document,
   snapshot.source_system='required-network-targets' AND snapshot.source_id='required-networks'
-    AND snapshot.parser_version='registry-target-ledger-v1' AND snapshot.edition_id=snapshot.input_sha256
+    AND snapshot.parser_version='registry-target-ledger-v2' AND snapshot.edition_id=snapshot.input_sha256
     AND snapshot.reporting_year IS NULL AND snapshot.published_at IS NULL
-    AND observation.source_record_key='ledger:v1' AND observation.source_row_number=1
+    AND observation.source_record_key='ledger:v2' AND observation.source_row_number=1
     AND observation.status='accepted' AND observation.issues_json='[]'::jsonb
     AND observation.observation_json->'ledger'->>'source_sha256'=snapshot.input_sha256
     AND octet_length(observation.observation_json::text)<=$2
@@ -88,7 +88,7 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
   FROM selected_bindings WHERE starts_with(evidence_id,'required-target-review:')
 ), ledger AS MATERIALIZED (
   SELECT observation_json AS document FROM __CONTROL__.registry_source_observation
-  WHERE snapshot_id=$1::uuid AND source_record_key='ledger:v1'
+  WHERE snapshot_id=$1::uuid AND source_record_key='ledger:v2'
 ), targets AS MATERIALIZED (
   SELECT target->>'target_key' AS target_key FROM ledger,
     LATERAL jsonb_array_elements(document#>'{ledger,targets}') target
@@ -104,7 +104,7 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
       AND jsonb_build_object('binding_id',binding.record_json->'binding_id','source_system',binding.record_json->'source_system','source_id',binding.record_json->'source_id','dataset_schema',binding.record_json->'dataset_schema','dataset_id',binding.record_json->'dataset_id','producer_id',binding.record_json->'producer_id','edition_id',binding.record_json->'edition_id','source_key',binding.record_json->'source_key','source_scope_json',binding.record_json->'source_scope_json','binding_key',binding.record_json->'binding_key')=item->'source_binding') AS approved_exact_binding
   FROM refs JOIN __CONTROL__.registry_source_observation observation ON observation.snapshot_id=refs.snapshot_id
   CROSS JOIN LATERAL jsonb_array_elements(observation.observation_json->'decisions') item
-  WHERE observation.source_record_key='review:v1'
+  WHERE observation.source_record_key='review:v2'
     AND observation.observation_json->>'ledger_snapshot_id'=$1::text
 ), mapping AS MATERIALIZED (
   SELECT target.target_key,count(decision.target_key)::bigint AS decision_count,

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native bounds for retained-input capture and the early artifact backfills."""
 
+import asyncio
 import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -67,7 +68,12 @@ async def test_retained_capture_bounds_same_readonly_backend_and_releases_on_tim
         fhir.PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS = ("profile", "address_overlay")
         limits, observed = _execution_admission(), []
         now = await _backend_clock(database)
-        fhir._profile_capacity_preflight_clock = AsyncMock(return_value=now)
+        # One rounded clock tick isolates the SQL clamp from transaction setup expiration.
+        fhir._profile_capacity_preflight_clock = (
+            AsyncMock(side_effect=(now - datetime.timedelta(seconds=1), now))
+            if deadline
+            else AsyncMock(return_value=now)
+        )
         limits.paired_profile_lease = SimpleNamespace(
             max_build_deadline=now + datetime.timedelta(seconds=1.05 if deadline else 30)
         )
@@ -97,6 +103,43 @@ async def test_retained_capture_bounds_same_readonly_backend_and_releases_on_tim
             )
             == 0
         )
+
+
+@pytest.mark.asyncio
+async def test_retained_capture_deadline_cancels_setup_before_any_reader_and_releases_backend(monkeypatch):
+    async with _delta_database(monkeypatch) as (database, schema):
+        fhir = _execution_fhir(database)
+        fhir._schema = lambda: schema
+        fhir.PROVIDER_DIRECTORY_PUBLISH_ARTIFACT_TARGETS = ("profile", "address_overlay")
+        limits = _execution_admission()
+        now = await _backend_clock(database)
+        fhir._profile_capacity_preflight_clock = AsyncMock(return_value=now)
+        limits.paired_profile_lease = SimpleNamespace(max_build_deadline=now + datetime.timedelta(seconds=1.05))
+        monkeypatch.setattr(serving, "_verified_capture_limits", AsyncMock(return_value=limits))
+        setup_release = asyncio.Event()
+
+        async def block_temp_limit(*_args, **_kwargs):
+            await setup_release.wait()
+
+        monkeypatch.setattr(serving, "apply_temp_file_limit", AsyncMock(side_effect=block_temp_limit))
+        reader = AsyncMock(side_effect=AssertionError("capture reader ran before setup completed"))
+        for owner, name in (
+            (serving, "prepare_desired_fence"),
+            (serving, "_current_predecessor"),
+            (serving.receipts, "capture_native_dependencies"),
+            (serving, "capture_native_address_input_fence"),
+            (serving, "_candidate_proof"),
+        ):
+            monkeypatch.setattr(owner, name, reader)
+        previous_setting_values = tuple(await database.first(_SETTINGS))
+        watchdog = asyncio.timeout(1)
+        async with watchdog:
+            with pytest.raises(TimeoutError):
+                await serving._capture_publish_inputs(fhir, object(), "run_" + "a" * 32, {}, limits.plan)
+        assert not watchdog.expired()
+        reader.assert_not_called()
+        assert database._transaction_binding() is None
+        assert tuple(await database.first(_SETTINGS)) == previous_setting_values
 
 
 async def _backfill_relations(database, schema, worker):

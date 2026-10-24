@@ -56,10 +56,15 @@ _IDENTITY_SQL = """SELECT session_user::text AS session,current_user::text AS cu
  pg_backend_pid() AS backend,pg_current_xact_id()::text AS xid,
  r.oid::bigint AS role_oid,r.rolcanlogin,r.rolsuper,r.rolcreatedb,r.rolcreaterole,r.rolreplication,r.rolbypassrls
  FROM pg_roles r WHERE r.rolname=current_user"""
-_CONTROL_SQL = """SELECT n.oid::bigint AS schema_oid,n.nspowner::bigint AS owner_oid,o.*,
+_CONTROL_SQL = """SELECT n.oid::bigint AS schema_oid,s.relowner::bigint AS owner_oid,o.*,
+ n.nspowner::bigint AS schema_owner_oid,q.rolname::text AS schema_owner_role,
+ c.relowner::bigint AS candidate_owner_oid,q.rolname::text AS candidate_owner_role,
  d.oid::bigint AS database_oid,current_database() AS database_name,
  c.oid::bigint AS candidate_table_oid,s.oid::bigint AS seal_table_oid,
- c.relowner=n.nspowner AND s.relowner=n.nspowner AND c.relkind='r' AND s.relkind='r'
+ c.relowner=n.nspowner AND c.relkind='r' AND s.relkind='r'
+ AND NOT (q.rolcanlogin OR q.rolsuper OR q.rolcreatedb OR q.rolcreaterole OR q.rolreplication OR q.rolbypassrls)
+ AND (s.relowner=n.nspowner OR (NOT pg_has_role(s.relowner,n.nspowner,'MEMBER')
+   AND NOT pg_has_role(n.nspowner,s.relowner,'MEMBER')))
  AND c.relpersistence='p' AND s.relpersistence='p' AND NOT s.relrowsecurity AND NOT s.relforcerowsecurity
  AND NOT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=s.oid AND NOT tgisinternal)
  AND NOT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=s.oid) AS owned,
@@ -67,11 +72,12 @@ _CONTROL_SQL = """SELECT n.oid::bigint AS schema_oid,n.nspowner::bigint AS owner
    SELECT a.* FROM aclexplode(coalesce(s.relacl,acldefault('r',s.relowner))) a
    UNION ALL SELECT a.* FROM pg_attribute att CROSS JOIN LATERAL aclexplode(att.attacl) a
     WHERE att.attrelid=s.oid AND att.attnum>0 AND NOT att.attisdropped
- ) a WHERE a.grantee<>n.nspowner AND (a.grantee=0 OR a.privilege_type<>'SELECT' OR a.is_grantable)) AS closed
- FROM pg_namespace n JOIN pg_roles o ON o.oid=n.nspowner
+ ) a WHERE a.grantee<>s.relowner AND (a.grantee=0 OR a.privilege_type<>'SELECT' OR a.is_grantable)) AS closed
+ FROM pg_namespace n JOIN pg_roles q ON q.oid=n.nspowner
  JOIN pg_database d ON d.datname=current_database()
  JOIN pg_class c ON c.relnamespace=n.oid AND c.relname='network_membership_candidate'
  JOIN pg_class s ON s.relnamespace=n.oid AND s.relname='network_candidate_custody'
+ JOIN pg_roles o ON o.oid=s.relowner
  WHERE n.nspname=$1"""
 
 
@@ -89,6 +95,11 @@ _CENSUS_SQL = f"""SELECT NOT EXISTS(
    WHERE has_table_privilege(r.oid,heap.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
    OR has_any_column_privilege(r.oid,heap.oid,'INSERT,UPDATE,REFERENCES')))
 """
+
+_Q_REACH_SQL = """SELECT NOT EXISTS(
+ SELECT FROM unnest($1::text[]) configured(name) LEFT JOIN pg_roles r ON r.rolname=configured.name
+ WHERE r.oid IS NULL OR pg_has_role(r.oid,$2::oid,'MEMBER')
+ OR pg_has_role(r.oid,$2::oid,'USAGE') OR pg_has_role(r.oid,$2::oid,'SET'))"""
 
 
 class NetworkCandidateCustodyError(ValueError):
@@ -159,15 +170,16 @@ def _source_event_assertion(report):
 
 
 def _evidence(candidate, *, revision=1):
-    _require(type(revision) is int and revision in (1, 2))
+    _require(type(revision) is int and revision in (1, 2, 3))
     evidence_by_name = {}
     _require(set(candidate) == set(_STABLE) | {"state"})
     for field in _STABLE:
         field_value = candidate[field]
         if field in ("source_generations", "source_recipes_json", "validation_json") and type(field_value) is str:
             field_value = json.loads(field_value)
-        if field == "validation_json" and revision == 2:
+        if field == "validation_json" and revision in (2, 3):
             _require(type(field_value) is dict)
+        if field == "validation_json" and (revision == 2 or (revision == 3 and SOURCE_EVENT_ASSERTION in field_value)):
             key, checkpoint = _source_event_assertion(field_value)
             _require(candidate["state"] != "published" or key in field_value)
             report_by_name = dict(field_value)
@@ -222,7 +234,13 @@ async def _require_reader_enrollment(connection, readers, control_schema):
     )
 
 
+async def _q_reach_closed(connection, control, runtime_roles):
+    """Reject every actor's direct, inherited or SET-only schema-owner reach."""
+    _require(await connection.fetchval(_Q_REACH_SQL, list(runtime_roles), control["schema_owner_oid"]) is True)
+
+
 async def _census_closed(connection, control, catalog, runtime_roles):
+    await _q_reach_closed(connection, control, runtime_roles)
     _require(
         await connection.fetchval(
             _CENSUS_SQL,
@@ -350,11 +368,26 @@ async def _control_owner(connection, owner):
 
 
 async def _operator(connection, actor, control, catalog, runtime_roles):
+    await _q_reach_closed(connection, control, runtime_roles)
     _require(actor["current"] not in runtime_roles and actor["role_oid"] != control["owner_oid"])
+    if control["schema_owner_oid"] != control["owner_oid"] and actor["rolsuper"] is not True:
+        _require(
+            not await connection.fetchval("SELECT pg_has_role(current_user,$1::oid,'SET')", control["schema_owner_oid"])
+        )
+        _require(
+            not await connection.fetchval(
+                "SELECT pg_has_role(current_user,$1::oid,'USAGE')", control["schema_owner_oid"]
+            )
+        )
+        _require(
+            not await connection.fetchval(
+                "SELECT pg_has_role(current_user,$1::oid,'MEMBER')", control["schema_owner_oid"]
+            )
+        )
     for oid in {
         control["owner_oid"],
         catalog["namespace"]["nspowner"],
-        *(row["relowner"] for row in catalog["relations"]),
+        *(relation["relowner"] for relation in catalog["relations"]),
     }:
         _require(actor["role_oid"] != oid)
         _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::oid,'SET')", oid))
@@ -371,11 +404,18 @@ async def _operator(connection, actor, control, catalog, runtime_roles):
 
 async def _transfer(connection, target, roles, catalog):
     namespace, owner = _identifier(target.schema_name), _identifier(roles["owner_role"])
+    for oid in {catalog["namespace"]["nspowner"], *(row["relowner"] for row in catalog["relations"])}:
+        _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::oid,'USAGE')", oid))
     await _remove_default_grants(connection, namespace, catalog)
+    original = await connection.fetchval("SELECT quote_ident(current_user)")
     await connection.execute(f"ALTER SCHEMA {namespace} OWNER TO {owner}")
+    await connection.execute(f"SET LOCAL ROLE {owner}")
+    try:
+        await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {original}")
+    finally:
+        await connection.execute(f"SET LOCAL ROLE {original}")
     for name in sorted(catalog["heaps"]):
         await connection.execute(f"ALTER TABLE {namespace}.{_identifier(name)} OWNER TO {owner}")
-    original = await connection.fetchval("SELECT quote_ident(current_user)")
     await connection.execute(f"SET LOCAL ROLE {owner}")
     try:
         owner_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", roles["owner_role"])
@@ -411,20 +451,31 @@ def _sealed_receipt(seal):
     _require(
         receipt_by_name["component"] == "network_candidate_custody"
         and type(receipt_by_name["revision"]) is int
-        and receipt_by_name["revision"] in (1, 2)
+        and receipt_by_name["revision"] in (1, 2, 3)
         and _digest(receipt_by_name) == seal["seal_sha256"]
     )
     return receipt_by_name
+
+
+def _control_identity(control, revision):
+    keys = ("database_oid", "database_name", "schema_oid", "owner_oid", "candidate_table_oid", "seal_table_oid")
+    if revision == 3:
+        _require(control["schema_owner_oid"] != control["owner_oid"])
+        keys += ("schema_owner_oid", "schema_owner_role", "candidate_owner_oid", "candidate_owner_role")
+    else:
+        # Old seals bind the single owner and cannot survive a ledger-only transfer.
+        _require(control["schema_owner_oid"] == control["candidate_owner_oid"] == control["owner_oid"])
+    identity_by_name = {key: control[key] for key in keys}
+    if revision == 3:
+        identity_by_name["owner_role"] = control["rolname"]
+    return identity_by_name
 
 
 async def _verify(connection, copy_target, schema, control, candidate, seal, *, operator=False):
     """Verify exact sealed metadata and hold immutable native relation locks."""
     _require(candidate["state"] in ("ready", "published") and seal is not None)
     receipt = _sealed_receipt(seal)
-    control_identity_by_name = {
-        key: control[key]
-        for key in ("database_oid", "database_name", "schema_oid", "owner_oid", "candidate_table_oid", "seal_table_oid")
-    }
+    control_identity_by_name = _control_identity(control, receipt["revision"])
     _require(
         receipt["control"] == control_identity_by_name
         and receipt["candidate_sha256"] == _digest(_evidence(candidate, revision=receipt["revision"]))
@@ -497,22 +548,18 @@ async def _store_candidate_seal(
     *,
     pre_enrolled_only=False,
 ):
-    revision = 2 if SOURCE_EVENT_ASSERTION in _json_object(candidate["validation_json"]) else 1
+    revision = (
+        3
+        if control["schema_owner_oid"] != control["owner_oid"]
+        else 2
+        if SOURCE_EVENT_ASSERTION in _json_object(candidate["validation_json"])
+        else 1
+    )
     receipt_by_name = {
         "component": "network_candidate_custody",
         "revision": revision,
         "runtime_roles": sorted(runtime_roles),
-        "control": {
-            key: control[key]
-            for key in (
-                "database_oid",
-                "database_name",
-                "schema_oid",
-                "owner_oid",
-                "candidate_table_oid",
-                "seal_table_oid",
-            )
-        },
+        "control": _control_identity(control, revision),
         "candidate_sha256": _digest(_evidence(candidate, revision=revision)),
         "closure": final_closure,
         "index_definition_sha256": await _index_digest(
@@ -582,6 +629,33 @@ async def _seal_ready_candidate(
     )
 
 
+async def _seal_or_verify_candidate(
+    connection, copy_target, candidate, control, control_schema, runtime_roles, actor, *, pre_enrolled_only
+):
+    async with _control_owner(connection, control["rolname"]):
+        existing = await _seal(connection, copy_target, control_schema)
+    if existing is not None:
+        sealed_result = await _verify(
+            connection, copy_target, control_schema, control, candidate, existing, operator=True
+        )
+        _require(sealed_result["receipt"]["runtime_roles"] == sorted(runtime_roles))
+        if pre_enrolled_only:
+            await _require_reader_enrollment(
+                connection, sealed_result["receipt"]["closure"]["reader_roles"], control_schema
+            )
+        return sealed_result
+    return await _seal_ready_candidate(
+        connection,
+        copy_target,
+        candidate,
+        control,
+        control_schema,
+        runtime_roles,
+        actor,
+        pre_enrolled_only=pre_enrolled_only,
+    )
+
+
 async def seal_network_candidate_custody(
     connection, copy_target, *, control_schema, runtime_roles, authorize, pre_enrolled_only=False
 ):
@@ -609,35 +683,27 @@ async def seal_network_candidate_custody(
         control = await _control(connection, control_schema)
         _require(await authorize(connection, copy_target) is True)
         _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::oid,'SET')", control["owner_oid"]))
-        async with _control_owner(connection, control["rolname"]):
+        if control["schema_owner_oid"] != control["owner_oid"]:
             candidate = await _candidate(connection, copy_target, control_schema, lock=True)
+        else:
+            async with _control_owner(connection, control["rolname"]):
+                candidate = await _candidate(connection, copy_target, control_schema, lock=True)
         initial_catalog = await _catalog(connection, copy_target, candidate)
         await _operator(connection, actor, control, initial_catalog, runtime_roles)
         loading_owner = _publication_readiness(candidate)[3]["owner_role"]
         _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", loading_owner))
-        async with _control_owner(connection, control["rolname"]):
-            existing = await _seal(connection, copy_target, control_schema)
-        if existing is not None:
-            sealed_result = await _verify(
-                connection, copy_target, control_schema, control, candidate, existing, operator=True
-            )
-            _require(sealed_result["receipt"]["runtime_roles"] == sorted(runtime_roles))
-            if pre_enrolled_only:
-                await _require_reader_enrollment(
-                    connection, sealed_result["receipt"]["closure"]["reader_roles"], control_schema
-                )
-        else:
-            sealed_result = await _seal_ready_candidate(
-                connection,
-                copy_target,
-                candidate,
-                control,
-                control_schema,
-                runtime_roles,
-                actor,
-                pre_enrolled_only=pre_enrolled_only,
-            )
+        sealed_result = await _seal_or_verify_candidate(
+            connection,
+            copy_target,
+            candidate,
+            control,
+            control_schema,
+            runtime_roles,
+            actor,
+            pre_enrolled_only=pre_enrolled_only,
+        )
         _require(await authorize(connection, copy_target) is True)
         _require(asyncio.current_task() is task and await _original_actor(connection) == actor)
+        await _q_reach_closed(connection, control, runtime_roles)
         _require(await _control(connection, control_schema) == control)
         return sealed_result

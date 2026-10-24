@@ -21,7 +21,7 @@ from process.uhc_flex_practitioner_async_safety import drain_operation
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_COPY_BYTES = MAX_ARTIFACT_BYTES + 1024
-PARSER_VERSION = "registry-target-ledger-v1"
+PARSER_VERSION = "registry-target-ledger-v2"
 _COPY_HEADER = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0"
 _COPY_COLUMNS = ("snapshot_id", "source_record_key", "source_row_number", "status", "observation_json", "issues_json")
 _DESCRIPTOR_FIELDS = {
@@ -151,7 +151,7 @@ async def _stage(connection, namespace, copy_bytes, edition, descriptor):
             raise RegistryRequiredTargetError("registry_required_target_copy_incomplete")
     valid = await connection.fetchval(
         f"""SELECT count(*)=1 AND COALESCE(bool_and(
-          snapshot_id=$1 AND source_record_key='ledger:v1' AND source_row_number=1
+          snapshot_id=$1 AND source_record_key='ledger:v2' AND source_row_number=1
           AND status='accepted' AND issues_json='[]'::jsonb
           AND observation_json->>'component'='registry_required_target_ledger'
           AND observation_json->'revision'='1'::jsonb AND observation_json->>'parser_version'=$2

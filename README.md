@@ -94,7 +94,7 @@ Each importer is a separate operational pipeline. Together, they build the canon
 | `mrf-source-discovery` | `python main.py start mrf-source-discovery` | payer, network, and TPA-hosted TiC source registries | searchable MRF source, plan, and file metadata catalog for PTG targeting |
 | `code-sets` | `python main.py start code-sets` | CMS POS + CMS Blue Button RC code pages | readable Revenue Center and Place of Service labels in `code_catalog` |
 | `ms-drg` | `python main.py start ms-drg` | CMS MS-DRG definitions manual | MS-DRG labels and MS-DRG to ICD-10-CM/PCS grouping relationships |
-| `clinical-reference` | `python main.py start clinical-reference` | official condition/procedure code files | condition, treatment, clinical-area, and crosswalk tables for Ribbon-replacement APIs |
+| `clinical-reference` | `python main.py start clinical-reference` | official condition/procedure code files | condition, treatment, clinical-area, and crosswalk tables for clinical reference APIs |
 | `npi` | `python main.py start npi` | NPPES | provider identity, addresses, taxonomies, and directory search data |
 | `nucc` | `python main.py start nucc` | NUCC | provider taxonomy lookup tables |
 | `geo` | `python main.py start geo` | repository support files | ZIP/city/state/coordinate lookup tables |

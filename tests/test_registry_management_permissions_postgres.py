@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -199,57 +200,110 @@ async def test_full_draft_services_and_protected_publisher_approval(permissions_
     assert await verify_registry_management_permissions(connection, **_arguments(fixture)) == receipt
 
 
+async def _assert_api_protected_objects(fixture, connection):
+    """Retain exact native denial checks for both authenticated and assumed API roles."""
+    namespace = f'"{fixture.schema}"'
+    assert await verify_registry_management_permissions(connection, **_arguments(fixture))
+    for table in _TABLES:
+        assert await connection.fetchval(f'SELECT count(*) FROM {namespace}."{table}"') >= 0
+        with pytest.raises(asyncpg.InsufficientPrivilegeError) as error:
+            await connection.execute(f'DELETE FROM {namespace}."{table}"')
+        assert error.value.sqlstate == "42501"
+    statements = [
+        f"UPDATE {namespace}.registry_revision_control SET approved_revision=0",
+        f"INSERT INTO {namespace}.registry_revision_control(id) VALUES(1)",
+        f"UPDATE {namespace}.registry_record_history SET reason=reason",
+        f"UPDATE {namespace}.network_registry_identity SET allocation_key=allocation_key",
+        f"INSERT INTO {namespace}.network_registry_identity(network_id,allocation_key) OVERRIDING SYSTEM VALUE VALUES(17,gen_random_uuid())",
+        f"UPDATE {namespace}.company_group_registry SET group_id=group_id",
+        f"UPDATE {namespace}.company_group_registry SET created_at=created_at",
+        f"CREATE TABLE {namespace}.extra(id integer)",
+        f"ALTER TABLE {namespace}.registry_approved_record ADD COLUMN extra integer",
+        f"SELECT setval('{namespace}.network_registry_identity_network_id_seq',1)",
+        f"SELECT nextval('{namespace}.network_serving_manifest_generation_id_seq')",
+    ]
+    protected = set(_TABLES) - {
+        "company_group_registry",
+        "company_registry",
+        "network_registry_record",
+        "manual_provider_registry",
+        "manual_location_registry",
+        "company_registry_links",
+        "network_membership_draft",
+        "registry_site_binding",
+        "registry_network_binding",
+        "registry_record_history",
+        "network_registry_identity",
+        "registry_revision_control",
+    }
+    statements += [
+        f'UPDATE {namespace}."{table}" SET "{_TABLES[table][1]}"="{_TABLES[table][1]}"' for table in protected
+    ]
+    statements += [
+        f'UPDATE {namespace}.registry_network_binding SET "{column}"="{column}"'
+        for column in ("binding_id", "binding_key", "source_scope_json", "edition_id", "created_at")
+    ]
+    for statement in statements:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError) as error:
+            await connection.execute(statement)
+        assert error.value.sqlstate == "42501"
+    assert await connection.fetchval(f"SELECT nextval('{namespace}.network_registry_identity_network_id_seq')") > 0
+
+
 async def test_api_cannot_modify_protected_objects_or_immutable_columns(permissions_db):
     fixture = permissions_db
     await _install(fixture)
-    connection, namespace = fixture.connection, f'"{fixture.schema}"'
+    connection = fixture.connection
     await connection.execute(f'SET ROLE "{fixture.roles_by_kind["api"]}"')
     try:
-        assert await verify_registry_management_permissions(connection, **_arguments(fixture))
-        for table in _TABLES:
-            assert await connection.fetchval(f'SELECT count(*) FROM {namespace}."{table}"') >= 0
-            with pytest.raises(asyncpg.InsufficientPrivilegeError):
-                await connection.execute(f'DELETE FROM {namespace}."{table}"')
-        statements = [
-            f"UPDATE {namespace}.registry_revision_control SET approved_revision=0",
-            f"INSERT INTO {namespace}.registry_revision_control(id) VALUES(1)",
-            f"UPDATE {namespace}.registry_record_history SET reason=reason",
-            f"UPDATE {namespace}.network_registry_identity SET allocation_key=allocation_key",
-            f"INSERT INTO {namespace}.network_registry_identity(network_id,allocation_key) OVERRIDING SYSTEM VALUE VALUES(17,gen_random_uuid())",
-            f"UPDATE {namespace}.company_group_registry SET group_id=group_id",
-            f"UPDATE {namespace}.company_group_registry SET created_at=created_at",
-            f"CREATE TABLE {namespace}.extra(id integer)",
-            f"ALTER TABLE {namespace}.registry_approved_record ADD COLUMN extra integer",
-            f"SELECT setval('{namespace}.network_registry_identity_network_id_seq',1)",
-            f"SELECT nextval('{namespace}.network_serving_manifest_generation_id_seq')",
-        ]
-        protected = set(_TABLES) - {
-            "company_group_registry",
-            "company_registry",
-            "network_registry_record",
-            "manual_provider_registry",
-            "manual_location_registry",
-            "company_registry_links",
-            "network_membership_draft",
-            "registry_site_binding",
-            "registry_network_binding",
-            "registry_record_history",
-            "network_registry_identity",
-            "registry_revision_control",
-        }
-        statements += [
-            f'UPDATE {namespace}."{table}" SET "{_TABLES[table][1]}"="{_TABLES[table][1]}"' for table in protected
-        ]
-        statements += [
-            f'UPDATE {namespace}.registry_network_binding SET "{column}"="{column}"'
-            for column in ("binding_id", "binding_key", "source_scope_json", "edition_id", "created_at")
-        ]
-        for statement in statements:
-            with pytest.raises(asyncpg.InsufficientPrivilegeError):
-                await connection.execute(statement)
-        assert await connection.fetchval(f"SELECT nextval('{namespace}.network_registry_identity_network_id_seq')") > 0
+        await _assert_api_protected_objects(fixture, connection)
     finally:
         await connection.execute("RESET ROLE")
+
+
+async def test_api_login_preserves_drafts_and_protected_boundaries(permissions_db, record_property):
+    """Authenticate the draft actor and retain native protected-object refusals."""
+    fixture = permissions_db
+    await _install(fixture)
+    role, password = fixture.roles_by_kind["api"], uuid4().hex
+    url = fixture.sessions.kw["bind"].url.set(username=role, password=password)
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(fixture.connection.execute, f'ALTER ROLE "{role}" NOLOGIN PASSWORD NULL')
+        await fixture.connection.execute(f"""ALTER ROLE "{role}" LOGIN PASSWORD '{password}'""")
+        api_connection = await asyncpg.connect(url.set(drivername="postgresql").render_as_string(hide_password=False))
+        cleanup.push_async_callback(api_connection.close)
+        assert tuple(await api_connection.fetchrow("SELECT session_user,current_user,current_setting('role')")) == (
+            role,
+            role,
+            "none",
+        )
+        assert (
+            await fixture.connection.fetchval(
+                "SELECT rolcanlogin FROM pg_roles WHERE rolname=$1", fixture.roles_by_kind["owner"]
+            )
+            is False
+        )
+        await _assert_api_protected_objects(fixture, api_connection)
+        api_engine = create_async_engine(url)
+        cleanup.push_async_callback(api_engine.dispose)
+        async with async_sessionmaker(api_engine)() as session, session.begin():
+            assert tuple(
+                (await session.execute(text("SELECT session_user,current_user,current_setting('role')"))).one()
+            ) == (
+                role,
+                role,
+                "none",
+            )
+            draft_record = await apply_registry_record_command(
+                session, create_record("group"), _actor(), schema=fixture.schema, source_schema=fixture.schema
+            )
+        assert draft_record["revision"] == 1
+        assert await api_connection.fetchval(f'SELECT count(*) FROM "{fixture.schema}".company_group_registry') == 1
+        identity_fields = tuple(
+            await api_connection.fetchrow("SELECT session_user,current_user,current_setting('role')")
+        )
+        assert identity_fields == (role, role, "none")
+        record_property("api_login_identity", json.dumps(identity_fields))
 
 
 async def test_api_membership_retains_binding_with_insert_only_privileges(permissions_db):

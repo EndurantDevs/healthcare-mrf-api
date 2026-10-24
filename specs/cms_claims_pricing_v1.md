@@ -6,7 +6,6 @@ This spec documents the first working pricing API for `healthcare-mrf-api` based
 
 - API surface: public read-only v1 endpoints only.
 - Data source for v1: CMS claims datasets.
-- Ribbon API is used only as behavior reference; no Ribbon path or ID parity is implemented.
 
 ## Data Sources (v1)
 

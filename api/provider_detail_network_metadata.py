@@ -16,7 +16,7 @@ from api.network_address_scope import (
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 from process.network_serving_read import PinnedNetworkServingManifest
-from process.registry_network_catalog_read import RegistryNetworkCatalogError
+from process.registry_network_catalog_read import RegistryNetworkCatalogError, _closed_json
 
 MAX_METADATA_BYTES = 32 * 1024 * 1024
 MAX_MEMBERSHIP_FACTS = 100_000
@@ -298,6 +298,53 @@ async def project_provider_network_metadata(provider_rows, *, session, include_s
         raise ServiceUnavailable(
             "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
         ) from error
+
+
+async def read_direct_detail_response(request, npi):
+    """Keep direct detail and exact membership on the same active Reader."""
+    from sanic.exceptions import ServiceUnavailable
+
+    from api.endpoint import npi as provider
+
+    scope = current_network_address_scope()
+    if scope is None or scope.access_scope_sha256 is None:
+        return await provider.read_npi_detail(request, npi)
+    async with provider.provider_profile_read_snapshot(
+        provider.db, provider._runtime_db_schema(), include_detail=True
+    ) as session:
+        http_response = await provider.read_npi_detail(request, npi)
+        if http_response.status >= 400:
+            return http_response
+        try:
+            detail_by_field = _closed_json(http_response.body, MAX_METADATA_BYTES)
+            if (
+                type(detail_by_field) is not dict
+                or type(detail_by_field.get("npi")) is not int
+                or detail_by_field["npi"] != int(npi)
+            ):
+                raise _unavailable()
+            is_debug_enabled = provider._is_truthy_arg(request.args.get("debug"), default=False)
+            projected_rows = await project_provider_network_metadata(
+                [detail_by_field],
+                session=session,
+                include_sources=is_debug_enabled
+                or provider._is_truthy_arg(request.args.get("include_sources"), default=False),
+                include_evidence=is_debug_enabled
+                or provider._is_truthy_arg(request.args.get("include_evidence"), default=False),
+            )
+            response_body = json.dumps(
+                projected_rows[0], ensure_ascii=False, allow_nan=False, default=str, separators=(",", ":")
+            ).encode("utf-8")
+            if len(response_body) > MAX_METADATA_BYTES:
+                raise _unavailable()
+        except (ValueError, TypeError, UnicodeError) as error:
+            raise ServiceUnavailable(
+                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+            ) from error
+        http_response.body = response_body
+        if "Content-Length" in http_response.headers:
+            http_response.headers["Content-Length"] = str(len(response_body))
+        return http_response
 
 
 async def attach_provider_source_details(addresses, *, include_sources, include_role_evidence=False, session=None):

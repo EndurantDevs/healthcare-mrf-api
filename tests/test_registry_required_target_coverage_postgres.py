@@ -36,7 +36,7 @@ def _input(extra=False):
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     writer.writerow(_HEADERS)
-    for source_id, ribbon in [("123", "12345678-1234-5678-8123-123456789abc"), ("456", ""), ("", "")]:
+    for source_id in ("123", "456", ""):
         writer.writerow(
             (
                 "Example",
@@ -46,11 +46,10 @@ def _input(extra=False):
                 "Example Carrier",
                 "Example Network",
                 source_id,
-                json.dumps([ribbon]) if ribbon else "",
             )
         )
     if extra:
-        writer.writerow(("Other", "Other Company", "Other Plan", "HMO", "Other Carrier", "Other Network", "789", ""))
+        writer.writerow(("Other", "Other Company", "Other Plan", "HMO", "Other Carrier", "Other Network", "789"))
     return output.getvalue().encode()
 
 

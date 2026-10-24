@@ -1,8 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Managed detail metadata retains public facts and exact location identity."""
 
+import asyncio
 import json
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -11,9 +12,16 @@ from uuid import UUID
 
 import pytest
 from asyncpg.pgproto.pgproto import UUID as DriverUUID
+from sanic import response
+from sanic.exceptions import ServiceUnavailable
+from sqlalchemy.exc import DBAPIError
 
+from api import network_address_scope as address_scope
 from api import provider_detail_network_metadata as metadata
+from api import provider_profile_snapshot as snapshot
+from api.endpoint import npi as provider
 from api.network_address_scope import network_address_read_scope
+from db import connection as db_connection
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
 from tests.test_provider_profile_network_read import address_manifest
 
@@ -21,6 +29,21 @@ _NPI = "1000000491"
 _ADDRESS = "22222222-2222-4222-8222-222222222222"
 _OTHER = "33333333-3333-4333-8333-333333333333"
 _SITE = "44444444-4444-4444-8444-444444444444"
+_DIRECT_DETAIL_DOCUMENT = {
+    "npi": int(_NPI),
+    "aca_network_array": [84],
+    "qualifications": {"network_refs": ["independent"]},
+    "address_list": [
+        {
+            "address_key": _ADDRESS,
+            "location_key": _SITE,
+            "aca_network_array": [84],
+            "ptg_plan_array": ["other-plan"],
+            "telephone_number": "555-0101",
+            "raw": {"network_refs": [84]},
+        }
+    ],
+}
 
 
 def _fact(**changes):
@@ -441,3 +464,324 @@ async def test_managed_collection_bridge_maps_projection_refusal_to_private_unav
                 [{"npi": int(_NPI), "address_key": _ADDRESS}], session=_session([], bounded=False)
             )
     assert raised.value.status_code == 503 and raised.value.headers == {"Cache-Control": "private, no-store"}
+
+
+def _direct_reader_snapshot(boundary):
+    @asynccontextmanager
+    async def snapshot(database, schema, *, include_detail):
+        assert database is provider.db and schema == provider._runtime_db_schema() and include_detail is True
+        boundary.snapshot_calls += 1
+        if not boundary.depth:
+            boundary.reader_opens += 1
+        boundary.depth += 1
+        try:
+            yield boundary.session
+        finally:
+            boundary.depth -= 1
+
+    return snapshot
+
+
+@pytest.fixture
+def direct_detail(monkeypatch):
+    """Keep ordinary and nested Reader lifetimes distinct without database I/O."""
+    manifest = address_manifest()
+    session = _session([_fact()])
+    ordinary_session = _session([])
+    ordinary_session.execute.side_effect = AssertionError("Metadata must use the active Reader session")
+    request = SimpleNamespace(args={"network_ids": "42"}, ctx=SimpleNamespace(sa_session=ordinary_session))
+    document_by_field = deepcopy(_DIRECT_DETAIL_DOCUMENT)
+    boundary = SimpleNamespace(
+        request=request,
+        session=session,
+        document=document_by_field,
+        cached_body=None,
+        access_scope="d" * 64,
+        depth=0,
+        reader_opens=0,
+        snapshot_calls=0,
+    )
+
+    async def read_metadata(*_arguments):
+        assert address_scope.current_network_address_scope().manifest is manifest
+        assert session.in_transaction() and boundary.depth == 1
+        return session.execute.return_value
+
+    session.execute.side_effect = read_metadata
+
+    async def pin(actual_request, selectors):
+        assert actual_request is request and selectors["network_ids"] == "42"
+        return manifest, (42,), boundary.access_scope
+
+    async def native_read(actual_request, npi):
+        assert actual_request is request and npi == _NPI
+        if "network_ids" in request.args:
+            assert address_scope.current_network_address_scope().manifest is manifest
+        async with provider.provider_profile_read_snapshot(
+            provider.db, provider._runtime_db_schema(), include_detail=True
+        ) as native_session:
+            assert native_session is session
+            response_body = boundary.cached_body or json.dumps(document_by_field).encode()
+            return response.raw(
+                response_body,
+                status=206,
+                content_type="application/json",
+                headers={"X-Example-Detail": "retained", "Content-Length": str(len(response_body))},
+            )
+
+    monkeypatch.setattr(address_scope, "_pin_network_scope", pin)
+    monkeypatch.setattr(provider, "provider_profile_read_snapshot", _direct_reader_snapshot(boundary))
+    boundary.native_read = AsyncMock(side_effect=native_read)
+    monkeypatch.setattr(provider, "read_npi_detail", boundary.native_read)
+    return boundary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True])
+async def test_direct_detail_keeps_reader_active_through_projection(direct_detail, cached):
+    boundary = direct_detail
+    if cached:
+        boundary.cached_body = json.dumps(boundary.document).encode()
+    http_response = await provider.get_npi(boundary.request, _NPI)
+    assert json.loads(http_response.body)["address_list"][0]["network_memberships"][0]["network_id"] == 42
+    assert boundary.snapshot_calls == 2 and boundary.reader_opens == 1 and boundary.depth == 0
+    boundary.session.execute.assert_awaited_once()
+    boundary.request.ctx.sa_session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "grouped,options,evidence",
+    [(False, {}, False), (True, {"debug": "true"}, True), (False, {"include_evidence": "true"}, True)],
+)
+async def test_direct_detail_projects_exact_office(direct_detail, grouped, options, evidence):
+    boundary = direct_detail
+    if grouped:
+        boundary.document["address_groups"] = [{"members": boundary.document.pop("address_list")}]
+    boundary.request.args.update(options)
+    native_document = deepcopy(boundary.document)
+    http_response = await provider.get_npi(boundary.request, _NPI)
+    projected = json.loads(http_response.body)
+    office = metadata._addresses(projected)[0]
+    assert "aca_network_array" not in projected
+    assert "aca_network_array" not in office and "ptg_plan_array" not in office
+    membership_by_field = {key: _fact()[key] for key in ("network_id", "provider_system", "provider_id", "location_id")}
+    if evidence:
+        membership_by_field["evidence_ids"] = ["a" * 64]
+    assert office["network_memberships"] == [membership_by_field]
+    assert office["location_key"] == _SITE and office["telephone_number"] == "555-0101"
+    assert office["raw"] == metadata._addresses(native_document)[0]["raw"]
+    assert projected["qualifications"] == native_document["qualifications"]
+    assert http_response.status == 206 and http_response.headers["X-Example-Detail"] == "retained"
+    assert http_response.content_type == "application/json"
+    assert http_response.headers["Content-Length"] == str(len(http_response.body))
+    assert http_response.headers["X-Network-Generation"] == str(address_manifest().generation_id)
+    assert http_response.headers["Cache-Control"] == "private, no-store"
+    boundary.session.execute.assert_awaited_once()
+    assert boundary.session.execute.await_args.args[1]["metadata_selected"] == [42]
+    assert boundary.document == native_document
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("facts", [[], [_fact(network_id=84)], [_fact(address_key=_OTHER)]])
+async def test_direct_detail_refuses_missing_membership(direct_detail, facts):
+    boundary = direct_detail
+    boundary.session.execute.return_value = _session(facts).execute.return_value
+    with pytest.raises(ServiceUnavailable) as raised:
+        await provider.get_npi(boundary.request, _NPI)
+    assert raised.value.status_code == 503
+    assert raised.value.headers["Cache-Control"] == "private, no-store"
+    boundary.session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cached_detail_rechecks_current_membership(direct_detail):
+    boundary = direct_detail
+    boundary.cached_body = json.dumps(boundary.document).encode()
+    first = await provider.get_npi(boundary.request, _NPI)
+    assert json.loads(first.body)["address_list"][0]["network_memberships"][0]["network_id"] == 42
+    boundary.session.execute.return_value = _session([]).execute.return_value
+    with pytest.raises(ServiceUnavailable):
+        await provider.get_npi(boundary.request, _NPI)
+    assert boundary.session.execute.await_count == 2
+    assert boundary.native_read.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical", [False, True])
+async def test_unmanaged_detail_preserves_native_response(direct_detail, canonical):
+    boundary = direct_detail
+    if canonical:
+        boundary.access_scope = None
+    else:
+        boundary.request.args = {}
+    http_response = await provider.get_npi(boundary.request, _NPI)
+    assert json.loads(http_response.body) == boundary.document
+    assert http_response.status == 206 and http_response.headers["X-Example-Detail"] == "retained"
+    boundary.session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_detail_preserves_native_error(direct_detail):
+    boundary = direct_detail
+    native_error = response.json({"error": "unavailable"}, status=503, headers={"Retry-After": "1"})
+    boundary.native_read.side_effect = None
+    boundary.native_read.return_value = native_error
+    http_response = await provider.get_npi(boundary.request, _NPI)
+    assert http_response is native_error and http_response.headers["Retry-After"] == "1"
+    assert json.loads(http_response.body) == {"error": "unavailable"}
+    boundary.session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_detail_preserves_native_response_without_length(direct_detail):
+    """Native raw responses leave framing to the HTTP server."""
+    boundary = direct_detail
+    boundary.native_read.side_effect = None
+    boundary.native_read.return_value = response.raw(
+        json.dumps(boundary.document).encode(), content_type="application/json"
+    )
+    http_response = await provider.get_npi(boundary.request, _NPI)
+    assert http_response.status == 200 and "Content-Length" not in http_response.headers
+    assert json.loads(http_response.body)["address_list"][0]["network_memberships"][0]["network_id"] == 42
+    boundary.session.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_body", [b"{", b'{"npi":1}', b'{"npi":true}', b'{"npi":1,"npi":1}'])
+async def test_direct_detail_refuses_invalid_document(direct_detail, native_body):
+    boundary = direct_detail
+    boundary.cached_body = native_body
+    with pytest.raises(ServiceUnavailable):
+        await provider.get_npi(boundary.request, _NPI)
+    boundary.session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_detail_bounds_serialized_response(direct_detail, monkeypatch):
+    boundary = direct_detail
+    boundary.document["qualifications"]["description"] = "x" * 512
+    monkeypatch.setattr(metadata, "MAX_METADATA_BYTES", len(json.dumps(boundary.document).encode()))
+    with pytest.raises(ServiceUnavailable):
+        await provider.get_npi(boundary.request, _NPI)
+    boundary.session.execute.assert_awaited_once()
+
+
+def _geocode_reader_session(outcome):
+    """Model PostgreSQL's aborted transaction until its savepoint rolls back."""
+    state = SimpleNamespace(aborted=False, depth=0, rollbacks=0, lookups=[], memberships=0)
+    session = _session([_fact()])
+    session.info = {"api_reader_verified": True}
+    owner_task = asyncio.current_task()
+    membership_result = session.execute.return_value
+
+    @asynccontextmanager
+    async def savepoint():
+        state.depth += 1
+        try:
+            yield
+        except BaseException:
+            state.aborted = False
+            state.rollbacks += 1
+            raise
+        finally:
+            state.depth -= 1
+
+    async def execute(statement, parameters=None):
+        assert asyncio.current_task() is owner_task
+        assert not state.aborted, "optional lookup left the shared Reader aborted"
+        if "metadata_npis" in (parameters or {}):
+            state.memberships += 1
+            return membership_result
+        sql = str(statement)
+        if sql.startswith("SET LOCAL"):
+            return None
+        if "to_regclass" in sql:
+            return SimpleNamespace(scalar=lambda: "mrf.openaddresses_geocode")
+        lookup = "openaddresses" if "openaddresses" in sql else "archive"
+        assert lookup == "openaddresses" or "address_archive" in sql
+        state.lookups.append((lookup, state.depth))
+        if outcome == lookup + "_error":
+            state.aborted = True
+            raise DBAPIError(sql, None, RuntimeError("synthetic optional lookup failure"))
+        coordinates = SimpleNamespace(
+            long=-87.5,
+            lat=41.5,
+            place_id=None,
+            geo_source="openaddresses",
+            geocode_source="openaddresses",
+            geocode_quality="exact",
+        )
+        value = coordinates if outcome == lookup or outcome == "archive_error" and lookup == "openaddresses" else None
+        return SimpleNamespace(
+            scalar=lambda: value, first=lambda: SimpleNamespace(_mapping=vars(value)) if value else None
+        )
+
+    session.begin_nested = savepoint
+    session.execute.side_effect = execute
+    return session, state
+
+
+def _install_geocode_detail_loaders(monkeypatch):
+    office_by_field = deepcopy(_DIRECT_DETAIL_DOCUMENT["address_list"][0]) | {
+        "npi": int(_NPI),
+        "checksum": 1,
+        "type": "practice",
+        "first_line": "100 Example Avenue",
+        "city_name": "Example",
+        "state_name": "IL",
+        "postal_code": "60001",
+        "lat": None,
+        "long": None,
+    }
+    replacements_by_name = {
+        "_build_npi_details": {"npi": int(_NPI)},
+        "_fetch_npi_location_candidates": [office_by_field],
+        "_hydrate_selected_provider_locations": [office_by_field],
+        "_apply_location_statuses": None,
+        "_fetch_other_names": [],
+        "_fetch_provider_enrichment_summary_detail": None,
+        "_is_table_available": True,
+    }
+    for name, value in replacements_by_name.items():
+        monkeypatch.setattr(provider, name, AsyncMock(return_value=value))
+    monkeypatch.setattr(provider, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 0)
+    monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "false")
+    monkeypatch.setattr(snapshot, "_lock_serving_relations", AsyncMock(return_value={}))
+    monkeypatch.setattr(snapshot, "_requires_cms_receipt", AsyncMock(return_value=False))
+    monkeypatch.setattr(snapshot, "_read_native_authorities", AsyncMock(return_value={}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["archive_error", "openaddresses_error", "archive", "openaddresses"])
+async def test_optional_geocodes_preserve_reader_membership(monkeypatch, outcome):
+    _install_geocode_detail_loaders(monkeypatch)
+    database = db_connection.Database()
+    session, state = _geocode_reader_session(outcome)
+    monkeypatch.setattr(provider, "db", database)
+    writer = AsyncMock(side_effect=AssertionError("geocode reads cannot open a Writer"))
+    monkeypatch.setattr(provider, "run_as_writer", writer)
+    request = SimpleNamespace(
+        args={"lookup_stored_geocode": "true", "sync_geocode": "false", "include_profile": "false", "view": "summary"},
+        app=SimpleNamespace(config={"NPI_API_UPDATE_GEOCODE": False}),
+    )
+    binding = db_connection._TransactionBinding(id(database), session, asyncio.current_task())
+    token = db_connection._READER.set(binding)
+    try:
+        with network_address_read_scope(address_manifest(), (42,), access_scope_sha256="d" * 64):
+            http_response = await metadata.read_direct_detail_response(request, _NPI)
+        assert database._reader_binding() is binding and not state.aborted
+    finally:
+        db_connection._READER.reset(token)
+    assert http_response.status == 200
+    office_by_field = json.loads(http_response.body)["address_list"][0]
+    assert office_by_field["telephone_number"] == "555-0101"
+    assert office_by_field["network_memberships"][0]["network_id"] == 42
+    assert office_by_field["lat"] == (None if outcome == "openaddresses_error" else 41.5)
+    assert [name for name, _depth in state.lookups] == (
+        ["archive"] if outcome == "archive" else ["archive", "openaddresses"]
+    )
+    assert all(depth > 0 for _name, depth in state.lookups)
+    assert state.rollbacks == int(outcome.endswith("_error")) and state.memberships == 1
+    assert snapshot._SNAPSHOT.get() is None and state.depth == 0
+    writer.assert_not_awaited()

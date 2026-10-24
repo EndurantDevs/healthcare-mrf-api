@@ -1,6 +1,6 @@
 # Clinical Reference Import
 
-`clinical-reference` builds local terminology lookup, synonym, crosswalk, and relationship tables for Ribbon-replacement APIs. `mrf.code_synonym` is the only synonym storage; `mrf.code_catalog` stores one row per canonical code without duplicate synonym arrays or checksum columns.
+`clinical-reference` builds local terminology lookup, synonym, crosswalk, and relationship tables for clinical reference APIs. `mrf.code_synonym` is the only synonym storage; `mrf.code_catalog` stores one row per canonical code without duplicate synonym arrays or checksum columns.
 
 ## Command
 
@@ -18,7 +18,7 @@ python main.py start clinical-reference --sources icd10cm,mesh,rxnorm,snomed,med
 
 ## Sources
 
-The importer uses official coding systems as canonical keys and retains downloaded artifacts under `/Volumes/Data/data/artifacts/terminology` by default:
+The importer uses official coding systems as canonical keys and retains downloaded artifacts locally. Configure their storage directory with `HLTHPRT_TERMINOLOGY_ARTIFACT_ROOT`:
 
 - `ICD10CM`: CDC ICD-10-CM code descriptions for conditions.
 - `ICD10PCS` is not loaded by this importer. CMS MS-DRG-specific ICD-10-PCS rows are loaded by the separate `ms-drg` importer.
