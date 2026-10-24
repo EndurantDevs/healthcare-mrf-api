@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fixed entrypoint of the admitted reference source-worker Job; the launcher sets workingDir /app.
+cd /opt && exec /opt/venv/bin/python main.py worker-once process.Geo
