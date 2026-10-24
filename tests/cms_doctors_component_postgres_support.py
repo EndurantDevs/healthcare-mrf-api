@@ -1,9 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Genuine native roles for component proofs, not enrolled runtime acceptance."""
 
+import os
+import re
 from contextlib import asynccontextmanager
 
+import pytest
+import pytest_asyncio
 from sqlalchemy import text
+from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import cms_doctors_immutable as immutable
@@ -12,8 +17,47 @@ from process.provider_directory_projection_stage import _copy_driver
 from tests.provider_directory_source_postgres_support import (
     native_source_component,
     source_component_database,
+    source_component_templates,
     verify_native_source_profile,
 )
+
+
+@asynccontextmanager
+async def doctors_component_scope():
+    """Keep the owned anchor alive until every closed migration template is removed."""
+    from tests import cms_npd_admission_postgres_support as admission
+
+    if os.getenv(admission._DSN_ENV):
+        source_url = admission._database_url()
+    else:
+        name = os.getenv("HLTHPRT_DB_DATABASE", "")
+        if not re.fullmatch(r"ptg2_v3_lifecycle_test_[a-z0-9_]{8,}", name):
+            pytest.skip("requires an explicitly selected disposable PostgreSQL database")
+        source_url = URL.create(
+            "postgresql+asyncpg",
+            username=os.getenv("HLTHPRT_DB_USER", "postgres"),
+            password=os.getenv("HLTHPRT_DB_PASSWORD") or None,
+            host=os.getenv("HLTHPRT_DB_HOST", "127.0.0.1"),
+            port=int(os.getenv("HLTHPRT_DB_PORT", "5432")),
+            database=name,
+        )
+        allowed_hosts = {"127.0.0.1", "localhost"}
+        if os.getenv("CI") == "true":
+            allowed_hosts.add("postgres")
+        if source_url.host not in allowed_hosts:
+            pytest.fail("Doctors fixture requires a local PostgreSQL test host")
+    async with admission._owned_database(source_url) as (database_url, _admin), source_component_templates():
+        with pytest.MonkeyPatch.context() as settings:
+            settings.setenv(admission._DSN_ENV, database_url.render_as_string(hide_password=False))
+            assert admission._database_url() == database_url
+            yield
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def doctors_component_template():
+    """Reuse migrations while each case retains its own database and native roles."""
+    async with doctors_component_scope():
+        yield
 
 
 async def _native_preimage(driver, schema):
