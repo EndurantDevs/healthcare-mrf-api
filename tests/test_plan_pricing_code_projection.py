@@ -244,8 +244,8 @@ def test_whole_release_work_guards_remain_uncalibrated(monkeypatch):
 
     with pytest.raises(ValueError, match="not calibrated"):
         _work_limits(_BuildState(hashlib.sha256()))
-    assert build._member_cell_limit() == 10_000
-    assert build._factor_join_limit() == 8_192
+    assert build._member_cell_limit() == 32_768
+    assert build._factor_join_limit() == 16_384
     monkeypatch.setattr(build, "MAX_CODE_MEMBER_CELL_WORK_ROWS", None)
     monkeypatch.setattr(build, "MAX_CODE_FACTOR_JOIN_WORK_ROWS", None)
     with pytest.raises(ValueError, match="not calibrated"):
@@ -423,50 +423,51 @@ async def test_code_provider_subbatch_rejects_rows_outside_its_scope(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("excess", [0, 1])
-async def test_code_factor_boundary_refuses_before_membership_writes(monkeypatch, excess):
+@pytest.mark.parametrize("work_rows,refused", [(9_993, False), (16_384, False), (16_385, True)])
+async def test_code_factor_boundary_refuses_before_membership_writes(monkeypatch, work_rows, refused):
     from unittest.mock import AsyncMock
 
     from api import plan_pricing_code_build as build
     from api import ptg2_serving as serving
 
     limit = build._factor_join_limit()
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=[limit + excess, 1, False]), execute=AsyncMock())
+    session = SimpleNamespace(scalar=AsyncMock(side_effect=[work_rows, 1, False]), execute=AsyncMock())
     binding = SimpleNamespace(binding={"ordinal": 0}, serving_tables=object())
     monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
     monkeypatch.setattr(serving, "_shared_v3_provider_set_table", lambda _tables: "synthetic.provider_set")
     monkeypatch.setattr(serving, "_ptg2_npi_scope_table", lambda _tables: "synthetic.dictionary")
     args = (session, binding, (SimpleNamespace(schema_name="synthetic"),), [{"code_key": 1}], 100, limit)
-    if excess:
+    if refused:
         with pytest.raises(ValueError, match="factor join exceeds"):
             await build._stage_memberships(*args)
         session.execute.assert_not_awaited()
     else:
-        assert await build._stage_memberships(*args) == (1, limit)
+        assert await build._stage_memberships(*args) == (1, work_rows)
         assert session.execute.await_count == 2
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("excess", [0, 1])
-async def test_code_member_cell_boundary_refuses_before_aggregate_work(monkeypatch, excess):
+@pytest.mark.parametrize("work_rows,refused", [(14_352, False), (32_768, False), (32_769, True)])
+async def test_code_member_cell_boundary_refuses_before_aggregate_work(monkeypatch, work_rows, refused):
     from unittest.mock import AsyncMock
 
     from api import plan_pricing_code_build as build
     from api import plan_pricing_projection_v3_work as work
 
     limit = build._member_cell_limit()
-    session = SimpleNamespace(execute=AsyncMock(side_effect=[None, SimpleNamespace(scalar_one=lambda: limit + excess)]))
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[None, SimpleNamespace(scalar_one=lambda: work_rows)]))
     monkeypatch.setattr(work, "_normalized_taxonomy_codes", lambda _code: (False, None))
 
     async def statement(_stage, sql):
         return sql
 
-    if excess:
+    if refused:
         with pytest.raises(ValueError, match="member-cell work bound exceeded"):
             await work._stage_member_cells(session, "a" * 64, ("CPT", "00000"), limit, statement)
     else:
-        assert await work._stage_member_cells(session, "a" * 64, ("CPT", "00000"), limit, statement) == limit
+        assert await work._stage_member_cells(session, "a" * 64, ("CPT", "00000"), limit, statement) == work_rows
     assert session.execute.await_count == 2
+    assert session.execute.await_args_list[0].args[1]["member_cell_limit"] == limit + 1
 
 
 @pytest.mark.parametrize(

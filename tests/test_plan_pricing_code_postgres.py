@@ -320,6 +320,15 @@ def _fixture(monkeypatch, db, oid, *, failure=None):
 @pytest.mark.asyncio
 async def test_code_native_publisher_reader_parity_dependency_retention_and_adoption(monkeypatch):
     """Publish once, adopt identically and preserve reader parity through retirement."""
+    for case in (
+        ([7, 8], 7, 0, (6, 7), None),
+        ([404], 0, 0, (0, 0), None),
+        ([10], 0, 0, (0, 0), None),
+        ([7, 8], 6, 0, None, "factor join exceeds"),
+        ([10], 0, 1, None, "membership is incomplete"),
+    ):
+        with pytest.MonkeyPatch.context() as factor_patch:
+            await _assert_selected_factor_preflight(factor_patch, *case)
     async with _database(monkeypatch) as db:
         oid = await _source_database(db)
         identity = _fixture(monkeypatch, db, oid)
@@ -388,6 +397,56 @@ async def test_interrupted_code_build_rolls_back_family_attachment_and_pins(monk
             for stage in db.stages:
                 assert not await session.scalar(
                     text("SELECT to_regnamespace(:name) IS NOT NULL"), {"name": stage.schema_name}
+                )
+
+
+async def _assert_selected_factor_preflight(monkeypatch, code_keys, factor_limit, missing_count, expected, error):
+    from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+
+    async with _database(monkeypatch) as db:
+        await _source_database(db)
+        monkeypatch.setattr(serving, "_required_shared_snapshot_key", lambda _tables: 1)
+        monkeypatch.setattr(serving, "_shared_v3_provider_set_table", lambda _tables: "mrf.code_source_provider_set")
+        monkeypatch.setattr(serving, "_ptg2_npi_scope_table", lambda _tables: "mrf.code_source_dictionary")
+        async with db.sessions() as session, session.begin():
+            await session.execute(text("SET LOCAL statement_timeout='5s'"))
+            await session.execute(text("SET LOCAL lock_timeout='500ms'"))
+            await session.execute(text("INSERT INTO mrf.ptg_membership_first VALUES (4,99),(5,99)"))
+            await session.execute(text("INSERT INTO mrf.ptg_membership_second VALUES (14,105),(99,999)"))
+            await session.execute(text("INSERT INTO mrf.ptg_membership_code VALUES (8,100),(9,999),(10,105)"))
+            await session.execute(
+                text("INSERT INTO mrf.code_source_provider_set VALUES (1,105,:count,decode(repeat('05',16),'hex'))"),
+                {"count": missing_count},
+            )
+            await build._create_stage_tables(session)
+            args = (
+                session,
+                SimpleNamespace(binding={"ordinal": 0}, serving_tables=object()),
+                (SimpleNamespace(schema_name="mrf"),),
+                [{"code_key": key} for key in code_keys],
+                100,
+                factor_limit,
+            )
+            if error:
+                with pytest.raises((ValueError, PTG2ManifestArtifactError), match=error):
+                    await build._stage_memberships(*args)
+                assert await session.scalar(text("SELECT count(*) FROM plan_pricing_provider_member_stage")) == 0
+            else:
+                assert await build._stage_memberships(*args) == expected
+                actual = (
+                    await session.execute(text("SELECT provider_set_key,npi FROM plan_pricing_provider_member_stage"))
+                ).all()
+                assert set(actual) == (
+                    {
+                        (100, 1000000001),
+                        (100, 1000000002),
+                        (101, 1000000001),
+                        (101, 1000000002),
+                        (102, 1000000003),
+                        (104, 1000000004),
+                    }
+                    if expected[0]
+                    else set()
                 )
 
 
