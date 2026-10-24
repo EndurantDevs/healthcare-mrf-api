@@ -29,6 +29,7 @@ from sqlalchemy import false, func, or_, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import literal_column, text, tuple_
 
+from api import provider_detail_network_metadata
 from api.code_systems import EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.custom_import_provider_sql import ProviderImportQuery
 from api.endpoint.pagination import parse_pagination
@@ -53,12 +54,6 @@ from api.npi_detail_cache_identity import (
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
 from api.provider_demographic_filters import normalize_provider_sex_code
-from api.provider_detail_network_metadata import (
-    attach_provider_source_details as _attach_selected_address_source_details,
-)
-from api.provider_detail_network_metadata import (
-    project_provider_network_metadata as _project_provider_network_metadata,
-)
 from api.provider_detail_sql import _npi_detail_address_filters, _npi_detail_taxonomy_aggregate
 from api.provider_directory_dataset_sql import (
     PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
@@ -111,6 +106,7 @@ from api.provider_profile import (
     fetch_provider_profile_projection,
 )
 from api.provider_profile_snapshot import (
+    provider_optional_read,
     provider_profile_read_snapshot,
     provider_read_savepoint,
     snapshot_relation_available,
@@ -192,6 +188,9 @@ from process.ext.utils import download_it
 from process.florida_mqa_profile import STANDARD_CATEGORIES
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
+_attach_selected_address_source_details = provider_detail_network_metadata.attach_provider_source_details
+_project_provider_network_metadata = provider_detail_network_metadata.project_provider_network_metadata
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
@@ -11528,7 +11527,7 @@ async def get_npi_batch(request):
 @canonical_network_read
 async def get_npi(request, npi):
     """Return one NPPES- or profile-backed provider with optional provenance."""
-    return await read_npi_detail(request, npi)
+    return await provider_detail_network_metadata.read_direct_detail_response(request, npi)
 
 
 async def read_npi_detail(request, npi, *, native_args=None):
@@ -11991,19 +11990,20 @@ async def read_npi_detail(request, npi, *, native_args=None):
                 should_update_geo = True
 
             if should_lookup_stored_geocode and (not address_by_field["lat"]) and (not should_force_address_update):
-                stored_coordinates = await _archive_coordinates_for(address_by_field)
-                if stored_coordinates:
-                    address_by_field["long"] = stored_coordinates.long
-                    address_by_field["lat"] = stored_coordinates.lat
-                    address_by_field["place_id"] = stored_coordinates.place_id
-                    address_by_field["geo_source"] = getattr(stored_coordinates, "geo_source", None) or (
-                        "google" if stored_coordinates.place_id else None
-                    )
+                async with provider_optional_read(request_session, logger):
+                    stored_coordinates = await _archive_coordinates_for(address_by_field)
+                    if stored_coordinates:
+                        address_by_field["long"] = stored_coordinates.long
+                        address_by_field["lat"] = stored_coordinates.lat
+                        address_by_field["place_id"] = stored_coordinates.place_id
+                        address_by_field["geo_source"] = getattr(stored_coordinates, "geo_source", None) or (
+                            "google" if stored_coordinates.place_id else None
+                        )
 
             if (
                 should_lookup_stored_geocode or should_sync_geocode or should_force_address_update
             ) and not address_by_field["lat"]:
-                try:
+                async with provider_optional_read(request_session, logger):
                     openaddresses_coordinates = await _openaddresses_coordinates_for(address_by_field)
                     if openaddresses_coordinates:
                         address_by_field["long"] = openaddresses_coordinates.long
@@ -12012,8 +12012,6 @@ async def read_npi_detail(request, npi, *, native_args=None):
                         address_by_field["geo_source"] = openaddresses_coordinates.geo_source
                         address_by_field["geocode_source"] = openaddresses_coordinates.geocode_source
                         address_by_field["geocode_quality"] = openaddresses_coordinates.geocode_quality
-                except Exception as exc:
-                    logger.debug("OpenAddresses geocoding failed for %s: %s", t_addr, exc)
 
             if (should_sync_geocode or should_force_address_update) and not address_by_field["lat"]:
                 try:
@@ -12286,7 +12284,8 @@ async def read_npi_detail(request, npi, *, native_args=None):
             except Exception:
                 other_names = []
             provider_enrichment_payload = None
-    request_session = None
+    # A direct-detail bridge can still own the Reader after this nested scope exits.
+    request_session = request_session if has_reader_session(db) else None
     update_address_tasks = [_update_address(address) for address in addresses if address]
     updated_addresses = list(await gather_reader_calls(db, *update_address_tasks)) if update_address_tasks else []
     if address_grouping == ADDRESS_GROUPING_PREMISE:

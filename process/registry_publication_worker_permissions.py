@@ -5,7 +5,13 @@ import asyncpg
 
 from process.network_address_projection import _identifier
 from process.network_membership_writer_closure import _protected_owner
-from process.registry_management_permissions import _TABLES, _catalog, _roles, verify_registry_management_permissions
+from process.registry_management_permissions import (
+    _TABLES,
+    _catalog,
+    _custody_ledger_owner,
+    _roles,
+    verify_registry_management_permissions,
+)
 from process.registry_publication_permissions import _CUSTODY_SQL, INSERT_COLUMNS, LIFECYCLE_COLUMNS
 
 _INSERT = {
@@ -234,11 +240,14 @@ async def verify_registry_publication_worker_permissions(
     }
 
 
-async def _grant_worker(connection, namespace, tables, role, *, execution):
+async def _grant_worker(connection, namespace, tables, role, *, execution, custody_owner_role=None):
     grantee = _identifier(role)
     await connection.execute(f"REVOKE ALL ON SCHEMA {_identifier(namespace)} FROM {grantee}")
     await connection.execute(f"GRANT USAGE ON SCHEMA {_identifier(namespace)} TO {grantee}")
     for table in tables:
+        caller = await connection.fetchval("SELECT quote_ident(current_user)")
+        if custody_owner_role and table["relname"] == "network_candidate_custody":
+            await connection.execute(f"SET LOCAL ROLE {_identifier(custody_owner_role)}")
         relation = _identifier(namespace) + "." + _identifier(table["relname"])
         await connection.execute(f"REVOKE ALL ON TABLE {relation} FROM {grantee}")
         columns = ",".join(_identifier(name) for name in table["columns"])
@@ -254,6 +263,39 @@ async def _grant_worker(connection, namespace, tables, role, *, execution):
             if allowed:
                 columns = ",".join(_identifier(name) for name in allowed)
                 await connection.execute(f"GRANT {privilege}({columns}) ON {relation} TO {grantee}")
+        await connection.execute(f"SET LOCAL ROLE {caller}")
+
+
+async def _install_worker_metadata(connection, namespace, tables, sequences, roles, custody_owner):
+    """Issue each metadata grant as its existing protected native owner."""
+    queue_owner = roles["queue_owner_role"]
+    lifecycle_role, execution_role = roles["lifecycle_role"], roles["execution_role"]
+    original_role = await connection.fetchval("SELECT quote_ident(current_user)")
+    await connection.execute(f"SET LOCAL ROLE {_identifier(queue_owner)}")
+    for table in tables:
+        if custody_owner and table["relname"] == "network_candidate_custody":
+            await connection.execute(f"SET LOCAL ROLE {_identifier(custody_owner)}")
+        await connection.execute(
+            f"LOCK TABLE {_identifier(namespace)}.{_identifier(table['relname'])} IN ACCESS EXCLUSIVE MODE NOWAIT"
+        )
+        await connection.execute(f"SET LOCAL ROLE {_identifier(queue_owner)}")
+    for role in (lifecycle_role, execution_role):
+        await _grant_worker(
+            connection,
+            namespace,
+            tables,
+            role,
+            execution=role == execution_role,
+            custody_owner_role=custody_owner,
+        )
+        for sequence in sequences:
+            await connection.execute(
+                f"REVOKE ALL ON SEQUENCE {_identifier(namespace)}.{_identifier(sequence['relname'])} FROM {_identifier(role)}"
+            )
+    await connection.execute(
+        f"GRANT USAGE ON SEQUENCE {_identifier(namespace)}.{_identifier(_SEQUENCE)} TO {_identifier(execution_role)}"
+    )
+    await connection.execute(f"SET LOCAL ROLE {original_role}")
 
 
 async def install_registry_publication_worker_permissions(
@@ -278,26 +320,12 @@ async def install_registry_publication_worker_permissions(
     try:
         async with connection.transaction():
             namespace, oid = await _context(connection, **options_by_name)
-            for owner in (queue_owner_role, physical_owner_role):
+            tables, sequences = await _catalog(connection, oid)
+            custody_owner = await _custody_ledger_owner(connection, namespace, tables, queue_owner_role)
+            for owner in (queue_owner_role, physical_owner_role, *([custody_owner] if custody_owner else [])):
                 if not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", owner):
                     raise RegistryPublicationWorkerPermissionError("Trusted installer cannot assume protected owners")
-            tables, sequences = await _catalog(connection, oid)
-            original_role = await connection.fetchval("SELECT quote_ident(current_user)")
-            await connection.execute(f"SET LOCAL ROLE {_identifier(queue_owner_role)}")
-            for table in tables:
-                await connection.execute(
-                    f"LOCK TABLE {_identifier(namespace)}.{_identifier(table['relname'])} IN ACCESS EXCLUSIVE MODE NOWAIT"
-                )
-            for role in (lifecycle_role, execution_role):
-                await _grant_worker(connection, namespace, tables, role, execution=role == execution_role)
-                for sequence in sequences:
-                    await connection.execute(
-                        f"REVOKE ALL ON SEQUENCE {_identifier(namespace)}.{_identifier(sequence['relname'])} FROM {_identifier(role)}"
-                    )
-            await connection.execute(
-                f"GRANT USAGE ON SEQUENCE {_identifier(namespace)}.{_identifier(_SEQUENCE)} TO {_identifier(execution_role)}"
-            )
-            await connection.execute(f"SET LOCAL ROLE {original_role}")
+            await _install_worker_metadata(connection, namespace, tables, sequences, options_by_name, custody_owner)
             await connection.execute(
                 f"GRANT CREATE ON DATABASE {_identifier(await connection.fetchval('SELECT current_database()'))} TO {_identifier(physical_owner_role)}"
             )

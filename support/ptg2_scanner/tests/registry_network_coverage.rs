@@ -431,11 +431,8 @@ fn malformed_json_errors_are_sanitized() {
 }
 
 #[test]
-fn maximum_ledger_fc_ribbon_target_fits_shared_utf8_bound() {
-    let key = format!(
-        "fc:{}:ribbon:12345678-1234-5678-8123-123456789abc",
-        "9".repeat(128)
-    );
+fn maximum_requested_target_fits_shared_utf8_bound() {
+    let key = format!("fc:{}", "9".repeat(128));
     assert!(key.len() > 128 && key.len() <= coverage::MAX_TARGET_KEY_BYTES);
     let mut input = json!({"targets":[{"target_key":key}],"bindings":[],"evidence":[]});
     assert_eq!(report(&input).totals.ledger_targets, 1);

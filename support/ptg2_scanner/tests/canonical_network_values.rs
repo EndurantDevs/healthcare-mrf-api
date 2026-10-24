@@ -138,7 +138,7 @@ fn labels_trim_for_display_while_source_aliases_and_original_spelling_survive() 
     observation["aliases"] = json!([" Example PPO ", "\t示例網絡\n", " Example PPO "]);
     observation["source_aliases"] = json!([
         source_alias("ptg_label", " Example Réséau "),
-        source_alias("ribbon_network_id", "000042/external")
+        source_alias("ptg_label", "000042/source")
     ]);
     let output = validate(&[observation]).unwrap();
     let entry = &output[0];
@@ -159,7 +159,7 @@ fn labels_trim_for_display_while_source_aliases_and_original_spelling_survive() 
     );
     assert_eq!(
         entry.source_aliases[1].canonical_alias_value,
-        "000042/external"
+        "000042/source"
     );
     assert_eq!(entry.source_aliases[0].source_id, "source-network-one");
     assert_eq!(
@@ -216,6 +216,9 @@ fn bytes_rows_aliases_and_utf8_fields_have_inclusive_limits() {
 
 #[test]
 fn source_alias_types_identifiers_scopes_and_evidence_are_validated() {
+    let mut unsupported = catalog_row();
+    unsupported["source_aliases"] = json!([source_alias("unsupported_alias_type", "000042")]);
+    assert_eq!(validate(&[unsupported]).unwrap_err().code, "invalid_row");
     for (alias_type, invalid_spellings) in [
         (
             "legacy_fhir_uuid",

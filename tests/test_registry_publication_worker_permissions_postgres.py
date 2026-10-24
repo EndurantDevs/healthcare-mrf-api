@@ -1,8 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Direct LOGIN publication roles_by_kind, exact grants and transactional refusal."""
 
+import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -22,6 +23,8 @@ from process.registry_publication_worker_permissions import (
     install_registry_publication_worker_permissions,
     verify_registry_publication_worker_permissions,
 )
+from tests import registry_candidate_custody_split_postgres_support as custody_split
+from tests.registry_candidate_custody_split_postgres_support import split_db as split_db
 from tests.test_network_custom_address_source_postgres import _draft, _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
@@ -367,7 +370,7 @@ async def test_set_only_sequence_helper_is_refused(worker_permissions, kind, bou
             await connection.execute(f'DROP ROLE "{helper}"')
 
 
-async def _native_qualified_candidate(fixture, connection):
+async def _native_qualified_candidate(fixture, connection, *, expected_head=0, runtime_roles=None):
     """Use real approved native streams and private artifact writers, without fixture receipts."""
     from process.network_approved_membership_source import pin_approved_membership_source
     from process.network_custom_address_source import prepare_custom_address_source
@@ -397,7 +400,7 @@ async def _native_qualified_candidate(fixture, connection):
             composition_id=str(uuid4()),
             approved_revision=approved.approved_revision,
             owner_role=fixture.roles_by_kind["physical"],
-            runtime_roles=(fixture.fixture.roles["reader"],),
+            runtime_roles=(fixture.fixture.roles["reader"],) if runtime_roles is None else runtime_roles,
             control_schema=schema,
         )
         source_stage = await stage_registry_source_recipes(
@@ -413,7 +416,7 @@ async def _native_qualified_candidate(fixture, connection):
                 "unified_address": artifact.address_source.generation_id,
             },
             approved_custom_revision=approved.approved_revision,
-            expected_head=0,
+            expected_head=expected_head,
             expected_rows=retention["effective_rows"],
             source_retention=retention,
             control_schema=schema,
@@ -456,3 +459,146 @@ async def test_execution_role_prepares_and_publishes_native_qualified_candidate(
             )
             == 0
         )
+
+
+async def test_split_ordinary_factory_publishes_successor_without_source_authority(split_db):
+    """Use real parsed custody connections, publish twice, and retain source preimages."""
+    fixture = split_db
+    await custody_split._assert_handoff(fixture)
+    await custody_split._assert_custodian(fixture)
+    await custody_split._publish_successor(fixture)
+    await custody_split._assert_installer_replay(fixture)
+    await custody_split._assert_native_denials(fixture)
+    assert await custody_split._protected(fixture) == fixture.protected
+    async with fixture.fixture.connection.transaction():
+        observed = await custody_split.admission.read_registry_source_admission_receipt(
+            fixture.fixture.connection,
+            fixture.edition,
+            header_sha256=custody_split.admission._source_header_sha256(custody_split._HEADERS),
+            control_schema=fixture.fixture.control_schema,
+        )
+    assert observed == fixture.admission
+
+
+def _split_ptg_worker_config(fixture, actual_role=None):
+    from process.registry_publication_worker import parse_registry_publication_worker_config
+
+    document = custody_split.configuration()
+    for name in ("lifecycle", "execution", "custody"):
+        document[name + "_dsn"] = getattr(fixture.config, name + "_url").render_as_string(hide_password=False)
+    document["consumer"] = {
+        **_options(fixture),
+        "loader_roles": [],
+        "reader_roles": [*fixture.readers, *(() if actual_role is None else (actual_role,))],
+    }
+    document["ptg"] = {
+        "owner_role": fixture.roles_by_kind["queue"],
+        "approval_role": fixture.roles_by_kind["api"],
+        "read_limits": {"maximum_bytes": 1048576, "maximum_pages": 32, "maximum_coordinates": 100},
+    }
+    return parse_registry_publication_worker_config(json.dumps(document))
+
+
+async def test_split_ptg_metadata_owner_publishes_and_retains_sealed_generations(split_db):
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+
+    fixture = split_db
+    fixture.config = _split_ptg_worker_config(fixture)
+    assert type(fixture.config.ptg.store) is RegistryPTGProducerScopeStore
+    assert fixture.config.ptg.store.owner_role == fixture.roles_by_kind["queue"]
+    assert fixture.config.ptg.store.owner_role != fixture.roles_by_kind["custody"]
+    assert (
+        await fixture.fixture.connection.fetchval(
+            "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid=to_regclass($1)",
+            f'"{fixture.fixture.control_schema}".registry_ptg_producer_scope',
+        )
+        == fixture.config.ptg.store.owner_role
+    )
+    await custody_split._assert_handoff(fixture)
+    await custody_split._assert_custodian(fixture)
+    await custody_split._publish_successor(fixture)
+    assert await custody_split._protected(fixture) == fixture.protected
+
+
+@pytest.mark.parametrize("kind", ["queue", "custody", "custodian"])
+async def test_split_ptg_actual_owner_or_custodian_actor_is_refused(split_db, kind):
+    from process.network_candidate_custody import NetworkCandidateCustodyError
+    from process.registry_publication_worker import _custody_runtime
+
+    fixture = split_db
+    await custody_split._assert_handoff(fixture)
+    if kind == "custody":
+        fixture.config = _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
+        with pytest.raises(NetworkCandidateCustodyError):
+            await custody_split._publish_successor(fixture)
+        assert (
+            await fixture.fixture.connection.fetchval(
+                f'SELECT generation_id FROM "{fixture.fixture.control_schema}".network_serving_control'
+            )
+            is None
+        )
+        assert (
+            await fixture.fixture.connection.fetchval(
+                f'SELECT count(*) FROM "{fixture.fixture.control_schema}".network_candidate_custody'
+            )
+            == 0
+        )
+        assert await custody_split._protected(fixture) == fixture.protected
+        return
+    if kind == "custodian":
+        with pytest.raises(ValueError, match="config_invalid"):
+            _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
+    else:
+        config = _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
+        async with AsyncExitStack() as stack, custody_split._login(fixture, "execution") as execution:
+            with pytest.raises(NetworkCandidateCustodyError):
+                await _custody_runtime(config, stack, config.consumer, execution)
+    assert await custody_split._protected(fixture) == fixture.protected
+
+
+async def test_split_refuses_population_and_preserves_outer_rollback(split_db):
+    fixture = split_db
+    admin, schema = (fixture.fixture.connection, fixture.fixture.control_schema)
+    before = await custody_split._relations(admin, schema)
+    with pytest.raises(RuntimeError, match="rollback"):
+        async with fixture.fixture.engine.begin() as connection:
+            await custody_split._split(fixture, connection)
+            raise RuntimeError("operator rollback")
+    assert await custody_split._relations(admin, schema) == before
+    async with admin.transaction():
+        await admin.execute(f"LOCK TABLE {custody_split._q(schema)}.network_membership_candidate IN ROW EXCLUSIVE MODE")
+        async with fixture.fixture.engine.begin() as connection:
+            with pytest.raises(custody_split.DBAPIError, match="lock"):
+                await custody_split._split(fixture, connection)
+    assert await custody_split._relations(admin, schema) == before
+    await custody_split._candidate(admin, schema, uuid4())
+    populated = await custody_split._relations(admin, schema)
+    async with fixture.fixture.engine.begin() as connection:
+        with pytest.raises(RuntimeError, match="empty publication"):
+            await custody_split._split(fixture, connection)
+    assert await custody_split._relations(admin, schema) == populated
+    assert await custody_split._protected(fixture) == fixture.protected
+
+
+async def test_split_ordinary_login_and_set_role_admin_are_refused(split_db):
+    fixture = split_db
+    before = await custody_split._relations(fixture.fixture.connection, fixture.fixture.control_schema)
+    for kind in ("api", "execution", "custodian"):
+        url = custody_split.make_url(fixture.dsn).set(
+            drivername="postgresql+asyncpg", username=fixture.roles_by_kind[kind], password=fixture.role_password
+        )
+        engine = custody_split.create_async_engine(url)
+        try:
+            async with engine.begin() as connection:
+                with pytest.raises(ValueError, match="original LOGIN administrator"):
+                    await custody_split._split(fixture, connection)
+        finally:
+            await engine.dispose()
+    async with fixture.fixture.engine.begin() as connection:
+        from sqlalchemy import text
+
+        await connection.execute(text(f"SET LOCAL ROLE {custody_split._q(fixture.roles_by_kind['queue'])}"))
+        with pytest.raises(ValueError, match="original LOGIN administrator"):
+            await custody_split._split(fixture, connection)
+    assert await custody_split._relations(fixture.fixture.connection, fixture.fixture.control_schema) == before
+    assert await custody_split._protected(fixture) == fixture.protected

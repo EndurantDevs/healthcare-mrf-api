@@ -51,7 +51,6 @@ pub enum SourceAliasType {
     LegacyFhirUuid,
     AcaChecksum,
     PtgLabel,
-    RibbonNetworkId,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -279,7 +278,7 @@ fn validate_source_alias(
                 )
             })?
         }
-        SourceAliasType::PtgLabel | SourceAliasType::RibbonNetworkId => alias.alias_value.clone(),
+        SourceAliasType::PtgLabel => alias.alias_value.clone(),
     };
     Ok(ValidatedSourceAlias {
         source_system: alias.source_system,

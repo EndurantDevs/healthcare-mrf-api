@@ -93,6 +93,16 @@ def provider_read_savepoint(session):
     return session.begin_nested() if session is not None else nullcontext()
 
 
+@asynccontextmanager
+async def provider_optional_read(session, logger):
+    """Keep optional provider reads recoverable within the caller's snapshot."""
+    try:
+        async with provider_read_savepoint(session):
+            yield
+    except Exception as exc:
+        logger.debug("Optional provider read failed: %s", exc)
+
+
 async def _relation_oids(session, schema, table_names):
     result = await session.execute(
         text(
