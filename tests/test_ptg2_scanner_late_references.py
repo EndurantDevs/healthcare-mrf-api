@@ -281,6 +281,7 @@ def _blocked_decoder_timeout_diagnostic(state_dir: Path, error) -> str:
     return json.dumps(diagnostic_by_kind, indent=2, sort_keys=True)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")
 @pytest.mark.parametrize("pid_text", (None, "43210 4", "43210 unfinished\n", "43210 43211\n"))
 def test_blocked_decoder_timeout_preserves_streams_before_cleanup(
     tmp_path,
@@ -334,6 +335,7 @@ def test_blocked_decoder_timeout_preserves_streams_before_cleanup(
         assert "FileNotFoundError" in diagnostic["diagnostic_error"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-specific")
 def test_blocked_decoder_timeout_diagnostic_captures_only_recorded_processes(
     tmp_path,
     monkeypatch,
