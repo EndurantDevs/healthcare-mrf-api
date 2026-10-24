@@ -6,8 +6,7 @@ from contextlib import asynccontextmanager
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from db.plan_release_storage import storage_relation, storage_snapshot_index_sql, storage_table_sql
-from tests.plan_release_storage_postgres_support import OLD_REVISION
+from db.plan_release_storage import storage_relation
 
 
 async def prepare_maintenance_actor(case):
@@ -35,19 +34,6 @@ async def prepare_maintenance_actor(case):
             "ptg2_snapshot_pin",
         ):
             await admin.execute(f'GRANT SELECT,UPDATE ON {case.relation(table)} TO "{case.reader}"')
-        await admin.execute(storage_table_sql(case.schema, "retained_plan_pin", pin=True))
-        relation = case.relation("retained_plan_pin")
-        await admin.execute(
-            storage_snapshot_index_sql(case.schema, "retained_plan_pin", "retained_plan_pin_snapshot_idx")
-        )
-        await admin.execute(
-            f"INSERT INTO {relation}(serving_revision_id,snapshot_id) VALUES($1,'old-snapshot')", OLD_REVISION
-        )
-        await admin.execute(f'ALTER TABLE {relation} OWNER TO "{case.owner}"')
-        await admin.execute(f'GRANT SELECT ON {relation} TO "{case.reader}"')
-        await admin.execute(
-            f"ALTER TABLE {case.relation('plan_release_snapshot_pin')} ATTACH PARTITION {relation} FOR VALUES IN ('{OLD_REVISION}')"
-        )
 
 
 @asynccontextmanager

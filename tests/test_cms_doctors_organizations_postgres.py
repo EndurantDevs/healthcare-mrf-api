@@ -4,8 +4,6 @@
 import asyncio
 import csv
 import importlib
-import os
-import re
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
@@ -14,7 +12,6 @@ import asyncpg
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError
 
 from db import models
@@ -26,35 +23,18 @@ from process.control_cancel import ImportCancelledError
 from process.entity_address_cutover_contract import postgres_sqlstate
 from process.ext.utils import make_class
 from process.provider_directory_generic_source_policy import bound_publisher
+from tests.cms_doctors_component_postgres_support import doctors_component_template as doctors_component_template
 from tests.cms_doctors_preparation_postgres_support import doctors_database
-from tests.cms_npd_admission_postgres_support import _owned_database
 
 cms_doctors = importlib.import_module("process.cms_doctors")
+pytestmark = pytest.mark.usefixtures("doctors_component_template")
 
 
 @asynccontextmanager
 async def _component(monkeypatch):
-    """Preserve the old disposable lifecycle selector and the shared UUID fixture."""
-    if os.getenv("HLTHPRT_CMS_NPD_ADMISSION_TEST_DSN"):
-        async with doctors_database(monkeypatch, cms_active=False) as fixture:
-            yield fixture
-        return
-    name = os.getenv("HLTHPRT_DB_DATABASE", "")
-    if not re.fullmatch(r"ptg2_v3_lifecycle_test_[a-z0-9_]{8,}", name):
-        pytest.skip("requires an explicitly selected disposable PostgreSQL database")
-    url = URL.create(
-        "postgresql+asyncpg",
-        username=os.getenv("HLTHPRT_DB_USER", "postgres"),
-        password=os.getenv("HLTHPRT_DB_PASSWORD") or None,
-        host=os.getenv("HLTHPRT_DB_HOST", "127.0.0.1"),
-        port=int(os.getenv("HLTHPRT_DB_PORT", "5432")),
-        database=name,
-    )
-    assert url.host in {"127.0.0.1", "localhost", "postgres"}
-    async with _owned_database(url) as (owned, _admin):
-        monkeypatch.setenv("HLTHPRT_CMS_NPD_ADMISSION_TEST_DSN", owned.render_as_string(hide_password=False))
-        async with doctors_database(monkeypatch, cms_active=False) as fixture:
-            yield fixture
+    """Provision fresh Source custody from this module's closed migration template."""
+    async with doctors_database(monkeypatch, cms_active=False) as fixture:
+        yield fixture
 
 
 def _write_organization_source(source_path, ids, site_ids):
