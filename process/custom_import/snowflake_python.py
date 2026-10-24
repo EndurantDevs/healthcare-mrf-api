@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import re
-import warnings
 from collections import deque
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -16,18 +15,9 @@ from typing import Any, BinaryIO
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-
-with warnings.catch_warnings():
-    # Arrow 25 supports row/Parquet reads; only the optional pandas extra caps it.
-    warnings.filterwarnings(
-        "ignore",
-        message=r"You have an incompatible version of 'pyarrow' installed \(25\.0\.1\), ",
-        category=UserWarning,
-        module=r"snowflake\.connector\.options$",
-    )
-    import snowflake.connector
+import snowflake.connector
 from cryptography.hazmat.primitives import serialization
-from snowflake.connector.constants import FIELD_TYPES as SNOWFLAKE_FIELD_TYPES
+from snowflake.connector.constants import FIELD_ID_TO_NAME as SNOWFLAKE_FIELD_TYPES
 
 from process.custom_import.capture import (
     CaptureError,
@@ -365,10 +355,18 @@ class SnowflakePythonConnectorAdapter:
                 warehouse=self._warehouse,
                 autocommit=False,
                 client_session_keep_alive=False,
-                ocsp_fail_open=True,
+                enable_server_session_keep_alive_auto_detection=True,
+                client_store_temporary_credential=False,
+                # Refuse unavailable CRLs; certificates without a CRL URL remain allowed.
+                crl_check_mode="ENABLED",
+                crl_allow_certificates_without_crl_url=True,
+                crl_connection_timeout=min(10, login_timeout),
+                crl_http_timeout=min(10, login_timeout),
                 login_timeout=login_timeout,
-                network_timeout=timeout_seconds,
-                socket_timeout=timeout_seconds,
+                query_timeout=timeout_seconds,
+                request_timeout=timeout_seconds,
+                connect_timeout=timeout_seconds,
+                retry_timeout=timeout_seconds,
                 session_parameters={
                     "QUERY_TAG": _QUERY_TAG,
                     "STATEMENT_TIMEOUT_IN_SECONDS": timeout_seconds,
