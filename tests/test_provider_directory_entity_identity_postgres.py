@@ -37,7 +37,10 @@ from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
 from process.provider_directory_insurance_network_batch import record_insurance_network_batch
 from tests import test_cms_doctors_organizations_postgres as doctors
+from tests.cms_doctors_component_postgres_support import doctors_component_template as doctors_component_template
 from tests.provider_directory_resource_identity_postgres_support import prepare_resource_candidate
+
+pytestmark = pytest.mark.usefixtures("doctors_component_template")
 
 _RELEASE_ONE = hashlib.sha256(b"release-one").hexdigest()
 _RELEASE_TWO = hashlib.sha256(b"release-two").hexdigest()
