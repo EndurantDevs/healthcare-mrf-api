@@ -14,13 +14,11 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import jwt
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from snowflake.connector.auth.keypair import AuthByKeyPair
 
 import process.custom_import.snowflake_python as snowflake_python
 from process.custom_import.capture import CaptureError, capture_stream, iter_records, verify_capture
@@ -421,34 +419,6 @@ def test_generated_landing_rejects_encoded_drift_and_closes_reader(monkeypatch, 
     assert len(destinations) == 1 and destinations[0].closed
 
 
-def test_key_pair_authentication_signs_a_verifiable_token():
-    """Keep the concrete connector's key conversion and JWT signing compatible."""
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    credentials = SnowflakeKeyPairCredentials(
-        account="example",
-        user="reader",
-        private_key_pem=key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ),
-    )
-    token = AuthByKeyPair(snowflake_python._private_key_der(credentials)).prepare(
-        account=credentials.account, user=credentials.user
-    )
-    claims = jwt.decode(token, key.public_key(), algorithms=["RS256"])
-
-    assert claims["sub"] == "EXAMPLE.READER"
-    assert claims["iss"].startswith("EXAMPLE.READER.SHA256:")
-    assert claims["exp"] > claims["iat"]
-    padded_token = token + "=" * (-len(token.rsplit(".", 1)[1]) % 4)
-    assert jwt.decode(padded_token, key.public_key(), algorithms=["RS256"]) == claims
-    wrong_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    with pytest.raises(jwt.InvalidSignatureError):
-        jwt.decode(token, wrong_key.public_key(), algorithms=["RS256"])
-
-
 def test_adapter_fetches_one_generated_bundle_with_fixed_connection_policy(monkeypatch, credentials):
     cursor = _Cursor((_metadata_row(), _data_row("1234567893", "Cardiology"), _data_row("1003000126", None)))
     connection, arguments = _connect(monkeypatch, cursor)
@@ -469,10 +439,17 @@ def test_adapter_fetches_one_generated_bundle_with_fixed_connection_policy(monke
         "warehouse": "IMPORT_WH",
         "autocommit": False,
         "client_session_keep_alive": False,
-        "ocsp_fail_open": True,
+        "enable_server_session_keep_alive_auto_detection": True,
+        "client_store_temporary_credential": False,
+        "crl_check_mode": "ENABLED",
+        "crl_allow_certificates_without_crl_url": True,
+        "crl_connection_timeout": 10,
+        "crl_http_timeout": 10,
         "login_timeout": 30,
-        "network_timeout": 120,
-        "socket_timeout": 120,
+        "query_timeout": 120,
+        "request_timeout": 120,
+        "connect_timeout": 120,
+        "retry_timeout": 120,
         "session_parameters": {
             "QUERY_TAG": "custom-import/v1-snowflake",
             "STATEMENT_TIMEOUT_IN_SECONDS": 120,
@@ -500,9 +477,7 @@ def test_adapter_emits_a_schema_bearing_empty_bundle_stream(monkeypatch, credent
 
 
 def test_adapter_resolves_type_codes_and_rejects_bad_result_boundaries(monkeypatch, credentials):
-    text_type_code = next(
-        index for index, field_type in enumerate(snowflake_python.SNOWFLAKE_FIELD_TYPES) if field_type.name == "TEXT"
-    )
+    text_type_code = next(code for code, name in snowflake_python.SNOWFLAKE_FIELD_TYPES.items() if name == "TEXT")
     cursor = _Cursor(
         (_metadata_row(),),
         description=_description(

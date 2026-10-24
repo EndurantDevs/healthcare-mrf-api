@@ -68,6 +68,24 @@ async def test_preflight_anchors_to_first_start_and_requires_registrar(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing", "digest"])
+async def test_unavailable_definition_prevents_registrar_access(monkeypatch, failure):
+    state = _store(monkeypatch)
+    if failure == "missing":
+        state.session.get.return_value = None
+    else:
+        state.verified = replace(state.verified, permit=replace(state.verified.permit, definition_sha256="f" * 64))
+    with pytest.raises(service.CaptureHandoffError, match="^custom_import_capture_unavailable$"):
+        await service.preflight_capture(state.factory, state.verified)
+    service.runner_registry.validate_revision_identity.assert_not_called()
+    service.require_raw_capture_authority.assert_not_called()
+    service.register_raw_capture_bundle.assert_not_called()
+    service.execution.bind_execution_capture_bundle.assert_not_called()
+    assert state.session.durable == state.session.pending == []
+    assert state.session.events == ["open", "begin", "rollback", "close"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["bind", "deadline", "content", "identity", "lease"])
 async def test_failed_registration_never_commits_partial_capture(monkeypatch, failure):
     state = _store(monkeypatch)
@@ -113,14 +131,46 @@ async def test_registration_uses_existing_store_and_commits_only_after_binding(m
 
 
 @pytest.mark.asyncio
+async def test_expiry_during_binding_rolls_back_capture_and_binding(monkeypatch):
+    state = _store(monkeypatch)
+
+    async def late_bind(*_args, **_kwargs):
+        state.session.pending.append("binding")
+        state.now = NOW + timedelta(seconds=4)
+        return SimpleNamespace(capture_bundle_id=71)
+
+    service.execution.bind_execution_capture_bundle.side_effect = late_bind
+    with pytest.raises(LeaseAuthorityLost, match="^custom_import_capture_acquisition_closed$"):
+        await service.register_capture(state.factory, state.verified, state.captures)
+    assert service.execution._lock_current_capture_binding.await_count == 2
+    service.register_raw_capture_bundle.assert_awaited_once()
+    service.execution.bind_execution_capture_bundle.assert_awaited_once()
+    assert state.session.durable == state.session.pending == []
+    assert state.session.events == ["open", "begin", "rollback", "close"]
+
+
+@pytest.mark.asyncio
+async def test_retained_read_without_committed_binding_never_loads_or_registers(monkeypatch):
+    state = _store(monkeypatch)
+    with pytest.raises(service.CaptureHandoffError, match="^custom_import_capture_unavailable$"):
+        await service.retained_capture(state.factory, state.verified)
+    service.load_replayable_raw_bundle.assert_not_called()
+    service.register_raw_capture_bundle.assert_not_called()
+    service.require_raw_capture_authority.assert_not_called()
+    service.execution.bind_execution_capture_bundle.assert_not_called()
+    assert state.session.durable == state.session.pending == []
+    assert state.session.events == ["open", "begin", "rollback", "close"]
+
+
+@pytest.mark.asyncio
 async def test_lost_ack_observation_after_acquisition_expiry_never_reopens_source(monkeypatch):
     state = _store(monkeypatch)
     state.retained.capture_bundle_id = 71
     state.now = NOW + timedelta(seconds=30)
     state.verified = replace(state.verified, fence=2)
     assert await service.retained_capture(state.factory, state.verified) == (71, state.captures)
-    service.register_raw_capture_bundle.assert_not_awaited()
-    service.require_raw_capture_authority.assert_not_awaited()
+    service.register_raw_capture_bundle.assert_not_called()
+    service.require_raw_capture_authority.assert_not_called()
     with pytest.raises(LeaseAuthorityLost):
         await service.preflight_capture(state.factory, state.verified)
 

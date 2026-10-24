@@ -169,6 +169,7 @@ async def test_header_requires_closed_canonical_ascii_json(bundle, failure):
         ("format", "other"),
         ("format", []),
         ("compression", "GZIP"),
+        ("source_snapshot_token", None),
         ("source_snapshot_token", ""),
         ("source_snapshot_token", "a" * 1025),
         ("source_snapshot_token", "line\n"),
@@ -396,3 +397,55 @@ def test_manifested_content_refuses_substitution(bundle, failure):
         manifests[0] = replace(manifests[0], **{field: value})
     with pytest.raises(wire.CaptureWireError):
         wire.manifested_content_sha256(definition, manifests)
+
+
+@pytest.mark.parametrize("failure", ("capture-type", "payload-type", "manifest-type"))
+async def test_encoder_refuses_untrusted_objects_before_first_byte(bundle, failure):
+    _, captures = bundle
+    original = captures[0]
+    invalid_by_kind = {
+        "capture-type": SimpleNamespace(payload=original.payload, manifest=original.manifest),
+        "payload-type": replace(original, payload=bytearray(original.payload)),
+        "manifest-type": replace(original, manifest=SimpleNamespace(**asdict(original.manifest))),
+    }
+    with pytest.raises(wire.CaptureWireError, match="^custom_import_capture_wire_invalid$"):
+        await anext(wire.iter_capture_body((invalid_by_kind[failure],), limits=CaptureLimits()))
+
+
+async def test_decoder_requires_an_async_transport_without_leaking_type_errors():
+    with pytest.raises(wire.CaptureWireError, match="^custom_import_capture_wire_invalid$") as rejected:
+        await wire.read_capture_body([b"untrusted synchronous input"], limits=CaptureLimits())
+    assert rejected.value.__cause__ is None
+    assert rejected.value.__suppress_context__ is True
+
+
+async def test_fragment_budget_rejects_before_retaining_oversized_transport_data():
+    reader = wire._Reader(_chunks(b"1234"), maximum=3)
+    with pytest.raises(wire.CaptureWireError, match="^custom_import_capture_wire_invalid$"):
+        await reader._has_bytes()
+    assert reader.pending.nbytes == 0
+    assert reader.received == 4
+
+
+@pytest.mark.parametrize("failure", ("unparsed", "stream-type", "duplicate-stream"))
+def test_content_identity_requires_typed_unique_definition_streams(bundle, failure):
+    definition, captures = bundle
+    invalid_by_kind = {
+        "unparsed": SimpleNamespace(source_streams=definition.source_streams),
+        "stream-type": replace(definition, source_streams=(SimpleNamespace(stream_id="root"),)),
+        "duplicate-stream": replace(definition, source_streams=(definition.source_streams[0],) * 2),
+    }
+    invalid = invalid_by_kind[failure]
+    with pytest.raises(wire.CaptureWireError, match="^custom_import_capture_wire_invalid$"):
+        wire.expected_content_sha256(invalid, _objects(captures), "snapshot")
+    with pytest.raises(wire.CaptureWireError, match="^custom_import_capture_wire_invalid$"):
+        wire.manifested_content_sha256(invalid, tuple(item.manifest for item in captures))
+
+
+def test_expected_content_refuses_combined_object_bytes_above_the_capture_budget(bundle):
+    definition, captures = bundle
+    objects = _objects(captures)
+    for item in objects:
+        item.expected_bytes = CaptureLimits().maximum_compressed_bytes
+    with pytest.raises(wire.CaptureWireError, match="^custom_import_capture_wire_invalid$"):
+        wire.expected_content_sha256(definition, objects, "snapshot")

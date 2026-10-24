@@ -84,7 +84,7 @@ def validate_preflight_result_schema(
     statement: object,
     description: object,
     *,
-    field_types: Sequence[object] = (),
+    field_types: Mapping[int, str] | Sequence[object] = (),
 ) -> None:
     """Require actual cursor metadata to match one generated preflight statement.
 
@@ -143,16 +143,14 @@ def _supports_preflight_field_type(value_type: str, source_type: str) -> bool:
     return value_type == "boolean" and source_type == "BOOLEAN"
 
 
-def _source_type(metadata: object, *, field_types: Sequence[object] = ()) -> str:
+def _source_type(metadata: object, *, field_types: Mapping[int, str] | Sequence[object] = ()) -> str:
     type_name = getattr(metadata, "type_name", None)
     type_code = getattr(metadata, "type_code", None)
-    if (
-        type_name is None
-        and isinstance(type_code, int)
-        and not isinstance(type_code, bool)
-        and 0 <= type_code < len(field_types)
-    ):
-        type_name = getattr(field_types[type_code], "name", None)
+    if type_name is None and isinstance(type_code, int) and not isinstance(type_code, bool) and type_code >= 0:
+        if isinstance(field_types, Mapping):
+            type_name = field_types.get(type_code)
+        elif type_code < len(field_types):
+            type_name = getattr(field_types[type_code], "name", None)
     if isinstance(type_name, str) and type_name:
         normalized = type_name.upper()
         if normalized == "FIXED":
