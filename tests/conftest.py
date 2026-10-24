@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -28,11 +29,16 @@ for key, value in TEST_ENV_DEFAULTS.items():
 
 @pytest.fixture(autouse=True)
 def clear_npi_detail_response_cache():
-    from api.endpoint import npi as npi_module
-
-    npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
+    # Unrelated tests should not load the endpoint just to clear an empty cache.
+    npi_module = sys.modules.get("api.endpoint.npi")
+    if npi_module is not None:
+        npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
     yield
-    npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
+    if npi_module is not None:
+        npi_module._NPI_DETAIL_RESPONSE_CACHE.clear()
+    current_module = sys.modules.get("api.endpoint.npi")
+    if current_module is not None and current_module is not npi_module:
+        current_module._NPI_DETAIL_RESPONSE_CACHE.clear()
 
 
 @pytest.fixture(autouse=True)
