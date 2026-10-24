@@ -127,7 +127,13 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ADD service/nginx.conf /etc/nginx/nginx.conf
 ADD service/start_api.sh /usr/local/bin/start_api.sh
 ADD service/run_import.sh /usr/local/bin/run_import.sh
-RUN chmod a+x /usr/local/bin/start_api.sh /usr/local/bin/run_import.sh
+ADD service/fhir-source-worker /usr/local/bin/fhir-source-worker
+ADD service/reference-source-worker /usr/local/bin/reference-source-worker
+ADD service/npi-source-worker /usr/local/bin/npi-source-worker
+ADD service/aca-registry-source-worker /usr/local/bin/aca-registry-source-worker
+# Admitted source-worker Jobs exec the fixed *-source-worker entrypoints from workingDir /app.
+RUN chmod a+x /usr/local/bin/start_api.sh /usr/local/bin/run_import.sh /usr/local/bin/*-source-worker \
+    && mkdir /app
 
 COPY api/ /opt/api/
 COPY db/ /opt/db/
