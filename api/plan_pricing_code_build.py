@@ -58,8 +58,8 @@ from process import reference_family_archive as native
 from process.live_progress import enqueue_live_progress
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
-MAX_CODE_MEMBER_CELL_WORK_ROWS: int | None = 10_000
-MAX_CODE_FACTOR_JOIN_WORK_ROWS: int | None = 8_192
+MAX_CODE_MEMBER_CELL_WORK_ROWS: int | None = 32_768
+MAX_CODE_FACTOR_JOIN_WORK_ROWS: int | None = 16_384
 CODE_PROVIDER_READ_BATCH_SIZE = 100
 
 
@@ -171,13 +171,12 @@ async def _bounded_factor_rows(session, schema, parameters_by_name, factor_remai
     """Validate complete pre-deduplication work before any membership insertion."""
     factor_rows = int(
         await session.scalar(
-            text(f"""WITH first_counts AS MATERIALIZED (
-        SELECT member_key AS factor,count(*)::numeric AS members FROM {schema}.ptg_membership_first GROUP BY member_key
-        ), second_counts AS MATERIALIZED (
+            text(f"""WITH second_counts AS MATERIALIZED (
         SELECT second.owner_key AS factor,count(*)::numeric AS sets FROM {schema}.ptg_membership_second second
          WHERE EXISTS(SELECT 1 FROM {schema}.ptg_membership_code code WHERE code.provider_set_key=second.member_key AND code.code_key=ANY(CAST(:code_keys AS bigint[])))
          GROUP BY second.owner_key)
-        SELECT coalesce(sum(members*sets),0) FROM first_counts JOIN second_counts USING(factor)"""),
+        SELECT coalesce(sum(selected.sets),0)
+          FROM {schema}.ptg_membership_first first JOIN second_counts selected ON selected.factor=first.member_key"""),
             parameters_by_name,
         )
     )
