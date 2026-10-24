@@ -23,6 +23,41 @@ from db.models.custom_import import (
 from process.custom_import.definition import CustomImportDefinition, load_json_definition
 from process.custom_import.definition_store import DefinitionRegistrationError, register_definition
 from tests.custom_import_postgres_support import isolated_publication_case, transaction_session
+from tests.custom_import_source_binding_store_postgres_cases import (
+    test_native_concurrent_object_registration_serializes_append_and_replay as test_native_concurrent_object_registration_serializes_append_and_replay,
+)
+from tests.custom_import_source_binding_store_postgres_cases import (
+    test_native_failed_object_readback_rolls_back_definition_and_binding as test_native_failed_object_readback_rolls_back_definition_and_binding,
+)
+from tests.custom_import_source_binding_store_postgres_cases import (
+    test_native_object_and_legacy_bindings_share_the_existing_revision_sequence as test_native_object_and_legacy_bindings_share_the_existing_revision_sequence,
+)
+
+# Prepared-source cases share this native suite's collection entry point.
+from tests.custom_import_source_binding_store_postgres_cases import (
+    test_native_object_registration_loads_and_replays_exact_immutable_identity as test_native_object_registration_loads_and_replays_exact_immutable_identity,
+)
+from tests.custom_import_source_binding_store_postgres_cases import (
+    test_native_object_registration_requires_the_existing_caller_transaction as test_native_object_registration_requires_the_existing_caller_transaction,
+)
+from tests.test_custom_import_snowflake_source_binding import (
+    test_binding_allowlist_downgrade_preserves_legacy_and_rejects_v2 as test_binding_allowlist_downgrade_preserves_legacy_and_rejects_v2,
+)
+from tests.test_custom_import_snowflake_source_binding import (
+    test_bound_candidate_rejects_mismatched_retained_digest_and_bundle_before_reservation as test_bound_candidate_rejects_mismatched_retained_digest_and_bundle_before_reservation,
+)
+from tests.test_custom_import_snowflake_source_binding import (
+    test_bound_request_replay_and_cancellation_keep_exact_binding_identity as test_bound_request_replay_and_cancellation_keep_exact_binding_identity,
+)
+from tests.test_custom_import_snowflake_source_binding import (
+    test_source_binding_registration_locks_and_appends_distinct_revisions as test_source_binding_registration_locks_and_appends_distinct_revisions,
+)
+from tests.test_custom_import_snowflake_source_binding import (
+    test_source_binding_registration_reloads_its_exact_immutable_receipt as test_source_binding_registration_reloads_its_exact_immutable_receipt,
+)
+from tests.test_custom_import_snowflake_source_binding import (
+    test_v2_native_registration_preserves_immutable_policy_choices as test_v2_native_registration_preserves_immutable_policy_choices,
+)
 
 _FIXTURE = Path(__file__).with_name("fixtures") / "custom_import" / "v1_valid.json"
 

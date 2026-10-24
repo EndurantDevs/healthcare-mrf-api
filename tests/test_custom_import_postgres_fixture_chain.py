@@ -74,6 +74,31 @@ async def test_publication_fixture_preserves_explicit_schema_override():
     assert (schema.canonical_schema, schema.schema_sha256) == (canonical_schema, schema_sha256)
 
 
+def _recording_migration_loader(schema, connection, installed_migrations, installed_metadata_revisions):
+    """Record migration order and schema binding without database I/O."""
+
+    def load(path, module_name):
+        assert path.is_file()
+        migration = SimpleNamespace()
+
+        def record_install():
+            assert migration._schema() == schema
+            assert migration.op is connection
+            installed_migrations.append(path.stem)
+
+        def record_metadata(selected_schema, *, ledger=None):
+            assert selected_schema == schema
+            installed_metadata_revisions.append((path.stem, ledger))
+            record_install()
+
+        migration.upgrade = record_install
+        migration._seal_metadata = record_metadata
+        migration._schema_changes = record_metadata
+        return migration
+
+    return load
+
+
 @pytest.mark.parametrize(
     "segmented,snapshots,migration_through,expected_tail",
     [
@@ -102,26 +127,8 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
     connection = SimpleNamespace(scalar=Mock(return_value="snapshot_family" if has_snapshot_storage else None))
     schema = "custom_import_publication_0123456789abcdef"
 
-    def load(path, module_name):
-        assert path.is_file()
-        migration = SimpleNamespace()
-
-        def record_install():
-            assert migration._schema() == schema
-            assert migration.op is connection
-            installed_migrations.append(path.stem)
-
-        def record_metadata(selected_schema, *, ledger=None):
-            assert selected_schema == schema
-            installed_metadata_revisions.append((path.stem, ledger))
-            record_install()
-
-        migration.upgrade = record_install
-        migration._seal_metadata = record_metadata
-        migration._schema_changes = record_metadata
-        return migration
-
-    monkeypatch.setattr(support, "_migration", load)
+    load_migration = _recording_migration_loader(schema, connection, installed_migrations, installed_metadata_revisions)
+    monkeypatch.setattr(support, "_migration", load_migration)
     monkeypatch.setattr(support, "MigrationContext", SimpleNamespace(configure=lambda value: value))
     monkeypatch.setattr(support, "Operations", lambda value: value)
     support._install_custom_import_migrations(connection, schema, segmented, snapshots, migration_through)
@@ -139,6 +146,8 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
     expected_migrations.append("20261010010000_custom_import_materialization_contract")
     expected_migrations.append("20261015020000_custom_import_query_projections")
     expected_migrations.append("20261019010000_custom_import_build_continuation")
+    if segmented:
+        expected_migrations.append("20261023010000_custom_import_prepared_source")
     assert installed_migrations == expected_migrations
     assert len(installed_migrations) == len(set(installed_migrations))
     installs_continuation_authority = segmented and snapshots and migration_through is None
@@ -280,7 +289,14 @@ async def test_fixture_drops_recorded_leaves_before_control_and_always_disposes(
         )
     else:
         assert len(statements) == 1
-    assert connection.run_sync.await_args.args[-1] == "20261005030000"
+    connection.run_sync.assert_awaited_once_with(
+        support._install_custom_import_migrations,
+        "custom_import_publication_0123456789abcdef",
+        True,
+        True,
+        "20261005030000",
+        True,
+    )
 
 
 @pytest.mark.asyncio

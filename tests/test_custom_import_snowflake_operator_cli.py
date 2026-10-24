@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 import custom_import_snowflake_operator as operator_entrypoint
 import process.custom_import.snowflake_operator_cli as operator_cli
 import process.custom_import.snowflake_source_binding as source_binding
+import process.custom_import.source_binding_store as binding_store
 from db.connection import Database, current_session
 from db.models.custom_import import (
     CustomImportDataset,
@@ -43,6 +44,7 @@ from process.custom_import.processing_policy import ProcessingPolicy
 from process.custom_import.runner import CandidateRunResult
 from tests.custom_import_postgres_support import isolated_publication_case
 from tests.test_custom_import_processing_policy import _policy_document
+from tests.test_custom_import_source_binding_store import _object_binding
 
 
 def _definition() -> CustomImportDefinition:
@@ -75,8 +77,13 @@ def _definition() -> CustomImportDefinition:
     )
 
 
-def _loaded_binding() -> source_binding.LoadedSnowflakeSourceBinding:
+def _loaded_binding(connector=None):
     definition = _definition()
+    if connector is not None:
+        binding = _object_binding(definition, connector)
+        return binding_store.LoadedObjectSourceBinding(
+            31, 32, 33, 34, bytes.fromhex(binding.digest), definition, binding
+        )
     binding = source_binding.SnowflakeSourceBinding.from_json(
         json.dumps(
             {
@@ -115,12 +122,17 @@ def _loaded_binding() -> source_binding.LoadedSnowflakeSourceBinding:
 
 
 def _binding_receipt(
-    loaded: source_binding.LoadedSnowflakeSourceBinding,
+    loaded: binding_store.LoadedObjectSourceBinding | source_binding.LoadedSnowflakeSourceBinding,
     *,
     created: bool = True,
     source_binding_sha256: bytes | None = None,
-) -> source_binding.SnowflakeSourceBindingReceipt:
-    return source_binding.SnowflakeSourceBindingReceipt(
+) -> binding_store.ObjectSourceBindingReceipt | source_binding.SnowflakeSourceBindingReceipt:
+    receipt_type = (
+        binding_store.ObjectSourceBindingReceipt
+        if isinstance(loaded, binding_store.LoadedObjectSourceBinding)
+        else source_binding.SnowflakeSourceBindingReceipt
+    )
+    return receipt_type(
         dataset_id=loaded.dataset_id,
         definition_revision_id=loaded.definition_revision_id,
         schema_revision_id=loaded.schema_revision_id,
@@ -1308,8 +1320,8 @@ async def test_admission_stage_cannot_select_legacy_runner(monkeypatch):
     run.assert_not_awaited()
 
 
-def _registration_document():
-    loaded = _loaded_binding()
+def _registration_document(connector=None):
+    loaded = _loaded_binding(connector)
     return {
         "dataset_key": "synthetic_registration",
         "definition": json.loads(loaded.definition.canonical),
@@ -1317,8 +1329,8 @@ def _registration_document():
     }
 
 
-def _registration_stream():
-    return BytesIO(json.dumps(_registration_document()).encode())
+def _registration_stream(connector=None):
+    return BytesIO(json.dumps(_registration_document(connector)).encode())
 
 
 @pytest.mark.parametrize("scope", ("envelope", "definition", "binding", "stream", "source_object", "column"))
@@ -1402,8 +1414,9 @@ def test_registration_receipt_rejects_invalid_immutable_results():
 
 
 @pytest.mark.asyncio
-async def test_committed_registration_receipt_requires_exact_readback(monkeypatch):
-    loaded = _loaded_binding()
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_committed_registration_receipt_requires_exact_readback(monkeypatch, connector):
+    loaded = _loaded_binding(connector)
     registration = _binding_receipt(loaded)
     identity_rows = []
     load_calls = []
@@ -1417,7 +1430,7 @@ async def test_committed_registration_receipt_requires_exact_readback(monkeypatc
         return SimpleNamespace(all=lambda: tuple(identity_rows))
 
     session = SimpleNamespace(execute=execute)
-    monkeypatch.setattr(operator_cli, "load_snowflake_source_binding", load)
+    monkeypatch.setattr(operator_cli, "load_source_binding", load)
 
     with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError, match="committed registration"):
         await operator_cli._committed_registration_receipt(
@@ -1451,8 +1464,9 @@ async def test_committed_registration_receipt_requires_exact_readback(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_registration_reads_back_the_committed_receipt_before_output(monkeypatch):
-    loaded = _loaded_binding()
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_registration_reads_back_the_committed_receipt_before_output(monkeypatch, connector):
+    loaded = _loaded_binding(connector)
     registration = _binding_receipt(loaded)
     database = _resume_database(loaded)
     calls = []
@@ -1465,10 +1479,10 @@ async def test_registration_reads_back_the_committed_receipt_before_output(monke
         calls.append(("committed", injected_session, receipt_keywords))
         return '{"status":"registered"}'
 
-    monkeypatch.setattr(operator_cli, "register_snowflake_source_binding", register)
+    monkeypatch.setattr(operator_cli, "register_source_binding", register)
     monkeypatch.setattr(operator_cli, "_committed_registration_receipt", committed)
 
-    rendered = await operator_cli._register_snowflake_binding(stream=_registration_stream(), database=database)
+    rendered = await operator_cli._register_snowflake_binding(stream=_registration_stream(connector), database=database)
 
     assert json.loads(rendered) == {"status": "registered"}
     assert calls == [
@@ -1524,7 +1538,7 @@ def test_operator_cli_suppresses_noisy_registration_lifecycle_output(
     async def register_command(**arguments):
         return await registration_operation(**arguments, database=database)
 
-    monkeypatch.setattr(operator_cli, "register_snowflake_source_binding", register)
+    monkeypatch.setattr(operator_cli, "register_source_binding", register)
     monkeypatch.setattr(operator_cli, "_committed_registration_receipt", committed)
     monkeypatch.setattr(operator_cli, "_register_snowflake_binding", register_command)
     try:
@@ -1621,28 +1635,29 @@ def test_registration_entry_point_redacts_rejected_stdin():
 
 
 @pytest.mark.asyncio
-async def test_registration_operator_commits_and_replays_the_same_revisions():
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_registration_operator_commits_and_replays_the_same_revisions(connector):
     database = _Database()
     async with isolated_publication_case() as case:
         database.session = case.sessions
         first = json.loads(
-            await operator_cli._register_snowflake_binding(stream=_registration_stream(), database=database)
+            await operator_cli._register_snowflake_binding(stream=_registration_stream(connector), database=database)
         )
         replay = json.loads(
-            await operator_cli._register_snowflake_binding(stream=_registration_stream(), database=database)
+            await operator_cli._register_snowflake_binding(stream=_registration_stream(connector), database=database)
         )
 
         assert first.pop("status") == "registered"
         assert replay.pop("status") == "replayed"
         assert first == replay
         async with case.sessions() as session:
-            loaded = await source_binding.load_snowflake_source_binding(
+            loaded = await binding_store.load_source_binding(
                 session,
                 definition_revision_id=first["definition_revision_id"],
                 source_binding_revision_id=first["source_binding_revision_id"],
             )
-            assert loaded.definition == _loaded_binding().definition
-            assert loaded.binding == _loaded_binding().binding
+            assert loaded.definition == _loaded_binding(connector).definition
+            assert loaded.binding == _loaded_binding(connector).binding
             for model in (CustomImportDataset, CustomImportDefinitionRevision, CustomImportSourceBindingRevision):
                 assert await session.scalar(select(func.count()).select_from(model)) == 1
         assert database.connected == database.disconnected == 2
@@ -1650,18 +1665,21 @@ async def test_registration_operator_commits_and_replays_the_same_revisions():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mismatch", ("binding_digest", "dataset_key", "revision_number"))
-async def test_registration_operator_suppresses_receipt_when_committed_readback_mismatches(monkeypatch, mismatch):
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_registration_operator_suppresses_receipt_when_committed_readback_mismatches(
+    monkeypatch, mismatch, connector
+):
     database = _Database()
     if mismatch == "binding_digest":
-        original_load = operator_cli.load_snowflake_source_binding
+        original_load = operator_cli.load_source_binding
 
         async def mismatched_load(*arguments, **keywords):
             loaded = await original_load(*arguments, **keywords)
             return replace(loaded, source_binding_sha256=b"x" * 32)
 
-        monkeypatch.setattr(operator_cli, "load_snowflake_source_binding", mismatched_load)
+        monkeypatch.setattr(operator_cli, "load_source_binding", mismatched_load)
     else:
-        original_register = operator_cli.register_snowflake_source_binding
+        original_register = operator_cli.register_source_binding
 
         async def mismatched_register(*arguments, **keywords):
             if mismatch == "dataset_key":
@@ -1673,12 +1691,12 @@ async def test_registration_operator_suppresses_receipt_when_committed_readback_
                 else receipt
             )
 
-        monkeypatch.setattr(operator_cli, "register_snowflake_source_binding", mismatched_register)
+        monkeypatch.setattr(operator_cli, "register_source_binding", mismatched_register)
 
     async with isolated_publication_case() as case:
         database.session = case.sessions
         with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError):
-            await operator_cli._register_snowflake_binding(stream=_registration_stream(), database=database)
+            await operator_cli._register_snowflake_binding(stream=_registration_stream(connector), database=database)
 
         async with case.sessions() as session:
             for model in (CustomImportDataset, CustomImportDefinitionRevision, CustomImportSourceBindingRevision):
@@ -1687,19 +1705,24 @@ async def test_registration_operator_suppresses_receipt_when_committed_readback_
 
 
 @pytest.mark.asyncio
-async def test_registration_operator_rolls_back_when_persisted_readback_does_not_match(monkeypatch):
+@pytest.mark.parametrize("connector", (None, "https", "s3", "upload"))
+async def test_registration_operator_rolls_back_when_persisted_readback_does_not_match(monkeypatch, connector):
     database = _Database()
-    original_load = source_binding.load_snowflake_source_binding
+    store = source_binding if connector is None else binding_store
+    loader = "load_snowflake_source_binding" if connector is None else "load_source_binding"
+    original_load = getattr(store, loader)
 
     async def mismatched_load(*arguments, **keywords):
         loaded = await original_load(*arguments, **keywords)
         return replace(loaded, source_binding_sha256=b"x" * 32)
 
-    monkeypatch.setattr(source_binding, "load_snowflake_source_binding", mismatched_load)
+    monkeypatch.setattr(store, loader, mismatched_load)
     async with isolated_publication_case() as case:
         database.session = case.sessions
-        with pytest.raises(source_binding.SnowflakeSourceBindingUnavailableError):
-            await operator_cli._register_snowflake_binding(stream=_registration_stream(), database=database)
+        with pytest.raises(
+            (source_binding.SnowflakeSourceBindingUnavailableError, binding_store.ObjectSourceBindingUnavailableError)
+        ):
+            await operator_cli._register_snowflake_binding(stream=_registration_stream(connector), database=database)
 
         async with case.sessions() as session:
             for model in (CustomImportDataset, CustomImportDefinitionRevision, CustomImportSourceBindingRevision):

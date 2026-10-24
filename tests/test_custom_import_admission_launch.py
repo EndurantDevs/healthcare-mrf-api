@@ -21,8 +21,10 @@ import pytest
 from process.custom_import import admission_authorization as authorization
 from process.custom_import import admission_launch as launch
 from process.custom_import import admission_worker, source_worker
+from process.custom_import.source_binding_store import LoadedObjectSourceBinding
 from tests.admission_transport_test_support import WRITER_CA_PEM
 from tests.test_custom_import_snowflake_operator_cli import _configured_loaded_binding, _loaded_binding
+from tests.test_custom_import_source_binding_store import _object_binding
 
 NOW = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
 EXPIRES = NOW + dt.timedelta(minutes=15)
@@ -63,13 +65,11 @@ def _permit_context(loaded):
     }
 
 
-@pytest.fixture
-def mounted(tmp_path, monkeypatch):
+def _mount_case(tmp_path, monkeypatch, loaded):
     """Build the complete immutable pair with independent descriptor digests."""
 
     directory = tmp_path / "admission"
     directory.mkdir(mode=0o700)
-    loaded = _configured_loaded_binding()
     context_by_name = _permit_context(loaded)
     signed = authorization.sign_permit(
         _canonical(context_by_name),
@@ -113,6 +113,11 @@ def mounted(tmp_path, monkeypatch):
         source_signed=source_signed,
         source_bytes=source_bytes,
     )
+
+
+@pytest.fixture
+def mounted(tmp_path, monkeypatch):
+    return _mount_case(tmp_path, monkeypatch, _configured_loaded_binding())
 
 
 def _load(case, *, loaded=None, idempotency_key=IDEMPOTENCY_KEY):
@@ -566,3 +571,32 @@ async def test_ca_exact_limit_and_bundle_are_admitted_without_environment_trust(
     async with _load(mounted) as pair:
         assert pair.admission.tls_context.cert_store_stats() == {"x509": 1, "crl": 0, "x509_ca": 1}
         assert pair.source.tls_context is pair.admission.tls_context
+
+
+@pytest.mark.parametrize("connector", ("https", "s3", "upload"))
+async def test_object_launch_preserves_both_purpose_permits(tmp_path, monkeypatch, connector):
+    legacy = _configured_loaded_binding()
+    binding = _object_binding(legacy.definition, connector)
+    loaded = LoadedObjectSourceBinding(
+        legacy.dataset_id,
+        legacy.definition_revision_id,
+        legacy.schema_revision_id,
+        legacy.source_binding_revision_id,
+        bytes.fromhex(binding.digest),
+        legacy.definition,
+        binding,
+    )
+    case = _mount_case(tmp_path, monkeypatch, loaded)
+    async with _load(case) as pair:
+        assert pair.admission.signed_permit == case.signed
+        assert pair.source.signed_permit == case.source_signed
+        assert pair.source._permit.source_binding_sha256 == binding.digest
+    with pytest.raises(ValueError, match=_UNAVAILABLE):
+        _load(
+            case,
+            loaded=replace(
+                legacy,
+                source_binding_sha256=loaded.source_binding_sha256,
+                binding=SimpleNamespace(processing_policy=binding.processing_policy),
+            ),
+        )

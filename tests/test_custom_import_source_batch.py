@@ -145,7 +145,7 @@ def _retained(monkeypatch):
         step.CustomImportCaptureBundle: bundle,
     }
     session = SimpleNamespace(get=AsyncMock(side_effect=lambda model, identifier: by_model[model]))
-    monkeypatch.setattr(step, "load_snowflake_source_binding", AsyncMock(return_value=loaded))
+    monkeypatch.setattr(step, "load_source_binding", AsyncMock(return_value=loaded))
     build.refresh_mode = request.definition.refresh_mode
     return session, request, build, execution, bundle, loaded
 
@@ -155,9 +155,7 @@ async def test_request_is_derived_from_persisted_definition_binding_and_bounds(m
     request, policy, bundle_id = await step._load_request(session, 4, 11, 1, expected.lease_token, _PERMIT)
     assert request == expected and policy is loaded.binding.processing_policy.capture and bundle_id == 9
     assert request.authorization_expires_at == _PERMIT.expires_at
-    step.load_snowflake_source_binding.assert_awaited_once_with(
-        session, definition_revision_id=2, source_binding_revision_id=5
-    )
+    step.load_source_binding.assert_awaited_once_with(session, definition_revision_id=2, source_binding_revision_id=5)
 
 
 def _context_case(monkeypatch):

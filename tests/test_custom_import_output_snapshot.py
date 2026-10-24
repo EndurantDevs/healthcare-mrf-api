@@ -262,6 +262,7 @@ def test_structural_verification_rechecks_budget_after_protected_binding(monkeyp
     monkeypatch.setattr(output, "_build_storage_models", bind)
     monkeypatch.setattr(output, "_prepare_read", prepare)
     monkeypatch.setattr(output, "_require_budget", lambda _deadline: None)
+    monkeypatch.setattr(output.prepared_source_lineage, "verify_prepared_source_lineage", lambda *_args, **_kw: None)
     if expired:
         with pytest.raises(LeaseAuthorityLost, match="deadline elapsed"):
             output._verify_page(session, request, 7)
@@ -379,3 +380,42 @@ async def test_immutable_replay_does_not_reopen_or_freeze_a_candidate(monkeypatc
     monkeypatch.setattr(output, "_freeze_output_snapshot", freeze)
     assert await output.build_output(None, _request(), 7) == "replayed"
     freeze.assert_not_called()
+
+
+@pytest.mark.parametrize("prepared_state", (None, "scanning", "refused"))
+def test_prepared_verification_dispatch_runs_inside_bound_transaction(monkeypatch, prepared_state):
+    events = []
+    request, session = _request(), Mock()
+
+    @contextmanager
+    def transaction(current, same_request, build_id):
+        assert (current, same_request, build_id) == (session, request, 7)
+        events.append("transaction")
+        try:
+            yield object(), 20
+        finally:
+            events.append("closed")
+
+    def prepared(current, same_request, build_id, *, deadline):
+        assert (current, same_request, build_id, deadline) == (session, request, 7, 20)
+        events.append("prepared")
+        if prepared_state == "refused":
+            raise CandidateRunnerError("prepared_source_lineage_invalid")
+        return prepared_state
+
+    session.connection.return_value.get_execution_options.return_value = {}
+    session.execute.return_value.one.return_value.verification_state = "complete"
+    monkeypatch.setattr(output, "_read_transaction", transaction)
+    monkeypatch.setattr(output, "_build_storage_models", lambda *_args: events.append("binding"))
+    monkeypatch.setattr(output, "_prepare_read", lambda *_args: events.append("prepare"))
+    monkeypatch.setattr(output, "_require_budget", lambda *_args: events.append("budget"))
+    monkeypatch.setattr(output.prepared_source_lineage, "verify_prepared_source_lineage", prepared)
+    if prepared_state == "refused":
+        with pytest.raises(CandidateRunnerError, match="prepared_source_lineage_invalid"):
+            output._verify_page(session, request, 7)
+    else:
+        assert output._verify_page(session, request, 7) == (prepared_state or "complete")
+    assert events == ["transaction", "binding", "prepare", "prepared"] + (
+        [] if prepared_state == "refused" else ["budget"]
+    ) + ["closed"]
+    assert session.execute.call_count == (1 if prepared_state is None else 0)

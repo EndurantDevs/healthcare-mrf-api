@@ -40,7 +40,7 @@ from process.custom_import.admission_authorization import (
 )
 from process.custom_import.build_source import SourceBuildRequest
 from process.custom_import.runner_types import CancellationRequested, LeaseAuthorityLost
-from process.custom_import.snowflake_source_binding import load_snowflake_source_binding
+from process.custom_import.source_binding_store import load_source_binding
 
 _HEADERS = ("Content-Type", "Authorization", CONTEXT_HEADER, KEY_ID_HEADER, SIGNATURE_HEADER)
 _HEADER_NAMES = frozenset(name.lower() for name in _HEADERS)
@@ -154,7 +154,7 @@ async def _retained_request(session_factory, verified: VerifiedAdmission) -> Sou
                 or execution.source_binding_revision_id != permit.source_binding_revision_id
             ):
                 raise _unavailable()
-            loaded = await load_snowflake_source_binding(
+            loaded = await load_source_binding(
                 session,
                 definition_revision_id=permit.definition_revision_id,
                 source_binding_revision_id=permit.source_binding_revision_id,
