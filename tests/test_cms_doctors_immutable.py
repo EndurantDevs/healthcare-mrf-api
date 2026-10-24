@@ -197,6 +197,43 @@ def test_legacy_group_indexes_never_relax_immutable_current():
     assert not immutable._index_shape_matches(immutable._models()[0], required_indexes, old, True)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_incumbent", (False, True))
+async def test_geo_profiles_reject_index_drift(is_incumbent):
+    from itertools import combinations
+
+    from db.models import GeoZipLookup
+    from process.geo_source_storage import GEO_LEGACY_INDEX_PROFILES
+
+    required = {(True, ("zip_code",))} | {
+        (False, tuple(index["index_elements"])) for index in GeoZipLookup.__my_additional_indexes__
+    }
+    assert len(required) == 6
+    coordinates = (False, ("latitude", "longitude", "zip_code"))
+    assert coordinates in required
+    assert GEO_LEGACY_INDEX_PROFILES == ({(True, ("zip_code",)), coordinates}, required - {coordinates})
+    profiles = [list(keys) for count in range(7) for keys in combinations(required, count)]
+    profiles.extend([list(required) + [entry] for entry in (*required, (False, ("population",)))])
+    for indexes in profiles:
+        session = SimpleNamespace(
+            execute=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(all=lambda: immutable._column_shape(GeoZipLookup)),
+                    SimpleNamespace(all=lambda: indexes),
+                ]
+            ),
+            scalar=AsyncMock(return_value=["zip_code"]),
+        )
+        accepted = len(indexes) == len(set(indexes)) and (
+            set(indexes) == required or (is_incumbent and set(indexes) in GEO_LEGACY_INDEX_PROFILES)
+        )
+        if accepted:
+            await immutable._shape(session, GeoZipLookup, 17, indexed=True, is_geo_incumbent=is_incumbent)
+        else:
+            with pytest.raises(RuntimeError, match="indexes_(incomplete|duplicated)"):
+                await immutable._shape(session, GeoZipLookup, 17, indexed=True, is_geo_incumbent=is_incumbent)
+
+
 def test_immutable_archive_contract_accepts_only_supported_family():
     archive._validate_source_capture_contract(
         dict(

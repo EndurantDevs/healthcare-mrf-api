@@ -25,8 +25,8 @@ async def test_cut_replays_reads_only_after_both_heap_custody_and_exact_locks(mo
         relation_oids=((storage.ROOT, 41 if damage == "same_oid" else 42),),
     )
 
-    async def old_custody(session, *, schema_name, expected_oid):
-        assert session is connection and (schema_name, expected_oid) == ("old_geo", 41)
+    async def old_custody(session, *, schema_name, expected_oid, is_incumbent):
+        assert session is connection and (schema_name, expected_oid, is_incumbent) == ("old_geo", 41, True)
         events.append("old-custody")
         if damage == "old_custody":
             raise RuntimeError("old changed")

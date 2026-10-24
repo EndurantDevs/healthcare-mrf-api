@@ -24,9 +24,40 @@ ROLE_SQL = """SELECT r.oid,r.rolname,r.rolcanlogin,r.rolsuper,r.rolcreatedb,
  JOIN pg_roles schema_owner ON schema_owner.oid=n.nspowner
  WHERE r.rolname=ANY($1::text[]) ORDER BY r.rolname"""
 
+# Only the two existing E&M control foreign keys may retain native RI hooks on
+# the header. Binding/pin storage remains trigger-free, including internal hooks.
 CATALOG_SQL = """WITH RECURSIVE family(oid) AS (
  SELECT to_regclass(name)::oid FROM unnest($1::text[]) names(name)
  UNION SELECT child.inhrelid FROM pg_inherits child JOIN family parent ON parent.oid=child.inhparent
+), control_relations AS (
+ SELECT child.* FROM pg_class header JOIN pg_class child ON child.relnamespace=header.relnamespace
+ WHERE header.oid=to_regclass(($1::text[])[1]) AND header.relname='plan_release_serving_revision'
+ AND child.relname IN (
+  'plan_pricing_em_distance_candidate','plan_pricing_em_distance_attachment')
+), control_foreign_keys AS (
+ SELECT k.* FROM control_relations child JOIN pg_constraint k ON k.conrelid=child.oid
+ WHERE child.relkind='r' AND child.relpersistence='p' AND NOT child.relispartition
+ AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=child.oid OR inhparent=child.oid)
+ AND k.conname=child.relname::text||'_serving_revision_id_fkey'
+ AND k.contype='f' AND k.convalidated AND coalesce((to_jsonb(k)->>'conenforced')::boolean,true)
+ AND k.conislocal AND k.coninhcount=0 AND k.conparentid=0 AND NOT k.condeferrable AND NOT k.condeferred
+ AND k.confrelid=to_regclass(($1::text[])[1])
+ AND k.confupdtype='a' AND k.confdeltype='r' AND k.confmatchtype='s'
+ AND k.conkey=ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid=child.oid
+  AND attname='serving_revision_id' AND atttypid='pg_catalog.varchar'::regtype AND atttypmod=68
+  AND attnotnull AND NOT attisdropped)]::smallint[]
+ AND k.confkey=ARRAY[1]::smallint[]
+ AND k.conindid=(SELECT indexrelid FROM pg_index WHERE indrelid=k.confrelid AND indisprimary)
+ AND k.conpfeqop=ARRAY['pg_catalog.=(text,text)'::regoperator]::oid[]
+ AND k.conppeqop=k.conpfeqop AND k.conffeqop=k.conpfeqop
+), control_triggers AS (
+ SELECT t.oid FROM pg_trigger t JOIN control_foreign_keys k ON k.oid=t.tgconstraint
+ WHERE t.tgrelid=k.confrelid AND t.tgconstrrelid=k.conrelid AND t.tgconstrindid=k.conindid
+ AND t.tgisinternal AND t.tgenabled='O' AND t.tgparentid=0 AND NOT t.tgdeferrable AND NOT t.tginitdeferred
+ AND t.tgnargs=0 AND t.tgattr=''::int2vector AND t.tgargs=''::bytea AND t.tgqual IS NULL
+ AND t.tgoldtable IS NULL AND t.tgnewtable IS NULL
+ AND ((t.tgtype=9 AND t.tgfoid='pg_catalog."RI_FKey_restrict_del"()'::regprocedure)
+   OR (t.tgtype=17 AND t.tgfoid='pg_catalog."RI_FKey_noaction_upd"()'::regprocedure))
 )
 SELECT c.oid::bigint,n.nspname,c.relname,c.relkind::text,c.relpersistence::text,c.relispartition,
  c.relowner::bigint,c.relrowsecurity,c.relforcerowsecurity,
@@ -58,7 +89,12 @@ SELECT c.oid::bigint,n.nspname,c.relname,c.relkind::text,c.relpersistence::text,
    ORDER BY i.indexrelid),'[]'::jsonb)
   FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_am am ON am.oid=idx.relam
   WHERE i.indrelid=c.oid) AS indexes,
- NOT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid)
+ NOT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid
+   AND (c.oid<>to_regclass(($1::text[])[1]) OR oid NOT IN(SELECT oid FROM control_triggers)))
+  AND (c.oid<>to_regclass(($1::text[])[1]) OR (
+   (SELECT count(*) FROM control_relations) IN (0,2)
+   AND (SELECT count(*) FROM control_foreign_keys)=(SELECT count(*) FROM control_relations)
+   AND (SELECT count(*) FROM control_triggers)=2*(SELECT count(*) FROM control_relations)))
   AND NOT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid) AS inert,
  NOT EXISTS(
   SELECT FROM pg_constraint k JOIN pg_depend d ON d.classid='pg_constraint'::regclass AND d.objid=k.oid

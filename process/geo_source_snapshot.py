@@ -62,7 +62,7 @@ async def _copy(session, name, columns, records, deadline):
 
 
 async def _prepare(session, schema, deadline):
-    oid = await require_geo_storage(session, schema_name=schema)
+    oid = await require_geo_storage(session, schema_name=schema, is_incumbent=True)
     authority = await generation.read_reference_family_result_generation_authority(
         session,
         importer_id="geo",
@@ -201,7 +201,7 @@ async def _publish(session, candidate):
     root = storage_relation(candidate.schema, ROOT)
     stage = storage_relation(candidate.schema, candidate.stage)
     await session.execute(text(f"LOCK TABLE ONLY {root},{stage} IN ACCESS EXCLUSIVE MODE NOWAIT"))
-    await require_geo_storage(session, schema_name=candidate.schema, expected_oid=candidate.old_oid)
+    await require_geo_storage(session, schema_name=candidate.schema, expected_oid=candidate.old_oid, is_incumbent=True)
     await require_geo_storage(session, schema_name=candidate.schema, relation_name=candidate.stage)
     authority = await generation.read_reference_family_result_generation_authority(
         session,

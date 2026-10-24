@@ -11,12 +11,20 @@ from process import geo_source_provision as provision
 from tests import provider_directory_source_postgres_support as source
 
 
-async def create_geo_indexes(connection):
-    """Finish exactly the model's four indexes on an empty bootstrap relation."""
+async def create_geo_indexes(connection, *, index_profile="current"):
+    """Create an exact historical or current index profile on an empty bootstrap heap."""
     from process.entity_address_snapshot_restore import _additional_index_sql
 
     assert await connection.scalar(text("SELECT count(*) FROM mrf.geo_zip_lookup")) == 0
+    assert index_profile in {"current", "legacy-pricing", "legacy-native"}
+    if index_profile == "legacy-pricing":
+        await connection.execute(
+            text("CREATE INDEX plan_pricing_geo_zip_coordinates_idx ON mrf.geo_zip_lookup(latitude,longitude,zip_code)")
+        )
+        return
     for index in GeoZipLookup.__my_additional_indexes__:
+        if index_profile == "legacy-native" and tuple(index["index_elements"]) == ("latitude", "longitude", "zip_code"):
+            continue
         await connection.execute(
             text(
                 _additional_index_sql(
@@ -77,7 +85,7 @@ async def provision_geo(engine, policy, verify_role_profile):
 
 
 @asynccontextmanager
-async def geo_source_component_database(monkeypatch):
+async def geo_source_component_database(monkeypatch, *, index_profile="current"):
     """Reuse the real CMS dependency/kernel and add Geo before native-role custody."""
     from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -96,7 +104,7 @@ async def geo_source_component_database(monkeypatch):
                 table = GeoZipLookup.__table__.to_metadata(MetaData(), schema=policy.schema)
                 assert await connection.scalar(text("SELECT to_regclass('mrf.geo_zip_lookup')")) is None
                 await connection.run_sync(lambda sync: table.create(sync, checkfirst=False))
-                await create_geo_indexes(connection)
+                await create_geo_indexes(connection, index_profile=index_profile)
         finally:
             await historical.dispose()
         await original_bootstrap(engine, policy)

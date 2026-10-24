@@ -33,6 +33,58 @@ from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_result_generation import ReferenceFamilyServingGeneration
 
 
+def test_geo_archive_requires_complete_index_transition():
+    from process.geo_source_archive import geo_index_schema_hashes
+
+    pairs = geo_index_schema_hashes()
+    assert len(pairs) == 6
+    for source_hash, stage_hash in pairs:
+        table = archive.ReferenceTableReceipt("GeoZipLookup", "geo_zip_lookup", source_hash, 1)
+        manifest = archive.ReferenceFamilyManifest("geo", (table,), {}, "a" * 64, archive._schema_digest((table,)))
+        next_table = replace(table, schema_sha256=stage_hash)
+        observed = replace(manifest, tables=(next_table,), schema_sha256=archive._schema_digest((next_table,)))
+        original = archive._canonical_json(manifest.as_dict())
+        assert archive._has_matching_manifest_stage_tables(manifest, observed.tables)
+        assert archive._has_matching_family_manifest(manifest, observed)
+        assert archive._has_matching_family_manifest(observed, observed)
+        if source_hash != stage_hash:
+            assert not archive._has_matching_manifest_stage_tables(manifest, manifest.tables)
+            assert not archive._has_matching_family_manifest(manifest, manifest)
+            assert not archive._has_matching_family_manifest(observed, manifest)
+        for changes in ({"row_count": 2}, {"model_name": "Unknown"}, {"table_name": "different"}):
+            assert not archive._has_matching_manifest_stage_tables(manifest, (replace(next_table, **changes),))
+        assert not archive._has_matching_family_manifest(observed, replace(observed, source_metadata={"changed": True}))
+        assert not archive._has_matching_manifest_stage_tables(manifest, (*observed.tables, next_table))
+        assert archive._canonical_json(manifest.as_dict()) == original
+
+
+def test_geo_archive_hashes_reject_catalog_changes():
+    from copy import deepcopy
+
+    from process import geo_source_archive as geo
+
+    columns = geo._geo_catalog_columns()
+    indexes = list(geo._geo_catalog_indexes(columns).values())
+    current_hashes = {current for _, current in geo.geo_index_schema_hashes()}
+    assert len(current_hashes) == 2
+    assert columns[7]["type"] == columns[8]["type"] == "double precision"
+    for constraints in archive._cms_group_constraint_orders(columns):
+        catalog_by_field = {"table_name": "geo_zip_lookup", "columns": columns, "constraints": constraints}
+        variants = [indexes[:-1], [*indexes, indexes[-1]]]
+        for field, changed in (("method", "hash"), ("predicate", "latitude IS NOT NULL"), ("options", "1 0 0")):
+            altered = deepcopy(indexes)
+            altered[-1][field] = changed
+            variants.append(altered)
+        altered = deepcopy(indexes)
+        altered[-1]["key_attributes"][0]["opclass_schema"] = "untrusted"
+        variants.append(altered)
+        for variant in variants:
+            digest = archive.catalog_identity._canonical_digest(
+                {**catalog_by_field, "indexes": sorted(variant, key=archive._canonical_json)}
+            )
+            assert digest not in current_hashes
+
+
 def _source_creation_options():
     """Exercise convenience cleanup only with the new explicit native custody boundary."""
     return {

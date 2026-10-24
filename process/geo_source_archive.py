@@ -98,7 +98,7 @@ async def preserve_geo_cut_reads(session, ownership, incumbent):
     require(ownership.importer_id == incumbent.importer_id == "geo", "family_changed")
     old_oid, new_oid = dict(incumbent.relation_oids)[ROOT], dict(ownership.relation_oids)[ROOT]
     require(type(old_oid) is int and old_oid != new_oid, "incumbent_changed")
-    await require_geo_storage(session, schema_name=incumbent.schema_name, expected_oid=old_oid)
+    await require_geo_storage(session, schema_name=incumbent.schema_name, expected_oid=old_oid, is_incumbent=True)
     await _heap_custody(session, GeoZipLookup, ownership.schema_name, ROOT, new_oid, owner)
     locked = await session.scalar(
         text(
@@ -109,6 +109,110 @@ async def preserve_geo_cut_reads(session, ownership, incumbent):
     )
     require(locked is True, "cut_locks_required")
     await replay_geo_reads(session, old_oid, storage_relation(ownership.schema_name, ROOT))
+
+
+def has_compatible_geo_indexes(manifest, tables):
+    """Accept only exact historical Geo receipts rebuilt with the complete current indexes."""
+    if manifest.importer_id != "geo" or len(manifest.tables) != 1 or len(tables) != 1:
+        return False
+    expected, observed = manifest.tables[0], tables[0]
+    expected_fields, observed_fields = expected.as_dict(), observed.as_dict()
+    expected_fields.pop("schema_sha256")
+    observed_fields.pop("schema_sha256")
+    return (
+        expected_fields == observed_fields
+        and (expected.schema_sha256, observed.schema_sha256) in geo_index_schema_hashes()
+    )
+
+
+def geo_index_schema_hashes():
+    """Pair exact index catalogs without changing archived manifests or constraint versions."""
+    from process import reference_family_archive as archive
+    from process.geo_source_storage import GEO_LEGACY_INDEX_PROFILES
+
+    columns = _geo_catalog_columns()
+    indexes_by_keys = _geo_catalog_indexes(columns)
+    current_keys = frozenset(indexes_by_keys)
+    pairs = set()
+    for constraints in archive._cms_group_constraint_orders(columns):
+        catalog_by_field = {"table_name": ROOT, "columns": columns, "constraints": constraints}
+        current_hash = archive.catalog_identity._canonical_digest(
+            {**catalog_by_field, "indexes": sorted(indexes_by_keys.values(), key=archive._canonical_json)}
+        )
+        for profile in (*GEO_LEGACY_INDEX_PROFILES, current_keys):
+            historical_hash = archive.catalog_identity._canonical_digest(
+                {
+                    **catalog_by_field,
+                    "indexes": sorted((indexes_by_keys[key] for key in profile), key=archive._canonical_json),
+                }
+            )
+            pairs.add((historical_hash, current_hash))
+    return pairs
+
+
+def _geo_catalog_columns():
+    """Describe the fixed native model with PostgreSQL's catalog type spellings."""
+    from process.cms_doctors_immutable import _column_shape
+
+    shapes_by_name = {name: (kind, required) for name, kind, required in _column_shape(GeoZipLookup)}
+    columns = []
+    for position, column in enumerate(GeoZipLookup.__table__.columns, 1):
+        kind, required = shapes_by_name[column.name]
+        is_collatable = kind.startswith("character varying")
+        columns.append(
+            {
+                "attnum": position,
+                "attname": column.name,
+                "type": kind,
+                "attnotnull": required,
+                "attgenerated": "",
+                "attidentity": "",
+                "collation_schema": "pg_catalog" if is_collatable else None,
+                "collation_name": "default" if is_collatable else None,
+                "default_expression": None,
+            }
+        )
+    return columns
+
+
+def _geo_catalog_indexes(columns):
+    """Describe only declared btree keys, including their exact default operator classes."""
+    columns_by_name = {column["attname"]: column for column in columns}
+    indexes_by_keys = {}
+    for is_primary, names in (
+        (True, ("zip_code",)),
+        *((False, tuple(index["index_elements"])) for index in GeoZipLookup.__my_additional_indexes__),
+    ):
+        key_attributes = []
+        for position, name in enumerate(names):
+            column = columns_by_name[name]
+            key_attributes.append(
+                {
+                    "position": position,
+                    "attribute_number": column["attnum"],
+                    "collation_schema": column["collation_schema"],
+                    "collation_name": column["collation_name"],
+                    "opclass_schema": "pg_catalog",
+                    "opclass_name": {"character varying": "text_ops", "double precision": "float8_ops"}[
+                        column["type"].split("(", 1)[0]
+                    ],
+                }
+            )
+        indexes_by_keys[(is_primary, names)] = {
+            "indisunique": is_primary,
+            "indisprimary": is_primary,
+            "indimmediate": True,
+            "indisvalid": True,
+            "indnkeyatts": len(names),
+            "indnatts": len(names),
+            "method": "btree",
+            "predicate": None,
+            "expressions": None,
+            "keys": " ".join(str(column["attribute_number"]) for column in key_attributes),
+            "options": " ".join("0" for _ in names),
+            "key_attributes": key_attributes,
+        }
+    return indexes_by_keys
 
 
 @asynccontextmanager

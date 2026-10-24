@@ -62,11 +62,17 @@ async def test_full_closure_precedes_only_attested_guard_retirement(cut):
         "schema_name": "source_schema",
         "legacy": True,
         "native_policy": cut.policy,
+        "is_incumbent": True,
+    }
+    assert cut.shape.await_args_list[1].kwargs == {
+        "schema_name": "source_schema",
+        "native_policy": cut.policy,
+        "is_incumbent": True,
     }
     statements = [call.args[0] for call in cut.native.execute.await_args_list]
     grant = next(sql for sql in statements if sql.startswith("GRANT"))
     assert 'UPDATE("local_generation"' in grant and 'UPDATE("importer_id"' not in grant
-    assert not any("FUNCTION" in sql or "CREATE TRIGGER" in sql for sql in statements)
+    assert not any("FUNCTION" in sql or "CREATE TRIGGER" in sql or "INDEX" in sql for sql in statements)
     update = next(sql for sql in cut.native.fetchval.call_args_list if "UPDATE" in sql.args[0])
     assert "SET source_revision_tracked=FALSE" in update.args[0] and "local_generation=" not in update.args[0]
 

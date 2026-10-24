@@ -1188,11 +1188,16 @@ async def _read_immutable_activation_predecessor(session, manifest, incumbent):
 
 
 async def _adopt_validated_family_generation(
-    session, manifest, incumbent, incoming_generation, live_pairs, predecessor
+    session, manifest, incumbent, incoming_generation, live_pairs, predecessor, *, geo_retained_cut=None
 ):
     """Select immutable NUCC only from the already validated exact capture contract."""
     from process import reference_family_archive as native
 
+    if geo_retained_cut is not None:
+        from process.geo_source_storage import require, require_geo_retained_manifest
+
+        require(predecessor is not None and manifest.importer_id == "geo", "retained_cut_scope_changed")
+        require_geo_retained_manifest(geo_retained_cut, manifest, live_pairs)
     if manifest.importer_id in native.TERMINAL_CAPTURE_IMPORTERS:
         return None
     if predecessor is not None and manifest.importer_id == "geo":
@@ -1204,6 +1209,7 @@ async def _adopt_validated_family_generation(
             source_generation=incoming_generation,
             expected_authority=predecessor,
             local=False,
+            geo_retained_cut=geo_retained_cut,
         )
     elif predecessor is not None and manifest.importer_id == "cms-doctors":
         from process.cms_doctors_immutable import adopt_doctors_generation

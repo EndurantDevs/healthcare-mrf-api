@@ -9,6 +9,7 @@ from uuid import uuid4
 from db.plan_release_storage import storage_relation, storage_snapshot_index_sql, storage_table_sql
 from process.plan_release_preparation_pin_catalog import capture_preparation_pin_heap
 from process.plan_release_preparation_pin_contract import (
+    PlanReleasePublication,
     PreparationPinAdmission,
     PreparationPinAuthority,
     PreparationPinHeap,
@@ -17,7 +18,7 @@ from process.plan_release_preparation_pin_contract import (
     preparation_pin_receipt_from_payload,
 )
 from tests.plan_release_storage_cohort_support import CAPTURED_TIME, prepare_native_cohort
-from tests.plan_release_storage_postgres_support import NEW_REVISION
+from tests.plan_release_storage_postgres_support import NEW_REVISION, PLAN, RELEASE
 
 SECOND_REVISION = "hpserve_" + "2" * 26
 THIRD_REVISION = "hpserve_" + "3" * 26
@@ -69,9 +70,6 @@ async def _expand_inputs(case, admin, revisions):
 async def prepare_pin_case(case, *, revisions=(NEW_REVISION,)):
     await prepare_native_cohort(case)
     admin = await case.connect()
-    await admin.execute(
-        f'GRANT SELECT ON {case.relation("ptg2_snapshot")},{case.relation("ptg2_v3_snapshot_plan_scope")} TO "{case.owner}"'
-    )
     await admin.execute(
         f'UPDATE {case.relation("ptg2_snapshot")} SET manifest=\'{{"serving_index":{{"source_key":"synthetic_source"}}}}\'::jsonb'
     )
@@ -168,7 +166,7 @@ def _transition_inventory(inventory_by_field, action, observed):
         inventory_by_field["detached"].remove(observed_payload)
         inventory_by_field["cleaned"].append(observed_payload)
     else:
-        assert action == "serving"
+        assert action in {"serving", "publish"}
 
 
 async def _admissions(connection, tables):
@@ -194,11 +192,13 @@ async def _admissions(connection, tables):
 
 def native_authority(tables):
     async def authority(connection, scope, *, action, phase, observed):
-        row = await connection.fetchrow(
+        preparation_by_field = await connection.fetchrow(
             f"SELECT * FROM {tables['preparation']} WHERE preparation_id=$1 FOR UPDATE NOWAIT", scope.preparation_id
         )
-        assert row is not None and document(row["scope"]) == document(json.dumps(scope.payload()))
-        inventory_by_field = document(row["inventory"])
+        assert preparation_by_field is not None and document(preparation_by_field["scope"]) == document(
+            json.dumps(scope.payload())
+        )
+        inventory_by_field = document(preparation_by_field["inventory"])
         if phase == "after":
             _transition_inventory(inventory_by_field, action, observed)
             await connection.execute(
@@ -206,21 +206,49 @@ def native_authority(tables):
                 scope.preparation_id,
                 json.dumps(inventory_by_field),
             )
+            if action == "publish":
+                await connection.execute(
+                    f"UPDATE {tables['preparation']} SET status='published',writers_closed=true WHERE preparation_id=$1",
+                    scope.preparation_id,
+                )
+                preparation_by_field = {**preparation_by_field, "status": "published", "writers_closed": True}
         receipt = preparation_pin_receipt_from_payload
         return PreparationPinAuthority(
             scope,
-            row["status"],
+            preparation_by_field["status"],
             await _admissions(connection, tables),
             receipt(inventory_by_field["registered"]) if inventory_by_field["registered"] else None,
-            tuple(receipt(row) for row in inventory_by_field["detached"]),
-            row["terminal_intent"],
-            row["writers_closed"],
+            tuple(receipt(encoded_receipt) for encoded_receipt in inventory_by_field["detached"]),
+            preparation_by_field["terminal_intent"],
+            preparation_by_field["writers_closed"],
             PreparationPinHeap(**inventory_by_field["binding_heap"]),
             PreparationPinHeap(**inventory_by_field["pin_heap"]),
-            tuple(receipt(row) for row in inventory_by_field["cleaned"]),
+            tuple(receipt(encoded_receipt) for encoded_receipt in inventory_by_field["cleaned"]),
+            inventory_by_field.get("publication_digest"),
         )
 
     return authority
+
+
+async def seal_native_publication(prepared):
+    """Seal a genuine no-network outcome against the captured native inventory."""
+    publication = PlanReleasePublication(
+        NEW_REVISION,
+        RELEASE,
+        PLAN,
+        None,
+        "2026-10",
+        prepared.binding_heap.row_count,
+        prepared.scope.binding_inputs_digest,
+        {"binding_payload_digest": prepared.binding_heap.payload_digest},
+    ).validate()
+    admin = await prepared.case.connect()
+    await admin.execute(f"UPDATE {prepared.tables['admission']} SET status='not_required'")
+    await admin.execute(
+        f"UPDATE {prepared.tables['preparation']} SET status='sealed',inventory=jsonb_set(inventory,'{{publication_digest}}',$1::jsonb)",
+        json.dumps(digest(publication.payload())),
+    )
+    return publication
 
 
 async def settle(prepared, statuses, *, state="sealed", intent=False):

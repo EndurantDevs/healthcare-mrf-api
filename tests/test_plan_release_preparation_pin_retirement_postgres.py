@@ -9,23 +9,34 @@ import asyncpg
 import pytest
 
 from db.plan_release_storage import storage_relation, storage_snapshot_index_sql, storage_table_sql
-from process.plan_release_preparation_pin_contract import PreparationPinInputs
+from process.plan_release_preparation_pin_contract import (
+    PlanReleaseHistoryAuthority,
+    PreparationPinHeap,
+    PreparationPinInputs,
+    digest,
+)
 from process.plan_release_preparation_pin_retirement import (
+    capture_plan_release_history,
     cleanup_detached_preparation_pin_heap,
     exchange_preparation_pins,
     retire_preparation_pins,
+    transition_plan_release_history,
 )
 from process.plan_release_preparation_pins import require_preparation_pins, retain_preparation_pins
+from process.ptg_parts.ptg2_source_snapshot_gc import _CURRENT_SNAPSHOT_IDS_SQL
 from tests.plan_release_preparation_pin_postgres_support import (
     SECOND_REVISION,
     THIRD_REVISION,
     capture_heap,
     prepare_pin_case,
     replacement_heap,
+    seal_native_publication,
     settle,
 )
 from tests.plan_release_storage_cohort_support import CAPTURED_TIME
-from tests.plan_release_storage_postgres_support import NEW_REVISION, storage_case
+from tests.plan_release_storage_postgres_support import NEW_REVISION, OLD_REVISION, storage_case
+from tests.test_plan_release_preparation_pins_postgres import publish_prepared_case, retain_case
+from tests.test_plan_release_storage_postgres import _storage_catalog_snapshot
 
 
 async def retained(prepared):
@@ -37,6 +48,273 @@ async def retained(prepared):
         authority=prepared.authority,
         **prepared.case.profile,
     )
+
+
+def history_authority(prepared, publication, expected_current):
+    async def authorize(connection, cut, *, action, phase, observed):
+        inventory = json.loads(
+            await connection.fetchval(f"SELECT inventory FROM {prepared.tables['preparation']} FOR UPDATE")
+        )
+        detached = inventory.get("history_detached")
+        if phase == "after":
+            if action == "detach":
+                detached = asdict(observed)
+            elif action == "reactivate":
+                detached = None
+            inventory["history_detached"] = detached
+            await connection.execute(
+                f"UPDATE {prepared.tables['preparation']} SET inventory=$1::jsonb", json.dumps(inventory)
+            )
+        return PlanReleaseHistoryAuthority(
+            digest(cut.payload()),
+            digest(publication.payload()),
+            action,
+            expected_current,
+            cut.pin_revision_ids if action == "detach" else (publication.serving_revision_id,),
+            PreparationPinHeap(**detached) if detached else None,
+        )
+
+    return authorize
+
+
+async def history_transition(prepared, operation, *, detached_pin_heap=None, manifest=None, revision_id=NEW_REVISION):
+    async with prepared.publisher.transaction():
+        cut = await capture_plan_release_history(
+            prepared.publisher,
+            prepared.case.schema,
+            revision_id,
+            detached_pin_heap=detached_pin_heap,
+            **prepared.case.profile,
+        )
+        current = await prepared.publisher.fetchrow(
+            f"SELECT serving_revision_id,binding_set_digest FROM {prepared.case.relation('plan_release_serving_revision')} WHERE healthporta_plan_id=$1 AND is_current",
+            cut.publication.healthporta_plan_id,
+        )
+        expected = tuple(current) if current else None
+        publication = replace(cut.publication, source_manifest=manifest) if manifest is not None else cut.publication
+        await transition_plan_release_history(
+            prepared.publisher,
+            prepared.case.schema,
+            cut,
+            operation=operation,
+            publication=publication,
+            expected_current=expected,
+            authority=history_authority(prepared, publication, expected),
+            **prepared.case.profile,
+        )
+        return cut
+
+
+async def published_history(case):
+    prepared = await prepare_pin_case(case)
+    receipt = await retain_case(prepared)
+    publication = await seal_native_publication(prepared)
+    await publish_prepared_case(prepared, receipt, publication)
+    return prepared
+
+
+@pytest.mark.asyncio
+async def test_retained_history_repairs_withdraws_and_reattaches_exact_pin():
+    async with storage_case(provisioned=True) as case:
+        prepared = await published_history(case)
+        manifest_by_field = {"projection": {"receipt": "verified-native-result"}}
+        await history_transition(prepared, "repair", manifest=manifest_by_field)
+        await history_transition(prepared, "withdraw")
+        cut = await history_transition(prepared, "detach")
+        admin = await case.connect()
+        assert not await admin.fetchval("SELECT relispartition FROM pg_class WHERE oid=$1", cut.pin_heap.oid)
+        assert await admin.fetchval("SELECT relispartition FROM pg_class WHERE oid=$1", cut.binding_heap.oid)
+        assert (
+            await admin.fetchval(
+                f"SELECT count(*) FROM {case.relation('plan_release_snapshot_binding')} WHERE serving_revision_id=$1",
+                NEW_REVISION,
+            )
+            == 2000
+        )
+        referenced = await admin.fetch(_CURRENT_SNAPSHOT_IDS_SQL.replace("__SCHEMA__", case.schema))
+        assert "new-snapshot" in {row["snapshot_id"] for row in referenced}
+        restored = await history_transition(prepared, "reactivate", detached_pin_heap=cut.pin_heap)
+        assert restored.binding_heap == cut.binding_heap and restored.pin_heap == cut.pin_heap
+        assert await admin.fetchval("SELECT relispartition FROM pg_class WHERE oid=$1", cut.pin_heap.oid)
+        header = await admin.fetchrow(
+            f"SELECT * FROM {case.relation('plan_release_serving_revision')} WHERE is_current"
+        )
+        assert (
+            header["serving_revision_id"] == NEW_REVISION and json.loads(header["source_manifest"]) == manifest_by_field
+        )
+        assert await prepared.publisher.fetchval("SELECT current_user=session_user")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "damage"),
+    [
+        ("reactivate", "superset"),
+        ("reactivate", "subset"),
+        ("reactivate", "noncanonical"),
+        ("detach", "subset"),
+        ("withdraw", "superset"),
+        ("repair", "superset"),
+    ],
+)
+async def test_history_refuses_forged_pin_revision_cohort_without_changing_storage(operation, damage):
+    async with storage_case(provisioned=True) as case:
+        prepared = await prepare_pin_case(case, revisions=(NEW_REVISION, SECOND_REVISION))
+        receipt = await retained(prepared)
+        await settle(prepared, {NEW_REVISION: "ready", SECOND_REVISION: "ready"})
+        async with prepared.publisher.transaction():
+            await _publish_native(prepared, receipt)
+        detached = None
+        if operation in {"detach", "reactivate"}:
+            await history_transition(prepared, "withdraw")
+        if operation == "reactivate":
+            await history_transition(prepared, "withdraw", revision_id=SECOND_REVISION)
+            detached = (await history_transition(prepared, "detach")).pin_heap
+        admin = await case.connect()
+        before = await _storage_catalog_snapshot(admin, case)
+        preparation_before = await admin.fetchrow(f"SELECT * FROM {prepared.tables['preparation']}")
+        async with prepared.publisher.transaction():
+            cut = await capture_plan_release_history(
+                prepared.publisher, case.schema, NEW_REVISION, detached_pin_heap=detached, **case.profile
+            )
+            assert cut.pin_revision_ids == (NEW_REVISION, SECOND_REVISION)
+            changed_revision_ids = {
+                "superset": (*cut.pin_revision_ids, THIRD_REVISION),
+                "subset": (NEW_REVISION,),
+                "noncanonical": (*cut.pin_revision_ids, "invalid'revision"),
+            }[damage]
+            damaged = replace(cut, pin_revision_ids=changed_revision_ids)
+            expected = (NEW_REVISION, cut.publication.binding_set_digest) if cut.header["is_current"] else None
+            with pytest.raises(ValueError, match="history_pin_revision_cohort_changed"):
+                await transition_plan_release_history(
+                    prepared.publisher,
+                    case.schema,
+                    damaged,
+                    operation=operation,
+                    publication=cut.publication,
+                    expected_current=expected,
+                    authority=history_authority(prepared, cut.publication, expected),
+                    **case.profile,
+                )
+            assert (
+                await capture_plan_release_history(
+                    prepared.publisher, case.schema, NEW_REVISION, detached_pin_heap=detached, **case.profile
+                )
+                == cut
+            )
+        assert await _storage_catalog_snapshot(admin, case) == before
+        assert await admin.fetchrow(f"SELECT * FROM {prepared.tables['preparation']}") == preparation_before
+        assert await prepared.publisher.fetchval("SELECT current_user=session_user")
+
+
+@pytest.mark.asyncio
+async def test_legacy_history_reuses_actual_custody_without_preparation_scope():
+    async with storage_case(provisioned=True) as case:
+        admin = await case.connect()
+        enrolled_oid = await admin.fetchval(
+            f"SELECT DISTINCT tableoid::oid FROM {case.relation('plan_release_snapshot_pin')} WHERE serving_revision_id=$1",
+            OLD_REVISION,
+        )
+        shared_before = await admin.fetch(f"SELECT * FROM {case.relation('ptg2_snapshot_pin')}")
+        assert enrolled_oid is not None
+        prepared = await published_history(case)
+        async with prepared.publisher.transaction():
+            original = await capture_plan_release_history(prepared.publisher, case.schema, OLD_REVISION, **case.profile)
+            await prepared.publisher.execute("SET LOCAL TIME ZONE 'Pacific/Honolulu'")
+            expected = (NEW_REVISION, prepared.scope.binding_inputs_digest)
+            await transition_plan_release_history(
+                prepared.publisher,
+                case.schema,
+                original,
+                operation="withdraw",
+                publication=original.publication,
+                expected_current=expected,
+                authority=history_authority(prepared, original.publication, expected),
+                **case.profile,
+            )
+        detached = await history_transition(prepared, "detach", revision_id=OLD_REVISION)
+        restored = await history_transition(
+            prepared, "reactivate", revision_id=OLD_REVISION, detached_pin_heap=detached.pin_heap
+        )
+        assert restored.binding_heap == original.binding_heap and restored.pin_heap == original.pin_heap
+        assert restored.pin_heap.oid == enrolled_oid
+        assert await admin.fetch(f"SELECT * FROM {case.relation('ptg2_snapshot_pin')}") == shared_before
+        assert restored.publication.serving_revision_id not in prepared.scope.revision_ids
+        assert (
+            await prepared.publisher.fetchval(
+                f"SELECT serving_revision_id FROM {case.relation('plan_release_serving_revision')} WHERE is_current"
+            )
+            == OLD_REVISION
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["filenode", "transaction"])
+async def test_retained_history_refuses_stale_heap_or_original_context(damage):
+    async with storage_case(provisioned=True) as case:
+        prepared = await published_history(case)
+        async with prepared.publisher.transaction():
+            cut = await capture_plan_release_history(prepared.publisher, case.schema, NEW_REVISION, **case.profile)
+            damaged = (
+                replace(cut, pin_heap=replace(cut.pin_heap, filenode=cut.pin_heap.filenode + 1))
+                if damage == "filenode"
+                else replace(cut, original_identity=(0, *cut.original_identity[1:]))
+            )
+            expected = (NEW_REVISION, cut.publication.binding_set_digest)
+            with pytest.raises(ValueError, match="heap_receipt_changed|original_transaction_changed"):
+                await transition_plan_release_history(
+                    prepared.publisher,
+                    case.schema,
+                    damaged,
+                    operation="withdraw",
+                    publication=cut.publication,
+                    expected_current=expected,
+                    authority=history_authority(prepared, cut.publication, expected),
+                    **case.profile,
+                )
+            assert await prepared.publisher.fetchval(
+                f"SELECT is_current FROM {case.relation('plan_release_serving_revision')} WHERE serving_revision_id=$1",
+                NEW_REVISION,
+            )
+        assert await prepared.publisher.fetchval("SELECT current_user=session_user")
+
+
+@pytest.mark.asyncio
+async def test_retained_pin_detach_waits_for_pinned_reader_without_losing_custody():
+    async with storage_case(provisioned=True) as case:
+        prepared = await published_history(case)
+        reader = await case.connect(case.reader)
+        pin = storage_relation(prepared.pin_heap.schema, prepared.pin_heap.name)
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            assert await reader.fetchval(f"SELECT count(*) FROM {pin}") == 1
+            await history_transition(prepared, "withdraw")
+            header = case.relation("plan_release_serving_revision")
+            headers_before = await prepared.publisher.fetch(f"SELECT * FROM {header} ORDER BY serving_revision_id")
+            preparation_before = await prepared.publisher.fetchrow(f"SELECT * FROM {prepared.tables['preparation']}")
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                async with prepared.publisher.transaction():
+                    failed_transaction = await prepared.publisher.fetchval("SELECT pg_current_xact_id()::text")
+                    await history_transition(prepared, "detach")
+            assert not prepared.publisher.is_in_transaction()
+            assert await prepared.publisher.fetchval("SELECT current_user=session_user")
+            assert (
+                await prepared.publisher.fetch(f"SELECT * FROM {header} ORDER BY serving_revision_id") == headers_before
+            )
+            assert (
+                await prepared.publisher.fetchrow(f"SELECT * FROM {prepared.tables['preparation']}")
+                == preparation_before
+            )
+            assert await prepared.publisher.fetchval(
+                "SELECT relispartition FROM pg_class WHERE oid=$1", prepared.pin_heap.oid
+            )
+            assert await reader.fetchval(f"SELECT count(*) FROM {pin}") == 1
+        cut = await history_transition(prepared, "detach")
+        assert cut.original_identity[2] != failed_transaction
+        assert not await prepared.publisher.fetchval(
+            "SELECT relispartition FROM pg_class WHERE oid=$1", cut.pin_heap.oid
+        )
+        await history_transition(prepared, "reactivate", detached_pin_heap=cut.pin_heap)
+        assert await reader.fetchval(f"SELECT count(*) FROM {pin}") == 1
 
 
 async def exchange(prepared, old, replacement):
