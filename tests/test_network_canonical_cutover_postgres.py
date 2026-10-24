@@ -1,8 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Genuine membership admission and exact-office canonical serving cutover."""
 
+import asyncio
 import hashlib
 import json
+import logging
+from contextlib import aclosing
 from types import SimpleNamespace
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -12,7 +15,11 @@ from sqlalchemy import MetaData, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.endpoint import npi
+from api.network_address_scope import current_network_address_scope, network_address_read_scope
+from api.provider_profile_snapshot import provider_optional_read
+from db.connection import ConnectionProxy
 from db.models import NPIData, NPIDataTaxonomy, NUCCTaxonomy
+from process.entity_address_cutover_contract import postgres_sqlstate
 from process.network_address_projection import PinnedAddressSource
 from process.network_membership_candidate_lifecycle import (
     admit_network_membership_batch,
@@ -30,6 +37,7 @@ from tests.test_network_membership_publication_postgres import (
     _reactivate,
 )
 from tests.test_network_membership_serving_indexes_postgres import _full_source
+from tests.test_network_provider_routes_postgres import inflight_provider_http
 from tests.test_network_serving_routes_postgres import _reader_engine
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _create, _draft
@@ -365,6 +373,152 @@ async def test_genuine_nearby_cutover_retains_old_office_and_reactivation(
     await _page(context, query_by_name, headers, "a", initial["generation_id"])
     await _page(context, new_retained, headers, "b", current["generation_id"])
     await _assert_projection_immutability(fixture, successor, old_arrays, source_before)
+
+
+async def test_optional_read_error_preserves_native_membership_reader(admitted_nearby_app, caplog):
+    """Recover a real SQL error without replacing the ordinary read-only session."""
+    context = admitted_nearby_app
+    fixture = context.fixture
+    sessions = async_sessionmaker(context.reader_engine.execution_options(isolation_level="REPEATABLE READ"))
+    caplog.set_level(logging.DEBUG, logger=__name__)
+    assert current_network_address_scope() is None
+    async with sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+        reader = await _copy_driver(session)
+        identity_sql = """SELECT current_user,rolsuper,current_setting('transaction_isolation'),
+            current_setting('transaction_read_only'),pg_backend_pid()
+            FROM pg_roles WHERE rolname=current_user"""
+        reader_identity_values = tuple(await reader.fetchrow(identity_sql))
+        assert reader_identity_values[:4] == (fixture.writer_roles["reader"], False, "repeatable read", "on")
+        pin = await resolve_network_serving_manifest(reader, control_schema=fixture.control_schema)
+        assert pin.generation_id == fixture.published_manifest["generation_id"]
+        binding = session.get_bind()
+        with network_address_read_scope(pin, (fixture.network_id,)):
+            scope = current_network_address_scope()
+            async with provider_optional_read(session, logging.getLogger(__name__)):
+                await session.execute(text("SELECT 1 / 0"))
+            errors = [log_record for log_record in caplog.records if log_record.name == __name__]
+            assert len(errors) == 1 and postgres_sqlstate(errors[0].args[-1]) == "22012"
+            assert session.in_transaction() and not session.in_nested_transaction()
+            assert session.get_bind() is binding and await _copy_driver(session) is reader
+            assert current_network_address_scope() is scope
+            assert tuple(await reader.fetchrow(identity_sql)) == reader_identity_values
+            membership = f'"{pin.schema_name}".network_membership'
+            assert (
+                await reader.fetchval(f"SELECT count(*) FROM {membership} WHERE network_id=$1", fixture.network_id) == 2
+            )
+            membership_rows = await reader.fetch(
+                f"SELECT provider_system,provider_id,location_id,evidence_id FROM {membership} "
+                "WHERE network_id=$1 ORDER BY provider_id",
+                fixture.network_id,
+            )
+            assert [tuple(membership_row) for membership_row in membership_rows] == [
+                ("npi", _NPI[letter], fixture.sites[letter], "synthetic-office-" + letter) for letter in ("c", "a")
+            ]
+            assert await resolve_network_serving_manifest(reader, control_schema=fixture.control_schema) == pin
+        assert current_network_address_scope() is None
+    assert not session.in_transaction() and not session.in_nested_transaction()
+
+
+def _observe_provider_reads(monkeypatch, fixture):
+    """Observe successful native reads and hold only the first completed count."""
+    counted, release, observed, stages = asyncio.Event(), asyncio.Event(), {}, []
+    original_count, original_all = npi._provider_list_count, ConnectionProxy.all
+
+    async def hold_completed_count(connection, statement, parameters, session, *, deadline=None):
+        total = await original_count(connection, statement, parameters, session, deadline=deadline)
+        if not observed:
+            scope = current_network_address_scope()
+            observed.update(total=total, session=session, manifest=scope.manifest)
+            assert total == 1
+            native = await _copy_driver(session)
+            settings = await native.fetchrow(
+                "SELECT current_user,current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+            )
+            assert tuple(settings) == (fixture.writer_roles["reader"], "repeatable read", "on")
+            counted.set()
+            await release.wait()
+        return total
+
+    async def observe_native_rows(connection, statement, **parameters):
+        rows = await original_all(connection, statement, **parameters)
+        sql = str(statement)
+        if "page_npis AS (" in sql:
+            stage = "page"
+        elif "c.location_key = ANY(:location_keys)" in sql:
+            stage = "hydration"
+        else:
+            return rows
+        scope = current_network_address_scope()
+        stages.append((stage, connection._connection, scope.manifest, [dict(row._mapping) for row in rows]))
+        return rows
+
+    monkeypatch.setattr(npi, "_provider_list_count", hold_completed_count)
+    monkeypatch.setattr(ConnectionProxy, "all", observe_native_rows)
+    return SimpleNamespace(counted=counted, release=release, result=observed, stages=stages)
+
+
+def _assert_provider_office(reply, generation, office):
+    """Require a computed total and the exact public office on the pinned generation."""
+    assert reply.status_code == 200, reply.text
+    body = reply.json()
+    assert body["total_source"] == "computed" and body["total"] == (0 if office is None else 1)
+    assert [provider["npi"] for provider in body["rows"]] == ([] if office is None else [1000000491])
+    if office is not None:
+        assert body["rows"][0]["second_line"] == "Office " + office.upper()
+    assert reply.headers["X-Network-Generation"] == str(generation)
+    assert reply.headers["Cache-Control"] == "private, no-store"
+
+
+async def test_inflight_count_retains_office(admitted_nearby_app, monkeypatch):
+    """Complete genuine count, page and hydration across an admitted successor publication."""
+    context = admitted_nearby_app
+    fixture = context.fixture
+    context.reader_engine.update_execution_options(isolation_level="REPEATABLE READ", postgresql_readonly=True)
+    initial = fixture.published_manifest
+    successor = await _admit(fixture, "b", initial["generation_id"])
+    context.app.add_route(npi.get_all, "/api/v1/npi/all", methods=["GET"])
+    headers_by_name = {"Authorization": "Bearer synthetic-network-nearby-token", "X-Network-Access-Scope": "a" * 64}
+    query_by_name = {
+        "network_ids": str(fixture.network_id),
+        "address_key": str(fixture.sites["a"]),
+        "include_total": "1",
+        "limit": "1",
+    }
+    observed = _observe_provider_reads(monkeypatch, fixture)
+    listener = inflight_provider_http.__wrapped__(context, monkeypatch)
+    held = None
+    async with aclosing(listener):
+        client = await anext(listener)
+        try:
+            async with asyncio.timeout(20):
+                held = asyncio.create_task(
+                    client.get("/api/v1/npi/all?" + urlencode(query_by_name), headers=headers_by_name)
+                )
+                await asyncio.wait_for(observed.counted.wait(), timeout=5)
+                pin = observed.result["manifest"]
+                assert observed.result["total"] == 1 and pin.generation_id == initial["generation_id"]
+                assert not held.done()
+                current = await asyncio.wait_for(_publish(fixture, successor), timeout=8)
+                assert not held.done() and not observed.release.is_set()
+                observed.release.set()
+                retained = await asyncio.wait_for(held, timeout=5)
+                _assert_provider_office(retained, initial["generation_id"], "a")
+                assert [stage for stage, _, _, _ in observed.stages] == ["page", "hydration"]
+                for _, session, manifest, native_rows in observed.stages:
+                    assert session is observed.result["session"] and manifest is pin
+                    assert len(native_rows) == 1 and native_rows[0]["second_line"] == "Office A"
+                absent = await client.get("/api/v1/npi/all?" + urlencode(query_by_name), headers=headers_by_name)
+                _assert_provider_office(absent, current["generation_id"], None)
+                fresh = await client.get(
+                    "/api/v1/npi/all?" + urlencode(query_by_name | {"address_key": str(fixture.sites["b"])}),
+                    headers=headers_by_name,
+                )
+                _assert_provider_office(fresh, current["generation_id"], "b")
+        finally:
+            observed.release.set()
+            if held is not None:
+                await asyncio.wait_for(asyncio.gather(held, return_exceptions=True), timeout=5)
 
 
 def _nearby_identity_metadata():

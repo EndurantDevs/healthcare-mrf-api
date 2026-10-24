@@ -9,11 +9,14 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
 
+from process import registry_required_target_coverage as collector
 from process import registry_required_target_coverage_import as coverage_import
+from process.network_serving_read import PinnedNetworkServingManifest
 
 SNAPSHOT_ID = UUID("34567890-3456-7890-8345-34567890abcd")
 PRIVATE_MARKER = "synthetic-private-diagnostic"
@@ -292,3 +295,208 @@ def test_actual_module_rejects_arguments_before_heavy_runtime_import(tmp_path, m
     )
     assert completed.returncode == 2 and completed.stdout == b""
     assert completed.stderr == b'{"code":"invalid_arguments","status":"error"}\n'
+
+
+def _collector_values():
+    """Synthetic read results exercise collector control flow, not native admission."""
+    report = _shape()
+    return SimpleNamespace(
+        manifest=PinnedNetworkServingManifest(
+            7, str(SNAPSHOT_ID), "serving_fixture", 1, {"custom_membership": "b" * 64}, 1, "c" * 64, 1
+        ),
+        approved=SimpleNamespace(generation_id="b" * 64),
+        descriptor={
+            "component": "registry_required_target_ledger_validation",
+            "revision": 1,
+            "snapshot_id": str(SNAPSHOT_ID),
+            "artifact_sha256": "a" * 64,
+            "source_sha256": "b" * 64,
+            "source_rows": 1,
+            "target_count": 1,
+        },
+        coverage={"targets": report["targets"], "totals": {**report["totals"], "ledger_targets": 1}},
+        rows=[
+            {"isolation": "repeatable read", "readonly": "on"},
+            {"metadata_valid": True, "document": "{}", "artifact_sha256": "a" * 64, "input_sha256": "b" * 64},
+            {
+                "candidate_id": SNAPSHOT_ID,
+                "manifest_status": "current",
+                "dataset_id": SNAPSHOT_ID,
+                "schema_id": SNAPSHOT_ID,
+                "producer_id": SNAPSHOT_ID,
+                "source_recipes_json": "[]",
+                "writer_closure": "{}",
+                "current_head_in_snapshot": 7,
+            },
+            {"references_valid": True, "bundle": "{}", "review_count": 0, "ledger_count": 0, "review_references": "[]"},
+            {"valid": True, "bounded": True, "native_input": "{}", "provenance": "[]"},
+        ],
+    )
+
+
+@pytest.fixture
+def collector_read(monkeypatch):
+    state = _collector_values()
+    database = state.database = _Database(None)
+    database.is_in_transaction = Mock(return_value=True)
+    database.fetchrow = AsyncMock(side_effect=state.rows)
+    database.execute = AsyncMock(side_effect=AssertionError("Coverage collection cannot write"))
+    state.manifest_read = AsyncMock(return_value=state.manifest)
+    state.pin = AsyncMock(return_value=state.approved)
+    state.recipes, state.bundle, state.selection = Mock(), Mock(), Mock(return_value={})
+    state.ledger_native = Mock(side_effect=lambda _: json.dumps(state.descriptor).encode())
+    state.coverage_native = Mock(side_effect=lambda _: json.dumps(state.coverage).encode())
+    state.pricing = AsyncMock(side_effect=lambda _connection, report, _approved, **_options: report)
+    monkeypatch.setitem(
+        sys.modules,
+        "ptg2_address_canon",
+        SimpleNamespace(
+            validate_registry_required_target_ledger_artifact=state.ledger_native,
+            build_registry_network_coverage=state.coverage_native,
+        ),
+    )
+    monkeypatch.setattr(coverage_import, "Database", lambda: database)
+    for name, replacement in {
+        "registry_schema": lambda: "control_fixture",
+        "resolve_network_serving_manifest": state.manifest_read,
+        "pin_retained_approved_membership_source": state.pin,
+        "verify_registry_source_recipes": state.recipes,
+        "_verify_bundle": state.bundle,
+        "verify_registry_source_selection_receipt": state.selection,
+        "append_pricing_binding_metadata": state.pricing,
+    }.items():
+        monkeypatch.setattr(collector, name, replacement)
+    return state
+
+
+def _assert_collection_refusal(state, capsys, reads):
+    previous_logging = logging.root.manager.disable
+    assert coverage_import.run_command(_arguments(7)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == '{"code":"coverage_failed","status":"error"}\n'
+    assert state.database.events == ["connect", "acquire", "begin_readonly_rr", "rollback", "release", "disconnect"]
+    assert state.database.fetchrow.await_count == reads
+    assert state.database.engine.echo is True and logging.root.manager.disable == previous_logging
+    state.pricing.assert_not_awaited()
+    state.database.execute.assert_not_awaited()
+
+
+def test_host_collector_reaches_pricing_only_after_complete_report(collector_read, capsys):
+    state = collector_read
+    assert coverage_import.run_command(_arguments(7)) == 0
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert captured.err == "" and report["targets"] == _shape()["targets"]
+    assert report["provenance"]["serving"]["generation_id"] == 7
+    assert report["provenance"]["approved_map_sha256"] == state.approved.generation_id
+    assert report["assessment"]["pricing"] == "not_assessed"
+    state.pricing.assert_awaited_once()
+    assert state.pricing.await_args.args[1] == report
+    assert state.database.fetchrow.await_count == 5
+    assert state.database.events == ["connect", "acquire", "begin_readonly_rr", "commit", "release", "disconnect"]
+    state.database.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("row", "change"),
+    [
+        (1, None),
+        (1, {"metadata_valid": False}),
+        (2, None),
+        (2, {"candidate_id": UUID(int=1)}),
+        (3, None),
+        (3, {"references_valid": False}),
+        (3, {"bundle": None}),
+        (4, None),
+        (4, {"valid": False}),
+        (4, {"bounded": False}),
+    ],
+)
+def test_collector_rejects_unverified_rows_before_later_reads(collector_read, capsys, row, change):
+    state = collector_read
+    state.rows[row] = None if change is None else {**state.rows[row], **change}
+    _assert_collection_refusal(state, capsys, row + 1)
+    assert state.ledger_native.call_count == int(row > 1)
+    assert state.pin.await_count == int(row > 1)
+    assert state.recipes.call_count == int(row > 2)
+    assert state.bundle.call_count == int(row > 3)
+    state.coverage_native.assert_not_called()
+    state.selection.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("row", "field", "limit", "reads"),
+    [
+        (1, "document", collector.MAX_LEDGER_TEXT_BYTES, 2),
+        (3, "bundle", collector.MAX_BUNDLE_BYTES, 4),
+        (4, "native_input", collector.MAX_NATIVE_INPUT_BYTES, 5),
+        (3, "review_references", collector.MAX_NATIVE_INPUT_BYTES, 5),
+    ],
+)
+def test_collector_enforces_encoded_byte_limits_before_next_stage(collector_read, capsys, row, field, limit, reads):
+    state = collector_read
+    state.rows[row][field] = "é" * (limit // 2 + 1)
+    assert len(state.rows[row][field]) <= limit < len(state.rows[row][field].encode())
+    _assert_collection_refusal(state, capsys, reads)
+    assert state.ledger_native.call_count == int(row != 1)
+    assert state.bundle.call_count == int(field in {"native_input", "review_references"})
+    assert state.coverage_native.call_count == int(field == "review_references")
+    state.selection.assert_not_called()
+
+
+@pytest.mark.parametrize("result", [b"", "{}"])
+def test_collector_rejects_native_result_framing_before_pin(collector_read, capsys, result):
+    state = collector_read
+    state.ledger_native.side_effect = None
+    state.ledger_native.return_value = result
+    _assert_collection_refusal(state, capsys, 2)
+    state.ledger_native.assert_called_once()
+    state.pin.assert_not_awaited()
+    state.coverage_native.assert_not_called()
+
+
+@pytest.mark.parametrize("change", [{"artifact_sha256": "c" * 64}, {"target_count": True}])
+def test_collector_rejects_unbound_ledger_descriptor_before_pin(collector_read, capsys, change):
+    state = collector_read
+    state.descriptor.update(change)
+    _assert_collection_refusal(state, capsys, 2)
+    state.ledger_native.assert_called_once()
+    state.pin.assert_not_awaited()
+    state.coverage_native.assert_not_called()
+
+
+def test_collector_rejects_approved_pin_mismatch_before_candidate_read(collector_read, capsys):
+    state = collector_read
+    state.manifest.source_generations["custom_membership"] = "c" * 64
+    _assert_collection_refusal(state, capsys, 2)
+    state.pin.assert_awaited_once_with(state.database, approved_revision=1, control_schema=None)
+    state.recipes.assert_not_called()
+    state.coverage_native.assert_not_called()
+
+
+@pytest.mark.parametrize("change", [{"targets": []}, {"totals": {"ledger_targets": True}}])
+def test_collector_rejects_incomplete_native_coverage_before_provenance(collector_read, capsys, change):
+    state = collector_read
+    state.coverage.update(change)
+    _assert_collection_refusal(state, capsys, 5)
+    state.coverage_native.assert_called_once()
+    state.selection.assert_not_called()
+
+
+def test_collector_rejects_aggregate_report_overflow_before_pricing(collector_read, capsys):
+    state = collector_read
+    state.rows[2]["writer_closure"] = json.dumps({"synthetic_padding": "x" * collector.MAX_REPORT_BYTES})
+    _assert_collection_refusal(state, capsys, 5)
+    state.coverage_native.assert_called_once()
+    state.selection.assert_called_once_with(state.rows[2])
+
+
+@pytest.mark.parametrize("generation", [True, 0, -1, "7", 9223372036854775808])
+def test_collector_rejects_invalid_generation_before_transaction_or_read(monkeypatch, generation):
+    connection = SimpleNamespace(is_in_transaction=Mock())
+    read = AsyncMock()
+    monkeypatch.setattr(collector, "_read", read)
+    with pytest.raises(collector.RegistryRequiredTargetCoverageError, match="coverage_selector_invalid"):
+        asyncio.run(collector.read_registry_required_target_coverage(connection, SNAPSHOT_ID, generation_id=generation))
+    connection.is_in_transaction.assert_not_called()
+    read.assert_not_awaited()

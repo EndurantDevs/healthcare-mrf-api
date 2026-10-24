@@ -9,6 +9,7 @@ import struct
 import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -58,22 +59,22 @@ def _encoded(source):
     ledger_document_dict = {
         "component": "registry_required_target_ledger",
         "revision": 1,
-        "parser_version": "registry-target-ledger-v1",
+        "parser_version": "registry-target-ledger-v2",
         "ledger": {
             "source_sha256": hashlib.sha256(source).hexdigest(),
             "row_count": 1,
-            "observations": [{"source_row_ordinal": 1, "raw_cells": ["Example"] * 8, "target_keys": ["target"]}],
-            "targets": [{"target_key": "target", "fc_network_id": "1", "ribbon_id": None, "source_row_ordinals": [1]}],
+            "observations": [{"source_row_ordinal": 1, "raw_cells": ["Example"] * 6 + ["1"], "target_keys": ["fc:1"]}],
+            "targets": [{"target_key": "fc:1", "fc_network_id": "1", "source_row_ordinals": [1]}],
         },
     }
     artifact = json.dumps(ledger_document_dict, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
-    fields = (SNAPSHOT_ID.bytes, b"ledger:v1", struct.pack(">i", 1), b"accepted", b"\x01" + artifact, b"\x01[]")
+    fields = (SNAPSHOT_ID.bytes, b"ledger:v2", struct.pack(">i", 1), b"accepted", b"\x01" + artifact, b"\x01[]")
     copy = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0" + struct.pack(">h", 6)
     copy += b"".join(struct.pack(">i", len(field)) + field for field in fields) + struct.pack(">h", -1)
     descriptor_by_field = {
         "component": "registry_required_target_ledger",
         "revision": 1,
-        "parser_version": "registry-target-ledger-v1",
+        "parser_version": "registry-target-ledger-v2",
         "snapshot_id": str(SNAPSHOT_ID),
         "source_sha256": hashlib.sha256(source).hexdigest(),
         "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
@@ -505,7 +506,16 @@ def test_cancellation_during_landing_preserves_exception_and_never_retains(monke
 
 @pytest.mark.parametrize(
     "failure",
-    ["field_count", "negative_length", "overlong_field", "truncated", "extra_row", "jsonb_version", "changed_document"],
+    [
+        "field_count",
+        "negative_length",
+        "overlong_field",
+        "truncated",
+        "truncated_length",
+        "extra_row",
+        "jsonb_version",
+        "changed_document",
+    ],
 )
 def test_facade_refuses_incomplete_or_unbound_single_copy_frame(monkeypatch, failure):
     source = b"source"
@@ -525,6 +535,7 @@ def test_facade_refuses_incomplete_or_unbound_single_copy_frame(monkeypatch, fai
             "negative_length": copy[:21] + struct.pack(">i", -1) + copy[25:],
             "overlong_field": copy[:21] + struct.pack(">i", len(copy)) + copy[25:],
             "truncated": copy[:30] + b"\xff\xff",
+            "truncated_length": copy[:21] + b"\x00\x00\x00\xff\xff",
             "extra_row": copy[:-2] + copy[19:],
         }
         copy = malformed_by_failure[failure]
@@ -554,3 +565,59 @@ def test_facade_refuses_document_over_limit_even_when_copy_and_hash_fit(monkeypa
     _native(monkeypatch, (copy, json.dumps(descriptor).encode()))
     with pytest.raises(store.RegistryRequiredTargetError, match="^registry_required_target_native_unavailable$"):
         store._encode(source, _edition(source))
+
+
+@pytest.mark.parametrize("failure", ["status", "short_stream", "database"])
+def test_incomplete_landing_rolls_back(monkeypatch, failure):
+    source = b"source"
+    copy, descriptor = _encoded(source)
+    connection = _Database()
+    connection.is_in_transaction = lambda: True
+    connection.execute = AsyncMock()
+    connection.fetchval = AsyncMock(side_effect=AssertionError("Incomplete COPY must not validate landing"))
+
+    async def copy_to_table(_table, **options):
+        assert options["schema_name"] == "pg_temp" and options["format"] == "binary"
+        if failure == "database":
+            raise store.asyncpg.PostgresError(PRIVATE_MARKER)
+        expected = len(copy) - (failure == "short_stream")
+        assert options["source"].read(expected) == copy[:expected]
+        return "COPY 0" if failure == "status" else "COPY 1"
+
+    connection.copy_to_table = AsyncMock(side_effect=copy_to_table)
+    retain = AsyncMock(side_effect=AssertionError("Incomplete COPY must not retain source evidence"))
+    monkeypatch.setattr(store, "_encode", lambda *_arguments: (copy, descriptor))
+    monkeypatch.setattr(store, "_is_replay_after_retention", retain)
+    code = "retention_failed" if failure == "database" else "copy_incomplete"
+    with pytest.raises(store.RegistryRequiredTargetError, match="^registry_required_target_" + code + "$") as caught:
+        asyncio.run(store.admit_registry_required_targets(connection, source, _edition(source)))
+    assert PRIVATE_MARKER not in str(caught.value) and connection.events == ["begin", "rollback"]
+    connection.copy_to_table.assert_awaited_once()
+    connection.fetchval.assert_not_awaited()
+    retain.assert_not_awaited()
+    assert connection.execute.await_count == 1
+    assert connection.execute.await_args.args[0].startswith("CREATE TEMP TABLE")
+
+
+def test_incomplete_retention_refuses_receipt(monkeypatch):
+    source = b"source"
+    copy, descriptor = _encoded(source)
+    connection = _Database()
+    connection.is_in_transaction = lambda: True
+    connection.execute = AsyncMock(side_effect=[None, "INSERT 0 1", "INSERT 0 0"])
+    connection.fetchval = AsyncMock(return_value=True)
+    connection.fetchrow = AsyncMock(return_value={"records": 0, "matching": 0})
+
+    async def copy_to_table(_table, **options):
+        assert options["source"].read() == copy
+        return "COPY 1"
+
+    connection.copy_to_table = AsyncMock(side_effect=copy_to_table)
+    monkeypatch.setattr(store, "_encode", lambda *_arguments: (copy, descriptor))
+    with pytest.raises(store.RegistryRequiredTargetError, match="^registry_required_target_retention_incomplete$"):
+        asyncio.run(store.admit_registry_required_targets(connection, source, _edition(source)))
+    assert connection.events == ["begin", "rollback"]
+    assert connection.fetchval.await_count == 2 and connection.fetchrow.await_count == 1
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert len(statements) == 3 and statements[0].startswith("CREATE TEMP TABLE")
+    assert ".registry_source_snapshot" in statements[1] and ".registry_source_observation SELECT" in statements[2]

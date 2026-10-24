@@ -661,6 +661,16 @@ def test_compiled_catalog_and_company_links_keep_typed_identity():
     assert validated_by_field["directory_available"] is True and validated_by_field["priceable"] is False
     with pytest.raises(ValueError, match="invalid_network_id"):
         catalog(_wire([{**catalog_by_field, "network_id": True}]))
+    unsupported_alias_by_field = {
+        "source_system": "source",
+        "source_id": "source-one",
+        "alias_type": "unsupported_alias_type",
+        "alias_value": "000042",
+        "scope_key": "scope-one",
+        "evidence_id": "evidence-one",
+    }
+    with pytest.raises(ValueError, match="invalid_row"):
+        catalog(_wire([{**catalog_by_field, "source_aliases": [unsupported_alias_by_field]}]))
     validate = _compiled_export("validate_company_network_assertions")
     assertion_by_field = {
         "company_id": _identity(2),
@@ -829,14 +839,16 @@ def test_compiled_fhir_network_projection_preserves_reference_order_and_copy():
 @pytest.fixture
 def native_ledger_artifact():
     source = (
-        b"COMPANY_ALIAS,COMPANY_NAME,PLAN_NAME,PLAN_TYPE,PLAN_CARRIER,FIND_CARE_NETWORK_NAME,NETWORK_FC_ID,RIBBON_IDS\r\n"
-        b"Example,Company,Plan,PPO,Carrier,Network,123,[]\r\n"
+        b"COMPANY_ALIAS,COMPANY_NAME,PLAN_NAME,PLAN_TYPE,PLAN_CARRIER,FIND_CARE_NETWORK_NAME,NETWORK_FC_ID\r\n"
+        b"Example,Company,Plan,PPO,Carrier,Network,123\r\n"
     )
     ledger = json.loads(_compiled_export("parse_registry_target_ledger")(source))
+    assert len(ledger["observations"][0]["raw_cells"]) == 7
+    assert ledger["targets"] == [{"target_key": "fc:123", "fc_network_id": "123", "source_row_ordinals": [1]}]
     wire, descriptor_bytes = _compiled_export("encode_registry_target_ledger_artifact")(source, _identity(4))
     descriptor = json.loads(descriptor_bytes)
     fields = _copy_fields(wire, 6)[0]
-    assert fields[:4] == [UUID(_identity(4)).bytes, b"ledger:v1", struct.pack(">i", 1), b"accepted"]
+    assert fields[:4] == [UUID(_identity(4)).bytes, b"ledger:v2", struct.pack(">i", 1), b"accepted"]
     assert fields[4][0] == 1 and fields[5] == b"\x01[]"
     document = json.loads(fields[4][1:])
     assert document["ledger"] == ledger
@@ -860,7 +872,7 @@ def test_compiled_review_artifact_roundtrip_binds_exact_retained_ledger(native_l
         "ledger_artifact_sha256": ledger["artifact_sha256"],
         "decisions": [
             {
-                "target_key": "fc:123:ribbon:missing",
+                "target_key": "fc:123",
                 "resolution_status": "unresolved",
                 "network_id": None,
                 "source_binding": None,
@@ -873,7 +885,7 @@ def test_compiled_review_artifact_roundtrip_binds_exact_retained_ledger(native_l
     encode = _compiled_export("encode_registry_required_target_review_artifact")
     wire, descriptor_bytes = encode(_wire(request_by_field), _wire(ledger["document"]), _identity(5))
     fields = _copy_fields(wire, 6)[0]
-    assert fields[:4] == [UUID(_identity(5)).bytes, b"review:v1", struct.pack(">i", 1), b"accepted"]
+    assert fields[:4] == [UUID(_identity(5)).bytes, b"review:v2", struct.pack(">i", 1), b"accepted"]
     descriptor = json.loads(descriptor_bytes)
     assert descriptor["resolved_count"] == 0
     assert descriptor["artifact_sha256"] == hashlib.sha256(fields[4][1:]).hexdigest()

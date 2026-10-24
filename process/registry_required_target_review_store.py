@@ -27,7 +27,7 @@ from process.registry_source_observation_store import _namespace
 from process.registry_source_selection_receipt import _unique_object
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
-PARSER_VERSION = "registry-target-review-v1"
+PARSER_VERSION = "registry-target-review-v2"
 EVIDENCE_PREFIX = "required-target-review:"
 MAX_LEDGER_TEXT_BYTES = 32 * 1024 * 1024
 _DESCRIPTOR_FIELDS = {
@@ -53,10 +53,10 @@ async def _read_ledger(connection, namespace, snapshot_id):
         FROM {namespace}.registry_source_snapshot snapshot
         JOIN {namespace}.registry_source_observation observation USING(snapshot_id)
         WHERE snapshot.snapshot_id=$1 AND snapshot.source_system='required-network-targets'
-          AND snapshot.source_id='required-networks' AND snapshot.parser_version='registry-target-ledger-v1'
+          AND snapshot.source_id='required-networks' AND snapshot.parser_version='registry-target-ledger-v2'
           AND snapshot.edition_id=snapshot.input_sha256
           AND snapshot.reporting_year IS NULL AND snapshot.published_at IS NULL
-          AND observation.source_record_key='ledger:v1' AND observation.source_row_number=1
+          AND observation.source_record_key='ledger:v2' AND observation.source_row_number=1
           AND observation.status='accepted' AND observation.issues_json='[]'::jsonb
           AND (SELECT count(*) FROM {namespace}.registry_source_observation complete
             WHERE complete.snapshot_id=snapshot.snapshot_id)=1
@@ -145,7 +145,7 @@ async def _stage(connection, namespace, copy_bytes, edition, ledger_snapshot_id,
               THEN (decision->>'network_id')::integer END END AS network_id
           FROM decisions WHERE decision->>'resolution_status'='resolved'
         ) SELECT count(*)=1 AND COALESCE(bool_and(
-          snapshot_id=$1 AND source_record_key='review:v1' AND source_row_number=1
+          snapshot_id=$1 AND source_record_key='review:v2' AND source_row_number=1
           AND status='accepted' AND issues_json='[]'::jsonb
           AND observation_json->>'component'='registry_required_target_review'
           AND observation_json->'revision'='1'::jsonb AND observation_json->>'parser_version'=$2
