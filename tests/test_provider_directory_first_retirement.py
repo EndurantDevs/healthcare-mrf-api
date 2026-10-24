@@ -40,6 +40,34 @@ def test_rewritten_retirement_routines_keep_source_custody(renderer):
         custody._require_function(routine_by_field | {"prosrc": routine_by_field["prosrc"] + " changed"}, schema, 100)
 
 
+@pytest.mark.parametrize("index", [0, 1])
+def test_owner_lineage_routine_variants_preserve_exact_source_custody(index):
+    from db import migration_provider_directory_first_retirement_owner_lineage as migration
+    from process import network_fhir_source_custody as custody
+
+    schema = "custody_contract"
+    for sql in migration.replacements(schema)[index]:
+        name = sql.split("CREATE FUNCTION ", 1)[1].split("(", 1)[0].split(".")[-1].strip('"')
+        routine_by_field = {
+            "proname": name,
+            "prosrc": sql.split("AS $function$\n", 1)[1].rsplit("\n    $function$;", 1)[0],
+            "lanname": "sql",
+            "provolatile": "s",
+            "prosecdef": True,
+            "proowner": 100,
+            "proconfig": ["search_path=pg_catalog", *(["TimeZone=UTC"] if index == 0 else [])],
+        }
+        custody._require_function(routine_by_field, schema, 100)
+        for mutation in (
+            {"prosrc": routine_by_field["prosrc"] + " changed"},
+            {"proowner": 101},
+            {"prosecdef": False},
+            {"proconfig": ["search_path=public"]},
+        ):
+            with pytest.raises(custody.FHIRSourceCustodyError):
+                custody._require_function(routine_by_field | mutation, schema, 100)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["preview", "apply"])
 @pytest.mark.parametrize("first_acquisition", [False, True])
@@ -136,6 +164,63 @@ async def test_first_selection_uses_root_locks_and_exact_runtime_absence(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("later_attempts", [1, 2])
+async def test_first_selection_retains_owner_before_later_failed_attempts(monkeypatch, later_attempts):
+    stopped = AsyncMock()
+    monkeypatch.setattr(runtime, "require_stopped_lineage", stopped)
+    database = FirstDatabase()
+    for number in range(later_attempts):
+        database.lineage.append(
+            database.lineage[-1]
+            | {
+                "run_id": f"run-later-{number}",
+                "retry_of_run_id": database.lineage[-1]["run_id"],
+                "depth": len(database.lineage),
+            }
+        )
+    database.evidence["terminal_run_count"] = len(database.lineage)
+    database.lock_results = [True] * (3 + 2 * len(database.lineage))
+    selected = await selected_terminal_root_retirement(database, first_request())
+    assert selected.request.owner_run_id == database.target["import_run_id"] == "run-owner"
+    assert selected.marker_by_field["evidence"]["terminal_run_count"] == len(database.lineage)
+    stopped.assert_awaited_once_with(tuple(database.lineage))
+
+
+@pytest.mark.asyncio
+async def test_published_predecessor_still_requires_owner_at_leaf():
+    database = SelectionDatabase()
+    database.lineage.append(
+        database.lineage[-1]
+        | {
+            "run_id": "run-later",
+            "retry_of_run_id": "run-owner",
+            "depth": 2,
+        }
+    )
+    with pytest.raises(TerminalRootRetirementError, match="evidence_invalid"):
+        await selected_terminal_root_retirement(database, request())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["foreign-owner", "running", "unfinished", "recent"])
+async def test_first_owner_ancestry_requires_complete_terminal_history(monkeypatch, change):
+    stopped = AsyncMock()
+    monkeypatch.setattr(runtime, "require_stopped_lineage", stopped)
+    database = FirstDatabase()
+    if change == "foreign-owner":
+        database.lineage[-1]["run_id"] = "run-unrelated"
+    elif change == "running":
+        database.lineage[-1]["status"] = "running"
+    elif change == "unfinished":
+        database.lineage[-1]["finished_at"] = None
+    else:
+        database.lineage[-1]["terminal_age_satisfied"] = False
+    with pytest.raises(TerminalRootRetirementError, match="evidence_invalid"):
+        await selected_terminal_root_retirement(database, first_request())
+    stopped.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_first_selection_rejects_current_dataset_before_runtime_probe(monkeypatch):
     stopped = AsyncMock()
     monkeypatch.setattr(runtime, "require_stopped_lineage", stopped)
@@ -161,7 +246,7 @@ async def test_first_selection_rechecks_children_committed_before_parent_fence(m
         return await scalar(sql, **params)
 
     monkeypatch.setattr(database, "scalar", insert_late_child)
-    with pytest.raises(TerminalRootRetirementError, match="evidence_invalid"):
+    with pytest.raises(TerminalRootRetirementError, match="evidence_changed"):
         await selected_terminal_root_retirement(database, first_request())
     stopped.assert_not_awaited()
 

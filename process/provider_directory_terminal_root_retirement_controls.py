@@ -5,6 +5,7 @@ import json
 import re
 
 from db import migration_provider_directory_first_acquisition_retirement as first
+from db import migration_provider_directory_first_retirement_owner_lineage as owner_lineage
 from db import migration_provider_directory_terminal_root_retirement_evidence as evidence
 from db import migration_provider_directory_terminal_root_retirement_guards as guards
 from process.provider_directory_terminal_root_retirement_contract import TerminalRootRetirementError, schema_name
@@ -37,6 +38,12 @@ def _retirement_contracts(schema, native):
             guards.child_guard_function_sql(schema),
         )
     ]
+    alternate_body_by_signature = {
+        _function_contract(old)["signature"]: _function_contract(new)["body"]
+        for old, new in owner_lineage.replacements(schema)
+    }
+    for function in functions:
+        function["alternate_body"] = alternate_body_by_signature.get(function["signature"])
     roots = (
         ("provider_directory_endpoint_dataset", "dataset", guards.PARENT_GUARD),
         ("import_run", "import_run", guards.IMPORT_RUN_GUARD),
@@ -68,14 +75,16 @@ async def require_retirement_controls(database):
         r"""
         SELECT NOT EXISTS (
             SELECT FROM pg_catalog.jsonb_to_recordset(CAST(:functions AS jsonb))
-                AS expected(signature text, body text, settings jsonb, language text, volatility text)
+                AS expected(signature text, body text, alternate_body text, settings jsonb, language text, volatility text)
             LEFT JOIN pg_catalog.pg_proc p ON p.oid=pg_catalog.to_regprocedure(expected.signature)
             LEFT JOIN pg_catalog.pg_language l ON l.oid=p.prolang
             WHERE p.oid IS NULL OR NOT p.prosecdef OR p.prokind<>'f'
                OR p.proisstrict OR p.proretset
                OR pg_catalog.to_jsonb(p.proconfig) IS DISTINCT FROM expected.settings
                OR l.lanname<>expected.language OR p.provolatile::text<>expected.volatility
-               OR pg_catalog.btrim(pg_catalog.regexp_replace(p.prosrc,'\s+',' ','g'))<>expected.body
+               OR (pg_catalog.btrim(pg_catalog.regexp_replace(p.prosrc,'\s+',' ','g'))<>expected.body
+                   AND (expected.alternate_body IS NULL OR
+                       pg_catalog.btrim(pg_catalog.regexp_replace(p.prosrc,'\s+',' ','g'))<>expected.alternate_body))
                OR EXISTS (SELECT FROM pg_catalog.pg_proc overload
                    WHERE overload.pronamespace=p.pronamespace AND overload.proname=p.proname
                      AND overload.oid<>p.oid)
