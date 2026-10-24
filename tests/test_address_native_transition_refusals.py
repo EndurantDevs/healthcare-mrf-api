@@ -547,7 +547,7 @@ async def test_native_sealing_read_authority(already_owned, unsafe, previous_sel
                 "previous_owner_read_columns": previous_read_columns,
             }
             return _result([catalog_by_field])
-        if query.startswith("SELECT quote_ident(principal.rolname)"):
+        if query.startswith("SELECT DISTINCT quote_ident(principal.rolname)"):
             return _result(['"synthetic_reader"'])
         if query.startswith("SELECT quote_ident(attname)"):
             return _result(['"evidence_id"', '"payload"'])
@@ -579,11 +579,91 @@ async def test_native_sealing_read_authority(already_owned, unsafe, previous_sel
         assert not any(query.startswith("ALTER TABLE") for query in queries)
     else:
         assert sum(query.startswith("REVOKE INSERT,UPDATE") for query in queries) == 2
-        assert sum(query.startswith("REVOKE INSERT (") for query in queries) == 2
+        assert not any(query.startswith("REVOKE INSERT (") for query in queries)
     if not unsafe:
         assert sum(query.startswith("REVOKE USAGE,UPDATE ON SEQUENCE") for query in queries) == 2
         assert session.scalar.await_args.args[1] == {"relation_oids": [201], "owner_oid": 52}
         assert "has_sequence_privilege" in str(session.scalar.await_args.args[0])
+
+
+def _sealing_acl_principals(query, parameters):
+    """Model a dropped unrelated role and distinct table, column and sequence writers."""
+    if "aclexplode(c.relacl)" not in query:
+        return _result(['"unrelated_dropped"'])
+    assert "c.oid=:oid" in query and "acl.grantee" in query
+    assert "JOIN pg_roles principal ON principal.oid=mutation.grantee" in query
+    assert preparation._ORDINARY_PRINCIPAL_SQL in query
+    assert "acl.privilege_type=ANY(CAST(:privileges AS text[]))" in query
+    assert parameters["owner_oid"] == 52
+    if parameters["oid"] == 100:
+        assert "aclexplode(a.attacl)" in query and "a.attrelid=:oid" in query
+        assert "a.attnum>0 AND NOT a.attisdropped" in query
+        assert set(parameters["privileges"]) == {"INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}
+        return _result(['"table_writer"', '"column_writer"'])
+    assert parameters["oid"] in (201, 202) and "pg_attribute" not in query
+    assert set(parameters["privileges"]) == {"USAGE", "UPDATE"}
+    return _result([f'"sequence_writer_{parameters["oid"]}"'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_owned", [False, True])
+async def test_sealing_ignores_unrelated_disappearing_roles(monkeypatch, already_owned):
+    """Close actual write grants without targeting unrelated or other-sequence principals."""
+    queries = []
+    revoked_principals = set()
+
+    async def execute_sealing(statement, parameters=None):
+        query = str(statement)
+        queries.append(query)
+        if query.startswith("SELECT quote_ident(n.nspname)"):
+            return _result(
+                [
+                    {
+                        "name": '"candidate"."fact"',
+                        "owner": '"owner"',
+                        "relowner": 52 if already_owned else 54,
+                        "previous_owner": '"prior"',
+                        "previous_owner_can_select": False,
+                        "previous_owner_read_columns": [],
+                    }
+                ]
+            )
+        if "quote_ident(principal.rolname)" in query:
+            return _sealing_acl_principals(query, parameters)
+        if query.startswith("SELECT quote_ident(attname)"):
+            return _result(['"id"'])
+        if query.startswith("SELECT s.oid"):
+            return _result([{"oid": oid, "name": f'"candidate"."sequence_{oid}"'} for oid in (201, 202)])
+        if 'FROM "unrelated_dropped"' in query:
+            raise RuntimeError("unrelated role disappeared")
+        if query.startswith("REVOKE"):
+            principal = query.rsplit(" FROM ", 1)[1]
+            if principal != "PUBLIC":
+                if principal in revoked_principals:
+                    raise RuntimeError("write grantee disappeared after its last grant was revoked")
+                revoked_principals.add(principal)
+        assert query.startswith(("ALTER TABLE", "ALTER SEQUENCE", "REVOKE")), query
+        return _result()
+
+    monkeypatch.setattr(preparation, "_publisher_authority", AsyncMock(return_value=52))
+    session = SimpleNamespace(execute=AsyncMock(side_effect=execute_sealing), scalar=AsyncMock(return_value=False))
+    await preparation._seal_published_relation(session, 100, 52)
+    expected_revocations = []
+    if not already_owned:
+        for principal in ("PUBLIC", '"table_writer"', '"column_writer"'):
+            expected_revocations.append(
+                f'REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER ON "candidate"."fact" FROM {principal}'
+            )
+    for oid in (201, 202):
+        for principal in ("PUBLIC", f'"sequence_writer_{oid}"'):
+            expected_revocations.append(
+                f'REVOKE USAGE,UPDATE ON SEQUENCE "candidate"."sequence_{oid}" FROM {principal}'
+            )
+    assert [query for query in queries if query.startswith("REVOKE")] == expected_revocations
+    assert [call.args[1] for call in session.scalar.await_args_list] == [
+        {"relation_oids": [100], "owner_oid": 52},
+        {"relation_oids": [201, 202], "owner_oid": 52},
+    ]
 
 
 def _loaded_inputs():

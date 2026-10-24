@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -239,138 +241,204 @@ def _recorded_pids(path: Path) -> tuple[int, ...]:
     return tuple(int(value) for value in record.split())
 
 
-def _process_descriptor_targets(process_id: int) -> dict[str, str]:
-    target_by_fd = {}
-    for descriptor in sorted(Path(f"/proc/{process_id}/fd").iterdir()):
-        try:
-            target_by_fd[descriptor.name] = os.readlink(descriptor)
-        except OSError as fd_error:
-            target_by_fd[descriptor.name] = repr(fd_error)
-    return target_by_fd
+def _process_numeric_state(process_id):
+    state_by_field = {"pid": process_id, "pgid": None, "state": None, "start_ticks": None}
+    try:
+        state_by_field["pgid"] = os.getpgid(process_id)
+    except OSError:
+        return state_by_field
+    try:
+        with Path(f"/proc/{process_id}/stat").open("rb") as stream:
+            content = stream.read(4097)
+    except OSError:
+        return state_by_field
+    if len(content) > 4096:
+        raise ValueError("process state exceeds diagnostic limit")
+    fields = content.rsplit(b") ", 1)[1].split()
+    if fields[0] in {b"R", b"S", b"D", b"Z", b"T", b"t", b"X", b"x", b"K", b"W", b"P", b"I"}:
+        state_by_field["state"] = fields[0].decode("ascii")
+    state_by_field["start_ticks"] = int(fields[19])
+    return state_by_field
+
+
+def _wrapper_phase_markers(state_dir):
+    phases = dict.fromkeys(
+        ("start", "direct-exec", "provider", "provider-complete", "blocked", "peer-wait", "peer-fail"), False
+    )
+    for index, path in enumerate(state_dir.glob("wrapper-*")):
+        if index >= 8 or path.is_symlink():
+            raise ValueError("wrapper state exceeds diagnostic limit")
+        with path.open("rb") as stream:
+            content = stream.read(1025)
+        if len(content) > 1024:
+            raise ValueError("wrapper log exceeds diagnostic limit")
+        for phase in phases:
+            phases[phase] |= b"phase=" + phase.encode() in content.splitlines()
+    return phases
 
 
 def _blocked_decoder_timeout_diagnostic(state_dir: Path, error) -> str:
-    diagnostic_by_kind = {"stdout": repr(error.stdout), "stderr": repr(error.stderr)}
+    """Retain bounded fingerprints and fixed markers without emitting process contents."""
+    stderr = error.stderr or b""
+    sample = stderr[:65536]
+    pid_path = state_dir / "blocked-pids"
     try:
-        state_by_name = diagnostic_by_kind["state"] = {}
-        process_ids = set()
-        for path in sorted(state_dir.iterdir()):
-            role, _, process_id = path.name.partition("-")
-            if role in {"wrapper", "descendant"} and process_id.isdecimal() and int(process_id) > 0:
-                process_ids.add(int(process_id))
-            try:
-                state_by_name[path.name] = (
-                    "symlink"
-                    if path.is_symlink()
-                    else "directory"
-                    if path.is_dir()
-                    else path.read_text(encoding="utf-8", errors="backslashreplace")
-                )
-            except OSError as state_error:
-                state_by_name[path.name] = repr(state_error)
-        process_by_pid = diagnostic_by_kind["processes"] = {}
-        for process_id in sorted(process_ids):
-            details_by_kind = process_by_pid[str(process_id)] = {}
-            try:
-                details_by_kind["pgid"] = os.getpgid(process_id)
-                details_by_kind["fds"] = _process_descriptor_targets(process_id)
-            except OSError as process_error:
-                details_by_kind["error"] = repr(process_error)
-    except Exception as diagnostic_error:
-        diagnostic_by_kind["diagnostic_error"] = repr(diagnostic_error)
-    return json.dumps(diagnostic_by_kind, indent=2, sort_keys=True)
+        with pid_path.open("rb") as stream:
+            raw = stream.read(129)
+    except FileNotFoundError:
+        raw = b""
+    try:
+        process_ids = tuple(int(encoded_pid) for encoded_pid in raw.split())
+    except ValueError:
+        process_ids = ()
+    has_complete_pair = (
+        len(raw) <= 128
+        and raw.endswith(b"\n")
+        and len(process_ids) == 2
+        and len(set(process_ids)) == 2
+        and min(process_ids) > 1
+    )
+    return json.dumps(
+        {
+            "stderr_bytes": len(stderr),
+            "stderr_sample_bytes": len(sample),
+            "stderr_sample_sha256": hashlib.sha256(sample).hexdigest(),
+            "error_markers": {
+                name: name.encode() in sample
+                for name in ("indexed range producer", "rapidgzip failed", "exit status: 42")
+            },
+            "state_markers": {
+                name: (state_dir / name).exists() for name in ("provider-range-complete", "blocked-pids")
+            },
+            "phases": _wrapper_phase_markers(state_dir),
+            "complete_pid_pair": has_complete_pair,
+            "processes": [_process_numeric_state(process_id) for process_id in process_ids]
+            if has_complete_pair
+            else [],
+        },
+        sort_keys=True,
+    )
 
 
 @pytest.mark.parametrize("pid_text", (None, "43210 4", "43210 unfinished\n", "43210 43211\n"))
-def test_blocked_decoder_timeout_preserves_streams_before_cleanup(
-    tmp_path,
-    monkeypatch,
-    pid_text,
-):
+@pytest.mark.parametrize("capture_error", [None, RuntimeError, KeyboardInterrupt])
+def test_timeout_projection_precedes_cleanup(tmp_path, monkeypatch, pid_text, capture_error):
+    """Neither capture failures nor partial markers may prevent the original cleanup."""
     state_dir = tmp_path / "state"
     if pid_text is not None:
         state_dir.mkdir()
         (state_dir / "blocked-pids").write_text(pid_text, encoding="ascii")
         (state_dir / "wrapper-pending").write_text("phase=sta", encoding="ascii")
     error = subprocess.TimeoutExpired(
-        ["scanner"],
+        ["/synthetic/command", "--synthetic"],
         20,
         output=b"config=" + b"x" * 20000 + b" stdout-tail",
         stderr=b"progress=" + b"y" * 20000 + b" stderr-tail",
     )
-
     events = []
     original_diagnostic = _blocked_decoder_timeout_diagnostic
+    capture_exception = capture_error("synthetic capture error") if capture_error else None
 
     def fail_run(*_args, **_kwargs):
         raise error
 
     def capture_diagnostic(state_dir, error):
         events.append("diagnostic")
+        if capture_exception is not None:
+            raise capture_exception
         return original_diagnostic(state_dir, error)
 
     monkeypatch.setattr(shutil, "which", lambda _name: "rapidgzip")
     monkeypatch.setattr(_SUPPORT, "_built_scanner_binary", lambda: Path("scanner"))
-    monkeypatch.setitem(
-        globals(),
-        "_blocked_decoder_scanner_input",
-        lambda *_args: (Path("fixture.gz"), state_dir, {}),
-    )
+    monkeypatch.setitem(globals(), "_blocked_decoder_scanner_input", lambda *_args: (Path("fixture.gz"), state_dir, {}))
     monkeypatch.setitem(globals(), "_blocked_decoder_timeout_diagnostic", capture_diagnostic)
+    monkeypatch.setitem(
+        globals(), "_process_numeric_state", lambda pid: {"pid": pid, "pgid": None, "state": None, "start_ticks": None}
+    )
     monkeypatch.setattr(subprocess, "run", fail_run)
     monkeypatch.setattr(os, "killpg", lambda pid, _signal: events.append(pid))
-    with pytest.raises(pytest.fail.Exception, match="scanner hung") as failure:
+    expected_error = KeyboardInterrupt if capture_error is KeyboardInterrupt else pytest.fail.Exception
+    with pytest.raises(expected_error) as failure:
         test_indexed_peer_failure_interrupts_blocked_decoder_and_descendants(tmp_path)
-
-    diagnostic = json.loads(str(failure.value).split("\n", 1)[1])
-    assert diagnostic["stdout"] == repr(error.stdout)
-    assert diagnostic["stderr"] == repr(error.stderr)
     assert events == (["diagnostic", 43210, 43211] if pid_text == "43210 43211\n" else ["diagnostic"])
-    if pid_text is not None:
-        assert diagnostic["state"]["blocked-pids"] == pid_text
-        assert diagnostic["state"]["wrapper-pending"] == "phase=sta"
-        assert diagnostic["processes"] == {}
+    assert failure.value.__context__ is None
+    if capture_error is KeyboardInterrupt:
+        assert failure.value is capture_exception and failure.value.__suppress_context__
+        return
+    diagnostic = json.loads(str(failure.value).split("\n", 1)[1])
+    for forbidden_text in ("stdout-tail", "stderr-tail", "phase=sta", "/synthetic/command", "synthetic capture error"):
+        assert forbidden_text not in str(failure.value)
+    if capture_error:
+        assert diagnostic == {"capture_error": True}
     else:
-        assert "FileNotFoundError" in diagnostic["diagnostic_error"]
+        assert diagnostic["stderr_bytes"] == diagnostic["stderr_sample_bytes"] == len(error.stderr)
+        assert diagnostic["stderr_sample_sha256"] == hashlib.sha256(error.stderr).hexdigest()
+        assert diagnostic["state_markers"]["blocked-pids"] is (pid_text is not None)
+        assert diagnostic["complete_pid_pair"] is (pid_text == "43210 43211\n")
+        assert [process_state["pid"] for process_state in diagnostic["processes"]] == (
+            [43210, 43211] if diagnostic["complete_pid_pair"] else []
+        )
+        assert not any(diagnostic["phases"].values())
 
 
+@pytest.mark.parametrize("missing_process", [False, True])
 def test_blocked_decoder_timeout_diagnostic_captures_only_recorded_processes(
     tmp_path,
     monkeypatch,
+    missing_process,
 ):
-    (tmp_path / "wrapper-43210").write_text("phase=blocked\n", encoding="ascii")
+    (tmp_path / "blocked-pids").write_text("43210 43211\n", encoding="ascii")
+    (tmp_path / "wrapper-43210").write_text("phase=blocked\n/synthetic/not-recorded\n", encoding="ascii")
+    (tmp_path / "wrapper-99999").write_text("phase=peer-wait\n", encoding="ascii")
     (tmp_path / "descendant-43211").write_text("parent=43210\n", encoding="ascii")
-    original_iterdir = Path.iterdir
+    original_open = Path.open
     probed_pids = []
 
     def getpgid(process_id):
         probed_pids.append(process_id)
         assert process_id in (43210, 43211)
+        if missing_process and process_id == 43211:
+            raise ProcessLookupError("synthetic process already exited")
         return 43210
 
-    def iterdir(path):
-        if path in (Path("/proc/43210/fd"), Path("/proc/43211/fd")):
-            return iter((path / "1", path / "2"))
-        return original_iterdir(path)
+    def open_stat(path, *args, **kwargs):
+        if path in (Path("/proc/43210/stat"), Path("/proc/43211/stat")):
+            fields = [b"S", b"1", b"43210", b"43210", *([b"0"] * 15), b"12345"]
+            return io.BytesIO(path.parent.name.encode() + b" (synthetic-command-name) " + b" ".join(fields))
+        return original_open(path, *args, **kwargs)
 
-    def readlink(path):
-        if path.name == "2":
-            raise FileNotFoundError("descriptor closed")
-        return "pipe:[12345]"
+    def readlink(_path):
+        pytest.fail("diagnostics must not inspect descriptor targets")
 
     monkeypatch.setattr(os, "getpgid", getpgid)
-    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(Path, "open", open_stat)
     monkeypatch.setattr(os, "readlink", readlink)
-    error = subprocess.TimeoutExpired(["scanner"], 20, output=b"out", stderr=b"err")
+    error = subprocess.TimeoutExpired(
+        ["scanner"],
+        20,
+        output=b"synthetic-stdout",
+        stderr=b"rapidgzip failed\n" + b"x" * 70000 + b"synthetic-stderr-tail",
+    )
 
     diagnostic = json.loads(_blocked_decoder_timeout_diagnostic(tmp_path, error))
 
     assert probed_pids == [43210, 43211]
-    assert set(diagnostic["processes"]) == {"43210", "43211"}
-    for process in diagnostic["processes"].values():
-        assert process["pgid"] == 43210
-        assert process["fds"]["1"] == "pipe:[12345]"
-        assert "descriptor closed" in process["fds"]["2"]
+    assert [process_state["pid"] for process_state in diagnostic["processes"]] == [43210, 43211]
+    assert diagnostic["processes"][0] == {"pid": 43210, "pgid": 43210, "state": "S", "start_ticks": 12345}
+    assert diagnostic["processes"][1]["pgid"] == (None if missing_process else 43210)
+    assert diagnostic["stderr_sample_bytes"] == 65536 and diagnostic["stderr_bytes"] == len(error.stderr)
+    assert diagnostic["stderr_sample_sha256"] == hashlib.sha256(error.stderr[:65536]).hexdigest()
+    assert diagnostic["error_markers"]["rapidgzip failed"] is True
+    assert diagnostic["phases"]["blocked"] and diagnostic["phases"]["peer-wait"]
+    for forbidden_text in (
+        "synthetic-stdout",
+        "synthetic-stderr-tail",
+        "/synthetic/not-recorded",
+        "synthetic-command-name",
+        "/proc/",
+        "fds",
+    ):
+        assert forbidden_text not in json.dumps(diagnostic)
 
 
 def _is_process_running(process_id: int) -> bool:
@@ -438,6 +506,7 @@ def test_indexed_peer_failure_interrupts_blocked_decoder_and_descendants(tmp_pat
     )
     scanner_binary = _SUPPORT._built_scanner_binary()
     started_at = time.monotonic()
+    timeout_diagnostic = capture_interruption = None
     try:
         completed = subprocess.run(
             [str(scanner_binary), "--compact-serving", str(artifact)],
@@ -448,19 +517,29 @@ def test_indexed_peer_failure_interrupts_blocked_decoder_and_descendants(tmp_pat
             timeout=20,
         )
     except subprocess.TimeoutExpired as error:
-        diagnostic = _blocked_decoder_timeout_diagnostic(state_dir, error)
-        pid_path = state_dir / "blocked-pids"
         try:
-            process_ids = _recorded_pids(pid_path)
-        except OSError, ValueError:
-            process_ids = ()
-        for process_id in process_ids:
+            timeout_diagnostic = _blocked_decoder_timeout_diagnostic(state_dir, error)
+        except Exception:
+            timeout_diagnostic = json.dumps({"capture_error": True})
+        except BaseException as interruption:
+            capture_interruption = interruption
+        finally:
+            pid_path = state_dir / "blocked-pids"
             try:
-                os.killpg(process_id, signal.SIGKILL)
-            except OSError:
-                continue
+                process_ids = _recorded_pids(pid_path)
+            except OSError, ValueError:
+                process_ids = ()
+            for process_id in process_ids:
+                try:
+                    os.killpg(process_id, signal.SIGKILL)
+                except OSError:
+                    continue
+    if capture_interruption is not None:
+        capture_interruption.__context__ = None
+        raise capture_interruption from None
+    if timeout_diagnostic is not None:
         pytest.fail(
-            f"scanner hung after indexed rapidgzip peer failure\n{diagnostic}",
+            f"scanner hung after indexed rapidgzip peer failure\n{timeout_diagnostic}",
             pytrace=False,
         )
 

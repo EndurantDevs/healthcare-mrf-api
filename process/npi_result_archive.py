@@ -2011,7 +2011,7 @@ async def _admit_automatic_cutover(
         raise NpiResultArchiveError("NPI automatic generation is stale or unrelated") from error
 
 
-async def _preserve_npi_input_reads(session, ownership, incumbent):
+async def _preserve_npi_input_reads(session, ownership, incumbent, expected_stage_owner_oid):
     from process.native_publication_read_access import preserve_publication_reads
 
     connection = await session.connection()
@@ -2023,6 +2023,7 @@ async def _preserve_npi_input_reads(session, ownership, incumbent):
             live_table=name,
             stage_schema=ownership.schema_name,
             stage_table=name,
+            expected_stage_owner_oid=expected_stage_owner_oid,
         )
 
 
@@ -2033,8 +2034,9 @@ async def _activate_npi_relations(
     incumbent: NpiIncumbent,
     manifest: NpiResultManifest,
     validation: NpiValidationReceipt,
+    expected_stage_owner_oid: int,
 ) -> NpiActivationReceipt:
-    await _preserve_npi_input_reads(session, ownership, incumbent)
+    await _preserve_npi_input_reads(session, ownership, incumbent, expected_stage_owner_oid)
     await _remove_npi_clone_freeze(session, ownership)
     await install_npi_stage_mutation_guards(
         session,
@@ -2131,6 +2133,7 @@ async def activate_validated_npi_stage(
         incumbent=incumbent,
         manifest=validated_manifest,
         validation=validation,
+        expected_stage_owner_oid=cutover.expected_stage_owner_oid,
     )
     await on_activated(session, receipt)
     return receipt

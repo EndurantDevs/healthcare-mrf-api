@@ -1155,6 +1155,100 @@ async def _publish_nucc_handoff_generation(session, handoff):
     )
 
 
+async def _rotate_family_relations(session, spec, ownership, expected_incumbent) -> str | None:
+    """Preserve incumbent reads and exchange the already locked, verified family heaps."""
+    from process import reference_family_archive as native
+
+    if spec.importer_id == "mrf":
+        ordinary_predecessors = ", ".join(
+            f"{native._quoted(expected_incumbent.schema_name)}.{native._quoted(table_name + '_old')}"
+            for table_name in spec.table_names
+        )
+        await session.execute(text(f"DROP TABLE IF EXISTS {ordinary_predecessors} RESTRICT"))
+    incumbent_oids_by_name = dict(expected_incumbent.relation_oids)
+    predecessor_schema = None
+    if any(oid is not None for oid in incumbent_oids_by_name.values()):
+        predecessor_schema = native.reference_family_predecessor_schema(ownership.dataset_id)
+        if spec.importer_id == "geo":
+            await native.preserve_geo_cut_reads(session, ownership, expected_incumbent)
+        elif spec.importer_id == "cms-doctors":
+            from process.cms_doctors_immutable import _archive_writer
+            from process.native_publication_read_access import preserve_publication_reads
+
+            owner = await _archive_writer(session, spec.importer_id, expected_incumbent.schema_name)
+            driver = await native._native_model_copy_driver(session, ("execute", "fetch"))
+            for name in spec.table_names:
+                await preserve_publication_reads(
+                    driver,
+                    schema=expected_incumbent.schema_name,
+                    live_table=name,
+                    stage_schema=ownership.schema_name,
+                    stage_table=name,
+                    expected_stage_owner_oid=owner,
+                )
+        # Never infer ownership from a UUID-shaped name or replace content
+        # already present there: CREATE is the collision/CAS fence.
+        await native.create_model_family_predecessor_schema(session, spec.importer_id, predecessor_schema)
+    for table_name in spec.table_names:
+        incumbent_oid = incumbent_oids_by_name[table_name]
+        if incumbent_oid is not None:
+            await session.execute(
+                text(
+                    f"ALTER TABLE {native._quoted(expected_incumbent.schema_name)}.{native._quoted(table_name)} "
+                    f"SET SCHEMA {native._quoted(predecessor_schema)}"
+                )
+            )
+        await session.execute(
+            text(
+                f"ALTER TABLE {native._quoted(ownership.schema_name)}.{native._quoted(table_name)} "
+                f"SET SCHEMA {native._quoted(expected_incumbent.schema_name)}"
+            )
+        )
+    return predecessor_schema
+
+
+async def _activate_verified_reference_family(
+    session, spec, ownership, expected_incumbent, validated_manifest, validation, cutover, contribution_effect_receipt
+):
+    """Keep immutable observation, heap exchange and generation CAS in one verified authority scope."""
+    from process import reference_family_archive as native
+
+    immutable_predecessor = await native._read_immutable_activation_predecessor(
+        session, validated_manifest, expected_incumbent
+    )
+    incoming_generation = native._activation_source_generation(validated_manifest, cutover)
+    if cutover.authority == "automatic":
+        await native._require_automatic_cutover_generation(
+            session,
+            spec,
+            expected_incumbent,
+            incoming_generation,
+            source_capture_contract=validated_manifest.source_capture_contract,
+        )
+    async with native._doctors_cut_savepoint(session, spec.importer_id):
+        await native._apply_validated_contribution(session, ownership, expected_incumbent, contribution_effect_receipt)
+        predecessor_schema_name, live_pairs, canonical_publication = await native._complete_validated_stage_activation(
+            session,
+            spec,
+            ownership,
+            expected_incumbent,
+            validated_manifest,
+        )
+        published_authority = await native._adopt_validated_family_generation(
+            session, validated_manifest, expected_incumbent, incoming_generation, live_pairs, immutable_predecessor
+        )
+    return native.ReferenceFamilyActivationReceipt(
+        spec.importer_id,
+        validated_manifest.source_metadata_sha256,
+        tuple((name, int(relation_oid)) for name, relation_oid in live_pairs),
+        expected_incumbent.relation_oids,
+        predecessor_schema_name,
+        validation.tables,
+        canonical_publication,
+        published_authority.as_dict() if immutable_predecessor is not None else None,
+    )
+
+
 async def _read_immutable_activation_predecessor(session, manifest, incumbent):
     """Observe the protected predecessor before physical receive rotation."""
     from process import reference_family_archive as native
