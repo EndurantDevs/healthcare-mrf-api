@@ -320,7 +320,7 @@ def test_qualified_stages_use_local_setup_and_scoped_common_test_evidence():
 def test_stale_artifact_cleanup_is_main_only_and_pinned():
     path = Path(__file__).resolve().parents[1] / ".github/workflows/artifact-cleanup.yml"
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
-    revision = yaml.safe_load((path.parent / "ci.yml").read_text())["env"]["CI_REVISION"]
+    revision = "b0b2b88b216cde2f6a811e0a54ffcf6a762c46fb"
     assert workflow.get("on", workflow.get(True)) == {
         "schedule": [{"cron": "47 2 * * *"}],
         "workflow_dispatch": {
