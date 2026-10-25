@@ -10,7 +10,7 @@ from datetime import date
 from uuid import UUID
 
 CONTRACT = "company_registry_assertion_values.v1"
-COMPANY_ROLES = ("insurer", "employer", "network_operator")
+COMPANY_ROLES = ("insurer", "employer", "network_operator", "benefits_administrator")
 IDENTIFIER_SYSTEMS = ("ein", "naic_company", "external_reference")
 PROVENANCE_KINDS = ("manual_reference", "source_reference")
 MAX_ROLE_ASSERTIONS = 32

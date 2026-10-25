@@ -17,7 +17,11 @@ from process.registry_required_target_coverage import (
     RegistryRequiredTargetCoverageUnavailable,
     read_registry_required_target_coverage,
 )
-from process.registry_required_target_store import admit_registry_required_targets
+from process.registry_required_target_store import (
+    BUSINESS_PARSER_VERSION,
+    RegistryRequiredTargetError,
+    admit_registry_required_targets,
+)
 from tests.test_network_custom_address_source_postgres import _draft, _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_provider_routes_postgres import _composed_candidate, _durable_state
@@ -53,9 +57,25 @@ def _input(extra=False):
     return output.getvalue().encode()
 
 
-async def _ledger(fixture, *, extra=False):
-    input_bytes = _input(extra)
+def _business_input():
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(_HEADERS[:6])
+    contexts = (
+        ("Employer A", "Employer legal", "Plan A", "PPO", "Carrier A", "Network"),
+        ("Employer B", "Other employer", "Plan B", "PPO", "Carrier A", "Network"),
+        ("Employer A", "Employer legal", "Plan C", "PPO", "Carrier B", "Network"),
+        ("Employer B", "Other employer", "Plan D", "Vision", "Carrier A", ""),
+    )
+    writer.writerows(contexts[index % len(contexts)] for index in range(7338))
+    return output.getvalue().encode()
+
+
+async def _ledger(fixture, *, extra=False, is_business=False):
+    input_bytes = _business_input() if is_business else _input(extra)
     edition = _edition(input_bytes)
+    if is_business:
+        edition = replace(edition, parser_version=BUSINESS_PARSER_VERSION)
     async with fixture.connection.transaction():
         receipt = await admit_registry_required_targets(
             fixture.connection, input_bytes, edition, control_schema=fixture.control_schema
@@ -164,13 +184,20 @@ async def coverage_db(custom_db, request):
     try:
         source_manifest = await _imported_candidate(fixture, copy_targets)
         seed = await _seed(fixture)
-        edition, ledger, required_targets = await _ledger(fixture)
+        scenario = getattr(request, "param", None)
+        is_business = scenario in ("business", "business_company_link")
+        edition, ledger, required_targets = await _ledger(fixture, is_business=is_business)
         reviewed_binding = _binding(seed.network["record_id"])
         review_document_dict = {
             "ledger_snapshot_id": str(edition.snapshot_id),
             "ledger_artifact_sha256": ledger["artifact_sha256"],
             "decisions": [
-                _decision(required_target["target_key"], reviewed_binding) for required_target in required_targets[:2]
+                _decision(required_target["target_key"], reviewed_binding)
+                for required_target in (
+                    [requirement for requirement in required_targets if requirement["business_context"]["network_name"]]
+                    if is_business
+                    else required_targets[:2]
+                )
             ],
         }
         review_edition, review = await _review(
@@ -191,7 +218,7 @@ async def coverage_db(custom_db, request):
             scenario_context_dict = await _approved_conflict_review(
                 fixture, seed, edition, review_document_dict, required_targets, scenario
             )
-        elif scenario == "company_link":
+        elif scenario in ("company_link", "business_company_link"):
             scenario_context_dict = await _approved_company_link_with_pending_clear(fixture, seed)
         await _composed_candidate(fixture, seed, source_manifest, request_id, copy_targets)
         yield SimpleNamespace(
@@ -226,18 +253,48 @@ async def test_all_targets_exact_office_shared_network_and_unknown_pricing(cover
     context = coverage_db
     report = await _read(context)
     assert len(report["targets"]) == report["totals"]["ledger_targets"] == 3
-    mapped_targets = [target for target in report["targets"] if target["mapping_status"] == "resolved"]
+    mapped_targets = [
+        coverage_target for coverage_target in report["targets"] if coverage_target["mapping_status"] == "resolved"
+    ]
     assert len(mapped_targets) == report["totals"]["mapped_targets"] == report["totals"]["directory_available"] == 2
     assert report["totals"]["exact_membership_count"] == 1
     assert report["totals"]["pricing_evidence_count"] is None
     assert report["totals"]["priceable"] == 0
-    assert all(target["priceable"] is None and "pricing_not_assessed" in target["gaps"] for target in mapped_targets)
+    assert all(
+        coverage_target["priceable"] is None and "pricing_not_assessed" in coverage_target["gaps"]
+        for coverage_target in mapped_targets
+    )
     assert report["totals"]["unresolved_location_count"] == 0
     assert report["provenance"]["approved_map_pin"] == "manifest"
     assert report["provenance"]["reviews"] == [
         {"snapshot_id": str(context.review_edition.snapshot_id), "artifact_sha256": context.review["artifact_sha256"]}
     ]
     assert report["assessment"]["source_status"] == "selected_serving_generation_lineage"
+    expected_fields = {
+        "target_key",
+        "decision_count",
+        "agreed_id_count",
+        "agreed_network_id",
+        "mapping_status",
+        "review_provenance",
+        "network_id",
+        "exact_membership_count",
+        "missing_approved_site_count",
+        "orphan_selected_binding_count",
+        "provider_identity_conflict",
+        "unresolved_served_site_count",
+        "duplicated_join_or_office",
+        "orphan_projected_addresses",
+        "approved_company_link",
+        "company_link_provenance",
+        "unresolved_location_count",
+        "serving_integrity_valid",
+        "pricing_evidence_count",
+        "pricing_status",
+    }
+    assert {frozenset(evidence_row) for evidence_row in report["provenance"]["target_evidence"]} == {
+        frozenset(expected_fields)
+    }
     assert context.seed.second["record_id"] not in json.dumps(report["provenance"]["target_evidence"])
     assert (
         await context.fixture.connection.fetchval(
@@ -505,3 +562,108 @@ async def test_read_only_repeatable_transaction_and_selectors_are_required(cover
                 await read_registry_required_target_coverage(
                     fixture.connection, selector, control_schema=fixture.control_schema
                 )
+
+
+async def _read_business_as_runtime_reader(context):
+    fixture = context.fixture
+    role = fixture.roles["reader"]
+    await fixture.connection.execute(f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{role}"')
+    await fixture.connection.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.control_schema}" TO "{role}"')
+    try:
+        await fixture.connection.execute(f'SET ROLE "{role}"')
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            assert tuple(
+                await fixture.connection.fetchrow(
+                    "SELECT current_user,current_setting('transaction_read_only'),pg_has_role(current_user,$1,'SET')",
+                    fixture.roles["owner"],
+                )
+            ) == (role, "on", False)
+            return await read_registry_required_target_coverage(
+                fixture.connection, context.edition.snapshot_id, control_schema=fixture.control_schema
+            )
+    finally:
+        await fixture.connection.execute("RESET ROLE")
+
+
+@pytest.mark.parametrize("coverage_db", ["business_company_link"], indirect=True)
+async def test_business_coverage_retains_bulk_denominators_without_carrier_inference(coverage_db):
+    context = coverage_db
+    report = await _read(context)
+    assert await _read_business_as_runtime_reader(context) == report
+    assert report["totals"]["source_rows"] == 7338
+    assert report["totals"]["ledger_targets"] == report["totals"]["business_targets"] == 3
+    assert report["totals"]["blank_network_targets"] == 1
+    assert report["totals"]["any_approved_company_link"] == 2
+    assert "company_link_verified" not in report["totals"]
+    assert sum(target["source_row_count"] for target in report["targets"]) == 7338
+    resolved_targets = [target for target in report["targets"] if target["mapping_status"] == "resolved"]
+    assert len(resolved_targets) == 2 and len({target["network_id"] for target in resolved_targets}) == 1
+    assert {target["business_context"]["plan_carrier"] for target in resolved_targets} == {"Carrier A", "Carrier B"}
+    assert all(target["directory_available"] and target["any_approved_company_link"] for target in resolved_targets)
+    assert all(
+        target["carrier_company_status"] == "not_assessed" and "company_link_verified" not in target
+        for target in report["targets"]
+    )
+    blank = next(target for target in report["targets"] if not target["business_context"]["network_name"])
+    assert blank["mapping_status"] == "unresolved" and blank["network_id"] is None and not blank["directory_available"]
+    assert report["totals"]["exact_membership_count"] == 1
+    assert report["assessment"]["company_link"] == "any_active_approved_relationship_not_target_carrier_verification"
+    assert report["provenance"]["ledger"]["parser_version"] == BUSINESS_PARSER_VERSION
+    assert report["provenance"]["reviews"] == [
+        {"snapshot_id": str(context.review_edition.snapshot_id), "artifact_sha256": context.review["artifact_sha256"]}
+    ]
+
+
+@pytest.mark.parametrize("coverage_db", ["business"], indirect=True)
+@pytest.mark.parametrize("corruption", ["ledger-parser", "ledger-key", "review-body"])
+async def test_business_coverage_rejects_retained_version_or_review_drift(coverage_db, corruption):
+    context = coverage_db
+    assert (await _read(context))["totals"]["business_targets"] == 3
+    connection, schema = context.fixture.connection, context.fixture.control_schema
+    if corruption == "ledger-parser":
+        await connection.execute(
+            f'UPDATE "{schema}".registry_source_snapshot SET parser_version=$2 WHERE snapshot_id=$1',
+            context.edition.snapshot_id,
+            "registry-target-ledger-v2",
+        )
+    elif corruption == "ledger-key":
+        await connection.execute(
+            f'UPDATE "{schema}".registry_source_observation SET source_record_key=$2 WHERE snapshot_id=$1',
+            context.edition.snapshot_id,
+            "ledger:v2",
+        )
+    else:
+        await connection.execute(
+            f"""UPDATE "{schema}".registry_source_observation SET observation_json=jsonb_set(observation_json,'{{decisions,0,reason}}',to_jsonb($2::text)) WHERE snapshot_id=$1""",
+            context.review_edition.snapshot_id,
+            "changed retained evidence",
+        )
+    with pytest.raises(RegistryRequiredTargetCoverageUnavailable):
+        await _read(context)
+    assert await connection.fetchval("SELECT 42") == 42
+
+
+@pytest.mark.parametrize("coverage_db", ["business"], indirect=True)
+@pytest.mark.parametrize("corruption", ["digest", "ledger-id", "target-key"])
+async def test_business_review_rejects_stale_ledger_or_target_without_partial_retention(coverage_db, corruption):
+    context = coverage_db
+    connection, schema = context.fixture.connection, context.fixture.control_schema
+    document = json.loads(json.dumps(context.document))
+    if corruption == "digest":
+        document["ledger_artifact_sha256"] = "0" * 64
+    elif corruption == "ledger-id":
+        document["ledger_snapshot_id"] = str(uuid4())
+    else:
+        document["decisions"][-1]["target_key"] = "business:v1:" + "0" * 64
+    before = await connection.fetch(
+        f'SELECT snapshot_id,artifact_sha256 FROM "{schema}".registry_source_snapshot ORDER BY snapshot_id'
+    )
+    with pytest.raises(RegistryRequiredTargetError):
+        await _review((connection, schema, context.fixture.engine), context.edition, document)
+    assert (
+        await connection.fetch(
+            f'SELECT snapshot_id,artifact_sha256 FROM "{schema}".registry_source_snapshot ORDER BY snapshot_id'
+        )
+        == before
+    )
+    assert await connection.fetchval("SELECT 42") == 42

@@ -9682,6 +9682,7 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+          description: Nonempty trimmed printable reference bounded to 128 UTF-8 bytes.
         snapshot_id:
           type: string
           format: uuid
@@ -9693,6 +9694,25 @@ components:
           nullable: true
       description: Manual references have null snapshot/source coordinates; source references require both
         coordinates. These are declared provenance, not serving access grants.
+      oneOf:
+      - properties:
+          kind:
+            enum: [manual_reference]
+          snapshot_id:
+            enum: [null]
+          source_record_key:
+            enum: [null]
+      - properties:
+          kind:
+            enum: [source_reference]
+          snapshot_id:
+            type: string
+            format: uuid
+            pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+          source_record_key:
+            type: string
+            minLength: 1
+            maxLength: 128
     RegistryOrganizationRoleAssertion:
       type: object
       additionalProperties: false
@@ -9722,6 +9742,7 @@ components:
           - insurer
           - employer
           - network_operator
+          - benefits_administrator
     RegistryOrganizationIdentifierAssertion:
       type: object
       additionalProperties: false
@@ -9786,6 +9807,7 @@ components:
           type: string
           format: date
           nullable: true
+          description: Inclusive end date, on or after valid_from when both bounds are present.
         provenance:
           $ref: '#/components/schemas/RegistryOrganizationAssertionProvenance'
         company_id:
@@ -9795,6 +9817,7 @@ components:
         group_id:
           type: string
           format: uuid
+          nullable: true
           pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
         group_kind:
           type: string
@@ -9803,10 +9826,32 @@ components:
           - naic_group
         relationship_kind:
           type: string
-          minLength: 1
-          maxLength: 32
-      description: Only independently visible active group targets in the same retained approved revision
-        are returned; group membership does not confer company or network access.
+          enum: [reported_affiliation, verified_ownership, verified_no_affiliation]
+      description: Approved affiliation evidence is scoped to one company and group kind with inclusive dates.
+        A verified_no_affiliation declaration requires a null group_id, known valid_from and manual evidence;
+        it does not infer independence from missing source data. Raw unknown source groups remain unresolved.
+        Positive affiliations require independently visible active group targets in the same retained approved
+        revision. Neither declaration confers company or network access.
+      oneOf:
+      - properties:
+          relationship_kind:
+            enum: [reported_affiliation, verified_ownership]
+          group_id:
+            type: string
+            format: uuid
+            pattern: ^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+      - properties:
+          relationship_kind:
+            enum: [verified_no_affiliation]
+          group_id:
+            enum: [null]
+          valid_from:
+            type: string
+            format: date
+          provenance:
+            properties:
+              kind:
+                enum: [manual_reference]
     RegistryServingCompany:
       type: object
       additionalProperties: false
@@ -9836,7 +9881,8 @@ components:
           maxLength: 64
         roles:
           type: array
-          maxItems: 3
+          minItems: 1
+          maxItems: 4
           uniqueItems: true
           items:
             type: string
@@ -9844,6 +9890,7 @@ components:
             - insurer
             - employer
             - network_operator
+            - benefits_administrator
         aliases:
           type: array
           maxItems: 100
@@ -11196,9 +11243,9 @@ components:
               roles:
                 type: array
                 minItems: 1
-                maxItems: 3
+                maxItems: 4
                 uniqueItems: true
-                items: {type: string, enum: [insurer, employer, network_operator]}
+                items: {type: string, enum: [insurer, employer, network_operator, benefits_administrator]}
               revision: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775807}
               link_revision: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775807}
               group_id: {type: string, format: uuid, nullable: true}

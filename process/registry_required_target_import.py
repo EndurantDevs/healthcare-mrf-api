@@ -11,6 +11,8 @@ from db.connection import Database
 from process.custom_import.cli import _receipt_only_database_output, _set_engine_echo
 from process.registry_required_target_store import (
     _DESCRIPTOR_FIELDS,
+    BUSINESS_PARSER_VERSION,
+    PARSER_VERSION,
     RegistryRequiredTargetEdition,
     admit_registry_required_targets,
 )
@@ -29,6 +31,9 @@ def _parser():
     parser.add_argument("--snapshot-id", type=UUID, required=True)
     parser.add_argument("--source-url", required=True)
     parser.add_argument("--input-sha256", required=True)
+    parser.add_argument(
+        "--target-contract", choices=("source-reference-v2", "business-context-v1"), default="source-reference-v2"
+    )
     parser.add_argument("--protected-owner-role", help="explicit trusted operator role for a closed registry")
     return parser
 
@@ -62,7 +67,10 @@ def run_command(arguments=None):
     """Emit one aggregate receipt; source cells and connection details stay private."""
     parsed = _parser().parse_args(arguments)
     try:
-        edition = RegistryRequiredTargetEdition(parsed.snapshot_id, parsed.source_url, parsed.input_sha256)
+        parser_version = BUSINESS_PARSER_VERSION if parsed.target_contract == "business-context-v1" else PARSER_VERSION
+        edition = RegistryRequiredTargetEdition(
+            parsed.snapshot_id, parsed.source_url, parsed.input_sha256, parser_version
+        )
         input_bytes = _read_input(parsed.input_file, edition.input_sha256)
         if not input_bytes:
             raise _InputError("input_empty")

@@ -192,3 +192,153 @@ fn python_registry_wrappers_refuse_invalid_inputs() {
         }
     });
 }
+
+#[test]
+fn python_business_ledger_bridge_preserves_snapshot_and_canonical_artifact() {
+    Python::initialize();
+    Python::attach(|py| {
+        let snapshot = "34567890-3456-7890-8345-34567890abcd";
+        let input = b"COMPANY_ALIAS,COMPANY_NAME,PLAN_NAME,PLAN_TYPE,PLAN_CARRIER,FIND_CARE_NETWORK_NAME\nExample,Example Company,Plan,PPO,Carrier,Network\n";
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let encoded = module
+            .getattr("encode_registry_business_target_ledger_artifact")
+            .unwrap()
+            .call1((PyBytes::new(py, input), snapshot))
+            .unwrap();
+        let (copy, descriptor): (Py<PyBytes>, Py<PyBytes>) = encoded.extract().unwrap();
+        let copy = copy.bind(py).as_bytes();
+        assert!(copy.starts_with(crate::network_membership_codec::COPY_HEADER));
+        assert_eq!(i16::from_be_bytes(copy[19..21].try_into().unwrap()), 6);
+        let mut offset = 21;
+        let mut fields = Vec::new();
+        for _ in 0..6 {
+            let length = i32::from_be_bytes(copy[offset..offset + 4].try_into().unwrap());
+            assert!(length >= 0);
+            offset += 4;
+            fields.push(&copy[offset..offset + length as usize]);
+            offset += length as usize;
+        }
+        assert_eq!(&copy[offset..], &(-1i16).to_be_bytes());
+        assert_eq!(fields[1], b"ledger:v3");
+        assert_eq!(fields[2], &1i32.to_be_bytes());
+        assert_eq!(fields[3], b"accepted");
+        assert_eq!(fields[4][0], 1);
+        assert_eq!(fields[5], b"\x01[]");
+        let document: Value = serde_json::from_slice(&fields[4][1..]).unwrap();
+        let descriptor: Value = serde_json::from_slice(descriptor.bind(py).as_bytes()).unwrap();
+        assert_eq!(descriptor["snapshot_id"], snapshot);
+        assert_eq!(descriptor["parser_version"], "registry-target-ledger-v3");
+        assert_eq!(descriptor["source_sha256"], registry_bytes_digest(input));
+        assert_eq!(
+            descriptor["artifact_sha256"],
+            registry_bytes_digest(&fields[4][1..])
+        );
+        assert_eq!(descriptor["source_rows"], 1);
+        assert_eq!(descriptor["target_count"], 1);
+        let retained = serde_json::json!({"snapshot_id":snapshot,"artifact_sha256":descriptor["artifact_sha256"],"document":document});
+        let validated = module
+            .getattr("validate_registry_required_target_ledger_artifact")
+            .unwrap()
+            .call1((PyBytes::new(py, &serde_json::to_vec(&retained).unwrap()),))
+            .unwrap();
+        let validated: Py<PyBytes> = validated.extract().unwrap();
+        let validated: Value = serde_json::from_slice(validated.bind(py).as_bytes()).unwrap();
+        assert_eq!(validated["target_count"], 1);
+    });
+}
+
+#[test]
+fn python_business_ledger_bridge_refuses_invalid_bytes_identity_and_types() {
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let encoder = module
+            .getattr("encode_registry_business_target_ledger_artifact")
+            .unwrap();
+        let snapshot = "34567890-3456-7890-8345-34567890abcd";
+        let valid = b"COMPANY_ALIAS,COMPANY_NAME,PLAN_NAME,PLAN_TYPE,PLAN_CARRIER,FIND_CARE_NETWORK_NAME\nExample,Company,Plan,PPO,Carrier,Network\n";
+        for (input, identity, code) in [
+            (b"".as_slice(), snapshot, "invalid_headers"),
+            (b"\xff".as_slice(), snapshot, "invalid_utf8"),
+            (valid.as_slice(), "invalid", "invalid_snapshot_id"),
+        ] {
+            let error = encoder
+                .call1((PyBytes::new(py, input), identity))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(error.value(py).str().unwrap().to_str().unwrap(), code);
+        }
+        let error = encoder.call1((42, snapshot)).unwrap_err();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        let error = encoder.call1((PyBytes::new(py, valid), 42)).unwrap_err();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+    });
+}
+
+#[test]
+fn python_graph_locator_bridge_preserves_coordinates_and_refuses_invalid_metadata() {
+    Python::initialize();
+    Python::attach(|py| {
+        let metadata = serde_json::json!({
+            "context": {"graph_identity": {"snapshot_key": 11, "layout_generation": "shared_blocks_v4",
+                "layout_mapping_sha256": "01".repeat(32), "map_sha256": "02".repeat(32),
+                "finalizer_map_sha256": "03".repeat(32), "source_assignments_sha256": "04".repeat(32)},
+                "after_ordinal": 0, "last_ordinal": 1, "row_count": 1},
+            "manifest": {"snapshot_key": 11, "relation": "group_npis_exact",
+                "member_object_kind": "v4_group_npis_exact_members_v1", "locator_object_kind": "v4_group_npis_exact_locators_v1",
+                "owner_base": 5, "owner_count": 1, "logical_member_count": 3, "vector_member_count": 3,
+                "member_width": 4, "member_page_bytes": 12, "locator_page_bytes": 12, "locator_owner_span": 1}});
+        let selected = [5u32.to_be_bytes(), 5u32.to_be_bytes()].concat();
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let locator = module
+            .getattr("plan_registry_ptg_graph_locator_pages")
+            .unwrap();
+        let encoded: Py<PyBytes> = locator
+            .call1((
+                PyBytes::new(py, &serde_json::to_vec(&metadata).unwrap()),
+                PyBytes::new(py, &selected),
+            ))
+            .unwrap()
+            .extract()
+            .unwrap();
+        let actual: Value = serde_json::from_slice(encoded.bind(py).as_bytes()).unwrap();
+        assert_eq!(
+            actual,
+            serde_json::json!({"owner_keys": [5], "coordinates": [["v4_group_npis_exact_locators_v1", 5, 0]]})
+        );
+        for invalid in [
+            b"{}".to_vec(),
+            vec![b' '; crate::registry_ptg_graph_python::MAX_LOCATOR_METADATA_BYTES + 1],
+        ] {
+            let error = locator
+                .call1((PyBytes::new(py, &invalid), PyBytes::new(py, &selected)))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+        }
+        let error = locator
+            .call1((42, PyBytes::new(py, &selected)))
+            .unwrap_err();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        let mut malformed = metadata;
+        malformed["map_packs"] = serde_json::json!(true);
+        malformed["blocks"] = serde_json::json!([]);
+        malformed["heavy"] = serde_json::json!([]);
+        let error = module
+            .getattr("plan_registry_ptg_graph_member_pages")
+            .unwrap()
+            .call1((
+                PyBytes::new(py, &serde_json::to_vec(&malformed).unwrap()),
+                PyBytes::new(py, &selected),
+                pyo3::types::PyTuple::empty(py),
+            ))
+            .unwrap_err();
+        assert!(error.is_instance_of::<PyValueError>(py));
+        assert_eq!(
+            error.value(py).str().unwrap().to_str().unwrap(),
+            "registry_ptg_graph_metadata_invalid"
+        );
+    });
+}

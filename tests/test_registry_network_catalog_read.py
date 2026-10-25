@@ -635,3 +635,19 @@ async def test_malformed_seal_marker_is_terminal_not_a_legacy_scan(batch_boundar
     with pytest.raises(catalog.RegistryNetworkCatalogError):
         await catalog._pin(connection, 9, "sample_control")
     accounting.assert_not_awaited()
+
+
+def test_all_four_company_roles_roundtrip_without_requiring_a_group():
+    company_by_field = {
+        "company_id": "11111111-1111-4111-8111-111111111111",
+        "display_name": "Example company",
+        "roles": ["insurer", "employer", "network_operator", "benefits_administrator"],
+        "revision": 1,
+        "link_revision": 1,
+        "group_id": None,
+    }
+    assert catalog._company_document(company_by_field) is None
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        catalog._company_document(company_by_field | {"roles": [*company_by_field["roles"], "benefits_administrator"]})
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        catalog._company_document(company_by_field | {"roles": ["unknown"]})

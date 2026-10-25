@@ -59,8 +59,9 @@ def test_group_evidence_keeps_revision_identity_nullable_periods_and_distinct_ro
         + " AND source_record_key IS NOT NULL AND source_record_key<>'' AND source_record_key=btrim(source_record_key) AND source_record_key !~ '[[:cntrl:]]' AND octet_length(source_record_key)<=128)",
         "company_group_assertion_group_identity": f"group_id IS NULL OR group_id<>{zero}",
         "company_group_assertion_group_kind": "group_kind IN ('corporate_parent','naic_group')",
-        "company_group_assertion_relationship": "relationship_kind IN ('reported_affiliation','verified_ownership')",
-        "company_group_assertion_manual_group": "provenance_kind<>'manual_reference' OR group_id IS NOT NULL",
+        "company_group_assertion_relationship": "relationship_kind IN ('reported_affiliation','verified_ownership','verified_no_affiliation')",
+        "company_group_assertion_manual_group": "provenance_kind<>'manual_reference' OR group_id IS NOT NULL OR relationship_kind='verified_no_affiliation'",
+        "company_group_assertion_no_affiliation": "relationship_kind<>'verified_no_affiliation' OR (group_id IS NULL AND valid_from IS NOT NULL AND provenance_kind='manual_reference')",
     }
     ddl = str(CreateTable(table).compile(dialect=dialect))
     assert "PRIMARY KEY (assertion_id, company_id, company_revision)" in ddl
