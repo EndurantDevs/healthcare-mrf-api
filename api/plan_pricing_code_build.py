@@ -2,7 +2,9 @@
 """Prepare one complete procedure with the existing occurrence and aggregate codecs."""
 
 import hashlib
-from dataclasses import asdict
+import time
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
 from uuid import uuid4
 
 from sqlalchemy import text
@@ -11,6 +13,7 @@ from api.plan_pricing_code_contract import (
     SPEC,
     capability_identity,
     identity_digest,
+    scope_selectors,
     sealed_read_digest,
     source_coverage,
     validate_params,
@@ -63,6 +66,26 @@ MAX_CODE_FACTOR_JOIN_WORK_ROWS: int | None = 16_384
 CODE_PROVIDER_READ_BATCH_SIZE = 100
 
 
+@dataclass
+class _CodeBuildState(_BuildState):
+    audit: dict | None = None
+    phase_timings: dict | None = None
+    calibration: object | None = None
+
+
+@contextmanager
+def _audit_phase(audit, phase_timings, name):
+    """Retain the last entered phase and elapsed work even when it is interrupted."""
+    if audit is not None:
+        audit["phase"] = name
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        if phase_timings is not None:
+            phase_timings[name] = phase_timings.get(name, 0.0) + time.monotonic() - started
+
+
 async def _code_provider_rows_for_npis(session, npis):
     """Bound each witness query without weakening the complete pending-batch limit."""
     providers_by_npi = {}
@@ -94,7 +117,7 @@ class CodeProjectionMembershipNotReady(ValueError):
     """A missing preparation dependency is different from corrupt ready storage."""
 
 
-async def resolve_inputs(session, selection, code_identity):
+async def resolve_inputs(session, selection, code_identity, *, scope=None):
     """Authenticate every logical binding and its complete protected code membership."""
     inputs, source_coverages = [], []
     bindings = tuple(binding for binding in selection.bindings if binding.role == "in_network")
@@ -151,8 +174,20 @@ async def resolve_inputs(session, selection, code_identity):
         > MAX_CODE_OCCURRENCES
     ):
         raise ValueError("code projection complete occurrence count exceeds its bound")
+    identity = await _resolve_capability_identity(session, selection, code_identity, source_coverages, scope)
+    return identity, inputs
+
+
+async def _resolve_capability_identity(session, selection, code_identity, source_coverages, scope):
+    """Bind fresh provider identity to the complete server-resolved centroid scope."""
+    scope_by_field = scope
+    if scope is not None:
+        from api.plan_pricing_projection_read import geo_cells
+
+        cells = await geo_cells(session, scope, result_type="rate_aggregates")
+        scope_by_field = {**scope, "geo_cells": sorted(set(cells))}
     signature = await provider_signature(session)
-    return capability_identity(selection, code_identity, signature, source_coverages), inputs
+    return capability_identity(selection, code_identity, signature, source_coverages, scope=scope_by_field)
 
 
 async def _copy(session, ownership, model, rows):
@@ -295,22 +330,37 @@ async def _store_occurrences(session, ownership, binding, serving_rows, retained
     return len(occurrences)
 
 
-async def _stage_inputs(session, ownership, candidate_id, inputs, code_identity, state):
-    """Stage complete bounded memberships, rates and frozen provider witnesses."""
+async def _stage_inputs(
+    session,
+    ownership,
+    candidate_id,
+    inputs,
+    code_identity,
+    state,
+    *,
+    scope=None,
+    zip_limits=None,
+):
+    """Complete scoped membership admission before copying rate occurrences."""
     remaining_atoms = MAX_CODE_STAGED_PRICE_ATOMS
-    factor_rows = 0
+    work_by_name = {"factor": 0}
+    if scope is not None:
+        from api import plan_pricing_code_zip_build as scoped
+
+        scoped_work = await scoped.stage_inputs(session, candidate_id, scope, inputs, code_identity, state, zip_limits)
     for binding, found in inputs:
         code_rows = binding.code_rows_by_identity[code_identity]
-        membership_count, factor_count = await _stage_memberships(
-            session,
-            binding,
-            found,
-            code_rows,
-            MAX_PROJECTION_PROVIDER_MEMBERSHIPS - state.provider_membership_count,
-            _factor_join_limit() - factor_rows,
-        )
-        state.provider_membership_count += membership_count
-        factor_rows += factor_count
+        if scope is None:
+            membership_count, factor_count = await _stage_memberships(
+                session,
+                binding,
+                found,
+                code_rows,
+                MAX_PROJECTION_PROVIDER_MEMBERSHIPS - state.provider_membership_count,
+                _factor_join_limit() - work_by_name["factor"],
+            )
+            state.provider_membership_count += membership_count
+            work_by_name["factor"] += factor_count
         serving_rows, price_keys = await _binding_code_rows(session, binding, code_rows)
         span = await _preflight_binding_price_memberships(
             session, state, binding, price_keys, _preflight_price_membership_aliases_from_db
@@ -321,13 +371,15 @@ async def _stage_inputs(session, ownership, candidate_id, inputs, code_identity,
         remaining_atoms -= atoms
         occurrence_count = await _store_occurrences(session, ownership, binding, serving_rows, retained)
         state.rate_occurrence_count += occurrence_count
+    if scope is not None:
+        return scoped_work
     await session.execute(
         text(
             "INSERT INTO plan_pricing_provider_npi_pending_stage SELECT DISTINCT npi FROM plan_pricing_provider_member_stage"
         )
     )
     await _materialize_provider_cells(session, candidate_id, state, provider_rows_for_npis=_code_provider_rows_for_npis)
-    return factor_rows
+    return {"factor_join_work_rows": work_by_name["factor"]}
 
 
 async def _store_provider_inputs(session, ownership, candidate_id):
@@ -351,11 +403,11 @@ async def _store_provider_inputs(session, ownership, candidate_id):
     )
 
 
-async def _store_aggregates(session, ownership, candidate_id, code_identity, state):
+async def _store_aggregates(session, ownership, candidate_id, code_identity, state, *, zip_limits=None):
     from api.plan_pricing_aggregate_pack import AggregateCodeIdentity
 
-    limit = MAX_PROJECTION_PROVIDER_MEMBERSHIPS
-    cell_limit = _member_cell_limit()
+    limit = MAX_PROJECTION_PROVIDER_MEMBERSHIPS if zip_limits is None else zip_limits["member_cell"]
+    cell_limit = _member_cell_limit() if zip_limits is None else zip_limits["member_cell"]
     work = await _stage_code_work(session, candidate_id, code_identity, limit, cell_limit)
     _record_code_work(state, work, _WorkLimits(limit, limit, cell_limit, cell_limit))
     aggregate_records = await _aggregate_records(session, candidate_id, code_identity, state)
@@ -445,37 +497,12 @@ async def _content_digest(session, ownership):
     return hasher.hexdigest()
 
 
-async def build_in_session(session, *, selection, code_system, code, expected_identity_digest):
-    """Build or adopt one exact capability within its caller-owned transaction."""
-    code_identity = projection_code_identity(code_system, code)
-    if code_identity != (code_system, code):
-        raise ValueError("code projection requires a canonical procedure identity")
-    _member_cell_limit()
-    _factor_join_limit()
-    identity, inputs = await resolve_inputs(session, selection, code_identity)
-    if identity_digest(identity) != expected_identity_digest:
-        raise ValueError("code pricing expected source or provider identity changed before preparation")
-    await lock_identity(session, identity)
-    existing = await locate(session, identity, allow_stale_provider=True)
-    if existing is not None:
-        return receipt(existing)
-    await native.protected_publisher_owner(session)
-    ownership = await native.precreate_model_family_stage(session, SPEC, uuid4())
-    state = _BuildState(hashlib.sha256())
-    candidate_id = identity_digest(identity)
-    await _create_stage_tables(session)
-    enqueue_live_progress(
-        phase="code pricing inputs",
-        message="Preparing complete procedure membership, prices and frozen provider witnesses",
-    )
-    factor_rows = await _stage_inputs(session, ownership, candidate_id, inputs, code_identity, state)
-    await _store_provider_inputs(session, ownership, candidate_id)
-    aggregate_counts = await _store_aggregates(session, ownership, candidate_id, code_identity, state)
+async def _complete_candidate(session, ownership, identity, state, work_counts, aggregate_counts):
     await native.complete_model_family_stage(session, SPEC, ownership)
     for name in SPEC.table_names:
         await session.execute(text(f"ANALYZE {native._quoted(ownership.schema_name)}.{native._quoted(name)}"))
     counts_by_name = {
-        "factor_join_work_rows": factor_rows,
+        **work_counts,
         "provider_membership_count": state.provider_membership_count,
         "provider_cell_count": state.provider_cell_count,
         "provider_state_count": state.provider_state_count,
@@ -490,46 +517,156 @@ async def build_in_session(session, *, selection, code_system, code, expected_id
         PlanPricingCodeManifest,
         [(1, canonical_json(identity), content_digest, canonical_json(counts_by_name))],
     )
-    after, _ = await resolve_inputs(session, selection, code_identity)
+
+
+async def _prepare_code_candidate(session, ownership, identity, inputs, code_identity, state, zip_limits):
+    candidate_id = identity_digest(identity)
+    with _audit_phase(state.audit, state.phase_timings, "code_pricing.inputs"):
+        work_counts = await _stage_inputs(
+            session,
+            ownership,
+            candidate_id,
+            inputs,
+            code_identity,
+            state,
+            scope=identity.get("scope"),
+            zip_limits=zip_limits,
+        )
+        await _store_provider_inputs(session, ownership, candidate_id)
+    with _audit_phase(state.audit, state.phase_timings, "code_pricing.aggregates"):
+        aggregate_counts = await _store_aggregates(
+            session,
+            ownership,
+            candidate_id,
+            code_identity,
+            state,
+            zip_limits=zip_limits,
+        )
+    with _audit_phase(state.audit, state.phase_timings, "code_pricing.candidate"):
+        await _complete_candidate(session, ownership, identity, state, work_counts, aggregate_counts)
+
+
+async def build_in_session(
+    session,
+    *,
+    selection,
+    code_system,
+    code,
+    expected_identity_digest,
+    scope=None,
+    audit=None,
+    phase_timings=None,
+):
+    """Prepare one exact candidate with transient worker diagnostics."""
+    code_identity = projection_code_identity(code_system, code)
+    if code_identity != (code_system, code):
+        raise ValueError("code projection requires a canonical procedure identity")
+    zip_limits = None
+    if scope is None:
+        _member_cell_limit()
+        _factor_join_limit()
+    else:
+        from api.plan_pricing_code_zip_build import work_limits
+
+        zip_limits = work_limits()
+    options = {} if scope is None else {"scope": scope}
+    with _audit_phase(audit, phase_timings, "code_pricing.resolve"):
+        identity, inputs = await resolve_inputs(session, selection, code_identity, **options)
+    if identity_digest(identity) != expected_identity_digest:
+        raise ValueError("code pricing expected source or provider identity changed before preparation")
+    await lock_identity(session, identity)
+    existing = await locate(session, identity, allow_stale_provider=True)
+    if existing is not None:
+        return receipt(existing)
+    await native.protected_publisher_owner(session)
+    ownership = await native.precreate_model_family_stage(session, SPEC, uuid4())
+    state = _CodeBuildState(hashlib.sha256(), audit=audit, phase_timings=phase_timings)
+    await _create_stage_tables(session)
+    enqueue_live_progress(
+        phase="code pricing inputs",
+        message="Preparing complete procedure membership, prices and frozen provider witnesses",
+    )
+    await _prepare_code_candidate(session, ownership, identity, inputs, code_identity, state, zip_limits)
+    after, _ = await resolve_inputs(session, selection, code_identity, **options)
     if after != identity:
         raise PTG2ManifestArtifactError("code pricing source or provider generation changed during preparation")
     principals = set()
     for binding, _found in inputs:
         principals.update(await _reader_principals(session, binding.serving_tables))
-    await seal(session, ownership, identity, reader_principals=tuple(sorted(principals)))
+    with _audit_phase(audit, phase_timings, "code_pricing.seal"):
+        await seal(session, ownership, identity, reader_principals=tuple(sorted(principals)))
     return receipt(await locate(session, identity))
 
 
 async def build_plan_pricing_code_projection(
-    *, plan_release_id, serving_revision_id, code_system, code, expected_identity_digest
+    *,
+    plan_release_id,
+    serving_revision_id,
+    code_system,
+    code,
+    expected_identity_digest,
+    scope_kind=None,
+    zip5=None,
+    zip_radius_miles=None,
 ):
-    """Build/reuse a complete capability atomically through the normal import worker."""
-    from api.plan_release_serving_resolution import (
-        PLAN_RELEASE_RESOLUTION_READY,
-        resolve_plan_release_serving_resolution,
-    )
-
-    selectors_by_field = dict(
+    """Retain the eight-selector entry point for direct callers and queued jobs."""
+    params_by_name = dict(
         plan_release_id=plan_release_id,
         serving_revision_id=serving_revision_id,
         code_system=code_system,
         code=code,
         expected_identity_digest=expected_identity_digest,
     )
-    validate_params(selectors_by_field)
+    scope_by_field = {"scope_kind": scope_kind, "zip5": zip5, "zip_radius_miles": zip_radius_miles}
+    params_by_name.update(
+        {key: parameter_value for key, parameter_value in scope_by_field.items() if parameter_value is not None}
+    )
+    return await _build_code_projection(params_by_name, {})
+
+
+async def control_start(ctx, task):
+    """Use trusted per-run context without admitting unrecognized worker selectors."""
+    params_by_name = dict(task)
+    params_by_name.pop("run_id", None)
+    params_by_name.pop("test_mode", None)
+    prepared_by_field = await _build_code_projection(params_by_name, ctx)
+    return {
+        **prepared_by_field,
+        "audit": ctx["context"]["audit"],
+        "phase_timings": ctx["context"]["phase_timings"],
+    }
+
+
+async def _build_code_projection(params_by_name, control_context):
+    from api.plan_release_serving_resolution import (
+        PLAN_RELEASE_RESOLUTION_READY,
+        resolve_plan_release_serving_resolution,
+    )
+
+    context_by_field = control_context.setdefault("context", {})
+    audit_by_name = context_by_field["audit"] = {}
+    timings_by_phase = context_by_field["phase_timings"] = {}
+    validate_params(params_by_name)
+    if params_by_name.get("operation") == "calibrate":
+        from api.plan_pricing_code_calibration import calibrate
+
+        return await calibrate(params_by_name, context_by_field)
     async with db.transaction() as session:
         await lock_provider_generation(session)
-        resolution = await resolve_plan_release_serving_resolution(session, plan_release_id)
+        resolution = await resolve_plan_release_serving_resolution(session, params_by_name["plan_release_id"])
         if (
             resolution.state != PLAN_RELEASE_RESOLUTION_READY
             or resolution.selection is None
-            or resolution.selection.serving_revision_id != serving_revision_id
+            or resolution.selection.serving_revision_id != params_by_name["serving_revision_id"]
         ):
             raise ValueError("code pricing release is not the exact current published revision")
         return await build_in_session(
             session,
             selection=resolution.selection,
-            code_system=code_system,
-            code=code,
-            expected_identity_digest=expected_identity_digest,
+            code_system=params_by_name["code_system"],
+            code=params_by_name["code"],
+            expected_identity_digest=params_by_name["expected_identity_digest"],
+            scope=scope_selectors(params_by_name),
+            audit=audit_by_name,
+            phase_timings=timings_by_phase,
         )

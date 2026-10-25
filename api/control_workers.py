@@ -348,6 +348,16 @@ def _bind_admitted_job(payload: dict[str, Any], admitted_run: dict[str, Any]) ->
     )
     if all(isinstance(value, str) and value and value == value.strip() for value in identity):
         payload.admitted_job = identity
+        params = admitted_run.get("params")
+        if (
+            identity[1] == "plan-pricing-code-projection"
+            and isinstance(params, dict)
+            and params.get("operation") == "calibrate"
+        ):
+            from api.plan_pricing_code_contract import validate_params
+
+            validate_params(params)
+            payload.code_calibration_job = identity
 
 
 async def guarded_ensure_worker(
@@ -1136,6 +1146,26 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
     return ",".join(f"{key}={value}" for key, value in selector_label_map.items())
 
 
+def _is_code_calibration_job(spec, payload):
+    """Only persisted exact admission can select the fixed diagnostic deadline."""
+    identity = getattr(payload, "code_calibration_job", None)
+    return (
+        isinstance(payload, _AdmittedWorkerRequest)
+        and identity is not None
+        and identity == getattr(payload, "admitted_job", None)
+        and identity
+        == (
+            payload.get("run_id"),
+            "plan-pricing-code-projection",
+            "arq:PTGCandidateAudit",
+            "control_single_job_start",
+            "plan_pricing_code_projection_" + payload.get("run_id", ""),
+        )
+        and spec.worker_class == "process.PTGCandidateAudit"
+        and spec.queue == "arq:PTGCandidateAudit"
+    )
+
+
 def _worker_job_environment(
     spec: WorkerSpec,
     launch_request: dict[str, Any],
@@ -1161,6 +1191,8 @@ def _worker_job_environment(
         policy_setting = "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
         if policy_path := os.environ.get(policy_setting):
             env_list.append({"name": policy_setting, "value": policy_path})
+    if _is_code_calibration_job(spec, launch_request):
+        env_list.append({"name": "HLTHPRT_PTG_CANDIDATE_AUDIT_JOB_TIMEOUT", "value": "385"})
     target_job_id = _single_job_worker_target(spec, launch_request)
     if target_job_id:
         env_list.append(
@@ -1302,6 +1334,8 @@ def _worker_job_spec(
             active_deadline_seconds,
             _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS,
         )
+    if _is_code_calibration_job(spec, launch_request):
+        active_deadline_seconds = min(active_deadline_seconds, 415) if active_deadline_seconds > 0 else 415
     if active_deadline_seconds > 0:
         job_spec_dict["activeDeadlineSeconds"] = active_deadline_seconds
     replicas = _worker_start_replicas(spec)

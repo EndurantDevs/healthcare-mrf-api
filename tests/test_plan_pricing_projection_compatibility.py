@@ -11,7 +11,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from api import plan_pricing_code_build as code_build
+from api import plan_pricing_code_contract as code_contract
+from api import plan_pricing_code_read as code_read
 from api import plan_pricing_projection as projection
+from api.plan_pricing_code_storage import attachment_name
 
 from .test_plan_pricing_projection import _selection, _Session
 
@@ -31,23 +35,53 @@ def _projection_migration():
 
 
 @pytest.mark.asyncio
-async def test_omitted_false_without_ready_projection_falls_back_to_legacy():
+@pytest.mark.parametrize("zip5", (None, "62401"))
+async def test_omitted_false_without_ready_projection_falls_back_to_legacy(monkeypatch, zip5):
     session = _Session([])
     session.scalar = AsyncMock(return_value=False)
+    selected = _selection(projection_id=None)
+    inputs, locate, lock = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(code_build, "resolve_inputs", inputs)
+    monkeypatch.setattr(code_read, "locate", locate)
+    monkeypatch.setattr(code_read, "_lock_provider_relations", lock)
+    request_by_field = {"include_providers": "false", "code_system": "CPT", "code": "27447"}
+    if zip5 is not None:
+        request_by_field["zip5"] = zip5
     response = await projection.search_plan_pricing_projection(
-        session,
-        _selection(projection_id=None),
-        {
-            "include_providers": "false",
-            "code_system": "CPT",
-            "code": "27447",
-            "zip5": "62401",
-        },
-        SimpleNamespace(limit=25, offset=0, page=1),
+        session, selected, request_by_field, SimpleNamespace(limit=25, offset=0, page=1)
     )
 
+    anchor_by_field = {
+        "contract": code_contract.CONTRACT,
+        "build_revision": code_contract.BUILD_REVISION,
+        "plan_release_id": selected.plan_release_id,
+        "serving_revision_id": selected.serving_revision_id,
+        "binding_set_digest": selected.binding_set_digest,
+        "code_system": "CPT",
+        "code": "27447",
+    }
+    anchors = [anchor_by_field]
+    if zip5 is not None:
+        anchors.insert(
+            0,
+            anchor_by_field
+            | {
+                "contract": code_contract.ZIP_CONTRACT,
+                "build_revision": code_contract.ZIP_BUILD_REVISION,
+                "scope": {"kind": "zip_radius", "zip5": zip5, "zip_radius_miles": "0"},
+            },
+        )
     assert response is None
-    session.scalar.assert_awaited_once()
+    assert [(str(call.args[0]), call.args[1]) for call in session.scalar.await_args_list] == [
+        (
+            "SELECT to_regclass(:relation) IS NOT NULL",
+            {"relation": "hp_snapshot_retention." + attachment_name(expected)},
+        )
+        for expected in anchors
+    ]
+    inputs.assert_not_awaited()
+    locate.assert_not_awaited()
+    lock.assert_not_awaited()
     assert session.statements == []
 
 

@@ -7,7 +7,7 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from api.plan_pricing_code_contract import CONTRACT, SPEC, identity_digest
+from api.plan_pricing_code_contract import CONTRACT, SPEC, ZIP_CONTRACT, identity_digest
 from api.ptg_membership_storage import protected_owner
 from process import reference_family_archive as native
 from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
@@ -29,6 +29,8 @@ def attachment_name(identity):
             "code",
         )
     }
+    if identity["contract"] == ZIP_CONTRACT:
+        anchor_by_field["scope"] = {key: identity["scope"][key] for key in ("kind", "zip5", "zip_radius_miles")}
     return "pc_" + base64.b32encode(bytes.fromhex(identity_digest(anchor_by_field))).decode("ascii").lower().rstrip("=")
 
 
@@ -36,13 +38,13 @@ async def lock_identity(session, identity):
     """Serialize preparation and retirement for this immutable attachment."""
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
-        {"key": CONTRACT + ":" + attachment_name(identity)},
+        {"key": identity["contract"] + ":" + attachment_name(identity)},
     )
 
 
 def _pins(identity):
     return tuple(
-        {"owner_type": CONTRACT, "owner_id": identity_digest(identity), "snapshot_id": snapshot}
+        {"owner_type": identity["contract"], "owner_id": identity_digest(identity), "snapshot_id": snapshot}
         for snapshot in sorted({source["source_identity"]["snapshot_id"] for source in identity["sources"]})
     )
 
@@ -161,6 +163,9 @@ async def locate(session, identity, *, allow_stale_provider=False):
         raise PTG2ManifestArtifactError("code pricing sealed identity differs")
     if header["identity"] != identity:
         old, new = dict(header["identity"]), dict(identity)
+        if identity["contract"] == ZIP_CONTRACT and old.get("provider_signature") != new.get("provider_signature"):
+            old["scope"] = {key: scope_value for key, scope_value in old.get("scope", {}).items() if key != "geo_cells"}
+            new["scope"] = {key: scope_value for key, scope_value in new["scope"].items() if key != "geo_cells"}
         old.pop("provider_signature", None)
         new.pop("provider_signature", None)
         if allow_stale_provider and old == new:
@@ -213,7 +218,7 @@ def receipt(found):
     """Expose the authenticated ready identity and captured native storage coordinates."""
     ownership, header, owner, oid = found
     return {
-        "contract": CONTRACT,
+        "contract": header["identity"]["contract"],
         "projection_id": identity_digest(header["identity"]),
         "state": "ready",
         "identity": header["identity"],
@@ -262,7 +267,7 @@ async def _unreferenced_source_schema(session, identity):
         references["pin"] = [
             reference_row
             for reference_row in references["pin"]
-            if reference_row["owner_type"] not in {CONTRACT, MEMBERSHIP_CONTRACT}
+            if reference_row["owner_type"] not in {CONTRACT, ZIP_CONTRACT, MEMBERSHIP_CONTRACT}
         ]
         if any(references.values()):
             raise PTG2ManifestArtifactError("code pricing source still has retention references")
@@ -274,7 +279,9 @@ async def retire_unreferenced(session, ready):
     from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
 
     identity = ready["identity"]
-    if identity.get("contract") != CONTRACT or ready.get("projection_id") != identity_digest(identity):
+    if identity.get("contract") not in {CONTRACT, ZIP_CONTRACT} or ready.get("projection_id") != identity_digest(
+        identity
+    ):
         raise PTG2ManifestArtifactError("code pricing retirement identity differs")
     owner = await native.protected_publisher_owner(session)
     await acquire_ptg2_lifecycle_lock(session)

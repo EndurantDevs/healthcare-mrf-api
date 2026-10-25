@@ -417,6 +417,10 @@ async def _projection_page_response(session, request, args, pagination, contribu
         if contributing_bindings is None and request.result_type == "rate_aggregates":
             return None
         raise
+    capability = current_code_projection()
+    if capability is not None and "scope" in capability.identity:
+        if sorted(set(selected_geo_cells)) != capability.identity["scope"]["geo_cells"]:
+            raise PlanPricingProjectionUnavailable("the complete ZIP aggregate scope changed")
     if not selected_geo_cells:
         response = _page_response(request, args, pagination, [], 0)
         response["result_state"] = "no_match_in_radius"
