@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any, Callable
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -154,3 +156,166 @@ async def test_apply_rechecks_token_after_selection(monkeypatch) -> None:
                 database,
                 request(expected_evidence_sha256="f" * 64),
             )
+
+
+def _terminal_run() -> dict[str, Any]:
+    return {
+        "run_id": "run_" + "a" * 32,
+        "importer": "provider-directory-fhir",
+        "status": "canceled",
+        "metrics": {
+            "job_id": "b" * 32,
+            "queue": "arq:ProviderDirectoryFHIR",
+            "function": "control_single_job_start",
+        },
+    }
+
+
+def _install_queue_presence(monkeypatch, present=(), worker=None):
+    from api import control_imports, control_workers
+
+    probes = []
+
+    class PresencePipeline:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_error):
+            return None
+
+        def zscore(self, queue, job_id):
+            self.queue, self.job_id = queue, job_id
+
+        def exists(self, _key):
+            return None
+
+        async def execute(self):
+            probes.append((self.queue, self.job_id))
+            return [
+                0 if (self.job_id, "queue_member") in present else None,
+                *[
+                    int((self.job_id, field) in present)
+                    for field, _key in control_imports._arq_evidence_keys(self.job_id)
+                ],
+            ]
+
+    redis = SimpleNamespace(pipeline=lambda **_kwargs: PresencePipeline(), aclose=AsyncMock())
+    monkeypatch.setattr(control_imports, "create_pool", AsyncMock(return_value=redis))
+    monkeypatch.setattr(
+        control_workers,
+        "exact_worker_presence",
+        lambda _payload: worker if worker is not None else {"enabled": True, "stopped": True},
+    )
+    return probes
+
+
+@pytest.mark.asyncio
+async def test_retirement_checks_canonical_and_legacy_terminal_jobs(monkeypatch):
+    from process.provider_directory_terminal_root_retirement_runtime import require_stopped_lineage
+
+    run = _terminal_run()
+    before = deepcopy(run)
+    probes = _install_queue_presence(monkeypatch)
+
+    await require_stopped_lineage((run,))
+
+    assert probes == [
+        ("arq:ProviderDirectoryFHIR", "provider_directory_start_" + run["run_id"]),
+        ("arq:ProviderDirectoryFHIR", run["metrics"]["job_id"]),
+    ]
+    assert run == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", ["canonical", "missing", "no_metrics"])
+async def test_retirement_preserves_canonical_job_lookup(monkeypatch, identity):
+    from process.provider_directory_terminal_root_retirement_runtime import require_stopped_lineage
+
+    run = _terminal_run()
+    canonical = "provider_directory_start_" + run["run_id"]
+    if identity == "canonical":
+        run["metrics"]["job_id"] = canonical
+    elif identity == "missing":
+        del run["metrics"]["job_id"]
+    else:
+        run["metrics"] = None
+    probes = _install_queue_presence(monkeypatch)
+
+    await require_stopped_lineage((run,))
+
+    assert probes == [("arq:ProviderDirectoryFHIR", canonical)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("field", ["queue_member", "job", "retry", "in_progress"])
+async def test_retirement_rejects_executable_state_under_either_job_id(monkeypatch, legacy, field):
+    from process.provider_directory_terminal_root_retirement_runtime import require_stopped_lineage
+
+    run = _terminal_run()
+    job_id = run["metrics"]["job_id"] if legacy else "provider_directory_start_" + run["run_id"]
+    _install_queue_presence(monkeypatch, present={(job_id, field)})
+
+    with pytest.raises(contract.TerminalRootRetirementError, match="busy"):
+        await require_stopped_lineage((run,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("metrics", "queue", "arq:Other"),
+        ("metrics", "function", "other_start"),
+        ("run", "status", "running"),
+        ("run", "importer", "nucc"),
+        ("run", "run_id", ""),
+        ("run", "run_id", None),
+        ("run", "run_id", " padded "),
+    ],
+)
+async def test_retirement_rejects_unbound_legacy_job_identity(monkeypatch, section, field, value):
+    from process.provider_directory_terminal_root_retirement_runtime import require_stopped_lineage
+
+    run = _terminal_run()
+    (run["metrics"] if section == "metrics" else run)[field] = value
+    probes = _install_queue_presence(monkeypatch)
+
+    with pytest.raises(contract.TerminalRootRetirementError, match="state_invalid"):
+        await require_stopped_lineage((run,))
+    assert probes == []
+
+
+@pytest.mark.asyncio
+async def test_retirement_rejects_unavailable_legacy_adapter(monkeypatch):
+    from api import control_imports
+    from process.provider_directory_terminal_root_retirement_runtime import require_stopped_lineage
+
+    probes = _install_queue_presence(monkeypatch)
+    monkeypatch.setattr(control_imports, "_adapter_for_import_row", lambda _run: None)
+
+    with pytest.raises(contract.TerminalRootRetirementError, match="state_invalid"):
+        await require_stopped_lineage((_terminal_run(),))
+    assert probes == []
+
+
+@pytest.mark.asyncio
+async def test_retirement_retains_terminal_results_and_requires_stopped_worker(monkeypatch):
+    from process.provider_directory_terminal_root_retirement_runtime import require_stopped_lineage
+
+    run = _terminal_run()
+    _install_queue_presence(monkeypatch, present={(run["metrics"]["job_id"], "result")})
+    await require_stopped_lineage((run,))
+
+    _install_queue_presence(monkeypatch, worker={"enabled": True, "stopped": False})
+    with pytest.raises(contract.TerminalRootRetirementError, match="busy"):
+        await require_stopped_lineage((run,))
+
+
+@pytest.mark.asyncio
+async def test_canonical_worker_lookup_still_rejects_conflicting_legacy_id(monkeypatch):
+    from api.control_imports import StaleWorkerReconciliationConflict, _arq_worker_presence
+
+    probes = _install_queue_presence(monkeypatch)
+    with pytest.raises(StaleWorkerReconciliationConflict, match="persisted ARQ job ID conflicts"):
+        await _arq_worker_presence(_terminal_run())
+    assert probes == []
