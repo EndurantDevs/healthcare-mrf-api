@@ -216,6 +216,15 @@ fn retained_heavy_owner_metadata_and_fragment_buffers_verify() {
     .unwrap();
     assert_eq!(proof["authenticated_graph_page_count"], 5);
     assert_eq!(proof["checked_member_count"], 3);
+    let mut planning = metadata.clone();
+    planning.as_object_mut().unwrap().remove("expected_context");
+    planning.as_object_mut().unwrap().remove("actual_context");
+    planning["context"] = context();
+    let plan: Value = serde_json::from_slice(
+        &boundary::plan_members(&bytes(&planning), &selected(), &borrowed).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan, json!({"owner_keys": [5], "coordinates": []}));
     metadata["heavy"][0]["extra"] = json!(1);
     assert!(boundary::verify(&bytes(&metadata), &selected(), &borrowed).is_err());
 }

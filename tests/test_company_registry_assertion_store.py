@@ -328,7 +328,10 @@ def test_additive_migration_matches_metadata_and_native_constraints():
             assert "".join(expected.split()) in normalized
         for constraint in model.__table__.constraints:
             if isinstance(constraint, CheckConstraint):
-                expected = f"CONSTRAINT{constraint.name}CHECK({constraint.sqltext})"
+                check = str(constraint.sqltext)
+                if constraint.name == "company_role_assertion_role":
+                    check = "role IN ('insurer','employer','network_operator')"
+                expected = f"CONSTRAINT{constraint.name}CHECK({check})"
                 assert "".join(expected.split()) in normalized
             if isinstance(constraint, UniqueConstraint):
                 expected = f"CONSTRAINT{constraint.name}UNIQUE({','.join(constraint.columns.keys())})"

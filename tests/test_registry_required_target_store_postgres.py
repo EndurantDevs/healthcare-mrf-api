@@ -11,7 +11,11 @@ from uuid import uuid4
 import pytest
 
 from process import registry_required_target_store as store
-from process.registry_required_target_store import RegistryRequiredTargetEdition, admit_registry_required_targets
+from process.registry_required_target_store import (
+    BUSINESS_PARSER_VERSION,
+    RegistryRequiredTargetEdition,
+    admit_registry_required_targets,
+)
 from tests.test_network_serving_schema_postgres import serving_schema
 
 pytestmark = pytest.mark.asyncio
@@ -174,3 +178,61 @@ async def test_copy_descriptor_mismatch_rolls_back_private_landing(serving_schem
             == 0
         )
     assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_source_snapshot') == 0
+
+
+async def test_business_ledger_retains_context_and_immutable_versioned_replay(serving_schema):
+    connection, schema, _ = serving_schema
+    original_rows = [
+        ("Employer A", "Employer legal", "Plan A", "PPO", "Carrier A", "Network", "123"),
+        ("Employer B", "Other employer", "Plan B", "PPO", "Carrier A", "Network", "123"),
+        ("Employer A", "Employer legal", "Plan C", "PPO", "Carrier B", "Network", "123"),
+        ("Employer B", "Other employer", "Plan D", "Vision", "Carrier A", "", "123"),
+    ]
+
+    def encoded(columns):
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(_HEADERS[:columns])
+        writer.writerows(source_row[:columns] for source_row in original_rows)
+        return output.getvalue().encode()
+
+    legacy_bytes, business_bytes = encoded(7), encoded(6)
+    legacy_edition = _edition(legacy_bytes)
+    business_edition = replace(_edition(business_bytes), parser_version=BUSINESS_PARSER_VERSION)
+    v2 = await _admit(connection, schema, legacy_bytes, legacy_edition)
+    v3 = await _admit(connection, schema, business_bytes, business_edition)
+    assert (v2["source_rows"], v2["target_count"], v3["source_rows"], v3["target_count"]) == (4, 1, 4, 3)
+    assert v2["physical_records"] == v3["physical_records"] == 1
+    assert await _admit(connection, schema, business_bytes, business_edition) == {**v3, "replayed": True}
+    document = json.loads(
+        await connection.fetchval(
+            f'SELECT observation_json::text FROM "{schema}".registry_source_observation WHERE snapshot_id=$1',
+            business_edition.snapshot_id,
+        )
+    )
+    assert document["parser_version"] == BUSINESS_PARSER_VERSION
+    assert all(len(source_row["raw_cells"]) == 6 for source_row in document["ledger"]["observations"])
+    assert {requirement["business_context"]["plan_carrier"] for requirement in document["ledger"]["targets"]} == {
+        "Carrier A",
+        "Carrier B",
+    }
+    assert sorted(len(requirement["source_row_ordinals"]) for requirement in document["ledger"]["targets"]) == [
+        1,
+        1,
+        2,
+    ]
+    assert all("fc_network_id" not in requirement for requirement in document["ledger"]["targets"])
+    before = await connection.fetch(
+        f'SELECT snapshot_id,source_record_key,observation_json::text FROM "{schema}".registry_source_observation ORDER BY snapshot_id'
+    )
+    with pytest.raises(store.RegistryRequiredTargetError, match="edition_conflict"):
+        await _admit(
+            connection, schema, business_bytes, replace(business_edition, source_url="https://example.test/other.csv")
+        )
+    assert (
+        await connection.fetch(
+            f'SELECT snapshot_id,source_record_key,observation_json::text FROM "{schema}".registry_source_observation ORDER BY snapshot_id'
+        )
+        == before
+    )
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_registry_identity') == 0

@@ -27,6 +27,8 @@ PRICING = "20261023110000_code_pricing_import_idempotency"
 JOIN = "20261023220000_merge_directory_pricing_controls"
 HEAD = "20261024050000_provider_directory_first_retirement_owner_lineage"
 SERVING_RECOVERY = "20261023100000_provider_directory_serving_recovery"
+COMPANY_AFFILIATION = "20261025010000_company_affiliation_states"
+COMPANY_JOIN = "20261025020000_company_affiliation_join"
 INDEX = "import_run_code_pricing_idempotency_idx"
 
 
@@ -40,7 +42,9 @@ def _config(connection=None):
 
 def test_directory_pricing_join_preserves_exact_parents_without_database_work():
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == [SERVING_RECOVERY]
+    assert scripts.get_heads() == [COMPANY_JOIN]
+    assert scripts.get_revision(COMPANY_JOIN).down_revision == (SERVING_RECOVERY, COMPANY_AFFILIATION)
+    assert scripts.get_revision(COMPANY_AFFILIATION).down_revision == JOIN
     assert scripts.get_revision(SERVING_RECOVERY).down_revision == HEAD
     assert scripts.get_revision(HEAD).down_revision == JOIN
     assert scripts.get_revision(JOIN).down_revision == (DIRECTORY, PRICING)
@@ -155,3 +159,21 @@ async def test_directory_pricing_join_preserves_native_controls_rows_and_outer_t
                 assert await _parent_control_identity(scenario) == controls_before
                 assert await retirement_trigger_state(scenario) == triggers_before
                 assert await scenario.snapshot() == rows_before
+
+
+@pytest.mark.parametrize(
+    "installed,expected",
+    (
+        (JOIN, [COMPANY_AFFILIATION, HEAD, SERVING_RECOVERY, COMPANY_JOIN]),
+        (SERVING_RECOVERY, [COMPANY_AFFILIATION, COMPANY_JOIN]),
+        (COMPANY_AFFILIATION, [HEAD, SERVING_RECOVERY, COMPANY_JOIN]),
+        ((SERVING_RECOVERY, COMPANY_AFFILIATION), [COMPANY_JOIN]),
+    ),
+    ids=("shared-predecessor", "directory-complete", "company-complete", "both-complete"),
+)
+def test_company_join_preserves_each_installed_branch(installed, expected):
+    scripts = ScriptDirectory.from_config(_config())
+    assert [step.revision.revision for step in scripts._upgrade_revs("head", installed)] == expected
+    assert [step.revision.revision for step in scripts._upgrade_revs(COMPANY_AFFILIATION, JOIN)] == [
+        COMPANY_AFFILIATION
+    ]

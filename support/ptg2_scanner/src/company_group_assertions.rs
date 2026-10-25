@@ -24,6 +24,7 @@ pub enum GroupKind {
 pub enum RelationshipKind {
     ReportedAffiliation,
     VerifiedOwnership,
+    VerifiedNoAffiliation,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -306,9 +307,23 @@ fn validate_row(
     if !reference(&row.provenance.evidence_ref) {
         return Err(failure("invalid_provenance", index, Some("evidence_ref")));
     }
+    let no_affiliation = row.relationship_kind == RelationshipKind::VerifiedNoAffiliation;
+    if no_affiliation
+        && (group_id.is_some()
+            || valid_from.is_none()
+            || row.provenance.kind != ProvenanceKind::ManualReference)
+    {
+        return Err(failure(
+            "invalid_no_affiliation",
+            index,
+            Some("relationship_kind"),
+        ));
+    }
     let provenance_valid = match row.provenance.kind {
         ProvenanceKind::ManualReference => {
-            snapshot_id.is_none() && source_record_key.is_none() && group_id.is_some()
+            snapshot_id.is_none()
+                && source_record_key.is_none()
+                && (group_id.is_some() || no_affiliation)
         }
         ProvenanceKind::SourceReference => {
             snapshot_id.as_deref().is_some_and(canonical_uuid)
@@ -376,7 +391,9 @@ fn canonical_date(value: &str) -> bool {
 fn missing_reviews(assertions: &[CompanyGroupAssertion]) -> Vec<AssertionReview> {
     let mut reviews: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (index, assertion) in assertions.iter().enumerate() {
-        let code = match (assertion.group_id.is_none(), assertion.valid_from.is_none()) {
+        let missing_group = assertion.group_id.is_none()
+            && assertion.relationship_kind != RelationshipKind::VerifiedNoAffiliation;
+        let code = match (missing_group, assertion.valid_from.is_none()) {
             (true, true) => "missing_group_and_effective_start",
             (true, false) => "missing_group",
             (false, true) => "missing_effective_start",
@@ -414,15 +431,22 @@ fn retain_component(
 fn overlap_reviews(assertions: &[CompanyGroupAssertion]) -> Vec<AssertionReview> {
     let mut scopes: BTreeMap<_, Vec<usize>> = BTreeMap::new();
     for (index, assertion) in assertions.iter().enumerate() {
-        if assertion.group_id.is_some() && assertion.valid_from.is_some() {
-            scopes
-                .entry((
-                    &assertion.company_id,
-                    assertion.group_kind,
-                    assertion.relationship_kind,
-                ))
-                .or_default()
-                .push(index);
+        let no_affiliation = assertion.relationship_kind == RelationshipKind::VerifiedNoAffiliation;
+        if (assertion.group_id.is_some() || no_affiliation) && assertion.valid_from.is_some() {
+            let kinds = if no_affiliation {
+                &[
+                    RelationshipKind::ReportedAffiliation,
+                    RelationshipKind::VerifiedOwnership,
+                ][..]
+            } else {
+                std::slice::from_ref(&assertion.relationship_kind)
+            };
+            for kind in kinds {
+                scopes
+                    .entry((&assertion.company_id, assertion.group_kind, *kind))
+                    .or_default()
+                    .push(index);
+            }
         }
     }
     let mut reviews = Vec::new();

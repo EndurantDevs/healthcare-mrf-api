@@ -38,7 +38,13 @@ def test_additive_group_assertion_migration_matches_frozen_model_and_index():
         assert "".join(expected.split()) in normalized
     for constraint in table.constraints:
         if isinstance(constraint, CheckConstraint):
-            expected = f"CONSTRAINT{constraint.name}CHECK({constraint.sqltext})"
+            if constraint.name == "company_group_assertion_no_affiliation":
+                continue  # This constraint belongs to the later additive branch.
+            check = {
+                "company_group_assertion_relationship": "relationship_kind IN ('reported_affiliation','verified_ownership')",
+                "company_group_assertion_manual_group": "provenance_kind<>'manual_reference' OR group_id IS NOT NULL",
+            }.get(constraint.name, str(constraint.sqltext))
+            expected = f"CONSTRAINT{constraint.name}CHECK({check})"
             assert "".join(expected.split()) in normalized
     assert "PRIMARYKEY(assertion_id,company_id,company_revision)" in normalized
     assert statements[1] == (
@@ -84,7 +90,7 @@ def test_group_migration_extends_only_the_actual_current_receipt_head():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261023100000_provider_directory_serving_recovery"]
+    assert script.get_heads() == ["20261025020000_company_affiliation_join"]
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"
@@ -212,3 +218,83 @@ def test_raw_object_join_upgrades_either_installed_branch_once(installed_revisio
     else:
         assert revisions[-2] == "20261018040000_registry_aca_source_notifications"
         assert "20261017020000_source_registry_snapshot_join" in revisions
+
+
+def test_affiliation_branch_preserves_pending_directory_migrations_and_matches_constraints(monkeypatch):
+    from db.models.company_registry import CompanyRegistry
+    from db.models.company_registry_assertions import CompanyRegistryRoleAssertion
+
+    branch = "20261025010000_company_affiliation_states"
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    base = "20261023220000_merge_directory_pricing_controls"
+    assert [step.revision.revision for step in script._upgrade_revs(branch, base)] == [branch]
+    assert set(step.revision.revision for step in script._upgrade_revs("head", base)) == {
+        branch,
+        "20261024050000_provider_directory_first_retirement_owner_lineage",
+        "20261023100000_provider_directory_serving_recovery",
+        "20261025020000_company_affiliation_join",
+    }
+    migration = _migration(branch)
+    statements = migration._ddl("example_registry")
+    names = {
+        "registry_company_roles",
+        "company_role_assertion_role",
+        "company_group_assertion_relationship",
+        "company_group_assertion_manual_group",
+        "company_group_assertion_no_affiliation",
+    }
+    checks_by_name = {
+        constraint.name: str(constraint.sqltext)
+        for model in (CompanyRegistry, CompanyRegistryRoleAssertion, CompanyRegistryGroupAssertion)
+        for constraint in model.__table__.constraints
+        if constraint.name in names
+    }
+    assert len(statements) == 3 and len(checks_by_name) == 5
+    for model in (CompanyRegistry, CompanyRegistryRoleAssertion, CompanyRegistryGroupAssertion):
+        assert (
+            sum(f'ALTER TABLE "example_registry".{model.__tablename__} ' in statement for statement in statements) == 1
+        )
+    for name, check in checks_by_name.items():
+        assert sum(f"ADD CONSTRAINT {name} CHECK ({check})" in statement for statement in statements) == 1
+    assert not any(
+        token in " ".join(statements).upper()
+        for token in ("GRANT", "CREATE FUNCTION", "TRIGGER", "INSERT", "DELETE", "UPDATE ", "NOT VALID", "COMMIT")
+    )
+    executed_statements = []
+    monkeypatch.setattr("alembic.op.execute", executed_statements.append)
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "example_registry")
+    migration.upgrade()
+    assert executed_statements == ["SET LOCAL lock_timeout='1s'", "SET LOCAL statement_timeout='10s'", *statements]
+    with pytest.raises(RuntimeError, match="retained-data migration"):
+        migration.downgrade()
+    join = _migration("20261025020000_company_affiliation_join")
+    executed_statements.clear()
+    assert join.upgrade() is join.downgrade() is None and executed_statements == []
+
+
+@pytest.mark.parametrize("schema", [None, "", 'bad"name', "a.b", "a" * 64])
+def test_affiliation_migration_rejects_bad_namespace(schema):
+    with pytest.raises(ValueError):
+        _migration("20261025010000_company_affiliation_states")._ddl(schema)
+
+
+def test_affiliation_upgrade_retains_directory_head():
+    script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
+    installed = "20261024050000_provider_directory_first_retirement_owner_lineage"
+    branch = "20261025010000_company_affiliation_states"
+    steps = script._upgrade_revs(branch, installed)
+    assert [step.revision.revision for step in steps] == [branch]
+    assert steps[0].should_create_branch({installed})
+    assert not steps[0].should_merge_branches({installed})
+    assert steps[0].to_revisions == (branch,)
+
+
+def test_native_fixture_head_checks_preserve_history_without_database_work():
+    from tests.entity_address_migrated_preparation_support import _assert_address_migration_chain
+    from tests.test_provider_directory_profile_capacity_adoption_postgres import _assert_registry_migration_lineage
+
+    script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
+    assert _assert_registry_migration_lineage() == {"20261025020000_company_affiliation_join"}
+    assert _assert_address_migration_chain(script) is None

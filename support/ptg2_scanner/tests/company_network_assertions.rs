@@ -501,3 +501,17 @@ fn distinct_benefit_selections_do_not_bypass_existing_overlap_review() {
     assert_eq!(output.conflicts[0].code, "overlapping_periods");
     assert_eq!(output, validate(&[second, first]).unwrap());
 }
+
+#[test]
+fn rejected_assertion_display_does_not_echo_submitted_identity_or_evidence() {
+    let mut invalid = row();
+    invalid["network_id"] = json!("synthetic-private-value");
+    invalid["evidence_text"] = json!("synthetic-private-evidence");
+    let error = validate(&[row(), invalid]).unwrap_err();
+    assert_eq!(error.row_index, Some(1));
+    assert_eq!(error.code, "invalid_row");
+    assert_eq!(
+        error.to_string(),
+        "Company-network assertions rejected: invalid_row"
+    );
+}

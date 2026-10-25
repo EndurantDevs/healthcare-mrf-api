@@ -39,7 +39,8 @@ _REFERENCES_SQL = """WITH refs AS MATERIALIZED (
 ),ledgers AS MATERIALIZED (
   SELECT snapshot.snapshot_id,snapshot.artifact_sha256,observation.observation_json AS document,
     snapshot.source_system='required-network-targets' AND snapshot.source_id='required-networks'
-      AND snapshot.parser_version='registry-target-ledger-v2' AND snapshot.edition_id=snapshot.input_sha256
+      AND snapshot.parser_version IN ('registry-target-ledger-v2','registry-target-ledger-v3')
+          AND observation.observation_json->>'parser_version'=snapshot.parser_version AND snapshot.edition_id=snapshot.input_sha256
       AND snapshot.reporting_year IS NULL AND snapshot.published_at IS NULL
       AND observation.source_row_number=1 AND observation.status='accepted' AND observation.issues_json='[]'::jsonb
       AND observation.observation_json->'ledger'->>'source_sha256'=snapshot.input_sha256
@@ -48,7 +49,7 @@ _REFERENCES_SQL = """WITH refs AS MATERIALIZED (
   FROM {namespace}.registry_source_snapshot snapshot
   JOIN {namespace}.registry_source_observation observation USING(snapshot_id)
   WHERE snapshot.snapshot_id IN (SELECT snapshot_id FROM ledger_ids)
-    AND observation.source_record_key='ledger:v2'
+    AND observation.source_record_key=CASE snapshot.parser_version WHEN 'registry-target-ledger-v2' THEN 'ledger:v2' ELSE 'ledger:v3' END
   {artifact_lock}
 ),documents AS MATERIALIZED (
   SELECT 'review' AS kind,snapshot_id,artifact_sha256,document FROM reviews UNION ALL

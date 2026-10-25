@@ -84,7 +84,7 @@ impl fmt::Display for RegistryTargetLedgerError {
 
 impl std::error::Error for RegistryTargetLedgerError {}
 
-fn failure(code: &'static str, row: Option<usize>) -> RegistryTargetLedgerError {
+pub(crate) fn failure(code: &'static str, row: Option<usize>) -> RegistryTargetLedgerError {
     RegistryTargetLedgerError {
         code,
         source_row_ordinal: row,
@@ -99,9 +99,13 @@ enum CsvState {
     AfterQuote,
 }
 
-fn check_record(columns: usize, completed: usize) -> Result<(), RegistryTargetLedgerError> {
+fn check_record(
+    columns: usize,
+    completed: usize,
+    expected_columns: usize,
+) -> Result<(), RegistryTargetLedgerError> {
     let row = (completed > 0).then_some(completed);
-    if columns != HEADERS.len() {
+    if columns != expected_columns {
         return Err(failure(
             if row.is_some() {
                 "invalid_csv"
@@ -119,7 +123,10 @@ fn check_record(columns: usize, completed: usize) -> Result<(), RegistryTargetLe
 
 /// The csv decoder permits unterminated quotes, trailing quote text and blank records.
 /// Check those concrete gaps before decoding so no source record is silently lost.
-fn strict_record_count(input: &[u8]) -> Result<usize, RegistryTargetLedgerError> {
+pub(crate) fn strict_record_count(
+    input: &[u8],
+    expected_columns: usize,
+) -> Result<usize, RegistryTargetLedgerError> {
     let mut state = CsvState::FieldStart;
     let mut columns = 1;
     let mut completed = 0;
@@ -143,7 +150,7 @@ fn strict_record_count(input: &[u8]) -> Result<usize, RegistryTargetLedgerError>
                 started = true;
             }
             (_, b'\r' | b'\n') => {
-                check_record(columns, completed)?;
+                check_record(columns, completed, expected_columns)?;
                 completed += 1;
                 columns = 1;
                 state = CsvState::FieldStart;
@@ -160,7 +167,7 @@ fn strict_record_count(input: &[u8]) -> Result<usize, RegistryTargetLedgerError>
         }
         index += 1;
     }
-    finish_record_count(state, started, columns, completed)
+    finish_record_count(state, started, columns, completed, expected_columns)
 }
 
 fn finish_record_count(
@@ -168,12 +175,13 @@ fn finish_record_count(
     started: bool,
     columns: usize,
     mut completed: usize,
+    expected_columns: usize,
 ) -> Result<usize, RegistryTargetLedgerError> {
     if matches!(state, CsvState::Quoted) {
         return Err(failure("invalid_csv", (completed > 0).then_some(completed)));
     }
     if started {
-        check_record(columns, completed)?;
+        check_record(columns, completed, expected_columns)?;
         completed += 1;
     }
     completed
@@ -206,7 +214,7 @@ pub(crate) fn target_key(fc: Option<&str>, digest: &str, row: usize) -> String {
     )
 }
 
-struct OutputCounter(usize);
+pub(crate) struct OutputCounter(pub(crate) usize);
 
 impl Write for OutputCounter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -264,7 +272,7 @@ pub fn parse_registry_target_ledger(
     if input.starts_with(b"\xef\xbb\xbf") {
         return Err(failure("invalid_headers", None));
     }
-    let expected_rows = strict_record_count(input)?;
+    let expected_rows = strict_record_count(input, HEADERS.len())?;
     if expected_rows == 0 {
         return Err(failure("empty_ledger", None));
     }
@@ -310,7 +318,7 @@ pub fn encode_registry_target_ledger_artifact(
     input: &[u8],
     snapshot_id: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), RegistryTargetLedgerError> {
-    let snapshot = uuid_bytes(snapshot_id)
+    let _snapshot = uuid_bytes(snapshot_id)
         .filter(|_| !snapshot_id.bytes().any(|byte| byte.is_ascii_uppercase()))
         .ok_or_else(|| failure("invalid_snapshot_id", None))?;
     let ledger = parse_registry_target_ledger(input)?;
@@ -324,17 +332,6 @@ pub fn encode_registry_target_ledger_artifact(
             Some(observation.source_row_ordinal),
         ));
     }
-    let mut descriptor = RegistryTargetLedgerArtifactDescriptor {
-        component: COMPONENT,
-        revision: 1,
-        parser_version: PARSER_VERSION,
-        snapshot_id,
-        source_sha256: ledger.source_sha256.clone(),
-        artifact_sha256: String::new(),
-        source_rows: ledger.row_count,
-        target_count: ledger.targets.len(),
-        physical_records: 1,
-    };
     let document = serde_json::to_value(RegistryTargetLedgerDocument {
         component: COMPONENT,
         revision: 1,
@@ -342,6 +339,37 @@ pub fn encode_registry_target_ledger_artifact(
         ledger,
     })
     .map_err(|_| failure("output_limit", None))?;
+    encode_document(document, snapshot_id, PARSER_VERSION, b"ledger:v2")
+}
+
+pub(crate) fn encode_document(
+    document: serde_json::Value,
+    snapshot_id: &str,
+    parser_version: &'static str,
+    record_key: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), RegistryTargetLedgerError> {
+    let snapshot = uuid_bytes(snapshot_id)
+        .filter(|_| !snapshot_id.bytes().any(|byte| byte.is_ascii_uppercase()))
+        .ok_or_else(|| failure("invalid_snapshot_id", None))?;
+    let mut descriptor = RegistryTargetLedgerArtifactDescriptor {
+        component: COMPONENT,
+        revision: 1,
+        parser_version,
+        snapshot_id,
+        source_sha256: document["ledger"]["source_sha256"]
+            .as_str()
+            .ok_or_else(|| failure("output_limit", None))?
+            .to_owned(),
+        artifact_sha256: String::new(),
+        source_rows: document["ledger"]["row_count"]
+            .as_u64()
+            .ok_or_else(|| failure("output_limit", None))? as usize,
+        target_count: document["ledger"]["targets"]
+            .as_array()
+            .ok_or_else(|| failure("output_limit", None))?
+            .len(),
+        physical_records: 1,
+    };
     serde_json::to_writer(OutputCounter(0), &document)
         .map_err(|_| failure("output_limit", None))?;
     let artifact = serde_json::to_vec(&document).map_err(|_| failure("output_limit", None))?;
@@ -357,7 +385,7 @@ pub fn encode_registry_target_ledger_artifact(
     observation_json.extend_from_slice(&artifact);
     let fields: [&[u8]; 6] = [
         &snapshot,
-        b"ledger:v2",
+        record_key,
         &1i32.to_be_bytes(),
         b"accepted",
         &observation_json,

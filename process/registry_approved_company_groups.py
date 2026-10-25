@@ -45,7 +45,10 @@ WITH prospective AS MATERIALIZED (
     AND (assertion->>'valid_to' IS NULL OR pg_input_is_valid(assertion->>'valid_to','date'))
     AND assertion->>'company_id'=g.record_key
     AND assertion->>'group_kind' IN ('corporate_parent','naic_group')
-    AND assertion->>'relationship_kind' IN ('reported_affiliation','verified_ownership')
+    AND assertion->>'relationship_kind' IN ('reported_affiliation','verified_ownership','verified_no_affiliation')
+    AND (assertion->>'relationship_kind'<>'verified_no_affiliation' OR
+      (assertion->>'group_id' IS NULL AND assertion->>'valid_from' IS NOT NULL
+        AND assertion->'provenance'->>'kind'='manual_reference'))
     AND jsonb_typeof(assertion->'provenance')='object'
     AND assertion->'provenance' ?& ARRAY['kind','evidence_ref','snapshot_id','source_record_key']
     AND (assertion->'provenance')-'kind'-'evidence_ref'-'snapshot_id'-'source_record_key'='{{}}'::jsonb

@@ -76,6 +76,7 @@ def test_manual_company_needs_no_external_identifier():
 def test_roles_and_periods_preserve_existing_identity():
     document = _command(
         role_assertions=[
+            _role(4, role="benefits_administrator"),
             _role(3, role="network_operator", valid_to="2025-01-01"),
             _role(2, role="employer"),
             _role(1),
@@ -85,7 +86,8 @@ def test_roles_and_periods_preserve_existing_identity():
     command = _parse(document)
     assert {entry.role for entry in command.role_assertions} == set(values.COMPANY_ROLES)
     assert command.company_id == UUID(COMPANY)
-    assert command.role_assertions[-1].valid_from == command.role_assertions[-1].valid_to
+    operator = next(entry for entry in command.role_assertions if entry.role == "network_operator")
+    assert operator.valid_from == operator.valid_to
     assert _parse(command.as_dict()) == command
     reversed_document = deepcopy(document)
     reversed_document["role_assertions"].reverse()
@@ -513,3 +515,28 @@ def test_groups_share_the_unchanged_whole_command_byte_limit(monkeypatch):
     monkeypatch.setattr(ptg2_address_canon, "validate_company_group_assertions", unexpected)
     with pytest.raises(values.CompanyRegistryAssertionValueError):
         _parse(document)
+
+
+def test_evidenced_no_affiliation_is_separate_for_each_group_kind():
+    rows = [
+        _group(40, group_id=None, relationship_kind="verified_no_affiliation"),
+        _group(41, group_id=None, group_kind="naic_group", relationship_kind="verified_no_affiliation"),
+    ]
+    command = _parse(_command(role_assertions=[_role(role="benefits_administrator")], group_assertions=rows))
+    assert command.as_dict()["group_assertions"] == rows
+    assert _parse(command.as_dict()) == command
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"group_id": "33333333-3333-4333-8333-333333333333"},
+        {"valid_from": None},
+        {"provenance": _provenance("source_reference")},
+        {"provenance": _provenance() | {"evidence_ref": ""}},
+    ],
+)
+def test_no_affiliation_requires_known_period_and_explicit_manual_evidence(changes):
+    row = _group(group_id=None, relationship_kind="verified_no_affiliation") | changes
+    with pytest.raises(values.CompanyRegistryAssertionValueError):
+        _parse(_command(group_assertions=[row]))

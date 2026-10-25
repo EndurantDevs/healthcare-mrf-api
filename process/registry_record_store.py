@@ -54,6 +54,7 @@ from db.models.registry_network_binding import RegistryNetworkBinding
 from db.models.registry_revision import RegistryRecordHistory, RegistryRevisionControl
 from db.models.registry_site_binding import RegistrySiteBinding
 from process.company_registry_assertion_values import (
+    COMPANY_ROLES,
     CONTRACT,
     MAX_GROUP_ASSERTIONS,
     MAX_IDENTIFIER_ASSERTIONS,
@@ -89,7 +90,7 @@ _RECORD_MODELS = {
         {"source_generation", "provider_system", "provider_id", "location_id", "location_key", "address_row_sha256"},
     ),
 }
-_COMPANY_ROLES = {"insurer", "employer", "network_operator"}
+_COMPANY_ROLES = frozenset(COMPANY_ROLES)
 
 
 class RegistryRecordConflict(ValueError):

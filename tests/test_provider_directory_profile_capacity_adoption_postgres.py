@@ -350,7 +350,7 @@ def _assert_registry_migration_lineage():
     """Require the current joined head and every protected registry parent edge."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     expected_heads = set(script.get_heads())
-    assert expected_heads == {"20261023100000_provider_directory_serving_recovery"}
+    assert expected_heads == {"20261025020000_company_affiliation_join"}
     _assert_custom_import_manual_acceptance_lineage(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision

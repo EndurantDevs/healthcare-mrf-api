@@ -401,3 +401,58 @@ fn errors_expose_only_static_codes_and_row_coordinates() {
         json!({"code":"invalid_uuid", "row_index":0, "field":"company_id"})
     );
 }
+
+fn no_affiliation(number: usize, start: Value, end: Value) -> Value {
+    let mut row = assertion(number, 10, start, end);
+    row["relationship_kind"] = json!("verified_no_affiliation");
+    row["group_id"] = Value::Null;
+    row
+}
+
+#[test]
+fn evidenced_no_affiliation_is_effective_without_inventing_a_group() {
+    let row = no_affiliation(1, json!("2024-01-01"), Value::Null);
+    let mut naic = row.clone();
+    naic["assertion_id"] = json!(identity(2));
+    naic["group_kind"] = json!("naic_group");
+    let reduced = reduce(vec![row.clone(), naic.clone()]);
+    assert!(reduced.reviews.is_empty());
+    assert_eq!(reduced.effective_assertion_indices, [0, 1]);
+    assert_eq!(
+        serde_json::to_value(reduced.assertions).unwrap(),
+        json!([row, naic])
+    );
+}
+
+#[test]
+fn no_affiliation_refuses_group_unknown_start_and_source_inference() {
+    let row = no_affiliation(1, json!("2024-01-01"), Value::Null);
+    let mut group = row.clone();
+    group["group_id"] = json!(identity(10));
+    let mut undated = row.clone();
+    undated["valid_from"] = Value::Null;
+    for malformed in [group, undated, source(row)] {
+        assert_eq!(reject(vec![malformed]).code, "invalid_no_affiliation");
+    }
+}
+
+#[test]
+fn no_affiliation_conflicts_with_both_positive_kinds_only_in_its_period_and_scope() {
+    for kind in ["reported_affiliation", "verified_ownership"] {
+        let none = no_affiliation(1, json!("2024-01-01"), json!("2024-02-29"));
+        let mut positive = assertion(2, 10, json!("2024-02-29"), Value::Null);
+        positive["relationship_kind"] = json!(kind);
+        let reduced = reduce(vec![none.clone(), positive.clone()]);
+        assert_eq!(reduced.reviews.len(), 1);
+        assert_eq!(reduced.reviews[0].code, "contradictory_overlapping_groups");
+        assert_eq!(reduced.reviews[0].assertion_indices, [0, 1]);
+        assert!(reduced.effective_assertion_indices.is_empty());
+        positive["valid_from"] = json!("2024-03-01");
+        assert!(reduce(vec![none.clone(), positive.clone()])
+            .reviews
+            .is_empty());
+        positive["valid_from"] = json!("2024-02-29");
+        positive["group_kind"] = json!("naic_group");
+        assert!(reduce(vec![none, positive]).reviews.is_empty());
+    }
+}

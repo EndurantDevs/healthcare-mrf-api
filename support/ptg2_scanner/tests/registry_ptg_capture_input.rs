@@ -637,3 +637,13 @@ fn published_plan_keeps_two_distinct_offices_without_cohort_labels() {
     ctx["source_scope"]["plan_id"] = json!("other");
     assert!(encode(&rows, &ctx, 0).is_err());
 }
+
+#[test]
+fn capture_error_display_retains_only_static_diagnostic_code() {
+    let mut invalid = office_b();
+    invalid["provider_id"] = json!("synthetic-private-value");
+    let failure = encode(&[row(), invalid], &context(), 0).unwrap_err();
+    assert_eq!(failure.row_ordinal, Some(2));
+    assert_eq!(failure.code, "registry_ptg_provider_invalid");
+    assert_eq!(failure.to_string(), failure.code);
+}

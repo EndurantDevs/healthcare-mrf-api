@@ -537,3 +537,17 @@ fn legacy_row_boundary_and_last_operation_use_one_document_mode() {
         ("row_limit", Some(MAX_ROWS))
     );
 }
+
+#[test]
+fn membership_error_display_does_not_echo_submitted_provider_or_evidence() {
+    let mut invalid = row();
+    invalid["network_id"] = json!(0);
+    invalid["provider_id"] = json!("synthetic-private-value");
+    invalid["evidence_id"] = json!("synthetic-private-evidence");
+    let failure = encode_network_membership_batch(&serde_json::to_vec(&[row(), invalid]).unwrap())
+        .unwrap_err();
+    assert_eq!(failure.row_index, Some(1));
+    assert_eq!(failure.field, Some("network_id"));
+    assert_eq!(failure.code, "invalid_network_id");
+    assert_eq!(failure.to_string(), "Network ID must be a positive int32");
+}

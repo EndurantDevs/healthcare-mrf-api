@@ -15,6 +15,7 @@ import asyncpg
 from db.models import GeoZipLookup, Plan, PlanNetworkTierRaw, PlanRatingAreas
 from db.registry_schema import registry_schema
 from db.tiger_models import ZipState
+from process.company_registry_assertion_values import COMPANY_ROLES
 from process.network_address_projection import _identifier, _membership_accounting
 from process.network_approved_membership_source import (
     pin_retained_approved_membership_source,
@@ -452,8 +453,8 @@ def _company_document(company):
     roles = company["roles"]
     if (
         type(roles) is not list
-        or not 1 <= len(roles) <= 3
-        or any(type(role) is not str or role not in {"insurer", "employer", "network_operator"} for role in roles)
+        or not 1 <= len(roles) <= len(COMPANY_ROLES)
+        or any(type(role) is not str or role not in COMPANY_ROLES for role in roles)
         or len(set(roles)) != len(roles)
     ):
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")

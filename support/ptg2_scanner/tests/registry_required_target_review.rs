@@ -767,3 +767,28 @@ fn review_retains_missing_requested_id_row_fallbacks() {
     changed["ledger"]["observations"][0]["target_keys"][0] = json!(key.replace(":row:1", ":row:2"));
     reject(&input, &changed);
 }
+
+#[test]
+fn rehashed_provenance_refuses_invalid_source_ids_and_missing_review_ledger() {
+    for source_id in ["01", "not-an-id", "1\u{0001}"] {
+        let mut retained = standalone_ledger();
+        retained["document"]["ledger"]["observations"][0]["raw_cells"][6] = json!(source_id);
+        rehash(&mut retained);
+        assert_eq!(
+            validate_ledger_artifact(&serde_json::to_vec(&retained).unwrap())
+                .unwrap_err()
+                .code,
+            "registry_target_review_ledger_invalid"
+        );
+    }
+    let mut retained = bundle();
+    retained["reviews"][0]["document"]["ledger_snapshot_id"] =
+        json!("56789012-5678-9012-8567-56789012abcd");
+    rehash(&mut retained["reviews"][0]);
+    assert_eq!(
+        validate_bundle(&serde_json::to_vec(&retained).unwrap())
+            .unwrap_err()
+            .code,
+        "registry_target_review_ledger_mismatch"
+    );
+}

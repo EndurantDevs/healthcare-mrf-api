@@ -19,7 +19,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import registry_record_store as record_store
@@ -79,6 +79,7 @@ _MIGRATIONS = (
     "20261012010000_company_registry_name_origin.py",
     "20261013010000_registry_custom_history_events.py",
     "20261018011000_network_candidate_custody.py",
+    "20261025010000_company_affiliation_states.py",
 )
 
 
@@ -133,11 +134,11 @@ async def _install(fixture):
         return await install_registry_management_permissions(fixture.connection, **fixture.permission_arguments())
 
 
-async def _migrate(engine, monkeypatch, schema):
+async def _migrate(engine, monkeypatch, schema, migrations=_MIGRATIONS):
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", schema)
     async with engine.begin() as connection:
-        for filename in _MIGRATIONS:
+        for filename in migrations:
             path = Path(__file__).parents[1] / "alembic/versions" / filename
             spec = importlib.util.spec_from_file_location(path.stem, path)
             migration = importlib.util.module_from_spec(spec)
@@ -178,7 +179,7 @@ def _registration(tmp_path):
     return journal, document_by_field
 
 
-async def _prepare_database(url, monkeypatch, journal, document_by_field, resources_by_kind):
+async def _prepare_database(url, monkeypatch, journal, document_by_field, resources_by_kind, migrations=_MIGRATIONS):
     schema, roles_by_kind = document_by_field["schema"], document_by_field["roles"]
     settings_by_name = {"application_name": document_by_field["application_name"], "statement_timeout": "20s"}
     connection = await asyncpg.connect(
@@ -194,7 +195,7 @@ async def _prepare_database(url, monkeypatch, journal, document_by_field, resour
     resources_by_kind["is_schema_created"] = True
     engine = create_async_engine(url, pool_size=1, max_overflow=0, connect_args={"server_settings": settings_by_name})
     resources_by_kind["engine"] = engine
-    await _migrate(engine, monkeypatch, schema)
+    await _migrate(engine, monkeypatch, schema, migrations)
     draft_password = secrets.token_hex(32)
     for kind, role in roles_by_kind.items():
         login = f"LOGIN PASSWORD '{draft_password}'" if kind == "draft" else "NOLOGIN"
@@ -261,12 +262,13 @@ async def _cleanup_database(journal, document_by_field, resources_by_kind):
 
 
 @pytest.fixture
-async def assertion_db(tmp_path, monkeypatch):
+async def assertion_db(tmp_path, monkeypatch, request):
     url = _guarded_url()
     journal, document_by_field = _registration(tmp_path)
     resources_by_kind = {}
+    migrations = _MIGRATIONS[:-1] if getattr(request, "param", None) == "before-affiliation" else _MIGRATIONS
     try:
-        yield await _prepare_database(url, monkeypatch, journal, document_by_field, resources_by_kind)
+        yield await _prepare_database(url, monkeypatch, journal, document_by_field, resources_by_kind, migrations)
     finally:
         await _cleanup_database(journal, document_by_field, resources_by_kind)
 
@@ -1380,3 +1382,204 @@ async def _verify_materialized_group_undo(fixture, materialized, group_id):
     assert replay.command == preparation.command
     assert await _draft(fixture, replay.command, undo_provenance=replay.provenance) == restored
     assert await fixture.connection.fetch(query, str(group_id)) == history
+
+
+async def test_administrator_no_affiliation_draft_approval_and_native_refusals(assertion_db):
+    fixture = assertion_db
+    command = _create()
+    command.fields["roles"] = ["benefits_administrator"]
+    command.fields["assertions"]["role_assertions"][0]["role"] = "benefits_administrator"
+    group_assertions = [
+        _declared_group(command.record_id, None, group_kind=kind, relationship_kind="verified_no_affiliation")
+        for kind in ("corporate_parent", "naic_group")
+    ]
+    command = _with_groups(command, group_assertions)
+    created = await _draft(fixture, command)
+    assert created["record"]["roles"] == ["benefits_administrator"]
+    assert created["record"]["group_assertions"] == sorted(group_assertions, key=lambda row: row["assertion_id"])
+    approved = await _approve(fixture, created)
+    document = json.loads(
+        await fixture.connection.fetchval(
+            f"SELECT record_json::text FROM {fixture.namespace}.registry_approved_record WHERE approved_revision=$1",
+            approved["approved_revision"],
+        )
+    )
+    assert document == created["record"]
+    from process.registry_serving_organization_read import _READ_SQL, _projection
+
+    for exclusions in (False, True):
+        query = _READ_SQL.format(
+            namespace=fixture.namespace, projection=_projection("company", fixture.namespace, exclusions=exclusions)
+        )
+        page = await fixture.connection.fetchrow(
+            query, approved["approved_revision"], "company", [str(command.record_id)], [], 0, 50, 1024 * 1024
+        )
+        assert json.loads(page["rows_json"])[0]["group_assertions"] == document["group_assertions"]
+        denied = await fixture.connection.fetchrow(
+            query, approved["approved_revision"], "company", [], [], 0, 50, 1024 * 1024
+        )
+        assert denied["total"] == 0 and json.loads(denied["rows_json"]) == []
+    await _native_no_affiliation_refusals(fixture)
+    assert (await _accounting(fixture))["groups"] == 2
+
+
+async def _native_no_affiliation_refusals(fixture):
+    async with fixture.sessions() as session, session.begin():
+        assert await session.scalar(text("SELECT current_user")) == fixture.roles_by_kind["draft"]
+        for column, value in (
+            ("group_id", "'11111111-1111-4111-8111-111111111111'::uuid"),
+            ("valid_from", "NULL"),
+            ("provenance_kind", "'source_reference'"),
+        ):
+            with pytest.raises(IntegrityError):
+                async with session.begin_nested():
+                    await session.execute(
+                        text(
+                            f"INSERT INTO {fixture.namespace}.company_registry_group_assertion "
+                            "(assertion_id,company_id,company_revision,group_id,group_kind,relationship_kind,"
+                            "valid_from,valid_to,provenance_kind,evidence_ref,source_snapshot_id,source_record_key) "
+                            "SELECT :identity,company_id,company_revision,"
+                            + (value if column == "group_id" else "group_id")
+                            + ",group_kind,relationship_kind,"
+                            + (value if column == "valid_from" else "valid_from")
+                            + ",valid_to,"
+                            + (value if column == "provenance_kind" else "provenance_kind")
+                            + f",evidence_ref,source_snapshot_id,source_record_key FROM {fixture.namespace}.company_registry_group_assertion LIMIT 1"
+                        ),
+                        {"identity": uuid4()},
+                    )
+
+
+async def _seed_affiliation_predecessor(fixture):
+    command = _create()
+    group_id = await _draft_group_target(fixture)
+    await _draft(fixture, _with_groups(command, [_declared_group(command.record_id, group_id)]))
+    source, _ = _group_assertion_rows()
+    source.update(company_id=command.record_id)
+    statement = text(
+        f"INSERT INTO {fixture.namespace}.company_registry_group_assertion "
+        "(assertion_id,company_id,company_revision,group_id,group_kind,relationship_kind,valid_from,valid_to,"
+        "provenance_kind,evidence_ref,source_snapshot_id,source_record_key) "
+        "VALUES(:assertion_id,:company_id,:company_revision,:group_id,:group_kind,:relationship_kind,"
+        ":valid_from,:valid_to,:provenance_kind,:evidence_ref,:source_snapshot_id,:source_record_key)"
+    )
+    async with fixture.sessions() as session, session.begin():
+        assert await session.scalar(text("SELECT current_user")) == fixture.roles_by_kind["draft"]
+        await session.execute(statement, source)
+
+
+async def _affiliation_snapshot(fixture):
+    tables = ("company_registry", "company_registry_role_assertion", "company_registry_group_assertion")
+    relations = await fixture.connection.fetch(
+        "SELECT relation.oid,relation.relname,relation.relowner,relation.relacl::text "
+        "FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND relation.relname=ANY($2::text[]) ORDER BY relation.relname",
+        fixture.schema,
+        tables,
+    )
+    constraints = await fixture.connection.fetch(
+        "SELECT constraint_row.oid,constraint_row.conrelid,constraint_row.conname,constraint_row.convalidated,"
+        "pg_get_constraintdef(constraint_row.oid) AS definition "
+        "FROM pg_constraint constraint_row JOIN pg_class relation ON relation.oid=constraint_row.conrelid "
+        "JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND relation.relname=ANY($2::text[]) ORDER BY relation.relname,constraint_row.conname",
+        fixture.schema,
+        tables,
+    )
+    rows_by_table = {
+        table: json.loads(
+            await fixture.connection.fetchval(
+                f"SELECT coalesce(jsonb_agg(to_jsonb(stored) ORDER BY to_jsonb(stored)::text),'[]'::jsonb)::text "
+                f"FROM {fixture.namespace}.{table} stored"
+            )
+        )
+        for table in tables
+    }
+    assert [len(rows_by_table[table]) for table in tables] == [1, 1, 2]
+    return {"relations": list(map(dict, relations)), "constraints": list(map(dict, constraints)), "rows": rows_by_table}
+
+
+async def _run_affiliation_upgrade(fixture, monkeypatch, *, fail_after=None):
+    from alembic import op
+
+    engine = create_async_engine(_guarded_url(), pool_size=1, max_overflow=0)
+    settings_query = text(
+        "SELECT pg_backend_pid(),current_setting('lock_timeout'),current_setting('statement_timeout'),"
+        "current_setting('idle_in_transaction_session_timeout')"
+    )
+    executed_tables = []
+    execute = op.execute
+
+    def execute_statement(statement):
+        execute(statement)
+        if statement.startswith("ALTER TABLE"):
+            executed_tables.append(statement.split()[2])
+            if len(executed_tables) == fail_after:
+                raise RuntimeError("injected-affiliation-ddl-failure")
+
+    try:
+        async with engine.connect() as connection:
+            settings_before = (await connection.execute(settings_query)).one()
+        try:
+            with monkeypatch.context() as replacement:
+                replacement.setattr(op, "execute", execute_statement)
+                await _migrate(engine, replacement, fixture.schema, (_MIGRATIONS[-1],))
+        finally:
+            async with engine.connect() as connection:
+                assert (await connection.execute(settings_query)).one() == settings_before
+    finally:
+        await engine.dispose()
+    assert len(executed_tables) == len(set(executed_tables)) == 3
+
+
+def _assert_affiliation_transition(before, after):
+    assert after["rows"] == before["rows"] and after["relations"] == before["relations"]
+    changed_names = {
+        "registry_company_roles",
+        "company_role_assertion_role",
+        "company_group_assertion_relationship",
+        "company_group_assertion_manual_group",
+        "company_group_assertion_no_affiliation",
+    }
+    old_by_name = {row["conname"]: row for row in before["constraints"]}
+    new_by_name = {row["conname"]: row for row in after["constraints"]}
+    assert "company_group_assertion_no_affiliation" not in old_by_name
+    assert changed_names <= new_by_name.keys() and all(row["convalidated"] for row in new_by_name.values())
+    assert {name: row for name, row in old_by_name.items() if name not in changed_names} == {
+        name: row for name, row in new_by_name.items() if name not in changed_names
+    }
+    assert "benefits_administrator" not in old_by_name["registry_company_roles"]["definition"]
+    assert "benefits_administrator" in new_by_name["registry_company_roles"]["definition"]
+    assert "verified_no_affiliation" not in old_by_name["company_group_assertion_relationship"]["definition"]
+    assert "verified_no_affiliation" in new_by_name["company_group_assertion_relationship"]["definition"]
+
+
+@pytest.mark.parametrize("assertion_db", ["before-affiliation"], indirect=True)
+async def test_affiliation_migration_rollback_retry(assertion_db, monkeypatch):
+    fixture = assertion_db
+    await _seed_affiliation_predecessor(fixture)
+    before = await _affiliation_snapshot(fixture)
+    assert all(row["convalidated"] for row in before["constraints"])
+    with pytest.raises(RuntimeError, match="injected-affiliation-ddl-failure"):
+        await _run_affiliation_upgrade(fixture, monkeypatch, fail_after=2)
+    assert await _affiliation_snapshot(fixture) == before
+    await _run_affiliation_upgrade(fixture, monkeypatch)
+    _assert_affiliation_transition(before, await _affiliation_snapshot(fixture))
+
+
+@pytest.mark.parametrize("assertion_db", ["before-affiliation"], indirect=True)
+async def test_affiliation_reader_lock_timeout(assertion_db, monkeypatch):
+    fixture = assertion_db
+    await _seed_affiliation_predecessor(fixture)
+    before = await _affiliation_snapshot(fixture)
+    async with fixture.sessions() as reader, reader.begin():
+        assert await reader.scalar(text("SELECT current_user")) == fixture.roles_by_kind["draft"]
+        assert await reader.scalar(text(f"SELECT count(*) FROM {fixture.namespace}.company_registry")) == 1
+        async with asyncio.timeout(5):
+            with pytest.raises(DBAPIError) as failure:
+                await _run_affiliation_upgrade(fixture, monkeypatch)
+        assert failure.value.orig.sqlstate == "55P03"
+        assert await _affiliation_snapshot(fixture) == before
+        assert await reader.scalar(text(f"SELECT count(*) FROM {fixture.namespace}.company_registry")) == 1
+    await _run_affiliation_upgrade(fixture, monkeypatch)
+    _assert_affiliation_transition(before, await _affiliation_snapshot(fixture))

@@ -297,3 +297,55 @@ def test_legacy_source_restart_contract_is_conditional_and_private(schemas):
             assert reply.headers["Cache-Control"] == "private, no-store"
             if full_policy:
                 assert reply.headers["X-Network-Access-Scope"] == "a" * 64
+
+
+def test_organization_role_schemas_share_the_runtime_vocabulary(schemas):
+    from process.company_registry_assertion_values import COMPANY_ROLES
+    from process.registry_record_store import _COMPANY_ROLES
+
+    expected_roles = set(COMPANY_ROLES)
+    assert _COMPANY_ROLES == frozenset(expected_roles)
+    assert set(schemas["RegistryOrganizationRoleAssertion"]["properties"]["role"]["enum"]) == expected_roles
+    for roles_schema in (
+        schemas["RegistryServingCompany"]["properties"]["roles"],
+        schemas["RegistryNetworkCatalogItem"]["properties"]["companies"]["items"]["properties"]["roles"],
+    ):
+        assert (roles_schema["minItems"], roles_schema["maxItems"], roles_schema["uniqueItems"]) == (1, 4, True)
+        assert set(roles_schema["items"]["enum"]) == expected_roles
+
+
+def test_affiliation_schema_distinguishes_dated_manual_absence_from_unknown_source_groups(schemas):
+    assertion = schemas["RegistryOrganizationGroupAssertion"]
+    assert assertion["additionalProperties"] is False
+    assert set(assertion["required"]) == set(assertion["properties"])
+    assert assertion["properties"]["group_id"]["nullable"] is True
+    assert assertion["properties"]["valid_from"]["nullable"] is True
+    positive_by_field = assertion["oneOf"][0]["properties"]
+    absence_by_field = assertion["oneOf"][1]["properties"]
+    assert positive_by_field["relationship_kind"]["enum"] == ["reported_affiliation", "verified_ownership"]
+    assert positive_by_field["group_id"]["type"] == "string"
+    assert not positive_by_field["group_id"].get("nullable", False)
+    assert absence_by_field["relationship_kind"]["enum"] == ["verified_no_affiliation"]
+    assert absence_by_field["group_id"]["enum"] == [None]
+    assert absence_by_field["valid_from"] == {"type": "string", "format": "date"}
+    assert absence_by_field["provenance"]["properties"]["kind"]["enum"] == ["manual_reference"]
+    assert set(assertion["properties"]["relationship_kind"]["enum"]) == {
+        "reported_affiliation",
+        "verified_ownership",
+        "verified_no_affiliation",
+    }
+    assert "Raw unknown source groups remain unresolved" in " ".join(assertion["description"].split())
+
+
+def test_affiliation_provenance_keeps_manual_and_source_coordinates_distinct(schemas):
+    provenance = schemas["RegistryOrganizationAssertionProvenance"]
+    manual_by_field = provenance["oneOf"][0]["properties"]
+    source_by_field = provenance["oneOf"][1]["properties"]
+    assert manual_by_field["kind"]["enum"] == ["manual_reference"]
+    assert source_by_field["kind"]["enum"] == ["source_reference"]
+    for field in ("snapshot_id", "source_record_key"):
+        assert manual_by_field[field]["enum"] == [None]
+        assert source_by_field[field]["type"] == "string" and not source_by_field[field].get("nullable", False)
+    assert source_by_field["snapshot_id"]["format"] == "uuid"
+    assert source_by_field["source_record_key"]["minLength"] == 1
+    assert "128 UTF-8 bytes" in provenance["properties"]["evidence_ref"]["description"]
