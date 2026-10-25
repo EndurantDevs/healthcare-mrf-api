@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """The rooted and practitioner publication group stays private until all checks."""
 
+import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -267,6 +268,68 @@ async def test_attach_bounds_parent_locks_and_restores_caller_setting(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_private_checks_and_grants_finish_before_locking_only_sorted_parents(monkeypatch):
+    _, connection, events = _setup(monkeypatch)
+    connection.fetchrow.return_value = ("100ms", 100)
+    checking, resume = asyncio.Event(), asyncio.Event()
+
+    async def execute(statement, *args):
+        events.append(statement)
+        if "ADD CHECK" in statement:
+            checking.set()
+            await resume.wait()
+
+    connection.execute.side_effect = execute
+    candidate._close_grants.side_effect = lambda *args, **kwargs: events.append("readable grant")
+    attachment = asyncio.create_task(
+        candidate._attach_partitions(
+            connection,
+            SimpleNamespace(schema="source_schema"),
+            {"z_parent": "private_z", "a_parent": "private_a"},
+            "dataset",
+        )
+    )
+    try:
+        await asyncio.wait_for(checking.wait(), 1)
+        assert not any("LOCK TABLE" in event or "ATTACH PARTITION" in event for event in events)
+    finally:
+        resume.set()
+        await asyncio.wait_for(attachment, 1)
+    lock_index = next(index for index, event in enumerate(events) if event.startswith("LOCK TABLE"))
+    assert sum("ADD CHECK" in event for event in events[:lock_index]) == 2
+    assert events[:lock_index].count("readable grant") == 2
+    assert events[lock_index] == (
+        'LOCK TABLE ONLY "source_schema"."a_parent",ONLY "source_schema"."z_parent" IN SHARE UPDATE EXCLUSIVE MODE'
+    )
+    assert all("ATTACH PARTITION" in event for event in events[lock_index + 1 : -1])
+    assert events[-1] == "SELECT set_config('lock_timeout',$1,true)"
+
+
+@pytest.mark.asyncio
+async def test_invalid_private_partition_bound_fails_before_parent_locks(monkeypatch):
+    _, connection, events = _setup(monkeypatch)
+    connection.fetchrow.return_value = ("100ms", 100)
+    failure = RuntimeError("candidate row outside partition")
+
+    async def execute(statement, *args):
+        events.append(statement)
+        if '"private_z" ADD CHECK' in statement:
+            raise failure
+
+    connection.execute.side_effect = execute
+    with pytest.raises(RuntimeError) as caught:
+        await candidate._attach_partitions(
+            connection,
+            SimpleNamespace(schema="source_schema"),
+            {"a_parent": "private_a", "z_parent": "private_z"},
+            "dataset",
+        )
+    assert caught.value is failure
+    assert not any("LOCK TABLE" in event or "ATTACH PARTITION" in event for event in events)
+    assert not any("set_config" in event for event in events)
+
+
+@pytest.mark.asyncio
 async def test_attach_lock_failure_preserves_original_error_for_savepoint_rollback(monkeypatch):
     """Do not mask the rejected lock by issuing restoration SQL in its aborted savepoint."""
     _, connection, events = _setup(monkeypatch)
@@ -284,5 +347,6 @@ async def test_attach_lock_failure_preserves_original_error_for_savepoint_rollba
         )
     assert events == [
         "SET LOCAL lock_timeout='1s'",
-        'LOCK TABLE "source_schema"."parent" IN SHARE UPDATE EXCLUSIVE MODE',
+        'ALTER TABLE "source_schema"."candidate" ADD CHECK (dataset_id=\'dataset\')',
+        'LOCK TABLE ONLY "source_schema"."parent" IN SHARE UPDATE EXCLUSIVE MODE',
     ]

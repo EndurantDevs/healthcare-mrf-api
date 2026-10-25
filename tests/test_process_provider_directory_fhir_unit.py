@@ -1179,6 +1179,7 @@ async def test_uhc_source_local_publication_uses_no_artifact_stage(
     )
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=1))
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=True))
     monkeypatch.setattr(
         importer,
         "_lock_and_verify_artifact_dataset_fence",
@@ -1204,6 +1205,7 @@ async def test_uhc_source_local_publication_uses_no_artifact_stage(
         "promote",
         "transaction-commit",
     ]
+    importer.db.scalar.assert_awaited_once()
     artifact_bundle.assert_not_awaited()
 
 
@@ -1239,6 +1241,7 @@ async def test_source_local_publication_reconciles_lost_commit(monkeypatch, unit
     )
     monkeypatch.setattr(importer.db, "transaction", facade_transaction)
     monkeypatch.setattr(importer.db, "status", AsyncMock(return_value=1))
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=True))
     monkeypatch.setattr(
         importer,
         "_lock_and_verify_artifact_dataset_fence",
@@ -1262,6 +1265,7 @@ async def test_source_local_publication_reconciles_lost_commit(monkeypatch, unit
     assert committed.await_count == 2
 
     assert caught.value is failure
+    assert importer.db.scalar.await_count == 2
     assert len(transactions) == 4
     assert len({id(session) for session in transactions}) == 4
     assert policy._PUBLISHER.get() is policy._OWNER.get() is None

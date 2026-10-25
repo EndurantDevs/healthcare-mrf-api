@@ -77,6 +77,47 @@ concurrent source refresh cannot invalidate its selected dataset during cutover.
 The partial Address job retains the same source fence through its own commit.
 Other sources remain available while that replacement is prepared.
 
+Private candidate constraints and grants finish before attachment takes ordered
+locks on only the shared partition parents. Attachment still has a short shared
+critical section. Parent-lock waits are capped at one second while preserving
+any tighter caller limit and restoring its setting after successful attachment.
+Source-local publication retains endpoint and selected-alias
+row fences while allowing unrelated metadata writes and publishers. This requires
+the validated, enforced, nondeferrable source-to-endpoint foreign key with all four
+native constraint triggers enabled ALWAYS. Original-administrator enrollment
+changes only those verified trigger modes and checks the complete native delta.
+
+For populated legacy witness and relationship heaps, prepare the native
+`pd_generic_source_history_bound` CHECK over every retained dataset ID before
+enrollment. Install its frozen bound in a short coordinated transaction, then
+validate it separately while the original heap serves. A NOT VALID CHECK already
+restricts subsequent writes, so coordinate the affected writers before installation.
+Enumerate each heap's complete retained dataset IDs independently and sort them
+in ascending text order. Encode every key as an `E'...'::pg_catalog.text` literal,
+doubling backslashes and apostrophes inside the literal. For the sorted keys
+`dataset_a` and `dataset_z`, use this form:
+
+```sql
+ALTER TABLE source_schema.retained_witness
+  ADD CONSTRAINT pd_generic_source_history_bound
+  CHECK (dataset_id OPERATOR(pg_catalog.=) ANY (
+    ARRAY[E'dataset_a'::pg_catalog.text,E'dataset_z'::pg_catalog.text]
+  )) NOT VALID;
+```
+
+Commit that installation before validating the constraint in a separate
+transaction with `ALTER TABLE source_schema.retained_witness VALIDATE CONSTRAINT
+pd_generic_source_history_bound`. Use `CHECK (false)` for a logically empty heap.
+The bound must contain exactly the retained key set; stale additional keys are
+rejected with `history_bound_changed`.
+
+The final cut requires the validated exact bound and equivalent existing indexes,
+preserves retained index storage, and keeps the finite history bound off the new
+parent so future datasets remain admissible. An unprepared populated heap is
+refused. Physical zero-byte heaps need no preparation. Measure the remaining
+cohort-parity and control-hash work, validation I/O and concurrent reader latency
+before treating the complete enrollment as a bounded maintenance operation.
+
 Ordinary nearby-provider queries keep page results, totals, late metadata reads
 and response encoding inside one authenticated read-only snapshot. Publication
 waits for that request's serving-table locks; the next request can then use the

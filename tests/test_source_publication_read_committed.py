@@ -154,7 +154,7 @@ async def test_final_coverage_borrows_rc_and_authenticates_replay(owner_body, mo
 @pytest.mark.parametrize("failure", [None, RuntimeError("synthetic competing writer"), asyncio.CancelledError()])
 async def test_fixed_control_fence_authenticates_before_ordered_nowait_locks(monkeypatch, failure):
     events = []
-    database = SimpleNamespace(status=AsyncMock())
+    database = SimpleNamespace(status=AsyncMock(), scalar=AsyncMock(return_value=True))
     publisher = SimpleNamespace(policy=SimpleNamespace(schema="source_schema"))
 
     async def authenticate(supplied):
@@ -173,13 +173,35 @@ async def test_fixed_control_fence_authenticates_before_ordered_nowait_locks(mon
     monkeypatch.setattr(fhir, "_schema", lambda: "source_schema")
     if failure is None:
         await fhir._lock_source_publication_controls()
-        assert 'provider_directory_api_endpoint" IN SHARE MODE NOWAIT' in events[1]
-        assert 'provider_directory_source" IN SHARE ROW EXCLUSIVE MODE NOWAIT' in events[2]
+        assert 'provider_directory_api_endpoint" IN ROW EXCLUSIVE MODE NOWAIT' in events[1]
+        assert 'provider_directory_source" IN ROW EXCLUSIVE MODE NOWAIT' in events[2]
+        database.scalar.assert_awaited_once()
+        assert database.scalar.await_args.kwargs == {
+            "source_ref": '"source_schema"."provider_directory_source"',
+            "endpoint_ref": '"source_schema"."provider_directory_api_endpoint"',
+        }
     else:
         with pytest.raises(type(failure)):
             await fhir._lock_source_publication_controls()
         assert len(events) == 2
+        database.scalar.assert_not_awaited()
     assert events[0] == "authenticated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", [False, None, 1])
+async def test_control_fence_refuses_missing_or_bypassable_native_alias_guard(monkeypatch, ready):
+    database = SimpleNamespace(status=AsyncMock(), scalar=AsyncMock(return_value=ready))
+    monkeypatch.setattr(fhir, "db", database)
+    monkeypatch.setattr(fhir, "_schema", lambda: "source_schema")
+    monkeypatch.setattr(
+        policy,
+        "require_source_publication_transaction",
+        AsyncMock(return_value=SimpleNamespace(policy=SimpleNamespace(schema="source_schema"))),
+    )
+    with pytest.raises(RuntimeError, match="publication_alias_fence_changed"):
+        await fhir._lock_source_publication_controls()
+    assert database.status.await_count == 2
 
 
 @pytest.mark.asyncio

@@ -107,3 +107,34 @@ async def provision_source_control_reads(connection, policy, *, verify_role_prof
         await grant_source_admission_controls(connection, policy)
         await verify_generic_source_family(connection, policy)
         await verify_role_profile(connection, policy.schema, **policy.role_arguments())
+
+
+async def lock_source_publication_controls(database, schema):
+    """Retain native alias guards while independent SOURCE cuts overlap."""
+    from process.provider_directory_generic_source_policy import require_source_publication_transaction
+
+    publisher = await require_source_publication_transaction(database)
+    if publisher.policy.schema != schema:
+        raise RuntimeError("provider_directory_source_publication_schema_changed")
+    endpoint_ref = storage_relation(schema, "provider_directory_api_endpoint")
+    source_ref = storage_relation(schema, "provider_directory_source")
+    # Keep the FK stable while its row locks fence alias inserts and moves.
+    await database.status(f"LOCK TABLE {endpoint_ref} IN ROW EXCLUSIVE MODE NOWAIT;")
+    await database.status(f"LOCK TABLE {source_ref} IN ROW EXCLUSIVE MODE NOWAIT;")
+    alias_fence_ready = await database.scalar(
+        """SELECT current_setting('session_replication_role')='origin' AND EXISTS(
+         SELECT FROM pg_catalog.pg_constraint k
+         WHERE k.conrelid=to_regclass(:source_ref) AND k.confrelid=to_regclass(:endpoint_ref)
+          AND k.contype='f' AND k.convalidated AND k.conenforced AND NOT k.condeferrable
+          AND k.conkey=ARRAY(SELECT attnum FROM pg_catalog.pg_attribute
+           WHERE attrelid=k.conrelid AND attname='endpoint_id' AND NOT attisdropped)
+          AND k.confkey=ARRAY(SELECT attnum FROM pg_catalog.pg_attribute
+           WHERE attrelid=k.confrelid AND attname='endpoint_id' AND NOT attisdropped)
+          AND (SELECT count(*)=4 AND bool_and(tgisinternal AND tgenabled='A')
+           FROM pg_catalog.pg_trigger WHERE tgconstraint=k.oid)
+        )""",
+        source_ref=source_ref,
+        endpoint_ref=endpoint_ref,
+    )
+    if alias_fence_ready is not True:
+        raise RuntimeError("provider_directory_source_publication_alias_fence_changed")

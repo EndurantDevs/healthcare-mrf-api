@@ -59,6 +59,264 @@ def _coverage_receipt():
     return AsyncMock(return_value={"oid": 42, "layout": "x", "guards": "y"})
 
 
+def _history_index(*, primary=True, columns=("dataset_id", "resource_type", "resource_id")):
+    return {
+        "indexrelid": 41,
+        "relname": "history_pk",
+        "filenode": 81,
+        "indisprimary": primary,
+        "usable": True,
+        "signature": {
+            "columns": list(columns),
+            "key_count": len(columns),
+            "column_count": len(columns),
+            "expressions": None,
+            "predicate": None,
+            "collations": [100] * len(columns),
+        },
+    }
+
+
+def _history_key_plan(index_name="history_pk"):
+    return [
+        {
+            "Plan": {
+                "Node Type": "Recursive Union",
+                "Plans": [
+                    {"Node Type": "Limit", "Plans": [{"Node Type": "Index Only Scan", "Index Name": index_name}]},
+                    {
+                        "Node Type": "Nested Loop",
+                        "Plans": [
+                            {"Node Type": "WorkTable Scan"},
+                            {
+                                "Node Type": "Limit",
+                                "Plans": [
+                                    {
+                                        "Node Type": "Index Scan",
+                                        "Index Name": index_name,
+                                        "Index Cond": "dataset_id > previous_key.dataset_id",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            }
+        }
+    ]
+
+
+@pytest.mark.parametrize("change", ["missing", "invalid", "key_order", "include", "expression", "predicate"])
+def test_history_keys_require_usable_exact_native_primary_index(change):
+    index = _history_index()
+    if change == "missing":
+        index["indisprimary"] = False
+    elif change == "invalid":
+        index["usable"] = False
+    else:
+        field, value = {
+            "key_order": ("columns", ["resource_type", "dataset_id", "resource_id"]),
+            "include": ("column_count", 4),
+            "expression": ("expressions", "lower(dataset_id)"),
+            "predicate": ("predicate", "dataset_id IS NOT NULL"),
+        }[change]
+        index["signature"][field] = value
+    with pytest.raises(GenericCandidateError, match="history_index_unprepared"):
+        provision._history_primary_index([index], ("dataset_id", "resource_type", "resource_id"))
+
+
+@pytest.mark.parametrize("kind", ["Seq Scan", "Bitmap Heap Scan", "Sort", "Index Only Scan"])
+def test_history_key_discovery_refuses_scan_or_wrong_index_fallback(kind):
+    plan = _history_key_plan()
+    plan[0]["Plan"]["Plans"][0]["Plans"][0] = {"Node Type": kind, "Index Name": "different_index"}
+    with pytest.raises(GenericCandidateError, match="history_key_plan_unprepared"):
+        provision._require_history_key_plan(plan, {"history_pk"})
+
+
+@pytest.mark.parametrize("change", ["missing_range", "filter"])
+def test_history_probes_require_native_range_condition(change):
+    plan = _history_key_plan()
+    probe = plan[0]["Plan"]["Plans"][1]["Plans"][1]["Plans"][0]
+    if change == "missing_range":
+        probe.pop("Index Cond")
+    else:
+        probe["Filter"] = "dataset_id > previous_key.dataset_id"
+    with pytest.raises(GenericCandidateError, match="history_key_plan_unprepared"):
+        provision._require_history_key_plan(plan, {"history_pk"})
+
+
+def test_verified_dataset_leading_target_index_is_eligible():
+    provision._require_history_key_plan(_history_key_plan("history_target"), {"history_pk", "history_target"})
+
+
+@pytest.mark.asyncio
+async def test_history_discovery_visits_all_retained_keys():
+    events = []
+    connection = SimpleNamespace(
+        transaction=lambda: _recorded_transaction(events),
+        fetchval=AsyncMock(side_effect=["on", _history_key_plan()]),
+        fetch=AsyncMock(return_value=[{"dataset_id": "retained_old"}, {"dataset_id": "current"}]),
+        execute=AsyncMock(),
+    )
+    assert await provision._history_dataset_keys(connection, '"source_schema"."payload"', [_history_index()]) == [
+        "current",
+        "retained_old",
+    ]
+    statement = connection.fetch.await_args.args[0]
+    assert "WITH RECURSIVE" in statement and "CROSS JOIN LATERAL" in statement
+    assert statement.count("ORDER BY dataset_id LIMIT 1") == 2
+    assert "dataset_id OPERATOR(pg_catalog.>) previous_key.dataset_id" in statement
+    assert "DISTINCT" not in statement and provision.HEADER not in statement
+    assert events == ["savepoint"]
+    assert connection.execute.await_args.args == ("SELECT set_config('enable_seqscan',$1,true)", "on")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting", ["on", "off"])
+async def test_failed_history_probe_preserves_error_and_savepoint_setting(setting):
+    events = []
+    failure = RuntimeError("original native failure")
+    connection = SimpleNamespace(
+        transaction=lambda: _recorded_transaction(events),
+        fetchval=AsyncMock(side_effect=[setting, _history_key_plan()]),
+        fetch=AsyncMock(side_effect=failure),
+        execute=AsyncMock(),
+    )
+    with pytest.raises(RuntimeError) as caught:
+        await provision._history_dataset_keys(connection, '"s"."heap"', [_history_index()])
+    assert caught.value is failure
+    assert events == ["savepoint", "rollback"]
+    assert connection.execute.await_args_list[0].args == ("SET LOCAL enable_seqscan=off",)
+    assert connection.execute.await_count == 1  # rollback, not SQL in the failed transaction, restores the setting
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [None, {"expression": "false", "ready": False}])
+async def test_missing_or_unvalidated_history_bound_refuses_before_ddl(bound):
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=bound), execute=AsyncMock())
+    with pytest.raises(GenericCandidateError, match="history_bound_unprepared"):
+        await provision._require_prepared_history_bound(connection, '"s"."heap"', 17, ["retained"])
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heap_bytes", [0, 8192])
+async def test_only_physical_zero_byte_heap_bypasses_prepared_key_discovery(monkeypatch, heap_bytes):
+    discover = AsyncMock(return_value=["retained"])
+    check = AsyncMock()
+    monkeypatch.setattr(provision, "_history_dataset_keys", discover)
+    monkeypatch.setattr(provision, "_require_prepared_history_bound", check)
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=bool(heap_bytes)), execute=AsyncMock())
+    keys = await provision._history_keys_for_cut(
+        connection, '"s"."heap"', {"oid": 17, "heap_bytes": heap_bytes}, [_history_index()]
+    )
+    if heap_bytes == 0:
+        assert keys == []
+        discover.assert_not_awaited()
+        assert "CHECK (false)" in connection.execute.await_args.args[0]
+    else:
+        assert keys == ["retained"]
+        discover.assert_awaited_once()
+        connection.execute.assert_not_awaited()
+    check.assert_awaited_once_with(connection, '"s"."heap"', 17, keys)
+
+
+@pytest.mark.asyncio
+async def test_validated_false_history_needs_no_dead_page_probe(monkeypatch):
+    discover, check = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(provision, "_history_dataset_keys", discover)
+    monkeypatch.setattr(provision, "_require_prepared_history_bound", check)
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value="false"), execute=AsyncMock())
+    assert (
+        await provision._history_keys_for_cut(
+            connection, '"s"."heap"', {"oid": 17, "heap_bytes": 8192}, [_history_index()]
+        )
+        == []
+    )
+    discover.assert_not_awaited()
+    connection.execute.assert_not_awaited()
+    check.assert_awaited_once_with(connection, '"s"."heap"', 17, [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_prepared_history_bound_must_match_complete_native_expression(changed):
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(return_value={"expression": "native complete bound", "ready": True}),
+        fetchval=AsyncMock(side_effect=[True, "partial bound" if changed else "native complete bound"]),
+        execute=AsyncMock(),
+    )
+    if changed:
+        with pytest.raises(GenericCandidateError, match="history_bound_changed"):
+            await provision._require_prepared_history_bound(connection, '"s"."heap"', 17, ["old", "new"])
+    else:
+        await provision._require_prepared_history_bound(connection, '"s"."heap"', 17, ["old", "new"])
+        assert connection.execute.await_args.args[0].startswith("DROP TABLE")
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert all("RENAME" not in statement and "VALIDATE CONSTRAINT" not in statement for statement in statements)
+    assert "E'old'::pg_catalog.text,E'new'::pg_catalog.text" in statements[1]
+
+
+def test_history_bound_literals_preserve_quotes_backslashes_and_empty_history():
+    assert provision._history_bound_expression([]) == "false"
+    assert provision._history_bound_expression(["old'\\path"]) == (
+        "dataset_id OPERATOR(pg_catalog.=) ANY (ARRAY[E'old''\\\\path'::pg_catalog.text])"
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_keeps_semantic_checks_but_drops_history_only_bound_before_indexes():
+    connection = SimpleNamespace(execute=AsyncMock())
+    await provision._create_history_parent(
+        connection,
+        _policy(),
+        provision.WITNESS,
+        '"source_schema"."retained"',
+        ("dataset_id", "resource_type", "resource_id"),
+    )
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert "INCLUDING CONSTRAINTS" in statements[0]
+    assert 'DROP CONSTRAINT "pd_generic_source_history_bound"' in statements[1]
+    assert statements[-1].endswith('ADD PRIMARY KEY ("dataset_id","resource_type","resource_id")')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "collation", "invalid", "missing", "extra"])
+async def test_history_attach_requires_equivalent_native_indexes(change):
+    parent, retained = _history_index(), _history_index()
+    if change == "collation":
+        parent["signature"]["collations"] = [101, 100, 100]
+    if change == "invalid":
+        parent["usable"] = False
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=100), fetch=AsyncMock(return_value=[] if change == "missing" else [parent])
+    )
+    indexes = [retained, _history_index(primary=False)] if change == "extra" else [retained]
+    if change is None:
+        await provision._require_history_index_reuse(connection, '"s"."parent"', indexes)
+    else:
+        with pytest.raises(GenericCandidateError, match="history_index_equivalence_changed"):
+            await provision._require_history_index_reuse(connection, '"s"."parent"', indexes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "filenode", "extra"])
+async def test_attached_or_empty_history_preserves_original_index_storage(change):
+    before, after = _history_index(), _history_index()
+    if change == "filenode":
+        after["filenode"] += 1
+    retained = [after, _history_index(primary=False)] if change == "extra" else [after]
+    if change == "extra":
+        retained[1]["indexrelid"] += 1
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=retained), execute=AsyncMock())
+    if change is None:
+        await provision._attach_prepared_history(connection, '"s"."parent"', '"s"."history"', [], [before], 17)
+        connection.execute.assert_not_awaited()
+    else:
+        with pytest.raises(GenericCandidateError, match="history_index_storage_changed"):
+            await provision._attach_prepared_history(connection, '"s"."parent"', '"s"."history"', ["old"], [before], 17)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed_root", provision.TABLES)
 async def test_legacy_heap_root_refuses_before_any_guard_retirement(monkeypatch, changed_root):

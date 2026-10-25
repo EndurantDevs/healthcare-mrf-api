@@ -153,12 +153,14 @@ async def _attach_partitions(connection, policy, relations_by_root, dataset_id):
     if timeout_ms == 0 or timeout_ms > 1000:
         await connection.execute("SET LOCAL lock_timeout='1s'")
     literal = "'" + dataset_id.replace("'", "''") + "'"
-    roots = [storage_relation(policy.schema, root) for root in relations_by_root]
-    await connection.execute("LOCK TABLE " + ",".join(roots) + " IN SHARE UPDATE EXCLUSIVE MODE")
-    for root, name in relations_by_root.items():
+    for name in relations_by_root.values():
         candidate_ref = storage_relation(policy.schema, name)
         await connection.execute(f"ALTER TABLE {candidate_ref} ADD CHECK (dataset_id={literal})")
         await _close_grants(connection, policy, name, readable=True)
+    roots = sorted("ONLY " + storage_relation(policy.schema, root) for root in relations_by_root)
+    await connection.execute("LOCK TABLE " + ",".join(roots) + " IN SHARE UPDATE EXCLUSIVE MODE")
+    for root, name in relations_by_root.items():
+        candidate_ref = storage_relation(policy.schema, name)
         await connection.execute(
             f"ALTER TABLE {storage_relation(policy.schema, root)} ATTACH PARTITION {candidate_ref} "
             f"FOR VALUES IN ({literal})"
