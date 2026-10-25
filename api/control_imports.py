@@ -1998,6 +1998,11 @@ def _arq_evidence_keys(job_id: str) -> tuple[tuple[str, str], ...]:
 
 async def _arq_worker_presence(run: dict[str, Any]) -> dict[str, Any]:
     _run_id, _importer, queue, job_id = _reconciliation_arq_identity(run)
+    return await _arq_job_presence(queue, job_id)
+
+
+async def _arq_job_presence(queue: str, job_id: str) -> dict[str, Any]:
+    """Read one exact queue/job identity without changing queued work."""
     arq_keys_by_field = _arq_evidence_keys(job_id)
     redis_pool = await create_pool(
         build_redis_settings(),
