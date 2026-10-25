@@ -30,6 +30,70 @@ fn empty_copy_file_event_drain_does_not_flush() {
     );
 }
 
+#[test]
+fn finished_worker_tail_event_is_retained_exactly_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let incumbent_path = directory.path().join("incumbent.copy");
+    let path = directory.path().join("late.copy");
+    let pending_path = directory.path().join("pending").join("compact.copy");
+    std::fs::write(&incumbent_path, b"old row\n").unwrap();
+    let paths = CopyPathConfig {
+        compact: Some(pending_path.to_string_lossy().into_owned()),
+        v3_serving_run_directory: Some(directory.path().to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let mut gate = CopyFileEventGate::deferred_for_scan(&paths, 1, 1).unwrap();
+    std::fs::write(&path, b"row one\nrow two\nrow six\n").unwrap();
+    let worker = thread::spawn(|| -> io::Result<CompactWorkerOutput> {
+        Err(io::Error::other("finished worker result"))
+    });
+    let started_at = Instant::now();
+    while !worker.is_finished() {
+        assert!(started_at.elapsed() < QUEUE_FULL_HANDSHAKE_TIMEOUT);
+        thread::yield_now();
+    }
+    let (event_tx, event_rx) = unbounded();
+    let mut incumbent_event = empty_copy_file_event();
+    incumbent_event.path = incumbent_path.to_string_lossy().into_owned();
+    incumbent_event.bytes = 8;
+    incumbent_event.row_count = 1;
+    event_tx.send(incumbent_event).unwrap();
+    let mut event = empty_copy_file_event();
+    event.path = path.to_string_lossy().into_owned();
+    event.bytes = 24;
+    event.row_count = 3;
+    event_tx.send(event).unwrap();
+    let handles = [(0, worker)];
+    let mut writer = Vec::new();
+
+    drain_copy_file_events_until_workers_finish(&event_rx, &handles, &mut writer, &mut gate)
+        .unwrap();
+
+    assert!(event_rx.is_empty());
+    assert!(writer.is_empty());
+    let events = gate.deferred.as_ref().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].path, incumbent_path.to_string_lossy());
+    assert_eq!(events[0].bytes, 8);
+    assert_eq!(events[0].row_count, 1);
+    assert!(events[0].final_file);
+    assert_eq!(events[1].path, path.to_string_lossy());
+    assert_eq!(events[1].bytes, 24);
+    assert_eq!(events[1].row_count, 3);
+    assert!(events[1].final_file);
+    assert!(gate.cleanup_paths.contains(&path));
+    assert!(!gate.cleanup_paths.contains(&incumbent_path));
+    for (_, handle) in handles {
+        assert!(
+            matches!(handle.join().unwrap(), Err(error) if error.kind() == io::ErrorKind::Other)
+        );
+    }
+    drop(gate);
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&incumbent_path).unwrap(), b"old row\n");
+    assert!(!pending_path.parent().unwrap().exists());
+}
+
 fn wait_until_event_is_drained(event_rx: &Receiver<CopyFileEvent>, failure_message: &str) {
     let started_at = Instant::now();
     while !event_rx.is_empty() {

@@ -346,6 +346,7 @@ def _validate_search_request(
             selection.pricing_projection_contract != PROJECTION_CONTRACT
             and not (
                 current_code_projection() is not None
+                and "scope" not in current_code_projection().identity
                 and selection.pricing_projection_id == current_code_projection().projection_id
                 and selection.pricing_projection_contract == current_code_projection().identity["contract"]
             )
