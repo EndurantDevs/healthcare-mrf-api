@@ -329,6 +329,11 @@ async def test_code_native_publisher_reader_parity_dependency_retention_and_adop
     ):
         with pytest.MonkeyPatch.context() as factor_patch:
             await _assert_selected_factor_preflight(factor_patch, *case)
+    from tests.plan_pricing_code_calibration_native_support import assert_calibration_native
+
+    for fault in (None, "membership", "work", "cancelled", "identity"):
+        with pytest.MonkeyPatch.context() as calibration_patch:
+            await assert_calibration_native(calibration_patch, fault)
     async with _database(monkeypatch) as db:
         oid = await _source_database(db)
         identity = _fixture(monkeypatch, db, oid)

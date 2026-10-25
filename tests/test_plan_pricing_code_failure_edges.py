@@ -285,8 +285,16 @@ async def test_worker_fences_release_and_closes_transaction_on_every_outcome(mon
     begin.assert_called_once_with()
     if outcome in {"ready", "build_error"}:
         builder.assert_awaited_once_with(
-            session, selection=selected, code_system="CPT", code="27447", expected_identity_digest="b" * 64
+            session,
+            selection=selected,
+            code_system="CPT",
+            code="27447",
+            expected_identity_digest="b" * 64,
+            scope=None,
+            audit={},
+            phase_timings={},
         )
+        assert builder.await_args.kwargs["audit"] is not builder.await_args.kwargs["phase_timings"]
     else:
         builder.assert_not_awaited()
     session.commit.assert_not_awaited()

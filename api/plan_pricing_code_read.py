@@ -6,9 +6,22 @@ from dataclasses import dataclass, replace
 from sqlalchemy import literal, text
 from sqlalchemy.dialects import postgresql
 
-from api.plan_pricing_code_contract import BUILD_REVISION, CONTRACT, identity_digest
+from api.plan_pricing_code_contract import (
+    BUILD_REVISION,
+    CONTRACT,
+    ZIP_BUILD_REVISION,
+    ZIP_CONTRACT,
+    canonical_radius,
+    identity_digest,
+    scope_selectors,
+)
 from api.plan_pricing_code_storage import attachment_name, locate
-from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable, projection_code_identity
+from api.plan_pricing_projection_contract import (
+    PlanPricingProjectionUnavailable,
+    PlanPricingProjectionUnsupported,
+    _lock_provider_relations,
+    projection_code_identity,
+)
 from process import reference_family_archive as native
 
 
@@ -34,6 +47,11 @@ class CodePricingCapability:
 
     def relation(self, name):
         """Expose existing read columns without copying or rewriting arbitrary SQL."""
+        if self.identity["contract"] == ZIP_CONTRACT and name in {
+            "plan_pricing_provider_state",
+            "plan_pricing_rate_occurrence",
+        }:
+            raise PlanPricingProjectionUnavailable("ZIP aggregates do not provide nationwide provider witnesses")
         relation = self.relations[name]
         schema = native._quoted(self.found[0].schema_name)
         columns = "stored.*"
@@ -75,7 +93,9 @@ class CodePricingCapability:
 
     def selection(self, selection):
         """Bind the capability to this request without changing the release identity."""
-        return replace(selection, pricing_projection_id=self.projection_id, pricing_projection_contract=CONTRACT)
+        return replace(
+            selection, pricing_projection_id=self.projection_id, pricing_projection_contract=self.identity["contract"]
+        )
 
     def contributors(self, bindings):
         """Preserve physical deduplication when a policy admits only a logical alias."""
@@ -96,6 +116,39 @@ async def resolve_code_pricing(session, selection, args):
     code_identity = projection_code_identity(args.get("code_system"), args.get("code"))
     if selection is None or code_identity is None:
         return None
+    scope = _request_scope(args)
+    if scope is not None:
+        capability = await _resolve_capability(session, selection, code_identity, scope=scope)
+        if capability is not None:
+            return capability
+    return await _resolve_capability(session, selection, code_identity)
+
+
+def _request_scope(args):
+    from api.plan_pricing_projection_read import projection_result_type, unsupported_projection_fields
+
+    zip5 = str(args.get("zip5") or args.get("zip") or "").strip()
+    if (
+        not zip5
+        or projection_result_type(args) != "rate_aggregates"
+        or unsupported_projection_fields(args)
+        or args.get("state")
+        or args.get("city")
+    ):
+        return None
+    try:
+        return scope_selectors(
+            {
+                "scope_kind": "zip_radius",
+                "zip5": zip5,
+                "zip_radius_miles": canonical_radius(args.get("zip_radius_miles") or 0),
+            }
+        )
+    except ValueError as error:
+        raise PlanPricingProjectionUnsupported(str(error)) from error
+
+
+async def _resolve_capability(session, selection, code_identity, *, scope=None):
     anchor_by_field = {
         "contract": CONTRACT,
         "build_revision": BUILD_REVISION,
@@ -105,14 +158,20 @@ async def resolve_code_pricing(session, selection, args):
         "code_system": code_identity[0],
         "code": code_identity[1],
     }
+    if scope is not None:
+        anchor_by_field.update(contract=ZIP_CONTRACT, build_revision=ZIP_BUILD_REVISION, scope=scope)
     if not await session.scalar(
         text("SELECT to_regclass(:relation) IS NOT NULL"),
         {"relation": "hp_snapshot_retention." + attachment_name(anchor_by_field)},
     ):
         return None
+    if scope is not None:
+        await _lock_provider_relations(session)
     from api.plan_pricing_code_build import resolve_inputs
 
-    identity, _inputs = await resolve_inputs(session, selection, code_identity)
+    identity, _inputs = await resolve_inputs(
+        session, selection, code_identity, **({} if scope is None else {"scope": scope})
+    )
     found = await locate(session, identity)
     if found is None:
         raise PlanPricingProjectionUnavailable("the complete selected-code capability is unavailable")

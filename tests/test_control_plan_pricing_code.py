@@ -224,7 +224,11 @@ async def test_invalid_import_identity_never_mutates_or_enqueues(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_valid_import_dispatches_complete_code_consumer(monkeypatch):
+@pytest.mark.parametrize(
+    "scope",
+    [{}, {"scope_kind": "zip_radius", "zip5": "48104", "zip_radius_miles": "25"}],
+)
+async def test_valid_import_dispatches_complete_code_consumer(monkeypatch, scope):
     enqueue = AsyncMock(return_value=SimpleNamespace(job_id="plan_pricing_code_projection_run_synthetic"))
     execute = AsyncMock(return_value=SimpleNamespace(rowcount=1))
     monkeypatch.setattr(imports, "db", SimpleNamespace(execute=execute))
@@ -233,7 +237,7 @@ async def test_valid_import_dispatches_complete_code_consumer(monkeypatch):
     monkeypatch.setattr(imports, "enqueue_status_event", Mock())
     monkeypatch.setattr(imports, "_write_run_live_progress", Mock())
     monkeypatch.setattr(imports, "read_live_progress", Mock(return_value=None))
-    params = _selectors() | {"expected_identity_digest": "c" * 64}
+    params = _selectors() | {"expected_identity_digest": "c" * 64} | scope
     returned, created = await imports.create_import_run(
         {"importer": IMPORTER, "run_id": "run_synthetic", "params": params}
     )
@@ -246,8 +250,8 @@ async def test_valid_import_dispatches_complete_code_consumer(monkeypatch):
             "importer": IMPORTER,
             "family": "mrf",
             "target_module": "api.plan_pricing_code_build",
-            "target_function": "build_plan_pricing_code_projection",
-            "call_style": "kwargs",
+            "target_function": "control_start",
+            "call_style": "ctx_task",
             "run_shutdown": False,
             "task": {"test_mode": False, **params},
         },

@@ -386,6 +386,7 @@ async def control_single_job_start(
                 status="canceled",
                 phase_detail=f"{target_function} canceled",
                 progress_message="canceled",
+                metrics=_terminal_metrics_from_context(ctx.get("context")),
                 attempt_id=attempt_id,
                 attempt_started_at=started_at if run_id else None,
             )
@@ -409,6 +410,7 @@ async def control_single_job_start(
                     "code": "import_interrupted",
                     "message": "worker task was cancelled",
                 },
+                metrics=_terminal_metrics_from_context(ctx.get("context")),
                 attempt_id=attempt_id,
                 attempt_started_at=started_at if run_id else None,
             )

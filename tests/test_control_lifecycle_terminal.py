@@ -300,6 +300,37 @@ async def test_control_single_job_start_marks_cancelled_task_failed(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ImportCancelledError, asyncio.CancelledError, RuntimeError])
+async def test_control_terminal_failures_preserve_job_owned_audit_and_phase_timings(monkeypatch, failure):
+    audit_by_name = {"phase": "zip.assurance", "zip_input_work": {"membership_count": 7, "complete": False}}
+    timings_by_phase = {"zip.assurance": 1.25}
+
+    async def target(ctx, _task):
+        ctx["context"].update(audit=audit_by_name, phase_timings=timings_by_phase)
+        raise failure("synthetic interruption")
+
+    marks = AsyncMock(return_value=True)
+    monkeypatch.setenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "0")
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", marks)
+    monkeypatch.setattr(control_lifecycle, "_flush_terminal_status_events", AsyncMock())
+    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: SimpleNamespace(process_data=target))
+    incoming_by_field = {"context": {"audit": {"other_job": True}}}
+    call = control_single_job_start(
+        incoming_by_field,
+        {"run_id": "synthetic_audit", "target_module": "synthetic.module", "target_function": "process_data"},
+    )
+    if failure is RuntimeError:
+        with pytest.raises(RuntimeError, match="synthetic interruption"):
+            await call
+    else:
+        await call
+    terminal = marks.await_args_list[-1].kwargs
+    assert terminal["status"] == ("canceled" if failure is ImportCancelledError else "failed")
+    assert terminal["metrics"] == {"audit": audit_by_name, "phase_timings": timings_by_phase}
+    assert incoming_by_field == {"context": {"audit": {"other_job": True}}}
+
+
+@pytest.mark.asyncio
 async def test_control_target_progress_inherits_wrapper_attempt(monkeypatch):
     """Nested progress preserves ownership through the terminal transition."""
 

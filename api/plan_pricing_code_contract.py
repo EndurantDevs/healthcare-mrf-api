@@ -1,7 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Closed release/procedure identity, separate from whole-release projections."""
 
+import re
 from dataclasses import asdict
+from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
 from api.plan_pricing_projection_contract import HEX_DIGEST, canonical_json, projection_code_identity
@@ -21,6 +23,10 @@ from process.reference_family_archive import ReferenceFamilySpec
 CONTRACT = "plan_pricing_code_v1"
 IMPORTER = "plan-pricing-code-projection"
 BUILD_REVISION = "complete-occurrences-memberships-provider-witnesses-v1"
+ZIP_CONTRACT = "plan_pricing_code_zip_v1"
+ZIP_BUILD_REVISION = "complete-centroid-zip-aggregates-v1"
+CALIBRATION_OPERATION = "calibrate"
+ZIP_SCOPE_FIELDS = frozenset({"scope_kind", "zip5", "zip_radius_miles"})
 SPEC = ReferenceFamilySpec(
     IMPORTER,
     (
@@ -40,6 +46,16 @@ def validate_params(params, *, include_identity=True):
     names = {"plan_release_id", "serving_revision_id", "code_system", "code"}
     if include_identity:
         names.add("expected_identity_digest")
+    if type(params) is dict and ZIP_SCOPE_FIELDS.intersection(params):
+        names.update(ZIP_SCOPE_FIELDS)
+    if type(params) is dict and "operation" in params:
+        if (
+            not include_identity
+            or params["operation"] != CALIBRATION_OPERATION
+            or not ZIP_SCOPE_FIELDS <= params.keys()
+        ):
+            raise ValueError("code calibration requires an exact scoped operator admission")
+        names.add("operation")
     if (
         type(params) is not dict
         or set(params) != names
@@ -54,6 +70,61 @@ def validate_params(params, *, include_identity=True):
         raise ValueError("code projection requires a canonical procedure identity")
     if include_identity and HEX_DIGEST.fullmatch(params["expected_identity_digest"]) is None:
         raise ValueError("code projection requires an exact expected identity digest")
+    scope_selectors(params)
+
+
+def canonical_radius(value):
+    """Use one finite decimal representation in control and reader identities."""
+    if isinstance(value, bool) or len(str(value)) > 32:
+        raise ValueError("code pricing ZIP radius is invalid")
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite() or number < 0 or number.adjusted() > 31 or number.as_tuple().exponent < -32:
+            raise ValueError
+        result = format(number, "f")
+        if "." in result:
+            result = result.rstrip("0").rstrip(".")
+        if number.is_zero():
+            result = "0"
+        if len(result) > 32:
+            raise ValueError
+        return result
+    except InvalidOperation, ValueError, OverflowError:
+        raise ValueError("code pricing ZIP radius is invalid") from None
+
+
+def scope_selectors(params):
+    """The additive ZIP contract accepts all three selectors or none."""
+    present = ZIP_SCOPE_FIELDS.intersection(params)
+    if not present:
+        return None
+    if (
+        present != ZIP_SCOPE_FIELDS
+        or params["scope_kind"] != "zip_radius"
+        or type(params["zip5"]) is not str
+        or re.fullmatch(r"[0-9]{5}", params["zip5"], flags=re.ASCII) is None
+        or type(params["zip_radius_miles"]) is not str
+        or canonical_radius(params["zip_radius_miles"]) != params["zip_radius_miles"]
+    ):
+        raise ValueError("code pricing requires exact canonical ZIP scope selectors")
+    return {"kind": "zip_radius", "zip5": params["zip5"], "zip_radius_miles": params["zip_radius_miles"]}
+
+
+def validate_scope(scope):
+    """Require a complete, ordered centroid ZIP set in the immutable identity."""
+    from api.plan_pricing_projection_contract import MAX_GEO_CELLS
+
+    if type(scope) is not dict or set(scope) != {"kind", "zip5", "zip_radius_miles", "geo_cells"}:
+        raise ValueError("code pricing ZIP coverage is invalid")
+    scope_selectors({"scope_kind": scope["kind"], "zip5": scope["zip5"], "zip_radius_miles": scope["zip_radius_miles"]})
+    cells = scope["geo_cells"]
+    if (
+        type(cells) is not list
+        or len(cells) > MAX_GEO_CELLS
+        or any(type(cell) is not str or re.fullmatch(r"[0-9]{5}", cell, flags=re.ASCII) is None for cell in cells)
+        or cells != sorted(set(cells))
+    ):
+        raise ValueError("code pricing ZIP coverage is invalid")
 
 
 def _require_source_coverage(selection, source_coverages):
@@ -92,7 +163,7 @@ def _require_source_coverage(selection, source_coverages):
         coverage_by_ordinal[coverage["binding_ordinal"]] = coverage
 
 
-def capability_identity(selection, code_identity, signature, sources):
+def capability_identity(selection, code_identity, signature, sources, *, scope=None):
     """Bind complete logical attribution and authenticated physical code coverage."""
     if type(selection) is not PlanReleaseServingSelection or not HEX_DIGEST.fullmatch(signature or ""):
         raise ValueError("code projection release or provider identity is invalid")
@@ -111,6 +182,9 @@ def capability_identity(selection, code_identity, signature, sources):
         "code": code_identity[1],
         "sources": sources,
     }
+    if scope is not None:
+        validate_scope(scope)
+        identity_by_field.update(contract=ZIP_CONTRACT, build_revision=ZIP_BUILD_REVISION, scope=scope)
     if len(canonical_json(identity_by_field).encode("ascii")) > 512 * 1024:
         raise ValueError("code projection identity exceeds its metadata bound")
     return identity_by_field

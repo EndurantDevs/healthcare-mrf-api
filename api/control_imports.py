@@ -211,9 +211,9 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
     "plan-pricing-code-projection": {
         "queue": "arq:PTGCandidateAudit",
         "function": "control_single_job_start",
-        "payload": "control_wrapped_kwargs",
+        "payload": "control_wrapped",
         "target_module": "api.plan_pricing_code_build",
-        "target_function": "build_plan_pricing_code_projection",
+        "target_function": "control_start",
         "job_prefix": "plan_pricing_code_projection",
     },
     "ptg-provider-membership-projection": {
@@ -919,25 +919,9 @@ def _membership_projection_registry_entry() -> dict[str, Any]:
 
 
 def _code_pricing_registry_entry() -> dict[str, Any]:
-    entry = _membership_projection_registry_entry()
-    entry["name"] = "plan-pricing-code-projection"
-    for field, name in zip(entry["params_schema"][:2], ("plan_release_id", "serving_revision_id"), strict=True):
-        field.update(
-            name=name, opts=["--" + name.replace("_", "-")], help="Exact current immutable release coordinate."
-        )
-    entry["params_schema"].append(
-        {
-            "name": "expected_identity_digest",
-            "opts": ["--expected-identity-digest"],
-            "required": True,
-            "multiple": False,
-            "is_flag": False,
-            "type": "string",
-            "default": None,
-            "help": "Exact complete identity digest reported by readiness.",
-        }
-    )
-    return entry
+    from api.control_plan_pricing_code import code_pricing_registry_entry
+
+    return code_pricing_registry_entry(_membership_projection_registry_entry())
 
 
 def importer_registry() -> list[dict[str, Any]]:

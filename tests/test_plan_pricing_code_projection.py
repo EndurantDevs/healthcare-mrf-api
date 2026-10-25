@@ -266,9 +266,20 @@ def test_importer_discovery_and_worker_share_closed_contract():
         "code_system",
         "code",
         "expected_identity_digest",
+        "scope_kind",
+        "zip5",
+        "zip_radius_miles",
+        "operation",
     }
     adapter = imports._SINGLE_JOB_ADAPTERS[entry["name"]]
-    assert adapter["target_function"] == "build_plan_pricing_code_projection"
+    assert adapter == {
+        "queue": "arq:PTGCandidateAudit",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "api.plan_pricing_code_build",
+        "target_function": "control_start",
+        "job_prefix": "plan_pricing_code_projection",
+    }
     assert any(entry["name"] in spec.importers for spec in _START_WORKERS)
     assert entry["name"] in imports.ALL_STATUS_IDEMPOTENCY_IMPORTERS
 
@@ -301,10 +312,12 @@ def test_code_preparation_all_status_key_has_its_own_unique_migration(monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("different", [None, "plan", "market", "physical_family"])
-async def test_authoritative_physical_aliases_are_validated_but_materialized_once(monkeypatch, different):
+@pytest.mark.parametrize("is_scoped", [False, True])
+async def test_authoritative_physical_aliases_are_validated_but_materialized_once(monkeypatch, different, is_scoped):
     from unittest.mock import AsyncMock
 
     from api import plan_pricing_code_build as build
+    from api import plan_pricing_projection_read as reader
 
     first = _selection().bindings[0]
     alias = replace(first, binding_ordinal=1, snapshot_id="alias-snapshot", source_key="alias-source")
@@ -337,11 +350,22 @@ async def test_authoritative_physical_aliases_are_validated_but_materialized_onc
     monkeypatch.setattr(build, "membership_receipt", lambda _found: member_by_key)
     monkeypatch.setattr(build, "load_sealed_code_rows", AsyncMock(return_value=[{"code_key": 1, "rate_count": 3}]))
     monkeypatch.setattr(build, "provider_signature", AsyncMock(return_value="c" * 64))
-    recipe, inputs = await build.resolve_inputs(object(), selected, ("CPT", "27447"))
+    cells = AsyncMock(return_value=["48105", "48104", "48105"])
+    monkeypatch.setattr(reader, "geo_cells", cells)
+    scope = {"kind": "zip_radius", "zip5": "48104", "zip_radius_miles": "25"} if is_scoped else None
+    session = object()
+    recipe, inputs = await build.resolve_inputs(session, selected, ("CPT", "27447"), scope=scope)
     assert loader.await_count == 2 and len(recipe["sources"]) == 2
     assert recipe["sources"][1]["source_identity"]["source_key"] == "alias-source"
     assert len(inputs) == (1 if different is None else 2)
     assert recipe["sources"][1]["materialized_binding_ordinal"] == (0 if different is None else 1)
+    assert recipe["provider_signature"] == "c" * 64
+    if is_scoped:
+        assert recipe["scope"] == scope | {"geo_cells": ["48104", "48105"]}
+        cells.assert_awaited_once_with(session, scope, result_type="rate_aggregates")
+    else:
+        assert "scope" not in recipe
+        cells.assert_not_awaited()
 
 
 def test_policy_alias_remapping_and_inferred_taxonomy_stay_inside_native_read_scope():
