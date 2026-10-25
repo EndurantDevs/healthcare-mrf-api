@@ -26,7 +26,7 @@ class CompanyRegistry(Base):
         CheckConstraint("jsonb_typeof(aliases) = 'array'", name="registry_company_aliases"),
         CheckConstraint(
             "cardinality(roles) > 0 AND array_position(roles, NULL) IS NULL "
-            "AND roles <@ ARRAY['insurer','employer','network_operator']::varchar[]",
+            "AND roles <@ ARRAY['insurer','employer','network_operator','benefits_administrator']::varchar[]",
             name="registry_company_roles",
         ),
         {"schema": _SCHEMA},

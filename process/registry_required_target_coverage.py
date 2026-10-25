@@ -16,6 +16,7 @@ from process.network_address_projection import _identifier
 from process.network_approved_membership_source import pin_retained_approved_membership_source
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_pricing_release_binding_lookup import append_pricing_binding_metadata
+from process.registry_required_target_business_report import business_target_report
 from process.registry_required_target_review_references import _REFERENCES_SQL, MAX_BUNDLE_BYTES, _verify_bundle
 from process.registry_source_recipe_store import verify_registry_source_recipes
 from process.registry_source_selection_receipt import _unique_object, verify_registry_source_selection_receipt
@@ -39,9 +40,10 @@ _LEDGER_SQL = """SELECT snapshot.snapshot_id,snapshot.source_system,snapshot.sou
   CASE WHEN octet_length(observation.observation_json::text)<=$2
     THEN observation.observation_json::text END AS document,
   snapshot.source_system='required-network-targets' AND snapshot.source_id='required-networks'
-    AND snapshot.parser_version='registry-target-ledger-v2' AND snapshot.edition_id=snapshot.input_sha256
+    AND snapshot.parser_version IN ('registry-target-ledger-v2','registry-target-ledger-v3')
+          AND observation.observation_json->>'parser_version'=snapshot.parser_version AND snapshot.edition_id=snapshot.input_sha256
     AND snapshot.reporting_year IS NULL AND snapshot.published_at IS NULL
-    AND observation.source_record_key='ledger:v2' AND observation.source_row_number=1
+    AND observation.source_record_key=CASE snapshot.parser_version WHEN 'registry-target-ledger-v2' THEN 'ledger:v2' ELSE 'ledger:v3' END AND observation.source_row_number=1
     AND observation.status='accepted' AND observation.issues_json='[]'::jsonb
     AND observation.observation_json->'ledger'->>'source_sha256'=snapshot.input_sha256
     AND octet_length(observation.observation_json::text)<=$2
@@ -88,9 +90,10 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
   FROM selected_bindings WHERE starts_with(evidence_id,'required-target-review:')
 ), ledger AS MATERIALIZED (
   SELECT observation_json AS document FROM __CONTROL__.registry_source_observation
-  WHERE snapshot_id=$1::uuid AND source_record_key='ledger:v2'
+  WHERE snapshot_id=$1::uuid AND source_record_key IN ('ledger:v2','ledger:v3')
 ), targets AS MATERIALIZED (
-  SELECT target->>'target_key' AS target_key FROM ledger,
+  SELECT target->>'target_key' AS target_key,target->'business_context' AS business_context,
+    jsonb_array_length(target->'source_row_ordinals') AS source_row_count FROM ledger,
     LATERAL jsonb_array_elements(document#>'{ledger,targets}') target
 ), decisions AS MATERIALIZED (
   SELECT refs.snapshot_id AS review_snapshot_id,refs.evidence_sha256 AS review_artifact_sha256,
@@ -107,11 +110,12 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
   WHERE observation.source_record_key='review:v2'
     AND observation.observation_json->>'ledger_snapshot_id'=$1::text
 ), mapping AS MATERIALIZED (
-  SELECT target.target_key,count(decision.target_key)::bigint AS decision_count,
+  SELECT target.target_key,target.business_context,target.source_row_count,count(decision.target_key)::bigint AS decision_count,
     count(DISTINCT decision.network_id) FILTER(WHERE decision.approved_exact_binding) AS agreed_id_count,
     CASE WHEN count(DISTINCT decision.network_id) FILTER(WHERE decision.approved_exact_binding)=1
       THEN min(decision.network_id) FILTER(WHERE decision.approved_exact_binding) END AS agreed_network_id,
-    CASE WHEN count(decision.target_key)=0 THEN 'missing'
+    CASE WHEN target.business_context->>'network_name'='' THEN 'unresolved'
+      WHEN count(decision.target_key)=0 THEN 'missing'
       WHEN count(DISTINCT decision.network_id) FILTER(WHERE decision.approved_exact_binding)>1
         OR bool_or(decision.resolution_status='conflicting') THEN 'conflicting'
       WHEN count(DISTINCT decision.network_id) FILTER(WHERE decision.approved_exact_binding)=1
@@ -121,7 +125,7 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
       'review_artifact_sha256',decision.review_artifact_sha256,'decision',decision.decision,
       'approved_exact_binding',decision.approved_exact_binding)) FILTER(WHERE decision.target_key IS NOT NULL),'[]')
       AS review_provenance
-  FROM targets target LEFT JOIN decisions decision USING(target_key) GROUP BY target.target_key
+  FROM targets target LEFT JOIN decisions decision USING(target_key) GROUP BY target.target_key,target.business_context,target.source_row_count
 ), networks AS MATERIALIZED (
   SELECT DISTINCT agreed_network_id AS network_id FROM mapping WHERE mapping_status='resolved'
 ), members AS MATERIALIZED (
@@ -327,6 +331,8 @@ def _verify_ledger(entry, snapshot_id):
         or not 0 <= descriptor["target_count"] <= 5000
     ):
         raise RegistryRequiredTargetCoverageUnavailable("registry_required_target_coverage_ledger_invalid")
+    if entry.get("parser_version") == "registry-target-ledger-v3":
+        return {**descriptor, "parser_version": "registry-target-ledger-v3"}
     return descriptor
 
 
@@ -436,6 +442,12 @@ def _coverage_report(manifest, ledger, approved, candidate_by_field, bundle, evi
             "pricing": "not_assessed",
         },
     }
+    if ledger.get("parser_version") == "registry-target-ledger-v3":
+        report_by_field = business_target_report(report_by_field, ledger)
+    else:
+        for evidence_row in report_by_field["provenance"]["target_evidence"]:
+            evidence_row.pop("business_context", None)
+            evidence_row.pop("source_row_count", None)
     if (
         len(json.dumps(report_by_field, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode())
         > MAX_REPORT_BYTES

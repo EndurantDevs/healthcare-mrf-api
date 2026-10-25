@@ -3,6 +3,7 @@
 
 use crate::network_membership_codec::{uuid_bytes, write_field, COPY_HEADER};
 use crate::network_source_binding_values::{validate_row, ValidatedSourceBinding};
+use crate::registry_business_target_ledger::{self as business, BusinessTarget};
 use crate::registry_network_coverage::MAX_TARGET_KEY_BYTES;
 use crate::registry_target_ledger;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -69,17 +70,53 @@ struct Ledger {
 #[serde(deny_unknown_fields)]
 struct LedgerObservation {
     source_row_ordinal: usize,
-    raw_cells: [String; 7],
+    raw_cells: Vec<String>,
     target_keys: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum LedgerTarget {
+    Reference(ReferenceTarget),
+    Business(BusinessTarget),
+}
+
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct LedgerTarget {
+struct ReferenceTarget {
     target_key: String,
     #[serde(deserialize_with = "required_option")]
     fc_network_id: Option<String>,
     source_row_ordinals: Vec<usize>,
+}
+
+impl LedgerTarget {
+    fn key(&self) -> &str {
+        match self {
+            Self::Reference(t) => &t.target_key,
+            Self::Business(t) => &t.target_key,
+        }
+    }
+    fn rows(&self) -> &[usize] {
+        match self {
+            Self::Reference(t) => &t.source_row_ordinals,
+            Self::Business(t) => &t.source_row_ordinals,
+        }
+    }
+}
+
+fn blank_network_targets(ledger: &LedgerDocument) -> BTreeSet<&str> {
+    ledger
+        .ledger
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            LedgerTarget::Business(t) if t.business_context.network_name.is_empty() => {
+                Some(t.target_key.as_str())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -259,7 +296,11 @@ fn ledger_targets(
     let invalid = || failure("registry_target_review_ledger_invalid");
     if ledger.component != registry_target_ledger::COMPONENT
         || ledger.revision != 1
-        || ledger.parser_version != registry_target_ledger::PARSER_VERSION
+        || ![
+            registry_target_ledger::PARSER_VERSION,
+            business::PARSER_VERSION,
+        ]
+        .contains(&ledger.parser_version.as_str())
         || !valid_digest(&ledger.ledger.source_sha256)
         || !(1..=registry_target_ledger::MAX_ROWS).contains(&ledger.ledger.row_count)
         || ledger.ledger.observations.len() != ledger.ledger.row_count
@@ -268,64 +309,96 @@ fn ledger_targets(
     {
         return Err(invalid());
     }
-    let mut keys = BTreeSet::new();
-    let mut source_ids = BTreeMap::new();
+    let mut targets = BTreeMap::new();
     let mut relations = BTreeMap::<&str, Vec<usize>>::new();
     for target in &ledger.ledger.targets {
-        if target.target_key.is_empty()
-            || target.target_key.len() > MAX_TARGET_KEY_BYTES
-            || !keys.insert(target.target_key.as_str())
-            || target.source_row_ordinals.is_empty()
-            || target
-                .source_row_ordinals
-                .windows(2)
-                .any(|rows| rows[0] >= rows[1])
-            || target
-                .source_row_ordinals
+        let key = target.key();
+        let rows = target.rows();
+        if key.is_empty()
+            || key.len() > MAX_TARGET_KEY_BYTES
+            || targets.insert(key, target).is_some()
+            || rows.is_empty()
+            || rows.windows(2).any(|pair| pair[0] >= pair[1])
+            || rows
                 .iter()
                 .any(|row| !(1..=ledger.ledger.row_count).contains(row))
-            || target.fc_network_id.as_ref().is_some_and(|value| {
-                value.len() > registry_target_ledger::MAX_FC_BYTES
-                    || value.is_empty()
-                    || value.starts_with('0')
-                    || !value.bytes().all(|byte| byte.is_ascii_digit())
-            })
         {
             return Err(invalid());
         }
-        source_ids.insert(target.target_key.as_str(), target.fc_network_id.as_deref());
-        relations.insert(&target.target_key, Vec::new());
+        match target {
+            LedgerTarget::Reference(t)
+                if ledger.parser_version == registry_target_ledger::PARSER_VERSION =>
+            {
+                if t.fc_network_id.as_ref().is_some_and(|v| {
+                    v.is_empty()
+                        || v.len() > registry_target_ledger::MAX_FC_BYTES
+                        || v.starts_with('0')
+                        || !v.bytes().all(|b| b.is_ascii_digit())
+                }) {
+                    return Err(invalid());
+                }
+            }
+            LedgerTarget::Business(_) if ledger.parser_version == business::PARSER_VERSION => (),
+            _ => return Err(invalid()),
+        }
+        relations.insert(key, Vec::new());
     }
     for (index, observation) in ledger.ledger.observations.iter().enumerate() {
         if observation.source_row_ordinal != index + 1
             || observation.target_keys.len() != 1
-            || observation.raw_cells.iter().any(|cell| cell.contains('\0'))
+            || observation.raw_cells.iter().any(|cell| {
+                cell.contains('\0') || cell.len() > registry_target_ledger::MAX_FIELD_BYTES
+            })
         {
             return Err(invalid());
         }
-        let fc = registry_target_ledger::source_id(&observation.raw_cells, index + 1)
-            .map_err(|_| invalid())?;
-        if observation.target_keys[0]
-            != registry_target_ledger::target_key(
-                fc.as_deref(),
-                &ledger.ledger.source_sha256,
-                index + 1,
-            )
-            || source_ids.get(observation.target_keys[0].as_str()) != Some(&fc.as_deref())
-        {
+        let key = &observation.target_keys[0];
+        let target = targets.get(key.as_str()).ok_or_else(invalid)?;
+        let expected = match target {
+            LedgerTarget::Reference(t) => {
+                let cells: &[String; 7] = observation
+                    .raw_cells
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid())?;
+                let reference =
+                    registry_target_ledger::source_id(cells, index + 1).map_err(|_| invalid())?;
+                if reference != t.fc_network_id {
+                    return Err(invalid());
+                }
+                registry_target_ledger::target_key(
+                    reference.as_deref(),
+                    &ledger.ledger.source_sha256,
+                    index + 1,
+                )
+            }
+            LedgerTarget::Business(t) => {
+                let cells: &[String; 6] = observation
+                    .raw_cells
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid())?;
+                let context = business::BusinessContext::from_cells(cells);
+                if context != t.business_context {
+                    return Err(invalid());
+                }
+                business::target_key(&context).map_err(|_| invalid())?
+            }
+        };
+        if expected != *key {
             return Err(invalid());
         }
         relations
-            .get_mut(observation.target_keys[0].as_str())
+            .get_mut(key.as_str())
             .ok_or_else(invalid)?
             .push(index + 1);
     }
     for target in &ledger.ledger.targets {
-        if relations[&target.target_key.as_str()] != target.source_row_ordinals {
+        if relations[target.key()] != target.rows() {
             return Err(invalid());
         }
     }
-    Ok(keys)
+    Ok(targets.keys().copied().collect())
 }
 
 fn source_binding(
@@ -352,6 +425,7 @@ fn source_binding(
 fn validate_decisions(
     rows: Vec<DecisionInput>,
     targets: &BTreeSet<&str>,
+    blank_networks: &BTreeSet<&str>,
 ) -> Result<(Vec<Decision>, usize), RegistryRequiredTargetReviewError> {
     if rows.is_empty() || rows.len() > MAX_DECISIONS {
         return Err(failure("registry_target_review_limit"));
@@ -371,7 +445,9 @@ fn validate_decisions(
             return Err(failure("registry_target_review_invalid"));
         }
         let binding = match (row.resolution_status, row.network_id, row.source_binding) {
-            (ResolutionStatus::Resolved, Some(network), Some(input)) if network > 0 => {
+            (ResolutionStatus::Resolved, Some(network), Some(input))
+                if network > 0 && !blank_networks.contains(row.target_key.as_str()) =>
+            {
                 let projection = source_binding(&input, network, index)?;
                 if let Some((previous, previous_network)) = bindings.get(&projection.binding_id) {
                     if previous != &projection || *previous_network != network {
@@ -426,7 +502,11 @@ pub fn encode_registry_required_target_review_artifact(
     if ledger_digest != input_decoded.ledger_artifact_sha256 {
         return Err(failure("registry_target_review_ledger_mismatch"));
     }
-    let (decisions, resolved_count) = validate_decisions(input_decoded.decisions, &targets)?;
+    let (decisions, resolved_count) = validate_decisions(
+        input_decoded.decisions,
+        &targets,
+        &blank_network_targets(&ledger),
+    )?;
     let decision_count = decisions.len();
     let source_sha256 = digest(input);
     let document = canonical(ReviewDocument {
@@ -611,7 +691,8 @@ pub fn validate_registry_required_target_review_artifacts(
     let review_count = bundle.reviews.len();
     let ledger_count = bundle.ledgers.len();
     let mut identities = BTreeSet::new();
-    let mut ledgers = BTreeMap::<String, (String, String, BTreeSet<String>)>::new();
+    let mut ledgers =
+        BTreeMap::<String, (String, String, BTreeSet<String>, BTreeSet<String>)>::new();
     for artifact in bundle.ledgers {
         if !canonical_uuid(&artifact.snapshot_id)
             || !valid_digest(&artifact.artifact_sha256)
@@ -632,8 +713,12 @@ pub fn validate_registry_required_target_review_artifacts(
             artifact.snapshot_id,
             (
                 artifact.artifact_sha256,
-                ledger.ledger.source_sha256,
+                ledger.ledger.source_sha256.clone(),
                 targets,
+                blank_network_targets(&ledger)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
             ),
         );
     }
@@ -661,7 +746,7 @@ pub fn validate_registry_required_target_review_artifacts(
         if digest(&canonical(&saved)?) != artifact.artifact_sha256 {
             return Err(failure("registry_target_review_ledger_mismatch"));
         }
-        let (ledger_hash, source_hash, targets) = ledgers
+        let (ledger_hash, source_hash, targets, blank_networks) = ledgers
             .get(&saved.ledger_snapshot_id)
             .ok_or_else(|| failure("registry_target_review_ledger_mismatch"))?;
         if ledger_hash != &saved.ledger_artifact_sha256
@@ -678,7 +763,8 @@ pub fn validate_registry_required_target_review_artifacts(
             .map(stored_decision)
             .collect::<Result<Vec<_>, _>>()?;
         let target_refs = targets.iter().map(String::as_str).collect();
-        let (validated, _) = validate_decisions(rows, &target_refs)?;
+        let blank_refs = blank_networks.iter().map(String::as_str).collect();
+        let (validated, _) = validate_decisions(rows, &target_refs, &blank_refs)?;
         if serde_json::to_value(validated).map_err(|_| failure("registry_target_review_invalid"))?
             != original
         {

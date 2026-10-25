@@ -22,6 +22,7 @@ MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 MAX_COPY_BYTES = MAX_ARTIFACT_BYTES + 1024
 PARSER_VERSION = "registry-target-ledger-v2"
+BUSINESS_PARSER_VERSION = "registry-target-ledger-v3"
 _COPY_HEADER = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0"
 _COPY_COLUMNS = ("snapshot_id", "source_record_key", "source_row_number", "status", "observation_json", "issues_json")
 _DESCRIPTOR_FIELDS = {
@@ -73,8 +74,11 @@ class RegistryRequiredTargetEdition:
     snapshot_id: UUID
     source_url: str
     input_sha256: str
+    parser_version: str = PARSER_VERSION
 
     def __post_init__(self):
+        if type(self.parser_version) is not str or self.parser_version not in (PARSER_VERSION, BUSINESS_PARSER_VERSION):
+            raise RegistryRequiredTargetError("registry_required_target_parser_invalid")
         if type(self.snapshot_id) is not UUID or not self.snapshot_id.int:
             raise RegistryRequiredTargetError("registry_required_target_identity_invalid")
         if (
@@ -93,7 +97,12 @@ def _encode(input_bytes, edition):
     """One native pass validates every source row and emits one bounded COPY artifact."""
     try:
         native = importlib.import_module("ptg2_address_canon")
-        encoded = native.encode_registry_target_ledger_artifact(input_bytes, str(edition.snapshot_id))
+        encoder = (
+            native.encode_registry_business_target_ledger_artifact
+            if edition.parser_version == BUSINESS_PARSER_VERSION
+            else native.encode_registry_target_ledger_artifact
+        )
+        encoded = encoder(input_bytes, str(edition.snapshot_id))
     except ImportError, AttributeError, RuntimeError, TypeError:
         raise RegistryRequiredTargetError("registry_required_target_native_unavailable") from None
     except ValueError:
@@ -118,7 +127,7 @@ def _encode(input_bytes, edition):
             or descriptor["component"] != "registry_required_target_ledger"
             or type(descriptor["revision"]) is not int
             or descriptor["revision"] != 1
-            or descriptor["parser_version"] != PARSER_VERSION
+            or descriptor["parser_version"] != edition.parser_version
             or descriptor["snapshot_id"] != str(edition.snapshot_id)
             or descriptor["source_sha256"] != edition.input_sha256
             or type(descriptor["artifact_sha256"]) is not str
@@ -151,7 +160,7 @@ async def _stage(connection, namespace, copy_bytes, edition, descriptor):
             raise RegistryRequiredTargetError("registry_required_target_copy_incomplete")
     valid = await connection.fetchval(
         f"""SELECT count(*)=1 AND COALESCE(bool_and(
-          snapshot_id=$1 AND source_record_key='ledger:v2' AND source_row_number=1
+          snapshot_id=$1 AND source_record_key=CASE $2::text WHEN 'registry-target-ledger-v2' THEN 'ledger:v2' ELSE 'ledger:v3' END AND source_row_number=1
           AND status='accepted' AND issues_json='[]'::jsonb
           AND observation_json->>'component'='registry_required_target_ledger'
           AND observation_json->'revision'='1'::jsonb AND observation_json->>'parser_version'=$2
@@ -166,7 +175,7 @@ async def _stage(connection, namespace, copy_bytes, edition, descriptor):
           AND jsonb_array_length(CASE WHEN jsonb_typeof(observation_json->'ledger'->'targets')='array'
             THEN observation_json->'ledger'->'targets' ELSE '[]'::jsonb END)=$5),false) FROM {staging}""",
         edition.snapshot_id,
-        PARSER_VERSION,
+        edition.parser_version,
         edition.input_sha256,
         descriptor["source_rows"],
         descriptor["target_count"],
@@ -258,7 +267,8 @@ async def admit_registry_required_targets(connection, input_bytes, edition, *, c
     try:
         async with connection.transaction():
             staging = await _stage(connection, namespace, copy_bytes, edition, descriptor)
-            replayed = await _is_replay_after_retention(connection, namespace, staging, edition, descriptor)
+            options = {} if edition.parser_version == PARSER_VERSION else {"parser_version": edition.parser_version}
+            replayed = await _is_replay_after_retention(connection, namespace, staging, edition, descriptor, **options)
             return {
                 **descriptor,
                 "copy_sha256": hashlib.sha256(copy_bytes).hexdigest(),

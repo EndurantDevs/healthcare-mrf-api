@@ -36,6 +36,7 @@ pub mod provider_directory_projection;
 pub mod provider_graph_v4;
 pub mod rate_schedule_observe;
 pub mod registry_assertion_conflicts;
+pub mod registry_business_target_ledger;
 pub mod registry_network_coverage;
 pub mod registry_network_evidence_values;
 pub mod registry_ptg_capture_input;
@@ -480,6 +481,25 @@ mod python_api {
     }
 
     #[pyfunction]
+    fn encode_registry_business_target_ledger_artifact(
+        py: Python<'_>,
+        input: &[u8],
+        snapshot_id: &str,
+    ) -> PyResult<(Py<PyBytes>, Py<PyBytes>)> {
+        let (copy, descriptor) = py.detach(|| {
+            crate::registry_business_target_ledger::encode_business_target_ledger_artifact(
+                input,
+                snapshot_id,
+            )
+            .map_err(|error| PyValueError::new_err(error.code))
+        })?;
+        Ok((
+            PyBytes::new(py, &copy).unbind(),
+            PyBytes::new(py, &descriptor).unbind(),
+        ))
+    }
+
+    #[pyfunction]
     fn encode_registry_required_target_review_artifact(
         py: Python<'_>,
         input: &[u8],
@@ -632,6 +652,10 @@ mod python_api {
         m.add_function(wrap_pyfunction!(parse_registry_target_ledger, m)?)?;
         m.add_function(wrap_pyfunction!(parse_registry_network_evidence, m)?)?;
         m.add_function(wrap_pyfunction!(encode_registry_target_ledger_artifact, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            encode_registry_business_target_ledger_artifact,
+            m
+        )?)?;
         m.add_function(wrap_pyfunction!(
             validate_registry_required_target_ledger_artifact,
             m

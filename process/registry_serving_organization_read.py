@@ -73,12 +73,13 @@ def _projection(record_kind, namespace, *, exclusions=False):
             value = f"""coalesce((SELECT jsonb_agg(assertion ORDER BY ordinal)
               FROM jsonb_array_elements(coalesce(page.record_json->'group_assertions','[]'::jsonb))
                 WITH ORDINALITY item(assertion,ordinal)
-              JOIN {namespace}.registry_approved_record target ON target.approved_revision=$1
+              LEFT JOIN {namespace}.registry_approved_record target ON target.approved_revision=$1
                 AND target.record_kind='group' AND target.record_key=assertion->>'group_id'
                 AND target.record_json->'archived'='false'::jsonb
                 AND target.record_json->>'group_kind'=assertion->>'group_kind'
-              WHERE assertion->>'group_id'=ANY($4::text[])
-                AND assertion->>'company_id'=page.record_key),'[]'::jsonb)"""
+              WHERE assertion->>'company_id'=page.record_key AND (
+                (assertion->>'relationship_kind'='verified_no_affiliation' AND assertion->>'group_id' IS NULL)
+                OR (target.record_key IS NOT NULL AND assertion->>'group_id'=ANY($4::text[])))),'[]'::jsonb)"""
         fields.extend((f"'{name}'", value))
     projection = "jsonb_build_object(" + ",".join(fields) + ")"
     return (

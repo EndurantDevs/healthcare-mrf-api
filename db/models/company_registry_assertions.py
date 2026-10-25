@@ -45,7 +45,10 @@ class CompanyRegistryRoleAssertion(Base):
     __runtime_schema_sync__ = False
     __table_args__ = (
         *_common_checks("company_role_assertion"),
-        CheckConstraint("role IN ('insurer','employer','network_operator')", name="company_role_assertion_role"),
+        CheckConstraint(
+            "role IN ('insurer','employer','network_operator','benefits_administrator')",
+            name="company_role_assertion_role",
+        ),
         UniqueConstraint(
             "company_id", "company_revision", "role", "valid_from", name="company_role_assertion_revision_key"
         ),
@@ -126,12 +129,17 @@ class CompanyRegistryGroupAssertion(Base):
         CheckConstraint(f"group_id IS NULL OR group_id<>{_ZERO_UUID}", name="company_group_assertion_group_identity"),
         CheckConstraint("group_kind IN ('corporate_parent','naic_group')", name="company_group_assertion_group_kind"),
         CheckConstraint(
-            "relationship_kind IN ('reported_affiliation','verified_ownership')",
+            "relationship_kind IN ('reported_affiliation','verified_ownership','verified_no_affiliation')",
             name="company_group_assertion_relationship",
         ),
         CheckConstraint(
-            "provenance_kind<>'manual_reference' OR group_id IS NOT NULL",
+            "provenance_kind<>'manual_reference' OR group_id IS NOT NULL OR relationship_kind='verified_no_affiliation'",
             name="company_group_assertion_manual_group",
+        ),
+        CheckConstraint(
+            "relationship_kind<>'verified_no_affiliation' OR "
+            "(group_id IS NULL AND valid_from IS NOT NULL AND provenance_kind='manual_reference')",
+            name="company_group_assertion_no_affiliation",
         ),
         Index("company_group_assertion_revision_idx", "company_id", "company_revision"),
         {"schema": _SCHEMA},

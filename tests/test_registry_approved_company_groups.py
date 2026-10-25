@@ -181,3 +181,15 @@ def test_history_normalizes_only_absent_legacy_group_family():
     assert "'group_assertions','[]'::jsonb" in defaults
     # The retained right operand preserves explicit families, including an empty one.
     assert retained_fields.strip() == "(history.record_json-'correction_predecessors')"
+
+
+@pytest.mark.asyncio
+async def test_no_affiliation_is_effective_but_overlapping_positive_evidence_blocks_approval():
+    none = _row() | {"group_id": None, "relationship_kind": "verified_no_affiliation"}
+    diagnostics = await _diagnose(_CursorConnection([[none]]))
+    assert diagnostics["group_review_rows"] == diagnostics["group_unresolved_count"] == 0
+    for kind in ("reported_affiliation", "verified_ownership"):
+        positive = _row(assertion=101) | {"relationship_kind": kind}
+        diagnostics = await _diagnose(_CursorConnection([[none, positive]]))
+        assert diagnostics["group_review_rows"] == diagnostics["group_unresolved_count"] == 2
+        assert diagnostics["group_reviews_by_code"] == {"contradictory_overlapping_groups": 1}
