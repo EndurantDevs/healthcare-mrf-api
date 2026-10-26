@@ -12,6 +12,7 @@ import pytest
 from db.connection import Database
 from process import provider_directory_generic_source_policy as policy
 from process.provider_directory_generic_candidate import GenericCandidateError
+from process import provider_directory_source_storage_binding as isolated
 
 
 @asynccontextmanager
@@ -169,6 +170,411 @@ def _identity_factory():
 
     factory._require_current_policy = Mock(side_effect=require_current_policy)
     return factory
+
+
+def _isolated_factory():
+    factory = _identity_factory()
+    factory.storage_binding = isolated.FHIRSourceStorageBinding(
+        "catalog_schema", "source_schema", 10, 20, 30, 100, 101, "d" * 64
+    )
+    factory.source_storage_binding = AsyncMock(return_value=factory.storage_binding)
+    return factory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolated_storage", [False, True])
+async def test_seen_cleanup_keeps_private_storage_separate(monkeypatch, isolated_storage):
+    from importlib import import_module
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _isolated_factory() if isolated_storage else _identity_factory()
+    execute = AsyncMock(return_value=9)
+    monkeypatch.setattr(directory.db, "status", execute)
+    async with policy.bind_generic_source_transaction_factory(factory):
+        assert await directory._clear_resource_rows_seen(None) == 0
+        assert await directory._clear_resource_rows_seen("synthetic-run") == (0 if isolated_storage else 9)
+        if isolated_storage:
+            factory._require_current_policy.assert_called_once_with()
+            execute.assert_not_awaited()
+            factory.producer_identity = ("c" * 40, factory.producer_identity[1])
+            with pytest.raises(ValueError, match="source_policy_changed"):
+                await directory._clear_resource_rows_seen("synthetic-run")
+        else:
+            assert "provider_directory_import_seen" in execute.await_args.args[0]
+            assert execute.await_args.kwargs == {"run_id": "synthetic-run"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolated_storage", [False, True])
+@pytest.mark.parametrize("dataset", [None, "synthetic-incumbent"])
+async def test_published_predecessor_uses_the_canonical_catalog(monkeypatch, isolated_storage, dataset):
+    from importlib import import_module
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _isolated_factory() if isolated_storage else _identity_factory()
+    query = AsyncMock(return_value={"dataset_id": dataset} if dataset else None)
+    monkeypatch.setattr(directory, "_schema", lambda: "catalog_schema")
+    monkeypatch.setattr(directory.db, "first", query)
+    monkeypatch.setattr(directory.db, "_transaction_binding", lambda: None)
+    async with policy.bind_generic_source_transaction_factory(factory):
+        assert await directory._current_endpoint_dataset_id("endpoint", exclude_dataset_id="candidate") == dataset
+    assert '"catalog_schema"."provider_directory_endpoint_dataset"' in query.await_args.args[0]
+    assert "source_schema" not in query.await_args.args[0]
+    assert "is_current = true" in query.await_args.args[0]
+    assert "dataset_id <> :exclude_dataset_id" in query.await_args.args[0]
+    assert query.await_args.kwargs == {"endpoint_id": "endpoint", "exclude_dataset_id": "candidate"}
+    if isolated_storage:
+        assert factory._require_current_policy.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["schema", "transaction", "producer"])
+async def test_published_predecessor_refuses_changed_reader_scope(monkeypatch, changed):
+    from importlib import import_module
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _isolated_factory()
+    query = AsyncMock(return_value={"dataset_id": "synthetic-incumbent"})
+    monkeypatch.setattr(directory, "_schema", lambda: "wrong_schema" if changed == "schema" else "catalog_schema")
+    monkeypatch.setattr(directory.db, "_transaction_binding", lambda: object() if changed == "transaction" else None)
+    monkeypatch.setattr(directory.db, "first", query)
+
+    async def changed_producer(*args, **kwargs):
+        factory.producer_identity = ("c" * 40, factory.producer_identity[1])
+        return {"dataset_id": "synthetic-incumbent"}
+
+    if changed == "producer":
+        query.side_effect = changed_producer
+    async with policy.bind_generic_source_transaction_factory(factory):
+        with pytest.raises((RuntimeError, ValueError), match="catalog_reader_required|source_policy_changed"):
+            await directory._current_endpoint_dataset_id("endpoint", exclude_dataset_id="candidate")
+    assert query.await_count == (1 if changed == "producer" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "function_name,arguments",
+    [
+        ("_artifact_stored_content_proof_sql", ("dataset", "metadata", "proof")),
+        ("_artifact_legacy_subset_proof_sql", ("dataset", "metadata", "proof")),
+        ("_artifact_subset_parent_proof_sql", ("dataset", "metadata", "proof")),
+        ("_artifact_legacy_content_proof_valid_sql", ("metadata", "proof", "run_id")),
+        ("_artifact_semantic_legacy_proof_sql", ("proof",)),
+        ("_artifact_semantic_content_proof_valid_sql", ("metadata", "proof", "run_id", "contract")),
+    ],
+)
+async def test_metadata_validators_keep_canonical_function_qualification(monkeypatch, function_name, arguments):
+    from importlib import import_module
+
+    directory = import_module("process.provider_directory_fhir")
+    monkeypatch.setattr(directory, "_schema", lambda: "catalog_schema")
+    async with policy.bind_generic_source_transaction_factory(_isolated_factory()):
+        fragment = getattr(directory, function_name)(*arguments)
+        assert '"catalog_schema"."provider_directory_subset_' in fragment
+        assert "source_schema" not in fragment
+        with pytest.raises(GenericCandidateError, match="isolated_transaction_required"):
+            directory._qt("catalog_schema", "provider_directory_subset_content_proof_valid")
+
+
+@pytest.mark.asyncio
+async def test_private_candidate_admission_qualifies_all_existing_functions(monkeypatch, custody):
+    from importlib import import_module
+    from process.provider_directory_generic_source_storage import HEADER
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _isolated_factory()
+    connection, _, _ = _isolated_connection(factory)
+    monkeypatch.setattr(directory, "_schema", lambda: "catalog_schema")
+    async with _callable_binding(factory, connection):
+        query = directory._locked_endpoint_verification_state_sql(directory._qt("catalog_schema", HEADER))
+    assert f'"source_schema"."{HEADER}"' in query
+    assert "provider_directory_cms_npd_stale_candidate" not in query
+    for name in (
+        "provider_directory_subset_content_proof_valid",
+        "provider_directory_subset_canonical_sha256",
+        "provider_directory_endpoint_dataset_admission_metadata_sha256",
+    ):
+        assert f'"catalog_schema"."{name}"' in query
+        assert f'"source_schema"."{name}"' not in query
+
+
+@pytest.mark.asyncio
+async def test_cms_dispositions_remain_scoped_to_shared_headers(custody):
+    from process.provider_directory_cms_npd_recovery import candidate_available_sql
+    from process.provider_directory_generic_source_storage import HEADER
+
+    factory = _isolated_factory()
+    connection, _, _ = _isolated_connection(factory)
+    canonical, private = f'"catalog_schema"."{HEADER}"', f'"source_schema"."{HEADER}"'
+    legacy_predicate = candidate_available_sql("dataset", "catalog_schema", dataset_relation=canonical)
+    assert '"catalog_schema"."provider_directory_cms_npd_stale_candidate"' in legacy_predicate
+    async with policy.bind_generic_source_transaction_factory(factory):
+        with pytest.raises(GenericCandidateError, match="isolated_transaction_required"):
+            candidate_available_sql("dataset", "catalog_schema", dataset_relation=private)
+    async with _callable_binding(factory, connection):
+        assert candidate_available_sql("dataset", "catalog_schema", dataset_relation=private) == "TRUE"
+        assert candidate_available_sql("dataset", "catalog_schema", dataset_relation=canonical) == legacy_predicate
+        assert candidate_available_sql("dataset", "catalog_schema", dataset_relation='"other"."header"') == legacy_predicate
+        assert candidate_available_sql("dataset", "catalog_schema") == legacy_predicate
+        with pytest.raises(GenericCandidateError, match="schema_changed"):
+            candidate_available_sql("dataset", "wrong_schema", dataset_relation=private)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["private", "changed", "whitespace", "immutable", "legacy"])
+async def test_validation_preserves_private_predecessor_and_legacy_current_fence(monkeypatch, custody, case):
+    from importlib import import_module
+
+    directory = import_module("process.provider_directory_fhir")
+    candidate = directory.EndpointDatasetCandidate(
+        endpoint_id="endpoint", dataset_id="candidate", acquisition_root_run_id="run",
+        source_ids=("source",), selected_resources=("Location",), expected_resources=("Location",),
+        import_run_id="run", previous_dataset_id="incumbent", semantic_projection_as_of="2026-01-01",
+    )
+    locked_by_field = {
+        "acquisition_root_run_id": "run", "is_current": False,
+        "status": directory.ENDPOINT_DATASET_PUBLISHED if case == "immutable" else directory.ENDPOINT_DATASET_ACQUIRING,
+        "previous_dataset_id": {"changed": "other", "whitespace": " incumbent "}.get(case, "incumbent"),
+        "publication_metadata_json": directory._endpoint_dataset_candidate_metadata(candidate),
+    }
+    lock_candidate = AsyncMock(return_value=locked_by_field)
+    lock_current = AsyncMock(return_value="incumbent")
+    monkeypatch.setattr(directory, "_locked_endpoint_dataset_candidate_record", lock_candidate)
+    monkeypatch.setattr(directory, "_locked_current_endpoint_dataset_id", lock_current)
+    factory = _identity_factory() if case == "legacy" else _isolated_factory()
+    connection, _ = _connection()
+    if case != "legacy":
+        connection, _, _ = _isolated_connection(factory)
+    async with _callable_binding(factory, connection):
+        if case in {"changed", "whitespace", "immutable"}:
+            expected = "candidate_stale" if case == "immutable" else "current_changed"
+            with pytest.raises(RuntimeError, match=expected):
+                await directory._lock_endpoint_dataset_for_validation(connection, candidate)
+        else:
+            assert await directory._lock_endpoint_dataset_for_validation(connection, candidate) == "incumbent"
+    lock_candidate.assert_awaited_once_with(connection, candidate)
+    assert lock_current.await_count == (1 if case == "legacy" else 0)
+
+
+def _isolated_connection(factory):
+    connection, transitions = _connection()
+    native_by_field = {
+        key: getattr(factory.storage_binding, key)
+        for key in ("database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid")
+    }
+    connection.fetchrow = AsyncMock(
+        side_effect=lambda query, *args: (
+            native_by_field
+            if query.startswith("SELECT d.oid")
+            else {"session": "source_publisher", "current": "source_publisher"}
+        )
+    )
+    return connection, native_by_field, transitions
+
+
+@pytest.mark.asyncio
+async def test_isolated_binding_is_same_original_factory_object_before_routing(custody):
+    factory = _isolated_factory()
+    connection, _, _ = _isolated_connection(factory)
+    async with _callable_binding(factory, connection):
+        publisher = policy.bound_publisher()
+        assert publisher.storage_binding is factory.storage_binding
+        assert isolated.storage_document(publisher)["producer"] == list(factory.producer_identity)
+        factory.source_storage_binding.assert_awaited_once_with(connection, factory.policy)
+        owner_token = policy._OWNER.set((publisher, object()))
+        try:
+            await policy._bind_isolated_storage(publisher)
+        finally:
+            policy._OWNER.reset(owner_token)
+        assert factory.source_storage_binding.await_count == 2
+    assert policy._PUBLISHER.get() is None and policy._FACTORY.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [None, "canonical_schema", "native_owner"])
+async def test_isolated_startup_recaptures_storage_and_never_issues_legacy_ddl(custody, monkeypatch, changed):
+    from importlib import import_module
+    from process import provider_directory_generic_source_adapters as adapters
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _isolated_factory()
+    connection, native_by_field, _ = _isolated_connection(factory)
+
+    @asynccontextmanager
+    async def original_transaction(database):
+        assert policy.bound_publisher().connection is connection
+        yield
+
+    monkeypatch.setattr(adapters, "source_transaction", original_transaction)
+    monkeypatch.setattr(directory, "_schema", lambda: "wrong_catalog" if changed == "canonical_schema" else "catalog_schema")
+    legacy_probe = AsyncMock(side_effect=AssertionError("legacy schema mutation path reached"))
+    monkeypatch.setattr(directory, "_is_table_present", legacy_probe)
+    async with _callable_binding(factory, connection):
+        if changed == "native_owner":
+            native_by_field["owner_oid"] += 1
+        if changed:
+            with pytest.raises(GenericCandidateError, match="schema_changed|storage_identity_changed"):
+                await directory._ensure_provider_directory_tables()
+        else:
+            await directory._ensure_provider_directory_tables()
+            assert factory.source_storage_binding.await_count == 2
+    legacy_probe.assert_not_awaited()
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field", ["database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid"]
+)
+async def test_isolated_coordinate_substitution_refuses_before_body(custody, field):
+    factory = _isolated_factory()
+    connection, native_by_field, _ = _isolated_connection(factory)
+    native_by_field[field] += 1
+    with pytest.raises(GenericCandidateError, match="storage_identity_changed"):
+        async with _callable_binding(factory, connection):
+            pytest.fail("substituted native identity reached the caller")
+    connection.execute.assert_not_awaited()
+    assert policy._PUBLISHER.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["missing", "copy", "factory", "binding"])
+async def test_isolated_binding_requires_original_factory_and_identity_after_await(custody, changed):
+    from dataclasses import replace
+
+    factory = _isolated_factory()
+    connection, _, _ = _isolated_connection(factory)
+    previous_factory = policy._FACTORY.get()
+    issued = factory.storage_binding
+    if changed == "missing":
+        del factory.source_storage_binding
+    else:
+
+        async def capture(*args):
+            if changed == "factory":
+                policy._FACTORY.set(_isolated_factory())
+            if changed == "binding":
+                factory.storage_binding = replace(issued)
+            await asyncio.sleep(0)
+            return replace(issued) if changed == "copy" else issued
+
+        factory.source_storage_binding = capture
+    try:
+        with pytest.raises(GenericCandidateError, match="storage_factory"):
+            async with _callable_binding(factory, connection):
+                pytest.fail("unissued storage reached the caller")
+    finally:
+        policy._FACTORY.set(previous_factory)
+    assert not any(call.args[0].startswith("SELECT d.oid") for call in connection.fetchrow.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_isolated_relation_routing_preserves_catalog_and_refuses_unverified_overrides(custody):
+    from importlib import import_module
+    from process.provider_directory_generic_source_storage import HEADER, RELATIONS
+    from process.provider_directory_proof_store import _proof_relation, PROVIDER_DIRECTORY_PROOF_SHARD_TABLE
+    from process.provider_directory_source_checkpoint_catalog import CHECKPOINT_LAYOUTS
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _isolated_factory()
+    connection, _, _ = _isolated_connection(factory)
+    async with _callable_binding(factory, connection):
+        assert directory._qt("catalog_schema", HEADER) == f'"source_schema"."{HEADER}"'
+        assert _proof_relation("catalog_schema") == f'"source_schema"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"'
+        for root in CHECKPOINT_LAYOUTS:
+            assert directory._qt("catalog_schema", root) == f'"source_schema"."{root}"'
+            with pytest.raises(GenericCandidateError, match="isolated_header_override_changed"):
+                isolated.source_relation_coordinates("catalog_schema", root, "other")
+        with pytest.raises(GenericCandidateError, match="isolated_header_override_changed"):
+            isolated.source_relation_coordinates("catalog_schema", PROVIDER_DIRECTORY_PROOF_SHARD_TABLE, "other")
+        assert directory._qt("catalog_schema", "provider_directory_source") == (
+            '"catalog_schema"."provider_directory_source"'
+        )
+        with pytest.raises(GenericCandidateError, match="schema_changed"):
+            directory._qt("source_schema", HEADER)
+        with pytest.raises(GenericCandidateError, match="isolated_relation_unsupported"):
+            directory._qt("catalog_schema", "provider_directory_resource_identity")
+        with pytest.raises(GenericCandidateError, match="isolated_relation_override_changed"):
+            directory._qt("catalog_schema", RELATIONS[0])
+        with directory._provider_directory_artifact_relation_scope({RELATIONS[0]: "other_heap"}):
+            with pytest.raises(GenericCandidateError, match="isolated_relation_override_changed"):
+                directory._qt("catalog_schema", RELATIONS[0])
+        tables_by_root = {root: "pdgs_" + "a" * 32 + "_" + str(index) for index, root in enumerate(RELATIONS)}
+        with isolated.isolated_source_relation_scope(policy.bound_publisher(), tables_by_root):
+            with pytest.raises(GenericCandidateError, match="isolated_relation_override_changed"):
+                directory._qt("catalog_schema", RELATIONS[0])
+            with directory._provider_directory_artifact_relation_scope(tables_by_root):
+                assert (
+                    directory._qt("catalog_schema", RELATIONS[0]) == f'"source_schema"."{tables_by_root[RELATIONS[0]]}"'
+                )
+        with directory._provider_directory_artifact_relation_scope({"provider_directory_source": "other_source"}):
+            with pytest.raises(GenericCandidateError, match="catalog_override_forbidden"):
+                directory._qt("catalog_schema", "provider_directory_source")
+
+
+@pytest.mark.asyncio
+async def test_isolated_routing_refuses_unbound_or_inherited_transaction_and_publication(custody):
+    factory = _isolated_factory()
+    connection, _, _ = _isolated_connection(factory)
+    factory.publication_session_factory = AsyncMock()
+    async with policy.bind_generic_source_transaction_factory(factory):
+        assert isolated.source_relation_coordinates("catalog_schema", "import_run", "import_run") == (
+            "catalog_schema", "import_run"
+        )
+        with pytest.raises(GenericCandidateError, match="isolated_transaction_required"):
+            isolated.source_relation_coordinates(
+                "catalog_schema", "provider_directory_endpoint_dataset", "provider_directory_endpoint_dataset"
+            )
+        with pytest.raises(GenericCandidateError, match="isolated_activation_unavailable"):
+            await policy.source_publication_sessions()
+        async with policy.bind_generic_source_publisher(
+            connection, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
+        ):
+
+            async def child():
+                with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
+                    policy.current_source_storage_binding()
+
+            await asyncio.create_task(child())
+            with pytest.raises(GenericCandidateError, match="isolated_activation_unavailable"):
+                await policy._publication_origin(object())
+    factory.publication_session_factory.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("storage_schema", "catalog_schema"),
+        ("storage_schema", "pg_private"),
+        ("database_oid", True),
+        ("storage_schema_oid", 20),
+        ("owner_oid", 0),
+        ("namespace_owner_oid", True),
+        ("namespace_owner_oid", 100),
+        ("enrollment_sha256", "x" * 64),
+    ],
+)
+def test_isolated_binding_refuses_ambiguous_or_non_native_coordinates(field, value):
+    from dataclasses import replace
+
+    with pytest.raises(GenericCandidateError):
+        replace(_isolated_factory().storage_binding, **{field: value})
+
+
+def test_legacy_policy_serialization_and_unbound_routing_remain_exact():
+    from dataclasses import asdict
+
+    assert asdict(_policy()) == dict(
+        schema="source_schema",
+        owner_role="source_owner",
+        publisher_role="source_publisher",
+        runtime_roles=("source_reader",),
+        control_runtime_roles=(),
+    )
+    assert isolated.source_relation_coordinates("catalog_schema", "any_root", "legacy_stage") == (
+        "catalog_schema",
+        "legacy_stage",
+    )
 
 
 def test_source_producer_identity_requires_bound_factory():

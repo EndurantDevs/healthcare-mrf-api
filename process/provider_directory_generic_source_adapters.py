@@ -315,11 +315,16 @@ async def retain_partition_references(directory, runner, resource_type, source_r
 async def require_generic_source_layout(directory):
     """Startup/import helpers may inspect managed layout but never recreate it."""
     require_source_transaction()
-    from process.provider_directory_generic_source_policy import bound_publisher
+    from process.provider_directory_generic_source_policy import _bind_isolated_storage, bound_publisher
+    from process.provider_directory_source_storage_binding import require_storage_schema
 
     async with source_transaction(directory.db):
         publisher = bound_publisher()
         connection, policy = publisher.connection, publisher.policy
+        if publisher.storage_binding is not None:
+            require_storage_schema(publisher, directory._schema())
+            await _bind_isolated_storage(publisher)
+            return publisher.storage_binding
         _require(policy.schema == directory._schema(), "schema_changed")
         roots = [storage_relation(policy.schema, name) for name in RELATIONS]
         count = await connection.fetchval(

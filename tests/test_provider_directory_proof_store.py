@@ -384,3 +384,34 @@ async def test_published_generic_dataset_reuses_metadata_without_json_scan(
     legacy_scan.assert_not_awaited()
     assert source_summary.await_args.args[2].source_metrics == (proof.source_metrics)
     assert record_proof.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_frozen_proof_uses_exact_physical_table_and_preserves_all_shard_checks():
+    connection = _MemoryProofConnection()
+    await _persist_rows_by_resource(connection, _sample_dataset_resources())
+    expected = await _stored_proof(connection)
+    original = connection.all
+
+    async def read_frozen(query, **parameters):
+        assert '"closed_source"."frozen_proof"' in query
+        assert '"provider_directory_dataset_proof_shard"' not in query
+        return await original(query, **parameters)
+
+    connection.all = read_frozen
+    parameters = dict(
+        dataset_id=DATASET_ID, endpoint_id=ENDPOINT_ID, acquisition_root_run_id=ROOT_RUN_ID,
+        source_ids=SOURCE_IDS, selected_resources=SELECTED_RESOURCES,
+        options=proof_store.ProviderDirectoryStoredProofOptions(proof_table="frozen_proof"),
+    )
+    actual = await proof_store.build_stored_dataset_proof(connection, "closed_source", **parameters)
+    assert actual == expected
+    next(iter(connection.shards.values()))["payload_bytes"] = b"damaged"
+    with pytest.raises(ProviderDirectoryProofStoreError):
+        await proof_store.build_stored_dataset_proof(connection, "closed_source", **parameters)
+    with pytest.raises(ValueError, match="identifier_invalid"):
+        await proof_store.build_stored_dataset_proof(
+            connection, "closed_source", **{
+                **parameters, "options": proof_store.ProviderDirectoryStoredProofOptions(proof_table='wrong";SELECT 1'),
+            },
+        )

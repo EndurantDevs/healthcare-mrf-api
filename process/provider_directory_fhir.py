@@ -83,6 +83,7 @@ from db.models import (
     ProviderDirectorySourceResource,
     db,
 )
+from db.plan_release_storage import storage_relation
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_artifact_custody as profile_artifact_custody
@@ -393,6 +394,8 @@ from process.provider_directory_resource_hash import (
     resource_payload_sha256_for_contract,
 )
 from process.provider_directory_source_checkpoint_control import (
+    RELEASE_BULK_CHECKPOINT_SQL,
+    assert_bulk_checkpoint_guard_owner,
     persist_control_progress,
     require_checkpoint_executor,
     source_checkpoint_transaction,
@@ -2849,11 +2852,10 @@ def _unscoped_qt(schema: str, table: str) -> str:
 
 
 def _qt(schema: str, table: str) -> str:
-    scoped_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
-        table,
-        table,
-    )
-    return _unscoped_qt(schema, scoped_table)
+    from process.provider_directory_source_storage_binding import source_relation_coordinates
+
+    scoped_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(table, table)
+    return _unscoped_qt(*source_relation_coordinates(schema, table, scoped_table))
 
 
 def _provider_directory_index_elements_sql(model: Any, index: dict[str, Any]) -> str:
@@ -8873,10 +8875,10 @@ _PUBLISH_VALIDATED_ARTIFACT_DATASET_SQL = """
 """
 
 
-async def _publish_validated_artifact_dataset(
+def _artifact_dataset_publication_statement(
     dataset: ProviderDirectoryArtifactDataset,
-) -> None:
-    """Publish one validated artifact dataset under its immutable identity."""
+) -> tuple[str, dict[str, Any]]:
+    """Share the exact final eligibility predicate across original native transactions."""
     publish_sql = (
         _PUBLISH_VALIDATED_ARTIFACT_DATASET_SQL.replace(
             "__ENDPOINT_DATASET_TABLE__",
@@ -8891,8 +8893,7 @@ async def _publish_validated_artifact_dataset(
             _artifact_publish_eligibility_metadata_columns(),
         )
     )
-    promoted_count = await db.status(
-        publish_sql,
+    parameters_by_name = dict(
         dataset_id=dataset.dataset_id,
         endpoint_id=dataset.endpoint_id,
         evidence_run_id=dataset.evidence_run_id,
@@ -8912,6 +8913,15 @@ async def _publish_validated_artifact_dataset(
         source_summary_contract_id=SOURCE_SUMMARY_CONTRACT_ID,
         source_summary_contract_version=SOURCE_SUMMARY_CONTRACT_VERSION,
     )
+    return publish_sql, parameters_by_name
+
+
+async def _publish_validated_artifact_dataset(
+    dataset: ProviderDirectoryArtifactDataset,
+) -> None:
+    """Publish one validated artifact dataset under its immutable identity."""
+    publish_sql, parameters = _artifact_dataset_publication_statement(dataset)
+    promoted_count = await db.status(publish_sql, **parameters)
     if _coerce_rowcount(promoted_count) != 1:
         raise ProviderDirectoryArtifactBuildStale("provider_directory_endpoint_dataset_candidate_changed")
 
@@ -13464,7 +13474,7 @@ def _artifact_candidate_universe_ctes(
                               AS full_metadata_jsonb
               ) AS candidate_publication
              WHERE {metadata} IS NOT NULL
-               AND {candidate_available_sql("dataset", _schema())}
+               AND {candidate_available_sql("dataset", _schema(), dataset_relation=dataset_ref)}
                AND jsonb_typeof({source_ids}) = 'array'
                AND jsonb_array_length({safe_source_ids}) > 0
                AND ({safe_source_ids}) ?| CAST(:source_ids AS text[])
@@ -13851,7 +13861,7 @@ def _artifact_stored_content_proof_sql(
 ) -> str:
     """Bind a canonical stored content proof to one finalized subset row."""
 
-    content_proof_valid = _qt(_schema(), "provider_directory_subset_content_proof_valid")
+    content_proof_valid = storage_relation(_schema(), "provider_directory_subset_content_proof_valid")
     completion_proof = f"{dataset_alias}.completion_proof_json"
     legacy_validation = f"""
         {content_proof_valid}(
@@ -13923,7 +13933,7 @@ def _artifact_legacy_subset_proof_sql(
         "embedded_proof": stored_proof,
         "completion_proof": f"{dataset_alias}.completion_proof_json",
         "completion_sha256": f"{dataset_alias}.completion_proof_sha256",
-        "canonical_sha256_function": _qt(_schema(), "provider_directory_subset_canonical_sha256"),
+        "canonical_sha256_function": storage_relation(_schema(), "provider_directory_subset_canonical_sha256"),
         "replay_evidence": (f"{metadata} -> '{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY}'"),
         "replay_sha256": (f"{metadata} ->> '{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY}'"),
         "coverage": f"{metadata} -> '{SERVER_ISSUED_SUBSET_COVERAGE_KEY}'",
@@ -14083,7 +14093,7 @@ def _artifact_subset_parent_proof_sql(
         "embedded_proof": embedded_proof,
         "completion_proof": f"{dataset_alias}.completion_proof_json",
         "completion_sha256": f"{dataset_alias}.completion_proof_sha256",
-        "canonical_sha256_function": _qt(_schema(), "provider_directory_subset_canonical_sha256"),
+        "canonical_sha256_function": storage_relation(_schema(), "provider_directory_subset_canonical_sha256"),
         "replay_evidence": (f"{metadata} -> '{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_KEY}'"),
         "replay_sha256": (f"{metadata} ->> '{SERVER_ISSUED_SUBSET_REPLAY_EVIDENCE_SHA256_KEY}'"),
         "coverage": f"{metadata} -> '{SERVER_ISSUED_SUBSET_COVERAGE_KEY}'",
@@ -15354,7 +15364,7 @@ def _artifact_publication_metadata_hash_sql(metadata: str) -> str:
 
     if is_source_storage_required():
         return "NULL::text"
-    metadata_hash = _qt(_schema(), "provider_directory_subset_payload_sha256")
+    metadata_hash = storage_relation(_schema(), "provider_directory_subset_payload_sha256")
     return f"{metadata_hash}({metadata})"
 
 
@@ -15369,7 +15379,7 @@ def _artifact_legacy_content_proof_valid_sql(
 ) -> str:
     """Validate one legacy proof entirely inside PostgreSQL."""
 
-    legacy_validator = _qt(_schema(), "provider_directory_subset_content_proof_valid")
+    legacy_validator = storage_relation(_schema(), "provider_directory_subset_content_proof_valid")
     expected_source_ids = _artifact_normalized_text_scope_sql(f"{metadata} -> 'source_ids'")
     expected_selected_resources = _artifact_normalized_text_scope_sql(
         selected_resources or f"{metadata} -> 'selected_resources'"
@@ -15422,7 +15432,7 @@ def _artifact_normalized_text_scope_sql(raw_scope: str) -> str:
 def _artifact_semantic_legacy_proof_sql(proof: str) -> str:
     """Project semantic proof bytes into the deployed shard validator shape."""
 
-    canonical_sha256 = _qt(_schema(), "provider_directory_subset_canonical_sha256")
+    canonical_sha256 = storage_relation(_schema(), "provider_directory_subset_canonical_sha256")
     legacy_unsigned = f"""
         (
             {proof} - ARRAY[
@@ -15501,7 +15511,7 @@ def _artifact_semantic_content_proof_valid_sql(
 ) -> str:
     """Validate one semantic proof entirely inside PostgreSQL."""
 
-    canonical_sha256 = _qt(_schema(), "provider_directory_subset_canonical_sha256")
+    canonical_sha256 = storage_relation(_schema(), "provider_directory_subset_canonical_sha256")
     legacy_proof = _artifact_semantic_legacy_proof_sql(proof)
     full_shards_valid = _artifact_legacy_content_proof_valid_sql(
         metadata,
@@ -15593,7 +15603,7 @@ def _artifact_admission_seal_shape_valid_sql(
 ) -> str:
     """Return the complete fixed-size receipt predicate for either kind."""
 
-    digest_function = _qt(
+    digest_function = storage_relation(
         _schema(),
         "provider_directory_endpoint_dataset_admission_metadata_sha256",
     )
@@ -16091,7 +16101,7 @@ def _artifact_dataset_options_cte(
          FROM {dataset_ref} AS dataset
           {publication_lateral}
           {candidate_lateral}
-         WHERE {endpoint_scope}{candidate_available_sql("dataset", _schema())} AND (
+         WHERE {endpoint_scope}{candidate_available_sql("dataset", _schema(), dataset_relation=dataset_ref)} AND (
             (
                     dataset.is_current = true
                 AND dataset.status = :published_status
@@ -20184,7 +20194,7 @@ async def _assert_reviewed_activation_ready(
     if (
         await executor.scalar(
             "SELECT "
-            + _qt(
+            + storage_relation(
                 _schema(),
                 "provider_directory_reviewed_subset_activation_valid",
             )
@@ -22851,7 +22861,7 @@ async def _record_current_dataset_publication_proof(
         _schema(),
         ProviderDirectoryEndpointDataset.__tablename__,
     )
-    metadata_digest = _qt(
+    metadata_digest = storage_relation(
         _schema(),
         "provider_directory_endpoint_dataset_admission_metadata_sha256",
     )
@@ -37521,10 +37531,27 @@ async def _is_address_corroboration_published(
     return True
 
 
+async def _prepare_provider_directory_job_tables(ctx, profile_execution) -> None:
+    """Profile reads existing canonical inputs; acquisition still requires its Source binding."""
+    from process.provider_directory_generic_source_policy import is_source_storage_required
+
+    if ctx["context"].get("provider_directory_tables_ready"):
+        return
+    if profile_execution is not None and not is_source_storage_required():
+        for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
+            columns = ",".join(_q(str(column.name)) for column in model.__table__.columns)
+            await db.all(f"SELECT {columns} FROM {_qt(_schema(), model.__tablename__)} LIMIT 0")
+        # Profile's signed admission verifies physical layouts; never mark acquisition preflight complete here.
+        return
+    await _ensure_provider_directory_tables()
+    ctx["context"]["provider_directory_tables_ready"] = True
+
+
 async def _ensure_provider_directory_tables() -> None:
     from process.provider_directory_generic_source_adapters import require_generic_source_layout
 
-    await require_generic_source_layout(sys.modules[__name__])
+    if await require_generic_source_layout(sys.modules[__name__]) is not None:
+        return
     schema = _schema()
     if not await _is_table_present(schema, SOURCE_MODELS[0].__tablename__):
         if not getattr(SOURCE_MODELS[0], "__runtime_schema_sync__", True):
@@ -38640,7 +38667,14 @@ async def _copy_mark_resource_rows_seen(
 
 
 async def _clear_resource_rows_seen(run_id: str | None) -> int:
+    """Retire legacy seen rows; detached snapshots never write that shared ledger."""
     if not run_id:
+        return 0
+    from process.provider_directory_generic_source_policy import _FACTORY
+
+    factory = _FACTORY.get()
+    if getattr(factory, "storage_binding", None) is not None:
+        factory._require_current_policy()
         return 0
     return int(
         await db.status(
@@ -43309,30 +43343,7 @@ async def _assert_bulk_checkpoint_guard_owner(
     identity: BulkExportCheckpointIdentity,
 ) -> None:
     """Fail before a write when the guard connection or owner is lost."""
-    try:
-        is_owner = await autocommit_connection.scalar(
-            db.text(
-                f"""
-                SELECT EXISTS (
-                    SELECT 1
-                      FROM {_bulk_acquisition_checkpoint_table_ref()}
-                     WHERE checkpoint_id = :checkpoint_id
-                       AND owner_run_id = :owner_run_id
-                       AND state NOT IN (:complete_state, :failed_state)
-                );
-                """
-            ),
-            {
-                "checkpoint_id": identity.checkpoint_id,
-                "owner_run_id": identity.owner_run_id,
-                "complete_state": BULK_EXPORT_CHECKPOINT_COMPLETE,
-                "failed_state": BULK_EXPORT_CHECKPOINT_FAILED,
-            },
-        )
-    except Exception as exc:
-        raise RuntimeError("bulk_export_checkpoint_worker_guard_lost") from exc
-    if is_owner is not True:
-        raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+    await assert_bulk_checkpoint_guard_owner(sys.modules[__name__], autocommit_connection, identity)
 
 
 @contextlib.asynccontextmanager
@@ -44710,21 +44721,22 @@ def _bulk_checkpoint_status_url(checkpoint: dict[str, Any]) -> str | None:
 async def _load_bulk_export_checkpoint(
     identity: BulkExportCheckpointIdentity,
 ) -> dict[str, Any]:
-    checkpoint_row = await db.first(
-        f"""
-        SELECT checkpoint_id, canonical_api_base, resource_type,
-               source_scope_hash, strategy_version, acquisition_root_run_id,
-               owner_run_id, retry_of_run_id, endpoint_id, dataset_id,
-               start_url_hash, status_url_ciphertext, status_url_hash,
-               manifest_hash, manifest_ciphertext, manifest_json, state,
-               rows_written, error, lease_expires_at, created_at,
-               accepted_at, last_polled_at, next_poll_at, manifest_received_at,
-               completed_at, failed_at, updated_at
-          FROM {_bulk_acquisition_checkpoint_table_ref()}
-         WHERE checkpoint_id = :checkpoint_id;
-        """,
-        checkpoint_id=identity.checkpoint_id,
-    )
+    async with profile_scope_copy.source_read_transaction(sys.modules[__name__]):
+        checkpoint_row = await db.first(
+            f"""
+            SELECT checkpoint_id, canonical_api_base, resource_type,
+                   source_scope_hash, strategy_version, acquisition_root_run_id,
+                   owner_run_id, retry_of_run_id, endpoint_id, dataset_id,
+                   start_url_hash, status_url_ciphertext, status_url_hash,
+                   manifest_hash, manifest_ciphertext, manifest_json, state,
+                   rows_written, error, lease_expires_at, created_at,
+                   accepted_at, last_polled_at, next_poll_at, manifest_received_at,
+                   completed_at, failed_at, updated_at
+              FROM {_bulk_acquisition_checkpoint_table_ref()}
+             WHERE checkpoint_id = :checkpoint_id;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+        )
     checkpoint = _pagination_checkpoint_row_mapping(checkpoint_row)
     if not checkpoint:
         return {}
@@ -44841,13 +44853,9 @@ async def _release_bulk_export_reservation(
         bulk_identity=identity,
     ):
         await db.status(
-            f"""
-            DELETE FROM {_bulk_acquisition_checkpoint_table_ref()}
-             WHERE checkpoint_id = :checkpoint_id
-               AND state = :state
-               AND status_url_ciphertext IS NULL
-               AND manifest_hash IS NULL;
-            """,
+            RELEASE_BULK_CHECKPOINT_SQL.format(
+                acquisition=_bulk_acquisition_checkpoint_table_ref(), output=_bulk_output_checkpoint_table_ref()
+            ),
             checkpoint_id=identity.checkpoint_id,
             state=BULK_EXPORT_CHECKPOINT_STARTING,
         )
@@ -45319,20 +45327,21 @@ async def _persist_bulk_export_manifest(
 async def _load_bulk_output_checkpoints(
     checkpoint_id: str,
 ) -> list[dict[str, Any]]:
-    output_rows = await db.all(
-        f"""
-        SELECT checkpoint_id, output_id, output_index, resource_type,
-               output_url_ciphertext, output_url_hash, state, rows_written,
-               content_length_bytes, etag_ciphertext, etag_hash,
-               committed_bytes, output_expires_at, validator_checked_at,
-               attempt_count, error, last_error, last_error_at,
-               started_at, completed_at, updated_at
-          FROM {_bulk_output_checkpoint_table_ref()}
-         WHERE checkpoint_id = :checkpoint_id
-         ORDER BY output_index;
-        """,
-        checkpoint_id=checkpoint_id,
-    )
+    async with profile_scope_copy.source_read_transaction(sys.modules[__name__]):
+        output_rows = await db.all(
+            f"""
+            SELECT checkpoint_id, output_id, output_index, resource_type,
+                   output_url_ciphertext, output_url_hash, state, rows_written,
+                   content_length_bytes, etag_ciphertext, etag_hash,
+                   committed_bytes, output_expires_at, validator_checked_at,
+                   attempt_count, error, last_error, last_error_at,
+                   started_at, completed_at, updated_at
+              FROM {_bulk_output_checkpoint_table_ref()}
+             WHERE checkpoint_id = :checkpoint_id
+             ORDER BY output_index;
+            """,
+            checkpoint_id=checkpoint_id,
+        )
     return [_pagination_checkpoint_row_mapping(row) for row in output_rows]
 
 
@@ -49751,7 +49760,9 @@ async def _save_last_updated_partition_plan(
     database_connection: Any | None = None,
 ) -> None:
     """Save planner and census state under the acquired checkpoint owner."""
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db, schema=_schema(), dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
         is_complete = _is_last_updated_partition_census_complete(census) and (plan.status is PlanStatus.SUCCEEDED)
         checkpoint_by_field = {
             "checkpoint_payload": _last_updated_partition_checkpoint_payload(
@@ -59007,39 +59018,41 @@ async def _checkpoint_candidate_dataset_id(
     if context is None or not context.acquisition_root_run_id:
         return None
     expected_owner_run_id = context.retry_of_run_id or context.owner_run_id
-    checkpoint_row = await db.first(
-        _checkpoint_candidate_dataset_sql(),
-        canonical_api_base=context.canonical_api_base,
-        source_scope_hash=context.source_scope_hash,
-        acquisition_root_run_id=context.acquisition_root_run_id,
-        expected_owner_run_id=expected_owner_run_id,
-        allow_ancestor_owner=context.retry_of_run_id is not None,
-        endpoint_id=endpoint_id,
-        resumable_statuses=[
-            ENDPOINT_DATASET_ACQUIRING,
-            ENDPOINT_DATASET_INCOMPLETE,
-            ENDPOINT_DATASET_FAILED,
-            ENDPOINT_DATASET_VALIDATED,
-        ],
-        selected_resources=json.dumps(selected_resources),
-    )
+    async with profile_scope_copy.source_read_transaction(sys.modules[__name__]):
+        checkpoint_row = await db.first(
+            _checkpoint_candidate_dataset_sql(),
+            canonical_api_base=context.canonical_api_base,
+            source_scope_hash=context.source_scope_hash,
+            acquisition_root_run_id=context.acquisition_root_run_id,
+            expected_owner_run_id=expected_owner_run_id,
+            allow_ancestor_owner=context.retry_of_run_id is not None,
+            endpoint_id=endpoint_id,
+            resumable_statuses=[
+                ENDPOINT_DATASET_ACQUIRING,
+                ENDPOINT_DATASET_INCOMPLETE,
+                ENDPOINT_DATASET_FAILED,
+                ENDPOINT_DATASET_VALIDATED,
+            ],
+            selected_resources=json.dumps(selected_resources),
+        )
     return _clean_text(_pagination_checkpoint_row_mapping(checkpoint_row).get("dataset_id"))
 
 
 async def _endpoint_dataset_state(dataset_id: str) -> dict[str, Any]:
-    row = await db.first(
-        f"""
-        SELECT dataset_id, endpoint_id, import_run_id,
-               acquisition_root_run_id, status,
-               is_current, previous_dataset_id, dataset_hash, resource_count,
-               validated_at, published_at,
-               publication_metadata_json, completion_proof_required_version,
-               completion_proof_json, completion_proof_sha256
-          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
-         WHERE dataset_id = :dataset_id;
-        """,
-        dataset_id=dataset_id,
-    )
+    async with profile_scope_copy.source_read_transaction(sys.modules[__name__]):
+        row = await db.first(
+            f"""
+            SELECT dataset_id, endpoint_id, import_run_id,
+                   acquisition_root_run_id, status,
+                   is_current, previous_dataset_id, dataset_hash, resource_count,
+                   validated_at, published_at,
+                   publication_metadata_json, completion_proof_required_version,
+                   completion_proof_json, completion_proof_sha256
+              FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+             WHERE dataset_id = :dataset_id;
+            """,
+            dataset_id=dataset_id,
+        )
     return _pagination_checkpoint_row_mapping(row)
 
 
@@ -59185,10 +59198,23 @@ async def _current_endpoint_dataset_id(
     *,
     exclude_dataset_id: str,
 ) -> str | None:
-    row = await db.first(
+    """Read the serving predecessor through the ordinary catalog credentials."""
+    from process.provider_directory_generic_source_policy import _FACTORY
+
+    factory = _FACTORY.get()
+    binding = getattr(factory, "storage_binding", None)
+    if binding is None:
+        relation = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
+    else:
+        factory._require_current_policy()
+        if _schema() != binding.catalog_schema or db._transaction_binding() is not None:
+            raise RuntimeError("provider_directory_predecessor_catalog_reader_required")
+        # The private header contains candidates, not the incumbent serving generation.
+        relation = storage_relation(binding.catalog_schema, ProviderDirectoryEndpointDataset.__tablename__)
+    predecessor = await db.first(
         f"""
         SELECT dataset_id
-          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
+          FROM {relation}
          WHERE endpoint_id = :endpoint_id
            AND is_current = true
            AND dataset_id <> :exclude_dataset_id
@@ -59197,7 +59223,9 @@ async def _current_endpoint_dataset_id(
         endpoint_id=endpoint_id,
         exclude_dataset_id=exclude_dataset_id,
     )
-    return _clean_text(_pagination_checkpoint_row_mapping(row).get("dataset_id"))
+    if binding is not None:
+        factory._require_current_policy()
+    return _clean_text(_pagination_checkpoint_row_mapping(predecessor).get("dataset_id"))
 
 
 async def _assert_locked_endpoint_candidate(
@@ -60046,7 +60074,7 @@ def _locked_endpoint_verification_state_sql(dataset_ref: str) -> str:
           FROM {dataset_ref} AS dataset
          WHERE dataset.endpoint_id = :endpoint_id
            AND dataset.dataset_id <> :dataset_id
-           AND {candidate_available_sql("dataset", _schema())}
+           AND {candidate_available_sql("dataset", _schema(), dataset_relation=dataset_ref)}
            AND ({state_filter_sql})
          ORDER BY CASE
                     WHEN dataset.status = :verification_baseline_status
@@ -61838,23 +61866,24 @@ async def _fetch_pagination_checkpoint(
     context: PaginationCheckpointContext,
     resource_type: str,
 ) -> dict[str, Any]:
-    checkpoint_row = await db.first(
-        f"""
-        SELECT dataset_id, source_ids, acquisition_root_run_id, owner_run_id,
-               retry_of_run_id, start_url_hash, next_url, state,
-               pages_processed, rows_processed, recent_cursor_hashes,
-               completeness_json
-          FROM {_pagination_checkpoint_table_ref()}
-         WHERE canonical_api_base = :canonical_api_base
-           AND resource_type = :resource_type
-           AND source_scope_hash = :source_scope_hash
-           AND acquisition_root_run_id = :acquisition_root_run_id;
-        """,
-        canonical_api_base=context.canonical_api_base,
-        resource_type=resource_type,
-        source_scope_hash=context.source_scope_hash,
-        acquisition_root_run_id=context.acquisition_root_run_id,
-    )
+    async with profile_scope_copy.source_read_transaction(sys.modules[__name__]):
+        checkpoint_row = await db.first(
+            f"""
+            SELECT dataset_id, source_ids, acquisition_root_run_id, owner_run_id,
+                   retry_of_run_id, start_url_hash, next_url, state,
+                   pages_processed, rows_processed, recent_cursor_hashes,
+                   completeness_json
+              FROM {_pagination_checkpoint_table_ref()}
+             WHERE canonical_api_base = :canonical_api_base
+               AND resource_type = :resource_type
+               AND source_scope_hash = :source_scope_hash
+               AND acquisition_root_run_id = :acquisition_root_run_id;
+            """,
+            canonical_api_base=context.canonical_api_base,
+            resource_type=resource_type,
+            source_scope_hash=context.source_scope_hash,
+            acquisition_root_run_id=context.acquisition_root_run_id,
+        )
     return _pagination_checkpoint_row_mapping(checkpoint_row)
 
 
@@ -61979,7 +62008,9 @@ async def _adopt_pagination_checkpoint_owner(
     start_url_hash: str,
 ) -> PaginationResumeState:
     """Atomically adopt the exact resume cursor observed by this retry."""
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db, schema=_schema(), dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
         is_direct_predecessor = context.retry_of_run_id == previous_owner_run_id
         is_verified_ancestor = bool(context.lineage_verified and context.dataset_id)
         if not (is_direct_predecessor or is_verified_ancestor):
@@ -62084,7 +62115,9 @@ async def _reset_pagination_checkpoint(
     *,
     database_connection: Any | None = None,
 ) -> None:
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db, schema=_schema(), dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
         from process.provider_directory_generic_source_policy import source_transaction
 
         async with source_transaction(db):
@@ -62167,7 +62200,9 @@ async def _restart_empty_pagination_checkpoint(
     checkpoint: dict[str, Any],
 ) -> None:
     """Restart an unchanged zero-progress checkpoint and clear it atomically."""
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db, schema=_schema(), dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
         observed_checkpoint_params = _pagination_checkpoint_observation_params(checkpoint)
         async with db.acquire() as connection:
             restarted_count = await connection.status(
@@ -62211,7 +62246,9 @@ async def _load_or_initialize_pagination_checkpoint(
     allow_terminal_census_restart: bool = False,
 ) -> PaginationResumeState:
     """Resume verified lineage and replace only a direct-retry drifted slice."""
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db, schema=_schema(), dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
         start_url_hash = hashlib.sha256(start_url.encode("utf-8")).hexdigest()
         checkpoint = await _fetch_pagination_checkpoint(context, resource_type)
         resume_state = _compatible_pagination_resume_state(
@@ -62273,7 +62310,9 @@ async def _save_pagination_checkpoint(
     recent_url_hashes: list[str],
     completeness: dict[str, Any] | None = None,
 ) -> None:
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db, schema=_schema(), dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
         bounded_hashes = recent_url_hashes[-PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:]
         is_complete = next_url is None
         updated = await db.status(
@@ -62320,7 +62359,9 @@ async def _save_pagination_checkpoint_completeness(
     resource_type: str,
     completeness: dict[str, Any],
 ) -> None:
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db, schema=_schema(), dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
         updated = await db.status(
             f"""
             UPDATE {_pagination_checkpoint_table_ref()}
@@ -62347,7 +62388,9 @@ async def _clear_pagination_checkpoints(
     context: PaginationCheckpointContext,
     resource_types: list[str],
 ) -> int:
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db, schema=_schema(), dataset_ids=(context.dataset_id,), root_run_ids=(context.acquisition_root_run_id,)
+    ):
         if not resource_types:
             return 0
         deleted = await db.status(
@@ -64239,6 +64282,7 @@ def _endpoint_dataset_hash_page_sql(
     has_cursor: bool,
     *,
     include_payload_json: bool = False,
+    resource_relation: tuple[str, str] | None = None,
 ) -> str:
     cursor_filter = ""
     if has_cursor:
@@ -64248,9 +64292,13 @@ def _endpoint_dataset_hash_page_sql(
            )
         """
     payload_projection = ", payload_json, acquired_resource_sha256" if include_payload_json else ""
+    relation = (
+        _qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)
+        if resource_relation is None else storage_relation(*resource_relation)
+    )
     return f"""
         SELECT resource_type, resource_id, payload_hash{payload_projection}
-          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+          FROM {relation}
          WHERE dataset_id = :dataset_id
            AND resource_type NOT LIKE 'LU:%:pass:%'
            {cursor_filter}
@@ -64266,6 +64314,7 @@ async def _endpoint_dataset_content_proof(
     *,
     verify_payload_hashes: bool = False,
     resource_hash_contract: str | None = None,
+    resource_relation: tuple[str, str] | None = None,
 ) -> EndpointDatasetContentProof:
     """Hash an ordered dataset and each resource family with bounded pages."""
     content_hash = hashlib.sha256()
@@ -64283,6 +64332,7 @@ async def _endpoint_dataset_content_proof(
             after_resource_type,
             after_resource_id,
             include_payload_json=verify_payload_hashes,
+            **({"resource_relation": resource_relation} if resource_relation is not None else {}),
         )
         if not resource_rows:
             break
@@ -64322,6 +64372,7 @@ async def _endpoint_dataset_content_page(
     after_resource_id: str | None,
     *,
     include_payload_json: bool,
+    resource_relation: tuple[str, str] | None = None,
 ) -> list[Any]:
     """Read one stable ordered page for the immutable content proof."""
     query_params_by_name: dict[str, Any] = {
@@ -64338,6 +64389,7 @@ async def _endpoint_dataset_content_page(
         _endpoint_dataset_hash_page_sql(
             has_cursor,
             include_payload_json=include_payload_json,
+            resource_relation=resource_relation,
         ),
         **query_params_by_name,
     )
@@ -64576,6 +64628,8 @@ async def _subset_acquired_resource_hashes(
     connection: Any,
     candidate: EndpointDatasetCandidate,
     expected_count_by_type: dict[str, int],
+    *,
+    resource_relation: tuple[str, str] | None = None,
 ) -> dict[str, str]:
     """Hash ordered raw-resource digests without retaining private transport data."""
 
@@ -64597,7 +64651,7 @@ async def _subset_acquired_resource_hashes(
                 after_resource_id=after_resource_id,
             )
         acquired_resource_rows = await connection.all(
-            _subset_acquired_page_sql(has_cursor),
+            _subset_acquired_page_sql(has_cursor, resource_relation=resource_relation),
             **query_params_by_name,
         )
         if not acquired_resource_rows:
@@ -64648,7 +64702,7 @@ def _update_subset_acquired_hash(
     return raw_resource_type, raw_resource_id
 
 
-def _subset_acquired_page_sql(has_cursor: bool) -> str:
+def _subset_acquired_page_sql(has_cursor: bool, *, resource_relation: tuple[str, str] | None = None) -> str:
     """Render one bounded composite-key page for acquired digests."""
 
     cursor_filter = (
@@ -64659,10 +64713,14 @@ def _subset_acquired_page_sql(has_cursor: bool) -> str:
         if has_cursor
         else ""
     )
+    relation = (
+        _qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)
+        if resource_relation is None else storage_relation(*resource_relation)
+    )
     return f"""
         SELECT resource_type, resource_id,
                acquired_resource_sha256
-          FROM {_qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)}
+          FROM {relation}
          WHERE dataset_id = :dataset_id
            AND resource_type = ANY(CAST(:resource_types AS varchar[]))
            {cursor_filter}
@@ -65460,6 +65518,14 @@ async def _lock_endpoint_dataset_for_validation(
         candidate,
     )
     _assert_locked_candidate_identity(candidate_record_map, candidate)
+    from process.provider_directory_generic_source_policy import current_source_storage_binding
+
+    if current_source_storage_binding() is not None:
+        previous_dataset_id = candidate_record_map.get("previous_dataset_id")
+        if previous_dataset_id != candidate.previous_dataset_id:
+            raise RuntimeError("provider_directory_endpoint_dataset_current_changed")
+        # Detached validation preserves its predecessor; protected publication checks the current pointer.
+        return previous_dataset_id
     return await _locked_current_endpoint_dataset_id(connection, candidate)
 
 
@@ -65947,8 +66013,18 @@ async def _validate_endpoint_dataset_candidate(
         async with completed_source_scope(sys.modules[__name__], candidate) as (publisher, binding):
             async with db.acquire() as connection:
                 validation_state = await _persist_endpoint_dataset_validation(connection, candidate, diagnostics)
-            await attach_generic_source_candidate(publisher, binding)
-        return _endpoint_dataset_validation_summary(candidate, *validation_state)
+            source_handoff = await attach_generic_source_candidate(publisher, binding)
+        summary_by_field = _endpoint_dataset_validation_summary(candidate, *validation_state)
+        if source_handoff is not None:
+            from process.provider_directory_source_storage_binding import FHIRSourceCandidateHandoff
+
+            if type(source_handoff) is not FHIRSourceCandidateHandoff:
+                raise RuntimeError("provider_directory_source_handoff_invalid")
+            summary_by_field["source_candidate_handoff"] = {
+                "document": source_handoff.document,
+                "sha256": source_handoff.document_sha256,
+            }
+        return summary_by_field
 
 
 async def _endpoint_dataset_validation_proofs(
@@ -66571,6 +66647,8 @@ async def _store_dataset_validation_state(
     int,
     ProviderDirectoryAdmissionSeal | None,
 ]:
+    from process.provider_directory_generic_source_policy import current_source_storage_binding
+
     admission_seal = await _store_endpoint_dataset_verification_result(
         connection,
         candidate,
@@ -66582,7 +66660,8 @@ async def _store_dataset_validation_state(
     retired_row_count = await _retire_matched_twin_root_baseline_payload(connection, candidate, metadata, final_status)
     if retired_row_count:
         admission_seal = admission_seal_from_validated_metadata(_subset_admission_seal_metadata(metadata))
-    if content_proof.proof_metadata is not None:
+    # Isolated handoff must retain the shards for independent frozen validation.
+    if content_proof.proof_metadata is not None and current_source_storage_binding() is None:
         await delete_dataset_proof_shards(
             connection,
             _schema(),
@@ -66706,7 +66785,12 @@ async def _clear_finalized_dataset_checkpoints(
     candidate: EndpointDatasetCandidate,
 ) -> int:
     """Retire every checkpoint attached to an immutable finalized dataset."""
-    async with source_checkpoint_transaction(db, schema=_schema()):
+    async with source_checkpoint_transaction(
+        db,
+        schema=_schema(),
+        dataset_ids=(candidate.dataset_id,),
+        root_run_ids=(candidate.acquisition_root_run_id,),
+    ):
         async with db.acquire() as connection:
             deleted_status = await connection.status(
                 f"""
@@ -67733,6 +67817,7 @@ async def _import_resources(
     resource_deadline_seconds: int = 0,
     linked_counts: dict[str, int] | None = None,
     resource_fetch_stats: dict[str, dict[str, Any]] | None = None,
+    source_candidate_handoffs: dict[str, dict[str, Any]] | None = None,
     resource_completion: dict[str, set[str]] | None = None,
     resource_retry_not_before: dict[str, str] | None = None,
     stale_counts: dict[str, int] | None = None,
@@ -67756,6 +67841,8 @@ async def _import_resources(
     restart_expired_current_census_slice: bool = True,
 ) -> dict[str, int]:
     """Import resources into the provider-directory snapshot."""
+    from process.provider_directory_generic_source_completion import record_candidate_handoff
+
     if defer_typed_materialization:
         if not is_pagination_checkpointing_enabled:
             raise ValueError("provider_directory_deferred_typed_materialization_checkpoint_required")
@@ -68340,12 +68427,14 @@ async def _import_resources(
     ) -> ResourceImportGroupResult:
         """Replay one immutable candidate after the cancellation fence."""
 
-        return await _replay_finalized_candidate_after_cancellation(
+        import_summary = await _replay_finalized_candidate_after_cancellation(
             candidate,
             resource_completion,
             prepared_source_records,
             resource_import_cancellation,
         )
+        await record_candidate_handoff(sys.modules[__name__], candidate, source_candidate_handoffs)
+        return import_summary
 
     async def run_guarded_group(
         source_records: list[dict[str, Any]],
@@ -68387,6 +68476,7 @@ async def _import_resources(
                 diagnostics_by_resource,
                 resource_import_cancellation,
             )
+            await record_candidate_handoff(sys.modules[__name__], candidate, source_candidate_handoffs)
             return import_summary
         except ProviderDirectoryPaginationTerminalFailure as failure:
             await _retain_and_abandon_terminal_failure(
@@ -69930,9 +70020,7 @@ async def process_provider_directory_fhir_data(
         raise ValueError("provider_directory_reviewed_root_policy_scope_invalid")
     await _raise_if_resource_import_cancelled(ctx, task)
     await ensure_database(test_mode)
-    if not ctx["context"].get("provider_directory_tables_ready"):
-        await _ensure_provider_directory_tables()
-        ctx["context"]["provider_directory_tables_ready"] = True
+    await _prepare_provider_directory_job_tables(ctx, profile_execution)
     if (
         "cms-npd" in requested_source_ids
         and not dataset_rehydrate_only
@@ -70347,6 +70435,7 @@ async def process_provider_directory_fhir_data(
                     resource_deadline_seconds=resource_deadline_seconds,
                     linked_counts=metrics_by_key.setdefault("linked_resource_rows", {}),
                     resource_fetch_stats=metrics_by_key.setdefault("resource_fetch_stats", {}),
+                    source_candidate_handoffs=metrics_by_key.setdefault("source_candidate_handoffs", {}),
                     resource_completion=completed_source_ids_by_resource,
                     resource_retry_not_before=retry_not_before_by_resource,
                     stale_counts=metrics_by_key.setdefault("stale_resource_rows_deleted", {}),
@@ -70470,12 +70559,14 @@ async def process_provider_directory_fhir_data(
             if not source_local_ids and len(importable) == 1:
                 source_id = _clean_text(importable[0].get("source_id"))
                 source_local_ids = [source_id] if source_id is not None else []
-            profile_followup = await _source_local_profile_followup_if_current(
-                source_ids=source_local_ids,
-                expected_acquisition_root_run_id=(pagination_root_run_id or run_id),
-            )
-            if profile_followup is not None:
-                metrics_by_key["profile_followup"] = profile_followup
+            # Detached candidates resolve followups only after protected publication.
+            if not metrics_by_key.get("source_candidate_handoffs"):
+                profile_followup = await _source_local_profile_followup_if_current(
+                    source_ids=source_local_ids,
+                    expected_acquisition_root_run_id=(pagination_root_run_id or run_id),
+                )
+                if profile_followup is not None:
+                    metrics_by_key["profile_followup"] = profile_followup
             if _has_dataset_publication_followup_trigger(
                 metrics_by_key,
                 source_local_ids,

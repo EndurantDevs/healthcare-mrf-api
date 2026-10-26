@@ -6,8 +6,18 @@ from db.plan_release_storage import storage_identifier, storage_relation
 from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import storage_roles
 from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
-from process.provider_directory_generic_source_storage import HEADER, _json, _require, _validate_binding
+from process.provider_directory_generic_source_storage import (
+    HEADER,
+    _json,
+    _require,
+    _validate_binding,
+    require_private_source_readers_closed,
+)
 from process.provider_directory_projection_stage import _copy_driver
+from process.provider_directory_source_storage_binding import (
+    require_storage_schema,
+    verify_isolated_source_storage_coordinates,
+)
 
 PROOF_ROOT = "provider_directory_dataset_proof_shard"
 _COLUMNS = (
@@ -54,16 +64,26 @@ async def require_proof_executor(executor, schema):
         is_original = binding is not None and binding.session is session
     else:
         is_original = isinstance(executor, ConnectionProxy) and executor._connection is session
-    _require(is_original and schema == publisher.policy.schema, "proof_transaction_changed")
+    binding = getattr(publisher, "storage_binding", None)
+    expected_schema = publisher.policy.schema if binding is None else binding.catalog_schema
+    _require(is_original and schema == expected_schema, "proof_transaction_changed")
     _require(await _copy_driver(session) is publisher.connection, "proof_transaction_changed")
-    await verify_proof_control(publisher.connection, publisher.policy)
+    if binding is None:
+        await verify_proof_control(publisher.connection, publisher.policy)
+    else:
+        require_storage_schema(publisher, schema)
+        await verify_proof_control(publisher.connection, publisher.policy, storage_binding=binding)
     return publisher
 
 
-async def verify_proof_control(connection, policy):
-    """The original native batch FK/PK/checks remain; custom hooks and DML do not."""
+async def verify_proof_control(connection, policy, *, storage_binding=None):
+    """Preserve legacy custody; private controls use parent fences without foreign keys."""
+    if storage_binding is not None:
+        await verify_isolated_source_storage_coordinates(connection, policy, storage_binding)
     owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
-    rows = await connection.fetch(CATALOG_SQL, [storage_relation(policy.schema, PROOF_ROOT)], owner, readers)
+    rows = await connection.fetch(
+        CATALOG_SQL, [storage_relation(policy.schema, PROOF_ROOT)], owner, readers if storage_binding is None else []
+    )
     _require(len(rows) == 1, "proof_control_missing")
     proof_by_field = rows[0]
     _require(
@@ -80,8 +100,12 @@ async def verify_proof_control(connection, policy):
         and proof_by_field["readers_closed"],
         "proof_control_custody_changed",
     )
-    _require_proof_layout(proof_by_field)
-    await _require_batch_foreign_key(connection, policy.schema, proof_by_field["oid"])
+    _require_proof_layout(proof_by_field, isolated=storage_binding is not None)
+    if storage_binding is None:
+        await _require_batch_foreign_key(connection, policy.schema, proof_by_field["oid"])
+    else:
+        _require(proof_by_field["inert"], "proof_control_hooks_changed")
+        await require_private_source_readers_closed(connection, [proof_by_field["oid"]], readers)
     return proof_by_field
 
 
@@ -106,7 +130,7 @@ async def retire_proof_control_hooks(connection, policy):
         )
 
 
-def _require_proof_layout(proof_by_field):
+def _require_proof_layout(proof_by_field, *, isolated=False):
     columns = _json(proof_by_field["columns"])
     _require(
         columns == [[name, kind, True, "now()" if name == "created_at" else None] for name, kind in _COLUMNS],
@@ -115,9 +139,10 @@ def _require_proof_layout(proof_by_field):
     constraints = _json(proof_by_field["constraints"])
     expected_types_by_name = {
         PROOF_ROOT + "_pkey": "p",
-        PROOF_ROOT + "_dataset_fkey": "f",
         **{name: "c" for name in _CHECKS},
     }
+    if not isolated:
+        expected_types_by_name[PROOF_ROOT + "_dataset_fkey"] = "f"
     _require(
         {entry_by_field["name"]: entry_by_field["type"] for entry_by_field in constraints} == expected_types_by_name
         and all(
