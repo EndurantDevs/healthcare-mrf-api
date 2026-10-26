@@ -1811,6 +1811,61 @@ async def process_plan(ctx, task):
     return 1
 
 
+async def _mrf_provider_plan_scope(plan, task, import_log, current_year):
+    """Reject one malformed link while preserving valid sibling memberships."""
+    if not await _has_valid_mrf_label(plan, "network_tier", task, "providers", import_log):
+        return None
+    plan_id = plan.get("plan_id")
+    if (
+        not isinstance(plan_id, str)
+        or not 12 < len(plan_id) <= 14
+        or not plan_id[:5].isascii()
+        or not plan_id[:5].isdigit()
+    ):
+        await log_error(
+            "err",
+            f"Mandatory field `plan_id` is not present or incorrect: {repr(plan_id)[:32]}.",
+            task.get("issuer_array"),
+            task.get("url"),
+            "providers",
+            "json",
+            import_log,
+        )
+        return None
+    raw_years = plan.get("years")
+    if not isinstance(raw_years, list) or not raw_years:
+        await log_error(
+            "err",
+            f"Mandatory field `years` is not present or incorrect for plan ID {plan_id}: {repr(raw_years)[:160]}.",
+            task.get("issuer_array"),
+            task.get("url"),
+            "providers",
+            "json",
+            import_log,
+        )
+        return None
+    years = set()
+    invalid_year_labels = []
+    for raw_year in raw_years:
+        parsed_year = _coerce_plan_year(raw_year)
+        if parsed_year is None:
+            if len(invalid_year_labels) < 5:
+                invalid_year_labels.append(repr(raw_year)[:32])
+        elif current_year <= parsed_year <= current_year + 1:
+            years.add(parsed_year)
+    if invalid_year_labels:
+        await log_error(
+            "err",
+            f"Mandatory field `years` contains incorrect values for plan ID {plan_id}: {', '.join(invalid_year_labels)}.",
+            task.get("issuer_array"),
+            task.get("url"),
+            "providers",
+            "json",
+            import_log,
+        )
+    return plan_id, int(plan_id[:5]), years
+
+
 async def process_provider(ctx, task):
     """
     The process_provider function is responsible for downloading the provider data from the CMS PUF website,
@@ -1899,53 +1954,26 @@ async def process_provider(ctx, task):
                     if provider_limit and processed_providers >= provider_limit:
                         break
                     network_tiers_by_checksum = {}
-                    has_invalid_plan = False
-                    if not provider_record or not provider_record.get("plans"):
+                    if not isinstance(provider_record, dict) or not isinstance(provider_record.get("plans"), list):
+                        continue
+                    npi_raw = provider_record.get("npi", "")
+                    if (
+                        not isinstance(npi_raw, str)
+                        or not npi_raw.isascii()
+                        or not npi_raw.isdigit()
+                        or not 0 < int(npi_raw) < 4294967295
+                    ):
                         continue
                     for plan in provider_record["plans"]:
-                        if not await _has_valid_mrf_label(plan, "network_tier", task, "providers", myimportlog):
+                        scope = await _mrf_provider_plan_scope(plan, task, myimportlog, current_year)
+                        if scope is None:
                             continue
-                        my_years = set()
-                        # try:
-                        #     for k in (
-                        #             'npi', 'type', 'plans', 'addresses', 'last_updated_on'):
-                        #         if not (k in res and res[k] is not None):
-                        #             await log_error('err',
-                        #                             f"Mandatory field `{k}` for providers data is not present or "
-                        #                             f"incorrect. Plan ID: "
-                        #                             f"{plan['plan_id']}, NPI: {res.get('npi', None)}",
-                        #                             task.get('issuer_array'), task.get('url'), 'plans', 'json',
-                        #                             myimportlog)
-
-                        # if not int(plan['plan_id'][:5]) in task.get('issuer_array'):
-                        #     await log_error('err',
-                        #                     f"File describes the issuer that is not defined/allowed by the index "
-                        #                     f"CMS PUF."
-                        #                     f"Issuer of Plan: {int(plan['plan_id'][:5])}. Allowed issuer list: "
-                        #                     f"{''.join([str(x) for x in task.get('issuer_array')])}"
-                        #                     f"Plan ID: {plan['plan_id']}, NPI: {res.get('npi', None)}",
-                        #                     task.get('issuer_array'), task.get('url'), 'providers', 'json',
-                        #                     myimportlog)
-                        npi_raw = provider_record.get("npi", "")
-                        has_valid_npi = npi_raw and npi_raw.isdigit() and 0 < int(npi_raw) < 4294967295
-                        has_plan_id = bool(plan.get("plan_id"))
-                        has_years = bool(plan.get("years"))
-                        if not has_valid_npi or not has_plan_id or not has_years:
-                            has_invalid_plan = True
-                            break
-                        if len(plan["plan_id"]) <= 12 or len(plan["plan_id"]) > 14:
-                            continue
-
-                        for x in plan.get("years", []):
-                            if x and (current_year + 1 >= int(x) >= current_year):
-                                my_years.add(int(x))
-
-                        issuer_id = int(plan["plan_id"][0:5])
+                        plan_id, issuer_id, my_years = scope
                         for year in my_years:
-                            checksum_plan = return_checksum([plan["plan_id"], plan["network_tier"], issuer_id, year])
+                            checksum_plan = return_checksum([plan_id, plan["network_tier"], issuer_id, year])
                             checksum_network = return_checksum([plan["network_tier"], issuer_id, year])
                             plan_networks_by_checksum[checksum_plan] = {
-                                "plan_id": plan["plan_id"],
+                                "plan_id": plan_id,
                                 "network_tier": plan["network_tier"],
                                 "issuer_id": issuer_id,
                                 "year": year,
@@ -1957,7 +1985,7 @@ async def process_provider(ctx, task):
                                 "year": year,
                                 "checksum_network": checksum_network,
                             }
-                    if has_invalid_plan or not network_tiers_by_checksum:
+                    if not network_tiers_by_checksum:
                         continue
 
                     provider_name_dict = provider_record.get("name", {})
