@@ -54,6 +54,67 @@ async def test_ordinary_command_defers_preflight_until_job(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ordinary_profile_layout_reads_never_admit_acquisition(monkeypatch):
+    from tests.test_provider_directory_profile_selection_attestation import _execution
+
+    context = {"context": {}}
+    monkeypatch.setattr(fhir.db, "all", AsyncMock(return_value=[]))
+    monkeypatch.setattr(fhir.db, "status", AsyncMock(side_effect=AssertionError("runtime DDL")))
+    assert not policy.is_source_storage_required()
+    await fhir._prepare_provider_directory_job_tables(context, _execution())
+    assert "provider_directory_tables_ready" not in context["context"]
+    assert fhir.db.all.await_count == len(fhir.SOURCE_MODELS) + len(fhir.CANONICAL_RESOURCE_MODELS)
+    assert all(call.args[0].startswith("SELECT ") and call.args[0].endswith(" LIMIT 0")
+               for call in fhir.db.all.await_args_list)
+    with pytest.raises(ValueError, match="publisher_connection_required"):
+        await fhir._prepare_provider_directory_job_tables(context, None)
+    fhir.db.status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_profile_missing_layout_refuses_without_ddl(monkeypatch):
+    from tests.test_provider_directory_profile_selection_attestation import _execution
+
+    context = {"context": {}}
+    monkeypatch.setattr(fhir.db, "all", AsyncMock(side_effect=RuntimeError("missing column")))
+    monkeypatch.setattr(fhir.db, "status", AsyncMock(side_effect=AssertionError("runtime DDL")))
+    with pytest.raises(RuntimeError, match="missing column"):
+        await fhir._prepare_provider_directory_job_tables(context, _execution())
+    assert "provider_directory_tables_ready" not in context["context"]
+    fhir.db.status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_real_profile_entry_reaches_existing_selection_guard_without_source_binding(monkeypatch):
+    from process import provider_directory_cms_replay as replay
+    from process import provider_directory_profile_selection as selection
+    from tests.test_provider_directory_profile_selection_attestation import _attestation
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
+    task = {
+        **selection._GLOBAL_PROFILE_PARAMS,
+        "provider_directory_profile_generation": 11,
+        "provider_directory_profile_selection_attestation": _attestation().payload,
+        "provider_directory_profile_capacity_attestation": {},
+    }
+    context = {"control_run_id": "run_" + "e" * 32, "context": {}}
+    monkeypatch.setattr(fhir, "ensure_database", AsyncMock())
+    monkeypatch.setattr(fhir, "_raise_if_resource_import_cancelled", AsyncMock())
+    monkeypatch.setattr(fhir.db, "all", AsyncMock(return_value=[]))
+    monkeypatch.setattr(fhir.db, "status", AsyncMock(side_effect=AssertionError("unexpected write")))
+    monkeypatch.setattr(replay, "replay_committed_cms_profile", AsyncMock(return_value=None))
+    monkeypatch.setattr(fhir, "_provider_directory_profile_selection_catalog", lambda: {})
+    selection_guard = AsyncMock(side_effect=RuntimeError("selection guard reached"))
+    monkeypatch.setattr(fhir, "assert_registered_profile_selection_current", selection_guard)
+    assert not policy.is_source_storage_required()
+    with pytest.raises(RuntimeError, match="selection guard reached"):
+        await fhir.process_provider_directory_fhir_data(context, task)
+    selection_guard.assert_awaited_once()
+    fhir.db.status.assert_not_awaited()
+    assert "provider_directory_tables_ready" not in context["context"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure_phase", ["enter", "query", "exit"])
 async def test_retry_cleanup_catches_source_transaction_failures(monkeypatch, failure_phase):
     """Query abort and role-reset/transaction-exit failures remain best effort."""

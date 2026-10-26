@@ -3,7 +3,7 @@
 
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -54,6 +54,72 @@ async def test_proof_executor_is_original_same_task_owner_before_native_custody(
         with pytest.raises(GenericCandidateError, match="proof_transaction_changed"):
             await control.require_proof_executor(executor, "other" if change == "schema" else "source_schema")
         custody.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_private_proof_executor_uses_issued_storage_with_the_original_catalog_locator(monkeypatch):
+    from process import provider_directory_generic_source_policy as policy
+    from tests.test_provider_directory_generic_source_policy import _isolated_factory
+
+    factory = _isolated_factory()
+    session, native = object(), object()
+    publisher = SimpleNamespace(connection=native, policy=factory.policy, storage_binding=factory.storage_binding)
+    monkeypatch.setattr(control, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(policy, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(control, "source_copy_session", lambda: session)
+    monkeypatch.setattr(control, "_copy_driver", AsyncMock(return_value=native))
+    custody = AsyncMock()
+    monkeypatch.setattr(control, "verify_proof_control", custody)
+    executor = ConnectionProxy(None, session, None)
+    assert await control.require_proof_executor(executor, "catalog_schema") is publisher
+    custody.assert_awaited_once_with(native, factory.policy, storage_binding=factory.storage_binding)
+    with pytest.raises(GenericCandidateError, match="proof_transaction_changed"):
+        await control.require_proof_executor(executor, "source_schema")
+    assert custody.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "foreign_key", "hook", "check", "namespace", "reader_access"])
+async def test_isolated_proof_control_rejects_foreign_keys_and_changed_native_custody(monkeypatch, change):
+    from tests.test_provider_directory_generic_source_policy import _isolated_factory
+    from tests.test_provider_directory_proof_store_contract_shape import _proof_control_catalog
+
+    factory = _isolated_factory()
+    binding = factory.storage_binding
+    catalog, _ = _proof_control_catalog()
+    catalog.update(nspname=binding.storage_schema, relowner=binding.owner_oid, inert=True)
+    if change != "foreign_key":
+        catalog["constraints"] = [entry for entry in catalog["constraints"] if entry["type"] != "f"]
+    if change == "hook":
+        catalog["inert"] = False
+    if change == "check":
+        catalog["constraints"][-1]["definition"] = "CHECK (true)"
+    coordinates_by_field = {
+        field: getattr(binding, field)
+        for field in ("database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid")
+    }
+    if change == "namespace":
+        coordinates_by_field["namespace_owner_oid"] += 1
+    connection = SimpleNamespace(
+        is_in_transaction=Mock(return_value=True),
+        fetchrow=AsyncMock(return_value=coordinates_by_field),
+        fetch=AsyncMock(return_value=[catalog]),
+        fetchval=AsyncMock(return_value=change != "reader_access"),
+    )
+    monkeypatch.setattr(control, "storage_roles", AsyncMock(return_value=(binding.owner_oid, [3])))
+    if change is None:
+        assert await control.verify_proof_control(connection, factory.policy, storage_binding=binding) == catalog
+        connection.fetch.assert_awaited_once()
+        assert connection.fetch.await_args.args[1] == [f'"source_schema"."{control.PROOF_ROOT}"']
+        assert connection.fetch.await_args.args[3] == []
+    else:
+        with pytest.raises(
+            GenericCandidateError,
+            match="constraints_changed|hooks_changed|storage_identity_changed|private_reader_access",
+        ):
+            await control.verify_proof_control(connection, factory.policy, storage_binding=binding)
+        if change == "namespace":
+            connection.fetch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

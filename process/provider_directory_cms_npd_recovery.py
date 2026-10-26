@@ -26,8 +26,19 @@ _RETAINED_FIELDS = ("cms_npd_retained_operation", "cms_npd_retained_vector_sha25
 _FAILED_STATUSES = {"failed", "canceled", "dead_letter"}
 
 
-def candidate_available_sql(dataset_alias: str, schema: str) -> str:
-    """Exclude exact dispositions from shared candidate selection."""
+def candidate_available_sql(dataset_alias: str, schema: str, *, dataset_relation: str | None = None) -> str:
+    """Exclude CMS dispositions only where CMS candidates can exist."""
+
+    if dataset_relation is not None:
+        from db.plan_release_storage import storage_relation
+        from process.provider_directory_source_storage_binding import source_relation_coordinates
+
+        private_schema, header = source_relation_coordinates(
+            schema, "provider_directory_endpoint_dataset", "provider_directory_endpoint_dataset"
+        )
+        # Issued private headers reject CMS source_release data at candidate admission.
+        if private_schema != schema and dataset_relation == storage_relation(private_schema, header):
+            return "TRUE"
 
     disposition = '"' + schema.replace('"', '""') + '"."' + TABLE + '"'
     return (

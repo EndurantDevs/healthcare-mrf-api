@@ -8,7 +8,7 @@ from db.migration_expression_adoption import _normalized_expression
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import storage_roles
-from process.provider_directory_generic_source_storage import _json, _require
+from process.provider_directory_generic_source_storage import _json, _require, require_private_source_readers_closed
 from process.provider_directory_source_coverage_control import _GUARD_SQL, _digest
 
 BULK_ROOT = "provider_directory_bulk_acquisition_checkpoint"
@@ -378,7 +378,7 @@ def _canonical_definition(value, schema):
     )
 
 
-def _require_layout(relation, schema):
+def _require_layout(relation, schema, *, isolated=False):
     expected = CHECKPOINT_LAYOUTS[relation["relname"]]
     constraints = _json(relation["constraints"])
     actual_constraints = sorted(
@@ -389,7 +389,11 @@ def _require_layout(relation, schema):
         ]
     )
     expected_constraints = sorted(
-        [(kind, _canonical_definition(definition, "mrf")) for kind, definition in expected["constraints"]]
+        [
+            (kind, _canonical_definition(definition, "mrf"))
+            for kind, definition in expected["constraints"]
+            if not isolated or kind != "f"
+        ]
     )
     indexes = _json(relation["indexes"])
     actual_indexes = sorted(
@@ -456,11 +460,16 @@ def _require_guards(guards, root, policy, *, legacy):
         )
 
 
-async def capture_checkpoint_controls(connection, policy, *, legacy=False):
+async def capture_checkpoint_controls(connection, policy, *, legacy=False, storage_binding=None):
     """Attest every fixed root before its original-session control transaction."""
+    if storage_binding is not None:
+        from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
+
+        _require(not legacy, "checkpoint_contract_conflict")
+        await verify_isolated_source_storage_coordinates(connection, policy, storage_binding)
     owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
     roots = [storage_relation(policy.schema, name) for name in CHECKPOINT_LAYOUTS]
-    relations = await connection.fetch(CATALOG_SQL, roots, owner, readers)
+    relations = await connection.fetch(CATALOG_SQL, roots, owner, readers if storage_binding is None else [])
     _require(
         len(relations) == len(roots) and {relation["relname"] for relation in relations} == set(CHECKPOINT_LAYOUTS),
         "checkpoint_missing",
@@ -468,7 +477,7 @@ async def capture_checkpoint_controls(connection, policy, *, legacy=False):
     proof_by_root = {}
     for relation in relations:
         _require(relation["nspname"] == policy.schema, "checkpoint_namespace_changed")
-        _require_layout(relation, policy.schema)
+        _require_layout(relation, policy.schema, isolated=storage_binding is not None)
         if legacy:
             permitted = await connection.fetchval(
                 "SELECT $1::oid=ANY(ARRAY(SELECT oid FROM pg_roles WHERE rolname=ANY($2::text[])))",
@@ -482,13 +491,19 @@ async def capture_checkpoint_controls(connection, policy, *, legacy=False):
                 "checkpoint_custody_changed",
             )
         _require(await connection.fetchval(_NATIVE_SQL, relation["oid"]) is True, "checkpoint_native_contract_changed")
-        guards = await connection.fetch(_GUARD_SQL, relation["oid"])
-        _require_guards(guards, relation["relname"], policy, legacy=legacy)
+        if storage_binding is None:
+            guards = await connection.fetch(_GUARD_SQL, relation["oid"])
+            _require_guards(guards, relation["relname"], policy, legacy=legacy)
+        else:
+            _require(relation["inert"], "checkpoint_hooks_changed")
+            guards = []
         proof_by_root[relation["relname"]] = {
             "oid": relation["oid"],
             "layout": _digest({key: _json(relation[key]) for key in ("columns", "constraints", "indexes")}),
             "guards": [dict(guard) for guard in guards if guard["tgname"] not in RETIRED_BULK_HOOKS],
         }
+    if storage_binding is not None:
+        await require_private_source_readers_closed(connection, [relation["oid"] for relation in relations], readers)
     return proof_by_root
 
 

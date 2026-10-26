@@ -13,6 +13,18 @@ from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
 
+@pytest.mark.parametrize("root", [storage.HEADER, "provider_directory_pagination_checkpoint"])
+def test_legacy_constraint_trigger_is_omitted_only_from_template_shape(root):
+    from process.provider_directory_source_storage_binding import _isolated_layout_shape
+
+    plain_by_field = dict(relname=root, columns=[], constraints=[], indexes=[])
+    guarded_by_field = dict(
+        plain_by_field, constraints=[["legacy_guard", "t", "TRIGGER DEFERRABLE INITIALLY DEFERRED", True]]
+    )
+    assert _isolated_layout_shape(guarded_by_field, template=True) == _isolated_layout_shape(plain_by_field, template=False)
+    assert _isolated_layout_shape(guarded_by_field, template=False) != _isolated_layout_shape(plain_by_field, template=False)
+
+
 def _case():
     candidate = SimpleNamespace(
         dataset_id="dataset",
@@ -121,6 +133,144 @@ def _rows(count):
     ]
 
 
+@asynccontextmanager
+async def _isolated_harness(harness, monkeypatch):
+    from process import provider_directory_generic_source_policy as policy
+    from tests.test_provider_directory_generic_source_policy import _isolated_factory
+
+    factory = _isolated_factory()
+    native_by_field = {
+        field: getattr(factory.storage_binding, field)
+        for field in ("database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid")
+    }
+    harness.policy = factory.policy
+    harness.directory._schema = lambda: "catalog_schema"
+    metadata = harness.header["candidate_storage_json"]["identity"]["metadata"]
+    metadata["source_ids"] = ["example-source"]
+    harness.directory._endpoint_dataset_candidate_metadata = lambda _: metadata
+    connection, actor = harness.connection, {"session": "source_publisher", "current": "source_publisher"}
+
+    async def fetchrow(query, *args):
+        if query.startswith("SELECT session_user"):
+            return dict(actor)
+        if query.startswith("SELECT d.oid"):
+            return native_by_field
+        return deepcopy(harness.header)
+
+    connection.fetchrow = AsyncMock(side_effect=fetchrow)
+    original_fetchval = connection.fetchval
+    connection.fetchval = AsyncMock(
+        side_effect=lambda query, *args: (
+            "repeatable read" if query == "SHOW transaction_isolation" else original_fetchval.side_effect(query, *args)
+        )
+    )
+    connection.is_in_transaction = lambda: True
+    monkeypatch.setattr(policy, "storage_roles", AsyncMock())
+
+    @asynccontextmanager
+    async def owner(database):
+        before = deepcopy(harness.header)
+        try:
+            yield policy.bound_publisher()
+        except BaseException:
+            harness.header.clear()
+            harness.header.update(before)
+            raise
+
+    monkeypatch.setattr(storage, "source_owner_transaction", owner)
+    async with policy.bind_generic_source_transaction_factory(factory):
+        async with policy.bind_generic_source_publisher(
+            connection, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
+        ) as publisher:
+            actor["current"] = "source_owner"
+            harness.header["candidate_storage_json"].update(
+                contract=storage.ISOLATED_CONTRACT,
+                storage=storage.storage_document(publisher),
+                admission=None,
+            )
+            yield publisher
+
+
+@pytest.mark.asyncio
+async def test_isolated_copy_uses_only_the_issued_storage_coordinates(harness, monkeypatch):
+    async with _isolated_harness(harness, monkeypatch):
+        assert await storage.append_generic_source_batch(object(), harness.directory, harness.candidate, _rows(2)) == 2
+    assert harness.copies[0][1]["schema_name"] == "source_schema"
+    assert '"source_schema"."provider_directory_endpoint_dataset"' in harness.sql[-1]
+    assert not any('"catalog_schema".' in statement for statement in harness.sql)
+
+
+@pytest.mark.asyncio
+async def test_isolated_prepare_and_complete_share_the_existing_candidate_binding(harness, monkeypatch):
+    from process import provider_directory_generic_source_completion as completion
+
+    async with _isolated_harness(harness, monkeypatch) as publisher:
+        harness.header["candidate_storage_json"] = None
+        harness.connection.fetch = AsyncMock(return_value=[])
+        harness.connection.fetchval = AsyncMock(
+            side_effect=lambda query, *args: "private_ordinal_sequence" if "pg_get_serial_sequence" in query else False
+        )
+        proof_by_name = {}
+
+        async def capture(connection, policy, names, **options):
+            assert connection is harness.connection and policy is harness.policy
+            for name in names:
+                proof_by_name.setdefault(
+                    name, dict(name=name, oid=1000 + len(proof_by_name), owner=100, layout_sha256="e" * 64)
+                )
+            return {name: proof_by_name[name] for name in names}
+
+        monkeypatch.setattr(storage, "_capture", capture)
+        monkeypatch.setattr(completion, "source_owner_transaction", storage.source_owner_transaction)
+        reduction = AsyncMock()
+        monkeypatch.setattr(completion, "_complete_payloads", reduction)
+        loading = await storage.prepare_generic_source_candidate(object(), harness.directory, harness.candidate)
+        assert loading["contract"] == storage.ISOLATED_CONTRACT
+        assert loading["storage"] == storage.storage_document(publisher)
+        prepared = await completion.complete_generic_source_candidate(object(), harness.directory, harness.candidate)
+        reduction.assert_awaited_once()
+        assert prepared["phase"] == "prepared" and prepared["storage"] == loading["storage"]
+        assert prepared["identity"] == loading["identity"]
+        assert set(prepared["tables"]) == {*storage.RELATIONS, "resource_input", "witness_input"}
+        pre_replay_statements = list(harness.sql)
+        assert (
+            await completion.complete_generic_source_candidate(object(), harness.directory, harness.candidate)
+            == prepared
+        )
+        assert harness.sql == pre_replay_statements
+    assert sum(statement.startswith("CREATE TABLE") for statement in harness.sql) == 2 + len(storage.RELATIONS)
+    assert all(
+        '"catalog_schema".' not in statement
+        and "ATTACH" not in statement
+        and "RENAME" not in statement
+        and "LOCK TABLE" not in statement
+        for statement in harness.sql
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["storage_schema_oid", "database_oid", "enrollment_sha256", "producer"])
+async def test_isolated_stored_binding_substitution_never_reaches_copy(harness, monkeypatch, changed):
+    async with _isolated_harness(harness, monkeypatch):
+        document = harness.header["candidate_storage_json"]["storage"]
+        document[changed] = ["c" * 40, "sha256:" + "d" * 64] if changed == "producer" else 999
+        with pytest.raises(GenericCandidateError, match="storage_binding_changed"):
+            await storage.append_generic_source_batch(object(), harness.directory, harness.candidate, _rows(1))
+    harness.connection.copy_records_to_table.assert_not_awaited()
+    assert harness.sql == []
+
+
+@pytest.mark.asyncio
+async def test_isolated_intake_rejects_specialized_source_before_target_access(harness, monkeypatch):
+    async with _isolated_harness(harness, monkeypatch):
+        harness.header["candidate_storage_json"]["identity"]["metadata"]["source_release"] = {"vector_sha256": "a" * 64}
+        harness.connection.fetchrow.reset_mock()
+        with pytest.raises(GenericCandidateError, match="isolated_kind_unsupported"):
+            await storage.append_generic_source_batch(object(), harness.directory, harness.candidate, _rows(1))
+        harness.connection.fetchrow.assert_not_awaited()
+    harness.connection.copy_records_to_table.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_many_singletons_are_one_copy_and_one_header_control(harness):
     h = harness
@@ -227,11 +377,12 @@ def _catalog_row():
         ("inert", False),
         ("direct_acl_closed", False),
         ("native_checks", False),
+        ("constraints", [{"type": "f", "valid": True}]),
         ("parents", [2]),
         ("relispartition", True),
     ),
 )
-def test_native_private_heap_custody_refuses_hooks_grants_or_attachment(field, value):
+def test_native_private_heap_custody_refuses_hooks_grants_foreign_keys_or_attachment(field, value):
     with pytest.raises(GenericCandidateError, match="storage_custody_changed"):
         storage._table_proof(_catalog_row() | {field: value}, private=True)
 

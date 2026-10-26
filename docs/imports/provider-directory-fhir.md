@@ -59,6 +59,19 @@ importer and worker class. Missing image configuration or an existing worker
 with changed purpose, target or process isolation is refused. The separately
 signed CMS Registry launch retains precedence and its own admission boundary.
 
+An issued isolated-storage manifest keeps ordinary REST acquisition in private
+tables. The existing worker closes candidate writes, validates the complete
+candidate, and copies verified rows through the Catalog Publisher before changing
+the retained-generation and canonical dataset pointers in one transaction.
+Acquisition success and source publication are reported separately. Publication
+failure leaves the incumbent serving; exact same-job recovery reuses the persisted
+candidate and does not fetch it again. API/search readiness still requires the
+existing Profile and Address follow-ups and live read verification.
+
+This isolated route requires deferred typed materialization and disables direct
+artifact publication, bulk export, and `publish_source_dataset_only`. The legacy
+source-only option below retains its separate issued-storage contract.
+
 The boolean task parameter `publish_source_dataset_only=true` selects a
 single-source REST refresh under that issued factory. It requires
 `import_resources=true`, `defer_typed_materialization=true`,

@@ -2,6 +2,7 @@
 """Batch fences retain both parent coordinates and the original transaction."""
 
 import ast
+import importlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -142,6 +143,58 @@ async def test_bulk_full_identity_preserves_adoption_and_new_reservation():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "missing", "endpoint_id", "acquisition_root_run_id", "retired"])
+async def test_private_bulk_parent_must_exist_and_match_before_checkpoint_lock(change):
+    parent_by_field = {field: _IDENTITY[field] for field in ("dataset_id", "endpoint_id", "acquisition_root_run_id")}
+    parent_by_field["status"] = "acquisition_retired" if change == "retired" else "acquiring"
+    if change in {"endpoint_id", "acquisition_root_run_id"}:
+        parent_by_field[change] = "other"
+    publisher = _publisher(existing=[_IDENTITY], parents=[] if change == "missing" else [parent_by_field])
+    publisher.storage_binding = object()
+    operation = control.fence_bulk_parents(
+        publisher, ["dataset"], ["root"], ["checkpoint"], bulk_identity=SimpleNamespace(**_IDENTITY)
+    )
+    if change is None:
+        await operation
+        assert publisher.connection.fetch.await_count == 3
+    else:
+        with pytest.raises(
+            GenericCandidateError,
+            match="checkpoint_parent_missing|checkpoint_parent_changed|checkpoint_parent_abandoned",
+        ):
+            await operation
+        assert publisher.connection.fetch.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "missing", "root", "retired", "root_retired"])
+async def test_private_pagination_fence_requires_live_parent_and_matching_root(change):
+    parents = [{"dataset_id": "dataset", "acquisition_root_run_id": "root", "status": "acquiring"}]
+    if change == "missing":
+        parents = []
+    elif change == "root":
+        parents[0]["acquisition_root_run_id"] = "other"
+    elif change == "retired":
+        parents[0]["status"] = "acquisition_retired"
+    elif change == "root_retired":
+        parents.append({"dataset_id": "other", "acquisition_root_run_id": "root", "status": "acquisition_retired"})
+    publisher = _publisher()
+    publisher.connection.fetch = AsyncMock(return_value=parents)
+    if change is None:
+        await control.fence_checkpoint_dataset_parents(publisher, ["dataset"], ["root"])
+    else:
+        with pytest.raises(
+            GenericCandidateError,
+            match="checkpoint_parent_missing|checkpoint_parent_changed|checkpoint_parent_abandoned",
+        ):
+            await control.fence_checkpoint_dataset_parents(publisher, ["dataset"], ["root"])
+    publisher.connection.fetch.assert_awaited_once()
+    query, datasets, roots = publisher.connection.fetch.await_args.args
+    assert query.endswith('ORDER BY dataset_id COLLATE "C" FOR SHARE')
+    assert datasets == ["dataset"] and roots == ["root"]
+
+
+@pytest.mark.asyncio
 async def test_bulk_scope_derives_exact_coordinates_and_passes_original_identity(monkeypatch):
     publisher = _publisher()
     identity = SimpleNamespace(**_IDENTITY)
@@ -202,6 +255,120 @@ async def test_connection_child_requires_same_original_immutable_bulk_scope(monk
                 await control.require_checkpoint_executor(executor, bulk_identity=SimpleNamespace(**_IDENTITY))
     finally:
         control._BULK_IDENTITY.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "missing", "dataset_id", "endpoint_id", "resource_type"])
+async def test_private_output_writer_fences_its_exact_checkpoint_parent(monkeypatch, change):
+    session = object()
+    checkpoint_by_field = {**_IDENTITY}
+    if change not in {None, "missing"}:
+        checkpoint_by_field[change] = "other"
+    native = SimpleNamespace(fetchrow=AsyncMock(return_value=None if change == "missing" else checkpoint_by_field))
+    publisher = SimpleNamespace(
+        connection=native, policy=SimpleNamespace(schema="private_source"), storage_binding=object()
+    )
+    monkeypatch.setattr(control, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(control, "source_copy_session", lambda: session)
+    monkeypatch.setattr(control, "_copy_driver", AsyncMock(return_value=native))
+    executor = control.ConnectionProxy(None, session, None)
+    token = control._BULK_IDENTITY.set(_IDENTITY)
+    try:
+        if change is None:
+            assert (
+                await control.require_checkpoint_executor(executor, bulk_identity=SimpleNamespace(**_IDENTITY))
+                is publisher
+            )
+        else:
+            with pytest.raises(GenericCandidateError, match="checkpoint_parent_missing|checkpoint_identity_changed"):
+                await control.require_checkpoint_executor(executor, bulk_identity=SimpleNamespace(**_IDENTITY))
+        native.fetchrow.assert_awaited_once()
+        query, checkpoint = native.fetchrow.await_args.args
+        assert '"private_source"."provider_directory_bulk_acquisition_checkpoint"' in query
+        assert query.endswith("FOR SHARE") and checkpoint == _IDENTITY["checkpoint_id"]
+    finally:
+        control._BULK_IDENTITY.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owns_lock,owns_row", [(True, True), (False, True), (True, False)])
+async def test_source_bulk_guard_keeps_private_reads_off_ordinary_lock_connection(monkeypatch, owns_lock, owns_row):
+    directory = importlib.import_module("process.provider_directory_fhir")
+    guard = SimpleNamespace(scalar=AsyncMock(return_value=owns_lock))
+    publisher_session = SimpleNamespace(scalar=AsyncMock(return_value=owns_row))
+    events = []
+
+    @asynccontextmanager
+    async def issued_read(actual):
+        assert actual is directory
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    monkeypatch.setattr(control.source, "is_source_storage_required", lambda: True)
+    monkeypatch.setattr(control, "source_copy_session", lambda: publisher_session)
+    monkeypatch.setattr(directory.profile_scope_copy, "source_read_transaction", issued_read)
+    monkeypatch.setattr(directory, "_bulk_acquisition_checkpoint_table_ref", lambda: '"private"."checkpoint"')
+    identity = SimpleNamespace(checkpoint_id="checkpoint", owner_run_id="owner")
+    if owns_lock and owns_row:
+        await control.assert_bulk_checkpoint_guard_owner(directory, guard, identity)
+    else:
+        with pytest.raises(RuntimeError, match="checkpoint_worker_guard_lost|checkpoint_ownership_lost"):
+            await control.assert_bulk_checkpoint_guard_owner(directory, guard, identity)
+    guard.scalar.assert_awaited_once()
+    assert "pg_locks" in str(guard.scalar.await_args.args[0])
+    assert events == (["enter", "exit"] if owns_lock else [])
+    assert publisher_session.scalar.await_count == int(owns_lock)
+    if owns_lock:
+        assert 'FROM "private"."checkpoint"' in str(publisher_session.scalar.await_args.args[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject", [False, True])
+@pytest.mark.parametrize(
+    "name,arguments,method",
+    [
+        ("_load_bulk_export_checkpoint", (SimpleNamespace(checkpoint_id="checkpoint"),), "first"),
+        ("_load_bulk_output_checkpoints", ("checkpoint",), "all"),
+        ("_fetch_pagination_checkpoint", (SimpleNamespace(**_IDENTITY), "Organization"), "first"),
+        (
+            "_checkpoint_candidate_dataset_id",
+            (SimpleNamespace(**_IDENTITY, retry_of_run_id=None, owner_run_id="owner"), "endpoint", ("Organization",)),
+            "first",
+        ),
+        ("_endpoint_dataset_state", ("dataset",), "first"),
+    ],
+)
+async def test_private_checkpoint_read_entrypoints_borrow_short_source_scope(
+    monkeypatch, reject, name, arguments, method
+):
+    directory = importlib.import_module("process.provider_directory_fhir")
+    events = []
+
+    @asynccontextmanager
+    async def scope(actual):
+        assert actual is directory
+        if reject:
+            raise RuntimeError("synthetic_scope_refused")
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    async def read(*args, **kwargs):
+        assert events == ["enter"]
+        return [] if method == "all" else None
+
+    query = AsyncMock(side_effect=read)
+    monkeypatch.setattr(directory.profile_scope_copy, "source_read_transaction", scope)
+    monkeypatch.setattr(directory.db, method, query)
+    if reject:
+        with pytest.raises(RuntimeError, match="synthetic_scope_refused"):
+            await getattr(directory, name)(*arguments)
+        query.assert_not_awaited()
+    else:
+        await getattr(directory, name)(*arguments)
+        query.assert_awaited_once()
+        assert events == ["enter", "exit"]
 
 
 def test_all_bulk_writer_scopes_and_connection_children_pass_full_identity():
