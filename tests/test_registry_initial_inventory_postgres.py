@@ -55,14 +55,17 @@ def _command(receipt=None, **changes):
 
 
 @pytest.fixture
-async def initial_worker(bootstrap_db, serving_schema):
+async def initial_worker(bootstrap_db, serving_schema, request):
     fixture = bootstrap_db
     fixture.control_schema = serving_schema[1]
     fixture.base = None
     actor = RegistryActor("platform_admin", uuid4(), "system")
     await _draft(fixture, _create(), actor)
     async with _worker_roles(fixture, SimpleNamespace(actor=actor)) as worker:
-        receipt = await _bootstrap_prepare(fixture, await _bootstrap_specification(fixture))
+        runtime_roles = (fixture.roles["reader"],) if getattr(request, "param", None) == "reader_only" else None
+        receipt = await _bootstrap_prepare(
+            fixture, await _bootstrap_specification(fixture), runtime_roles=runtime_roles
+        )
         fixture.base = receipt.address_source
         worker.bootstrap = receipt
         yield worker
@@ -612,3 +615,27 @@ async def test_ordinary_custody_enrolls_and_restricted_replay_preserves_revocati
             await connection.fetchval(f'SELECT receipt_json::text FROM "{schema}".network_candidate_custody') == before
         )
         assert await _head(worker) is None and (await _status(worker, queued))["state"] == "running"
+
+
+@pytest.mark.parametrize("initial_worker", ["reader_only"], indirect=True)
+async def test_initial_inventory_uses_private_bootstrap_access(initial_worker):
+    from process import network_bootstrap_read_access as access
+
+    worker = initial_worker
+    connection, executor = worker.fixture.connection, worker.roles_by_kind["execution"]
+    await connection.execute(f'REVOKE "{worker.fixture.roles["reader"]}" FROM "{executor}"')
+    await _enqueue(worker, _command(worker.bootstrap))
+    async with _consumer(worker) as (arguments, _calls), _custodian(worker, arguments) as (arguments, _custody):
+        async with connection.transaction(isolation="repeatable_read"):
+            await access.install_bootstrap_read_access(connection, worker.bootstrap, reader_role=executor)
+        arguments["initial_address_sources"] = _sources(worker)
+        async with arguments["execution_pool"].acquire() as executing:
+            assert not await executing.fetchval(
+                "SELECT pg_has_role(current_user,$1::name,'MEMBER')", worker.fixture.roles["reader"]
+            )
+            assert not await executing.fetchval(
+                "SELECT has_schema_privilege(current_user,$1,'USAGE')", worker.fixture.source_schema
+            )
+        completed = await consume_registry_publication_once(**arguments)
+        assert completed["state"] == "completed"
+        assert completed["result"]["membership_rows"] == 0

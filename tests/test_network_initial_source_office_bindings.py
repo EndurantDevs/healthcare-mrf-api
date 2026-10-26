@@ -31,9 +31,13 @@ def _canonical_contract_pin(*, typed, canonical_oid=31, auxiliary_oid=None, auxi
     )
 
 
-@pytest.mark.parametrize("typed", [False, True])
-async def test_canonical_contract_selects_exact_native_oid_and_minimal_query_projection(typed):
+@pytest.mark.parametrize(
+    "typed,model_contract",
+    [(False, None), (True, archive.MODEL_CLOSURE_CONTRACT), (True, archive.ACCOUNTED_MODEL_CLOSURE_CONTRACT)],
+)
+async def test_canonical_contract_selects_exact_native_oid_and_minimal_query_projection(typed, model_contract):
     pin = _canonical_contract_pin(typed=typed, auxiliary_oid=None if typed else 32)
+    pin.prepared.manifest.auxiliary["contract"] = model_contract
     canonical_oid, canonical_sql = office_bindings._canonical_source(pin)
     assert canonical_oid == (31 if typed else 32)
     if typed:

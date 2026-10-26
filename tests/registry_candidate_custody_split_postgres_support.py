@@ -217,9 +217,10 @@ async def _configure_custody(fixture):
         reader_roles=list(fixture.readers),
     )
     fixture.config = parse_registry_publication_worker_config(json.dumps(document))
-    await admin.execute(
-        f'ALTER ROLE {_q(roles_by_kind["custodian"])} SET temp_file_limit TO "{fixture.config.sql_limits.temp_file_limit_bytes // 1024}kB"'
-    )
+    for kind in ("lifecycle", "execution", "custodian", "reader"):
+        await admin.execute(
+            f'ALTER ROLE {_q(roles_by_kind[kind])} SET temp_file_limit TO "{fixture.config.sql_limits.temp_file_limit_bytes // 1024}kB"'
+        )
 
 
 async def _remove_worker_roles(fixture):

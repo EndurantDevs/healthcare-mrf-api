@@ -17,6 +17,8 @@ from process import registry_candidate_composition as composition
 from process import registry_membership_composition_stage as command_stages
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
+from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_legacy_membership_source import PinnedACAMembershipSource
 from process.network_membership_candidate_lifecycle import (
     admit_network_membership_batch,
@@ -25,21 +27,32 @@ from process.network_membership_candidate_lifecycle import (
 )
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.network_membership_validation import _validated_sources
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approved_company_read import read_registry_approved_companies
 from process.registry_candidate_composition import (
+    RegistryAddressArtifactCustody,
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
+    prepare_registry_composition_address_artifact,
 )
 from process.registry_initial_source_composition import (
     SUMMARY_KEY,
     RegistryInitialSourceError,
+    _office_receipt,
     validate_initial_source_office_receipt,
     verify_initial_source_office_receipt,
 )
 from process.registry_record_store import RegistryRecordCommand, _history_result, apply_registry_record_command
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
-from tests.test_network_custom_address_source_postgres import _draft, _seed, custom_db
+from tests.test_network_custom_address_source_postgres import (
+    _draft,
+    _seed,
+    bootstrap_db,
+    custom_db,
+    restricted_artifact_db,
+    restricted_bootstrap_artifact_db,
+)
 from tests.test_network_initial_source_office_bindings_postgres import (
     _archive,
     _cleanup_offices,
@@ -53,8 +66,207 @@ from tests.test_registry_approval_store_postgres import _actor, _approve, _comma
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("generation", ["retained-office-edition", "z" * 64, "a" * 64])
+async def test_retained_address_label_binds_digest_receipt_and_original_pin(generation):
+    """A valid source label must survive the digest-only office receipt contract."""
+    address_pin = PinnedAddressSource("retained_offices", "entity_address_unified", generation)
+    artifact = composition._retained_address_artifact(address_pin, ("reader",))
+    assert artifact.original_source == address_pin and address_pin.generation_id == generation
+    assert artifact.address_source.schema_name == address_pin.schema_name
+    assert artifact.address_source.table_name == address_pin.table_name
+    if generation == "a" * 64:
+        assert artifact.address_source == address_pin
+    else:
+        assert artifact.generation_sha256 != generation
+    pin = PinnedFHIRMembershipSource(
+        "mrf",
+        "source-one",
+        "endpoint-one",
+        "dataset-one",
+        "a" * 64,
+        "release-one",
+        123,
+        "scope-one",
+        "2026-01-01",
+    )
+    recipe = RegistrySourceMembershipRecipe(
+        pin, RegistryNetworkSourceCoordinates("fhir", "source-one", "mrf", "dataset-one", "producer", "edition")
+    )
+    approved = SimpleNamespace(approved_revision=1, generation_id="approved-one")
+    summary = _office_receipt((recipe,), approved, artifact.address_source, 0, 0, "b" * 64)
+    generations_by_source = {}
+    composition._bind_prepared_generations(generations_by_source, approved, artifact, None)
+    assert _validated_sources({"source_generations": generations_by_source}) == generations_by_source
+    assert (
+        generations_by_source["unified_address"] == summary["address_generation_sha256"] == artifact.generation_sha256
+    )
+    if artifact.address_source == address_pin:
+        assert "retained_unified_address" not in generations_by_source
+    else:
+        assert generations_by_source["retained_unified_address"] == address_pin.generation_id
+
+
 def _roles(fixture):
     return {"owner_role": fixture.roles["owner"], "loader_roles": (), "reader_roles": (fixture.roles["reader"],)}
+
+
+def _custodied_artifact_arguments(fixture, request_id, revision):
+    return dict(
+        request_id=request_id,
+        approved_revision=revision,
+        address_sources=RegistryCompositionAddressSources(fixture.base.base),
+        source_manifest=None,
+        expected_head=0,
+        custody=RegistryAddressArtifactCustody(
+            fixture.roles["custody"], fixture.runtime_roles, fixture.base.control_schema
+        ),
+    )
+
+
+async def _assert_restricted_artifact_topology(fixture):
+    custodian = fixture.custodian
+    identity = await custodian.fetchrow(
+        "SELECT session_user=current_user AS genuine,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls "
+        "FROM pg_roles WHERE rolname=session_user"
+    )
+    assert identity["genuine"] and not any(
+        identity[name] for name in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+    )
+    assert await custodian.fetchval("SELECT has_database_privilege(current_user,current_database(),'CREATE')")
+    assert not await custodian.fetchval(
+        "SELECT has_database_privilege($1,current_database(),'CREATE')", fixture.roles["custody"]
+    )
+    assert await custodian.fetchval(
+        "SELECT pg_has_role(current_user,$1,'SET') AND NOT pg_has_role(current_user,$1,'USAGE')",
+        fixture.roles["custody"],
+    )
+    assert not await custodian.fetchval(
+        "SELECT pg_has_role($1,$2,'MEMBER') OR pg_has_role($1,$2,'USAGE') OR pg_has_role($1,$2,'SET')",
+        fixture.roles["execution"],
+        fixture.roles["custody"],
+    )
+
+
+async def _exercise_custodied_artifact(fixture):
+    """Prepare, consume and replay the same closed artifact using actual K and E logins."""
+    approved_seed = await _seed(fixture.base)
+    request_id = uuid4()
+    arguments = _custodied_artifact_arguments(fixture, request_id, approved_seed.revision)
+    async with fixture.custodian.transaction(isolation="repeatable_read"):
+        await _assert_restricted_artifact_topology(fixture)
+        receipt = await prepare_registry_composition_address_artifact(fixture.custodian, **arguments)
+        fixture.base.composition_ids.append(UUID(receipt.composition_id))
+        assert await fixture.custodian.fetchval("SELECT current_user") == fixture.roles["custodian"]
+        await _assert_restricted_artifact_topology(fixture)
+    writer_roles_by_kind = dict(
+        owner_role=fixture.roles["loading"], loader_roles=(), reader_roles=(fixture.base.roles["reader"],)
+    )
+    address_sources = replace(arguments["address_sources"], prepared_address_artifact=receipt)
+    async with fixture.execution.transaction(isolation="repeatable_read", readonly=True):
+        approved = await pin_approved_membership_source(
+            fixture.execution, approved_revision=approved_seed.revision, control_schema=fixture.base.control_schema
+        )
+        artifact, summary = await composition._composition_artifact(
+            fixture.execution, address_sources, request_id, approved, writer_roles_by_kind, fixture.base.control_schema
+        )
+        assert artifact == receipt and summary is None
+        assert await fixture.execution.fetchval("SELECT current_user=session_user")
+        assert not await fixture.execution.fetchval(
+            "SELECT has_schema_privilege(current_user,$1,'CREATE') OR "
+            "has_table_privilege(current_user,$2::oid,'INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER,REFERENCES,MAINTAIN')",
+            receipt.address_source.schema_name,
+            receipt.address_table_oid,
+        )
+        with pytest.raises(composition.RegistryCompositionError, match="artifact_changed"):
+            await composition._composition_artifact(
+                fixture.execution, address_sources, uuid4(), approved, writer_roles_by_kind, fixture.base.control_schema
+            )
+        incomplete = replace(
+            receipt, runtime_roles=tuple(role for role in receipt.runtime_roles if role != fixture.roles["execution"])
+        )
+        with pytest.raises(composition.RegistryCompositionError, match="artifact_roles_differ"):
+            await composition._composition_artifact(
+                fixture.execution,
+                replace(address_sources, prepared_address_artifact=incomplete),
+                request_id,
+                approved,
+                writer_roles_by_kind,
+                fixture.base.control_schema,
+            )
+        assert not await fixture.execution.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a "
+            "WHERE n.oid=$1::oid AND a.grantee=$2::regrole)",
+            receipt.schema_oid,
+            fixture.roles["custodian"],
+        )
+    async with fixture.custodian.transaction(isolation="repeatable_read"):
+        assert await prepare_registry_composition_address_artifact(fixture.custodian, **arguments) == receipt
+    return receipt
+
+
+async def test_independent_restricted_custodian_prepares_runtime_unreachable_artifact(restricted_artifact_db):
+    await _exercise_custodied_artifact(restricted_artifact_db)
+
+
+async def test_custodied_artifact_preserves_authenticated_bootstrap_readers(restricted_bootstrap_artifact_db):
+    from process import network_bootstrap_read_access as access
+    from process.network_custom_address_source import NetworkCustomAddressSourceError, verify_custom_address_source
+
+    fixture = restricted_bootstrap_artifact_db
+    admin = fixture.base.connection
+    before = await access._acl(admin, fixture.bootstrap)
+    receipt = await _exercise_custodied_artifact(fixture)
+    assert await access._acl(admin, fixture.bootstrap) == before
+    assert not await admin.fetchval(
+        "SELECT has_table_privilege($1,$2::oid,'SELECT')",
+        fixture.roles["loading"],
+        fixture.bootstrap.relation_oids[0][1],
+    )
+    namespace = '"' + fixture.bootstrap.address_source.schema_name + '"'
+    try:
+        await admin.execute(f'GRANT USAGE ON SCHEMA {namespace} TO "{fixture.roles["loading"]}"')
+        await admin.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA {namespace} TO "{fixture.roles["loading"]}"')
+        async with fixture.execution.transaction(isolation="repeatable_read", readonly=True):
+            with pytest.raises(NetworkCustomAddressSourceError, match="bootstrap read access differs"):
+                await verify_custom_address_source(fixture.execution, receipt)
+    finally:
+        await admin.execute(f'REVOKE ALL ON SCHEMA {namespace} FROM "{fixture.roles["loading"]}"')
+        await admin.execute(f'REVOKE ALL ON ALL TABLES IN SCHEMA {namespace} FROM "{fixture.roles["loading"]}"')
+    assert await access._acl(admin, fixture.bootstrap) == before
+
+
+async def test_custodied_artifact_interruption_removes_construction_access_and_retries(
+    restricted_artifact_db, monkeypatch
+):
+    from process import network_custom_address_source as custom_sources
+
+    fixture = restricted_artifact_db
+    seed = await _seed(fixture.base)
+    arguments = _custodied_artifact_arguments(fixture, uuid4(), seed.revision)
+    lookup = custom_sources._prepare_office_lookup
+
+    async def interrupt(*_arguments):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(custom_sources, "_prepare_office_lookup", interrupt)
+    async with fixture.custodian.transaction(isolation="repeatable_read"):
+        with pytest.raises(asyncio.CancelledError):
+            await prepare_registry_composition_address_artifact(fixture.custodian, **arguments)
+        assert await fixture.custodian.fetchval("SELECT current_user") == fixture.roles["custodian"]
+        assert not await fixture.custodian.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname LIKE 'network_composition_%')"
+        )
+        await _assert_restricted_artifact_topology(fixture)
+    monkeypatch.setattr(custom_sources, "_prepare_office_lookup", lookup)
+    async with fixture.custodian.transaction(isolation="repeatable_read"):
+        receipt = await prepare_registry_composition_address_artifact(fixture.custodian, **arguments)
+        fixture.base.composition_ids.append(UUID(receipt.composition_id))
+    assert (
+        await fixture.base.connection.fetchval(
+            "SELECT to_regnamespace($1)::oid::bigint", receipt.address_source.schema_name
+        )
+        == receipt.schema_oid
+    )
 
 
 async def _remove_candidates(fixture, copy_targets, request_id):
@@ -217,6 +429,65 @@ async def test_approved_manual_composition_seals_without_publishing_and_replays(
             == 0
         )
         _assert_manual_retention(candidate)
+    finally:
+        await _remove_candidates(fixture, copy_targets, request_id)
+
+
+async def test_composition_replays_candidate_sealed_between_preparation_and_copy(custom_db, monkeypatch):
+    """A completed newer phase must be verified instead of replaying stale open-state writes."""
+    fixture = custom_db
+    await _allow_composition_owner(fixture)
+    approved_seed = await _seed(fixture)
+    request_id = uuid4()
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        approved = await pin_approved_membership_source(
+            fixture.connection, approved_revision=approved_seed.revision, control_schema=fixture.control_schema
+        )
+    fixture.composition_ids.append(uuid5(request_id, "address:" + approved.generation_id))
+    copy_targets = []
+    original_complete = composition._complete_composition
+    original_copy = composition._copy_composition
+    copy_calls = []
+
+    async def count_copy(*arguments):
+        copy_calls.append(arguments[1])
+        return await original_copy(*arguments)
+
+    async def complete_after_another_attempt(connection, prepared, source_manifest, control_schema):
+        copy_target, _address, prior_state, source_stage, command_stage, writer_roles = prepared
+        copy_targets.append(copy_target)
+        assert prior_state == "open"
+        await count_copy(connection, copy_target, control_schema, source_stage, command_stage, writer_roles)
+        state = await connection.fetchval(
+            f'SELECT state FROM "{control_schema}".network_membership_candidate WHERE candidate_id=$1',
+            UUID(copy_target.candidate_id),
+        )
+        assert state == "sealed"
+        return await original_complete(connection, prepared, source_manifest, control_schema)
+
+    monkeypatch.setattr(composition, "_copy_composition", count_copy)
+    monkeypatch.setattr(composition, "_complete_composition", complete_after_another_attempt)
+    try:
+        copy_target, _address_source = await compose_registry_membership_candidate(
+            fixture.connection,
+            request_id=request_id,
+            approved_revision=approved_seed.revision,
+            expected_head=0,
+            address_sources=RegistryCompositionAddressSources(fixture.base),
+            writer_roles=_roles(fixture),
+            control_schema=fixture.control_schema,
+        )
+        assert copy_calls == [copy_target]
+        candidate = await fixture.connection.fetchrow(
+            f'SELECT * FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+            UUID(copy_target.candidate_id),
+        )
+        assert candidate["state"] == "sealed" and candidate["accepted_rows"] == candidate["expected_rows"] == 1
+        _assert_manual_retention(candidate)
+        assert (
+            await fixture.connection.fetchval(f'SELECT count(*) FROM "{copy_target.schema_name}".network_membership')
+            == 1
+        )
     finally:
         await _remove_candidates(fixture, copy_targets, request_id)
 

@@ -459,3 +459,414 @@ async def test_replay_rejects_foreign_checkpoint_or_candidate_before_publication
         await consumer._replay(connection, case.accepted, case.recipe, case.config)
     publish.assert_not_awaited()
     case.custody.assert_not_awaited()
+
+
+def batch_config(**kwargs):
+    return consumer.RegistryACASourceConsumerConfig(
+        "registry_control", "executor", "loading_owner", initial_batch=True, **kwargs
+    )
+
+
+async def batch_recipes(monkeypatch):
+    from tests.test_registry_aca_source_recipe import _batch_prepared
+
+    prepared, validation = await _batch_prepared(monkeypatch)
+    recipes = producer._batch_recipes(prepared, validation, _ROLES)
+    monkeypatch.setattr(consumer, "require_registry_aca_source_batch", AsyncMock(return_value=recipes))
+    return recipes
+
+
+def batch_addresses():
+    return consumer.RegistryCompositionAddressSources(
+        consumer.PinnedAddressSource("retained_addresses", "entity_address_unified", "a" * 64)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("counts", [(1, 0), (0, 1), (1, 2), (0, 0)])
+async def test_initial_batch_preserves_every_scope_but_requires_some_approved_mapping(monkeypatch, counts):
+    recipes = await batch_recipes(monkeypatch)
+    connection = SimpleNamespace(transaction=transaction, fetchval=AsyncMock(side_effect=[1, 0]))
+    approved = object()
+    monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock(return_value=approved))
+    bindings = AsyncMock(side_effect=counts)
+    monkeypatch.setattr(consumer, "require_approved_network_source_bindings", bindings)
+    selected = await consumer._selection(connection, recipes, batch_config(initial_address_sources=batch_addresses()))
+    if any(counts):
+        assert selected == (1, approved, None, recipes)
+    else:
+        assert selected == {"state": "review_required"}
+    assert [call.args[2] for call in bindings.await_args_list] == [recipe.binding_coordinates for recipe in recipes]
+    consumer.require_registry_aca_source_batch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("head,addresses", [(1, True), (0, False)])
+async def test_batch_cannot_replace_an_existing_head_or_invent_address_inputs(monkeypatch, head, addresses):
+    recipes = await batch_recipes(monkeypatch)
+    connection = SimpleNamespace(transaction=transaction, fetchval=AsyncMock(side_effect=[1, head]))
+    monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock())
+    assert await consumer._selection(
+        connection, recipes, batch_config(initial_address_sources=batch_addresses() if addresses else None)
+    ) == {"state": "review_required"}
+    consumer.require_registry_aca_source_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["subset", "native_subset", "no_mapping", "boolean_count", "prior_head"])
+async def test_batch_replay_requires_complete_native_recipes_current_approval_and_initial_head(monkeypatch, damage):
+    recipes = await batch_recipes(monkeypatch)
+    candidate_by_name = {
+        "source_recipes_json": canonical_registry_source_recipes(recipes),
+        "approved_custom_revision": 1,
+        "expected_head": 0,
+    }
+    if damage == "subset":
+        candidate_by_name["source_recipes_json"] = canonical_registry_source_recipes(recipes[:1])
+    elif damage == "native_subset":
+        consumer.require_registry_aca_source_batch.return_value = recipes[:1]
+    elif damage == "prior_head":
+        candidate_by_name["expected_head"] = 3
+    count = 0 if damage == "no_mapping" else True if damage == "boolean_count" else 1
+    monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock())
+    monkeypatch.setattr(consumer, "require_approved_network_source_bindings", AsyncMock(return_value=count))
+    with pytest.raises(ValueError):
+        await consumer._replay_recipes(object(), candidate_by_name, recipes, batch_config())
+
+
+@pytest.mark.asyncio
+async def test_batch_replay_retains_zero_map_members_in_the_exact_original_set(monkeypatch):
+    recipes = await batch_recipes(monkeypatch)
+    candidate_by_name = {
+        "source_recipes_json": canonical_registry_source_recipes(recipes),
+        "approved_custom_revision": 1,
+        "expected_head": 0,
+    }
+    monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock())
+    monkeypatch.setattr(consumer, "require_approved_network_source_bindings", AsyncMock(side_effect=[1, 0]))
+    assert await consumer._replay_recipes(object(), candidate_by_name, recipes, batch_config()) == recipes
+
+
+async def global_batch_case(monkeypatch, counts=(1, 0)):
+    from tests.test_registry_aca_global_transport import attach, global_config, global_family
+
+    anchors = await batch_recipes(monkeypatch)
+    _, epoch = await global_family(monkeypatch)
+    state = SimpleNamespace(head=4, recipes=anchors)
+    approved = SimpleNamespace(approved_revision=1)
+    counts_by_coordinates = dict(zip((anchor.binding_coordinates for anchor in anchors), counts, strict=True))
+    counts_by_parameters = {coordinates.sql_parameters: count for coordinates, count in counts_by_coordinates.items()}
+
+    async def fetchval(query, *parameters):
+        if "SELECT EXISTS" in query:
+            return counts_by_parameters.get(parameters[1:], 1) > 0
+        return state.head if "generation_id" in query else 1
+
+    async def bindings(connection, pin, coordinates, **options):
+        assert pin is approved and options == {"control_schema": "registry_control"}
+        return counts_by_coordinates.get(coordinates, 1)
+
+    connection = SimpleNamespace(transaction=transaction, fetchval=AsyncMock(side_effect=fetchval))
+    monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock(return_value=approved))
+    monkeypatch.setattr(consumer, "require_approved_network_source_bindings", AsyncMock(side_effect=bindings))
+    monkeypatch.setattr(consumer, "resolve_network_serving_manifest", AsyncMock(return_value=state))
+    monkeypatch.setattr(
+        consumer, "resolve_retained_registry_source_recipes", AsyncMock(side_effect=lambda *a, **k: state.recipes)
+    )
+    monkeypatch.setattr(consumer, "_require_archive", AsyncMock())
+    return SimpleNamespace(
+        connection=connection,
+        state=state,
+        approved=approved,
+        anchors=anchors,
+        epoch=epoch,
+        config=global_config(),
+        combined=tuple(attach(anchor, epoch) for anchor in anchors),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("counts", [(1, 0), (0, 1)])
+async def test_initial_batch_zero_map_global_lifecycle(monkeypatch, counts):
+    case = await global_batch_case(monkeypatch, counts)
+    case.state.head = 0
+    assert await consumer._selection(
+        case.connection, case.anchors, batch_config(initial_address_sources=batch_addresses())
+    ) == (1, case.approved, None, case.anchors)
+    case.state.head = 4
+    assert await consumer._selection(case.connection, case.epoch, case.config) == (
+        1,
+        case.approved,
+        case.state,
+        case.combined,
+    )
+    await consumer._verify_selected_recipes(case.connection, case.approved, case.combined, case.epoch, case.config)
+    candidate_by_name = {
+        "source_recipes_json": canonical_registry_source_recipes(case.combined),
+        "approved_custom_revision": 1,
+    }
+    assert await consumer._replay_recipes(case.connection, candidate_by_name, case.epoch, case.config) == case.combined
+    case.state.recipes = case.combined
+    assert await consumer._selection(case.connection, case.epoch, case.config) == {"state": "replayed"}
+    native = consumer._require_archive.await_args_list
+    assert [call.args[1] for call in native] == [recipe.source_pin for recipe in case.combined] * 4
+    assert {call.args[2] for call in consumer.require_approved_network_source_bindings.await_args_list} == {
+        anchor.binding_coordinates for anchor in case.anchors
+    }
+
+
+@pytest.mark.asyncio
+async def test_global_batch_all_zero_refuses_selection_final_check_and_replay(monkeypatch):
+    case = await global_batch_case(monkeypatch, (0, 0))
+    assert await consumer._selection(case.connection, case.epoch, case.config) == {"state": "review_required"}
+    with pytest.raises(ValueError):
+        await consumer._verify_selected_recipes(case.connection, case.approved, case.combined, case.epoch, case.config)
+    candidate_by_name = {
+        "source_recipes_json": canonical_registry_source_recipes(case.combined),
+        "approved_custom_revision": 1,
+    }
+    with pytest.raises(ValueError):
+        await consumer._replay_recipes(case.connection, candidate_by_name, case.epoch, case.config)
+    consumer._require_archive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["subset", "native_subset", "foreign", "native_refusal"])
+@pytest.mark.parametrize("phase", ["selection", "final", "replay"])
+async def test_global_batch_refuses_incomplete_or_foreign_scopes(monkeypatch, damage, phase):
+    from tests.test_registry_aca_global_transport import attach
+
+    case = await global_batch_case(monkeypatch, (1, 1))
+    if damage == "subset":
+        case.state.recipes = case.anchors[:1]
+    elif damage == "native_subset":
+        consumer.require_registry_aca_source_batch.return_value = case.anchors[:1]
+    elif damage == "foreign":
+        case.state.recipes = (case.anchors[0], await recipe(monkeypatch))
+    else:
+        consumer.require_registry_aca_source_batch.side_effect = ValueError("native batch stamp changed")
+    combined_recipes = tuple(attach(anchor, case.epoch) for anchor in case.state.recipes)
+    with pytest.raises(ValueError):
+        if phase == "selection":
+            await consumer._selection(case.connection, case.epoch, case.config)
+        elif phase == "final":
+            await consumer._verify_selected_recipes(
+                case.connection, case.approved, combined_recipes, case.epoch, case.config
+            )
+        else:
+            candidate_by_name = {
+                "source_recipes_json": canonical_registry_source_recipes(combined_recipes),
+                "approved_custom_revision": 1,
+            }
+            await consumer._replay_recipes(case.connection, candidate_by_name, case.epoch, case.config)
+    consumer._require_archive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_global_zero_map_member_still_requires_its_native_archive(monkeypatch):
+    case = await global_batch_case(monkeypatch)
+    consumer._require_archive.side_effect = [None, ValueError("unmapped native scope changed")]
+    with pytest.raises(ValueError, match="unmapped native scope changed"):
+        await consumer._selection(case.connection, case.epoch, case.config)
+    assert [call.args[1] for call in consumer._require_archive.await_args_list] == [
+        recipe.source_pin for recipe in case.combined
+    ]
+
+
+@pytest.mark.asyncio
+async def test_global_legacy_singleton_missing_approval_still_refuses(monkeypatch):
+    from tests.test_registry_aca_global_transport import attach
+
+    case = await global_batch_case(monkeypatch)
+    case.state.recipes = (await recipe(monkeypatch),)
+    monkeypatch.setattr(consumer, "_selected_anchor", AsyncMock(return_value=False))
+    assert await consumer._selection(case.connection, case.epoch, case.config) == {"state": "review_required"}
+    combined_recipes = (attach(case.state.recipes[0], case.epoch),)
+    with pytest.raises(ValueError):
+        await consumer._verify_selected_recipes(
+            case.connection, case.approved, combined_recipes, case.epoch, case.config
+        )
+    candidate_by_name = {
+        "source_recipes_json": canonical_registry_source_recipes(combined_recipes),
+        "approved_custom_revision": 1,
+    }
+    with pytest.raises(ValueError):
+        await consumer._replay_recipes(case.connection, candidate_by_name, case.epoch, case.config)
+    consumer.require_registry_aca_source_batch.assert_not_awaited()
+    consumer._require_archive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_batch_source_fence_rechecks_all_original_descriptors_and_completion(monkeypatch, changed):
+    recipes = await batch_recipes(monkeypatch)
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+
+    publisher = SimpleNamespace(
+        policy=GenericSourcePolicy("mrf", "source_owner", "source_publisher", ("source_reader",), ()),
+        transaction_isolation="read committed",
+    )
+    session = object()
+    active_sessions = []
+
+    @asynccontextmanager
+    async def source_transaction(*args, **kwargs):
+        assert kwargs == {"isolation": "read committed"}
+        active_sessions.append(True)
+        try:
+            yield session
+        finally:
+            active_sessions.pop()
+
+    metadata = dict(recipes[0].source_pin.prepared.manifest.source_metadata)
+    if changed:
+        metadata["aca_completed_publication"] = {}
+    family_lock = AsyncMock()
+    monkeypatch.setattr(consumer, "_lock_current_source_family", family_lock)
+    capture = AsyncMock(return_value=metadata)
+    monkeypatch.setattr(consumer, "capture_registry_aca_source_batch_metadata", capture)
+    monkeypatch.setattr(consumer.source_policy, "source_transaction", source_transaction)
+    monkeypatch.setattr(consumer.source_policy, "bound_publisher", lambda: publisher)
+    settings = batch_config(source_authority_roles=consumer.source_authority_roles(publisher.policy))
+    if changed:
+        with pytest.raises(consumer.StaleACASourceError):
+            async with consumer.current_aca_source_fence(recipes, settings):
+                pytest.fail("changed source must refuse before publication")
+    else:
+        async with consumer.current_aca_source_fence(recipes, settings):
+            assert active_sessions == [True]
+    assert active_sessions == []
+    family_lock.assert_awaited_once_with(session, "mrf")
+    assert capture.await_args.args == (
+        session,
+        [consumer.aca_source_descriptor(recipe.source_pin) for recipe in recipes],
+    )
+    assert capture.await_args.kwargs["dataset_id"] == recipes[0].source_pin.prepared.ownership.dataset_id
+    assert capture.await_args.kwargs["runtime_roles"] == _ROLES
+
+
+@pytest.mark.asyncio
+async def test_batch_configuration_cannot_smuggle_recipes_outside_the_accepted_event(monkeypatch):
+    from dataclasses import replace
+
+    recipes = await batch_recipes(monkeypatch)
+    for phase in ("initial_source_recipes", "replacement_source_recipes"):
+        with pytest.raises(ValueError):
+            batch_config(initial_address_sources=replace(batch_addresses(), **{phase: recipes}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_event", [False, True])
+async def test_batch_attempt_composes_complete_set_and_refuses_partial_final_event(monkeypatch, changed_event):
+    recipes = await batch_recipes(monkeypatch)
+    approved = SimpleNamespace(generation_id="approved")
+    runtime = object.__new__(RegistryPublicationPTGRuntime)
+    copy_target = SimpleNamespace(candidate_id=str(UUID(int=6)))
+    compose = AsyncMock(return_value=(copy_target, object()))
+    monkeypatch.setattr(RegistryPublicationPTGRuntime, "compose", compose)
+    monkeypatch.setattr(consumer, "_selection", AsyncMock(return_value=(1, approved, None, recipes)))
+    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    monkeypatch.setattr(consumer, "_checkpoint", AsyncMock(return_value=({}, {})))
+    monkeypatch.setattr(consumer, "_notice", AsyncMock(return_value=recipes[:1] if changed_event else recipes))
+    monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock(return_value=approved))
+    bindings = AsyncMock(side_effect=[1, 0])
+    monkeypatch.setattr(consumer, "require_approved_network_source_bindings", bindings)
+    fenced_batches = []
+
+    @asynccontextmanager
+    async def source_fence(accepted, settings):
+        fenced_batches.append(accepted)
+        yield
+
+    monkeypatch.setattr(consumer, "current_aca_source_fence", source_fence)
+    publish = AsyncMock()
+    monkeypatch.setattr(consumer, "publish_network_candidate", publish)
+    connection = SimpleNamespace(transaction=transaction, execute=AsyncMock(return_value="UPDATE 1"))
+    settings = batch_config(
+        initial_address_sources=batch_addresses(), composition_runtime=runtime, seal_candidate=AsyncMock()
+    )
+    operation = consumer._attempt(connection, None, None, {}, consumer._event(event(), {}), recipes, settings)
+    if changed_event:
+        with pytest.raises(ValueError):
+            await operation
+        assert fenced_batches == []
+        publish.assert_not_awaited()
+        bindings.assert_not_awaited()
+    else:
+        assert await operation == {"state": "completed"}
+        assert fenced_batches == [recipes]
+        publish.assert_awaited_once()
+        assert bindings.await_count == len(recipes)
+    composed = compose.await_args.kwargs
+    assert composed["expected_head"] == 0 and composed["source_manifest"] is None
+    assert composed["address_sources"].initial_source_recipes == recipes
+
+
+def _source_fence_config(mode, roles):
+    return (
+        config(source_authority_roles=roles)
+        if mode == "singleton"
+        else consumer.RegistryACASourceConsumerConfig(
+            "registry_control",
+            "executor",
+            "loading_owner",
+            source_authority_roles=roles,
+            initial_batch=mode == "batch",
+            global_epoch=mode == "global",
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["singleton", "batch", "global"])
+@pytest.mark.parametrize("isolation", ["read committed", "repeatable read", "serializable"])
+async def test_every_source_mode_fences_before_metadata_and_refuses_stale_snapshot_modes(monkeypatch, mode, isolation):
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+
+    selected = await recipe(monkeypatch)
+    accepted = await batch_recipes(monkeypatch) if mode == "batch" else selected
+    if mode == "global":
+        accepted = SimpleNamespace(prepared=selected.source_pin.prepared)
+    publisher = SimpleNamespace(
+        policy=GenericSourcePolicy("mrf", "source_owner", "source_publisher", ("source_reader",), ()),
+        transaction_isolation=isolation,
+    )
+    roles = consumer.source_authority_roles(publisher.policy)
+    settings = _source_fence_config(mode, roles)
+    session, sequence = object(), []
+
+    @asynccontextmanager
+    async def source_transaction(*args, **kwargs):
+        assert kwargs == {"isolation": "read committed"}
+        yield session
+
+    async def lock(actual, schema):
+        assert actual is session and schema == "mrf"
+        sequence.append("fenced")
+
+    async def capture(*args, **kwargs):
+        assert sequence == ["fenced"]
+        sequence.append("metadata")
+        return (
+            accepted[0].source_pin.prepared.manifest.source_metadata
+            if mode == "batch"
+            else selected.source_pin.prepared.manifest.source_metadata
+        )
+
+    monkeypatch.setattr(consumer.source_policy, "source_transaction", source_transaction)
+    monkeypatch.setattr(consumer.source_policy, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(consumer, "_lock_current_source_family", lock)
+    for name in (
+        "capture_registry_aca_source_metadata",
+        "capture_registry_aca_source_batch_metadata",
+        "_current_global_metadata",
+    ):
+        monkeypatch.setattr(consumer, name, capture)
+    if isolation != "read committed":
+        with pytest.raises(ValueError):
+            async with consumer.current_aca_source_fence(accepted, settings):
+                pytest.fail("old snapshot cannot enter publication")
+        assert sequence == []
+    else:
+        async with consumer.current_aca_source_fence(accepted, settings):
+            assert sequence == ["fenced", "metadata"]

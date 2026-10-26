@@ -227,11 +227,14 @@ class Engine:
     async def connect(self):
         harness = self.harness
         harness.events.append("reader connect")
-        harness.options["listener"](SimpleNamespace(run_async=harness.listeners.append), None, None)
-        await harness.listeners[-1](harness.reader)
+        if "listener" in harness.options:
+            harness.options["listener"](SimpleNamespace(run_async=harness.listeners.append), None, None)
+            await harness.listeners[-1](harness.reader)
         if harness.fail_connect:
             raise RuntimeError(_PRIVATE)
-        yield SimpleNamespace(get_raw_connection=AsyncMock())
+        yield SimpleNamespace(
+            get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=harness.reader))
+        )
 
     async def dispose(self):
         self.harness.events.append("reader dispose")
@@ -250,6 +253,11 @@ def resources(monkeypatch, *, wrong_database=False, fail_connect=False, fail_clo
     )
     verify = AsyncMock()
     monkeypatch.setattr(worker.RegistryPublicationSQLLimits, "verify", verify)
+    monkeypatch.setattr(
+        worker,
+        "_worker_backend_qualification",
+        AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock())),
+    )
 
     async def create_pool(**kwargs):
         harness.options["pool"] = kwargs
@@ -286,7 +294,7 @@ async def test_one_consume_has_finite_actual_checkout_limits_and_state_only_outp
 
     monkeypatch.setattr(worker, "consume_registry_cms_source_notification_once", consume)
     assert await worker.run_registry_cms_source_worker(parsed()) == {"state": state}
-    assert events == ["acquire", "reader connect", "consume", "release", "reader dispose", "pool close"]
+    assert events == ["reader connect", "acquire", "consume", "release", "pool close", "reader dispose"]
     assert verify.await_count == 2
     assert options["pool"]["min_size"] == options["pool"]["max_size"] == 1
     assert options["engine"]["pool_size"] == 1 and options["engine"]["max_overflow"] == 0
@@ -318,11 +326,14 @@ async def test_failure_and_cancellation_drain_before_owned_cleanup(monkeypatch, 
     monkeypatch.setattr(worker, "consume_registry_cms_source_notification_once", consume)
     with pytest.raises((ValueError, RuntimeError, asyncio.CancelledError)):
         await worker.run_registry_cms_source_worker(parsed())
-    assert events.index("release") < events.index("reader dispose") < events.index("pool close")
+    if failure == "connect":
+        assert events == ["reader connect", "reader dispose"]
+        return
+    assert events.index("release") < events.index("pool close") < events.index("reader dispose")
     if failure not in {"database", "connect"}:
         assert events.index("consumer drained") < events.index("release")
     if failure == "close":
-        assert events[-1] == "pool terminate"
+        assert events[-2:] == ["pool terminate", "reader dispose"]
 
 
 @pytest.mark.asyncio
@@ -330,6 +341,16 @@ async def test_failure_and_cancellation_drain_before_owned_cleanup(monkeypatch, 
 async def test_execution_identity_refuses_wrong_actor_or_open_transaction(role, transaction):
     with pytest.raises(ValueError):
         await worker._identity(Connection(role, in_transaction=transaction), parsed(), "registry_executor")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only,isolation", [("off", "repeatable read"), ("on", "read committed")])
+async def test_notification_reader_requires_read_settings(monkeypatch, read_only, isolation):
+    connection = Connection("source_reader")
+    connection.fetchval = AsyncMock(side_effect=[read_only, isolation])
+    monkeypatch.setattr(worker.RegistryPublicationSQLLimits, "verify", AsyncMock())
+    with pytest.raises(ValueError, match="registry_cms_source_worker_connection_invalid"):
+        await worker._notification_reader_identity(parsed(), connection)
 
 
 def test_actual_command_registration_and_unsupported_argument_redaction():

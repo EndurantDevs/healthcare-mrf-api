@@ -511,7 +511,7 @@ def direct_detail(monkeypatch):
 
     async def pin(actual_request, selectors):
         assert actual_request is request and selectors["network_ids"] == "42"
-        return manifest, (42,), boundary.access_scope
+        return manifest, (42,), boundary.access_scope, None
 
     async def native_read(actual_request, npi):
         assert actual_request is request and npi == _NPI
@@ -785,3 +785,27 @@ async def test_optional_geocodes_preserve_reader_membership(monkeypatch, outcome
     assert state.rollbacks == int(outcome.endswith("_error")) and state.memberships == 1
     assert snapshot._SNAPSHOT.get() is None and state.depth == 0
     writer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_offices_without_canonical_coverage_keep_facts_without_invented_membership():
+    manifest = address_manifest()
+    document_by_field = {
+        "npi": int(_NPI),
+        "address_list": [
+            {"address_key": _ADDRESS, "first_line": "Covered office"},
+            {"address_key": _OTHER, "first_line": "Legacy sibling office"},
+            {"first_line": "Legacy office without canonical location"},
+        ],
+    }
+    with network_address_read_scope(manifest, (42,), access_scope_sha256="d" * 64, legacy_checksums=(84,)):
+        result = await metadata.project_managed_collection_metadata(
+            _session([_fact()]), manifest, [document_by_field], include_sources=False, include_evidence=False
+        )
+    offices = result[0]["address_list"]
+    assert len(offices) == 3
+    assert offices[0]["network_memberships"][0]["network_id"] == 42
+    assert offices[1]["network_memberships"] == offices[2]["network_memberships"] == []
+    assert [office["first_line"] for office in offices] == [
+        office["first_line"] for office in document_by_field["address_list"]
+    ]

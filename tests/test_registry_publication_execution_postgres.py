@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
@@ -43,6 +44,19 @@ from process.registry_publication_queue import (
 from process.registry_record_store import RegistryActor
 from tests.test_network_address_projection_postgres import projection_db as projection_db
 from tests.test_network_custom_address_source_postgres import _draft as _custom_draft
+from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_db
+from tests.test_network_fhir_retained_capture_postgres import (
+    _approved_capture_recipe,
+    _retained_custody_base,
+    _retained_custody_captured_input,
+    _retained_custody_compose,
+    _retained_custody_publish,
+    _retained_custody_seal,
+)
+from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
+from tests.test_network_fhir_retained_capture_postgres import (
+    retained_address_custody_db as retained_address_custody_db,
+)
 from tests.test_network_membership_candidate_indexes_postgres import indexed_db as indexed_db
 from tests.test_network_membership_pipeline_postgres import _arguments
 from tests.test_network_membership_pipeline_postgres import pipeline_db as pipeline_db
@@ -798,6 +812,123 @@ async def test_source_preview_preserves_verified_retained_custom_npi_office(cust
         )
         == history.second.generation_id
     )
+
+
+async def _bootstrap_retained_history(case, publisher, source, serving, bootstrap):
+    """Publish genuine retained FHIR on an independently owned address/NPI capture."""
+    capture = await _retained_custody_captured_input(source, case.complete_runtime_roles)
+    recipe, approved, network_id = await _approved_capture_recipe(source, serving, capture)
+    bootstrap_address = base = await _retained_custody_base(case, source, serving, bootstrap)
+    first = previous = None
+    for _ in range(2):
+        (target, address), _ = await _retained_custody_compose(
+            case, publisher, base, recipe, approved.approved_revision, previous=previous
+        )
+        await _retained_custody_publish(case, target, address)
+        async with publisher.transaction(isolation="repeatable_read", readonly=True):
+            previous = await resolve_network_serving_manifest(publisher, control_schema=case.control_schema)
+        first = first or previous
+        base = PinnedAddressSource(previous.schema_name, "entity_address_unified", previous.manifest_sha256)
+    return first, previous, network_id, bootstrap_address
+
+
+async def _bootstrap_rollback_preview(case, publisher, first, current):
+    command_by_name = {
+        "operation": "prepare_source_rollback",
+        "target_generation": first.generation_id,
+        "expected_serving_generation": current.generation_id,
+        "expected_approved_revision": first.approved_custom_revision,
+        "reason": "Review retained source edition",
+        "idempotency_key": uuid4().hex,
+    }
+    async with case.connection.transaction():
+        queued = await enqueue_registry_source_rollback_preview(
+            case.connection,
+            command_by_name,
+            RegistryActor("platform_admin", uuid4(), "system"),
+            session_token_sha256="a" * 64,
+            control_schema=case.control_schema,
+        )
+        lease = await claim_registry_publication_request(
+            case.connection, operation_family="publication", control_schema=case.control_schema
+        )
+    assert str(lease["request_id"]) == queued["request_id"]
+
+    async def seal(target):
+        case.copy_target = target
+        case.additional_schemas.append(target.schema_name)
+        await _retained_custody_seal(case)
+
+    preview_by_name = await execution.complete_queued_registry_source_rollback_preview(
+        publisher,
+        lease["request_id"],
+        lease["lease_id"],
+        authorize=_reactivation_authority([]),
+        writer_roles={
+            "owner_role": case.writer_roles["owner"],
+            "loader_roles": (case.writer_roles["loader"],),
+            "reader_roles": (case.writer_roles["reader"],),
+        },
+        control_schema=case.control_schema,
+        seal_candidate=seal,
+    )
+    status = await read_registry_publication_request(publisher, lease["request_id"], control_schema=case.control_schema)
+    assert status["state"] == "completed" and status["result"] == preview_by_name
+    return preview_by_name
+
+
+@pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
+async def test_bootstrap_retained_source_successor_and_rollback_preview(
+    retained_address_custody_db, legacy_capture_db, serving_schema, bootstrap_db
+):
+    """The real queued preview recovers protected NPI without reclassifying bootstrap."""
+    case = retained_address_custody_db
+    case.additional_schemas.append(case.copy_target.schema_name)
+    role, password = case.writer_roles["publisher"], secrets.token_hex(24)
+    await case.connection.execute(f"ALTER ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+    publisher = await asyncpg.connect(os.environ["NETWORK_REGISTRY_TEST_DSN"], user=role, password=password)
+    try:
+        first, current, network_id, bootstrap_address = await _bootstrap_retained_history(
+            case, publisher, legacy_capture_db, serving_schema, bootstrap_db
+        )
+        address_sources = await execution._source_rollback_address_sources(publisher, first, case.control_schema)
+        assert address_sources.base_source == PinnedAddressSource(
+            first.schema_name, "entity_address_unified", first.manifest_sha256
+        )
+        assert address_sources.npi_source == PinnedAddressSource(
+            bootstrap_address.schema_name, "npi", bootstrap_address.generation_id
+        )
+        preview_by_name = await _bootstrap_rollback_preview(case, publisher, first, current)
+        assert preview_by_name["operation"] == "prepare_source_rollback"
+        assert (preview_by_name["additions"], preview_by_name["removals"], preview_by_name["changes"]) == (0, 0, 0)
+        assert preview_by_name["source_selection"] == {"mapped_rows": 1, "omitted_rows": 0}
+        async with publisher.transaction(isolation="repeatable_read", readonly=True):
+            assert await resolve_network_serving_manifest(publisher, control_schema=case.control_schema) == current
+            assert (
+                await publisher.fetchval(
+                    f'SELECT count(*) FROM "{first.schema_name}".network_membership WHERE network_id=$1', network_id
+                )
+                == 1
+            )
+            office_rows = await publisher.fetch(
+                f'SELECT canonical_network_ids FROM "{current.schema_name}".entity_address_unified ORDER BY location_key'
+            )
+            assert [office["canonical_network_ids"] for office in office_rows] == [[network_id], []]
+        npi_table = f'"{bootstrap_address.schema_name}".npi'
+        original_name = await case.connection.fetchval(f"SELECT provider_first_name FROM {npi_table}")
+        await case.connection.execute(f"UPDATE {npi_table} SET provider_first_name='Changed'")
+        try:
+            with pytest.raises(execution.bootstrap_sources.NetworkBootstrapSourceError, match="content or shape"):
+                await execution._source_rollback_address_sources(publisher, first, case.control_schema)
+        finally:
+            await case.connection.execute(f"UPDATE {npi_table} SET provider_first_name=$1", original_name)
+    finally:
+        await publisher.close()
+        await case.connection.execute(f'ALTER ROLE "{role}" NOLOGIN PASSWORD NULL')
+        candidate_rows = await case.connection.fetch(
+            f'SELECT schema_name FROM "{case.control_schema}".network_membership_candidate'
+        )
+        case.additional_schemas.extend(candidate_row["schema_name"] for candidate_row in candidate_rows)
 
 
 async def test_source_preview_rejects_changed_recorded_npi_oid(custom_npi_preview):

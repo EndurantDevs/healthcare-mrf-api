@@ -335,6 +335,94 @@ def test_nested_company_and_binding_metadata_is_closed():
         catalog._network_document(changed)
 
 
+def retained_binding_document():
+    """Keep retained capture evidence distinct from legacy aliases."""
+    return {
+        "namespace": "source_binding",
+        "binding_id": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "source_system": "fhir",
+        "source_id": "source",
+        "dataset_schema": "sample_source",
+        "dataset_id": "dataset",
+        "producer_id": "registry-retained-normalized-fhir-v1",
+        "edition_id": "capture-one",
+        "source_key": "network-one",
+        "source_scope": {"organization_id": "network-one", "capture_sha256": "a" * 64},
+        "evidence_id": "reviewed-evidence",
+        "evidence_sha256": "b" * 64,
+    }
+
+
+@pytest.mark.asyncio
+async def test_retained_capture_catalog_response_preserves_exact_source_and_generation(batch_boundary):
+    """Accept only the producer-bound capture shape through the ordinary pinned reader."""
+    connection, manifest, revisions = batch_boundary
+    binding = retained_binding_document()
+    document = network_document() | {"source_bindings": [binding]}
+    connection.page["rows_json"] = json.dumps([document])
+    coordinates = RegistryNetworkSourceCoordinates(
+        *[
+            binding[key]
+            for key in ("source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id")
+        ]
+    )
+    page = await catalog.read_registry_network_catalog(
+        connection,
+        catalog.RegistryNetworkCatalogQuery(source=coordinates, generation_id=manifest.generation_id),
+        excluded_network_ids=(2,),
+        control_schema="sample_control",
+    )
+    assert page["items"] == (document,) and page["generation"] == "9" and revisions == [4]
+    assert connection.calls[-1][1][4] == coordinates.sql_parameters
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"producer_id": "different-producer"},
+        {"source_system": "ptg"},
+        {"source_scope": {"organization_id": "network-one", "capture_sha256": "A" * 64}},
+        {"source_scope": {"organization_id": "network-one", "capture_sha256": "a" * 63}},
+        {"source_scope": {"organization_id": "network-one", "capture_sha256": None}},
+        {"source_scope": {"organization_id": "network_one", "capture_sha256": "a" * 64}},
+        {"source_scope": {"organization_id": "network-one"}},
+        {
+            "source_scope": {
+                "organization_id": "network-one",
+                "capture_sha256": "a" * 64,
+                "legacy_uuid": "11111111-1111-4111-8111-111111111111",
+            }
+        },
+    ],
+)
+def test_retained_capture_catalog_refuses_forged_producer_hash_or_mixed_scope(changes):
+    """Do not widen arbitrary FHIR metadata or the legacy UUID namespace."""
+    document = network_document() | {"source_bindings": [retained_binding_document() | changes]}
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        catalog._network_document(document)
+
+
+def test_retained_capture_scope_never_satisfies_a_legacy_uuid_selector():
+    """A registry capture digest cannot create an original-source UUID alias."""
+    binding = retained_binding_document()
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="document_invalid"):
+        catalog._source_scope("fhir", binding["source_scope"])
+    coordinates = replace(source_coordinates("fhir"), producer_id=binding["producer_id"])
+    identifier = "11111111-1111-4111-8111-111111111111"
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="request_invalid"):
+        catalog.RegistryNetworkCatalogLegacySelector(
+            coordinates, "legacy_fhir_uuid", identifier, json.dumps(binding["source_scope"]).encode()
+        )
+    legacy_scope_by_field = {"organization_id": "network-one", "legacy_uuid": identifier, "alias_scope": "original"}
+    assert (
+        catalog.RegistryNetworkCatalogLegacySelector(
+            coordinates, "legacy_fhir_uuid", identifier, json.dumps(legacy_scope_by_field).encode()
+        ).value
+        == identifier
+    )
+
+
 @pytest.mark.asyncio
 async def test_approved_multibyte_names_aliases_and_search_use_character_limits(batch_boundary):
     connection, _, pinned_revisions = batch_boundary

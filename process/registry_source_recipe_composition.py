@@ -15,6 +15,7 @@ from process.network_fhir_membership_source import (
     FHIRMembershipBatchBoundsError,
     PinnedFHIRMembershipSource,
     read_fhir_membership_batch,
+    read_retained_fhir_membership_batch,
 )
 from process.network_fhir_source_custody import (
     FHIRSourceCustodyError,
@@ -22,7 +23,12 @@ from process.network_fhir_source_custody import (
     require_retained_cms_fhir_source_custody,
 )
 from process.network_fhir_source_epoch import FHIRSourceEpochError, require_retained_cms_fhir_source_epoch
-from process.network_legacy_membership_source import LegacyMembershipBatchBoundsError, read_aca_raw_fact_batch
+from process.network_legacy_membership_source import (
+    LegacyMembershipBatchBoundsError,
+    PinnedACAMembershipSource,
+    _read_aca_batch,
+    read_aca_raw_fact_batch,
+)
 from process.network_membership_copy import COPY_COLUMNS, _encode
 from process.registry_ptg_office_membership import (
     PTGOfficeBatchBoundsError,
@@ -65,17 +71,37 @@ async def _read_recipe_page(connection, recipe, approved, cursor, control_schema
                 )
                 return batch, batch.next_ordinal, limit
             if type(recipe.source_pin) is PinnedFHIRMembershipSource:
-                batch = await read_fhir_membership_batch(
-                    connection, recipe.source_pin, after_resource=cursor, limit=limit, **options_by_name
-                )
+                if recipe.source_pin.retained_capture is not None:
+                    batch = await read_retained_fhir_membership_batch(
+                        connection,
+                        recipe.source_pin,
+                        office_source,
+                        registry_schema=control_schema,
+                        after_resource=cursor,
+                        limit=limit,
+                        approved_source=approved,
+                        binding_coordinates=recipe.binding_coordinates,
+                    )
+                else:
+                    batch = await read_fhir_membership_batch(
+                        connection, recipe.source_pin, after_resource=cursor, limit=limit, **options_by_name
+                    )
                 return batch, batch.next_resource, limit
-            batch = await read_aca_raw_fact_batch(
-                connection,
-                recipe.source_pin,
-                after_source_position=cursor,
-                limit=limit,
-                **options_by_name,
-            )
+            if office_source is None:
+                batch = await read_aca_raw_fact_batch(
+                    connection, recipe.source_pin, after_source_position=cursor, limit=limit, **options_by_name
+                )
+            else:
+                batch = await _read_aca_batch(
+                    connection,
+                    recipe.source_pin,
+                    control_schema,
+                    approved,
+                    recipe.binding_coordinates,
+                    True,
+                    (None, limit, cursor, True),
+                    office_source,
+                )
             return batch, batch.next_source_position, limit
         except FHIRMembershipBatchBoundsError, LegacyMembershipBatchBoundsError, PTGOfficeBatchBoundsError:
             if limit == 1:
@@ -104,8 +130,25 @@ async def _copy_recipe_page(connection, batch, raw_table):
                 raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
 
 
-async def _stage_recipe(connection, recipe, approved, raw_table, control_schema, office_authority=None):
-    office_source = await _require_recipe_custody(connection, recipe, approved, control_schema, office_authority)
+async def _stage_recipe(
+    connection,
+    recipe,
+    approved,
+    raw_table,
+    control_schema,
+    office_authority=None,
+    aca_reads_by_oid=None,
+    retained_fhir_reads=None,
+):
+    office_source = await _require_recipe_custody(
+        connection,
+        recipe,
+        approved,
+        control_schema,
+        office_authority,
+        aca_reads_by_oid,
+        retained_fhir_reads=retained_fhir_reads,
+    )
     cursor, generation = None, None
     limit = 1000
     membership_rows = omitted_rows = 0
@@ -142,27 +185,53 @@ async def _stage_recipe(connection, recipe, approved, raw_table, control_schema,
         cursor = next_cursor
 
 
-async def _require_recipe_custody(connection, recipe, approved=None, control_schema=None, office_authority=None):
+async def _require_recipe_custody(
+    connection,
+    recipe,
+    approved=None,
+    control_schema=None,
+    office_authority=None,
+    aca_reads_by_oid=None,
+    *,
+    retained_fhir_reads=None,
+):
     """Recheck CMS retained custody once before paging its complete recipe."""
-    source = recipe.source_pin
-    if type(source) is PinnedPTGOfficeMembershipSource:
+    source_pin = recipe.source_pin
+    if type(source_pin) is PinnedPTGOfficeMembershipSource:
         return await require_ptg_office_recipe(connection, recipe, approved, control_schema, office_authority)
-    if type(source) is not PinnedFHIRMembershipSource:
+    if type(source_pin) is PinnedACAMembershipSource:
+        from process.registry_aca_source_recipe import prepare_registry_aca_batch_read
+
+        schema_oid = source_pin.prepared.ownership.schema_oid
+        prior = (
+            aca_reads_by_oid.get(schema_oid)
+            if aca_reads_by_oid is not None
+            and source_pin.retained_successor is None
+            and source_pin.retained_epoch is None
+            else None
+        )
+        verified = await prepare_registry_aca_batch_read(connection, source_pin, verified=prior)
+        if aca_reads_by_oid is not None and verified is not None:
+            aca_reads_by_oid[schema_oid] = verified
+        return verified
+    if type(source_pin) is not PinnedFHIRMembershipSource:
         return
-    if source.retained_epoch is not None:
+    if source_pin.retained_capture is not None:
+        return await _retained_recipe_read(connection, source_pin.retained_capture, retained_fhir_reads)
+    if source_pin.retained_epoch is not None:
         try:
-            await require_retained_cms_fhir_source_epoch(connection, source, source.retained_epoch)
+            await require_retained_cms_fhir_source_epoch(connection, source_pin, source_pin.retained_epoch)
             return
         except FHIRSourceEpochError as error:
             raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable") from error
-    if source.custody_owner_role is None:
+    if source_pin.custody_owner_role is None:
         raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable")
     custody = RetainedCMSFHIRSourceCustody(
-        source,
-        source.custody_owner_role,
-        source.custody_runtime_roles,
-        source.custody_proof_sha256,
-        source.custody_catalog_sha256,
+        source_pin,
+        source_pin.custody_owner_role,
+        source_pin.custody_runtime_roles,
+        source_pin.custody_proof_sha256,
+        source_pin.custody_catalog_sha256,
     )
     try:
         await require_retained_cms_fhir_source_custody(connection, custody)
@@ -170,8 +239,25 @@ async def _require_recipe_custody(connection, recipe, approved=None, control_sch
         raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable") from error
 
 
+async def _retained_recipe_read(connection, capture, retained_fhir_reads):
+    """Share one full admission, retaining native custody checks at every use."""
+    from process.network_fhir_retained_capture import RetainedFHIRRead, pin_retained_fhir_read
+
+    if retained_fhir_reads is None:
+        return await pin_retained_fhir_read(connection, capture)
+    if type(retained_fhir_reads) is not dict:
+        raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable")
+    if capture not in retained_fhir_reads:
+        retained_fhir_reads[capture] = await pin_retained_fhir_read(connection, capture)
+    read = retained_fhir_reads[capture]
+    if type(read) is not RetainedFHIRRead:
+        raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable")
+    await read.verify(connection, capture)
+    return read
+
+
 async def stage_registry_source_recipes(
-    connection, recipes, approved, *, request_id, control_schema, office_authority=None
+    connection, recipes, approved, *, request_id, control_schema, office_authority=None, retained_fhir_reads=None
 ):
     """Stage bounded native pages in one repeatable transaction; never publish.
 
@@ -193,28 +279,22 @@ async def stage_registry_source_recipes(
     stage_id = uuid5(request_id, recipe_sha256 + ":" + approved.generation_id).hex
     raw_table = "registry_recipe_raw_" + stage_id
     page_table = "registry_source_page_" + stage_id
-    generations = []
-    membership_rows = omitted_rows = 0
-    raw_source_rows = accepted_raw_source_rows = omitted_raw_source_rows = 0
+    retained_fhir_reads = {} if retained_fhir_reads is None else retained_fhir_reads
     async with connection.transaction():
         await connection.execute(f"""CREATE TEMP TABLE {_identifier(raw_table)}(
           network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,
           location_id uuid NOT NULL,evidence_id text NOT NULL)""")
-        for recipe in recipes:
-            (
-                generation,
-                row_count,
-                omitted_count,
-                source_count,
-                accepted_count,
-                omitted_source_count,
-            ) = await _stage_recipe(connection, recipe, approved, raw_table, control_schema, office_authority)
-            generations.append(generation)
-            membership_rows += row_count
-            omitted_rows += omitted_count
-            raw_source_rows += source_count
-            accepted_raw_source_rows += accepted_count
-            omitted_raw_source_rows += omitted_source_count
+        totals = await _stage_recipe_totals(
+            connection, recipes, approved, raw_table, control_schema, office_authority, retained_fhir_reads
+        )
+        (
+            generations,
+            membership_rows,
+            omitted_rows,
+            raw_source_rows,
+            accepted_raw_source_rows,
+            omitted_raw_source_rows,
+        ) = totals
         await _finish_source_stage(connection, raw_table, page_table, membership_rows)
     generation_sha256 = _source_stage_generation(recipe_sha256, approved, generations, membership_rows, omitted_rows)
     return RegistrySourceRecipeStage(
@@ -223,6 +303,34 @@ async def stage_registry_source_recipes(
         omitted_rows,
         generation_sha256,
         tuple(generations),
+        raw_source_rows,
+        accepted_raw_source_rows,
+        omitted_raw_source_rows,
+    )
+
+
+async def _stage_recipe_totals(
+    connection, recipes, approved, raw_table, control_schema, office_authority, retained_reads
+):
+    """Keep complete raw accounting unchanged across every admitted recipe."""
+    generations = []
+    membership_rows = omitted_rows = 0
+    raw_source_rows = accepted_raw_source_rows = omitted_raw_source_rows = 0
+    aca_reads_by_oid = {}
+    for recipe in recipes:
+        generation, row_count, omitted_count, source_count, accepted_count, omitted_source_count = await _stage_recipe(
+            connection, recipe, approved, raw_table, control_schema, office_authority, aca_reads_by_oid, retained_reads
+        )
+        generations.append(generation)
+        membership_rows += row_count
+        omitted_rows += omitted_count
+        raw_source_rows += source_count
+        accepted_raw_source_rows += accepted_count
+        omitted_raw_source_rows += omitted_source_count
+    return (
+        generations,
+        membership_rows,
+        omitted_rows,
         raw_source_rows,
         accepted_raw_source_rows,
         omitted_raw_source_rows,

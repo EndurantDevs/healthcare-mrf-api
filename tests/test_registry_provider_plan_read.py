@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Closed provider selectors and exact raw-address projection refusals."""
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -72,11 +73,15 @@ def _document():
     }
 
 
-def test_exact_address_projection_preserves_only_the_proved_original_entry():
+@pytest.mark.parametrize("encoded", [False, True])
+def test_exact_address_projection_preserves_only_the_proved_original_entry(encoded):
     document = _document()
+    if encoded:
+        document["npi_info"]["addresses"] = [json.dumps(entry) for entry in document["npi_info"]["addresses"]]
     result = _project_addresses(document)
     assert result["npi_info"]["addresses"] == document["npi_info"]["addresses"][:1]
-    assert result["npi_info"]["addresses"][0]["phone"] == "123"
+    address = result["npi_info"]["addresses"][0]
+    assert (json.loads(address) if encoded else address)["phone"] == "123"
 
 
 @pytest.mark.parametrize(
@@ -90,14 +95,19 @@ def test_exact_address_projection_preserves_only_the_proved_original_entry():
         ("postal_code", "00000"),
     ],
 )
-def test_projection_requires_all_identity_fields_even_if_other_proof_fields_match(field, value):
+@pytest.mark.parametrize("encoded", [False, True])
+def test_projection_requires_all_identity_fields_even_if_other_proof_fields_match(field, value, encoded):
     document = _document()
+    if encoded:
+        document["npi_info"]["addresses"] = [json.dumps(entry) for entry in document["npi_info"]["addresses"]]
     document["proofs"][0][field] = value
     with pytest.raises(RegistryNetworkCatalogError, match="source_unavailable"):
         _project_addresses(document)
 
 
-@pytest.mark.parametrize("addresses", [None, [], [{"city": "Incomplete"}]])
+@pytest.mark.parametrize(
+    "addresses", [None, [], [{"city": "Incomplete"}], ["{"], ["null"], ["[]"], ["1"], ['"not an object"']]
+)
 def test_unproved_selected_raw_row_is_unavailable_not_certified_empty(addresses):
     document = _document()
     document["npi_info"]["addresses"] = addresses

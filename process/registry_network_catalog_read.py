@@ -21,6 +21,8 @@ from process.network_approved_membership_source import (
     pin_retained_approved_membership_source,
 )
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_fhir_retained_capture_contract import PRODUCER as RETAINED_FHIR_PRODUCER
+from process.network_fhir_retained_capture_contract import is_sha256
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 
@@ -68,9 +70,23 @@ def _uuid(identifier):
     return identifier
 
 
-def _source_scope(system, scope):
+def _retained_fhir_scope(scope, producer_id):
+    """Admit only registry-owned captures, without synthesizing legacy aliases."""
+    if (
+        producer_id != RETAINED_FHIR_PRODUCER
+        or type(scope["organization_id"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", scope["organization_id"]) is None
+        or not is_sha256(scope["capture_sha256"])
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+
+
+def _source_scope(system, scope, *, producer_id=None):
     if type(scope) is not dict:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    if system == "fhir" and set(scope) == {"organization_id", "capture_sha256"}:
+        _retained_fhir_scope(scope, producer_id)
+        return scope
     if system == "ptg" and "review_type" in scope:
         from process.registry_published_plan_binding_refs import (
             validated_published_plan_binding_scope,
@@ -196,7 +212,7 @@ class RegistryNetworkCatalogLegacySelector:
         if type(self.source) is not RegistryNetworkSourceCoordinates:
             raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
         scope = _closed_json(self.source_scope_json, 16384)
-        _source_scope(self.source.source_system, scope)
+        _source_scope(self.source.source_system, scope, producer_id=self.source.producer_id)
         if self.namespace == "checksum_network" and self.source.source_system == "aca":
             if set(scope) != {"issuer_id", "plan_id", "plan_year", "state", "checksum_network"}:
                 raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
@@ -480,7 +496,7 @@ def _binding_document(binding):
     _text(binding["evidence_id"], 512)
     if type(binding["evidence_sha256"]) is not str or re.fullmatch(r"[0-9a-f]{64}", binding["evidence_sha256"]) is None:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
-    _source_scope(binding["source_system"], binding["source_scope"])
+    _source_scope(binding["source_system"], binding["source_scope"], producer_id=binding["producer_id"])
 
 
 def _network_document(document):

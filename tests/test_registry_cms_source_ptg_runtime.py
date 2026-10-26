@@ -177,6 +177,7 @@ async def test_missing_runtime_keeps_ptg_owner_refusal_before_prepare_or_publish
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["completed", "error", "cancel", "qualification"])
 async def test_worker_qualifies_genuine_execution_factory_and_disposes_it_after_drain(monkeypatch, outcome):
+    """Qualify the fresh execution backend and drain before disposing owned resources."""
     actual_listen = worker.event.listen
     events, options, _verify, sessions = worker_support.resources(monkeypatch)
     reader_listen = worker.event.listen
@@ -221,18 +222,25 @@ async def test_worker_qualifies_genuine_execution_factory_and_disposes_it_after_
     else:
         with pytest.raises(RuntimeError if outcome in {"error", "qualification"} else asyncio.CancelledError):
             await worker.run_registry_cms_source_worker(config)
+    _assert_worker_cleanup(events, options, outcome)
+
+
+def _assert_worker_cleanup(events, options, outcome):
+    """Keep qualification refusal and all consumer outcomes under the same cleanup checks."""
     if outcome == "qualification":
-        assert "reader connect" not in events and "consume" not in events
+        assert events.index("reader connect") < events.index("ptg qualify")
+        assert "consume" not in events
         assert (
             events.index("ptg qualify")
             < events.index("release")
             < events.index("sqlalchemy close")
             < events.index("pool close")
+            < events.index("reader dispose")
         )
         return
-    assert events.index("ptg qualify") < events.index("reader connect") < events.index("consume")
-    assert events.index("consumer drained") < events.index("release") < events.index("reader dispose")
-    assert events.index("reader dispose") < events.index("sqlalchemy close") < events.index("pool close")
+    assert events.index("reader connect") < events.index("ptg qualify") < events.index("consume")
+    assert events.index("consumer drained") < events.index("release") < events.index("sqlalchemy close")
+    assert events.index("sqlalchemy close") < events.index("pool close") < events.index("reader dispose")
     assert options["pool"]["max_size"] == 1
     assert options["engine"]["connect_args"]["server_settings"]["default_transaction_read_only"] == "on"
 

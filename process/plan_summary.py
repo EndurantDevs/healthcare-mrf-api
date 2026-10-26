@@ -306,7 +306,7 @@ async def _publish_summary_index_names(session, schema, stage_name):
         name = storage_identifier(live_index)
         await session.execute(text(f"ALTER INDEX {target} RENAME TO {name}"))
     target = qualified(str(schema), str(summary_table.name))
-    old_name = storage_identifier(f"{stage_name}_pkey")
+    old_name = storage_identifier(f"{stage_name}_candidate_pkey")
     new_name = storage_identifier(f"{summary_table.name}_pkey")
     await session.execute(text(f"ALTER TABLE {target} RENAME CONSTRAINT {old_name} TO {new_name}"))
 
@@ -350,7 +350,7 @@ async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=No
     temp_metadata = MetaData()
     temp_table = summary_table.tometadata(temp_metadata, name=temp_name)
     temp_table.schema = schema
-    temp_table.primary_key.name = f"{temp_name}_pkey"
+    temp_table.primary_key.name = f"{temp_name}_candidate_pkey"
 
     qualified_temp = f'"{schema}"."{temp_name}"'
     qualified_base = f'"{schema}"."{summary_table.name}"'
@@ -447,13 +447,6 @@ async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=No
         rowcount = count_result.scalar() or 0
 
         await _ensure_summary_indexes(session, schema, temp_name)
-        await _preserve_summary_reads(session, schema, temp_name)
-        await session.execute(text(f"DROP TABLE IF EXISTS {qualified_backup};"))
-        await session.execute(text(f'ALTER TABLE IF EXISTS {qualified_base} RENAME TO "{summary_table.name}_old";'))
-        await session.execute(text(f'ALTER TABLE {qualified_temp} RENAME TO "{summary_table.name}"'))
-        await session.execute(text(f"DROP TABLE IF EXISTS {qualified_backup};"))
-
-        await _publish_summary_index_names(session, schema, temp_name)
         if publication:
             attempt, generation, address_resolution_performed = publication
             await complete_publication(
@@ -463,7 +456,15 @@ async def rebuild_plan_search_summary(test_mode: bool = False, *, publication=No
                 generation,
                 summary_inputs,
                 address_resolution_performed,
+                refresh_summary=True,
             )
+        await _preserve_summary_reads(session, schema, temp_name)
+        await session.execute(text(f"DROP TABLE IF EXISTS {qualified_backup};"))
+        await session.execute(text(f'ALTER TABLE IF EXISTS {qualified_base} RENAME TO "{summary_table.name}_old";'))
+        await session.execute(text(f'ALTER TABLE {qualified_temp} RENAME TO "{summary_table.name}"'))
+        await session.execute(text(f"DROP TABLE IF EXISTS {qualified_backup};"))
+
+        await _publish_summary_index_names(session, schema, temp_name)
 
     logger.info("Rebuilt plan_search_summary with %s rows", rowcount)
     return int(rowcount)

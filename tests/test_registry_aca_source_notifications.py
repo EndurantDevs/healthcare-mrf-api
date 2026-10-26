@@ -378,3 +378,89 @@ async def test_native_receipt_facade_keeps_exact_driver_and_original_qualificati
             await _store().qualify(connection, writing=True)
         connection.fetchval.assert_not_awaited()
     assert connection.rows == {} and connection.statements == []
+
+
+async def _batch_fixture(monkeypatch):
+    from tests.test_registry_aca_source_recipe import _batch_prepared
+
+    prepared, validation = await _batch_prepared(monkeypatch)
+    recipes = producer._batch_recipes(prepared, validation, _ROLES)
+    connection = _Connection()
+    monkeypatch.setattr(notices, "native_driver", AsyncMock(return_value=connection))
+    verifier = AsyncMock(return_value=recipes)
+    monkeypatch.setattr(notices, "require_registry_aca_source_batch", verifier)
+    return SimpleNamespace(in_transaction=lambda: True), connection, recipes, verifier
+
+
+@pytest.mark.asyncio
+async def test_complete_batch_has_one_notification_hold_and_replay(monkeypatch):
+    session, connection, recipes, verifier = await _batch_fixture(monkeypatch)
+    first = await _store().append(session, recipes)
+    assert set(first) == {"event", "recipes"} and first["recipes"] == recipes
+    assert set(first["event"]) == {"capture_id", "recipe_sha256", "notification_sha256"}
+    assert first["event"]["recipe_sha256"] == notices._digest(notices.canonical_registry_source_recipes(recipes))
+    connection.xid = "99"
+    assert await _store().append(session, tuple(reversed(recipes))) == first
+    assert len(connection.rows) == len(connection.statements) == 1
+    assert await _store().hold(session, recipes[0].source_pin.prepared) == first
+    assert await _store().accepted(session, recipes[0].source_pin.prepared.ownership.dataset_id, holding=True) == first
+    connection.writing, connection.actor = False, "reader"
+    assert await _store().read(session, first["event"]) == first
+    assert verifier.await_count >= 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["empty", "partial", "duplicate", "singleton", "oversize"])
+async def test_invalid_batch_never_creates_a_partial_notification(monkeypatch, damage):
+    session, connection, recipes, verifier = await _batch_fixture(monkeypatch)
+    subject = recipes
+    if damage == "empty":
+        subject = ()
+    elif damage == "partial":
+        subject = recipes[:1]
+    elif damage == "duplicate":
+        subject = recipes + recipes[:1]
+    elif damage == "singleton":
+        subject = recipes[0]
+    else:
+        monkeypatch.setattr(notices, "MAX_BYTES", 100)
+    with pytest.raises(ValueError):
+        await _store().append(session, subject)
+    assert not connection.rows and not connection.statements
+    if damage == "empty":
+        verifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_self_consistent_partial_batch_payload_cannot_replace_complete_stamp(monkeypatch):
+    import json
+
+    session, connection, recipes, _ = await _batch_fixture(monkeypatch)
+    accepted = await _store().append(session, recipes)
+    row = next(iter(connection.rows.values()))
+    document = json.loads(row["notification_json"])
+    document["recipes_json"] = notices.canonical_registry_source_recipes(recipes[:1])
+    row.update(zip(notices.INSERT_COLUMNS, notices._values(document, recipes[:1]), strict=True))
+    event_header_map = {key: str(row[key]) for key in accepted["event"]}
+    connection.writing, connection.actor = False, "reader"
+    with pytest.raises(ValueError):
+        await _store().read(session, event_header_map)
+    assert len(connection.rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_decoder_rejects_a_different_physical_manifest(monkeypatch):
+    from dataclasses import replace
+
+    _, _, recipes, _ = await _batch_fixture(monkeypatch)
+    pin = recipes[1].source_pin
+    changed = replace(pin.prepared, manifest=replace(pin.prepared.manifest, source_metadata={}))
+    foreign = object.__new__(type(pin))
+    for field in pin.__dataclass_fields__:
+        object.__setattr__(foreign, field, changed if field == "prepared" else getattr(pin, field))
+    member = object.__new__(type(recipes[1]))
+    object.__setattr__(member, "source_pin", foreign)
+    object.__setattr__(member, "binding_coordinates", recipes[1].binding_coordinates)
+    object.__setattr__(member, "selection_policy", recipes[1].selection_policy)
+    with pytest.raises(ValueError):
+        notices._subject_payload((recipes[0], member))

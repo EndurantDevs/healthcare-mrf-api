@@ -325,6 +325,42 @@ async def _lock_objects(connection, target, candidate, *, exclusive, assume_owne
     return before
 
 
+async def _address_runtime_closure(connection, candidate, runtime_roles):
+    """Keep every actual candidate actor unable to alter or assume the retained owner."""
+    address_source = PinnedAddressSource(**_json_object(candidate["validation_json"])["address_source"])
+    safe = await connection.fetchval(
+        """WITH target AS (
+          SELECT c.oid,c.relowner,n.oid AS namespace_oid,n.nspowner,owner.rolcanlogin,owner.rolsuper,
+            owner.rolcreaterole,owner.rolcreatedb,owner.rolreplication,owner.rolbypassrls FROM pg_class c
+          JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles owner ON owner.oid=c.relowner
+          WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind='r' AND c.relpersistence='p'
+        ), actors AS (SELECT r.* FROM unnest($3::text[]) selected(name)
+          LEFT JOIN pg_roles r ON r.rolname=selected.name)
+        SELECT (SELECT count(*)=1 AND bool_and(relowner=nspowner AND NOT (rolcanlogin OR rolsuper
+          OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls)) FROM target) AND NOT EXISTS(
+          SELECT FROM actors r,target t WHERE r.oid IS NULL OR r.rolsuper OR r.rolcreaterole
+          OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls
+          OR pg_has_role(r.oid,t.relowner,'MEMBER') OR pg_has_role(r.oid,t.relowner,'USAGE')
+          OR pg_has_role(r.oid,t.relowner,'SET') OR pg_has_role(r.oid,t.nspowner,'MEMBER')
+          OR pg_has_role(r.oid,t.nspowner,'USAGE') OR pg_has_role(r.oid,t.nspowner,'SET')
+          OR has_schema_privilege(r.oid,t.namespace_oid,'CREATE')
+          OR has_parameter_privilege(r.oid,'session_replication_role','SET')
+          OR has_table_privilege(r.oid,t.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+          OR has_any_column_privilege(r.oid,t.oid,'INSERT,UPDATE,REFERENCES'))
+        AND NOT EXISTS(SELECT FROM pg_proc p,actors r WHERE p.prosecdef
+          AND p.prorettype NOT IN ('trigger'::regtype,'event_trigger'::regtype)
+          AND has_schema_privilege(r.oid,p.pronamespace,'USAGE') AND has_function_privilege(r.oid,p.oid,'EXECUTE')
+          AND EXISTS(SELECT FROM pg_roles definer,target t WHERE definer.oid=p.proowner
+            AND (definer.rolsuper OR definer.rolcreaterole OR pg_has_role(definer.oid,t.relowner,'MEMBER')
+              OR pg_has_role(definer.oid,t.relowner,'SET') OR pg_has_role(definer.oid,t.nspowner,'MEMBER')
+              OR pg_has_role(definer.oid,t.nspowner,'SET'))))""",
+        address_source.schema_name,
+        address_source.table_name,
+        list(runtime_roles),
+    )
+    _require(safe is True)
+
+
 async def _final_proof(connection, target, candidate, schema):
     from process.network_membership_publication import _publication_readiness, _verify_provider_custody
 
@@ -500,6 +536,7 @@ async def _verify(connection, copy_target, schema, control, candidate, seal, *, 
     _require(_receipt(copy_target, roles, catalog) == closure)
     await _check_closed(connection, roles, catalog)
     await _census_closed(connection, control, catalog, runtime_roles)
+    await _address_runtime_closure(connection, candidate, runtime_roles)
     _require(
         await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
         == receipt["index_definition_sha256"]
@@ -605,6 +642,7 @@ async def _seal_ready_candidate(
         _require(checkpoint_key not in report)
     catalog = await _lock_objects(connection, copy_target, candidate, exclusive=True, assume_owner=True)
     await _operator(connection, actor, control, catalog, runtime_roles)
+    await _address_runtime_closure(connection, candidate, runtime_roles)
     await _final_proof(connection, copy_target, candidate, control_schema)
     # Preserve only pre-existing effective reads; the forbidden census grants no fact access.
     readers = await _existing_readers(connection, catalog, runtime_roles)
@@ -617,6 +655,7 @@ async def _seal_ready_candidate(
     _require(before == after)
     await _check_closed(connection, roles, closed)
     await _census_closed(connection, control, closed, runtime_roles)
+    await _address_runtime_closure(connection, candidate, runtime_roles)
     return await _store_candidate_seal(
         connection,
         copy_target,

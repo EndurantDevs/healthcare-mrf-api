@@ -185,7 +185,9 @@ def _office_copies(provider_rows, scope):
         if address_count > MAX_MEMBERSHIP_FACTS:
             raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
         for address in addresses:
-            address_key = _address_key(address, selected=scope.network_ids is not None)
+            address_key = _address_key(
+                address, selected=scope.network_ids is not None and scope.legacy_checksums is None
+            )
             if address_key is not None:
                 office_key = (provider_by_field["npi"], address_key)
                 copies_by_office[office_key] = copies_by_office.get(office_key, 0) + 1
@@ -242,7 +244,7 @@ async def project_managed_collection_metadata(session, manifest, provider_rows, 
     metadata_bytes = 2 + 4 * address_count
     for office_key, copies in copies_by_office.items():
         memberships = memberships_by_office.get(office_key, [])
-        if scope.network_ids is not None and not memberships:
+        if scope.network_ids is not None and scope.legacy_checksums is None and not memberships:
             raise _unavailable()
         membership_count += copies * len(memberships)
         metadata_bytes += copies * (
@@ -258,7 +260,9 @@ async def project_managed_collection_metadata(session, manifest, provider_rows, 
         for address in addresses:
             for key in _LEGACY_ASSOCIATIONS:
                 address.pop(key, None)
-            address_key = _address_key(address, selected=scope.network_ids is not None)
+            address_key = _address_key(
+                address, selected=scope.network_ids is not None and scope.legacy_checksums is None
+            )
             address_memberships = memberships_by_office.get((provider_by_field["npi"], address_key), [])
             address["network_memberships"] = deepcopy(address_memberships)
     return projected_rows

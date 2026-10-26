@@ -1,9 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native raw-source replay, reviewed corrections and complete-stage rollback."""
 
+import asyncio
 import hashlib
 import json
+import os
+import secrets
 from contextlib import aclosing
+from dataclasses import replace
 from uuid import UUID, uuid4, uuid5
 
 import asyncpg
@@ -12,6 +16,7 @@ import pytest
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_fhir_membership_source import read_fhir_membership_batch
+from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
 from process.network_membership_candidate_lifecycle import (
     admit_network_membership_batch,
     create_network_candidate,
@@ -24,7 +29,11 @@ from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
-from process.registry_source_recipe_composition import RegistrySourceCompositionError, stage_registry_source_recipes
+from process.registry_source_recipe_composition import (
+    RegistrySourceCompositionError,
+    _require_recipe_custody,
+    stage_registry_source_recipes,
+)
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe, canonical_registry_source_recipes
 from tests.cms_registry_recipe_postgres_support import (
     cms_recipe_database as cms_recipe_database,
@@ -38,7 +47,9 @@ from tests.cms_registry_recipe_postgres_support import (
 from tests.cms_registry_recipe_postgres_support import (
     serving_schema as serving_schema,
 )
+from tests.test_network_address_projection_postgres import projection_db as projection_db
 from tests.test_network_custom_address_source_postgres import _seed
+from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_db
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_fhir_membership_source_postgres import (
     _reviewed_binding,
@@ -49,7 +60,20 @@ from tests.test_network_fhir_membership_source_postgres import (
 from tests.test_network_fhir_membership_source_postgres import (
     reviewed_fhir_source as reviewed_fhir_source,
 )
+from tests.test_network_fhir_retained_capture_postgres import (
+    _approved_capture_recipe,
+    _capture,
+    _retained_custody_base,
+    _retained_custody_captured_input,
+    _retained_custody_compose,
+)
+from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
+from tests.test_network_fhir_retained_capture_postgres import (
+    retained_address_custody_db as retained_address_custody_db,
+)
 from tests.test_network_legacy_membership_source_postgres import reviewed_aca_source as reviewed_aca_source
+from tests.test_network_membership_pipeline_postgres import pipeline_db as pipeline_db
+from tests.test_network_membership_validation_postgres import validation_db as validation_db
 from tests.test_registry_approval_store_postgres import _approve, _command
 from tests.test_registry_candidate_composition_postgres import _remove_candidates, _roles
 from tests.test_registry_retained_site_adoption_postgres import _source_addresses
@@ -508,3 +532,136 @@ async def test_late_fhir_partial_resource_refuses_complete_recipe(disposition_cm
         "AND (relname LIKE 'registry_recipe_raw_%' OR relname LIKE 'registry_source_page_%'))"
     )
     assert await connection.fetchval(f'SELECT generation_id FROM "{schema}".network_serving_control') is None
+
+
+def _count_retained_content_reads(monkeypatch):
+    from process import network_fhir_retained_capture as retained
+
+    native_content, native_catalog = retained._content_tables, retained._catalog
+    contents, catalogs = [], []
+
+    async def content(connection, schema):
+        contents.append(schema)
+        return await native_content(connection, schema)
+
+    async def catalog(connection, schema, owner, runtime_roles):
+        catalogs.append(schema)
+        return await native_catalog(connection, schema, owner, runtime_roles)
+
+    monkeypatch.setattr(retained, "_content_tables", content)
+    monkeypatch.setattr(retained, "_catalog", catalog)
+    return contents, catalogs
+
+
+@pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
+@pytest.mark.parametrize("legacy_entry", [False, True])
+async def test_initial_retained_composition_admits_content_once_per_transaction(
+    retained_address_custody_db, legacy_capture_db, serving_schema, bootstrap_db, monkeypatch, legacy_entry
+):
+    case, source = retained_address_custody_db, legacy_capture_db
+    capture = await _retained_custody_captured_input(source, case.complete_runtime_roles)
+    recipe, approved, _ = await _approved_capture_recipe(source, serving_schema, capture)
+    base = await _retained_custody_base(case, source, serving_schema, bootstrap_db)
+    case.additional_schemas.append(case.copy_target.schema_name)
+    role, password = case.writer_roles["publisher"], secrets.token_hex(24)
+    await case.connection.execute(f"ALTER ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+    publisher = await asyncpg.connect(os.environ["NETWORK_REGISTRY_TEST_DSN"], user=role, password=password)
+    contents, catalogs = _count_retained_content_reads(monkeypatch)
+    if legacy_entry:
+        from process import registry_candidate_composition as composition
+
+        monkeypatch.setattr(composition, "record_initial_source_offices_with_reads", _record_initial_offices_legacy)
+    try:
+        (target, address), arguments = await _retained_custody_compose(
+            case, publisher, base, recipe, approved.approved_revision
+        )
+        assert address == base and contents == [capture.schema_name] * (1 + 2 * legacy_entry)
+        assert catalogs.count(capture.schema_name) >= 5
+        assert await compose_registry_membership_candidate(publisher, **arguments) == (target, address)
+        assert contents == [capture.schema_name] * (2 + 2 * legacy_entry)
+    finally:
+        await publisher.close()
+
+
+async def _record_initial_offices_legacy(connection, target, recipes, approved, address, **options_by_name):
+    """Exercise the old record and summary signatures against genuine native offices."""
+    from process import registry_initial_source_composition as initial
+
+    authority, _ = options_by_name.pop("office_phase")
+    receipt = await initial.record_initial_source_offices(
+        connection, target, recipes, approved, address, office_authority=authority, **options_by_name
+    )
+    before = await initial._office_summary(
+        connection, recipes, approved, address, options_by_name["runtime_roles"], options_by_name["control_schema"]
+    )
+    assert before == receipt
+    return receipt
+
+
+@pytest.mark.parametrize("scope", ["task", "connection", "transaction"])
+async def test_retained_admission_reuse_refuses_another_native_scope(legacy_capture_db, serving_schema, scope):
+    source = legacy_capture_db
+    capture = await _capture(source)
+    recipe, _, _ = await _approved_capture_recipe(source, serving_schema, capture)
+    reader = await source.connect("reader")
+    reads_by_capture = {}
+    async with reader.transaction(isolation="repeatable_read", readonly=True):
+        admitted = await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
+        assert await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture) is admitted
+        if scope == "task":
+            with pytest.raises(RetainedFHIRCaptureError):
+                await asyncio.create_task(_require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture))
+        elif scope == "connection":
+            with pytest.raises(RetainedFHIRCaptureError):
+                await _reuse_retained_on_new_connection(source, recipe, reads_by_capture)
+    if scope == "transaction":
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            with pytest.raises(RetainedFHIRCaptureError):
+                await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
+
+
+async def _reuse_retained_on_new_connection(source, recipe, reads_by_capture):
+    other = await source.connect("reader")
+    async with other.transaction(isolation="repeatable_read", readonly=True):
+        return await _require_recipe_custody(other, recipe, retained_fhir_reads=reads_by_capture)
+
+
+async def test_new_retained_capture_requires_its_own_full_admission(legacy_capture_db, serving_schema, monkeypatch):
+    source = legacy_capture_db
+    first, second = await _capture(source), await _capture(source)
+    recipe, _, _ = await _approved_capture_recipe(source, serving_schema, first)
+    successor = replace(
+        recipe,
+        source_pin=replace(recipe.source_pin, retained_capture=second, release_id=second.release_id),
+        binding_coordinates=replace(recipe.binding_coordinates, edition_id=second.capture_id),
+    )
+    reader, reads_by_capture = await source.connect("reader"), {}
+    contents, _ = _count_retained_content_reads(monkeypatch)
+    async with reader.transaction(isolation="repeatable_read", readonly=True):
+        first_read = await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
+        reads_by_capture[second] = first_read
+        with pytest.raises(RetainedFHIRCaptureError):
+            await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture)
+        del reads_by_capture[second]
+        second_read = await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture)
+        assert first_read is not second_read and contents == [first.schema_name, second.schema_name]
+        assert await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture) is first_read
+        assert await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture) is second_read
+        assert contents == [first.schema_name, second.schema_name]
+
+
+async def test_shared_retained_admission_rechecks_native_writer_privileges(legacy_capture_db, serving_schema):
+    source = legacy_capture_db
+    capture = await _capture(source)
+    recipe, _, _ = await _approved_capture_recipe(source, serving_schema, capture)
+    reader, reads_by_capture = await source.connect("reader"), {}
+    table = f'"{capture.schema_name}".provider_directory_dataset_resource'
+    role = '"' + source.role_by_kind["reader"] + '"'
+    try:
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
+            await source.admin.execute(f"GRANT UPDATE ON {table} TO {role}")
+            with pytest.raises((RetainedFHIRCaptureError, ValueError)):
+                await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
+    finally:
+        await source.admin.execute(f"REVOKE UPDATE ON {table} FROM {role}")

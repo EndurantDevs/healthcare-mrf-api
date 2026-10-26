@@ -51,6 +51,12 @@ from process.registry_serving_organization_read import (
 from tests.test_company_registry_assertions_postgres import _declared_group, _identifier, _role
 from tests.test_network_custom_address_source_postgres import _draft, _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
+from tests.test_network_fhir_retained_capture_postgres import (
+    legacy_capture_db as legacy_capture_db,
+)
+from tests.test_network_fhir_retained_capture_postgres import (
+    test_retained_capture_composes_and_publishes_one_exact_office as _publish_retained_capture,
+)
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _approve, _command, _CountedConnection, _create
 from tests.test_registry_candidate_composition_postgres import (
@@ -72,6 +78,30 @@ ACA_SCOPE = {
     "state": "CA",
     "checksum_network": -17,
 }
+
+
+@pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
+async def test_native_retained_capture_publication_serializes_in_pinned_catalog(legacy_capture_db, serving_schema):
+    """Read an actual complete captured publication without inventing a legacy alias."""
+    await _publish_retained_capture(legacy_capture_db, serving_schema)
+    connection, control, _ = serving_schema
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        page = await read_registry_network_catalog(
+            connection, RegistryNetworkCatalogQuery(), excluded_network_ids=(), control_schema=control
+        )
+        assert page["total"] == len(page["items"]) == 1
+        binding = page["items"][0]["source_bindings"][0]
+        assert binding["producer_id"] == "registry-retained-normalized-fhir-v1"
+        assert binding["source_scope"]["organization_id"] == "network-one"
+        assert set(binding["source_scope"]) == {"organization_id", "capture_sha256"}
+        detail = await read_registry_network_catalog_detail(
+            connection,
+            page["items"][0]["network_id"],
+            excluded_network_ids=(),
+            generation_id=int(page["generation"]),
+            control_schema=control,
+        )
+        assert json.loads(json.dumps(detail)) == json.loads(json.dumps(page | {"limit": 1}))
 
 
 def _binding(network_id, coordinates, source_key, scope):

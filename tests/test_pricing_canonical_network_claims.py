@@ -28,7 +28,7 @@ MANIFEST = PinnedNetworkServingManifest(
 
 @pytest.fixture
 def canonical_pin(monkeypatch):
-    pin = AsyncMock(return_value=(MANIFEST, (42, 88), "a" * 64))
+    pin = AsyncMock(return_value=(MANIFEST, (42, 88), "a" * 64, None))
     monkeypatch.setattr(scope_module, "_pin_network_scope", pin)
     monkeypatch.setattr(
         pricing_module,

@@ -138,6 +138,13 @@ struct FhirScope {
     alias_scope: String,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedFhirScope {
+    organization_id: String,
+    capture_sha256: String,
+}
+
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct ValidatedSourceBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,7 +273,19 @@ fn published_plan_scope(scope: PublishedPlanScope) -> Option<serde_json::Value> 
     serde_json::to_value(scope).ok()
 }
 
-fn fhir_scope(raw: &str) -> Option<serde_json::Value> {
+fn fhir_scope(raw: &str, producer: &str, source: &str) -> Option<serde_json::Value> {
+    if producer == "registry-retained-normalized-fhir-v1" && source != "cms-npd"
+        && let Ok(scope) = serde_json::from_str::<RetainedFhirScope>(raw)
+    {
+        if scope.organization_id.is_empty() || scope.organization_id.len() > 64
+            || !scope.organization_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+            || scope.capture_sha256.len() != 64
+            || !scope.capture_sha256.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return None;
+        }
+        return serde_json::to_value(scope).ok();
+    }
     let scope: FhirScope = serde_json::from_str(raw).ok()?;
     if scope.organization_id.is_empty()
         || scope.organization_id.len() > 64
@@ -364,7 +383,7 @@ pub(crate) fn validate_row(
     let scope = match input.source_system.as_str() {
         "aca" => aca_scope(input.source_scope_json.get()),
         "ptg" => ptg_scope(input.source_scope_json.get()),
-        "fhir" => fhir_scope(input.source_scope_json.get()),
+        "fhir" => fhir_scope(input.source_scope_json.get(), &input.producer_id, &input.source_id),
         _ => None,
     }
     .ok_or_else(|| failure("invalid_scope", Some(index), Some("source_scope_json")))?;
