@@ -61,6 +61,33 @@ from tests.provider_directory_fhir_subset_completion_support import (
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolated", [False, True])
+@pytest.mark.parametrize("has_proof", [False, True])
+async def test_validation_retains_isolated_handoff_proof(monkeypatch, isolated, has_proof):
+    from process import provider_directory_generic_source_policy as policy
+
+    monkeypatch.setattr(policy, "current_source_storage_binding", lambda: object() if isolated else None)
+    seal = object()
+    persist = AsyncMock(return_value=seal)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(importer, "_store_endpoint_dataset_verification_result", persist)
+    monkeypatch.setattr(importer, "_retire_matched_twin_root_baseline_payload", AsyncMock(return_value=0))
+    monkeypatch.setattr(importer, "delete_dataset_proof_shards", cleanup)
+    connection = object()
+    candidate = SimpleNamespace(dataset_id="dataset-a")
+    proof = SimpleNamespace(proof_metadata={"verified": True} if has_proof else None)
+    result = await importer._store_dataset_validation_state(
+        connection, candidate, "previous", proof, {}, "validated", [], {},
+    )
+    persist.assert_awaited_once_with(connection, candidate, "previous", proof, {}, "validated")
+    assert result == ("previous", proof, {}, "validated", [], 0, seal)
+    if has_proof and not isolated:
+        cleanup.assert_awaited_once_with(connection, importer._schema(), "dataset-a")
+    else:
+        cleanup.assert_not_awaited()
+
+
 @pytest_asyncio.fixture
 async def unit_source_factory(monkeypatch):
     """Explicit unit-only Source custody; real guards receive synthetic role catalog rows."""
@@ -7480,13 +7507,10 @@ async def test_deferred_materialization_requires_checkpoint_safe_mode():
 async def test_deferred_materialization_rejects_source_specific_connector(
     monkeypatch,
 ):
-    """Reject deferred typing when a source requires a custom connector."""
+    """Reject the resolved metadata connector before grouping or candidate IO."""
 
-    monkeypatch.setattr(
-        importer,
-        "_uses_alohr_graphql_connector",
-        lambda _source_record: True,
-    )
+    group_sources = Mock(side_effect=AssertionError("unsupported source reached acquisition"))
+    monkeypatch.setattr(importer, "_group_resource_import_sources", group_sources)
     with pytest.raises(
         ValueError,
         match="provider_directory_deferred_typed_materialization_source_unsupported",
@@ -7496,6 +7520,7 @@ async def test_deferred_materialization_rejects_source_specific_connector(
                 {
                     "source_id": "source-a",
                     "api_base": "https://directory.example.test/fhir",
+                    "metadata_json": {"provider_directory_graphql_tenant_id": importer.ALOHR_TENANT_ID},
                 }
             ],
             resources=[],
@@ -7507,6 +7532,7 @@ async def test_deferred_materialization_rejects_source_specific_connector(
             defer_typed_materialization=True,
             is_pagination_checkpointing_enabled=True,
         )
+    group_sources.assert_not_called()
 
 
 def _alohr_graphql_fixture_page(root_key: str):
@@ -13313,15 +13339,31 @@ async def test_finalized_dataset_checkpoint_cleanup_is_verified(
         "acquire",
         lambda: _FakeAcquire(connection),
     )
+    original = importer.source_checkpoint_transaction
+    fenced_coordinates = []
+
+    @contextlib.asynccontextmanager
+    async def checkpoint_scope(*args, **kwargs):
+        fenced_coordinates.append(kwargs)
+        async with original(*args, **kwargs) as session:
+            yield session
+
+    monkeypatch.setattr(importer, "source_checkpoint_transaction", checkpoint_scope)
+    candidate = _endpoint_dataset_candidate()
 
     if remaining_count:
         with pytest.raises(
             RuntimeError,
             match="provider_directory_finalized_dataset_checkpoint_cleanup_incomplete",
         ):
-            await importer._clear_finalized_dataset_checkpoints(_endpoint_dataset_candidate())
+            await importer._clear_finalized_dataset_checkpoints(candidate)
     else:
-        assert await importer._clear_finalized_dataset_checkpoints(_endpoint_dataset_candidate()) == 2
+        assert await importer._clear_finalized_dataset_checkpoints(candidate) == 2
+    assert fenced_coordinates == [{
+        "schema": importer._schema(),
+        "dataset_ids": (candidate.dataset_id,),
+        "root_run_ids": (candidate.acquisition_root_run_id,),
+    }]
 
 
 @pytest.mark.asyncio
@@ -26907,12 +26949,15 @@ async def test_import_resources_propagates_progress_cancellation(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_import_resources_replays_finalized_candidate(monkeypatch):
-    """Replay a finalized dataset without reacquiring its endpoint."""
+@pytest.mark.parametrize("already_validated", [False, True])
+async def test_import_finalization_records_handoff(monkeypatch, already_validated):
+    """Both fresh acquisition and resume pass the exact candidate to handoff capture."""
+    from process import provider_directory_generic_source_completion as completion
+
     _stub_resource_import_metadata(monkeypatch)
     candidate = dataclasses.replace(
         _endpoint_dataset_candidate(),
-        already_validated=True,
+        already_validated=already_validated,
     )
     replay_result = (
         ["source_a"],
@@ -26940,11 +26985,25 @@ async def test_import_resources_replays_finalized_candidate(monkeypatch):
         "_replay_finalized_candidate_and_clear_checkpoints",
         replay_candidate,
     )
+    fetch_rows = AsyncMock(return_value=None)
+    finalize = AsyncMock()
+    handoff_capture = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fetch_rows)
+    monkeypatch.setattr(importer, "_validate_and_finalize_import_candidate", finalize)
+    monkeypatch.setattr(completion, "record_candidate_handoff", handoff_capture)
+    handoffs_by_dataset = {}
 
-    counts = await _import_location_source_groups(["source_a"])
+    counts = await _import_location_source_groups(["source_a"], source_candidate_handoffs=handoffs_by_dataset)
 
-    assert counts == {"Location": 4}
-    replay_candidate.assert_awaited_once_with(candidate, None)
+    assert counts == {"Location": 4 if already_validated else 0}
+    handoff_capture.assert_awaited_once_with(importer, candidate, handoffs_by_dataset)
+    if already_validated:
+        replay_candidate.assert_awaited_once_with(candidate, None)
+        fetch_rows.assert_not_awaited()
+        finalize.assert_not_awaited()
+    else:
+        replay_candidate.assert_not_awaited()
+        assert finalize.await_args.args[0] is candidate
 
 
 @pytest.mark.asyncio
@@ -34411,6 +34470,34 @@ async def test_caresource_candidate_count_reads_valid_dataset(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_frozen_content_scan_keeps_hash_validation_and_composite_pagination(monkeypatch):
+    import hashlib
+    from tests.test_provider_directory_proof_store import _sample_dataset_resources, _stable_json
+
+    rows = sorted(_sample_dataset_resources(), key=lambda row: (row["resource_type"], row["resource_id"]))
+    connection = SimpleNamespace(all=AsyncMock(side_effect=[[row] for row in rows] + [[]]))
+    monkeypatch.setattr(importer, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 1)
+    proof = await importer._endpoint_dataset_content_proof(
+        connection, "dataset", verify_payload_hashes=True,
+        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        resource_relation=("closed_source", "closed_resource"),
+    )
+    expected = "\n".join(_stable_json((row["resource_type"], row["resource_id"], row["payload_hash"])) for row in rows)
+    assert proof.dataset_hash == hashlib.sha256(expected.encode()).hexdigest()
+    assert proof.resource_count == len(rows)
+    assert all('"closed_source"."closed_resource"' in call.args[0] for call in connection.all.await_args_list)
+    assert "after_resource_type" not in connection.all.await_args_list[0].kwargs
+    assert connection.all.await_args_list[1].kwargs["after_resource_id"] == rows[0]["resource_id"]
+    connection.all = AsyncMock(return_value=[{**rows[0], "payload_hash": "0" * 64}])
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="payload_hash_mismatch"):
+        await importer._endpoint_dataset_content_proof(
+            connection, "dataset", verify_payload_hashes=True,
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
+            resource_relation=("closed_source", "closed_resource"),
+        )
+
+
+@pytest.mark.asyncio
 async def test_endpoint_content_and_candidate_proof_terminal_paths(
     monkeypatch,
 ):
@@ -34958,6 +35045,29 @@ def _stub_seen_stage_profile_followup(monkeypatch):
         profile_followup,
     )
     return prepare_seen, drop_seen
+
+
+@pytest.mark.asyncio
+async def test_detached_acquisition_defers_profile_followup(monkeypatch):
+    """A private handoff cannot resolve a canonical followup before publication."""
+    import_resources = _stub_corroboration_publish_pipeline(monkeypatch)
+    followup = AsyncMock(side_effect=AssertionError("unpublished candidate reached canonical lookup"))
+    monkeypatch.setattr(importer, "_source_local_profile_followup_if_current", followup)
+
+    async def acquire(*args, **options):
+        """Return the detached handoff without publishing the candidate."""
+        options["source_candidate_handoffs"]["synthetic-candidate"] = {"sha256": "a" * 64}
+        return {"Location": 2}
+
+    import_resources.side_effect = acquire
+    metrics = await importer.process_data(
+        {"context": {}},
+        {"test": True, "run_id": "run_detached", "probe": False, "import_resources": True,
+         "resources": "Location", "publish_artifacts": False, "defer_typed_materialization": True},
+    )
+    import_resources.assert_awaited_once()
+    followup.assert_not_awaited()
+    assert "profile_followup" not in metrics and metrics["source_candidate_handoffs"]
 
 
 @pytest.mark.asyncio

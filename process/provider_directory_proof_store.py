@@ -67,6 +67,16 @@ _SOURCE_METRIC_FIELDS = {
 _SEMANTIC_PROJECTION_AS_OF_FIELD = "semantic_projection_as_of"
 
 
+def _proof_relation(schema: str) -> str:
+    """Resolve only the original issued namespace when isolated storage is bound."""
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_source_storage_binding import source_relation_coordinates
+
+    return storage_relation(
+        *source_relation_coordinates(schema, PROVIDER_DIRECTORY_PROOF_SHARD_TABLE, PROVIDER_DIRECTORY_PROOF_SHARD_TABLE)
+    )
+
+
 class ProviderDirectoryProofStoreError(RuntimeError):
     """Fail closed when durable FHIR batch proof is incomplete."""
 
@@ -88,6 +98,7 @@ class ProviderDirectoryStoredProofOptions:
     proof_resource_scope: Iterable[str] | None = None
     expected_resource_hash_contract: str | None = None
     expected_semantic_projection_as_of: str | None = None
+    proof_table: str | None = None
 
 
 @dataclass(frozen=True)
@@ -698,7 +709,7 @@ async def _store_dataset_proof_shard(
         proof_resource_scope
     ):
         raise ProviderDirectoryProofStoreError("provider directory proof parent resource scope changed")
-    table_ref = f'"{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"'
+    table_ref = _proof_relation(schema)
     await _insert_dataset_proof_shard(
         connection, table_ref, _proof_shard_insert_params(descriptor_by_field, compressed)
     )
@@ -1395,8 +1406,12 @@ async def _load_shards(
     schema: str,
     dataset_id: str,
     record_spool: _RecordSpool,
+    *,
+    proof_table: str | None = None,
 ) -> list[dict[str, Any]]:
-    table_ref = f'"{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}"'
+    from db.plan_release_storage import storage_relation
+
+    table_ref = _proof_relation(schema) if proof_table is None else storage_relation(schema, proof_table)
     shard_descriptors = []
     after_shard_id = ""
     while True:
@@ -1502,6 +1517,8 @@ async def _merged_stored_dataset_proof(
     connection: Any,
     schema: str,
     lineage: _ProofLineage,
+    *,
+    proof_table: str | None = None,
 ) -> _MergedDatasetProof:
     """Read and merge all durable shards for one candidate dataset."""
 
@@ -1516,6 +1533,7 @@ async def _merged_stored_dataset_proof(
             schema,
             lineage.dataset_id,
             record_spool,
+            proof_table=proof_table,
         )
         if not shard_descriptors:
             raise ProviderDirectoryProofStoreError("provider directory durable proof shards are missing")
@@ -1717,6 +1735,7 @@ async def build_stored_dataset_proof(
         connection,
         schema,
         lineage,
+        proof_table=options.proof_table,
     )
     public_descriptors = _verified_public_shards(lineage, merged_proof)
     proof_by_field = _sealed_dataset_proof_metadata(
@@ -2195,7 +2214,7 @@ async def delete_dataset_proof_shards(
     await lock_proof_parent(publisher, dataset_id, acquiring=False)
 
     await connection.status(
-        f'DELETE FROM "{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" WHERE dataset_id=:dataset_id;',
+        f"DELETE FROM {_proof_relation(schema)} WHERE dataset_id=:dataset_id;",
         dataset_id=dataset_id,
     )
 
@@ -2213,7 +2232,7 @@ async def delete_dataset_resource_proof_shards(
     await lock_proof_parent(publisher, dataset_id, acquiring=False)
 
     await connection.status(
-        f'DELETE FROM "{schema}"."{PROVIDER_DIRECTORY_PROOF_SHARD_TABLE}" '
+        f"DELETE FROM {_proof_relation(schema)} "
         "WHERE dataset_id=:dataset_id "
         "AND resource_counts_json ? CAST(:resource_type AS text);",
         dataset_id=dataset_id,

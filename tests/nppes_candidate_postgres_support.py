@@ -119,15 +119,20 @@ def nppes_source_component_migration_stages():
     return prefixes[:boundary], prefixes[boundary:]
 
 
-async def _bootstrap_nppes_parent_component(engine, policy, prefixes):
-    """Create the real legacy Builder family before its genuine custody cuts."""
+async def _bootstrap_nppes_parent_component(engine, policy, prefixes, *, migration_role=None):
+    """Create the native family as its declared initial actor, defaulting to the legacy Builder."""
     from db.models import CMSDoctorEducation, DoctorClinicianAddress
 
-    builder = policy.control_runtime_roles[0]
+    actor = policy.control_runtime_roles[0] if migration_role is None else migration_role
     async with engine.begin() as connection:
+        if migration_role is not None:
+            assert await connection.scalar(text("SELECT session_user::text")) == migration_role
+            assert await connection.scalar(
+                text("SELECT current_user=session_user AND rolsuper FROM pg_roles WHERE rolname=current_user")
+            )
         database = await connection.scalar(text("SELECT current_database()"))
-        await connection.execute(text(f'GRANT CREATE ON DATABASE "{database}" TO "{builder}"'))
-    historical = create_async_engine(engine.url.set(username=builder))
+        await connection.execute(text(f'GRANT CREATE ON DATABASE "{database}" TO "{actor}"'))
+    historical = create_async_engine(engine.url.set(username=actor))
     try:
         async with historical.begin() as connection:
             for model in (DoctorClinicianAddress, CMSDoctorEducation):
@@ -145,7 +150,7 @@ async def _bootstrap_nppes_parent_component(engine, policy, prefixes):
     finally:
         await historical.dispose()
         async with engine.begin() as connection:
-            await connection.execute(text(f'REVOKE CREATE ON DATABASE "{database}" FROM "{builder}"'))
+            await connection.execute(text(f'REVOKE CREATE ON DATABASE "{database}" FROM "{actor}"'))
 
 
 async def install_source_canonical_functions(engine, schema):

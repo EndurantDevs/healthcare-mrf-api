@@ -56,6 +56,7 @@ class _Publisher:
     task: object
     transaction_isolation: str
     factory: object
+    storage_binding: object = None
 
 
 async def _genuine_publisher(connection, policy):
@@ -82,9 +83,13 @@ async def bind_generic_source_publisher(connection, policy, *, verify_role_profi
     _require(await connection.fetchval("SHOW transaction_isolation") == transaction_isolation, "isolation_changed")
     await storage_roles(connection, policy.schema, **policy.role_arguments())
     await verify_role_profile(connection, policy.schema, **policy.role_arguments())
-    publisher = _Publisher(connection, policy, asyncio.current_task(), transaction_isolation, _FACTORY.get())
+    factory = _FACTORY.get()
+    storage_binding = getattr(factory, "storage_binding", None)
+    publisher = _Publisher(connection, policy, asyncio.current_task(), transaction_isolation, factory, storage_binding)
     token = _PUBLISHER.set(publisher)
     try:
+        if storage_binding is not None:
+            await _bind_isolated_storage(publisher)
         yield publisher
     finally:
         _PUBLISHER.reset(token)
@@ -94,7 +99,48 @@ def bound_publisher():
     """Reject inherited task contexts and missing orchestration before target IO."""
     publisher = _PUBLISHER.get()
     _require(publisher is not None and publisher.task is asyncio.current_task(), "publisher_connection_required")
+    _require(
+        getattr(publisher.factory, "storage_binding", None) is publisher.storage_binding, "storage_factory_changed"
+    )
+    if publisher.storage_binding is not None:
+        factory = _FACTORY.get()
+        _require(
+            factory is publisher.factory
+            and getattr(factory, "policy", None) is publisher.policy
+            and getattr(factory, "storage_binding", None) is publisher.storage_binding,
+            "storage_factory_changed",
+        )
+        current = getattr(factory, "_require_current_policy", None)
+        _require(callable(current), "transaction_factory_required")
+        current()
     return publisher
+
+
+async def _bind_isolated_storage(publisher):
+    """Accept coordinates only after the original factory repeats native issuance."""
+    from process.provider_directory_source_storage_binding import (
+        FHIRSourceStorageBinding,
+        verify_isolated_source_storage_coordinates,
+    )
+
+    _require(bound_publisher() is publisher, "original_storage_publisher_required")
+    factory, binding = publisher.factory, publisher.storage_binding
+    _require(type(binding) is FHIRSourceStorageBinding, "storage_binding_required")
+    capture = getattr(factory, "source_storage_binding", None)
+    _require(callable(capture), "storage_factory_required")
+    actual = await capture(publisher.connection, publisher.policy)
+    _require(bound_publisher() is publisher and actual is binding, "storage_factory_changed")
+    await verify_isolated_source_storage_coordinates(publisher.connection, publisher.policy, binding)
+    _require(bound_publisher() is publisher, "storage_factory_changed")
+
+
+def current_source_storage_binding():
+    """An isolated locator cannot route ordinary or inherited-task database IO."""
+    if _PUBLISHER.get() is not None:
+        return bound_publisher().storage_binding
+    factory = _FACTORY.get()
+    _require(getattr(factory, "storage_binding", None) is None, "isolated_transaction_required")
+    return None
 
 
 @asynccontextmanager
@@ -151,6 +197,7 @@ def is_source_storage_required():
 def _publication_factory():
     factory = _FACTORY.get()
     _require(factory is not None and _PUBLISHER.get() is None, "original_publication_required")
+    _require(getattr(factory, "storage_binding", None) is None, "isolated_activation_unavailable")
     _require(
         callable(getattr(factory, "publication_session_factory", None))
         and callable(getattr(factory, "bind_existing_transaction", None)),
@@ -276,6 +323,7 @@ def source_copy_session():
 async def _publication_origin(database):
     """Read native identity only within the original fresh-statement Owner body."""
     publisher = bound_publisher()
+    _require(publisher.storage_binding is None, "isolated_activation_unavailable")
     _require(publisher.transaction_isolation == "read committed", "read_committed_publication_required")
     session = source_copy_session()
     binding = database._transaction_binding()

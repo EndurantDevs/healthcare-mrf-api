@@ -6,13 +6,77 @@ import dataclasses
 import hashlib
 import importlib
 import uuid
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql.asyncpg import dialect
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
+from tests.test_provider_directory_isolated_source_provision import native_bootstrap as native_bootstrap
 
 importer = importlib.import_module("process.provider_directory_fhir")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_foreign_key", [False, True])
+async def test_reservation_cleanup_is_atomic_without_a_foreign_key(native_bootstrap, monkeypatch, legacy_foreign_key):
+    """Exercise real cleanup SQL; publisher authority is covered by the control cohort."""
+    connection = native_bootstrap.connection
+    await connection.execute(
+        "CREATE TEMP TABLE reservation_parent(checkpoint_id text PRIMARY KEY,state text NOT NULL,"
+        "status_url_ciphertext text,manifest_hash text)"
+    )
+    reference = " REFERENCES reservation_parent(checkpoint_id) ON DELETE CASCADE" if legacy_foreign_key else ""
+    await connection.execute(
+        "CREATE TEMP TABLE reservation_output(checkpoint_id text NOT NULL" + reference + ",output_id text NOT NULL,"
+        "PRIMARY KEY(checkpoint_id,output_id))"
+    )
+    identity = _identity()
+    starting = importer.BULK_EXPORT_CHECKPOINT_STARTING
+    checkpoint_rows = [
+        (identity.checkpoint_id, starting, None, None),
+        ("unrelated", starting, None, None),
+        ("active", importer.BULK_EXPORT_CHECKPOINT_STREAMING, None, None),
+        ("with_status", starting, "opaque-status", None),
+        ("with_manifest", starting, None, "hash"),
+    ]
+    await connection.executemany("INSERT INTO reservation_parent VALUES($1,$2,$3,$4)", checkpoint_rows)
+    await connection.execute("INSERT INTO reservation_output SELECT checkpoint_id,'output' FROM reservation_parent")
+
+    async def status(sql, **parameters):
+        statement = text(sql).compile(dialect=dialect())
+        return await connection.execute(str(statement), *(parameters[name] for name in statement.positiontup))
+
+    @asynccontextmanager
+    async def transaction(database, **coordinates):
+        assert coordinates["bulk_identity"].acquisition_root_run_id == identity.acquisition_root_run_id
+        async with connection.transaction():
+            yield
+
+    monkeypatch.setattr(importer, "db", SimpleNamespace(status=status))
+    monkeypatch.setattr(importer, "source_checkpoint_transaction", transaction)
+    monkeypatch.setattr(importer, "_bulk_acquisition_checkpoint_table_ref", lambda: "pg_temp.reservation_parent")
+    monkeypatch.setattr(importer, "_bulk_output_checkpoint_table_ref", lambda: "pg_temp.reservation_output")
+    for checkpoint_id in ("active", "with_status", "with_manifest", "absent"):
+        await importer._release_bulk_export_reservation(dataclasses.replace(identity, checkpoint_id=checkpoint_id))
+    assert await connection.fetchval("SELECT count(*) FROM reservation_output") == 5
+    rollback = connection.transaction()
+    await rollback.start()
+    try:
+        await importer._release_bulk_export_reservation(identity)
+        assert await connection.fetchval("SELECT count(*) FROM reservation_parent") == 4
+        assert await connection.fetchval("SELECT count(*) FROM reservation_output") == 4
+    finally:
+        await rollback.rollback()
+    assert await connection.fetchval("SELECT count(*) FROM reservation_parent") == 5
+    assert await connection.fetchval("SELECT count(*) FROM reservation_output") == 5
+    await importer._release_bulk_export_reservation(identity)
+    assert await connection.fetchval("SELECT count(*) FROM reservation_parent") == 4
+    assert await connection.fetchval("SELECT count(*) FROM reservation_output") == 4
+    assert await connection.fetchval("SELECT count(*) FROM reservation_output WHERE checkpoint_id='unrelated'") == 1
 
 
 async def _require_disposable_postgres(database: Database) -> None:

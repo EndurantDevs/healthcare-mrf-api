@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from uuid import uuid4
@@ -27,6 +27,7 @@ from process.provider_directory_generic_candidate import (
     copy_record_batches,
 )
 from process.provider_directory_generic_source_policy import source_copy_session, source_owner_transaction
+from process.provider_directory_source_storage_binding import require_storage_schema, storage_document
 
 HEADER = "provider_directory_endpoint_dataset"
 RESOURCE = "provider_directory_dataset_resource"
@@ -40,6 +41,8 @@ RELATIONS = (
     WITNESS,
     RELATIONSHIP,
 )
+ISOLATED_STORAGE_ROOTS = (HEADER, *RELATIONS)
+HANDOFF_CONTROL_ROOTS = (HEADER, "provider_directory_dataset_proof_shard")
 CMS_IDENTITY_ROOTS = (
     "provider_directory_entity_source_binding",
     "provider_directory_entity_release_evidence",
@@ -49,12 +52,22 @@ CMS_IDENTITY_ROOTS = (
 CMS_RESOURCE_IDENTITY_ROOT = "provider_directory_resource_identity"
 AUXILIARY_ROOTS = (*CMS_IDENTITY_ROOTS, CMS_RESOURCE_IDENTITY_ROOT)
 CONTRACT = "generic-source-candidate-v2"
+ISOLATED_CONTRACT = "generic-source-detached-v1"
 # Autovacuum on a private heap competes with the bulk load and reduce for I/O; statistics come from
 # explicit ANALYZE and attached heaps get the default back right before they join their root.
 PRIVATE_HEAP_OPTIONS = " WITH (autovacuum_enabled = false)"
-_NAME = re.compile(r"pdgs_[0-9a-f]{32}_(?:ri|wi|r|ip|np|ao|w|rl|eb|ee|nb|ne|re)")
+_NAME = re.compile(r"pdgs_[0-9a-f]{32}_(?:ri|wi|r|ip|np|ao|w|rl|eb|ee|nb|ne|re|h|p)")
 _SUFFIXES = dict(zip((*RELATIONS, *AUXILIARY_ROOTS), ("r", "ip", "np", "ao", "w", "rl", "eb", "ee", "nb", "ne", "re")))
+_SUFFIXES.update(zip(HANDOFF_CONTROL_ROOTS, ("h", "p")))
 _BINDING_KEYS = {"contract", "identity", "phase", "ordinal", "resets", "tables", "auxiliary", "relationship_sha256"}
+HANDOFF_HEADER_FIELDS = (
+    "dataset_hash",
+    "resource_count",
+    "previous_dataset_id",
+    "completion_proof_required_version",
+    "completion_proof_sha256",
+    "content_proof_admission_sha256",
+)
 _INPUT_SEQUENCES_SQL = """SELECT t.relname AS input_name,a.attname,a.attidentity::text,
  d.deptype::text,s.oid::bigint,s.relname,n.nspname,s.relowner::bigint,
  s.relkind::text,s.relpersistence::text,q.seqtypid::regtype::text,
@@ -120,10 +133,20 @@ def candidate_identity(directory, candidate):
 
 
 def _validate_binding(binding_by_field, identity, *, phases):
+    """Authenticate the complete closed candidate document before native lookup."""
+    _validate_binding_shape(binding_by_field, identity, phases=phases)
+    _validate_binding_storage(binding_by_field, is_isolated=binding_by_field["contract"] == ISOLATED_CONTRACT)
+    _validate_binding_tables(binding_by_field, identity)
+
+
+def _validate_binding_shape(binding_by_field, identity, *, phases):
+    """Share the document checks across loading and protected snapshot readers."""
+    is_isolated = type(binding_by_field) is dict and binding_by_field.get("contract") == ISOLATED_CONTRACT
+    keys = _BINDING_KEYS | {"storage", "admission"} if is_isolated else _BINDING_KEYS
     _require(
         type(binding_by_field) is dict
-        and set(binding_by_field) == _BINDING_KEYS
-        and binding_by_field["contract"] == CONTRACT
+        and set(binding_by_field) == keys
+        and binding_by_field["contract"] == (ISOLATED_CONTRACT if is_isolated else CONTRACT)
         and type(binding_by_field["identity"]) is dict
         and set(binding_by_field["identity"]) == {"dataset_id", "endpoint_id", "acquisition_root_run_id", "metadata"}
         and type(binding_by_field["identity"]["metadata"]) is dict
@@ -146,14 +169,54 @@ def _validate_binding(binding_by_field, identity, *, phases):
         ),
         "binding_changed",
     )
+
+
+def _validate_binding_storage(binding_by_field, *, is_isolated):
+    """Keep detached evidence inseparable from the originally issued namespace."""
+    if is_isolated:
+        from process.provider_directory_generic_source_policy import bound_publisher
+
+        _validate_isolated_binding_storage(binding_by_field, storage_document(bound_publisher()))
+    else:
+        _require(binding_by_field["phase"] != "ready_for_freeze", "binding_changed")
+
+
+def _validate_isolated_binding_storage(binding_by_field, expected_storage):
+    _require(binding_by_field["storage"] == expected_storage, "storage_binding_changed")
+    _require(
+        binding_by_field["phase"] != "published" and binding_by_field["auxiliary"] is None,
+        "isolated_kind_unsupported",
+    )
+    if binding_by_field["phase"] == "ready_for_freeze":
+        validate_handoff_header(binding_by_field["admission"])
+    else:
+        _require(binding_by_field["admission"] is None, "admission_changed")
+
+
+def validate_handoff_document(document, expected_storage):
+    """Check data against issued coordinates; this grants no read or publication rights."""
+    _require(type(document) is dict and document.get("contract") == ISOLATED_CONTRACT, "isolated_storage_required")
+    _validate_binding_shape(document, document.get("identity"), phases=("ready_for_freeze",))
+    _validate_isolated_binding_storage(document, expected_storage)
+    _validate_binding_tables(document, document["identity"])
+
+
+def _validate_binding_tables(binding_by_field, identity):
+    """Require the complete phase-specific native inventory, without aliases."""
     _require(type(binding_by_field["tables"]) is dict, "tables_changed")
-    expected = set() if binding_by_field["phase"] in {"published", "disposed"} else {"resource_input", "witness_input"}
-    if binding_by_field["phase"] in {"prepared", "published"}:
+    expected = (
+        set()
+        if binding_by_field["phase"] in {"published", "disposed", "ready_for_freeze"}
+        else {"resource_input", "witness_input"}
+    )
+    if binding_by_field["phase"] in {"prepared", "published", "ready_for_freeze"}:
         expected |= set(RELATIONS)
+    if binding_by_field["phase"] == "ready_for_freeze":
+        expected |= set(HANDOFF_CONTROL_ROOTS)
     _require(set(binding_by_field["tables"]) == expected, "tables_changed")
     tables_by_kind = {**binding_by_field["tables"], **_auxiliary_tables(binding_by_field, identity)}
     names = []
-    for table in tables_by_kind.values():
+    for root, table in tables_by_kind.items():
         _require(
             type(table) is dict
             and set(table) == {"name", "oid", "owner", "layout_sha256"}
@@ -167,8 +230,97 @@ def _validate_binding(binding_by_field, identity, *, phases):
             and re.fullmatch(r"[0-9a-f]{64}", table["layout_sha256"]),
             "table_binding_changed",
         )
+        if root in HANDOFF_CONTROL_ROOTS or table["name"].endswith(("_h", "_p")):
+            _require(
+                binding_by_field["contract"] == ISOLATED_CONTRACT
+                and binding_by_field["phase"] == "ready_for_freeze"
+                and root in HANDOFF_CONTROL_ROOTS
+                and table["name"].endswith("_" + _SUFFIXES[root]),
+                "table_binding_changed",
+            )
         names.append(table["name"])
     _require(len(set(names)) == len(names), "table_binding_changed")
+
+
+def validate_handoff_header(seal):
+    """Keep complete content/completion evidence for revalidation after writer closure."""
+    _require(type(seal) is dict and set(seal) == set(HANDOFF_HEADER_FIELDS), "admission_changed")
+    from process.provider_directory_fhir_subset_canonical import SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+
+    completion_version, completion_hash = seal["completion_proof_required_version"], seal["completion_proof_sha256"]
+    completion_valid = (
+        completion_version is None
+        and completion_hash is None
+        or (
+            type(completion_version) is int
+            and completion_version == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
+            and type(completion_hash) is str
+            and re.fullmatch(r"[0-9a-f]{64}", completion_hash)
+        )
+    )
+    _require(
+        all(
+            type(seal[key]) is str and re.fullmatch(r"[0-9a-f]{64}", seal[key])
+            for key in ("dataset_hash", "content_proof_admission_sha256")
+        )
+        and type(seal["resource_count"]) is int
+        and 0 <= seal["resource_count"] < 2**63
+        and completion_valid
+        and (
+            seal["previous_dataset_id"] is None
+            or type(seal["previous_dataset_id"]) is str
+            and 1 <= len(seal["previous_dataset_id"]) <= 96
+        ),
+        "admission_changed",
+    )
+
+
+def validate_handoff_completion(header):
+    """Apply the two legacy callable CHECKs without installing them on private heaps."""
+    from process.provider_directory_fhir_subset_canonical import validate_subset_completion_proof_pair
+
+    validate_handoff_header({field: header[field] for field in HANDOFF_HEADER_FIELDS})
+    proof = _json(header["completion_proof_json"])
+    if header["completion_proof_required_version"] is None:
+        _require(proof is None, "completion_proof_unexpected")
+        return
+    try:
+        proof, _ = validate_subset_completion_proof_pair(proof, header["completion_proof_sha256"])
+    except ValueError as error:
+        raise GenericCandidateError("provider_directory_generic_source_completion_proof_invalid") from error
+    _require(
+        proof["dataset"]["hash"] == header["dataset_hash"]
+        and proof["dataset"]["count"] == header["resource_count"],
+        "completion_dataset_changed",
+    )
+
+
+def _require_candidate_storage(publisher, directory, identity):
+    binding = require_storage_schema(publisher, directory._schema())
+    if binding is not None:
+        metadata = identity["metadata"]
+        _require(
+            metadata.get("source_release") is None
+            and type(metadata.get("source_ids")) is list
+            and bool(metadata["source_ids"])
+            and all(type(source) is str and 1 <= len(source) <= 64 for source in metadata["source_ids"])
+            and type(metadata.get("selected_resources")) is list
+            and bool(metadata["selected_resources"])
+            and all(type(resource) is str for resource in metadata["selected_resources"])
+            and set(metadata["selected_resources"])
+            <= {
+                "Organization",
+                "OrganizationAffiliation",
+                "Practitioner",
+                "PractitionerRole",
+                "Location",
+                "HealthcareService",
+                "InsurancePlan",
+                "Endpoint",
+            },
+            "isolated_kind_unsupported",
+        )
+    return binding
 
 
 def _auxiliary_tables(binding_by_field, identity):
@@ -233,11 +385,17 @@ async def _locked(connection, policy, identity, *, phases=("loading",), lock="UP
         and all(metadata.get(key) == value for key, value in identity["metadata"].items()),
         "acquisition_changed",
     )
-    if "published" not in phases:
+    if "published" not in phases and "ready_for_freeze" not in phases:
         _require(row["status"] == "acquiring" and row["is_current"] is False, "header_sealed")
     binding_by_field = _json(row["candidate_storage_json"])
     if binding_by_field is not None:
         _validate_binding(binding_by_field, identity, phases=phases)
+        from process.provider_directory_generic_source_policy import current_source_storage_binding
+
+        _require(
+            (current_source_storage_binding() is not None) == (binding_by_field["contract"] == ISOLATED_CONTRACT),
+            "storage_contract_changed",
+        )
     return binding_by_field
 
 
@@ -322,6 +480,18 @@ async def _capture(connection, policy, names, *, private=True):
     for name, sequence in (await _capture_input_sequences(connection, policy, names, owner)).items():
         proof_by_name[name]["layout_sha256"] = _input_layout_hash(proof_by_name[name]["layout_sha256"], sequence)
     return proof_by_name
+
+
+async def require_private_source_readers_closed(connection, relation_oids, reader_oids):
+    """Private loading storage grants no direct or inherited runtime access."""
+    closed = await connection.fetchval(
+        "SELECT NOT EXISTS(SELECT FROM unnest($1::oid[]) relations(oid),unnest($2::oid[]) readers(oid) "
+        "WHERE has_table_privilege(readers.oid,relations.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
+        "OR has_any_column_privilege(readers.oid,relations.oid,'SELECT,INSERT,UPDATE,REFERENCES'))",
+        list(relation_oids),
+        list(reader_oids),
+    )
+    _require(closed is True, "private_reader_access")
 
 
 def _input_layout_hash(table_layout, sequence):
@@ -415,6 +585,7 @@ async def _verify_tables_recently(connection, policy, binding_by_field):
             "phase": binding_by_field["phase"],
             "tables": binding_by_field["tables"],
             "auxiliary": binding_by_field["auxiliary"],
+            "storage": binding_by_field.get("storage"),
         }
     )
     verified = _VERIFIED_CUSTODY.get()
@@ -430,7 +601,7 @@ async def prepare_generic_source_candidate(database, directory, candidate):
     identity = candidate_identity(directory, candidate)
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
-        _require(policy.schema == directory._schema(), "schema_changed")
+        isolated = _require_candidate_storage(publisher, directory, identity)
         binding_by_field = await _locked(connection, policy, identity)
         if binding_by_field is not None:
             await _verify_tables(connection, policy, binding_by_field)
@@ -468,6 +639,8 @@ async def prepare_generic_source_candidate(database, directory, candidate):
             auxiliary=None,
             relationship_sha256=None,
         )
+        if isolated is not None:
+            binding_by_field.update(contract=ISOLATED_CONTRACT, storage=storage_document(publisher), admission=None)
         await _store(connection, policy, identity, None, binding_by_field)
         return binding_by_field
 
@@ -489,7 +662,7 @@ async def resolve_existing_source_candidate(database, directory, dataset_id):
     """Read only the explicit existing protected binding for reset/witness controls."""
     _require(type(dataset_id) is str and 1 <= len(dataset_id) <= 96, "dataset_invalid")
     async with source_owner_transaction(database) as publisher:
-        _require(publisher.policy.schema == directory._schema(), "schema_changed")
+        require_storage_schema(publisher, directory._schema())
         row = await publisher.connection.fetchrow(
             f"SELECT candidate_storage_json FROM {storage_relation(publisher.policy.schema, HEADER)} "
             "WHERE dataset_id=$1 FOR KEY SHARE",
@@ -566,7 +739,7 @@ async def append_generic_source_batch(database, directory, candidate, resources,
         )
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
-        _require(policy.schema == directory._schema(), "schema_changed")
+        _require_candidate_storage(publisher, directory, identity)
         previous = await _locked(connection, policy, identity, lock="KEY SHARE")
         _require(previous is not None, "preparation_required")
         families = {_resource_family(resource_row["resource_type"]) for resource_row in (*resources, *witnesses)}
@@ -605,7 +778,7 @@ async def reset_generic_source_family(database, directory, candidate, resource_t
     _require(resource_type is None or resource_type in candidate.selected_resources, "reset_scope_changed")
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
-        _require(policy.schema == directory._schema(), "schema_changed")
+        _require_candidate_storage(publisher, directory, identity)
         if resource_type is not None:
             await _locked(connection, policy, identity, lock="KEY SHARE")
             await _lock_resource_family(connection, policy, candidate.dataset_id, resource_type)
@@ -624,7 +797,7 @@ async def discard_generic_source_inputs(database, directory, candidate, release)
     """Reclaim only exact failed, unpublished, unattached heaps; never row DELETE."""
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
-        _require(policy.schema == directory._schema(), "schema_changed")
+        require_storage_schema(publisher, directory._schema())
         header_by_field = await connection.fetchrow(
             f"SELECT endpoint_id,acquisition_root_run_id,status,is_current,published_at,publication_metadata_json,"
             f"candidate_storage_json FROM {storage_relation(policy.schema, HEADER)} WHERE dataset_id=$1 FOR UPDATE",
@@ -680,7 +853,7 @@ async def generic_source_relation_scope(database, directory, candidate):
     """Read/write only the exact closed candidate group in the original owner tx."""
     identity = candidate_identity(directory, candidate)
     async with source_owner_transaction(database) as publisher:
-        _require(publisher.policy.schema == directory._schema(), "schema_changed")
+        isolated = _require_candidate_storage(publisher, directory, identity)
         binding_by_field = await _locked(publisher.connection, publisher.policy, identity, phases=("prepared",))
         _require(binding_by_field is not None, "completion_required")
         await _verify_tables(publisher.connection, publisher.policy, binding_by_field)
@@ -689,7 +862,9 @@ async def generic_source_relation_scope(database, directory, candidate):
         if auxiliary is not None:
             relations_by_root.update({root: proof["name"] for root, proof in auxiliary["tables"].items()})
         from process.provider_directory_generic_source_auxiliary import identity_candidate_scope
+        from process.provider_directory_source_storage_binding import isolated_source_relation_scope
 
         async with identity_candidate_scope(publisher, binding_by_field):
-            with directory._provider_directory_artifact_relation_scope(relations_by_root):
+            isolated_scope = isolated_source_relation_scope(publisher, relations_by_root) if isolated else nullcontext()
+            with isolated_scope, directory._provider_directory_artifact_relation_scope(relations_by_root):
                 yield publisher, binding_by_field

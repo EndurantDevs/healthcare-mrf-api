@@ -17,8 +17,12 @@ from process.provider_directory_generic_source_storage import (
     CMS_IDENTITY_ROOTS,
     CMS_RESOURCE_IDENTITY_ROOT,
     HEADER,
+    RELATIONS,
     RELATIONSHIP,
     WITNESS,
+    _capture,
+    _close_grants,
+    _json,
     _require,
 )
 from process.provider_directory_source_checkpoint_catalog import (
@@ -60,6 +64,262 @@ CONTROL_ROOTS = (
     "pd_dataset_migration_plan",
     *MINT_ROOTS,
 )
+ISOLATED_FHIR_ROOTS = (HEADER, *RELATIONS, PROOF_ROOT, *CHECKPOINT_LAYOUTS)
+# Full pg_get_constraintdef output, with only the function namespace replaced.
+# These two checks move to protected application validation, never disappear.
+_ISOLATED_APPLICATION_CHECKS = {
+    "pd_endpoint_dataset_completion_digest_check": (
+        "provider_directory_subset_completion_proof_pair_valid(jsonb,text)",
+        "4e22ef3ce7308145b26216e914c0ea2f8ec4c27df70fff6c5cc96144870a863f",
+    ),
+    "pd_endpoint_dataset_completion_shape_check": (
+        "provider_directory_subset_completion_proof_shape_valid(jsonb,text,bigint)",
+        "a1a5f5744bae74014dd21d17f3b03c6905663f4a5785c52ad277b905fe6be7a3",
+    ),
+}
+_ISOLATED_TEMPLATE_SQL = """SELECT c.oid::bigint,c.relname,
+ c.relkind IN ('r','p') AND c.relpersistence='p' AND NOT c.relispartition
+ AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND c.reloftype=0
+ AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid)
+ AND NOT EXISTS(SELECT FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid
+  WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+  AND (a.attidentity<>'' OR t.typnamespace<>'pg_catalog'::regnamespace
+   OR EXISTS(SELECT FROM pg_collation WHERE oid=a.attcollation AND collnamespace<>'pg_catalog'::regnamespace)))
+ AND EXISTS(SELECT FROM pg_constraint WHERE conrelid=c.oid AND contype='p')
+ AND NOT EXISTS(SELECT FROM pg_constraint WHERE conrelid=c.oid
+  AND (contype NOT IN ('n','c','p','u','f','t') OR NOT convalidated))
+ AND NOT EXISTS(SELECT FROM pg_index WHERE indrelid=c.oid
+  AND NOT (indisvalid AND indisready AND indislive AND NOT indisexclusion)) AS supported,
+ (SELECT jsonb_agg(jsonb_build_object('oid',k.oid::bigint,'name',k.conname,
+  'definition',pg_get_constraintdef(k.oid),'functions',ARRAY(
+   SELECT p.oid::regprocedure::text FROM pg_depend d JOIN pg_proc p ON p.oid=d.refobjid
+   WHERE d.classid='pg_constraint'::regclass AND d.objid=k.oid
+    AND d.refclassid='pg_proc'::regclass ORDER BY p.oid),'function_oids',ARRAY(
+   SELECT d.refobjid::bigint FROM pg_depend d WHERE d.classid='pg_constraint'::regclass AND d.objid=k.oid
+    AND d.refclassid='pg_proc'::regclass ORDER BY d.refobjid)) ORDER BY k.conname)
+  FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype='c') AS checks
+ FROM pg_class c WHERE c.relnamespace=$1::oid AND c.relname=ANY($2::text[]) ORDER BY c.relname"""
+_ISOLATED_DEPENDENCIES_SQL = """WITH objects(classid,objid,relation) AS (
+ SELECT 'pg_attrdef'::regclass,d.oid,d.adrelid FROM pg_attrdef d WHERE d.adrelid=ANY($1::oid[])
+ UNION ALL SELECT 'pg_constraint'::regclass,k.oid,k.conrelid FROM pg_constraint k
+  WHERE k.conrelid=ANY($1::oid[]) AND k.contype='c' AND k.oid<>ALL($2::oid[])
+ UNION ALL SELECT 'pg_class'::regclass,i.indexrelid,i.indrelid FROM pg_index i WHERE i.indrelid=ANY($1::oid[])
+ ) SELECT NOT EXISTS(SELECT FROM objects o JOIN pg_depend d ON d.classid=o.classid AND d.objid=o.objid
+ WHERE ((pg_identify_object(d.refclassid,d.refobjid,d.refobjsubid)).schema='pg_catalog'
+  OR d.refclassid='pg_class'::regclass AND d.refobjid=o.relation
+  OR d.refclassid='pg_constraint'::regclass AND EXISTS(SELECT FROM pg_constraint k
+   WHERE k.oid=d.refobjid AND k.conrelid=o.relation AND k.contype IN ('p','u'))) IS NOT TRUE)"""
+
+
+async def provision_isolated_fhir_source_storage(
+    connection, policy, *, catalog_schema, namespace_owner, verify_role_profile
+):
+    """Prepare empty private native storage; this evidence cannot activate a worker."""
+    _require(type(policy) is GenericSourcePolicy and callable(verify_role_profile), "explicit_policy_required")
+    _require(connection.is_in_transaction() is True, "transaction_required")
+    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
+    for schema in (catalog_schema, policy.schema):
+        storage_identifier(schema)
+        _require(schema not in {"public", "information_schema"} and not schema.startswith("pg_"), "schema_invalid")
+    storage_identifier(namespace_owner)
+    _require(catalog_schema != policy.schema and namespace_owner not in role_names, "isolated_coordinates_required")
+    async with connection.transaction():
+        await connection.execute("SET LOCAL search_path=pg_catalog,pg_temp")
+        task = asyncio.current_task()
+        identity, catalog_oid = await _isolated_admin_preimage(connection, policy, catalog_schema, namespace_owner)
+        template_rows, checks_by_name, excluded_oids = await _isolated_template_preimage(
+            connection, catalog_schema, catalog_oid
+        )
+        await _create_isolated_namespace(connection, policy, namespace_owner, verify_role_profile)
+        await _clone_isolated_templates(connection, policy, catalog_schema, template_rows, excluded_oids)
+        preparation = await _capture_isolated_preparation(
+            connection, policy, catalog_schema, catalog_oid, namespace_owner, identity, checks_by_name
+        )
+        _require(
+            connection.is_in_transaction() is True
+            and asyncio.current_task() is task
+            and await _fhir_input_identity(connection) == identity,
+            "original_admin_changed",
+        )
+        return preparation
+
+
+async def _isolated_admin_preimage(connection, policy, catalog_schema, namespace_owner):
+    """Authenticate the independent issuer and untouched namespace coordinates."""
+    identity = await _fhir_input_identity(connection)
+    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
+    _require(
+        identity["session"] == identity["current"] and identity["current"] not in (*role_names, namespace_owner),
+        "independent_admin_required",
+    )
+    _require(
+        await connection.fetchval("SELECT rolsuper FROM pg_roles WHERE rolname=session_user") is True,
+        "native_admin_required",
+    )
+    catalog_oid = await connection.fetchval("SELECT oid::bigint FROM pg_namespace WHERE nspname=$1", catalog_schema)
+    _require(
+        catalog_oid
+        and not await connection.fetchval("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname=$1)", policy.schema),
+        "namespace_preimage_changed",
+    )
+    _require(
+        await connection.fetchval(
+            "SELECT NOT (n.rolcanlogin OR n.rolsuper OR n.rolcreatedb OR n.rolcreaterole OR n.rolreplication OR n.rolbypassrls) "
+            "AND NOT EXISTS(SELECT FROM pg_roles r WHERE "
+            "(r.rolname=ANY($2::text[]) AND (pg_has_role(r.oid,n.oid,'SET') OR pg_has_role(r.oid,n.oid,'USAGE'))) "
+            "OR ((r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls) "
+            "AND (pg_has_role(n.oid,r.oid,'SET') OR pg_has_role(n.oid,r.oid,'USAGE')))) "
+            "FROM pg_roles n WHERE n.rolname=$1",
+            namespace_owner,
+            list(role_names),
+        )
+        is True,
+        "namespace_owner_unprotected",
+    )
+    return identity, catalog_oid
+
+
+async def _isolated_template_preimage(connection, catalog_schema, catalog_oid):
+    """Pin reader-compatible templates and authenticate every copied dependency."""
+    templates = [storage_relation(catalog_schema, name) for name in ISOLATED_FHIR_ROOTS]
+    await connection.execute(
+        "LOCK TABLE " + ",".join("ONLY " + name for name in templates) + " IN ACCESS SHARE MODE NOWAIT"
+    )
+    template_rows = await connection.fetch(_ISOLATED_TEMPLATE_SQL, catalog_oid, list(ISOLATED_FHIR_ROOTS))
+    _require(
+        len(template_rows) == len(ISOLATED_FHIR_ROOTS) and all(template["supported"] for template in template_rows),
+        "template_preimage_changed",
+    )
+    prefix = await connection.fetchval("SELECT quote_ident($1::text)||'.'", catalog_schema)
+    checks_by_name, excluded_oids = {}, []
+    for template in template_rows:
+        for check in _json(template["checks"]) or []:
+            if template["relname"] == HEADER and check["name"] in _ISOLATED_APPLICATION_CHECKS:
+                function, digest = _ISOLATED_APPLICATION_CHECKS[check["name"]]
+                normalized = check["definition"].replace(
+                    prefix + function.split("(")[0] + "(", "__catalog__." + function.split("(")[0] + "("
+                )
+                _require(
+                    check["functions"] == [prefix + function]
+                    and hashlib.sha256(normalized.encode()).hexdigest() == digest,
+                    "application_check_changed",
+                )
+                checks_by_name[check["name"]] = dict(check, normalized_definition_sha256=digest)
+                excluded_oids.append(check["oid"])
+    _require(set(checks_by_name) == set(_ISOLATED_APPLICATION_CHECKS), "application_check_missing")
+    _require(
+        await connection.fetchval(
+            _ISOLATED_DEPENDENCIES_SQL, [template["oid"] for template in template_rows], excluded_oids
+        )
+        is True,
+        "template_dependency_unsupported",
+    )
+    return template_rows, checks_by_name, excluded_oids
+
+
+async def _create_isolated_namespace(connection, policy, namespace_owner, verify_role_profile):
+    """Close the new namespace ACL before the existing native role admission."""
+    namespace = storage_identifier(policy.schema)
+    await connection.execute(f"CREATE SCHEMA {namespace} AUTHORIZATION {storage_identifier(namespace_owner)}")
+    for grant in await connection.fetch(
+        "SELECT DISTINCT a.grantee,r.rolname FROM pg_namespace n CROSS JOIN LATERAL "
+        "aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a LEFT JOIN pg_roles r ON r.oid=a.grantee "
+        "WHERE n.nspname=$1 AND a.grantee<>n.nspowner",
+        policy.schema,
+    ):
+        principal = "PUBLIC" if grant["grantee"] == 0 else storage_identifier(grant["rolname"])
+        await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM {principal} CASCADE")
+    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
+    await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO " + ",".join(map(storage_identifier, role_names)))
+    await connection.execute(f"GRANT CREATE ON SCHEMA {namespace} TO {storage_identifier(policy.owner_role)}")
+    await storage_roles(connection, policy.schema, **policy.role_arguments())
+    await verify_role_profile(connection, policy.schema, **policy.role_arguments())
+
+
+async def _clone_isolated_templates(connection, policy, catalog_schema, template_rows, excluded_oids):
+    """Clone native heap structure and close each new table's inherited grants."""
+    for template in template_rows:
+        private_relation = storage_relation(policy.schema, template["relname"])
+        template_relation = storage_relation(catalog_schema, template["relname"])
+        await connection.execute(
+            f"CREATE TABLE {private_relation} (LIKE {template_relation} INCLUDING DEFAULTS INCLUDING GENERATED "
+            "INCLUDING STORAGE INCLUDING INDEXES INCLUDING CONSTRAINTS) USING heap"
+        )
+        checkpoint_columns = CHECKPOINT_LAYOUTS.get(template["relname"], {}).get("columns", ())
+        json_columns = (
+            await connection.fetch(
+                "SELECT attname FROM pg_attribute WHERE attrelid=$1::regclass AND attname=ANY($2::text[]) "
+                "AND atttypid='pg_catalog.json'::regtype AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+                private_relation,
+                [column[0] for column in checkpoint_columns if column[1] == "jsonb"],
+            )
+            if checkpoint_columns
+            else []
+        )
+        if json_columns:
+            # Only the new empty heap changes; canonical readers keep their original layout.
+            await connection.execute(
+                f"ALTER TABLE {private_relation} "
+                + ",".join(
+                    f"ALTER COLUMN {storage_identifier(column['attname'])} TYPE jsonb "
+                    f"USING {storage_identifier(column['attname'])}::jsonb"
+                    for column in json_columns
+                )
+            )
+        for check in _json(template["checks"]) or []:
+            if check["oid"] in excluded_oids:
+                await connection.execute(
+                    f"ALTER TABLE {private_relation} DROP CONSTRAINT {storage_identifier(check['name'])}"
+                )
+        await connection.execute(f"ALTER TABLE {private_relation} OWNER TO {storage_identifier(policy.owner_role)}")
+        await _close_grants(connection, policy, template["relname"])
+
+
+async def _capture_isolated_preparation(
+    connection, policy, catalog_schema, catalog_oid, namespace_owner, identity, checks_by_name
+):
+    """Bind preparation evidence to the complete physical inventory and native roles."""
+    inventory_by_name = await _capture(connection, policy, ISOLATED_FHIR_ROOTS)
+    inventory = await _fhir_physical_inventory(connection, list(inventory_by_name.values()))
+    coordinates_by_name = dict(
+        await connection.fetchrow(
+            "SELECT n.oid::bigint AS storage_schema_oid,n.nspowner::bigint AS namespace_owner_oid,"
+            "r.oid::bigint AS owner_oid,p.oid::bigint AS publisher_oid FROM pg_namespace n,pg_roles r,pg_roles p "
+            "WHERE n.nspname=$1 AND r.rolname=$2 AND p.rolname=$3",
+            policy.schema,
+            policy.owner_role,
+            policy.publisher_role,
+        )
+    )
+    _require(
+        await connection.fetchval(
+            "SELECT array_agg(relname::text ORDER BY relname) FROM pg_class WHERE relnamespace=$1::oid AND relkind<>'i'",
+            coordinates_by_name["storage_schema_oid"],
+        )
+        == sorted(ISOLATED_FHIR_ROOTS),
+        "private_inventory_changed",
+    )
+    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles, namespace_owner)
+    role_oids_by_name = {
+        principal["rolname"]: principal["oid"]
+        for principal in await connection.fetch(
+            "SELECT rolname,oid::bigint FROM pg_roles WHERE rolname=ANY($1::text[])", list(role_names)
+        )
+    }
+    return dict(
+        version=1,
+        preparation_only=True,
+        catalog_schema=catalog_schema,
+        storage_schema=policy.schema,
+        catalog_schema_oid=catalog_oid,
+        database_oid=identity["database_oid"],
+        **coordinates_by_name,
+        role_oids=role_oids_by_name,
+        inventory=inventory,
+        required_application_checks=checks_by_name,
+    )
+
+
 _PAYLOAD_GUARDS = {
     "guard_pd_dataset_candidate_parent",
     "deny_pd_dataset_candidate_write",

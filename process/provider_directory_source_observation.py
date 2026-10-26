@@ -39,10 +39,26 @@ class _Observation:
     isolation: str
     producer: tuple
     origin: tuple
+    storage_binding: object
 
 
 def _fields(observation):
     return tuple(getattr(observation, name) for name in observation.__dataclass_fields__)
+
+
+def _storage_binding(directory, factory):
+    from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
+
+    binding = getattr(factory, "storage_binding", None)
+    require_output(
+        directory._schema() == factory.policy.schema
+        if binding is None
+        else type(binding) is FHIRSourceStorageBinding
+        and directory._schema() == binding.catalog_schema
+        and factory.policy.schema == binding.storage_schema,
+        "source_observation_schema_changed",
+    )
+    return binding
 
 
 def current_observation(directory):
@@ -61,7 +77,7 @@ def current_observation(directory):
         and source._FACTORY.get() is observation.factory
         and observation.factory.policy is observation.policy
         and source.source_producer_identity() == observation.producer
-        and directory._schema() == observation.policy.schema
+        and _storage_binding(directory, observation.factory) is observation.storage_binding
         and binding is not None
         and binding.session is observation.session
         and binding.borrowed is True
@@ -73,10 +89,20 @@ def current_observation(directory):
     return observation
 
 
+def current_storage_binding(catalog_schema):
+    """Expose private coordinates only through the original readonly observation."""
+    observation = _ACTIVE.get()
+    if observation is None:
+        return None
+    require_output(type(observation) is _Observation, "source_observation_required")
+    current_observation(observation.directory)
+    require_output(observation.directory._schema() == catalog_schema, "source_observation_schema_changed")
+    return observation.storage_binding
+
+
 async def _native_origin(directory, factory, session, connection, isolation):
     require_output(
         source._FACTORY.get() is factory
-        and factory.policy.schema == directory._schema()
         and await _copy_driver(session) is connection
         and connection.is_in_transaction() is True,
         "source_observation_connection_changed",
@@ -94,6 +120,11 @@ async def _native_origin(directory, factory, session, connection, isolation):
         and bool(actor_by_field["transaction"]),
         "source_observation_actor_changed",
     )
+    storage_binding = _storage_binding(directory, factory)
+    if storage_binding is not None:
+        from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
+
+        await verify_isolated_source_storage_coordinates(connection, factory.policy, storage_binding)
     return actor_by_field["backend"], actor_by_field["transaction"]
 
 
@@ -178,7 +209,8 @@ async def observation_transaction(directory, *, isolation):
         async with directory.db.bind_existing_session(session):
             origin = await _native_origin(directory, factory, session, connection, isolation)
             observation = _Observation(
-                directory, directory.db, factory, factory.policy, task, session, connection, isolation, producer, origin
+                directory, directory.db, factory, factory.policy, task, session, connection, isolation, producer, origin,
+                _storage_binding(directory, factory),
             )
             _ISSUED[observation] = _fields(observation)
             token = _ACTIVE.set(observation)
