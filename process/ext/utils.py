@@ -198,6 +198,7 @@ async def _head_download_info(client: aiohttp.ClientSession, url: str) -> tuple[
     try:
         async with client.head(
             url,
+            headers={"Accept-Encoding": "identity"},
             allow_redirects=True,
             timeout=aiohttp.ClientTimeout(total=HEAD_TIMEOUT_SECONDS),
         ) as head_response:
@@ -315,6 +316,18 @@ async def _download_range_once(
     ) as response:
         if response.status != 206:
             raise RuntimeError(f"Range request not honored (status={response.status})")
+        content_encoding = (response.headers.get("Content-Encoding") or "identity").strip().lower()
+        if content_encoding != "identity":
+            raise RuntimeError(f"Range encoding mismatch for {context.url}: {content_encoding!r}")
+        content_range = (response.headers.get("Content-Range") or "").strip()
+        range_match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+        actual_range = tuple(int(range_part) for range_part in range_match.groups()) if range_match else None
+        expected_range = (start_byte, end_byte, context.size_bytes)
+        if actual_range != expected_range:
+            raise RuntimeError(
+                f"Range metadata mismatch for {context.url}: got {content_range!r}, "
+                f"expected 'bytes {start_byte}-{end_byte}/{context.size_bytes}'"
+            )
         range_bytes = await response.read()
         expected_byte_count = end_byte - start_byte + 1
         if len(range_bytes) != expected_byte_count:

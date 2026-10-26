@@ -10,6 +10,7 @@ from arq import Retry
 from process.ext import utils
 from tests.ext_utils_import_coverage_support import _Client, _Request, _Response
 
+
 @pytest.mark.parametrize(
     ("raw_value", "default_bytes", "expected"),
     [
@@ -151,19 +152,11 @@ def test_parallel_download_host_matching(monkeypatch):
         "HLTHPRT_PARALLEL_DOWNLOAD_DISABLED_HOSTS",
         "blocked.test,.example.test",
     )
-    assert utils._is_parallel_download_disabled_for_url(
-        "https://blocked.test/file"
-    )
-    assert utils._is_parallel_download_disabled_for_url(
-        "https://child.example.test/file"
-    )
-    assert not utils._is_parallel_download_disabled_for_url(
-        "https://other.test/file"
-    )
+    assert utils._is_parallel_download_disabled_for_url("https://blocked.test/file")
+    assert utils._is_parallel_download_disabled_for_url("https://child.example.test/file")
+    assert not utils._is_parallel_download_disabled_for_url("https://other.test/file")
     monkeypatch.setenv("HLTHPRT_PARALLEL_DOWNLOAD_DISABLED_HOSTS", "")
-    assert not utils._is_parallel_download_disabled_for_url(
-        "https://blocked.test/file"
-    )
+    assert not utils._is_parallel_download_disabled_for_url("https://blocked.test/file")
 
 
 @pytest.mark.asyncio
@@ -176,8 +169,8 @@ async def test_parallel_range_download_success_and_refusal(tmp_path, monkeypatch
     destination_path = tmp_path / "ranged.bin"
     client = _Client(
         get_requests=[
-            _Request(_Response(status=206, body=b"ab")),
-            _Request(_Response(status=206, body=b"cd")),
+            _Request(_Response(status=206, body=b"ab", headers={"Content-Range": "bytes 0-1/4"})),
+            _Request(_Response(status=206, body=b"cd", headers={"Content-Range": "bytes 2-3/4"})),
         ]
     )
     await utils._download_parallel_by_ranges(
@@ -189,9 +182,7 @@ async def test_parallel_range_download_success_and_refusal(tmp_path, monkeypatch
     )
     assert destination_path.read_bytes() == b"abcd"
 
-    refused = _Client(
-        get_requests=[_Request(_Response(status=200, body=b"ab"))]
-    )
+    refused = _Client(get_requests=[_Request(_Response(status=200, body=b"ab"))])
     with pytest.raises(RuntimeError, match="Failed to download range"):
         await utils._download_parallel_by_ranges(
             refused,
@@ -202,7 +193,7 @@ async def test_parallel_range_download_success_and_refusal(tmp_path, monkeypatch
         )
 
     mismatched = _Client(
-        get_requests=[_Request(_Response(status=206, body=b"a"))]
+        get_requests=[_Request(_Response(status=206, body=b"a", headers={"Content-Range": "bytes 0-1/2"}))]
     )
     with pytest.raises(RuntimeError, match="payload mismatch"):
         await utils._download_parallel_by_ranges(
@@ -227,7 +218,11 @@ async def test_parallel_range_download_large_range_tuning(
     monkeypatch.setattr(utils, "PROGRESS_INTERVAL_SECONDS", 0.0)
     payload = b"x" * size_bytes
     client = _Client(
-        get_requests=[_Request(_Response(status=206, body=payload))]
+        get_requests=[
+            _Request(
+                _Response(status=206, body=payload, headers={"Content-Range": f"bytes 0-{size_bytes - 1}/{size_bytes}"})
+            )
+        ]
     )
 
     destination_path = tmp_path / f"tuned-{size_bytes}.bin"
@@ -254,7 +249,7 @@ async def test_parallel_range_download_retries_one_chunk(tmp_path, monkeypatch):
     client = _Client(
         get_requests=[
             _Request(error=aiohttp.ClientError("temporary reset")),
-            _Request(_Response(status=206, body=b"ok")),
+            _Request(_Response(status=206, body=b"ok", headers={"Content-Range": "bytes 0-1/2"})),
         ]
     )
 
@@ -318,15 +313,16 @@ async def test_text_and_nostream_downloads(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(utils, "get_http_client", AsyncMock(return_value=text_client))
     assert await utils.download_it("https://example.test/plain") == "plain"
-    assert await utils.download_it(
-        "https://example.test/timed",
-        local_timeout=3,
-    ) == "timed"
+    assert (
+        await utils.download_it(
+            "https://example.test/timed",
+            local_timeout=3,
+        )
+        == "timed"
+    )
 
     destination_path = tmp_path / "nostream.bin"
-    binary_client = _Client(
-        get_requests=[_Request(_Response(status=200, body=b"payload"))]
-    )
+    binary_client = _Client(get_requests=[_Request(_Response(status=200, body=b"payload"))])
     monkeypatch.setattr(
         utils,
         "get_http_client",
@@ -338,9 +334,7 @@ async def test_text_and_nostream_downloads(tmp_path, monkeypatch):
     )
     assert destination_path.read_bytes() == b"payload"
 
-    refused_client = _Client(
-        get_requests=[_Request(_Response(status=503, body=b"retry"))]
-    )
+    refused_client = _Client(get_requests=[_Request(_Response(status=503, body=b"retry"))])
     monkeypatch.setattr(
         utils,
         "get_http_client",

@@ -11,11 +11,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from process.ext import utils
 from tests.ext_utils_import_coverage_support import (
     _Client,
-    _Request,
-    _Response,
     _fixed_download_info,
     _fixed_download_timeout,
+    _Request,
+    _Response,
 )
+
 
 @pytest.mark.asyncio
 async def test_stream_download_cache_round_trip(tmp_path, monkeypatch):
@@ -140,7 +141,7 @@ async def test_stream_download_parallel_fallback(
     fallback_response.content_length = None
     fallback_client = _Client(
         get_requests=[
-            _Request(_Response(status=206, body=b"r" * 512)),
+            _Request(_Response(status=206, body=b"r" * 512, headers={"Content-Range": "bytes 0-511/1024"})),
             _Request(_Response(status=200, body=b"range refused")),
             _Request(fallback_response),
         ]
