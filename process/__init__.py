@@ -94,8 +94,8 @@ from process.geo_import import geo_lookup
 from process.hospital_prices import main as initiate_hospital_prices
 from process.hospital_prices import process_data as process_hospital_prices_data
 from process.initial import finish_main as finish_mrf
+from process.initial import main as initiate_mrf
 from process.initial import (
-    init_file,
     mrf_worker_shutdown,
     process_formulary,
     process_json_index,
@@ -103,7 +103,6 @@ from process.initial import (
     process_provider,
     save_mrf_data,
 )
-from process.initial import main as initiate_mrf
 from process.initial import shutdown as shutdown_mrf
 from process.initial import startup as initial_startup
 from process.kentucky_profile import kentucky_kbml_profile
@@ -116,6 +115,7 @@ from process.medicare_enrollment import main as initiate_medicare_enrollment
 from process.medicare_enrollment import process_data as process_medicare_enrollment_data
 from process.medicare_enrollment import shutdown as medicare_enrollment_shutdown
 from process.medicare_enrollment import startup as medicare_enrollment_startup
+from process.mrf_initial_control import init_file
 from process.mrf_source_discovery import main as initiate_mrf_source_discovery
 from process.mrf_source_discovery import process_data as process_mrf_source_discovery_data
 from process.mrf_source_discovery import shutdown as mrf_source_discovery_shutdown
@@ -408,7 +408,7 @@ class MRF_start:
 
 
 class MRF_finish:
-    functions = [shutdown_mrf]
+    functions = [arq_func(shutdown_mrf, name="shutdown")]
     on_startup = db_startup
     max_jobs = (
         int(os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS")) if os.environ.get("HLTHPRT_MAX_MRF_FINISH_JOBS") else 1

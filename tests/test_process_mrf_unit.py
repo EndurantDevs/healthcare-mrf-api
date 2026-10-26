@@ -2,16 +2,16 @@
 
 import asyncio
 import datetime
+import importlib
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import importlib
-import os
-
-from asyncpg.exceptions import DeadlockDetectedError
 import pytest
+from arq.worker import func as arq_func
+from asyncpg.exceptions import DeadlockDetectedError
 from sqlalchemy import BigInteger
 
 os.environ.setdefault("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
@@ -168,8 +168,9 @@ def test_ptg_lane_worker_defaults(monkeypatch):
 
 
 def test_mrf_finish_worker_configuration():
-    names = [fn.__name__ for fn in process_pkg.MRF_finish.functions]
-    assert names == ["shutdown"]
+    functions = [arq_func(fn) for fn in process_pkg.MRF_finish.functions]
+    assert [fn.name for fn in functions] == ["shutdown"]
+    assert functions[0].coroutine is process_initial.publish_initial_generation
     assert process_pkg.MRF_finish.queue_name == "arq:MRF_finish"
     assert process_pkg.MRF_finish.max_jobs == 1
     assert process_pkg.MRF_finish.queue_read_limit == 1
@@ -216,6 +217,7 @@ def test_mrf_flush_rows_are_configurable(monkeypatch):
 @pytest.mark.asyncio
 async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
     """Verify process json index dedupes provider url jobs."""
+
     async def fake_download(_url, filename, **_kwargs):
         payload = {
             "plan_urls": [],
@@ -263,11 +265,14 @@ async def test_process_json_index_dedupes_provider_url_jobs(monkeypatch):
         "https://example.test/providers.json",
     )
     assert redis.values[process_initial._mrf_state_key("run_test_123", "total_work")] == 1
-    assert process_initial._mrf_url_job_id(
-        "index",
-        "run_test_123",
-        "https://example.test/index.json",
-    ) in redis.sets[process_initial._mrf_state_key("run_test_123", "done_work")]
+    assert (
+        process_initial._mrf_url_job_id(
+            "index",
+            "run_test_123",
+            "https://example.test/index.json",
+        )
+        in redis.sets[process_initial._mrf_state_key("run_test_123", "done_work")]
+    )
 
 
 class _UniqueWorkRedis:
@@ -398,9 +403,7 @@ async def test_recover_missing_mrf_work_requeues_persisted_payload():
         "context": {"control_run_id": "run_test", "import_date": "20260613"},
         "work_id": work_id,
     }
-    work_payload = process_initial.serialize_job(
-        {"function": "process_provider", "task": task_dict}
-    )
+    work_payload = process_initial.serialize_job({"function": "process_provider", "task": task_dict})
     redis = RecoveryRedis(pending_key, attempts_key, work_id, work_payload)
 
     recovery_by_state = await process_initial._recover_missing_mrf_work(redis, "run_test")

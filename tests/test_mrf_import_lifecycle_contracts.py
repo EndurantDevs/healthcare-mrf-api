@@ -32,9 +32,7 @@ def _configure_import_boundary(monkeypatch, source_records):
         pushed_batches.append((stage.label, [dict(row) for row in rows]))
 
     async def push_duplicate_tolerant(rows, stage):
-        duplicate_tolerant_batches.append(
-            (stage.label, [dict(row) for row in rows])
-        )
+        duplicate_tolerant_batches.append((stage.label, [dict(row) for row in rows]))
 
     monkeypatch.setattr(initial, "download_it_and_save", download)
     monkeypatch.setattr(initial, "ensure_database", AsyncMock())
@@ -82,10 +80,7 @@ async def _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pus
 
     assert outcome == 1
     plan_rows = [
-        plan_row
-        for label, row_dicts in pushed + duplicate_tolerant
-        for plan_row in row_dicts
-        if label == "Plan"
+        plan_row for label, row_dicts in pushed + duplicate_tolerant for plan_row in row_dicts if label == "Plan"
     ]
     benefit_rows = [
         benefit_row
@@ -99,9 +94,7 @@ async def _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pus
         for formulary_row in row_dicts
         if label == "PlanFormulary"
     ]
-    assert {
-        (plan_row["plan_id"], plan_row["year"]) for plan_row in plan_rows
-    } == {
+    assert {(plan_row["plan_id"], plan_row["year"]) for plan_row in plan_rows} == {
         (plan_id, 2026),
         (plan_id, 2027),
         ("54321BB0000000", 2026),
@@ -174,9 +167,7 @@ async def test_plan_import_preserves_below_threshold_cost_sharing_and_year_contr
             "last_updated_on": "2026-07-02",
         },
     ]
-    pushed, duplicate_tolerant = _configure_import_boundary(
-        monkeypatch, plan_source_records
-    )
+    pushed, duplicate_tolerant = _configure_import_boundary(monkeypatch, plan_source_records)
     monkeypatch.setattr(initial, "_mrf_plan_flush_rows", lambda _test_mode: 100)
 
     await _assert_plan_import_rows(duplicate_tolerant, monkeypatch, plan_id, pushed)
@@ -227,23 +218,14 @@ def _provider_contract_fixture(current_year):
 
 def _assert_provider_contract_rows(duplicate_tolerant, current_year):
     provider_rows = [
-        provider_row
-        for label, row_dicts in duplicate_tolerant
-        for provider_row in row_dicts
-        if label == "PlanNPIRaw"
+        provider_row for label, row_dicts in duplicate_tolerant for provider_row in row_dicts if label == "PlanNPIRaw"
     ]
     assert {provider_row["npi"] for provider_row in provider_rows} == {
         1000000002,
         1000000003,
     }
-    assert any(
-        provider_row["name_or_facility_name"] == "Dr. Ada M Example III"
-        for provider_row in provider_rows
-    )
-    assert any(
-        provider_row["name_or_facility_name"] == "Synthetic Clinic"
-        for provider_row in provider_rows
-    )
+    assert any(provider_row["name_or_facility_name"] == "Dr. Ada M Example III" for provider_row in provider_rows)
+    assert any(provider_row["name_or_facility_name"] == "Synthetic Clinic" for provider_row in provider_rows)
     assert {provider_row["year"] for provider_row in provider_rows} == {
         current_year,
         current_year + 1,
@@ -258,9 +240,7 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
 
     current_year = datetime.datetime.now().year
     provider_source_records = _provider_contract_fixture(current_year)
-    _pushed, duplicate_tolerant = _configure_import_boundary(
-        monkeypatch, provider_source_records
-    )
+    _pushed, duplicate_tolerant = _configure_import_boundary(monkeypatch, provider_source_records)
     monkeypatch.setattr(initial, "_mrf_provider_flush_rows", lambda _test_mode: 0)
     monkeypatch.setattr(
         initial.db,
@@ -290,16 +270,14 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
     monkeypatch.setattr(initial, "_push_mrf_address_rows", AsyncMock())
     monkeypatch.setattr(initial, "_mark_mrf_provider_file_progress", AsyncMock())
 
-    outcome = await initial.process_provider(
-        _import_context(), _import_task("providers")
-    )
+    outcome = await initial.process_provider(_import_context(), _import_task("providers"))
 
     assert outcome == 1
     _assert_provider_contract_rows(duplicate_tolerant, current_year)
     initial._mark_mrf_provider_file_progress.assert_awaited_once_with(
         ANY,
         url="https://data.example.invalid/providers.json",
-        processed_providers=3,
+        processed_providers=2,
     )
     initial._mark_mrf_work_done.assert_awaited_once()
 
@@ -307,10 +285,7 @@ async def test_provider_import_preserves_person_facility_and_network_contracts(
 def _assert_formulary_import_rows(duplicate_tolerant):
     """Assert formulary import rows."""
     drug_rows = [
-        drug_row
-        for label, row_dicts in duplicate_tolerant
-        for drug_row in row_dicts
-        if label == "PlanDrugRaw"
+        drug_row for label, row_dicts in duplicate_tolerant for drug_row in row_dicts if label == "PlanDrugRaw"
     ]
     assert len(drug_rows) == 2
     first, second = drug_rows
@@ -374,14 +349,10 @@ async def test_formulary_import_normalizes_flags_and_rejects_incomplete_rows(
             ],
         },
     ]
-    _pushed, duplicate_tolerant = _configure_import_boundary(
-        monkeypatch, formulary_source_records
-    )
+    _pushed, duplicate_tolerant = _configure_import_boundary(monkeypatch, formulary_source_records)
     monkeypatch.setattr(initial, "_mrf_formulary_flush_rows", lambda _test_mode: 0)
 
-    outcome = await initial.process_formulary(
-        _import_context(), _import_task("formulary")
-    )
+    outcome = await initial.process_formulary(_import_context(), _import_task("formulary"))
 
     assert outcome == 1
     _assert_formulary_import_rows(duplicate_tolerant)
@@ -415,9 +386,7 @@ async def test_formulary_parse_errors_preserve_terminal_messages(
 
     assert is_imported is False
     assert initial._log_formulary_row_error.await_args.args[2].startswith(message_prefix)
-    initial._mark_mrf_task_terminal.assert_awaited_once_with(
-        ANY, task, "formulary", cleanup_chunk=True
-    )
+    initial._mark_mrf_task_terminal.assert_awaited_once_with(ANY, task, "formulary", cleanup_chunk=True)
 
 
 @pytest.mark.parametrize(

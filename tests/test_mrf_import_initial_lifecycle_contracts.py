@@ -189,7 +189,7 @@ def _install_initial_import_mocks(
     ):
         monkeypatch.setattr(initial, name, AsyncMock())
     monkeypatch.setattr(initial.glob, "glob", lambda _pattern: [next(workbook_paths)])
-    monkeypatch.setattr(initial.xl, "readxl", lambda path: workbook_by_path[path])
+    monkeypatch.setattr(initial, "read_mrf_workbook", lambda path: workbook_by_path[path])
     monkeypatch.setattr(initial.os, "unlink", lambda _path: None)
     monkeypatch.setattr(initial, "make_class", lambda model, *_args, **_kwargs: model)
     monkeypatch.setattr(initial, "push_objects", push)
@@ -243,7 +243,7 @@ def _install_initial_import_catalog_mocks(monkeypatch, progress_events):
     )
 
 
-def _assert_initial_import_catalog_result(context_by_field, pushed_batches):
+def _assert_initial_import_catalog_result(context_by_field, pushed_batches, *, sadp_only=False):
     assert context_by_field["context"] == {
         "import_date": "20260724",
         "run": 1,
@@ -260,7 +260,7 @@ def _assert_initial_import_catalog_result(context_by_field, pushed_batches):
             "issuer_name": "Synthetic Issuer",
             "issuer_id": 12345,
             "new_issuer_to_exchange": True,
-            "sadp_only": False,
+            "sadp_only": sadp_only,
             "plan_id": "12345AA0000000",
             "year": 2026,
             "qhp_sadp": "QHP",
@@ -305,12 +305,24 @@ def _assert_initial_import_queue_result(progress_events, redis):
     ]
 
 
+@pytest.mark.parametrize("current_headers", [False, True, "legacy"])
 @pytest.mark.asyncio
 async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_jobs(
     monkeypatch,
+    current_headers,
 ):
     """Stage catalog records before enqueuing a bounded, deterministic URL set."""
     workbook_by_path = _initial_import_workbooks()
+    transparency_rows = workbook_by_path["/tmp/transparency.xlsx"]._rows
+    if current_headers is True:
+        transparency_rows[2][3] = "Is_Issuer_New_to_Exchange?(Yes_or_No)"
+        transparency_rows[2][4] = "SADP_Only"
+        transparency_rows[2][6] = "QHP or SADP?"
+    elif current_headers == "legacy":
+        transparency_rows[2].pop(4)
+        transparency_rows[3].pop(4)
+    transparency_rows[3:3] = [[], [None, "", "  "]]
+    transparency_rows.extend([[""] * 10, [None] * 10])
     pushed_batches = []
     progress_events = []
     _install_initial_import_mocks(monkeypatch, workbook_by_path, pushed_batches, progress_events)
@@ -329,8 +341,31 @@ async def test_initial_import_stages_catalog_rows_and_enqueues_bounded_index_job
             "mrf_file_chunking": "providers,formularies",
         },
     )
-    _assert_initial_import_catalog_result(context_by_field, pushed_batches)
+    _assert_initial_import_catalog_result(
+        context_by_field, pushed_batches, sadp_only=None if current_headers == "legacy" else False
+    )
     _assert_initial_import_queue_result(progress_events, redis)
+
+
+@pytest.mark.parametrize("invalid_row", ["missing_header", "blank_issuer", "invalid_issuer"])
+@pytest.mark.asyncio
+async def test_initial_import_rejects_invalid_transparency(monkeypatch, invalid_row):
+    workbook_by_path = _initial_import_workbooks()
+    rows = workbook_by_path["/tmp/transparency.xlsx"]._rows
+    if invalid_row == "missing_header":
+        rows[2][2] = "Unrecognized issuer column"
+        message = "Transparency worksheet missing columns: issuer_id"
+    else:
+        rows[3][2] = "" if invalid_row == "blank_issuer" else "not-an-id"
+        message = "invalid literal for int"
+    pushed_batches = []
+    _install_initial_import_mocks(monkeypatch, workbook_by_path, pushed_batches, [])
+    context_by_field = {"redis": SimpleNamespace(), "context": {"import_date": "20260724", "run": 0}}
+
+    with pytest.raises(ValueError, match=message):
+        await initial.init_file(context_by_field, {"test_mode": True})
+
+    assert pushed_batches == []
 
 
 @pytest.mark.parametrize(
