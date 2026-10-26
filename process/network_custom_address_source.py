@@ -109,7 +109,7 @@ def _arguments(base_source, composition_id, approved_revision, owner_role, runti
     _identifier(owner_role)
     if (
         type(runtime_roles) is not tuple
-        or not 1 <= len(runtime_roles) <= 32
+        or not 1 <= len(runtime_roles) <= 128
         or tuple(sorted(set(runtime_roles))) != runtime_roles
     ):
         raise NetworkCustomAddressSourceError("Runtime roles must be a sorted unique bounded tuple")
@@ -132,6 +132,96 @@ async def _require_transaction(connection):
 
 
 async def _source_identity(connection, pinned_source, runtime_roles, *, address=False, control_schema=None):
+    if pinned_source.schema_name.startswith("network_bootstrap_"):
+        from process.network_bootstrap_read_access import bootstrap_pin_read_roles
+
+        runtime_roles = await bootstrap_pin_read_roles(connection, pinned_source, runtime_roles)
+    return await _source_identity_with_read_roles(
+        connection, pinned_source, runtime_roles, address=address, control_schema=control_schema
+    )
+
+
+async def _artifact_dependency_identity(
+    connection, pinned_source, runtime_roles, *, address=False, control_schema=None
+):
+    """Use sealed input-reader intent without dropping any actual output actor."""
+    if pinned_source.schema_name.startswith("network_bootstrap_"):
+        from process.network_bootstrap_read_access import bootstrap_pin_read_roles
+
+        runtime_roles = await bootstrap_pin_read_roles(connection, pinned_source, (), runtime_actors=runtime_roles)
+    elif address and pinned_source.schema_name.startswith(("network_composition_", "entity_address_archive_")):
+        readers = await _retained_dependency_readers(connection, pinned_source)
+        if readers is not None:
+            await _dependency_actors_closed(connection, pinned_source, tuple(sorted(set((*readers, *runtime_roles)))))
+            runtime_roles = readers
+    elif address and pinned_source.schema_name.startswith("network_candidate_") and control_schema is not None:
+        await _dependency_actors_closed(connection, pinned_source, runtime_roles)
+    return await _source_identity(
+        connection, pinned_source, runtime_roles, address=address, control_schema=control_schema
+    )
+
+
+async def _retained_dependency_readers(connection, pinned_source):
+    """Authenticate reader intent from the existing independently owned source receipt."""
+    if pinned_source.schema_name.startswith("network_composition_"):
+        document = await connection.fetchval(
+            "SELECT CASE WHEN octet_length(obj_description(oid,'pg_namespace'))<=65536 "
+            "THEN obj_description(oid,'pg_namespace') END FROM pg_namespace WHERE nspname=$1",
+            pinned_source.schema_name,
+        )
+        receipt = _from_document(document)
+        if receipt.address_source != pinned_source:
+            raise NetworkCustomAddressSourceError("Retained composition dependency differs")
+        await verify_retained_custom_address_source(connection, receipt)
+        return receipt.runtime_roles
+    from process.network_cms_registry_source_pair import (
+        _COMMENT,
+        _COMMENT_V2,
+        _read_committed_pair,
+        require_registry_cms_source_pair_connection,
+    )
+    from process.network_registry_cms_prepared_pair import _PREPARED_COMMENT, _PREPARED_COMMENT_V2
+
+    prefixes = (_COMMENT, _COMMENT_V2, _PREPARED_COMMENT, _PREPARED_COMMENT_V2)
+    comment = await connection.fetchval(
+        "SELECT left(obj_description(oid,'pg_namespace'),$2) FROM pg_namespace WHERE nspname=$1",
+        pinned_source.schema_name,
+        max(map(len, prefixes)),
+    )
+    if comment is None or not comment.startswith(prefixes):
+        return None
+    pair, schema_oid = await _read_committed_pair(connection, pinned_source.schema_name)
+    if pair.address_source != pinned_source or pair.address_ownership.schema_oid != schema_oid:
+        raise NetworkCustomAddressSourceError("Retained CMS address dependency differs")
+    await require_registry_cms_source_pair_connection(connection, pair, verify_content=False)
+    return pair.runtime_roles
+
+
+async def _dependency_actors_closed(connection, pinned_source, runtime_roles):
+    """Include direct, inherited and SET-only actor authority in the unchanged owner/write guard."""
+    from process.network_candidate_custody import NetworkCandidateCustodyError, _retained_address_runtime_closure
+
+    rows = await connection.fetch(
+        "SELECT DISTINCT reachable.rolname::text AS name FROM unnest($1::text[]) configured(name) "
+        "LEFT JOIN pg_roles actor ON actor.rolname=configured.name LEFT JOIN pg_roles reachable "
+        "ON reachable.oid=actor.oid OR pg_has_role(actor.oid,reachable.oid,'MEMBER') "
+        "OR pg_has_role(actor.oid,reachable.oid,'USAGE') OR pg_has_role(actor.oid,reachable.oid,'SET') "
+        "ORDER BY name LIMIT 129",
+        list(runtime_roles),
+    )
+    actors = tuple(row["name"] for row in rows)
+    if not 1 <= len(actors) <= 128 or any(actor is None for actor in actors):
+        raise NetworkCustomAddressSourceError("Retained dependency actor census differs")
+    try:
+        await _retained_address_runtime_closure(connection, pinned_source, actors)
+    except NetworkCandidateCustodyError as error:
+        raise NetworkCustomAddressSourceError("Retained dependency actor authority is not closed") from error
+
+
+async def _source_identity_with_read_roles(
+    connection, pinned_source, runtime_roles, *, address=False, control_schema=None
+):
+    """Check exact retained relation custody with roles already resolved by the caller."""
     catalog = await connection.fetchrow(
         """SELECT namespace.oid::bigint AS schema_oid,relation.oid::bigint AS table_oid,
         owner.oid::bigint AS owner_oid,owner.*,relation.relkind,relation.relpersistence,
@@ -167,9 +257,20 @@ async def _source_identity(connection, pinned_source, runtime_roles, *, address=
         await _closed(
             connection, catalog["schema_oid"], catalog["owner_oid"], runtime_roles, [pinned_source.table_name]
         )
+    shape_sha256 = await _source_shape(connection, catalog["table_oid"], address=address)
+    return (
+        catalog["schema_oid"],
+        catalog["table_oid"],
+        catalog["owner_oid"],
+        shape_sha256,
+    )
+
+
+async def _source_shape(connection, table_oid, *, address):
+    """Retain exact native column order, shape and defaults for each pinned source."""
     columns = await connection.fetch(
         "SELECT attname,atttypid::regtype::text AS type,atttypmod,attnotnull,pg_get_expr(d.adbin,d.adrelid) AS default_expr FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped ORDER BY attnum",
-        catalog["table_oid"],
+        table_oid,
     )
     # Metadata compaction can replace a column at the end. The receipt below
     # still pins its exact native order, types, nullability and defaults.
@@ -179,12 +280,7 @@ async def _source_identity(connection, pinned_source, runtime_roles, *, address=
         raise NetworkCustomAddressSourceError("Retained unified address shape differs")
     if not address and not any(column["attname"] == "npi" and column["type"] == "bigint" for column in columns):
         raise NetworkCustomAddressSourceError("Retained NPI shape differs")
-    return (
-        catalog["schema_oid"],
-        catalog["table_oid"],
-        catalog["owner_oid"],
-        _digest([dict(column) for column in columns]),
-    )
+    return _digest([dict(column) for column in columns])
 
 
 async def _closed(connection, schema_oid, owner_oid, runtime_roles, relation_names):
@@ -266,7 +362,9 @@ async def _verify_retained_rows(connection, base_table, address_table, copied_ro
         raise NetworkCustomAddressSourceError("Retained address COPY accounting or full-row parity differs")
 
 
-async def _build_heaps(connection, schema_name, base_source, control, revision, npi_source, base_oid, office_inputs):
+async def _build_heaps(connection, recipe, schema_name, control, office_inputs):
+    base_source, npi_source = recipe.base_source, recipe.npi_source
+    revision, base_oid = recipe.approved_revision, recipe.source_oids[1]
     site_sources = await verify_approved_site_sources(
         connection, approved_revision=revision, control_schema=control[1:-1]
     )
@@ -279,7 +377,7 @@ async def _build_heaps(connection, schema_name, base_source, control, revision, 
         raise NetworkCustomAddressSourceError("Retained address native identity differs")
     # Validate the existing native key; retention keeps every original column.
     await _projection_columns(connection, base_table)
-    await connection.execute(f"CREATE SCHEMA {namespace}")
+    await _create_artifact_schema(connection, schema_name, recipe.owner_role)
     await connection.execute(f"CREATE TABLE {address_table} (LIKE {base_table} INCLUDING DEFAULTS)")
     await connection.execute(f"ALTER TABLE {address_table} ADD PRIMARY KEY(location_key)")
     copied_rows = await _copy_projection_rows(
@@ -344,16 +442,53 @@ async def _freeze(connection, schema_name, owner_role, runtime_roles):
         "SELECT pg_has_role(current_user,$1::name,'SET')", owner_role
     ):
         raise NetworkCustomAddressSourceError("Protected composition owner is unavailable")
-    await connection.execute(f"ALTER SCHEMA {namespace} OWNER TO {owner}")
+    if (
+        await connection.fetchval(
+            "SELECT nspowner=$2::oid FROM pg_namespace WHERE nspname=$1", schema_name, role["oid"]
+        )
+        is not True
+    ):
+        raise NetworkCustomAddressSourceError("Composition schema protected owner differs")
     for table in ("entity_address_unified", "provider_location_binding"):
         await connection.execute(f"ALTER TABLE {namespace}.{table} OWNER TO {owner}")
+    original = await connection.fetchval("SELECT quote_ident(current_user)")
+    await connection.execute(f"SET LOCAL ROLE {owner}")
+    try:
+        await _freeze_artifact_grants(connection, schema_name, role["oid"], runtime_roles)
+    finally:
+        await connection.execute(f"SET LOCAL ROLE {original}")
+    return role["oid"]
+
+
+async def _create_artifact_schema(connection, schema_name, owner_role):
+    """Create under the final owner without granting that owner database CREATE."""
+    namespace, owner = _identifier(schema_name), _identifier(owner_role)
+    role = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", owner_role)
+    if not _protected_owner(role) or not await connection.fetchval(
+        "SELECT pg_has_role(current_user,$1::name,'SET')", owner_role
+    ):
+        raise NetworkCustomAddressSourceError("Protected composition owner is unavailable")
+    original = await connection.fetchval("SELECT quote_ident(current_user)")
+    await connection.execute(f"CREATE SCHEMA {namespace} AUTHORIZATION {owner}")
+    await connection.execute(f"SET LOCAL ROLE {owner}")
+    try:
+        # The existing custodian already has SET to this owner. This target-only
+        # construction grant is removed before any artifact may be returned.
+        await connection.execute(f"GRANT USAGE,CREATE ON SCHEMA {namespace} TO {original}")
+    finally:
+        await connection.execute(f"SET LOCAL ROLE {original}")
+
+
+async def _freeze_artifact_grants(connection, schema_name, owner_oid, runtime_roles):
+    """Remove construction access while the original custodian assumes the final owner."""
+    namespace = _identifier(schema_name)
     acl_rows = await connection.fetch(
         """SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END AS grantee
       FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid
       CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))||coalesce(c.relacl,acldefault('r',c.relowner))) a
       LEFT JOIN pg_roles r ON r.oid=a.grantee WHERE n.nspname=$1 AND a.grantee<>$2::oid""",
         schema_name,
-        role["oid"],
+        owner_oid,
     )
     for acl in acl_rows:
         await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM {acl['grantee']} CASCADE")
@@ -361,7 +496,6 @@ async def _freeze(connection, schema_name, owner_role, runtime_roles):
     for runtime in runtime_roles:
         await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {_identifier(runtime)}")
         await connection.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {namespace} TO {_identifier(runtime)}")
-    return role["oid"]
 
 
 async def _artifact_identity(connection, schema_name, owner_oid, runtime_roles):
@@ -502,12 +636,9 @@ async def _prepare_artifact(connection, recipe, schema_name, control, office_inp
         return await verify_custom_address_source(connection, receipt)
     carry = await _build_heaps(
         connection,
+        recipe,
         schema_name,
-        recipe.base_source,
         control,
-        recipe.approved_revision,
-        recipe.npi_source,
-        recipe.source_oids[1],
         office_inputs,
     )
     await _prepare_office_lookup(connection, schema_name)
@@ -533,7 +664,12 @@ async def _prepare_artifact(connection, recipe, schema_name, control, office_inp
     if len(document.encode()) > 65536:
         raise NetworkCustomAddressSourceError("Composition receipt exceeds its bound")
     quoted_document = await connection.fetchval("SELECT quote_literal($1::text)", document)
-    await connection.execute(f"COMMENT ON SCHEMA {_identifier(schema_name)} IS {quoted_document}")
+    original = await connection.fetchval("SELECT quote_ident(current_user)")
+    await connection.execute(f"SET LOCAL ROLE {_identifier(recipe.owner_role)}")
+    try:
+        await connection.execute(f"COMMENT ON SCHEMA {_identifier(schema_name)} IS {quoted_document}")
+    finally:
+        await connection.execute(f"SET LOCAL ROLE {original}")
     return receipt
 
 
@@ -612,7 +748,7 @@ async def prepare_recipe_address_source(connection, base_source, arguments, offi
     try:
         async with connection.transaction():
             summary = await _approved_identity(connection, control, approved_revision)
-            source_oids = await _source_identity(
+            source_oids = await _artifact_dependency_identity(
                 connection, base_source, runtime_roles, address=True, control_schema=control_name
             )
             effective_npi_source = npi_source or (
@@ -621,7 +757,7 @@ async def prepare_recipe_address_source(connection, base_source, arguments, offi
                 else None
             )
             npi_oids = (
-                await _source_identity(connection, effective_npi_source, runtime_roles)
+                await _artifact_dependency_identity(connection, effective_npi_source, runtime_roles)
                 if effective_npi_source
                 else None
             )
@@ -719,11 +855,12 @@ async def _verify_custom_address_source(connection, receipt, *, retained=False):
     )
     if summary["fingerprint"] != receipt.approved_records_sha256 or summary["pairs"] != receipt.custom_pair_count:
         raise NetworkCustomAddressSourceError("Approved composition records differ")
-    if await _source_identity(
+    if await _artifact_dependency_identity(
         connection, receipt.base_source, receipt.runtime_roles, address=True, control_schema=receipt.control_schema
     ) != receipt.source_oids or (
         receipt.npi_source is not None
-        and await _source_identity(connection, receipt.npi_source, receipt.runtime_roles) != receipt.npi_oids
+        and await _artifact_dependency_identity(connection, receipt.npi_source, receipt.runtime_roles)
+        != receipt.npi_oids
     ):
         raise NetworkCustomAddressSourceError("Retained source physical identity differs")
     if await _artifact_identity(connection, schema_name, receipt.owner_oid, receipt.runtime_roles) != (

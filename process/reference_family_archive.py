@@ -61,7 +61,10 @@ from process.geo_source_archive import (
 )
 from process.geo_source_archive import geo_cut_savepoint as _doctors_cut_savepoint
 from process.mrf_address_publication import (
+    ACCOUNTED_MODEL_CLOSURE_CONTRACT,
+    ADDRESS_COVERAGE_CONTRACT,
     MODEL_CLOSURE_CONTRACT,
+    MODEL_CLOSURE_CONTRACTS,
     STAGE_TABLE,
     CanonicalSourceFence,
     _clone_model_table,
@@ -179,6 +182,12 @@ from process.reference_family_model_indexes import (
 from process.reference_family_model_indexes import (
     _witness_index_element as _witness_index_element,
 )
+from process.reference_family_mrf_receipts import _AUX_NATIVE_SET_CONTRACT as _AUX_NATIVE_SET_CONTRACT
+from process.reference_family_mrf_receipts import _AUX_SCHEMA as _AUX_SCHEMA
+from process.reference_family_mrf_receipts import _canonical_model_receipt as _canonical_model_receipt
+from process.reference_family_mrf_receipts import _manifest_auxiliary as _manifest_auxiliary
+from process.reference_family_mrf_receipts import _validate_mrf_auxiliary_receipt as _validate_mrf_auxiliary_receipt
+from process.reference_family_mrf_receipts import mrf_publication_digest as mrf_publication_digest
 from process.reference_family_result_generation import (
     RELATION_NAMES_BY_IMPORTER,
     ReferenceFamilyServingGeneration,
@@ -266,8 +275,6 @@ _PREDECESSOR_PREFIX = "reference_family_predecessor_"
 _LOCK_TIMEOUT = "500ms"
 _CAPTURE_TIMEOUT = "5s"
 _MAX_METADATA_BYTES = 16_384
-_AUX_SCHEMA = "mrf-canonical-address.payload-jsonb.v1"
-_AUX_NATIVE_SET_CONTRACT = "mrf-canonical-address.indexed-set.v2"
 _CLAIMS_DICTIONARY_SOURCE = "cms_physician_provider_service"
 
 
@@ -344,7 +351,7 @@ class ReferenceFamilyManifest:
 
         manifest_by_field = {
             "contract": TYPED_MRF_CONTRACT
-            if (self.auxiliary or {}).get("contract") == MODEL_CLOSURE_CONTRACT
+            if (self.auxiliary or {}).get("contract") in MODEL_CLOSURE_CONTRACTS
             else CONTRACT,
             "importer_id": self.importer_id,
             "publication_authority": self.publication_authority,
@@ -737,15 +744,7 @@ async def _mrf_auxiliary_receipt(session, schema_name, *, is_source=False, publi
             count, digest = await _projected_row_identity(
                 session, schema_name, archive_name, row_json_sql="to_jsonb(row_value)", where_sql=where_sql
             )
-        publication_sha256 = hashlib.sha256(
-            _canonical_json(
-                {
-                    "attempt_id": str(publication["attempt_id"]),
-                    "generation": publication["generation"],
-                    "address_content": publication.get("native_address_coverage", publication["address_content"]),
-                }
-            )
-        ).hexdigest()
+        publication_sha256 = mrf_publication_digest(publication)
     else:
         archive_name, count, digest, publication_sha256 = await _restored_mrf_auxiliary_identity(
             session, schema_name, publication
@@ -1025,7 +1024,11 @@ async def _family_manifest(
     )
     schema_sha256 = _schema_digest(receipts)
     if spec.importer_id == "mrf" and STAGE_TABLE in spec.table_names:
-        auxiliary = _canonical_model_receipt()
+        auxiliary = (
+            _canonical_model_receipt(publication)
+            if publication is not None
+            else auxiliary or _canonical_model_receipt()
+        )
     elif spec.importer_id == "mrf":
         auxiliary = await _mrf_auxiliary_receipt(
             session,
@@ -1069,17 +1072,6 @@ async def _canonical_table_receipt(session, importer_id, schema_name, model_type
     )
 
 
-def _canonical_model_receipt():
-    """Record the typed model meaning without inventing mutable payload authority."""
-    return {
-        "contract": MODEL_CLOSURE_CONTRACT,
-        "table_name": STAGE_TABLE,
-        "archive_name": archive_table_name(),
-        "source_bit": 16,
-        "display_priority": 5,
-    }
-
-
 def _dependency_packages(importer_id: str, value: object) -> dict[str, str]:
     """Keep dependency identity portable: exact package hashes, never local OIDs."""
     if (
@@ -1100,53 +1092,11 @@ def _dependency_packages(importer_id: str, value: object) -> dict[str, str]:
     return dict(sorted(value.items()))
 
 
-def _validate_mrf_auxiliary_receipt(auxiliary: object) -> Mapping[str, Any]:
-    """Validate the required portable canonical-address receipt."""
-
-    if isinstance(auxiliary, Mapping) and auxiliary.get("contract") == MODEL_CLOSURE_CONTRACT:
-        if auxiliary != {
-            "contract": MODEL_CLOSURE_CONTRACT,
-            "table_name": STAGE_TABLE,
-            "archive_name": "address_archive_v2",
-            "source_bit": 16,
-            "display_priority": 5,
-        }:
-            raise ReferenceFamilyArchiveError("MRF canonical model receipt is invalid")
-        return dict(auxiliary)
-    expected_fields = {
-        "table_name",
-        "archive_name",
-        "schema_sha256",
-        "row_count",
-        "content_sha256",
-        "publication_sha256",
-    }
-    is_native_set = isinstance(auxiliary, Mapping) and auxiliary.get("contract") == _AUX_NATIVE_SET_CONTRACT
-    if is_native_set:
-        expected_fields.remove("content_sha256")
-        expected_fields.add("contract")
-    if (
-        not isinstance(auxiliary, Mapping)
-        or set(auxiliary) != expected_fields
-        or auxiliary["table_name"] != STAGE_TABLE
-        or _IDENTIFIER.fullmatch(str(auxiliary["archive_name"])) is None
-        or auxiliary["schema_sha256"] != hashlib.sha256(_AUX_SCHEMA.encode()).hexdigest()
-        or type(auxiliary["row_count"]) is not int
-        or auxiliary["row_count"] < 0
-        or any(
-            re.fullmatch(r"[0-9a-f]{64}", str(auxiliary[key])) is None
-            for key in (("publication_sha256",) if is_native_set else ("content_sha256", "publication_sha256"))
-        )
-    ):
-        raise ReferenceFamilyArchiveError("MRF canonical auxiliary receipt is invalid")
-    return auxiliary
-
-
 def reference_family_profile_contract(manifest: ReferenceFamilyManifest) -> str:
     """Keep legacy row-hash payloads distinct from the explicit native set-proof envelope."""
     if manifest.importer_id == "nucc":
         return NUCC_CONTRACT
-    if manifest.importer_id == "mrf" and manifest.auxiliary.get("contract") == MODEL_CLOSURE_CONTRACT:
+    if manifest.importer_id == "mrf" and manifest.auxiliary.get("contract") in MODEL_CLOSURE_CONTRACTS:
         return TYPED_MRF_CONTRACT
     if manifest.importer_id == "mrf" and manifest.auxiliary.get("contract") == _AUX_NATIVE_SET_CONTRACT:
         return MRF_CONTRACT
@@ -1219,9 +1169,9 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         raise ReferenceFamilyArchiveError("terminal reference captures have no producer generation")
     if spec.importer_id == "label" and authority != "tracked-generation":
         raise ReferenceFamilyArchiveError("label source generation is required")
-    auxiliary = _manifest_auxiliary(manifest_value, spec)
     metadata, metadata_sha256 = _source_metadata(manifest_value["source_metadata"])
     receipts = _manifest_table_receipts(manifest_value["tables"], spec)
+    auxiliary = _manifest_auxiliary(manifest_value, spec, receipts)
     schema_sha256 = _schema_digest(receipts)
     if manifest_value["source_metadata_sha256"] != metadata_sha256 or manifest_value["schema_sha256"] != schema_sha256:
         raise ReferenceFamilyArchiveError("reference family manifest digest differs")
@@ -1246,16 +1196,6 @@ def validate_reference_family_manifest(manifest_value: object) -> ReferenceFamil
         source_serving_generation,
         manifest_value.get("source_capture_contract"),
     )
-
-
-def _manifest_auxiliary(manifest_value, spec):
-    """Keep the recorded JSON receipt distinct from the new native model contract."""
-    if spec.importer_id != "mrf":
-        return None
-    auxiliary = _validate_mrf_auxiliary_receipt(manifest_value.get("auxiliary"))
-    if (manifest_value["contract"] == TYPED_MRF_CONTRACT) != (auxiliary.get("contract") == MODEL_CLOSURE_CONTRACT):
-        raise ReferenceFamilyArchiveError("MRF canonical model contract differs")
-    return auxiliary
 
 
 def _validate_manifest_authority(manifest_value: Mapping[str, Any], authority: object) -> None:
@@ -1921,7 +1861,11 @@ async def _validate_source_clone_sets(session, capture, stage_schema):
             raise ReferenceFamilyArchiveError("reference family source clone differs from its pinned source")
     if spec.importer_id == "mrf" and STAGE_TABLE in spec.table_names:
         await validate_canonical_closure(
-            session, spec.importer_id, stage_schema, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
+            session,
+            spec.importer_id,
+            stage_schema,
+            lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}",
+            address_coverage=capture.manifest.auxiliary.get("address_coverage"),
         )
     if spec.importer_id == "drug-claims":
         await validate_prescription_dictionary_closure(session, stage_schema)
@@ -2376,6 +2320,7 @@ async def _validate_stage_manifest(
     ownership: ReferenceFamilyStageOwnership,
     manifest: ReferenceFamilyManifest,
 ) -> tuple[ReferenceTableReceipt, ...]:
+    """Require restored models, accounting and family closure to match the sealed manifest."""
     validated = validate_reference_family_manifest(manifest)
     if validated.importer_id != ownership.importer_id:
         raise ReferenceFamilyArchiveError("reference family stage scope differs")
@@ -2405,9 +2350,7 @@ async def _validate_stage_manifest(
     elif not _has_matching_family_manifest(validated, observed):
         raise ReferenceFamilyArchiveError("reference family restored stage differs")
     if spec.importer_id == "mrf" and STAGE_TABLE in spec.table_names:
-        await validate_canonical_closure(
-            session, "mrf", ownership.schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
-        )
+        await _validate_stage_canonical_closure(session, ownership, validated)
     if spec.importer_id == "claims-pricing":
         await validate_claims_dictionary_closure(session, ownership.schema_name)
     if spec.importer_id == "drug-claims":
@@ -2426,6 +2369,17 @@ async def _validate_stage_manifest(
                 ),
             )
     return observed.tables
+
+
+async def _validate_stage_canonical_closure(session, ownership, manifest):
+    """Recheck canonical closure against the restored stage's recorded raw accounting."""
+    await validate_canonical_closure(
+        session,
+        "mrf",
+        ownership.schema_name,
+        lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}",
+        address_coverage=manifest.auxiliary.get("address_coverage"),
+    )
 
 
 async def validate_nucc_reference_set(session: Any, *, ownership: ReferenceFamilyStageOwnership) -> dict[str, Any]:

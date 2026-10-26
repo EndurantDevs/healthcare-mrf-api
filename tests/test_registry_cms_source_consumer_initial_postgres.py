@@ -37,15 +37,23 @@ async def _publisher_sessions(database, _pair, store, stack):
 
 
 async def _later_head(fixture, pair, current, revision):
-    target, addresses = await compose_registry_membership_candidate(
-        fixture.execution_connection,
-        request_id=uuid4(),
+    request_id = uuid4()
+    sources = await fixture.prepare_address_sources(
+        request_id=request_id,
         approved_revision=revision,
         expected_head=current.generation_id,
         source_manifest=current,
         address_sources=RegistryCompositionAddressSources(
             pair.address_source, replacement_source_recipes=(pair.recipe,)
         ),
+    )
+    target, addresses = await compose_registry_membership_candidate(
+        fixture.execution_connection,
+        request_id=request_id,
+        approved_revision=revision,
+        expected_head=current.generation_id,
+        source_manifest=current,
+        address_sources=sources,
         writer_roles={**fixture.writer_roles, "reader_roles": pair.runtime_roles},
         control_schema=fixture.control_schema,
     )

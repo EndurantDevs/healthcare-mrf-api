@@ -437,10 +437,15 @@ async def _source_rollback_address_sources(connection, source_pin, control_schem
         )
         if document is None:
             return address_sources
-        receipt = _custom_address_receipt(document)
+        metadata = _document(document)
+        bootstrap = isinstance(metadata, dict) and metadata.get("component") == "network_bootstrap_sources"
+        receipt = bootstrap_sources._decode(document) if bootstrap else _custom_address_receipt(document)
         if receipt.address_source != address_pin:
             raise ValueError("registry_source_rollback_address_changed")
-        await verify_retained_custom_address_source(connection, receipt)
+        if bootstrap:
+            await bootstrap_sources.verify_network_bootstrap_sources(connection, receipt)
+        else:
+            await verify_retained_custom_address_source(connection, receipt)
         return RegistryCompositionAddressSources(address_sources.base_source, receipt.npi_source)
 
 
@@ -453,7 +458,7 @@ async def complete_queued_registry_source_rollback_preview(
     writer_roles,
     control_schema=None,
     composition_runtime=None,
-    seal_candidate=None,
+    **custody_callbacks,
 ):
     """Prepare a closed READY candidate and audit its exact diff; never publish.
 
@@ -462,23 +467,26 @@ async def complete_queued_registry_source_rollback_preview(
     final audit transaction while serving readers retain their current head.
     """
     _require_outside_transaction(connection)
+    if set(custody_callbacks) - {"seal_candidate", "prepare_address_sources"}:
+        raise ValueError("registry_publication_address_preparation_invalid")
+    seal_candidate = custody_callbacks.get("seal_candidate")
+    prepare_address_sources = custody_callbacks.get("prepare_address_sources")
     if composition_runtime is not None and type(composition_runtime) is not RegistryPublicationPTGRuntime:
         raise ValueError("registry_publication_ptg_runtime_invalid")
-    compose = compose_registry_membership_candidate if composition_runtime is None else composition_runtime.compose
+    if prepare_address_sources is not None and not callable(prepare_address_sources):
+        raise ValueError("registry_publication_address_preparation_invalid")
     request_record = await _request(connection, request_id, lease_id, _namespace(control_schema))
     command = await _fresh_retained_operation_authority(authorize, request_record, "prepare_source_rollback")
-    source_pin, current_pin = await _source_rollback_pins(connection, command, control_schema)
-    copy_target, addresses = await compose(
+    copy_target, source_pin, current_pin = await _prepare_rollback_candidate(
         connection,
-        request_id=request_id,
-        approved_revision=command.expected_approved_revision,
-        expected_head=command.expected_serving_generation,
-        source_manifest=source_pin,
-        address_sources=await _source_rollback_address_sources(connection, source_pin, control_schema),
-        writer_roles=writer_roles,
-        control_schema=control_schema,
+        request_record,
+        command,
+        writer_roles,
+        control_schema,
+        composition_runtime,
+        prepare_address_sources,
+        authorize,
     )
-    await prepare_network_candidate(connection, copy_target, addresses, **writer_roles, control_schema=control_schema)
     if seal_candidate is not None:
         await _fresh_retained_operation_authority(authorize, request_record, "prepare_source_rollback")
         await seal_candidate(copy_target)
@@ -496,6 +504,71 @@ async def complete_queued_registry_source_rollback_preview(
         writer_roles=writer_roles,
         control_schema=control_schema,
     )
+
+
+async def _prepare_rollback_candidate(
+    connection,
+    request_record,
+    command,
+    writer_roles,
+    control_schema,
+    composition_runtime,
+    prepare_address_sources,
+    authorize,
+):
+    """Prepare historical source with the current approved custom rows before the separate seal."""
+    source_pin, current_pin = await _source_rollback_pins(connection, command, control_schema)
+    address_sources = await _prepared_operation_addresses(
+        connection,
+        request_record,
+        source_pin,
+        await _source_rollback_address_sources(connection, source_pin, control_schema),
+        prepare_address_sources,
+        authorize,
+        control_schema,
+        "prepare_source_rollback",
+    )
+    compose = compose_registry_membership_candidate if composition_runtime is None else composition_runtime.compose
+    copy_target, addresses = await compose(
+        connection,
+        request_id=request_record["request_id"],
+        approved_revision=command.expected_approved_revision,
+        expected_head=command.expected_serving_generation,
+        source_manifest=source_pin,
+        address_sources=address_sources,
+        writer_roles=writer_roles,
+        control_schema=control_schema,
+    )
+    await prepare_network_candidate(connection, copy_target, addresses, **writer_roles, control_schema=control_schema)
+    return copy_target, source_pin, current_pin
+
+
+async def _prepared_operation_addresses(
+    connection, request_record, source_pin, sources, prepare, authorize, control_schema, operation
+):
+    """Keep the exact command, lease and authority around independently committed address preparation."""
+    if prepare is None:
+        return sources
+    namespace = _namespace(control_schema)
+
+    async def reauthorize():
+        """Verify the original request and purpose after each independently committed phase."""
+        current = await _request(connection, request_record["request_id"], request_record["lease_id"], namespace)
+        if current["request_sha256"] != request_record["request_sha256"]:
+            raise RegistryApprovalConflict("registry_queue_request_changed")
+        await _fresh_operation_authority(authorize, current, operation)
+
+    await reauthorize()
+    command = _document(request_record["command_json"])
+    sources = await prepare(
+        request_id=request_record["request_id"],
+        approved_revision=command["expected_approved_revision"],
+        source_manifest=source_pin,
+        expected_head=command["expected_serving_generation"],
+        address_sources=sources,
+    )
+    await reauthorize()
+    return sources
 
 
 async def _source_rollback_publication_target(connection, command_by_name, namespace, *, lock=False):
@@ -749,6 +822,29 @@ async def _initial_candidate_custody_enrollment(connection, copy_target, writer_
         await _require_initial_custody_enrollment(connection, readers, writer_context.control_schema)
 
 
+async def _initial_inventory_sources(connection, request_record, command, writer_context, sources, authorize):
+    """Keep enrollment and bootstrap admission ahead of any independently prepared artifact."""
+    known_readers = (writer_context.execution_role, writer_context.physical_owner_role)
+    control_schema = writer_context.control_schema
+    await _require_initial_custody_enrollment(
+        connection,
+        tuple(sorted(set(known_readers + writer_context.loader_roles + writer_context.reader_roles))),
+        control_schema,
+    )
+    bootstrap = await _initial_inventory_bootstrap(connection, command, sources, control_schema)
+    sources = await _prepared_operation_addresses(
+        connection,
+        request_record,
+        None,
+        sources,
+        writer_context.prepare_address_sources,
+        authorize,
+        control_schema,
+        "publish_initial_inventory",
+    )
+    return bootstrap, sources
+
+
 async def complete_queued_registry_initial_inventory(
     connection, request_id, lease_id, *, authorize, writer_context, initial_address_sources
 ):
@@ -762,13 +858,9 @@ async def complete_queued_registry_initial_inventory(
     namespace = _namespace(control_schema)
     request_record = await _request(connection, request_id, lease_id, namespace)
     command, _revision = await _fresh_operation_authority(authorize, request_record, "publish_initial_inventory")
-    known_readers = (writer_context.execution_role, writer_context.physical_owner_role)
-    await _require_initial_custody_enrollment(
-        connection,
-        tuple(sorted(set(known_readers + writer_context.loader_roles + writer_context.reader_roles))),
-        control_schema,
+    bootstrap, initial_address_sources = await _initial_inventory_sources(
+        connection, request_record, command, writer_context, initial_address_sources, authorize
     )
-    bootstrap = await _initial_inventory_bootstrap(connection, command, initial_address_sources, control_schema)
     compose = (
         compose_registry_membership_candidate
         if writer_context.composition_runtime is None

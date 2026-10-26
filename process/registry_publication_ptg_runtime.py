@@ -28,7 +28,8 @@ _SQL_LIMIT_SQL = """SELECT
  (SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout') AS statement_timeout_ms,
  (SELECT setting::bigint FROM pg_settings WHERE name='lock_timeout') AS lock_timeout_ms,
  current_setting('max_parallel_workers_per_gather')::bigint AS parallel_query,
- current_setting('max_parallel_maintenance_workers')::bigint AS parallel_maintenance"""
+ current_setting('max_parallel_maintenance_workers')::bigint AS parallel_maintenance,
+ current_setting('session_replication_role') AS replication_role"""
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,11 @@ class RegistryPublicationSQLLimits:
             value = observed[name]
             if type(value) is not int or not 0 < value <= getattr(self, name):
                 raise RuntimeError("registry_publication_worker_sql_limits_unavailable")
-        if observed["parallel_query"] != 0 or observed["parallel_maintenance"] != 0:
+        if (
+            observed["parallel_query"] != 0
+            or observed["parallel_maintenance"] != 0
+            or observed["replication_role"] != "origin"
+        ):
             raise RuntimeError("registry_publication_worker_sql_limits_unavailable")
 
 

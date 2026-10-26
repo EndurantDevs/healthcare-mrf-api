@@ -325,15 +325,21 @@ async def _hydrate_native_batch(npis, state, params, native_args, session, *, wi
             )
         provider_items.append(provider_item)
     if native_args.get("view") != "card":
-        provider_rows = await npi._project_provider_network_metadata(
-            [provider_item["provider"] for provider_item in provider_items],
-            session=session,
-            include_sources=params["include_sources"],
-            include_evidence=params["include_evidence"],
-        )
-        for item_by_field, provider_by_field in zip(provider_items, provider_rows, strict=True):
-            item_by_field["provider"] = provider_by_field
+        await _project_batch_provider_metadata(provider_items, params, session)
     return provider_items
+
+
+async def _project_batch_provider_metadata(items, params, session):
+    """Project successful providers once without changing per-item absence or legacy reads."""
+    successful_items = [item for item in items if item["status"] == 200]
+    provider_rows = await npi._project_provider_network_metadata(
+        [item["provider"] for item in successful_items],
+        session=session,
+        include_sources=params["include_sources"],
+        include_evidence=params["include_evidence"],
+    )
+    for item_by_field, provider_by_field in zip(successful_items, provider_rows, strict=True):
+        item_by_field["provider"] = provider_by_field
 
 
 def _apply_premise_groups(provider, groups, hydrated, params):
@@ -444,6 +450,7 @@ async def build_native_batch_payload(
         )
         response_items.append(provider_result_map)
         found_count += int(was_found)
+    await _project_batch_provider_metadata(response_items, batch_params, session)
     return {
         "items": response_items,
         "requested": len(npis),

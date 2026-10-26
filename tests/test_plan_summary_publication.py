@@ -84,6 +84,7 @@ async def test_read_grants_replay_on_same_native_transaction_before_swap(publica
             live_table="plan_search_summary",
             stage_table="plan_search_summary_refresh",
         )
+        assert summary.complete_publication.await_count == int(completed)
         context.events.append("preserve")
 
     gate = AsyncMock(side_effect=preserve)
@@ -104,6 +105,7 @@ async def test_read_grants_replay_on_same_native_transaction_before_swap(publica
             publication[1],
             {"plan": 100},
             False,
+            refresh_summary=True,
         )
     else:
         summary.complete_publication.assert_not_awaited()
@@ -124,7 +126,7 @@ async def test_grant_failure_or_cancel_rolls_back_before_swap(publication_bounda
     assert context.events == ["begin", "rollback"]
     assert not any(statement.startswith(("DROP", "ALTER")) for statement in context.statements)
     context.preparation.execute.assert_awaited_once()
-    summary.complete_publication.assert_not_awaited()
+    assert summary.complete_publication.await_count == int(completed)
 
 
 @pytest.mark.asyncio
@@ -199,7 +201,7 @@ class IndexNames:
             assert checkfirst
             return
         key = str(table.primary_key.name)
-        assert key == name + "_pkey" and key not in self.indexes
+        assert key == name + "_candidate_pkey" and key not in self.indexes
         self.tables.add(name)
         self.indexes[key] = name
 
@@ -235,9 +237,13 @@ class IndexNames:
 
 
 @pytest.mark.asyncio
-async def test_two_successive_stages_keep_private_indexes_and_canonical_names(publication_boundary, monkeypatch):
+@pytest.mark.parametrize("prior_primary_key", ["plan_search_summary_pkey", "plan_search_summary_refresh_pkey"])
+async def test_two_successive_stages_keep_private_indexes_and_canonical_names(
+    publication_boundary, monkeypatch, prior_primary_key
+):
     context = publication_boundary
     names = IndexNames()
+    names.indexes = {prior_primary_key: "plan_search_summary"}
     original = context.session.execute.side_effect
 
     async def execute(statement):

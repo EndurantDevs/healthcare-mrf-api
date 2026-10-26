@@ -175,7 +175,16 @@ async def test_control_uses_trusted_config_and_exact_event_and_drains_watcher(mo
 
 @pytest.mark.asyncio
 async def test_second_pool_failure_closes_first_without_consumer(monkeypatch):
-    pool = SimpleNamespace(close=AsyncMock(), terminate=lambda: None)
+    @asynccontextmanager
+    async def acquire(*, timeout):
+        yield object()
+
+    pool = SimpleNamespace(close=AsyncMock(), terminate=lambda: None, acquire=acquire)
+    monkeypatch.setattr(
+        worker,
+        "_worker_backend_qualification",
+        AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock())),
+    )
     monkeypatch.setattr(worker.asyncpg, "create_pool", AsyncMock(side_effect=[pool, RuntimeError("synthetic")]))
     consume = AsyncMock()
     monkeypatch.setattr(worker, "consume_registry_ptg_source_notification_once", consume)
@@ -253,6 +262,11 @@ def resources(monkeypatch, failure=None):
     harness.execution = Connection("executor", harness.events)
     harness.reader = Connection("office_reader", harness.events)
     monkeypatch.setattr(worker.RegistryPublicationSQLLimits, "verify", AsyncMock())
+    monkeypatch.setattr(
+        worker,
+        "_worker_backend_qualification",
+        AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock())),
+    )
 
     async def create_pool(**options):
         if failure == "startup":
@@ -312,6 +326,8 @@ async def test_typed_event_consumption_qualifies_before_work_and_closes_owned_re
     options = {"event": selected} if override else {}
     assert await worker.run_registry_ptg_source_worker(configured, **options) == {"state": state}
     assert harness.events == [
+        "office_reader checkout",
+        "office_reader released",
         "executor checkout",
         "office_reader checkout",
         "reader transaction",
@@ -322,10 +338,10 @@ async def test_typed_event_consumption_qualifies_before_work_and_closes_owned_re
         "consume",
         "executor released",
         "runtime disposed",
-        "office_reader closed",
         "executor closed",
+        "office_reader closed",
     ]
-    assert [pool_options["user"] for pool_options in harness.options] == ["executor", "office_reader"]
+    assert [pool_options["user"] for pool_options in harness.options] == ["office_reader", "executor"]
     assert all(
         pool_options["min_size"] == pool_options["max_size"] == 1 and pool_options["timeout"] == 5
         for pool_options in harness.options
@@ -371,8 +387,10 @@ async def test_runner_failures_drain_and_release_owned_pools_and_runtime(monkeyp
         )
     if failure == "startup":
         assert not harness.events and not harness.options
+    elif failure == "office_reader checkout":
+        assert harness.events == ["office_reader checkout", "office_reader closed"]
     else:
-        assert harness.events[-2:] == ["office_reader closed", "executor closed"]
+        assert harness.events[-2:] == ["executor closed", "office_reader closed"]
     if failure in {"runtime qualification", "consume", "cancel", "result"}:
         assert harness.events.index("executor released") < harness.events.index("runtime disposed")
         assert harness.events.index("runtime disposed") < harness.events.index("office_reader closed")
@@ -404,7 +422,14 @@ async def test_runner_rejects_unqualified_execution_before_notification_or_runti
         await worker.run_registry_ptg_source_worker(
             worker.parse_registry_ptg_source_worker_config(json.dumps(configuration()))
         )
-    assert harness.events == ["executor checkout", "executor released", "office_reader closed", "executor closed"]
+    assert harness.events == [
+        "office_reader checkout",
+        "office_reader released",
+        "executor checkout",
+        "executor released",
+        "executor closed",
+        "office_reader closed",
+    ]
 
 
 @pytest.mark.parametrize("changes", [{"sql_limits": object()}, {"notification_store": object()}, {"ptg": None}])

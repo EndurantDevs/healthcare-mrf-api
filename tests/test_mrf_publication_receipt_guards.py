@@ -101,6 +101,25 @@ async def test_completion_rejects_changed_publication_authority(monkeypatch, fai
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_summary", [None, "plan_search_summary_refresh", 1])
+async def test_completion_rejects_non_boolean_fixed_summary_selection(monkeypatch, refresh_summary):
+    generation, _ = _publication(monkeypatch)
+    session = SimpleNamespace(execute=AsyncMock())
+    with pytest.raises(ValueError, match="refresh summary selection must be an explicit boolean"):
+        await receipt.complete_publication(
+            session,
+            "synthetic",
+            "attempt",
+            generation,
+            {"plan": 13},
+            False,
+            refresh_summary=refresh_summary,
+        )
+    receipt.capture_summary_inputs.assert_not_awaited()
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure,message",
     [

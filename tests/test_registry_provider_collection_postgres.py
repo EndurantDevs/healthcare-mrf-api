@@ -41,19 +41,19 @@ async def collection_transport(profile_transport, monkeypatch):
     async with context.fixture.engine.begin() as connection:
         await connection.run_sync(model_table.create)
         await connection.execute(text(f'GRANT SELECT ON mrf.nucc_taxonomy TO "{context.role}"'))
-    requests, pins, accounting = [], [], []
-    original_pin, original_accounting = catalog._pin, catalog._membership_accounting
+    requests, pins, custody = [], [], []
+    original_pin, original_custody = catalog._pin, catalog.resolve_network_serving_manifest
 
     async def observe_pin(*args, **kwargs):
         pins.append(args)
         return await original_pin(*args, **kwargs)
 
-    async def observe_accounting(*args, **kwargs):
-        accounting.append(args)
-        return await original_accounting(*args, **kwargs)
+    async def observe_custody(*args, **kwargs):
+        custody.append(args)
+        return await original_custody(*args, **kwargs)
 
     monkeypatch.setattr(catalog, "_pin", observe_pin)
-    monkeypatch.setattr(catalog, "_membership_accounting", observe_accounting)
+    monkeypatch.setattr(catalog, "resolve_network_serving_manifest", observe_custody)
     sentinel = object()
 
     @context.app.middleware("request")
@@ -68,7 +68,7 @@ async def collection_transport(profile_transport, monkeypatch):
     context.writer_statements.clear()
     context.statements.clear()
     context.transactions.clear()
-    yield SimpleNamespace(context=context, requests=requests, pins=pins, accounting=accounting, sentinel=sentinel)
+    yield SimpleNamespace(context=context, requests=requests, pins=pins, custody=custody, sentinel=sentinel)
 
 
 def _query(kind):
@@ -93,7 +93,9 @@ def _reader_evidence(case):
     assert all(identity[5:] == (False, False) for _, identity in context.statements)
     assert len({identity[4] for _, identity in context.statements}) == 1
     assert None not in context.transactions and len(set(context.transactions)) == 1
-    assert len(case.pins) == len(case.accounting) == 1
+    assert len(case.pins) == 1 and len(case.custody) == 2
+    assert case.custody[0] == case.custody[1]
+    assert case.custody[0][0] is case.pins[0][0]
     assert all(request.ctx.sa_session is case.sentinel for request in case.requests)
 
 
@@ -102,7 +104,7 @@ async def _post(case, document, *, headers=None):
     context.statements.clear()
     context.transactions.clear()
     case.pins.clear()
-    case.accounting.clear()
+    case.custody.clear()
     _, reply = await context.app.asgi_client.post(
         _PATH, data=json.dumps(document).encode(), headers=_AUTH if headers is None else headers
     )
@@ -220,7 +222,7 @@ async def test_native_legacy_collection_reuses_the_exact_accounted_manifest(coll
     data_by_field = _success(case, await _post(case, document), document)
     _assert_offices(context, "batch", data_by_field, "selected")
     assert case.pins[0][1:] == (context.manifest.generation_id, context.fixture.control_schema)
-    assert case.accounting[0][0] is case.pins[0][0]
+    assert case.custody[0][0] is case.pins[0][0]
 
 
 async def test_native_collection_authority_refusal_precedes_reader(collection_transport):
@@ -228,10 +230,10 @@ async def test_native_collection_authority_refusal_precedes_reader(collection_tr
     document = v2_envelope(_query("list"))
     wrong = await _post(case, document, headers={"Authorization": "Bearer wrong"})
     assert wrong.status == 403
-    assert not case.context.statements and not case.pins and not case.accounting
+    assert not case.context.statements and not case.pins and not case.custody
     invalid = await _post(case, document | {"access_scope_sha256": "0" * 64})
     assert invalid.status == 400
-    assert not case.context.statements and not case.pins and not case.accounting
+    assert not case.context.statements and not case.pins and not case.custody
     typed = await _post(case, document | {"policy_revision": True})
     assert typed.status == 400
-    assert not case.context.statements and not case.pins and not case.accounting
+    assert not case.context.statements and not case.pins and not case.custody

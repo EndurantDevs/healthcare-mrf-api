@@ -17,6 +17,7 @@ from tests.ptg2_serving_address_evidence_postgres_support import (
     _schema_sql,
     _temporary_schema,
 )
+from tests.test_ptg2_graph_runtime_boundaries import _local_distance_tables
 
 
 @pytest.mark.asyncio
@@ -144,9 +145,35 @@ async def _radius_locations(database: Database, schema: str, limit: int, offset:
     return [dict(row._mapping) for row in await database.all(sql, **query.parameter_map)]
 
 
+async def _assert_later_code_match(database, schema, monkeypatch, matching_npi):
+    """Grow a real row-limited KNN prefix before declaring its code scope exhausted."""
+    probe_limits = []
+
+    async def location_rows(*_args, limit, **_kwargs):
+        probe_limits.append(limit)
+        return await _radius_locations(database, schema, limit)
+
+    async def memberships(_session, _tables, npis, _request, _state):
+        return {npi: (10 if npi == matching_npi else 20,) for npi in npis}
+
+    async def code_sets(*_args, provider_set_keys, **_kwargs):
+        return tuple(key for key in provider_set_keys if key == 10)
+
+    monkeypatch.setattr(serving, "_membership_location_rows", location_rows)
+    monkeypatch.setattr(serving, "_local_v4_memberships", memberships)
+    monkeypatch.setattr(serving, "_scoped_rate_provider_set_keys", code_sets)
+    tables = _local_distance_tables()
+    request = serving._LocalDistanceGraphRequest(1, [{"code_key": 7}], serving._v4_geo_rate_forward_limits(tables))
+    candidates = await serving._scan_local_distance_graph(object(), tables, {}, request, 1, 4)
+
+    assert probe_limits == [1, 4]
+    assert [location["npi"] for location in candidates.location_rows] == [matching_npi]
+    assert candidates.provider_set_keys_by_npi == {matching_npi: {10}}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("broad_scope", [False, True])
-async def test_exact_radius_precedes_raw_probe_limit_and_page_exhaustion(broad_scope):
+async def test_exact_radius_precedes_raw_probe_limit_and_page_exhaustion(broad_scope, monkeypatch):
     async with _temporary_schema() as (database, schema):
         await _insert_radius_boundary_addresses(database, schema, broad_scope)
         first_page = await _radius_locations(database, schema, 1)
@@ -157,5 +184,7 @@ async def test_exact_radius_precedes_raw_probe_limit_and_page_exhaustion(broad_s
         assert [row["npi"] for row in full_prefix] == [1990000015, 1990000221]
         assert [row["npi"] for row in first_page + second_page] == [row["npi"] for row in full_prefix]
         assert all(row["distance_miles"] <= 10.0 for row in full_prefix)
-        assert all(row["_ptg_source_exhausted"] is True for row in first_page + full_prefix)
+        assert first_page[0]["_ptg_source_exhausted"] is False
+        assert all(row["_ptg_source_exhausted"] is True for row in full_prefix)
         assert empty_page == []
+        await _assert_later_code_match(database, schema, monkeypatch, full_prefix[1]["npi"])

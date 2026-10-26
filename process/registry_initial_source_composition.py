@@ -7,12 +7,17 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from uuid import UUID
 
 from process.network_custom_address_source import _require_transaction
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
-from process.network_initial_cms_office_bindings import copy_initial_cms_office_bindings, pin_cms_office_address_source
+from process.network_initial_cms_office_bindings import (
+    copy_initial_cms_office_bindings,
+    pin_cms_office_address_source,
+    prepare_cms_office_matches,
+)
 from process.network_initial_source_office_bindings import (
     copy_initial_aca_office_bindings,
     pin_aca_office_address_source,
@@ -62,6 +67,8 @@ def validate_initial_source_recipes(recipes) -> tuple:
             if type(source_pin) in {PinnedACAMembershipSource, PinnedPTGOfficeMembershipSource}:
                 continue
             if type(source_pin) is PinnedFHIRMembershipSource and source_pin.retained_epoch is not None:
+                continue
+            if type(source_pin) is PinnedFHIRMembershipSource and source_pin.retained_capture is not None:
                 continue
             if (
                 type(source_pin) is not PinnedFHIRMembershipSource
@@ -138,6 +145,43 @@ def verify_initial_source_office_receipt(candidate: Mapping) -> dict | None:
         raise RegistryInitialSourceError("registry_initial_source_office_receipt_invalid") from None
 
 
+async def _fhir_office_pages(connection, recipes, approved, control_schema, office_authority, retained_fhir_reads=None):
+    """Replay every genuine FHIR page without collecting complete inputs in memory."""
+    retained_fhir_reads = {} if retained_fhir_reads is None else retained_fhir_reads
+    for recipe in recipes:
+        if type(recipe.source_pin) is not PinnedFHIRMembershipSource:
+            continue
+        office_source = await _require_recipe_custody(
+            connection, recipe, approved, control_schema, office_authority, {}, retained_fhir_reads=retained_fhir_reads
+        )
+        cursor, limit = None, 1000
+        while True:
+            batch, next_cursor, limit = await _read_recipe_page(
+                connection, recipe, approved, cursor, control_schema, limit, office_source
+            )
+            if not batch.source_rows:
+                break
+            yield batch, cursor, office_source
+            if next_cursor in {None, cursor}:
+                raise RegistryInitialSourceError("registry_initial_source_office_accounting_invalid")
+            cursor = next_cursor
+
+
+@asynccontextmanager
+async def _fhir_office_matches(
+    connection, recipes, approved, address_source, runtime_roles, control_schema, office_authority, retained_fhir_reads
+):
+    """Keep the complete FHIR match in the current preparation transaction only."""
+    if not any(type(recipe.source_pin) is PinnedFHIRMembershipSource for recipe in recipes):
+        yield None
+        return
+    pages = _fhir_office_pages(connection, recipes, approved, control_schema, office_authority, retained_fhir_reads)
+    async with prepare_cms_office_matches(
+        connection, address_source, runtime_roles, pages, control_schema=control_schema
+    ) as matches:
+        yield matches
+
+
 async def _office_summary(
     connection,
     recipes,
@@ -148,6 +192,27 @@ async def _office_summary(
     copy_target=None,
     office_authority=None,
 ):
+    """Preserve the original standalone office-summary caller contract."""
+    return await _office_summary_with_reads(
+        connection,
+        recipes,
+        approved,
+        address_source,
+        runtime_roles,
+        control_schema,
+        (copy_target, office_authority, None),
+    )
+
+
+async def _office_summary_with_reads(
+    connection,
+    recipes,
+    approved,
+    address_source,
+    runtime_roles,
+    control_schema,
+    office_phase,
+):
     """Hash native page pins in canonical recipe order, without candidate identity.
 
     Office counts are page occurrences, not a distinct office census. Every page
@@ -155,10 +220,47 @@ async def _office_summary(
     """
     await _require_transaction(connection)
     recipes = validate_initial_source_recipes(recipes)
+    copy_target, office_authority, retained_fhir_reads = office_phase
+    retained_fhir_reads = {} if retained_fhir_reads is None else retained_fhir_reads
+    async with _fhir_office_matches(
+        connection,
+        recipes,
+        approved,
+        address_source,
+        runtime_roles,
+        control_schema,
+        office_authority,
+        retained_fhir_reads,
+    ):
+        return await _accumulate_office_pages(
+            connection,
+            recipes,
+            approved,
+            address_source,
+            runtime_roles,
+            control_schema,
+            (copy_target, office_authority, retained_fhir_reads),
+        )
+
+
+async def _accumulate_office_pages(
+    connection, recipes, approved, address_source, runtime_roles, control_schema, office_phase
+):
+    """Keep original per-page receipts and replay/copy accounting unchanged."""
+    copy_target, office_authority, retained_fhir_reads = office_phase
     digest = hashlib.sha256()
     office_rows = page_count = 0
+    aca_reads_by_oid = {}
     for recipe in recipes:
-        office_source = await _require_recipe_custody(connection, recipe, approved, control_schema, office_authority)
+        office_source = await _require_recipe_custody(
+            connection,
+            recipe,
+            approved,
+            control_schema,
+            office_authority,
+            aca_reads_by_oid,
+            retained_fhir_reads=retained_fhir_reads,
+        )
         cursor, limit = None, 1000
         while True:
             batch, next_cursor, limit = await _read_recipe_page(
@@ -166,10 +268,26 @@ async def _office_summary(
             )
             if not batch.source_rows:
                 break
-            pin = await _pin_offices(connection, recipe, batch, address_source, runtime_roles, cursor, control_schema)
+            pin = await _pin_offices(
+                connection,
+                recipe,
+                batch,
+                address_source,
+                runtime_roles,
+                cursor,
+                control_schema,
+                office_source,
+            )
             if copy_target is not None:
                 copied = await _copy_offices(
-                    connection, recipe, batch, copy_target, pin, runtime_roles, cursor, control_schema
+                    connection,
+                    recipe,
+                    batch,
+                    copy_target,
+                    pin,
+                    runtime_roles,
+                    control_schema,
+                    (cursor, office_source),
                 )
                 if copied["office_count"] != pin.office_count:
                     raise RegistryInitialSourceError("registry_initial_source_office_accounting_invalid")
@@ -183,7 +301,16 @@ async def _office_summary(
     return _office_receipt(recipes, approved, address_source, office_rows, page_count, digest.hexdigest())
 
 
-async def _pin_offices(connection, recipe, batch, address_source, runtime_roles, cursor, control_schema):
+async def _pin_offices(
+    connection,
+    recipe,
+    batch,
+    address_source,
+    runtime_roles,
+    cursor,
+    control_schema,
+    office_source=None,
+):
     if type(recipe.source_pin) is PinnedPTGOfficeMembershipSource:
         return await pin_ptg_office_address_source(
             connection,
@@ -209,10 +336,12 @@ async def _pin_offices(connection, recipe, batch, address_source, runtime_roles,
         runtime_roles=runtime_roles,
         after_resource=cursor,
         control_schema=control_schema,
+        retained_read=office_source,
     )
 
 
-async def _copy_offices(connection, recipe, batch, copy_target, pin, runtime_roles, cursor, control_schema):
+async def _copy_offices(connection, recipe, batch, copy_target, pin, runtime_roles, control_schema, source_page):
+    cursor, office_source = source_page
     if type(recipe.source_pin) is PinnedPTGOfficeMembershipSource:
         return await copy_ptg_office_bindings(
             connection,
@@ -241,6 +370,7 @@ async def _copy_offices(connection, recipe, batch, copy_target, pin, runtime_rol
         runtime_roles=runtime_roles,
         after_resource=cursor,
         control_schema=control_schema,
+        retained_read=office_source,
     )
 
 
@@ -262,11 +392,25 @@ def _office_receipt(recipes, approved, address_source, office_rows, page_count, 
 
 
 async def prepare_initial_source_offices(
-    connection, recipes, approved, address_source, *, runtime_roles, control_schema, office_authority=None
+    connection,
+    recipes,
+    approved,
+    address_source,
+    *,
+    runtime_roles,
+    control_schema,
+    office_authority=None,
+    retained_fhir_reads=None,
 ):
     """Prove complete selected offices before immutable candidate metadata is created."""
-    return await _office_summary(
-        connection, recipes, approved, address_source, runtime_roles, control_schema, office_authority=office_authority
+    return await _office_summary_with_reads(
+        connection,
+        recipes,
+        approved,
+        address_source,
+        runtime_roles,
+        control_schema,
+        (None, office_authority, retained_fhir_reads),
     )
 
 
@@ -281,23 +425,57 @@ async def record_initial_source_offices(
     control_schema,
     office_authority=None,
 ):
-    """Copy proved offices and write one aggregate within the caller preparation transaction."""
+    """Copy proved offices using the existing standalone caller contract."""
+    return await record_initial_source_offices_with_reads(
+        connection,
+        copy_target,
+        recipes,
+        approved,
+        address_source,
+        runtime_roles=runtime_roles,
+        control_schema=control_schema,
+        office_phase=(office_authority, None),
+    )
+
+
+async def record_initial_source_offices_with_reads(
+    connection,
+    copy_target,
+    recipes,
+    approved,
+    address_source,
+    *,
+    runtime_roles,
+    control_schema,
+    office_phase,
+):
+    """Reuse native admissions only inside the original preparation transaction."""
+    office_authority, retained_fhir_reads, *verified = office_phase
+    verified_matches = verified[0] if verified else None
     namespace = _control_namespace(control_schema)
     async with connection.transaction():
         candidate = await _locked_candidate(connection, copy_target, namespace)
         _require_open(candidate)
-        receipt = await _office_summary(
-            connection,
-            recipes,
-            approved,
-            address_source,
-            runtime_roles,
-            control_schema,
-            copy_target,
-            office_authority,
-        )
+        if verified_matches is not None:
+            receipt = await verified_retained_source_office_summary(
+                connection, recipes, approved, address_source, runtime_roles, control_schema, verified_matches
+            )
+        else:
+            receipt = await _office_summary_with_reads(
+                connection,
+                recipes,
+                approved,
+                address_source,
+                runtime_roles,
+                control_schema,
+                (copy_target, office_authority, retained_fhir_reads),
+            )
         if not _is_receipt_match(candidate, receipt, verify_registry_source_recipes(candidate)):
             raise RegistryInitialSourceError("registry_initial_source_office_receipt_conflict")
+        if verified_matches is not None:
+            from process.network_initial_cms_office_bindings import copy_verified_retained_offices
+
+            await copy_verified_retained_offices(connection, verified_matches, copy_target)
         report = _report(candidate)
         if SUMMARY_KEY in report:
             if verify_initial_source_office_receipt(candidate) != receipt:
@@ -311,3 +489,32 @@ async def record_initial_source_offices(
                 _canonical(receipt),
             )
         return receipt
+
+
+async def verified_retained_source_office_summary(
+    connection, recipes, approved, address_source, runtime_roles, control_schema, matches
+):
+    """Reuse only the same authenticated mapping set before and after candidate creation."""
+    from process.network_initial_cms_office_bindings import verified_retained_offices
+
+    recipes = validate_initial_source_recipes(recipes)
+    if (
+        approved.total_rows
+        or not recipes
+        or not all(
+            type(recipe.source_pin) is PinnedFHIRMembershipSource and recipe.source_pin.retained_capture is not None
+            for recipe in recipes
+        )
+        or matches.recipe_sha256 != registry_source_recipes_sha256(canonical_registry_source_recipes(recipes))
+        or matches.approved_generation_id != approved.generation_id
+    ):
+        raise RegistryInitialSourceError("registry_initial_source_office_receipt_conflict")
+    correspondence = await verified_retained_offices(connection, matches, address_source, runtime_roles, control_schema)
+    return _office_receipt(
+        recipes,
+        approved,
+        address_source,
+        sum(count for count, _ in matches.page_proofs_by_key.values()),
+        len(matches.page_proofs_by_key),
+        correspondence,
+    )

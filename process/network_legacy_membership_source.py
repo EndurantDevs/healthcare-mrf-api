@@ -11,7 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from process.network_address_projection import _identifier
@@ -123,7 +124,7 @@ class PinnedACAMembershipSource:
             ):
                 raise LegacyMembershipSourceError("ACA source coordinates are invalid")
         aca_checksum_scope(self.issuer_id, self.year, self.alias_scope)
-        if self.prepared.manifest.source_metadata.get("network_membership") != self.coordinates:
+        if aca_source_descriptor(self).get("network_membership") != self.coordinates:
             raise LegacyMembershipSourceError("ACA source admission coordinates differ")
         _validate_successor(self)
 
@@ -249,7 +250,7 @@ def with_aca_global_epoch(anchor, epoch):
 
 
 def _aca_binding_coordinates(source):
-    descriptor = source.prepared.manifest.source_metadata.get("network_bindings")
+    descriptor = aca_source_descriptor(source).get("network_bindings")
     keys = {*RegistryNetworkSourceCoordinates.__dataclass_fields__, "source_key_kind"}
     if type(descriptor) is not dict or set(descriptor) != keys or descriptor["source_key_kind"] != "hios_plan_id":
         raise LegacyMembershipSourceError("ACA successor binding descriptor differs")
@@ -264,6 +265,31 @@ def _aca_binding_coordinates(source):
     ):
         raise LegacyMembershipSourceError("ACA successor binding descriptor differs")
     return coordinates
+
+
+@lru_cache(maxsize=64)
+def _cached_batch_descriptors(encoded_metadata, runtime_roles):
+    """Reuse bounded structural validation only; native authority is checked separately."""
+    from process.registry_aca_source_recipe import _batch_descriptors
+
+    return tuple(_canonical_json(scope) for scope in _batch_descriptors(json.loads(encoded_metadata), runtime_roles))
+
+
+def aca_source_descriptor(source):
+    """Select one exact sealed scope without changing the physical archive identity."""
+    metadata = source.prepared.manifest.source_metadata
+    if "registry_aca_initial_batch" not in metadata:
+        return metadata
+    matches = [
+        descriptor
+        for descriptor in map(
+            json.loads, _cached_batch_descriptors(_canonical_json(dict(metadata)), source.runtime_roles)
+        )
+        if descriptor["network_membership"] == source.coordinates
+    ]
+    if len(matches) != 1:
+        raise LegacyMembershipSourceError("ACA source admission coordinates differ")
+    return matches[0]
 
 
 def aca_physical_source(source):
@@ -362,16 +388,36 @@ async def _require_archive(connection, source_pin):
         from process.registry_aca_source_recipe import require_registry_aca_source_recipe
 
         recipe = await require_registry_aca_source_recipe(
-            NativeReceiptSession(connection), physical.prepared, runtime_roles=physical.runtime_roles
+            NativeReceiptSession(connection),
+            physical.prepared,
+            runtime_roles=physical.runtime_roles,
+            **({"binding_coordinates": _aca_binding_coordinates(physical)} if _is_initial_batch(physical) else {}),
         )
         if recipe.source_pin != physical or recipe.binding_coordinates != _aca_binding_coordinates(physical):
             raise LegacyMembershipSourceError("ACA successor protected recipe differs")
 
 
 async def _require_flat_archive(connection, source_pin):
-    if source_pin.prepared.manifest.source_metadata.get("network_membership") != source_pin.coordinates:
+    if aca_source_descriptor(source_pin).get("network_membership") != source_pin.coordinates:
         raise LegacyMembershipSourceError("ACA source admission coordinates differ")
+    if _is_initial_batch(source_pin):
+        from process.network_cms_registry_address_capture import NativeReceiptSession
+        from process.registry_aca_source_recipe import require_registry_aca_source_recipe
+
+        recipe = await require_registry_aca_source_recipe(
+            NativeReceiptSession(connection),
+            source_pin.prepared,
+            runtime_roles=source_pin.runtime_roles,
+            binding_coordinates=_aca_binding_coordinates(source_pin),
+        )
+        if recipe.source_pin != source_pin:
+            raise LegacyMembershipSourceError("ACA protected batch scope differs")
+        return
     await _require_native_archive(connection, source_pin.prepared, source_pin.validation, source_pin.runtime_roles)
+
+
+def _is_initial_batch(source):
+    return "registry_aca_initial_batch" in source.prepared.manifest.source_metadata
 
 
 async def _require_native_archive(connection, prepared, validation, runtime_roles):
@@ -589,7 +635,7 @@ def _reviewed_descriptor(source, approved_source, coordinates, approved_only=Fal
         raise LegacyMembershipSourceError("Reviewed ACA source coordinates are invalid")
     descriptor_dict = {**asdict(coordinates), "source_key_kind": "hios_plan_id"}
     # ReferenceFamilyStageOwnership has no producer field; the sealed descriptor is its authority.
-    if source.prepared.manifest.source_metadata.get("network_bindings") != descriptor_dict:
+    if aca_source_descriptor(source).get("network_bindings") != descriptor_dict:
         raise LegacyMembershipSourceError("Reviewed ACA source admission coordinates differ")
     return descriptor_dict
 
@@ -603,7 +649,9 @@ def _reviewed_generation(source, approved_source, coordinates, approved_only=Fal
     if approved_only:
         recipe_dict["selection_policy"] = "approved-bindings-only"
     if complete_raw_facts:
-        recipe_dict["fact_policy"] = "retained-raw-pk-v1"
+        physical = aca_physical_source(source)
+        has_batch_scope = type(physical) is PinnedACAMembershipSource and _is_initial_batch(physical)
+        recipe_dict["fact_policy"] = "retained-url-raw-pk-v1" if has_batch_scope else "retained-raw-pk-v1"
     return hashlib.sha256(_canonical_json(recipe_dict)).hexdigest()
 
 
@@ -643,6 +691,7 @@ class ACAMembershipBatch:
     unresolved_source_rows: int = 0
     omitted_source_rows: int = 0
     source_outcomes: tuple[ACARawFactOutcome, ...] = ()
+    verified_source: object = field(default=None, compare=False, repr=False)
 
     @property
     def generation_id(self):
@@ -655,13 +704,24 @@ class ACAMembershipBatch:
         )
 
 
-def _raw_fact_selection_sql():
+def _raw_fact_selection_sql(batch_scope=False):
     # Raw provenance is the admitted immutable relation and issuer/year, not an inferred URL.
     raw_page = """raw_page AS MATERIALIZED (
       SELECT npi,checksum_network,network_tier,issuer_id,year FROM {source}.plan_npi_raw
       WHERE issuer_id=$9 AND year=$10 AND $12::bigint IS NULL
       AND ($15::bigint IS NULL OR (npi,checksum_network)>($15,$16::bigint))
       ORDER BY npi,checksum_network LIMIT $13),"""
+    if batch_scope:
+        raw_page = raw_page.replace("FROM {source}.plan_npi_raw", "FROM {source}.plan_npi_raw raw")
+        raw_page = raw_page.replace(
+            "AND ($15::bigint IS NULL",
+            "AND EXISTS(SELECT 1 FROM {source}.mrf_address_evidence selected_evidence "
+            "WHERE selected_evidence.npi=raw.npi AND selected_evidence.checksum_network=raw.checksum_network "
+            "AND selected_evidence.issuer_id=raw.issuer_id AND selected_evidence.year=raw.year "
+            "AND selected_evidence.network_tier=raw.network_tier "
+            "AND selected_evidence.import_id=$8 AND selected_evidence.source_url=$11) "
+            "AND ($15::bigint IS NULL",
+        )
     page_sql = """SELECT evidence.*,raw.npi AS fact_npi,raw.checksum_network AS fact_checksum
       FROM raw_page raw LEFT JOIN {source}.mrf_address_evidence evidence
       ON evidence.npi=raw.npi AND evidence.checksum_network=raw.checksum_network
@@ -700,6 +760,7 @@ def _reviewed_sql(
     anchor_namespace=None,
     binding_projection=None,
     global_epoch=False,
+    batch_scope=False,
 ):
     """Build bounded raw/evidence membership SQL from a verified physical source view."""
     complete_key = """COALESCE(retained_npi IS NOT NULL AND retained_plan_id IS NOT NULL AND plan_id IS NOT NULL
@@ -721,7 +782,7 @@ def _reviewed_sql(
       AND provider.issuer_id=page.issuer_id AND provider.year=page.year AND provider.network_tier=page.network_tier"""
     fact_status = raw_summary = ""
     if complete_raw_facts:
-        raw_page, page_sql, provider_join, fact_status, raw_summary = _raw_fact_selection_sql()
+        raw_page, page_sql, provider_join, fact_status, raw_summary = _raw_fact_selection_sql(batch_scope)
     namespace_sql = _identifier(namespace)
     if binding_projection is None:
         binding_projection = _binding_projection(
@@ -796,6 +857,7 @@ async def _read_reviewed(
             complete_raw_facts,
             binding_projection=reviewed_aca_binding_projection(source_pin, registry_schema=registry_schema),
             global_epoch=type(physical) is ACAGlobalEpochReadScope,
+            batch_scope=type(physical) is PinnedACAMembershipSource and _is_initial_batch(physical),
         ),
         approved_source.approved_revision,
         *coordinates.sql_parameters,
@@ -905,14 +967,26 @@ def _validate_aca_page(connection, source_pin, approved_source, binding_coordina
 
 
 async def _read_aca_batch(
-    connection, source_pin, registry_schema, approved_source, binding_coordinates, approved_only, page_options
+    connection,
+    source_pin,
+    registry_schema,
+    approved_source,
+    binding_coordinates,
+    approved_only,
+    page_options,
+    verified_source=None,
 ):
     after_evidence_checksum, limit, _, _ = page_options
     descriptor = _validate_aca_page(
         connection, source_pin, approved_source, binding_coordinates, approved_only, page_options
     )
     registry_namespace = _identifier(registry_schema)
-    await _require_archive(connection, source_pin)
+    if verified_source is None:
+        await _require_archive(connection, source_pin)
+    else:
+        from process.registry_aca_source_recipe import require_registry_aca_batch_read
+
+        await require_registry_aca_batch_read(connection, source_pin, verified_source)
     if descriptor is not None:
         batch = await _read_reviewed(
             connection,
@@ -930,8 +1004,11 @@ async def _read_aca_batch(
     input_bytes = batch["input_json"].encode()
     if len(input_bytes) > MAX_INPUT_BYTES:
         raise LegacyMembershipBatchBoundsError("ACA membership batch exceeds bounds")
-    return _aca_batch_from_row(
-        source_pin, batch, approved_source, binding_coordinates, approved_only, page_options, input_bytes
+    return replace(
+        _aca_batch_from_row(
+            source_pin, batch, approved_source, binding_coordinates, approved_only, page_options, input_bytes
+        ),
+        verified_source=verified_source,
     )
 
 

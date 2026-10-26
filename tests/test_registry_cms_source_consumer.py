@@ -32,6 +32,7 @@ def _config():
         ("reader_roles", ("reader", "reader")),
         ("execution_role", "role;bad"),
         ("coordinates", {}),
+        ("prepare_address_sources", {}),
     ],
 )
 def test_consumer_configuration_is_closed(field, value):
@@ -61,6 +62,52 @@ from process import registry_cms_source_consumer as consumer
 from process.network_address_projection import PinnedAddressSource
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe, canonical_registry_source_recipes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.parametrize("outcome", ["complete", "refused", "cancel"])
+async def test_source_attempt_commits_independent_address_preparation_before_composition(monkeypatch, initial, outcome):
+    import asyncio
+
+    notice, attempt = _notice(), UUID(int=9)
+    pin = None if initial else SimpleNamespace(generation_id=7)
+    observed, events = {}, []
+
+    async def prepare(**options):
+        events.append("prepare")
+        observed.update(options)
+        assert options["request_id"] == attempt and options["approved_revision"] == 4
+        assert options["source_manifest"] is pin and options["expected_head"] == (0 if initial else 7)
+        sources = options["address_sources"]
+        assert sources.base_source == notice.pair.address_source
+        assert sources.introduced_source_recipes == (notice.pair.recipe,)
+        if outcome != "complete":
+            raise asyncio.CancelledError if outcome == "cancel" else ValueError("address_refused")
+        return sources
+
+    async def compose(_connection, **options):
+        events.append("compose")
+        assert options["address_sources"] is observed["address_sources"]
+        assert options["source_manifest"] is pin and options["request_id"] == attempt
+        return "target", "addresses"
+
+    composed = AsyncMock(side_effect=compose)
+    ready = AsyncMock()
+    monkeypatch.setattr(consumer, "compose_registry_membership_candidate", composed)
+    monkeypatch.setattr(consumer, "prepare_network_candidate", ready)
+    config = replace(_config(), prepare_address_sources=prepare)
+    operation = consumer._prepare_source_candidate(object(), notice, config, attempt, 4, pin, (notice.pair.recipe,))
+    if outcome == "complete":
+        assert await operation == "target"
+        assert events == ["prepare", "compose"]
+        ready.assert_awaited_once()
+    else:
+        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else ValueError):
+            await operation
+        assert events == ["prepare"]
+        composed.assert_not_awaited()
+        ready.assert_not_awaited()
 
 
 def _recipe(dataset, edition, *, endpoint="endpoint-one", producer="producer"):
