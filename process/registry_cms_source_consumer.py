@@ -67,9 +67,14 @@ class RegistryCMSSourceConsumerConfig:
     operation_seconds: int = 300
     composition_runtime: RegistryPublicationPTGRuntime | None = field(default=None, repr=False)
     seal_candidate: Callable[[MembershipCopyTarget], Awaitable[None]] | None = field(default=None, repr=False)
+    prepare_address_sources: Callable[..., Awaitable[RegistryCompositionAddressSources]] | None = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self):
         if self.seal_candidate is not None and not callable(self.seal_candidate):
+            raise _invalid()
+        if self.prepare_address_sources is not None and not callable(self.prepare_address_sources):
             raise _invalid()
         if self.composition_runtime is not None and type(self.composition_runtime) is not RegistryPublicationPTGRuntime:
             raise _invalid()
@@ -325,6 +330,18 @@ async def _seal_source_checkpoint(connection, copy_target, checkpoint, config, r
 
 async def _prepare_source_candidate(connection, notice, config, attempt_id, revision, pin, recipes):
     """Compose and commit READY using the current dynamically selected composer."""
+    address_sources = RegistryCompositionAddressSources(
+        notice.pair.address_source,
+        **{("initial_source_recipes" if pin is None else "replacement_source_recipes"): recipes},
+    )
+    if config.prepare_address_sources is not None:
+        address_sources = await config.prepare_address_sources(
+            request_id=attempt_id,
+            approved_revision=revision,
+            source_manifest=pin,
+            expected_head=0 if pin is None else pin.generation_id,
+            address_sources=address_sources,
+        )
     compose = (
         compose_registry_membership_candidate
         if config.composition_runtime is None
@@ -336,10 +353,7 @@ async def _prepare_source_candidate(connection, notice, config, attempt_id, revi
         approved_revision=revision,
         expected_head=0 if pin is None else pin.generation_id,
         source_manifest=pin,
-        address_sources=RegistryCompositionAddressSources(
-            notice.pair.address_source,
-            **{("initial_source_recipes" if pin is None else "replacement_source_recipes"): recipes},
-        ),
+        address_sources=address_sources,
         writer_roles=config.writer_roles,
         control_schema=config.control_schema,
     )

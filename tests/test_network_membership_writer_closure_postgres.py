@@ -437,6 +437,42 @@ async def test_database_create_needed_only_for_transfer(writer_db):
     assert await _freeze(fixture) == receipt
 
 
+async def test_already_owned_candidate_closes_without_database_create(writer_db):
+    """Close real existing Owner objects without issuing any ownership transfer."""
+    fixture = writer_db
+    namespace = f'"{fixture.copy_target.schema_name}"'
+    owner = f'"{fixture.roles["owner"]}"'
+    await fixture.connection.execute(f"ALTER SCHEMA {namespace} OWNER TO {owner}")
+    for table in ("network_membership", "provider_location_binding"):
+        await fixture.connection.execute(f"ALTER TABLE {namespace}.{table} OWNER TO {owner}")
+    await fixture.connection.execute(f"GRANT ALL ON SCHEMA {namespace} TO PUBLIC")
+    await fixture.connection.execute(f"GRANT ALL ON {namespace}.network_membership TO PUBLIC")
+    await fixture.connection.execute(
+        f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {namespace} "
+        f'GRANT ALL ON TABLES TO "{fixture.roles["outsider"]}"'
+    )
+    database = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
+    await fixture.connection.execute(
+        f'REVOKE CREATE ON DATABASE {database} FROM {owner},"{fixture.roles["publisher"]}"'
+    )
+    receipt = await _freeze(fixture)
+    assert await _verify(fixture) == receipt
+    await fixture.observer.execute(f'SET ROLE "{fixture.roles["reader"]}"')
+    await _assert_closed_writes(fixture, fixture.observer)
+
+
+async def test_mixed_owner_candidate_still_requires_database_create(writer_db):
+    """An Owner schema cannot hide a real heap ownership transfer."""
+    fixture = writer_db
+    await fixture.connection.execute(
+        f'ALTER SCHEMA "{fixture.copy_target.schema_name}" OWNER TO "{fixture.roles["owner"]}"'
+    )
+    database = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
+    await fixture.connection.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{fixture.roles["owner"]}"')
+    with pytest.raises(NetworkWriterClosureError, match="database CREATE"):
+        await _freeze(fixture)
+
+
 @pytest.mark.parametrize("tamper", ["extra_key", "revision_type", "oid_type"])
 async def test_retained_proof_shape_is_exact(writer_db, tamper):
     fixture = writer_db

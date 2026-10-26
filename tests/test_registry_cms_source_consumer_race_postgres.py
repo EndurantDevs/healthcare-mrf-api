@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import uuid4, uuid5
 
 import asyncpg
 import pytest
@@ -69,21 +69,36 @@ class _CheckpointBarrier:
 
 
 async def _competing_publication(fixture, pair, incumbent, revision):
-    target, addresses = await compose_registry_membership_candidate(
-        fixture.execution_connection,
-        request_id=uuid4(),
+    from process.network_approved_membership_source import pin_approved_membership_source
+
+    request_id = uuid4()
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        approved = await pin_approved_membership_source(
+            fixture.connection, approved_revision=revision, control_schema=fixture.control_schema
+        )
+    fixture.composition_ids.append(uuid5(request_id, "address:" + approved.generation_id))
+    address_sources = await fixture.prepare_address_sources(
+        request_id=request_id,
         approved_revision=revision,
         expected_head=incumbent.generation_id,
         source_manifest=incumbent,
         address_sources=RegistryCompositionAddressSources(
             pair.address_source, replacement_source_recipes=(pair.recipe,)
         ),
+    )
+    copy_target, addresses = await compose_registry_membership_candidate(
+        fixture.execution_connection,
+        request_id=request_id,
+        approved_revision=revision,
+        expected_head=incumbent.generation_id,
+        source_manifest=incumbent,
+        address_sources=address_sources,
         writer_roles={**fixture.writer_roles, "reader_roles": pair.runtime_roles},
         control_schema=fixture.control_schema,
     )
     return await prepare_and_publish_network_candidate(
         fixture.execution_connection,
-        target,
+        copy_target,
         addresses,
         **{**fixture.writer_roles, "reader_roles": pair.runtime_roles},
         control_schema=fixture.control_schema,
@@ -109,9 +124,8 @@ async def _run_competitor(database, fixture, pair, incumbent, manual, barrier, a
     other = None
     try:
         await asyncio.wait_for(barrier.arrived.wait(), 30)
-        other = await asyncpg.connect(
-            database.engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
-        )
+        url = database.engine.url if barrier.phase == "serialization" else fixture.execution_url
+        other = await asyncpg.connect(url.set(drivername="postgresql").render_as_string(hide_password=False))
         await consumer._canonical_session(other)
         competitor = SimpleNamespace(**{**vars(fixture), "connection": other, "execution_connection": other})
         if barrier.phase == "serialization":

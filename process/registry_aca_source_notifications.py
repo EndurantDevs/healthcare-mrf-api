@@ -18,15 +18,17 @@ from process.registry_aca_global_epoch import (
     require_registry_aca_global_epoch,
 )
 from process.registry_aca_source_notification_permissions import _RUNTIME_SQL
-from process.registry_aca_source_recipe import require_registry_aca_source_recipe
+from process.registry_aca_source_recipe import require_registry_aca_source_batch, require_registry_aca_source_recipe
 from process.registry_cms_source_notifications import _PRIVILEGES_SQL as _CMS_ACL_SQL
 from process.registry_source_recipe_store import (
+    MAX_SOURCE_RECIPES,
     RegistrySourceMembershipRecipe,
     canonical_registry_source_recipes,
     decode_registry_source_recipes,
 )
 
 EPOCH_CONTRACT = "registry-aca-source-notification/v2"
+BATCH_CONTRACT = "registry-aca-source-notification/v3"
 
 _ACL_SQL = _CMS_ACL_SQL.replace("registry_cms_source_notification", TABLE)
 _IDENTITY_SQL = """SELECT n.oid::bigint AS schema_oid,n.nspowner::bigint AS owner_oid,o.*,
@@ -70,6 +72,9 @@ def validate_registry_aca_source_event(event):
 
 
 def _subject_payload(subject):
+    if type(subject) is tuple:
+        _subject_pin(subject)
+        return "recipes_json", canonical_registry_source_recipes(subject)
     if type(subject) is PinnedACAGlobalEpoch:
         return "epoch_json", _json(subject.as_dict())
     if type(subject) is not RegistrySourceMembershipRecipe or type(subject.source_pin) is not PinnedACAMembershipSource:
@@ -78,6 +83,20 @@ def _subject_payload(subject):
 
 
 def _subject_pin(subject):
+    if type(subject) is tuple:
+        if not 1 <= len(subject) <= MAX_SOURCE_RECIPES or any(
+            type(recipe) is not RegistrySourceMembershipRecipe
+            or type(recipe.source_pin) is not PinnedACAMembershipSource
+            for recipe in subject
+        ):
+            _invalid()
+        pin = subject[0].source_pin
+        if "registry_aca_initial_batch" not in pin.prepared.manifest.source_metadata or any(
+            recipe.source_pin.prepared != pin.prepared or recipe.source_pin.runtime_roles != pin.runtime_roles
+            for recipe in subject
+        ):
+            _invalid()
+        return pin
     if type(subject) is PinnedACAGlobalEpoch:
         return subject
     if type(subject) is not RegistrySourceMembershipRecipe or type(subject.source_pin) is not PinnedACAMembershipSource:
@@ -87,6 +106,11 @@ def _subject_pin(subject):
 
 async def _require_subject(session, subject):
     pin = _subject_pin(subject)
+    if type(subject) is tuple:
+        actual = await require_registry_aca_source_batch(session, pin.prepared, runtime_roles=pin.runtime_roles)
+        if canonical_registry_source_recipes(actual) != canonical_registry_source_recipes(subject):
+            _invalid()
+        return actual
     verifier = (
         require_registry_aca_global_epoch
         if type(subject) is PinnedACAGlobalEpoch
@@ -106,6 +130,8 @@ def _decode(encoded, digest):
         _invalid()
     if document.get("contract") == EPOCH_CONTRACT:
         payload_key = "epoch_json"
+    elif document.get("contract") == BATCH_CONTRACT:
+        payload_key = "recipes_json"
     elif document.get("contract") == CONTRACT:
         payload_key = "recipe_json"
     else:
@@ -118,9 +144,12 @@ def _decode(encoded, digest):
         subject = decode_pinned_aca_global_epoch(document[payload_key])
     else:
         recipes = decode_registry_source_recipes(document[payload_key])
-        if len(recipes) != 1 or type(recipes[0].source_pin) is not PinnedACAMembershipSource:
+        if payload_key == "recipes_json":
+            subject = recipes
+        elif len(recipes) != 1 or type(recipes[0].source_pin) is not PinnedACAMembershipSource:
             _invalid()
-        subject = recipes[0]
+        else:
+            subject = recipes[0]
     if document["capture_id"] != str(_subject_pin(subject).prepared.ownership.dataset_id) or _subject_payload(
         subject
     ) != (payload_key, document[payload_key]):
@@ -209,26 +238,32 @@ class RegistryACASourceNotificationStore:
         """Persist accepted evidence and its indefinite hold in the clone's original transaction."""
         connection = await native_driver(session)
         await self.qualify(connection, writing=True)
-        await _require_subject(session, recipe)
+        recipe = await _require_subject(session, recipe)
         pin = _subject_pin(recipe)
         existing = await self._row(connection, pin.prepared.ownership.dataset_id)
         if existing is not None:
             return await self._checked(session, existing, expected=recipe)
         payload_key, payload_json = _subject_payload(recipe)
         notification_map = {
-            "contract": EPOCH_CONTRACT if type(recipe) is PinnedACAGlobalEpoch else CONTRACT,
+            "contract": (
+                BATCH_CONTRACT
+                if type(recipe) is tuple
+                else EPOCH_CONTRACT
+                if type(recipe) is PinnedACAGlobalEpoch
+                else CONTRACT
+            ),
             "capture_id": str(pin.prepared.ownership.dataset_id),
             payload_key: payload_json,
             "publication_xid": await connection.fetchval("SELECT pg_current_xact_id()::text"),
             "producer_role": self.publisher_role,
         }
-        values = _values(notification_map, recipe)
+        notification_values = _values(notification_map, recipe)
         await connection.execute(
             f"INSERT INTO {_identifier(self.control_schema)}.{TABLE} ({','.join(INSERT_COLUMNS)}) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(capture_id) DO NOTHING",
-            *values,
+            *notification_values,
         )
-        stored = await self._row(connection, values[0])
-        if stored is None or tuple(stored[field] for field in INSERT_COLUMNS) != values:
+        stored = await self._row(connection, notification_values[0])
+        if stored is None or tuple(stored[field] for field in INSERT_COLUMNS) != notification_values:
             _invalid()
         return await self._checked(session, stored, expected=recipe)
 
@@ -256,7 +291,11 @@ class RegistryACASourceNotificationStore:
                     "notification_sha256": row["notification_sha256"],
                 }
             ),
-            "epoch" if type(recipe) is PinnedACAGlobalEpoch else "recipe": recipe,
+            "recipes"
+            if type(recipe) is tuple
+            else "epoch"
+            if type(recipe) is PinnedACAGlobalEpoch
+            else "recipe": recipe,
         }
 
     async def read(self, session, event, *, holding=False):
@@ -293,7 +332,9 @@ class RegistryACASourceNotificationStore:
         if row is None:
             _invalid()
         result = await self._checked(session, row)
-        subject = result["epoch"] if "epoch" in result else result["recipe"]
+        subject = (
+            result["recipes"] if "recipes" in result else result["epoch"] if "epoch" in result else result["recipe"]
+        )
         if _subject_pin(subject).prepared != prepared:
             _invalid()
         return result

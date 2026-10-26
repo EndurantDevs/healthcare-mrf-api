@@ -6,8 +6,9 @@ import json
 import os
 import re
 import sys
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from uuid import UUID
 
 import asyncpg
@@ -226,7 +227,123 @@ def parse_registry_publication_worker_config(encoded):
         _invalid()
 
 
-def _pool_options(url, maximum, sql_limits=None):
+_BACKEND_IDENTITY_FIELDS = (
+    "database_name",
+    "database_oid",
+    "server_address",
+    "server_port",
+    "server_started",
+    "control_oid",
+    "inbox_oid",
+)
+
+
+async def _backend_observation(connection, schema, roles):
+    """Read the actual backend and native identity without assuming another role."""
+    from process.registry_cms_source_worker import _IDENTITY_SQL
+
+    if connection.is_in_transaction():
+        raise ValueError("registry_publication_worker_backend_invalid")
+    identity_sql = (
+        "SELECT native.*,pg_catalog.clock_timestamp() AS observed_at,backend.pid,backend.backend_start,"
+        "backend.backend_type,backend.datid::bigint,backend.usesysid::bigint,"
+        "pg_catalog.current_setting('role') AS assumed_role,"
+        "(SELECT pg_catalog.jsonb_object_agg(rolname,oid::bigint) FROM pg_catalog.pg_roles "
+        "WHERE rolname=ANY($3::text[]))::text AS role_oids "
+        "FROM (" + _IDENTITY_SQL + ") native JOIN pg_catalog.pg_stat_activity backend "
+        "ON backend.pid=pg_catalog.pg_backend_pid()"
+    )
+    observed = await connection.fetchrow(identity_sql, schema, schema, roles)
+    if observed is None:
+        raise ValueError("registry_publication_worker_backend_invalid")
+    return dict(observed)
+
+
+def _backend_actor(connection, observed, role, roles):
+    """Require the protocol backend to belong to the configured direct login."""
+    role_oids = json.loads(observed["role_oids"] or "{}")
+    if (
+        set(role_oids) != set(roles)
+        or any(type(oid) is not int or oid <= 0 for oid in role_oids.values())
+        or observed["safe_login"] is not True
+        or observed["current_role"] != role
+        or observed["session_role"] != role
+        or observed["assumed_role"] != "none"
+        or observed["backend_type"] != "client backend"
+        or observed["pid"] != connection.get_server_pid()
+        or observed["datid"] != observed["database_oid"]
+        or observed["usesysid"] != role_oids.get(role)
+        or observed["control_oid"] is None
+        or any(not isinstance(observed[name], datetime) for name in ("observed_at", "backend_start"))
+        or observed["backend_start"] > observed["observed_at"]
+    ):
+        raise ValueError("registry_publication_worker_backend_invalid")
+    return tuple(sorted(role_oids.items()))
+
+
+@dataclass(frozen=True, repr=False)
+class _FreshBackendQualification:
+    schema: str
+    not_before: datetime
+    identity: tuple
+    role_oids: tuple
+
+    def verifier(self, role):
+        """Bind one actor to every new connection and checkout, including reconnects."""
+        if role not in dict(self.role_oids):
+            raise ValueError("registry_publication_worker_backend_invalid")
+
+        async def verify(connection):
+            """Reject a stale physical backend or any change in its authenticated origin."""
+            observed = await _backend_observation(connection, self.schema, tuple(dict(self.role_oids)))
+            actual_oids = _backend_actor(connection, observed, role, tuple(dict(self.role_oids)))
+            if (
+                actual_oids != self.role_oids
+                or tuple(observed[name] for name in _BACKEND_IDENTITY_FIELDS) != self.identity
+                or observed["backend_start"] < self.not_before
+            ):
+                raise ValueError("registry_publication_worker_backend_invalid")
+
+        return verify
+
+
+async def _qualify_fresh_backends(connection, *, schema, observer_role, execution_roles):
+    """Anchor provisioned roles to server time before opening their physical backends."""
+    roles = tuple(sorted({observer_role, *execution_roles}))
+    observed = await _backend_observation(connection, schema, roles)
+    role_oids = _backend_actor(connection, observed, observer_role, roles)
+    return _FreshBackendQualification(
+        schema, observed["observed_at"], tuple(observed[name] for name in _BACKEND_IDENTITY_FIELDS), role_oids
+    )
+
+
+async def _worker_backend_qualification(config, connection, observer_role):
+    """Qualify execution and custody from the worker's existing independent observer."""
+    execution_roles = (config.consumer.execution_role,)
+    if config.custody_url is not None:
+        execution_roles += (config.custody_url.username,)
+    return await _qualify_fresh_backends(
+        connection, schema=config.consumer.control_schema, observer_role=observer_role, execution_roles=execution_roles
+    )
+
+
+def _connection_verifier(sql_limits, backend_verifier):
+    if backend_verifier is None:
+        return sql_limits.verify if sql_limits is not None else None
+
+    async def verify(connection):
+        """Keep finite SQL limits and backend qualification on the same connection."""
+        try:
+            if sql_limits is not None:
+                await sql_limits.verify(connection)
+            await backend_verifier(connection)
+        except ValueError:
+            raise RuntimeError("registry_publication_consumer_unavailable") from None
+
+    return verify
+
+
+def _pool_options(url, maximum, sql_limits=None, *, backend_verifier=None):
     options_by_name = dict(
         host=url.host,
         port=url.port or 5432,
@@ -243,8 +360,10 @@ def _pool_options(url, maximum, sql_limits=None):
             command_timeout=sql_limits.statement_timeout_ms / 1000 + sql_limits.connect_timeout_seconds,
             server_settings=sql_limits.server_settings(),
         )
-        if maximum == 1:
-            options_by_name["setup"] = sql_limits.verify
+    verifier = _connection_verifier(sql_limits if maximum == 1 else None, backend_verifier)
+    if verifier is not None:
+        options_by_name["init"] = verifier
+        options_by_name["setup"] = verifier
     return options_by_name
 
 
@@ -285,13 +404,12 @@ def _summary(result_by_name):
     return {"request_id": identity, "state": "completed"}
 
 
-def _ptg_runtime(config, stack):
-    if config.ptg is None:
-        return config.consumer
+def _bounded_sessions(config, stack, url, *, backend_verifier=None):
+    """Own one qualified genuine session factory for the selected existing login."""
     engine = create_async_engine(
-        config.execution_url,
+        url,
         connect_args={
-            "password": config.execution_url.password or "",
+            "password": url.password or "",
             "timeout": config.sql_limits.connect_timeout_seconds,
             "command_timeout": config.sql_limits.statement_timeout_ms / 1000
             + config.sql_limits.connect_timeout_seconds,
@@ -306,10 +424,16 @@ def _ptg_runtime(config, stack):
 
     def verify_checkout(connection, _record, _proxy):
         """Inspect the actual adapted asyncpg backend on every genuine checkout."""
-        connection.run_async(config.sql_limits.verify)
+        connection.run_async(_connection_verifier(config.sql_limits, backend_verifier))
 
     event.listen(engine.sync_engine, "checkout", verify_checkout)
-    sessions = async_sessionmaker(engine, class_=AsyncSession)
+    return async_sessionmaker(engine, class_=AsyncSession)
+
+
+def _ptg_runtime(config, stack, *, backend_verifier=None):
+    if config.ptg is None:
+        return config.consumer
+    sessions = _bounded_sessions(config, stack, config.execution_url, backend_verifier=backend_verifier)
     runtime = RegistryPublicationPTGRuntime(sessions, config.ptg.store, config.ptg.read_budget, config.sql_limits)
     return replace(config.consumer, composition_runtime=runtime)
 
@@ -449,7 +573,71 @@ async def _custody_identity(connection, schema, role):
     return identity_by_name
 
 
-async def _custody_runtime(config, stack, consumer, execution_connection):
+@asynccontextmanager
+async def _address_preparation_snapshot(pool, sessions, consumer):
+    """Keep PTG's genuine approval fence on the independent preparation backend."""
+    if sessions is None:
+        async with pool.acquire() as custodian, custodian.transaction(isolation="repeatable_read"):
+            yield custodian, None
+        return
+    from process.registry_company_approval_fence import (
+        registry_company_approval_transaction,
+        require_registry_company_approval_fence,
+    )
+
+    async with registry_company_approval_transaction(sessions, control_schema=consumer.control_schema) as session:
+        await require_registry_company_approval_fence(session, consumer.control_schema)
+        custodian = (await (await session.connection()).get_raw_connection()).driver_connection
+        runtime = consumer.composition_runtime
+        yield custodian, (session, runtime.store, runtime.read_budget)
+
+
+def _address_preparer(config, consumer, pool, identity, role, *, sessions=None):
+    """Use only the existing independent custodian before execution opens its snapshot."""
+    from process.network_candidate_custody import _final_roles, _q_reach_closed
+    from process.registry_candidate_composition import (
+        RegistryAddressArtifactCustody,
+        prepare_registry_composition_address_artifact,
+    )
+
+    async def prepare(*, request_id, approved_revision, source_manifest, expected_head, address_sources):
+        """Return only a committed independently sealed artifact or the verified retained-only inputs."""
+        runtime_roles = _custody_runtime_roles(config, identity, consumer)
+        _final_roles(identity["custody_owner_role"], runtime_roles)
+        schema = consumer.control_schema
+        async with _address_preparation_snapshot(pool, sessions, consumer) as (custodian, office_authority):
+            if await _custody_identity(custodian, schema, role) != identity:
+                raise ValueError("registry_candidate_custody_connection_invalid")
+            await _q_reach_closed(custodian, identity, runtime_roles)
+            for input_pin in (address_sources.base_source, address_sources.npi_source):
+                if input_pin is not None and not await custodian.fetchval(
+                    "SELECT has_schema_privilege($1::name,to_regnamespace($2)::oid,'USAGE') "
+                    "AND has_table_privilege($1::name,to_regclass($3)::oid,'SELECT')",
+                    consumer.execution_role,
+                    input_pin.schema_name,
+                    f"{_identifier(input_pin.schema_name)}.{_identifier(input_pin.table_name)}",
+                ):
+                    raise ValueError("registry_composition_execution_input_reader_unavailable")
+            artifact = await prepare_registry_composition_address_artifact(
+                custodian,
+                request_id=UUID(str(request_id)),
+                approved_revision=approved_revision,
+                address_sources=address_sources,
+                source_manifest=source_manifest,
+                expected_head=expected_head,
+                custody=RegistryAddressArtifactCustody(identity["custody_owner_role"], runtime_roles, schema),
+                office_authority=office_authority,
+            )
+            if await _custody_identity(custodian, schema, role) != identity:
+                raise ValueError("registry_candidate_custody_connection_invalid")
+            await _q_reach_closed(custodian, identity, runtime_roles)
+        return address_sources if artifact is None else replace(address_sources, prepared_address_artifact=artifact)
+
+    return prepare
+
+
+async def _custody_runtime(config, stack, consumer, execution_connection, *, backend_verifier=None):
+    """Install only the qualified independent preparation and sealing callbacks."""
     if config.custody_url is None:
         return consumer
     from process.network_candidate_custody import (
@@ -462,7 +650,9 @@ async def _custody_runtime(config, stack, consumer, execution_connection):
     schema = consumer.control_schema
     identity = await _custody_identity(execution_connection, schema, consumer.execution_role)
     await _q_reach_closed(execution_connection, identity, _custody_runtime_roles(config, identity, consumer))
-    pool = await asyncpg.create_pool(**_pool_options(config.custody_url, 1, config.sql_limits))
+    pool = await asyncpg.create_pool(
+        **_pool_options(config.custody_url, 1, config.sql_limits, backend_verifier=backend_verifier)
+    )
     stack.push_async_callback(_close_pool, pool)
     pool = _BoundedPool(pool, config.sql_limits.connect_timeout_seconds)
     role = config.custody_url.username
@@ -495,7 +685,46 @@ async def _custody_runtime(config, stack, consumer, execution_connection):
             if verified != sealed:
                 raise ValueError("registry_candidate_custody_connection_invalid")
 
+    return _with_address_preparation(config, stack, consumer, pool, identity, seal_candidate, backend_verifier)
+
+
+def _with_address_preparation(config, stack, consumer, pool, identity, seal_candidate, backend_verifier):
+    """Keep supported source consumers on the same committed preparation route."""
+    from process.registry_cms_source_consumer import RegistryCMSSourceConsumerConfig
+    from process.registry_ptg_source_consumer import RegistryPTGSourceConsumerConfig
+
+    if type(consumer) in {
+        RegistryPublicationConsumerConfig,
+        RegistryCMSSourceConsumerConfig,
+        RegistryPTGSourceConsumerConfig,
+    }:
+        sessions = (
+            _bounded_sessions(config, stack, config.custody_url, backend_verifier=backend_verifier)
+            if consumer.composition_runtime is not None
+            else None
+        )
+        return replace(
+            consumer,
+            seal_candidate=seal_candidate,
+            prepare_address_sources=_address_preparer(
+                config, consumer, pool, identity, config.custody_url.username, sessions=sessions
+            ),
+        )
     return replace(consumer, seal_candidate=seal_candidate)
+
+
+async def _qualified_worker_runtime(config, stack, qualification, connection):
+    """Apply one observer proof to both execution factories and the custody pool."""
+    consumer = _ptg_runtime(config, stack, backend_verifier=qualification.verifier(config.consumer.execution_role))
+    return await _custody_runtime(
+        config,
+        stack,
+        consumer,
+        connection,
+        backend_verifier=qualification.verifier(config.custody_url.username)
+        if config.custody_url is not None
+        else None,
+    )
 
 
 async def run_registry_publication_worker(config):
@@ -511,13 +740,17 @@ async def run_registry_publication_worker(config):
             await stack.enter_async_context(plan_metadata_client)
         lifecycle = await asyncpg.create_pool(**_pool_options(config.lifecycle_url, 2, config.sql_limits))
         stack.push_async_callback(_close_pool, lifecycle)
-        execution = await asyncpg.create_pool(**_pool_options(config.execution_url, 1, config.sql_limits))
-        stack.push_async_callback(_close_pool, execution)
         lifecycle = _BoundedPool(lifecycle, config.sql_limits.connect_timeout_seconds)
+        async with lifecycle.acquire() as connection:
+            qualification = await _worker_backend_qualification(config, connection, config.consumer.lifecycle_role)
+        execution_verifier = qualification.verifier(config.consumer.execution_role)
+        execution = await asyncpg.create_pool(
+            **_pool_options(config.execution_url, 1, config.sql_limits, backend_verifier=execution_verifier)
+        )
+        stack.push_async_callback(_close_pool, execution)
         execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
-        consumer = _ptg_runtime(config, stack)
         async with execution.acquire() as connection:
-            consumer = await _custody_runtime(config, stack, consumer, connection)
+            consumer = await _qualified_worker_runtime(config, stack, qualification, connection)
             if consumer.composition_runtime is not None:
                 await consumer.composition_runtime.qualify()
         async with asyncio.timeout(config.operation_seconds):

@@ -150,6 +150,8 @@ def test_provider_network_binding_openapi_contract():
     assert binding["additionalProperties"] is False
     assert set(binding["required"]) == network._BINDING_FIELDS
     assert binding["properties"]["network_ids"]["maxItems"] == 50
+    assert binding["properties"]["legacy_checksums"]["maxItems"] == 50
+    assert "legacy_checksums" not in binding["required"]
     for name in ("CustomImportProviderRequest", "CustomImportProviderBatchRequest"):
         assert schemas[name]["properties"]["network_binding"] == {
             "$ref": "#/components/schemas/CustomImportProviderNetworkBinding"
@@ -368,3 +370,92 @@ async def test_canonical_batch_membership_precedes_import_order_and_page_without
         (requested_npis[1], 404),
     ]
     assert current_network_address_scope() is None
+
+
+def test_signed_legacy_subset_changes_authority_identity_without_changing_canonical_ids():
+    """The complete signed binding includes the original checksum namespace."""
+    document = _bound_document()
+    canonical = network.parse_provider_network_binding(document)
+    document["network_binding"]["legacy_checksums"] = [-17, 42]
+    legacy = network.parse_provider_network_binding(document)
+    assert legacy.legacy_checksums == (-17, 42)
+    assert legacy.network_ids == canonical.network_ids
+    assert legacy.access_scope_sha256 != canonical.access_scope_sha256
+
+
+@pytest.mark.parametrize(
+    "checksums", [None, [], (), [True], ["42"], [42, 42], [42, -17], [-2147483649], [2147483648], list(range(51))]
+)
+def test_signed_legacy_subset_rejects_untyped_or_noncanonical_values(checksums):
+    """Presence never falls back to the wider canonical-only contract."""
+    document = _bound_document()
+    document["network_binding"]["legacy_checksums"] = checksums
+    with pytest.raises(CustomImportReadRequestError, match="binding"):
+        network.parse_provider_network_binding(document)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("checksums", [(-2147483648, 0, 2147483647), (-17,), (42,)])
+async def test_signed_legacy_subset_is_resolved_pinned_enforced_and_acknowledged(monkeypatch, checksums):
+    """The acknowledgement comes from the enforced context after actual mapping."""
+    session = _ScopedSession()
+    page_fixtures._install(monkeypatch, session, page_rows=[{"npi": 1104212877}])
+    session.driver = SimpleNamespace(fetchrow=AsyncMock(return_value={"complete": True, "network_ids": [42, 88]}))
+    _install_manifest(monkeypatch, session)
+    original_reader = providers._read_provider_payload
+
+    async def read(*arguments):
+        _assert_scope()
+        scope = current_network_address_scope()
+        assert scope.legacy_checksums == checksums
+        assert "plans_network_array" in str(scope.address_relation)
+        assert "canonical_network_ids &&" not in str(scope.address_relation)
+        return await original_reader(*arguments)
+
+    monkeypatch.setattr(providers, "_read_provider_payload", read)
+    document = _bound_document()
+    document["network_binding"]["legacy_checksums"] = list(checksums)
+    reply = await providers.serve_custom_import_providers(page_fixtures._request(_body(document)), session)
+    assert reply.status == 200
+    assert reply.headers["X-Network-Legacy-Checksums"] == ",".join(map(str, checksums))
+    assert session.driver.fetchrow.await_args.args[1:] == (0, tuple(map(str, checksums)), "checksum_network", ())
+    assert current_network_address_scope() is None
+    assert "X-Network-Legacy-Checksums" not in network.provider_network_response({}, _MANIFEST).headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        None,
+        {"complete": False, "network_ids": [42, 88]},
+        {"complete": True, "network_ids": [42]},
+        {"complete": True, "network_ids": [88, 42]},
+    ],
+)
+async def test_signed_legacy_subset_refuses_missing_or_different_pinned_mapping(monkeypatch, mapping):
+    """Never prepare, read or acknowledge a partially resolved legacy subset."""
+    session = _ScopedSession()
+    page_fixtures._install(monkeypatch, session)
+    session.driver = SimpleNamespace(fetchrow=AsyncMock(return_value=mapping))
+    _install_manifest(monkeypatch, session)
+    document = _bound_document()
+    document["network_binding"]["legacy_checksums"] = [42]
+    reply = await providers.serve_custom_import_providers(page_fixtures._request(_body(document)), session)
+    assert reply.status == 503 and "prepare" not in session.events
+    assert "X-Network-Legacy-Checksums" not in reply.headers
+    assert current_network_address_scope() is None and session.rolled_back
+
+
+@pytest.mark.asyncio
+async def test_changing_signed_checksum_subset_fails_before_database_access(monkeypatch):
+    """A correct unsigned-body hash cannot replace the full transport signature."""
+    session = _ScopedSession()
+    page_fixtures._install(monkeypatch, session)
+    document = _bound_document()
+    document["network_binding"]["legacy_checksums"] = [42]
+    request = page_fixtures._request(_body(document))
+    document["network_binding"]["legacy_checksums"] = [-17]
+    request.body = _body(document)
+    reply = await providers.serve_custom_import_providers(request, session)
+    assert reply.status == 404 and session.events == []

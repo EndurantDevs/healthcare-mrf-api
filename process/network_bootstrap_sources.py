@@ -22,7 +22,12 @@ from db.models import EntityAddressUnified, NPIData
 from process.entity_address_result_generation import validate_entity_address_result_generation_authority
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_cms_registry_address_equivalence import _declared_type
-from process.network_custom_address_source import NetworkCustomAddressSourceError, _closed, _digest, _source_identity
+from process.network_custom_address_source import (
+    NetworkCustomAddressSourceError,
+    _closed,
+    _digest,
+    _source_identity_with_read_roles,
+)
 from process.network_membership_writer_closure import NetworkWriterClosureError, _check_roles, _transfer_and_grant
 from process.npi_result_generation import validate_npi_result_generation_authority
 
@@ -323,6 +328,8 @@ def _decode(document):
 
 async def _verify_capture(connection, receipt, *, verify_content):
     """Check native custody; fresh uncommitted copies already proved content parity."""
+    from process.network_bootstrap_read_access import bootstrap_read_roles
+
     await _transaction(connection)
     if type(receipt) is not NetworkBootstrapSourceReceipt:
         raise NetworkBootstrapSourceError("An immutable bootstrap receipt is required")
@@ -349,11 +356,12 @@ async def _verify_capture(connection, receipt, *, verify_content):
     ):
         raise NetworkBootstrapSourceError("Retained native bootstrap identities differ")
     try:
-        await _closed(connection, receipt.schema_oid, receipt.owner_oid, receipt.runtime_roles, None)
+        read_roles = await bootstrap_read_roles(connection, receipt)
+        await _closed(connection, receipt.schema_oid, receipt.owner_oid, read_roles, None)
         for parent in receipt.parent_receipts:
             pin = receipt.address_source if parent.table_name == "entity_address_unified" else receipt.npi_source
-            identity = await _source_identity(
-                connection, pin, receipt.runtime_roles, address=parent.table_name == "entity_address_unified"
+            identity = await _source_identity_with_read_roles(
+                connection, pin, read_roles, address=parent.table_name == "entity_address_unified"
             )
             if identity[3] != parent.shape_sha256 or (
                 verify_content
@@ -500,9 +508,12 @@ async def _persist_capture(connection, receipt):
     publisher = await connection.fetchval("SELECT quote_ident(current_user)")
     quoted = await connection.fetchval("SELECT quote_literal($1::text)", document)
     await connection.execute(f"SET LOCAL ROLE {_identifier(owner_role)}")
-    await connection.execute(f"COMMENT ON SCHEMA {namespace} IS {quoted}")
-    await connection.execute(f"SET LOCAL ROLE {publisher}")
-    return await _verify_capture(connection, receipt, verify_content=False)
+    try:
+        async with connection.transaction():
+            await connection.execute(f"COMMENT ON SCHEMA {namespace} IS {quoted}")
+            return await _verify_capture(connection, receipt, verify_content=False)
+    finally:
+        await connection.execute(f"SET LOCAL ROLE {publisher}")
 
 
 async def prepare_network_bootstrap_sources(connection, specification, *, owner_role, runtime_roles):

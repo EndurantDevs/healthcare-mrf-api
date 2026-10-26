@@ -11,19 +11,20 @@ from dataclasses import asdict, dataclass
 from uuid import UUID, uuid4
 
 from process.network_address_projection import PinnedAddressSource, _identifier
-from process.network_custom_address_source import _require_transaction, _source_identity
+from process.network_custom_address_source import _artifact_dependency_identity, _require_transaction
 from process.network_legacy_membership_source import (
     ACAGlobalEpochReadScope,
     ACAMembershipBatch,
     ACARawFactPosition,
     PinnedACAMembershipSource,
+    _read_aca_batch,
     aca_physical_source,
     read_aca_membership_batch,
     read_aca_raw_fact_batch,
 )
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, MembershipCopyTarget, _encode
-from process.reference_family_archive import CONTRACT, MODEL_CLOSURE_CONTRACT, TYPED_MRF_CONTRACT
+from process.reference_family_archive import CONTRACT, MODEL_CLOSURE_CONTRACTS, TYPED_MRF_CONTRACT
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
@@ -67,7 +68,7 @@ async def pin_aca_office_address_source(
     await _verify_batch(
         connection, batch, _control_namespace(control_schema)[1:-1], after_evidence_checksum, after_source_position
     )
-    identity = await _source_identity(
+    identity = await _artifact_dependency_identity(
         connection, address_source, runtime_roles, address=True, control_schema=_control_namespace(control_schema)[1:-1]
     )
     office_records = await _office_records(connection, batch, address_source)
@@ -156,7 +157,7 @@ def _canonical_source(source_pin):
     contract = manifest.as_dict()["contract"]
     relation_oid_by_name = dict(ownership.relation_oids)
     model_contract = (manifest.auxiliary or {}).get("contract")
-    if contract == TYPED_MRF_CONTRACT and model_contract == MODEL_CLOSURE_CONTRACT:
+    if contract == TYPED_MRF_CONTRACT and model_contract in MODEL_CLOSURE_CONTRACTS:
         canonical_oid = relation_oid_by_name.get("mrf_canonical_address")
         canonical_sql = _TYPED_CANONICAL_SQL
         has_valid_layout = ownership.auxiliary_oid is None
@@ -236,20 +237,32 @@ async def _verify_batch(connection, batch, control_schema, after, after_source_p
     )
     if batch.complete_raw_facts and after is not None:
         raise InitialACAOfficeBindingError("initial_aca_office_cursor_differs")
-    replay = await reader(
-        connection,
-        batch.source,
-        registry_schema=control_schema,
-        **cursor_options,
-        limit=max(1, batch.source_rows),
-        approved_source=batch.approved_source,
-        binding_coordinates=batch.binding_coordinates,
-        approved_only=batch.approved_only,
-    )
+    if batch.verified_source is None:
+        replay = await reader(
+            connection,
+            batch.source,
+            registry_schema=control_schema,
+            **cursor_options,
+            limit=max(1, batch.source_rows),
+            approved_source=batch.approved_source,
+            binding_coordinates=batch.binding_coordinates,
+            approved_only=batch.approved_only,
+        )
+    else:
+        replay = await _read_aca_batch(
+            connection,
+            batch.source,
+            control_schema,
+            batch.approved_source,
+            batch.binding_coordinates,
+            batch.approved_only,
+            (after, max(1, batch.source_rows), after_source_position, batch.complete_raw_facts),
+            batch.verified_source,
+        )
     if replay != batch:
         raise InitialACAOfficeBindingError("initial_aca_office_batch_differs")
-    _, rows = await drain_operation(asyncio.to_thread(_encode, batch.input_bytes), preserve_cancellation=True)
-    if rows != batch.membership_rows:
+    _, encoded_rows = await drain_operation(asyncio.to_thread(_encode, batch.input_bytes), preserve_cancellation=True)
+    if encoded_rows != batch.membership_rows:
         raise InitialACAOfficeBindingError("initial_aca_office_batch_accounting_invalid")
 
 
@@ -411,7 +424,7 @@ async def copy_initial_aca_office_bindings(
     async with connection.transaction():
         await _candidate(connection, copy_target, batch, address_source, control)
         await _verify_batch(connection, batch, control[1:-1], after_evidence_checksum, after_source_position)
-        address_identity = await _source_identity(
+        address_identity = await _artifact_dependency_identity(
             connection, address_source, runtime_roles, address=True, control_schema=control[1:-1]
         )
         if address_identity != address_pin.address_identity:

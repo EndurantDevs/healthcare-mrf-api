@@ -18,6 +18,7 @@ from process.registry_candidate_composition import (
 from process.registry_publication_execution import (
     _command_actor,
     _fresh_authority,
+    _request,
     _source_rollback_address_sources,
     approve_queued_registry_publication,
     complete_queued_registry_initial_inventory,
@@ -55,9 +56,14 @@ class RegistryPublicationConsumerConfig:
     reader_roles: tuple[str, ...] = ()
     composition_runtime: RegistryPublicationPTGRuntime | None = field(default=None, repr=False)
     seal_candidate: Callable[..., Awaitable[None]] | None = field(default=None, repr=False)
+    prepare_address_sources: Callable[..., Awaitable[RegistryCompositionAddressSources]] | None = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self):
         if self.seal_candidate is not None and not callable(self.seal_candidate):
+            raise ValueError("registry_publication_consumer_config_invalid")
+        if self.prepare_address_sources is not None and not callable(self.prepare_address_sources):
             raise ValueError("registry_publication_consumer_config_invalid")
         if self.composition_runtime is not None and type(self.composition_runtime) is not RegistryPublicationPTGRuntime:
             raise ValueError("registry_publication_consumer_config_invalid")
@@ -132,6 +138,13 @@ async def _heartbeat(lifecycle_pool, config, request_record):
         await asyncio.sleep(_HEARTBEAT_SECONDS)
         async with lifecycle_pool.acquire() as connection, connection.transaction():
             await _verify_lifecycle(connection, config)
+            await _renew_active_lease(connection, config, request_record)
+
+
+async def _renew_active_lease(connection, config, request_record):
+    try:
+        # Execution may hold this same row while its exact lease remains valid.
+        async with connection.transaction():
             renewed = await renew_registry_publication_lease(
                 connection,
                 request_record["request_id"],
@@ -139,8 +152,16 @@ async def _heartbeat(lifecycle_pool, config, request_record):
                 lease_seconds=_LEASE_SECONDS,
                 control_schema=config.control_schema,
             )
-            if renewed != request_record["request_id"]:
-                raise RegistryApprovalConflict("registry_queue_lease_conflict")
+    except asyncpg.LockNotAvailableError:
+        await _request(
+            connection,
+            request_record["request_id"],
+            request_record["lease_id"],
+            _namespace(config.control_schema),
+        )
+        return
+    if renewed != request_record["request_id"]:
+        raise RegistryApprovalConflict("registry_queue_lease_conflict")
 
 
 async def _publication_address_sources(connection, expected_head, config, initial_address_sources):
@@ -195,7 +216,11 @@ async def _ordinary_publication(
     source_pin, address_sources = await _publication_address_sources(
         connection, expected_head, config, initial_address_sources
     )
-    await _fresh_authority(authorize, request_record)
+    if config.prepare_address_sources is None:
+        await _fresh_authority(authorize, request_record)
+    address_sources = await _prepared_address_sources(
+        connection, config, request_record, approval["approved_revision"], source_pin, address_sources, authorize
+    )
     compose = (
         compose_registry_membership_candidate
         if config.composition_runtime is None
@@ -221,6 +246,35 @@ async def _ordinary_publication(
         writer_context=config,
         seal_candidate=config.seal_candidate,
     )
+
+
+async def _prepared_address_sources(
+    connection, config, request_record, approved_revision, source_pin, sources, authorize
+):
+    """Commit independent address preparation, then recheck the live lease and user authority."""
+    if config.prepare_address_sources is None:
+        return sources
+
+    async def reauthorize():
+        """Fence the exact live request before and after the separate custodian transaction."""
+        current = await _request(
+            connection, request_record["request_id"], request_record["lease_id"], _namespace(config.control_schema)
+        )
+        if current["request_sha256"] != request_record["request_sha256"]:
+            raise RegistryApprovalConflict("registry_queue_request_changed")
+        await _fresh_authority(authorize, current)
+
+    await reauthorize()
+    command = _document(request_record["command_json"])
+    sources = await config.prepare_address_sources(
+        request_id=request_record["request_id"],
+        approved_revision=approved_revision,
+        source_manifest=source_pin,
+        expected_head=command["expected_serving_generation"],
+        address_sources=sources,
+    )
+    await reauthorize()
+    return sources
 
 
 async def _execute_publication_request(
@@ -254,6 +308,8 @@ async def _execute_publication_request(
             options_by_name["writer_roles"] = config.writer_roles
             options_by_name["composition_runtime"] = config.composition_runtime
             options_by_name["seal_candidate"] = config.seal_candidate
+            if config.prepare_address_sources is not None:
+                options_by_name["prepare_address_sources"] = config.prepare_address_sources
         elif operation == "publish_source_rollback":
             complete = complete_queued_registry_source_rollback_publication
             options_by_name["writer_roles"] = config.writer_roles

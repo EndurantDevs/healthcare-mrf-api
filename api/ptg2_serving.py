@@ -9553,9 +9553,8 @@ WITH scope_probe AS MATERIALIZED (
 )
 SELECT selected.*,
        (
-           probe_stats.geocoded_probe_count
-           + probe_stats.exact_zip_probe_count
-           < :raw_probe_limit
+           probe_stats.geocoded_probe_count + probe_stats.exact_zip_probe_count < :raw_probe_limit
+           AND NOT EXISTS (SELECT 1 FROM matched WHERE address_rank = 1 OFFSET :limit)
        ) AS _ptg_source_exhausted,
        (selected.npi IS NULL) AS _ptg_probe_empty
 FROM probe_stats

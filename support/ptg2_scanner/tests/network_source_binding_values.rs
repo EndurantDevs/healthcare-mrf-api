@@ -34,6 +34,46 @@ fn fhir() -> Value {
     input
 }
 
+#[test]
+fn retained_fhir_scope_has_no_invented_legacy_alias() {
+    let mut input = fhir();
+    input["producer_id"] = json!("registry-retained-normalized-fhir-v1");
+    input["source_scope_json"] = json!({
+        "organization_id": "Organization-1.v2", "capture_sha256": "a".repeat(64)
+    });
+    let output = encode(&[input.clone()]);
+    assert_eq!(
+        output.rows[0].source_scope_json["capture_sha256"],
+        "a".repeat(64)
+    );
+    assert!(output.rows[0]
+        .source_scope_json
+        .get("legacy_uuid")
+        .is_none());
+    for field in ["producer_id", "source_id"] {
+        let mut wrong = input.clone();
+        wrong[field] = json!(if field == "source_id" {
+            "cms-npd"
+        } else {
+            "other-producer"
+        });
+        reject(&[wrong], "invalid_scope");
+    }
+    for value in ["", "a", &"A".repeat(64), &"g".repeat(64)] {
+        let mut wrong = input.clone();
+        wrong["source_scope_json"]["capture_sha256"] = json!(value);
+        reject(&[wrong], "invalid_scope");
+    }
+    let mut mixed = input;
+    mixed["source_scope_json"]["legacy_uuid"] = json!("01234567-89ab-cdef-8123-456789abcde0");
+    reject(&[mixed], "invalid_scope");
+    // Existing historical scope remains independent of the new profile.
+    assert!(encode(&[fhir()]).rows[0]
+        .source_scope_json
+        .get("capture_sha256")
+        .is_none());
+}
+
 fn encode(rows: &[Value]) -> EncodedSourceBindingBatch {
     bindings::encode_network_source_binding_batch(&serde_json::to_vec(rows).unwrap()).unwrap()
 }

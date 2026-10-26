@@ -1362,16 +1362,25 @@ async def test_manual_activation_cannot_rotate_an_owner_sealed_nucc_predecessor(
     session.scalar.assert_awaited_once()
 
 
-@pytest.mark.parametrize("fault", ("unregistered-canonical", "canonical-fields", "contract-envelope"))
-def test_canonical_manifest_never_upgrades_another_family_or_legacy_envelope(fault):
-    with pytest.raises(
-        archive.ReferenceFamilyArchiveError,
-        match="canonical model family|canonical model receipt|canonical model contract",
-    ):
+@pytest.mark.parametrize(
+    ("fault", "reason"),
+    (
+        ("unregistered-canonical", "reference canonical model family is unsupported"),
+        ("canonical-fields", "MRF canonical model receipt is invalid"),
+        ("contract-envelope", "MRF canonical model contract differs"),
+        ("contract-tables", "reference family manifest table set is invalid"),
+    ),
+)
+def test_canonical_manifest_never_upgrades_another_family_or_legacy_envelope(fault, reason):
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match=reason):
         if fault == "unregistered-canonical":
             archive.reference_family_spec("nucc", canonical=True)
         elif fault == "canonical-fields":
             archive._validate_mrf_auxiliary_receipt({**archive._canonical_model_receipt(), "source_bit": 1})
+        elif fault == "contract-envelope":
+            document = _declared_manifest("mrf").as_dict()
+            document["auxiliary"] = archive._canonical_model_receipt()
+            archive.validate_reference_family_manifest(document)
         else:
             document = _declared_manifest("mrf", canonical=True).as_dict()
             document["contract"] = archive.CONTRACT

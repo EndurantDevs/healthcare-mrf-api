@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import re
 from dataclasses import replace
 from uuid import uuid4
 
@@ -107,6 +108,24 @@ async def _indexes(fixture):
     )
 
 
+def _assert_only_parity_temporary_ddl(logged_queries):
+    """Replay may prepare only its exact transaction-local expected-array table."""
+    commands = {"CREATE", "ALTER", "DROP", "TRUNCATE", "ANALYZE", "REINDEX", "CLUSTER", "COMMENT", "GRANT", "REVOKE"}
+    statements = [entry.query.strip() for entry in logged_queries if entry.query.lstrip().split()[0] in commands]
+    assert len(statements) == 4
+    creation, primary_key, analyze, removal = statements
+    identity = re.fullmatch(
+        r'ALTER TABLE (pg_temp\."network_parity_expected_[0-9a-f]{32}") ADD PRIMARY KEY\(location_key,entity_type,entity_id\)',
+        primary_key,
+    )
+    assert identity is not None
+    expected_table = identity.group(1)
+    assert creation.startswith(f"CREATE TEMP TABLE {expected_table} ON COMMIT DROP AS \n")
+    assert creation.endswith("GROUP BY binding.location_key,binding.entity_type,binding.entity_id")
+    assert analyze == f"ANALYZE {expected_table}"
+    assert removal == f"DROP TABLE {expected_table}"
+
+
 @pytest.mark.asyncio
 async def test_complete_profile_and_native_replay(serving_indexes_db):
     fixture = serving_indexes_db
@@ -120,7 +139,8 @@ async def test_complete_profile_and_native_replay(serving_indexes_db):
         await asyncio.sleep(0)
         print({"serving_build_roundtrips": len(logged_queries)})
         build_count = len(logged_queries)
-        assert build_count == 41
+        assert build_count == 49
+        assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
     indexes = await _indexes(fixture)
     plan, _ = _post_publish_index_plan(f'"{fixture.copy_target.schema_name}"', "serving", build_concurrently=False)
     assert len(plan) == 24 and len(indexes) == 25
@@ -142,8 +162,9 @@ async def test_complete_profile_and_native_replay(serving_indexes_db):
         assert await _prepare(fixture) == readiness
         await asyncio.sleep(0)
         print({"serving_replay_roundtrips": len(logged_queries), "build_roundtrips": build_count})
-        assert len(logged_queries) == 13
-        assert not any("CREATE INDEX" in query.query or "ALTER TABLE" in query.query for query in logged_queries)
+        assert len(logged_queries) == 21
+        assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
+        _assert_only_parity_temporary_ddl(logged_queries)
     assert await _state(fixture) == state and await _indexes(fixture) == indexes
     from tests.test_network_membership_publication_postgres import _candidate_writer_roles, _publish
 
@@ -330,7 +351,7 @@ async def _assert_query_indexes(fixture):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("serving_indexes_db", [20000], indirect=True)
-async def test_large_candidate_uses_same_statement_count(serving_indexes_db):
+async def test_large_candidate_uses_bounded_parity_statements(serving_indexes_db):
     fixture = serving_indexes_db
     logged_queries = []
     fixture.connection.add_query_logger(logged_queries.append)
@@ -339,7 +360,9 @@ async def test_large_candidate_uses_same_statement_count(serving_indexes_db):
         logged_queries.clear()
         await _prepare(fixture)
         await asyncio.sleep(0)
-        assert len(logged_queries) == 41
+        assert len(logged_queries) == 57
+        assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
+        assert len([entry for entry in logged_queries if "WITH source AS (" in entry.query]) == 5
     assert (
         await fixture.connection.fetchval(
             f'SELECT count(*) FROM "{fixture.copy_target.schema_name}".entity_address_unified'

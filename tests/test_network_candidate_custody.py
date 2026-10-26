@@ -80,7 +80,10 @@ class Connection:
             accepted_rows=2,
             index_ready=True,
             source_recipes_json=[],
-            validation_json={"writer_closure": {}},
+            validation_json={
+                "writer_closure": {},
+                "address_source": {"schema_name": "source", "table_name": "addresses", "generation_id": "a" * 64},
+            },
             created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
             state="ready",
         )
@@ -97,6 +100,9 @@ class Connection:
         self.forbidden = set()
         self.q_forbidden = set()
         self.heap_safe = True
+        self.address_safe = True
+        self.address_checks = 0
+        self.address_censuses = []
         self.safe = True
         self.inherit = True
         self.noninherited = set()
@@ -144,6 +150,13 @@ class Connection:
 
     async def fetchval(self, sql, *args):
         self.calls.append((sql, args))
+        if sql.startswith("WITH target AS ("):
+            address = self.candidate["validation_json"]["address_source"]
+            assert args[:2] == (address["schema_name"], address["table_name"])
+            assert type(args[2]) is list and 1 <= len(args[2]) <= 128
+            self.address_censuses.append(tuple(args[2]))
+            self.address_checks += 1
+            return self.address_safe
         if "SELECT NOT EXISTS(SELECT FROM unnest($1::text[]) configured(name)" in sql:
             return set(args[0]) <= self.enrolled_readers
         if sql == custody._CENSUS_SQL:
@@ -485,6 +498,8 @@ async def test_complete_128_role_census_is_not_truncated(boundary):
     assert result["receipt"]["closure"]["reader_roles"] == list(roles)
     assert len([sql for sql, _ in boundary.calls if sql.startswith('GRANT SELECT ON "control".')]) == 128
     assert await verify(boundary) == result
+
+    assert boundary.address_censuses and all(census == roles for census in boundary.address_censuses)
 
 
 async def test_census_above_128_is_refused_before_sql(boundary):
@@ -905,3 +920,25 @@ async def test_split_seal_rejects_owner_or_relation_identity_drift(boundary, fie
     boundary.control[field] = original + 1 if type(original) is int else original + "_changed"
     with pytest.raises(custody.NetworkCandidateCustodyError):
         await verify(boundary)
+
+
+async def test_retained_address_guard_refusal_preserves_synthetic_candidate(boundary):
+    before = copy.deepcopy(boundary.catalog)
+    boundary.address_safe = False
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.address_checks == 1
+    assert boundary.catalog == before and boundary.seal is None and boundary.proofs == 0
+    assert not any(sql.startswith("INSERT INTO") for sql, _ in boundary.calls)
+
+
+async def test_retained_address_guard_is_rechecked_for_seal_and_replay(boundary):
+    receipt = await seal(boundary)
+    assert boundary.address_checks >= 2
+    checked = boundary.address_checks
+    assert await verify(boundary) == receipt
+    assert boundary.address_checks == checked + 1
+    boundary.address_safe = False
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await verify(boundary)
+    assert boundary.seal["seal_sha256"] == receipt["seal_sha256"]
