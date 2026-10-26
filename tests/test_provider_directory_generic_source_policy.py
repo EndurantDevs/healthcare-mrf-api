@@ -277,7 +277,7 @@ async def test_metadata_validators_keep_canonical_function_qualification(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_private_candidate_admission_qualifies_all_existing_functions(monkeypatch, custody):
+async def test_private_candidate_admission_needs_no_canonical_functions(monkeypatch, custody):
     from importlib import import_module
     from process.provider_directory_generic_source_storage import HEADER
 
@@ -286,7 +286,7 @@ async def test_private_candidate_admission_qualifies_all_existing_functions(monk
     connection, _, _ = _isolated_connection(factory)
     monkeypatch.setattr(directory, "_schema", lambda: "catalog_schema")
     async with _callable_binding(factory, connection):
-        query = directory._locked_endpoint_verification_state_sql(directory._qt("catalog_schema", HEADER))
+        query = directory._private_verification_state_sql(directory._qt("catalog_schema", HEADER))
     assert f'"source_schema"."{HEADER}"' in query
     assert "provider_directory_cms_npd_stale_candidate" not in query
     for name in (
@@ -294,8 +294,72 @@ async def test_private_candidate_admission_qualifies_all_existing_functions(monk
         "provider_directory_subset_canonical_sha256",
         "provider_directory_endpoint_dataset_admission_metadata_sha256",
     ):
-        assert f'"catalog_schema"."{name}"' in query
+        assert f'"catalog_schema"."{name}"' not in query
         assert f'"source_schema"."{name}"' not in query
+    assert "dataset.endpoint_id = :endpoint_id" in query
+    assert "dataset.dataset_id <> :dataset_id" in query
+    assert "LIMIT 1 FOR UPDATE" in query
+    assert "octet_length(dataset.publication_metadata_json::text)" in query
+
+
+@pytest.mark.asyncio
+async def test_private_admission_routes_through_original_binding(monkeypatch, custody):
+    """A competing validated private header blocks without canonical callable access."""
+    from importlib import import_module
+    from tests.test_provider_directory_twin_root_verification import _candidate, _private_header
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _isolated_factory()
+    driver, _, _ = _isolated_connection(factory)
+    candidate = _candidate(requires_verification=False)
+    executor = SimpleNamespace(first=AsyncMock(return_value=_private_header(has_admission_receipt=True)))
+    monkeypatch.setattr(directory, "_schema", lambda: "catalog_schema")
+    async with _callable_binding(factory, driver):
+        with pytest.raises(RuntimeError, match="active_conflict"):
+            await directory._assert_no_conflicting_endpoint_candidate(executor, candidate)
+    query = executor.first.await_args.args[0]
+    assert 'FROM "source_schema"."provider_directory_endpoint_dataset"' in query
+    assert "LIMIT 1 FOR UPDATE" in query
+    assert "provider_directory_endpoint_dataset_admission_metadata_sha256" not in query
+    assert executor.first.await_args.kwargs["dataset_id"] == candidate.dataset_id
+    assert executor.first.await_args.kwargs["endpoint_id"] == candidate.endpoint_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("function_owner", [103, 401])
+async def test_private_custody_requires_no_metadata_execution(monkeypatch, closed, function_owner):
+    """Both private principals must lack effective execution; canonical ACLs stay captured."""
+    from copy import deepcopy
+    from process import provider_directory_source_callable_custody as callables
+    from tests.test_provider_directory_source_callable_custody import _entry
+
+    signature = "provider_directory_subset_canonical_sha256(jsonb)"
+    function_by_field = _entry(signature, owner=function_owner)
+    function_by_field["signature"] = '"sample".' + signature
+    native_functions = [deepcopy(function_by_field)]
+    monkeypatch.setattr(isolated, "_isolated_metadata_rows", AsyncMock(return_value=native_functions))
+    monkeypatch.setattr(callables, "_body_digest", lambda body, schema: body)
+    configured = _policy()
+    roles_by_name = {name: {"oid": oid} for name, oid in zip(
+        (configured.owner_role, configured.publisher_role, *configured.runtime_roles), (101, 102, 103), strict=True
+    )}
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=closed))
+    if closed:
+        captured = await isolated._isolated_metadata_custody(connection, "sample", 201, roles_by_name, configured)
+        assert captured[signature]["definition"] == function_by_field["definition"]
+        assert captured[signature]["acl"] == function_by_field["acl"]
+        assert captured[signature]["access"] == function_by_field["access"][:3]
+        assert captured[signature]["access"][2][-1] is (function_owner == 103)
+    else:
+        with pytest.raises(GenericCandidateError, match="metadata_authority_changed"):
+            await isolated._isolated_metadata_custody(connection, "sample", 201, roles_by_name, configured)
+    query, owner_checked_oids, owner_oid, execution_checked_oids, function_oid = connection.fetchval.await_args.args
+    assert "AND NOT EXISTS(SELECT FROM unnest($3::oid[])" in query
+    assert "has_function_privilege(actor.oid,$4::oid,'EXECUTE')" in query
+    assert (owner_checked_oids, owner_oid, execution_checked_oids, function_oid) == (
+        [101, 102], function_owner, [101, 102], 501
+    )
 
 
 @pytest.mark.asyncio

@@ -542,6 +542,7 @@ async def _isolated_metadata_rows(connection, catalog_schema, runtime_roles):
 
 
 async def _isolated_metadata_custody(connection, catalog_schema, catalog_oid, roles_by_name, policy):
+    """Pin canonical callable definitions and ACLs without admitting private executors."""
     from process.provider_directory_cms_callable_custody import _decoded
     from process.provider_directory_source_callable_custody import _CONTRACTS, _TYPE_OIDS, _require_definition
 
@@ -564,20 +565,21 @@ async def _isolated_metadata_custody(connection, catalog_schema, catalog_oid, ro
         ordinary_oids = [
             roles_by_name[name]["oid"] for name in (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
         ]
+        private_oids = [roles_by_name[name]["oid"] for name in (policy.owner_role, policy.publisher_role)]
         _require(
             await connection.fetchval(
                 "SELECT NOT EXISTS(SELECT FROM unnest($1::oid[]) actor(oid) WHERE "
                 "pg_has_role(actor.oid,$2::oid,'SET') OR pg_has_role(actor.oid,$2::oid,'USAGE')) "
-                "AND has_function_privilege($3::oid,$4::oid,'EXECUTE') "
-                "AND NOT has_function_privilege($3::oid,$4::oid,'EXECUTE WITH GRANT OPTION')",
-                ordinary_oids,
+                "AND NOT EXISTS(SELECT FROM unnest($3::oid[]) actor(oid) "
+                "WHERE has_function_privilege(actor.oid,$4::oid,'EXECUTE'))",
+                private_oids,
                 function_owner,
-                roles_by_name[policy.owner_role]["oid"],
+                private_oids,
                 int(function_by_field["definition"]["oid"]),
             ),
             "metadata_authority_changed",
         )
-        # Effective authority is rechecked; unrelated role creation cannot invalidate this receipt.
+        # Existing runtime rights stay pinned; only private principals must lack canonical authority.
         function_by_field["access"] = [access for access in function_by_field["access"] if access[0] in ordinary_oids]
         functions_by_signature[signature] = function_by_field
     return functions_by_signature
