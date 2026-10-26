@@ -60103,9 +60103,9 @@ def _endpoint_verification_baseline_count_sql(dataset_ref: str) -> str:
     """
 
 
-def _locked_endpoint_verification_filter_sql(dataset_ref: str) -> str:
+def _locked_endpoint_verification_filter_sql(dataset_ref: str, *, private_metadata: bool = False) -> str:
     terminal_successor_sql = _terminal_twin_successor_filter_sql(dataset_ref)
-    validated_candidate_sql = _validated_endpoint_candidate_blocks_admission_sql(dataset_ref)
+    validated_candidate_sql = "true" if private_metadata else _validated_endpoint_candidate_blocks_admission_sql(dataset_ref)
     return f"""
         (
             dataset.is_current = false
@@ -60371,9 +60371,11 @@ async def _locked_endpoint_verification_state(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, Any]:
+    """Keep canonical SQL admission and private application validation on their own actors."""
+    from process.provider_directory_generic_source_policy import current_source_storage_binding
+
     dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
-    state_record = await connection.first(
-        _locked_endpoint_verification_state_sql(dataset_ref),
+    parameters_by_name = dict(
         endpoint_id=candidate.endpoint_id,
         dataset_id=candidate.dataset_id,
         verification_baseline_status=ENDPOINT_DATASET_VERIFICATION_BASELINE,
@@ -60403,7 +60405,97 @@ async def _locked_endpoint_verification_state(
             ENDPOINT_DATASET_SUPERSEDED,
         ],
     )
+    if current_source_storage_binding() is not None:
+        return await _locked_private_verification_state(connection, dataset_ref, parameters_by_name)
+    state_record = await connection.first(_locked_endpoint_verification_state_sql(dataset_ref), **parameters_by_name)
     return _pagination_checkpoint_row_mapping(state_record)
+
+
+def _private_verification_state_sql(dataset_ref: str) -> str:
+    """Lock one private contender with bounded metadata and native-only predicates."""
+    receipt_present = f"NOT ({_artifact_admission_seal_absent_sql()}) OR dataset.artifact_selection_receipt_json IS NOT NULL"
+    return f"""
+        SELECT dataset.dataset_id, dataset.endpoint_id, dataset.import_run_id,
+               dataset.acquisition_root_run_id, dataset.status,
+               dataset.dataset_hash, dataset.resource_count,
+               ({receipt_present}) AS has_admission_receipt,
+               ({_retired_partition_candidate_nonblocking_sql(dataset_ref)}) AS retired_candidate,
+               CASE
+                   WHEN CAST(:include_twin_states AS boolean)
+                   THEN dataset.publication_metadata_json::jsonb
+                   WHEN ({receipt_present}) THEN NULL::jsonb
+                   WHEN octet_length(dataset.publication_metadata_json::text)
+                        <= {ADMISSION_LEGACY_METADATA_MAX_BYTES}
+                   THEN dataset.publication_metadata_json::jsonb
+                   ELSE NULL::jsonb
+               END AS publication_metadata_json,
+               dataset.completion_proof_required_version,
+               CASE WHEN CAST(:include_twin_states AS boolean)
+                    THEN dataset.completion_proof_json::jsonb ELSE NULL::jsonb
+               END AS completion_proof_json,
+               dataset.completion_proof_sha256,
+               CASE WHEN CAST(:include_twin_states AS boolean)
+                    THEN ({_endpoint_verification_baseline_count_sql(dataset_ref)}) ELSE 0::bigint
+               END AS verification_baseline_count
+          FROM {dataset_ref} AS dataset
+         WHERE dataset.endpoint_id = :endpoint_id
+           AND dataset.dataset_id <> :dataset_id
+           AND dataset.dataset_id <> ALL(CAST(:rejected_dataset_ids AS varchar[]))
+           AND {candidate_available_sql("dataset", _schema(), dataset_relation=dataset_ref)}
+           AND ({_locked_endpoint_verification_filter_sql(dataset_ref, private_metadata=True)})
+         ORDER BY CASE WHEN dataset.status = :verification_baseline_status THEN 1 ELSE 0 END,
+                  dataset.created_at
+         LIMIT 1 FOR UPDATE;
+    """
+
+
+def _is_private_candidate_blocking(state_by_field: dict[str, Any]) -> bool:
+    """Ignore only a bounded, provably invalid unsealed private content proof."""
+    if state_by_field["retired_candidate"] is True:
+        return False
+    metadata = state_by_field["publication_metadata_json"]
+    if state_by_field["has_admission_receipt"] or not isinstance(metadata, Mapping):
+        return True
+    if PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY not in metadata:
+        return True
+    proof_by_field = metadata[PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY]
+    shards = proof_by_field.get("shards") if isinstance(proof_by_field, Mapping) else None
+    if isinstance(shards, list) and len(shards) > ADMISSION_LEGACY_SHARD_MAX_COUNT:
+        return True
+    dataset_by_field = dict(state_by_field)
+    dataset_by_field["acquisition_root_run_id"] = (
+        state_by_field["acquisition_root_run_id"] or state_by_field["import_run_id"]
+    )
+    try:
+        proof_by_field = _validated_finalized_stored_proof(dataset_by_field, metadata)
+    except (RuntimeError, ValueError, TypeError):
+        return False
+    return (
+        proof_by_field["dataset_hash"] == state_by_field["dataset_hash"]
+        and proof_by_field["resource_count"] == state_by_field["resource_count"]
+    )
+
+
+async def _locked_private_verification_state(connection, dataset_ref, parameters_by_name):
+    """Keep each examined contender locked while selecting the first blocking state."""
+    query = _private_verification_state_sql(dataset_ref)
+    rejected_dataset_ids = []
+    while True:
+        state_record = await connection.first(query, **parameters_by_name, rejected_dataset_ids=rejected_dataset_ids)
+        state_by_field = _pagination_checkpoint_row_mapping(state_record)
+        if not state_by_field:
+            return {}
+        if (
+            parameters_by_name["include_twin_states"]
+            or state_by_field["status"] != ENDPOINT_DATASET_VALIDATED
+            or _is_private_candidate_blocking(state_by_field)
+        ):
+            for field in ("import_run_id", "has_admission_receipt", "retired_candidate"):
+                state_by_field.pop(field)
+            if not parameters_by_name["include_twin_states"]:
+                state_by_field["publication_metadata_json"] = None
+            return state_by_field
+        rejected_dataset_ids.append(state_by_field["dataset_id"])
 
 
 def _compatible_twin_root_baseline(
