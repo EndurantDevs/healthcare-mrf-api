@@ -1910,9 +1910,9 @@ def test_knn_query_carries_bounded_raw_probe_exhaustion_marker():
     assert "sparse_geocoded_candidates AS MATERIALIZED" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
     assert "broad_geocoded_candidates AS MATERIALIZED" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
     assert ":raw_probe_limit - geocoded_probe_stats.raw_probe_count" in (ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL)
-    assert "probe_stats.geocoded_probe_count\n           + probe_stats.exact_zip_probe_count" in (
-        ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL
-    )
+    query = " ".join(ptg2_serving._MEMBERSHIP_LOCATION_KNN_SQL.split())
+    assert "probe_stats.geocoded_probe_count + probe_stats.exact_zip_probe_count" in query
+    assert "AND NOT EXISTS (SELECT 1 FROM matched WHERE address_rank = 1 OFFSET :limit)" in query
 
 
 @pytest.mark.asyncio

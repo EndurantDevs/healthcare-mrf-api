@@ -217,9 +217,10 @@ async def _configure_custody(fixture):
         reader_roles=list(fixture.readers),
     )
     fixture.config = parse_registry_publication_worker_config(json.dumps(document))
-    await admin.execute(
-        f'ALTER ROLE {_q(roles_by_kind["custodian"])} SET temp_file_limit TO "{fixture.config.sql_limits.temp_file_limit_bytes // 1024}kB"'
-    )
+    for kind in ("lifecycle", "execution", "custodian", "reader"):
+        await admin.execute(
+            f'ALTER ROLE {_q(roles_by_kind[kind])} SET temp_file_limit TO "{fixture.config.sql_limits.temp_file_limit_bytes // 1024}kB"'
+        )
 
 
 async def _remove_worker_roles(fixture):
@@ -391,9 +392,47 @@ async def _assert_custodian(fixture):
             await custodian.execute(f"SET LOCAL ROLE {_q(roles_by_kind['physical'])}")
 
 
-async def _publish_successor(fixture):
+async def _prepare_split_dependency(fixture):
+    """Seal the fixture's exact existing read contract using the genuine independent custodian."""
+    from process.network_custom_address_source import prepare_custom_address_source
+
+    async with _login(fixture, "custodian") as custodian, custodian.transaction(isolation="repeatable_read"):
+        return await prepare_custom_address_source(
+            custodian,
+            fixture.fixture.base,
+            composition_id=str(uuid4()),
+            approved_revision=fixture.seed.revision,
+            owner_role=fixture.roles_by_kind["custody"],
+            runtime_roles=fixture.readers,
+            control_schema=fixture.fixture.control_schema,
+        )
+
+
+async def _prepare_split_successor(fixture, execution, consumer, dependency, head):
+    """Consume the authenticated dependency under the complete worker actor census."""
+    from process.registry_candidate_composition import RegistryCompositionAddressSources
     from tests.test_registry_publication_worker_permissions_postgres import _native_qualified_candidate
 
+    request_id = uuid4()
+    prepared = await consumer.prepare_address_sources(
+        request_id=request_id,
+        approved_revision=fixture.seed.revision,
+        source_manifest=None,
+        expected_head=head,
+        address_sources=RegistryCompositionAddressSources(dependency.address_source),
+    )
+    return await _native_qualified_candidate(
+        fixture,
+        execution,
+        expected_head=head,
+        runtime_roles=fixture.readers,
+        request_id=request_id,
+        prepared_address_artifact=prepared.prepared_address_artifact,
+    )
+
+
+async def _publish_successor(fixture):
+    """Publish and replay both independently prepared successors while retaining their native proofs."""
     admin, schema, roles_by_kind = fixture.fixture.connection, fixture.fixture.control_schema, fixture.roles_by_kind
     async with (
         AsyncExitStack() as stack,
@@ -407,10 +446,9 @@ async def _publish_successor(fixture):
         ]
         assert len(set(pids)) == 3
         consumer = await _custody_runtime(fixture.config, stack, fixture.config.consumer, execution)
+        dependency = await _prepare_split_dependency(fixture)
         for head in (0, 1):
-            copy_target, address = await _native_qualified_candidate(
-                fixture, execution, expected_head=head, runtime_roles=fixture.readers
-            )
+            copy_target, address = await _prepare_split_successor(fixture, execution, consumer, dependency, head)
             options_by_name = dict(
                 owner_role=roles_by_kind["physical"],
                 loader_roles=(),

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, replace
 from uuid import UUID, uuid5
 
 import asyncpg
+from sqlalchemy import text
 
 from db.connection import db
 from process import provider_directory_generic_source_policy as source_policy
@@ -21,6 +22,7 @@ from process.network_legacy_membership_source import (
     PinnedACAMembershipSource,
     _require_archive,
     aca_physical_source,
+    aca_source_descriptor,
     with_aca_global_epoch,
     with_aca_successor,
 )
@@ -28,11 +30,16 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import NetworkPublicationError, publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
+from process.reference_family_archive import _lock_family, _lock_source_family, reference_family_spec
 from process.registry_aca_source_notifications import (
     RegistryACASourceNotificationStore,
     validate_registry_aca_source_event,
 )
-from process.registry_aca_source_recipe import capture_registry_aca_source_metadata
+from process.registry_aca_source_recipe import (
+    capture_registry_aca_source_batch_metadata,
+    capture_registry_aca_source_metadata,
+    require_registry_aca_source_batch,
+)
 from process.registry_candidate_composition import RegistryCompositionAddressSources, _target
 from process.registry_cms_source_consumer import _canonical_session
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
@@ -78,11 +85,17 @@ class RegistryACASourceConsumerConfig:
     seal_candidate: object = field(default=None, repr=False)
     source_authority_roles: tuple[str, ...] = field(default=(), repr=False)
     global_epoch: bool = False
+    initial_batch: bool = False
 
     def __post_init__(self):
         for name in (self.control_schema, self.execution_role, self.owner_role):
             _identifier(name)
-        if self.execution_role == self.owner_role or type(self.global_epoch) is not bool:
+        if (
+            self.execution_role == self.owner_role
+            or type(self.global_epoch) is not bool
+            or type(self.initial_batch) is not bool
+            or (self.global_epoch and self.initial_batch)
+        ):
             _invalid()
         self._require_logical_scope()
         for roles, cap in ((self.loader_roles, 32), (self.reader_roles, 32), (self.source_authority_roles, 128)):
@@ -111,10 +124,19 @@ class RegistryACASourceConsumerConfig:
             _invalid()
         if self.seal_candidate is not None and not callable(self.seal_candidate):
             _invalid()
+        if (
+            self.initial_batch
+            and self.initial_address_sources is not None
+            and (
+                self.initial_address_sources.initial_source_recipes
+                or self.initial_address_sources.replacement_source_recipes
+            )
+        ):
+            _invalid()
 
     def _require_logical_scope(self):
         coordinates = (self.source_id, self.producer_id, self.issuer_id, self.year)
-        if self.global_epoch:
+        if self.global_epoch or self.initial_batch:
             if any(value is not None for value in coordinates):
                 _invalid()
             return
@@ -155,11 +177,25 @@ def source_authority_roles(policy):
 @asynccontextmanager
 async def current_aca_source_fence(recipe, config):
     """Hold the original qualified Source owner's brief completion fence through CAS."""
-    async with source_policy.source_transaction(db, isolation="repeatable read") as session:
+    async with source_policy.source_transaction(db, isolation="read committed") as session:
         publisher = source_policy.bound_publisher()
-        if source_authority_roles(publisher.policy) != config.source_authority_roles:
+        if (
+            publisher.transaction_isolation != "read committed"
+            or source_authority_roles(publisher.policy) != config.source_authority_roles
+        ):
             _invalid()
-        if config.global_epoch:
+        await _lock_current_source_family(session, publisher.policy.schema)
+        if config.initial_batch:
+            pin = recipe[0].source_pin
+            current = await capture_registry_aca_source_batch_metadata(
+                session,
+                [aca_source_descriptor(member.source_pin) for member in recipe],
+                schema=publisher.policy.schema,
+                runtime_roles=pin.runtime_roles,
+                dataset_id=pin.prepared.ownership.dataset_id,
+            )
+            expected_metadata = pin.prepared.manifest.source_metadata
+        elif config.global_epoch:
             current = await _current_global_metadata(session, recipe, publisher)
             expected_metadata = recipe.prepared.manifest.source_metadata
         else:
@@ -178,6 +214,14 @@ async def current_aca_source_fence(recipe, config):
         yield
         if source_policy.bound_publisher() is not publisher:
             _invalid()
+
+
+async def _lock_current_source_family(session, schema):
+    """Read fresh completion only after its family and independent claim are fenced."""
+    if await session.scalar(text("SHOW transaction_isolation")) != "read committed":
+        _invalid()
+    await _lock_source_family(session, reference_family_spec("mrf", canonical=True), schema)
+    await _lock_family(session, schema, ("mrf_publication_receipt",), "SHARE", nowait=True)
 
 
 async def _current_global_metadata(session, epoch, publisher):
@@ -204,8 +248,14 @@ async def _notice(pool, store, identity, event):
         result = await store.read(NativeReceiptSession(connection), event)
         if await store.qualify(connection, writing=False) != identity:
             _invalid()
-        if type(result) is not dict or set(result) not in ({"event", "recipe"}, {"event", "epoch"}):
+        if type(result) is not dict or set(result) not in (
+            {"event", "recipe"},
+            {"event", "epoch"},
+            {"event", "recipes"},
+        ):
             _invalid()
+        if "recipes" in result:
+            return result["recipes"]
         return result["epoch"] if "epoch" in result else result["recipe"]
 
 
@@ -221,6 +271,17 @@ def _has_logical_source(recipe, config):
 def _is_accepted_notice(recipe, config):
     from process.registry_aca_global_epoch import PinnedACAGlobalEpoch
 
+    if config.initial_batch:
+        return (
+            type(recipe) is tuple
+            and bool(recipe)
+            and all(
+                type(member) is RegistrySourceMembershipRecipe
+                and type(member.source_pin) is PinnedACAMembershipSource
+                and "registry_aca_initial_batch" in member.source_pin.prepared.manifest.source_metadata
+                for member in recipe
+            )
+        )
     if config.global_epoch:
         return type(recipe) is PinnedACAGlobalEpoch
     return type(recipe) is RegistrySourceMembershipRecipe and _has_logical_source(recipe, config)
@@ -255,6 +316,8 @@ def _logical_recipe(recipes, config):
 
 
 async def _selection(connection, recipe, config):
+    if config.initial_batch:
+        return await _batch_selection(connection, recipe, config)
     if config.global_epoch:
         return await _global_selection(connection, recipe, config)
     namespace = _identifier(config.control_schema)
@@ -298,6 +361,73 @@ async def _selection(connection, recipe, config):
         return revision, approved, pin, recipes
 
 
+async def _batch_selection(connection, recipes, config):
+    """Load all authenticated scopes once; only approved mappings produce memberships."""
+    namespace = _identifier(config.control_schema)
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        revision = await connection.fetchval(
+            f"SELECT approved_revision FROM {namespace}.registry_revision_control WHERE id=1"
+        )
+        approved = await pin_approved_membership_source(
+            connection, approved_revision=revision, control_schema=config.control_schema
+        )
+        head = await connection.fetchval(
+            f"SELECT COALESCE(generation_id,0) FROM {namespace}.network_serving_control WHERE id=1"
+        )
+        if head is None:
+            _invalid()
+        if head != 0 or config.initial_address_sources is None:
+            return {"state": "review_required"}
+        if not await _has_approved_batch(connection, approved, recipes, recipes, config):
+            return {"state": "review_required"}
+        return revision, approved, None, recipes
+
+
+async def _has_approved_batch(connection, approved, recipes, accepted, config):
+    """Recheck the whole native batch and every approved scope without dropping zero-map sources."""
+    if not _is_accepted_notice(accepted, config) or canonical_registry_source_recipes(
+        recipes
+    ) != canonical_registry_source_recipes(accepted):
+        _invalid()
+    return await _approved_batch_count(connection, approved, recipes, config) > 0
+
+
+async def _approved_batch_count(connection, approved, recipes, config):
+    """Authenticate the complete original batch before allowing any zero-map member."""
+    pin = recipes[0].source_pin
+    current = await require_registry_aca_source_batch(
+        NativeReceiptSession(connection), pin.prepared, runtime_roles=pin.runtime_roles
+    )
+    if canonical_registry_source_recipes(current) != canonical_registry_source_recipes(recipes):
+        _invalid()
+    mapped = 0
+    for recipe in recipes:
+        count = await require_approved_network_source_bindings(
+            connection, approved, recipe.binding_coordinates, control_schema=config.control_schema
+        )
+        if type(count) is not int or count < 0:
+            _invalid()
+        mapped += count
+    return mapped
+
+
+async def _has_approved_global_anchors(connection, approved, anchors, config):
+    """Keep complete batch anchors, but require each ordinary anchor's approved mapping."""
+    batches_by_dataset, mapped = {}, 0
+    for recipe in anchors:
+        source = recipe.source_pin
+        if "registry_aca_initial_batch" in source.prepared.manifest.source_metadata:
+            original = replace(recipe, source_pin=replace(source, retained_successor=None, retained_epoch=None))
+            batches_by_dataset.setdefault(source.prepared.ownership.dataset_id, []).append(original)
+        elif not await _selected_anchor(connection, approved, recipe.binding_coordinates, config):
+            return False
+        else:
+            mapped += 1
+    for batch in batches_by_dataset.values():
+        mapped += await _approved_batch_count(connection, approved, tuple(batch), config)
+    return mapped > 0
+
+
 async def _global_selection(connection, epoch, config):
     namespace = _identifier(config.control_schema)
     async with connection.transaction(isolation="repeatable_read", readonly=True):
@@ -325,9 +455,8 @@ async def _global_selection(connection, epoch, config):
         anchors = _global_anchors(recipes)
         if not anchors:
             return {"state": "review_required"}
-        for anchor in anchors:
-            if not await _selected_anchor(connection, approved, anchor.binding_coordinates, config):
-                return {"state": "review_required"}
+        if not await _has_approved_global_anchors(connection, approved, anchors, config):
+            return {"state": "review_required"}
         combined_recipes = tuple(
             RegistrySourceMembershipRecipe(with_aca_global_epoch(recipe.source_pin, epoch), recipe.binding_coordinates)
             if type(recipe.source_pin) is PinnedACAMembershipSource
@@ -341,16 +470,20 @@ async def _global_selection(connection, epoch, config):
 
 
 async def _verify_selected_recipes(connection, approved, recipes, accepted, config):
+    if config.initial_batch:
+        if not await _has_approved_batch(connection, approved, recipes, accepted, config):
+            _invalid()
+        return
     selected = _global_anchors(recipes) if config.global_epoch else (_logical_recipe(recipes, config),)
     if not selected or any(recipe is None for recipe in selected):
         _invalid()
+    if config.global_epoch and (
+        any(recipe.source_pin.retained_epoch != accepted for recipe in selected)
+        or not await _has_approved_global_anchors(connection, approved, selected, config)
+    ):
+        _invalid()
     for recipe in selected:
-        if config.global_epoch:
-            if recipe.source_pin.retained_epoch != accepted or not await _selected_anchor(
-                connection, approved, recipe.binding_coordinates, config
-            ):
-                _invalid()
-        else:
+        if not config.global_epoch:
             await require_approved_network_source_bindings(
                 connection, approved, recipe.binding_coordinates, control_schema=config.control_schema
             )
@@ -360,7 +493,9 @@ async def _verify_selected_recipes(connection, approved, recipes, accepted, conf
 async def _replay_recipes(connection, candidate_by_name, recipe, config):
     """Prove the stored successor and current original approval before replay publication."""
     recipes = decode_registry_source_recipes(candidate_by_name["source_recipes_json"])
-    if config.global_epoch:
+    if config.initial_batch or config.global_epoch:
+        if config.initial_batch and candidate_by_name["expected_head"] != 0:
+            _invalid()
         approved = await pin_approved_membership_source(
             connection,
             approved_revision=candidate_by_name["approved_custom_revision"],
@@ -587,7 +722,9 @@ async def consume_registry_aca_source_notification_once(
         key = int.from_bytes(
             hashlib.sha256(
                 _json(
-                    (config.control_schema, config.source_id, config.producer_id, config.issuer_id, config.year)
+                    (config.control_schema, "initial_batch")
+                    if config.initial_batch
+                    else (config.control_schema, config.source_id, config.producer_id, config.issuer_id, config.year)
                 ).encode()
             ).digest()[:8],
             "big",

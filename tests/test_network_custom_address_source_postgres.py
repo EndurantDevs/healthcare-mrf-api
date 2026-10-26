@@ -4,6 +4,8 @@
 import asyncio
 import importlib.util
 import json
+import os
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ from sqlalchemy import MetaData
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from db.models import EntityAddressUnified, NPIData
+from process import network_bootstrap_read_access as bootstrap_access
 from process.network_address_projection import PinnedAddressSource
 from process.network_bootstrap_sources import (
     NetworkBootstrapSourceError,
@@ -27,6 +30,8 @@ from process.network_bootstrap_sources import (
 from process.network_custom_address_source import (
     NetworkCustomAddressSourceError,
     NetworkCustomAddressUnresolved,
+    _artifact_dependency_identity,
+    _source_identity,
     prepare_custom_address_source,
     verify_custom_address_source,
 )
@@ -96,6 +101,94 @@ async def custom_db(serving_schema):
         assert not await connection.fetchval(
             "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]))", created_roles
         )
+
+
+@asynccontextmanager
+async def _restricted_artifact_context(fixture):
+    """Use genuine E and K logins with E-to-loading and SET-only K-to-custody edges."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    role_suffix = uuid4().hex
+    password = uuid4().hex
+    role_by_kind = {
+        kind: "artifact_" + kind + "_" + role_suffix for kind in ("loading", "execution", "custodian", "custody")
+    }
+    connections = []
+    try:
+        for kind, role in role_by_kind.items():
+            options = f" LOGIN PASSWORD '{password}'" if kind in {"execution", "custodian"} else " NOLOGIN"
+            await fixture.connection.execute(f'CREATE ROLE "{role}"{options}')
+        database = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
+        await fixture.connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{role_by_kind["loading"]}"')
+        for target_role, member, inherit, set_role in (
+            (role_by_kind["loading"], role_by_kind["execution"], "TRUE", "TRUE"),
+            (role_by_kind["execution"], role_by_kind["custodian"], "TRUE", "TRUE"),
+            (role_by_kind["custody"], role_by_kind["custodian"], "FALSE", "TRUE"),
+            (fixture.roles["reader"], role_by_kind["execution"], "TRUE", "FALSE"),
+        ):
+            await fixture.connection.execute(
+                f'GRANT "{target_role}" TO "{member}" WITH ADMIN FALSE, INHERIT {inherit}, SET {set_role}'
+            )
+        await fixture.connection.execute(
+            f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{role_by_kind["execution"]}"'
+        )
+        await fixture.connection.execute(
+            f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.control_schema}" TO "{role_by_kind["execution"]}"'
+        )
+        await fixture.connection.execute(
+            f'GRANT USAGE ON SCHEMA "{fixture.source_schema}" TO "{role_by_kind["loading"]}"'
+        )
+        await fixture.connection.execute(
+            f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.source_schema}" TO "{role_by_kind["loading"]}"'
+        )
+        parsed = urlsplit(os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://"))
+        for kind in ("custodian", "execution"):
+            dsn = urlunsplit(
+                (parsed.scheme, role_by_kind[kind] + "@" + parsed.netloc.split("@")[-1], parsed.path, parsed.query, "")
+            )
+            connections.append(await asyncpg.connect(dsn, password=password))
+        yield SimpleNamespace(
+            base=fixture,
+            roles=role_by_kind,
+            custodian=connections[0],
+            execution=connections[1],
+            runtime_roles=tuple(sorted((role_by_kind["execution"], role_by_kind["loading"], fixture.roles["reader"]))),
+        )
+    finally:
+        for connection in connections:
+            await connection.close()
+        for identity in fixture.composition_ids:
+            await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "network_composition_{identity.hex}" CASCADE')
+        for role in reversed(tuple(role_by_kind.values())):
+            await fixture.connection.execute(f'DROP OWNED BY "{role}"')
+            await fixture.connection.execute(f'DROP ROLE "{role}"')
+
+
+@pytest.fixture
+async def restricted_artifact_db(custom_db):
+    """Keep generic retained-source read permissions explicit before native preparation."""
+    async with _restricted_artifact_context(custom_db) as fixture:
+        yield fixture
+
+
+@pytest.fixture
+async def restricted_bootstrap_artifact_db(bootstrap_db, serving_schema):
+    """The admitted bootstrap grants only E, while the output requires the complete actor census."""
+    base = SimpleNamespace(
+        connection=bootstrap_db.connection,
+        engine=bootstrap_db.engine,
+        control_schema=serving_schema[1],
+        source_schema=bootstrap_db.source_schema,
+        roles=bootstrap_db.roles,
+        composition_ids=[],
+    )
+    async with _restricted_artifact_context(base) as fixture:
+        capture = await _bootstrap_prepare(
+            bootstrap_db, await _bootstrap_specification(bootstrap_db), runtime_roles=(fixture.roles["execution"],)
+        )
+        base.base = capture.address_source
+        fixture.bootstrap = capture
+        yield fixture
 
 
 async def _draft(fixture, command, actor):
@@ -623,14 +716,14 @@ async def _bootstrap_specification(fixture):
     )
 
 
-async def _bootstrap_prepare(fixture, specification):
+async def _bootstrap_prepare(fixture, specification, *, runtime_roles=None):
     async with fixture.connection.transaction(isolation="repeatable_read"):
         await fixture.connection.execute(f'SET LOCAL ROLE "{fixture.roles["publisher"]}"')
         return await prepare_network_bootstrap_sources(
             fixture.connection,
             specification,
             owner_role=fixture.roles["owner"],
-            runtime_roles=tuple(sorted((fixture.roles["loader"], fixture.roles["reader"]))),
+            runtime_roles=runtime_roles or tuple(sorted((fixture.roles["loader"], fixture.roles["reader"]))),
         )
 
 
@@ -1639,3 +1732,531 @@ async def test_aca_carry_invalid_source_or_existing_pair_rolls_back_artifact(aca
         assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", target_schema) is None
     finally:
         await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{target_schema}" CASCADE')
+
+
+async def test_bootstrap_fresh_verification_uses_noninherited_protected_owner(bootstrap_db):
+    fixture = bootstrap_db
+    connection = fixture.connection
+    publisher = fixture.roles["publisher"]
+    owner = fixture.roles["owner"]
+    reader = fixture.roles["reader"]
+    await connection.execute(f'GRANT "{owner}" TO "{publisher}" WITH INHERIT FALSE, SET TRUE')
+    specification = await _bootstrap_specification(fixture)
+    async with connection.transaction(isolation="repeatable_read"):
+        await connection.execute(f'SET LOCAL ROLE "{publisher}"')
+        assert await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", owner)
+        assert not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'USAGE')", owner)
+        receipt = await prepare_network_bootstrap_sources(
+            connection, specification, owner_role=owner, runtime_roles=(reader,)
+        )
+        assert await connection.fetchval("SELECT current_user::text") == publisher
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with connection.transaction():
+                await connection.fetchval(f'SELECT count(*) FROM "{receipt.address_source.schema_name}".npi')
+        await connection.execute("RESET ROLE")
+        await connection.execute(f'SET LOCAL ROLE "{reader}"')
+        assert await verify_network_bootstrap_sources(connection, receipt) == receipt
+
+
+@pytest.fixture
+async def bootstrap_access_fixture(bootstrap_db, request):
+    fixture = bootstrap_db
+    # Exercise the ordinary immutable shape separately from dormant serial defaults.
+    if getattr(request, "param", "constant") != "serial":
+        await fixture.connection.execute(f'ALTER TABLE "{fixture.source_schema}".npi ALTER COLUMN npi DROP DEFAULT')
+    receipt = await _bootstrap_prepare(
+        fixture, await _bootstrap_specification(fixture), runtime_roles=(fixture.roles["reader"],)
+    )
+    reader, stranger = "access_reader_" + uuid4().hex, "access_stranger_" + uuid4().hex
+    password = uuid4().hex
+    for role in (reader, stranger):
+        await fixture.connection.execute(f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+    try:
+        yield SimpleNamespace(fixture=fixture, receipt=receipt, reader=reader, stranger=stranger, password=password)
+    finally:
+        await fixture.connection.execute("RESET ROLE")
+        await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{bootstrap_access._namespace(receipt)}" CASCADE')
+        for role in (stranger, reader):
+            await fixture.connection.execute(f'DROP OWNED BY "{role}"')
+            await fixture.connection.execute(f'DROP ROLE "{role}"')
+        assert (
+            await fixture.connection.fetchval("SELECT to_regnamespace($1)", bootstrap_access._namespace(receipt))
+            is None
+        )
+
+
+async def _change_bootstrap_access(bootstrap_access_fixture, *, revoke=False, reader=None):
+    connection = bootstrap_access_fixture.fixture.connection
+    async with connection.transaction(isolation="repeatable_read"):
+        await connection.execute(f'SET LOCAL ROLE "{bootstrap_access_fixture.fixture.roles["publisher"]}"')
+        operation = (
+            bootstrap_access.revoke_bootstrap_read_access if revoke else bootstrap_access.install_bootstrap_read_access
+        )
+        return await operation(
+            connection, bootstrap_access_fixture.receipt, reader_role=reader or bootstrap_access_fixture.reader
+        )
+
+
+@asynccontextmanager
+async def _bootstrap_access_login(role, password=None):
+    dsn = os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://")
+    connection = await asyncpg.connect(dsn, user=role, password=password)
+    try:
+        assert await connection.fetchval("SELECT current_user=session_user AND current_user::text=$1", role)
+        yield connection
+    finally:
+        await connection.close()
+
+
+async def _verify_bootstrap_access(bootstrap_access_fixture, connection=None):
+    connection = connection or bootstrap_access_fixture.fixture.connection
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        return await verify_network_bootstrap_sources(connection, bootstrap_access_fixture.receipt)
+
+
+async def test_bootstrap_access_exact_successor_preserves_receipt_and_old_reader(bootstrap_access_fixture, monkeypatch):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    original_native = bootstrap_access._native
+    native_receipts = []
+
+    async def observe_native(connection, receipt, reader_oid):
+        native_receipts.append(receipt)
+        return await original_native(connection, receipt, reader_oid)
+
+    monkeypatch.setattr(bootstrap_access, "_native", observe_native)
+    original = await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", receipt.schema_oid)
+    before = await bootstrap_access._acl(connection, receipt)
+    proof = await _change_bootstrap_access(bootstrap_access_fixture)
+    assert proof == await _change_bootstrap_access(bootstrap_access_fixture)
+    assert proof["before"] == before
+    assert original == await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", receipt.schema_oid)
+    native_receipts.clear()
+    assert await _verify_bootstrap_access(bootstrap_access_fixture) == receipt
+    assert native_receipts == [receipt]
+    async with _bootstrap_access_login(bootstrap_access_fixture.reader, bootstrap_access_fixture.password) as reader:
+        assert not await reader.fetchval("SELECT pg_has_role(current_user,$1::name,'MEMBER')", receipt.runtime_roles[0])
+        assert await _verify_bootstrap_access(bootstrap_access_fixture, reader) == receipt
+        native_receipts.clear()
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            await _source_identity(reader, receipt.address_source, receipt.runtime_roles, address=True)
+            await _source_identity(reader, receipt.npi_source, receipt.runtime_roles)
+        assert native_receipts == [receipt, receipt]
+        assert await reader.fetchval(f'SELECT count(*) FROM "{receipt.address_source.schema_name}".npi') == 1
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await reader.execute(f"UPDATE \"{receipt.address_source.schema_name}\".npi SET provider_first_name='No'")
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        await connection.execute(f'SET LOCAL ROLE "{receipt.runtime_roles[0]}"')
+        assert await verify_network_bootstrap_sources(connection, receipt) == receipt
+
+
+async def test_bootstrap_access_revoke_keeps_proof_and_restores_original_acl(bootstrap_access_fixture):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    proof = await _change_bootstrap_access(bootstrap_access_fixture)
+    assert await _change_bootstrap_access(bootstrap_access_fixture, revoke=True) == proof
+    assert await _change_bootstrap_access(bootstrap_access_fixture, revoke=True) == proof
+    assert await bootstrap_access._acl(connection, receipt) == proof["before"]
+    assert await _verify_bootstrap_access(bootstrap_access_fixture) == receipt
+    assert await bootstrap_access._proof(connection, receipt) == proof
+    async with _bootstrap_access_login(bootstrap_access_fixture.reader, bootstrap_access_fixture.password) as reader:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await reader.fetchval(f'SELECT count(*) FROM "{receipt.address_source.schema_name}".npi')
+    assert await _change_bootstrap_access(bootstrap_access_fixture) == proof
+    with pytest.raises(bootstrap_access.BootstrapReadAccessError):
+        await _change_bootstrap_access(bootstrap_access_fixture, reader=bootstrap_access_fixture.stranger)
+
+
+async def test_bootstrap_access_original_reader_survives_successor_retirement(bootstrap_access_fixture):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    proof = await _change_bootstrap_access(bootstrap_access_fixture)
+    await _change_bootstrap_access(bootstrap_access_fixture, revoke=True)
+    await connection.execute(f'DROP ROLE "{bootstrap_access_fixture.reader}"')
+    assert await _change_bootstrap_access(bootstrap_access_fixture, revoke=True) == proof
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        await connection.execute(f'SET LOCAL ROLE "{receipt.runtime_roles[0]}"')
+        assert await verify_network_bootstrap_sources(connection, receipt) == receipt
+    await connection.execute(
+        f"CREATE ROLE \"{bootstrap_access_fixture.reader}\" LOGIN PASSWORD '{bootstrap_access_fixture.password}'"
+    )
+    with pytest.raises(bootstrap_access.BootstrapReadAccessError):
+        await _change_bootstrap_access(bootstrap_access_fixture)
+    assert await bootstrap_access._acl(connection, receipt) == proof["before"]
+    assert await _verify_bootstrap_access(bootstrap_access_fixture) == receipt
+
+
+@pytest.mark.parametrize("phase", ["install", "revoke"])
+async def test_bootstrap_access_cancelled_acl_change_rolls_back_savepoint(bootstrap_access_fixture, monkeypatch, phase):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    if phase == "revoke":
+        await _change_bootstrap_access(bootstrap_access_fixture)
+    before = await bootstrap_access._acl(connection, receipt)
+    original_grant = bootstrap_access._grant
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def interrupted(*args, **kwargs):
+        await original_grant(*args, **kwargs)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(bootstrap_access, "_grant", interrupted)
+    async with connection.transaction(isolation="repeatable_read"):
+        await connection.execute("CREATE TEMP TABLE access_marker(value int) ON COMMIT DROP")
+        pending = asyncio.create_task(
+            (
+                bootstrap_access.revoke_bootstrap_read_access
+                if phase == "revoke"
+                else bootstrap_access.install_bootstrap_read_access
+            )(connection, receipt, reader_role=bootstrap_access_fixture.reader)
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert await bootstrap_access._acl(connection, receipt) == before
+        await connection.execute("INSERT INTO access_marker VALUES(1)")
+    assert (await bootstrap_access._proof(connection, receipt) is None) is (phase == "install")
+    assert await _verify_bootstrap_access(bootstrap_access_fixture) == receipt
+
+
+async def test_bootstrap_access_untrusted_installer_and_shared_reader_membership_refuse(bootstrap_access_fixture):
+    async with _bootstrap_access_login(
+        bootstrap_access_fixture.stranger, bootstrap_access_fixture.password
+    ) as connection:
+        async with connection.transaction(isolation="repeatable_read"):
+            with pytest.raises(bootstrap_access.BootstrapReadAccessError):
+                await bootstrap_access.install_bootstrap_read_access(
+                    connection, bootstrap_access_fixture.receipt, reader_role=bootstrap_access_fixture.reader
+                )
+    await bootstrap_access_fixture.fixture.connection.execute(
+        f'GRANT "{bootstrap_access_fixture.receipt.runtime_roles[0]}" TO "{bootstrap_access_fixture.reader}"'
+    )
+    with pytest.raises(bootstrap_access.BootstrapReadAccessError):
+        await _change_bootstrap_access(bootstrap_access_fixture)
+    assert (
+        await bootstrap_access._proof(bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt)
+        is None
+    )
+
+
+async def test_bootstrap_access_connected_actor_cannot_reach_source_owner(bootstrap_access_fixture):
+    connection = bootstrap_access_fixture.fixture.connection
+    await connection.execute(f'GRANT "{bootstrap_access_fixture.reader}" TO "{bootstrap_access_fixture.stranger}"')
+    await connection.execute(
+        f'GRANT "{bootstrap_access_fixture.fixture.roles["owner"]}" TO "{bootstrap_access_fixture.stranger}"'
+    )
+    assert not await connection.fetchval(
+        "SELECT pg_has_role($1::name,$2::name,'SET')",
+        bootstrap_access_fixture.reader,
+        bootstrap_access_fixture.fixture.roles["owner"],
+    )
+    with pytest.raises(ValueError):
+        await _change_bootstrap_access(bootstrap_access_fixture)
+    assert await bootstrap_access._proof(connection, bootstrap_access_fixture.receipt) is None
+
+
+async def test_bootstrap_dependency_preserves_original_readers_with_incoming_creator(bootstrap_db):
+    """A trusted creator's owner reach does not become an ordinary loader's reach."""
+    from process.network_custom_address_source import _artifact_dependency_identity
+
+    fixture = bootstrap_db
+    receipt = await _bootstrap_prepare(fixture, await _bootstrap_specification(fixture))
+    connection = fixture.connection
+    assert await connection.fetchval("SELECT pg_has_role($1,$2,'SET')", fixture.roles["publisher"], receipt.owner_role)
+    assert not await connection.fetchval(
+        "SELECT pg_has_role($1,$2,'MEMBER')", fixture.roles["loader"], receipt.owner_role
+    )
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        assert (
+            await bootstrap_access.bootstrap_pin_read_roles(connection, receipt.address_source, receipt.runtime_roles)
+            == receipt.runtime_roles
+        )
+        assert await _artifact_dependency_identity(
+            connection, receipt.address_source, (fixture.roles["reader"],), address=True
+        )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["direct_owner", "transitive_owner", "set_owner", "transitive_set_owner", "write", "create", "grant", "missing"],
+)
+async def test_bootstrap_dependency_checks_output_only_actor_reach(bootstrap_access_fixture, drift):
+    """Output actors need no input SELECT but cannot reach input ownership or writes."""
+    from process.network_custom_address_source import _artifact_dependency_identity, _source_identity
+
+    fixture = bootstrap_access_fixture
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    actor, bridge = fixture.stranger, fixture.reader
+    roles = tuple(sorted((*receipt.runtime_roles, actor)))
+    schema = '"' + receipt.address_source.schema_name + '"'
+    before_acl = await bootstrap_access._acl(connection, receipt)
+    async with connection.transaction(isolation="repeatable_read"):
+        assert not await connection.fetchval(
+            "SELECT has_table_privilege($1,$2::oid,'SELECT')", actor, receipt.relation_oids[0][1]
+        )
+        expected = await _artifact_dependency_identity(connection, receipt.address_source, roles, address=True)
+        with pytest.raises(NetworkCustomAddressSourceError, match="bootstrap read access differs"):
+            await _source_identity(connection, receipt.address_source, roles, address=True)
+        changed = connection.transaction()
+        await changed.start()
+        try:
+            options = "INHERIT FALSE, SET TRUE" if "set_owner" in drift else "INHERIT TRUE, SET TRUE"
+            statements_by_drift = {
+                "direct_owner": (f'GRANT "{receipt.owner_role}" TO "{actor}" WITH {options}',),
+                "set_owner": (f'GRANT "{receipt.owner_role}" TO "{actor}" WITH {options}',),
+                "transitive_owner": (
+                    f'GRANT "{receipt.owner_role}" TO "{bridge}" WITH {options}',
+                    f'GRANT "{bridge}" TO "{actor}" WITH {options}',
+                ),
+                "transitive_set_owner": (
+                    f'GRANT "{receipt.owner_role}" TO "{bridge}" WITH {options}',
+                    f'GRANT "{bridge}" TO "{actor}" WITH {options}',
+                ),
+                "write": (f'GRANT UPDATE ON {schema}.npi TO "{actor}"',),
+                "create": (f'GRANT CREATE ON SCHEMA {schema} TO "{actor}"',),
+                "grant": (f'GRANT SELECT ON {schema}.npi TO "{actor}" WITH GRANT OPTION',),
+                "missing": (),
+            }
+            for statement in statements_by_drift[drift]:
+                await connection.execute(statement)
+            if "owner" in drift:
+                assert await bootstrap_access._acl(connection, receipt) == before_acl
+                assert await connection.fetchval("SELECT pg_has_role($1,$2,'SET')", actor, receipt.owner_role)
+                if "set_owner" in drift:
+                    assert not await connection.fetchval("SELECT pg_has_role($1,$2,'USAGE')", actor, receipt.owner_role)
+            checked_roles = ("missing_" + uuid4().hex,) if drift == "missing" else roles
+            with pytest.raises(NetworkCustomAddressSourceError, match="bootstrap read access differs"):
+                await _artifact_dependency_identity(connection, receipt.address_source, checked_roles, address=True)
+        finally:
+            await changed.rollback()
+        assert await _artifact_dependency_identity(connection, receipt.address_source, roles, address=True) == expected
+        assert await bootstrap_access._acl(connection, receipt) == before_acl
+
+
+async def test_bootstrap_access_proof_creation_does_not_expand_owner_database_privileges(bootstrap_access_fixture):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    database = await connection.fetchval("SELECT quote_ident(current_database())")
+    await connection.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{receipt.owner_role}"')
+    await _change_bootstrap_access(bootstrap_access_fixture)
+    assert not await connection.fetchval(
+        "SELECT has_database_privilege($1::name,current_database(),'CREATE')", receipt.owner_role
+    )
+    assert await _verify_bootstrap_access(bootstrap_access_fixture) == receipt
+
+
+async def test_bootstrap_access_install_requires_explicit_repeatable_read(bootstrap_access_fixture):
+    with pytest.raises(ValueError):
+        await bootstrap_access.install_bootstrap_read_access(
+            bootstrap_access_fixture.fixture.connection,
+            bootstrap_access_fixture.receipt,
+            reader_role=bootstrap_access_fixture.reader,
+        )
+    assert (
+        await bootstrap_access._proof(bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt)
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "write",
+        "grant_option",
+        "partial",
+        "extra_reader",
+        "role_reach",
+        "role_oid",
+        "rls",
+        "trigger",
+        "default",
+        "check",
+        "index",
+        "proof_owner",
+        "proof_object",
+    ],
+)
+async def test_bootstrap_access_native_drift_refuses(bootstrap_access_fixture, drift):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    await _change_bootstrap_access(bootstrap_access_fixture)
+    schema = '"' + receipt.address_source.schema_name + '"'
+    statement_by_kind = {
+        "write": f'GRANT UPDATE ON {schema}.npi TO "{bootstrap_access_fixture.reader}"',
+        "grant_option": f'GRANT SELECT ON {schema}.npi TO "{bootstrap_access_fixture.reader}" WITH GRANT OPTION',
+        "partial": f'REVOKE SELECT ON {schema}.npi FROM "{bootstrap_access_fixture.reader}"',
+        "extra_reader": f'GRANT SELECT ON {schema}.npi TO "{bootstrap_access_fixture.stranger}"',
+        "role_reach": f'GRANT "{bootstrap_access_fixture.fixture.roles["owner"]}" TO "{bootstrap_access_fixture.reader}"',
+        "rls": f"ALTER TABLE {schema}.npi ENABLE ROW LEVEL SECURITY",
+        "default": f"ALTER TABLE {schema}.npi ALTER COLUMN provider_first_name SET DEFAULT current_user",
+        "check": f"ALTER TABLE {schema}.npi ADD CHECK(npi>0)",
+        "index": f"ALTER INDEX {schema}.npi_pkey SET (fillfactor=80)",
+        "proof_owner": f'ALTER SCHEMA "{bootstrap_access._namespace(receipt)}" OWNER TO "{bootstrap_access_fixture.stranger}"',
+        "proof_object": f'CREATE TABLE "{bootstrap_access._namespace(receipt)}".unexpected(value int)',
+    }
+    async with connection.transaction():
+        if drift == "trigger":
+            await connection.execute(
+                f"CREATE FUNCTION {schema}.unexpected() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$"
+            )
+            await connection.execute(
+                f"CREATE TRIGGER unexpected BEFORE UPDATE ON {schema}.npi FOR EACH ROW EXECUTE FUNCTION {schema}.unexpected()"
+            )
+        elif drift == "role_oid":
+            await connection.execute(f'DROP OWNED BY "{bootstrap_access_fixture.reader}"')
+            await connection.execute(f'DROP ROLE "{bootstrap_access_fixture.reader}"')
+            await connection.execute(
+                f"CREATE ROLE \"{bootstrap_access_fixture.reader}\" LOGIN PASSWORD '{bootstrap_access_fixture.password}'"
+            )
+            await bootstrap_access._grant(connection, receipt, bootstrap_access_fixture.reader)
+        else:
+            await connection.execute(statement_by_kind[drift])
+    with pytest.raises(ValueError):
+        await _verify_bootstrap_access(bootstrap_access_fixture)
+
+
+async def test_bootstrap_access_forged_successor_and_stale_pin_refuse(bootstrap_access_fixture):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    proof = await _change_bootstrap_access(bootstrap_access_fixture)
+    proof["bootstrap_sha256"] = "0" * 64
+    literal = await connection.fetchval("SELECT quote_literal($1::text)", json.dumps(proof))
+    await connection.execute(f'COMMENT ON SCHEMA "{bootstrap_access._namespace(receipt)}" IS {literal}')
+    with pytest.raises(bootstrap_access.BootstrapReadAccessError):
+        await _verify_bootstrap_access(bootstrap_access_fixture)
+
+
+async def test_bootstrap_access_owner_content_change_refuses_before_grant(bootstrap_access_fixture):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    await connection.execute(f"UPDATE \"{receipt.address_source.schema_name}\".npi SET provider_first_name='Changed'")
+    with pytest.raises(ValueError):
+        await _change_bootstrap_access(bootstrap_access_fixture)
+    assert await bootstrap_access._proof(connection, receipt) is None
+    assert not await connection.fetchval(
+        "SELECT has_table_privilege($1::name,$2::oid,'SELECT')",
+        bootstrap_access_fixture.reader,
+        dict(receipt.relation_oids)["npi"],
+    )
+
+
+@pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
+async def test_bootstrap_access_dormant_serial_default_never_executes(bootstrap_access_fixture):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    sequence = await connection.fetchval(
+        "SELECT pg_get_serial_sequence($1,'npi')", bootstrap_access_fixture.fixture.source_schema + ".npi"
+    )
+    sequence_oid = await connection.fetchval("SELECT $1::regclass::oid", sequence)
+    before = await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
+    await _change_bootstrap_access(bootstrap_access_fixture)
+    async with _bootstrap_access_login(bootstrap_access_fixture.reader, bootstrap_access_fixture.password) as reader:
+        assert await _verify_bootstrap_access(bootstrap_access_fixture, reader) == receipt
+        assert not await reader.fetchval(
+            "SELECT has_sequence_privilege(current_user,$1::oid,'SELECT,USAGE,UPDATE')", sequence_oid
+        )
+        assert not await reader.fetchval(
+            "SELECT has_schema_privilege(current_user,$1,'USAGE')", bootstrap_access_fixture.fixture.source_schema
+        )
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await reader.fetchval("SELECT nextval($1::oid::regclass)", sequence_oid)
+    assert await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == before
+
+
+@pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
+@pytest.mark.parametrize(
+    "drift", ["sequence_grant", "indirect_grant", "npi_write", "sequence_reference", "default_function"]
+)
+async def test_bootstrap_access_dormant_serial_drift_refuses(bootstrap_access_fixture, drift):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    if drift == "indirect_grant":
+        await connection.execute(f'GRANT "{bootstrap_access_fixture.reader}" TO "{bootstrap_access_fixture.stranger}"')
+    sequence = await connection.fetchval(
+        "SELECT pg_get_serial_sequence($1,'npi')", bootstrap_access_fixture.fixture.source_schema + ".npi"
+    )
+    await _change_bootstrap_access(bootstrap_access_fixture)
+    npi_table = '"' + receipt.address_source.schema_name + '".npi'
+    if drift in {"sequence_grant", "indirect_grant"}:
+        role = bootstrap_access_fixture.stranger if drift == "indirect_grant" else bootstrap_access_fixture.reader
+        await connection.execute(f'GRANT USAGE ON SEQUENCE {sequence} TO "{role}"')
+    elif drift == "npi_write":
+        await connection.execute(f'GRANT INSERT ON {npi_table} TO "{bootstrap_access_fixture.reader}"')
+    elif drift == "sequence_reference":
+        target = '"' + bootstrap_access_fixture.fixture.source_schema + '".unexpected_sequence'
+        await connection.execute(f"CREATE SEQUENCE {target}")
+        literal = await connection.fetchval("SELECT quote_literal($1::text)", target)
+        await connection.execute(f"ALTER TABLE {npi_table} ALTER COLUMN npi SET DEFAULT nextval({literal}::regclass)")
+    else:
+        target = '"' + bootstrap_access_fixture.fixture.source_schema + '".unexpected_default'
+        await connection.execute(f"CREATE FUNCTION {target}() RETURNS bigint LANGUAGE sql AS 'SELECT 1::bigint'")
+        await connection.execute(f"ALTER TABLE {npi_table} ALTER COLUMN npi SET DEFAULT {target}()")
+    with pytest.raises(ValueError):
+        await _verify_bootstrap_access(bootstrap_access_fixture)
+
+
+async def test_bootstrap_access_grants_are_atomic_and_reader_is_uninterrupted(bootstrap_access_fixture):
+    connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
+    administrator = await connection.fetchval("SELECT session_user")
+    async with (
+        _bootstrap_access_login(bootstrap_access_fixture.reader, bootstrap_access_fixture.password) as reader,
+        _bootstrap_access_login(administrator) as other,
+    ):
+        async with connection.transaction(isolation="repeatable_read"):
+            await bootstrap_access.install_bootstrap_read_access(
+                connection, receipt, reader_role=bootstrap_access_fixture.reader
+            )
+            assert not await reader.fetchval(
+                "SELECT has_table_privilege(current_user,$1::oid,'SELECT')", dict(receipt.relation_oids)["npi"]
+            )
+            await other.execute(f'SET ROLE "{receipt.runtime_roles[0]}"')
+            assert await other.fetchval(f'SELECT count(*) FROM "{receipt.address_source.schema_name}".npi') == 1
+            await other.execute("RESET ROLE")
+            async with other.transaction(isolation="repeatable_read"):
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await bootstrap_access.install_bootstrap_read_access(
+                        other, receipt, reader_role=bootstrap_access_fixture.reader
+                    )
+        assert await reader.fetchval(f'SELECT count(*) FROM "{receipt.address_source.schema_name}".npi') == 1
+
+
+async def _alter_dependency_authority(connection, receipt, actor, reader, drift):
+    owner, schema = '"' + receipt.owner_role + '"', '"' + receipt.address_source.schema_name + '"'
+    changes_by_drift = {
+        "set_owner": (f'GRANT {owner} TO "{actor}" WITH INHERIT FALSE, SET TRUE',),
+        "transitive_set_owner": (
+            f'GRANT {owner} TO "{reader}" WITH INHERIT FALSE, SET TRUE',
+            f'GRANT "{reader}" TO "{actor}" WITH INHERIT FALSE, SET TRUE',
+        ),
+        "write": (f'GRANT UPDATE ON {schema}.entity_address_unified TO "{actor}"',),
+        "create": (f'GRANT CREATE ON SCHEMA {schema} TO "{actor}"',),
+    }
+    for statement in changes_by_drift.get(drift, ()):
+        await connection.execute(statement)
+    actors = {"owner_alias": (receipt.owner_role,), "missing": ("missing_" + uuid4().hex,)}.get(drift, (actor,))
+    pin = replace(receipt.address_source, generation_id="b" * 64) if drift == "generation" else receipt.address_source
+    return pin, actors
+
+
+@pytest.mark.parametrize(
+    "drift", ["none", "owner_alias", "set_owner", "transitive_set_owner", "write", "create", "missing", "generation"]
+)
+async def test_sealed_composition_input_requires_readers_and_refuses_output_actor_authority(custom_db, drift):
+    fixture = custom_db
+    receipt = await _prepare(fixture, (await _seed(fixture)).revision)
+    connection, actor, reader = fixture.connection, fixture.roles["outsider"], fixture.roles["reader"]
+    pin = receipt.address_source
+    actors = (actor,)
+    assert not await connection.fetchval(
+        "SELECT has_table_privilege($1,$2::oid,'SELECT')", actor, receipt.address_table_oid
+    )
+    async with connection.transaction(isolation="repeatable_read"):
+        expected = await _artifact_dependency_identity(connection, pin, actors, address=True)
+        with pytest.raises(NetworkCustomAddressSourceError):
+            await _artifact_dependency_identity(connection, fixture.base, actors, address=True)
+        changed = connection.transaction()
+        await changed.start()
+        try:
+            pin, actors = await _alter_dependency_authority(connection, receipt, actor, reader, drift)
+            if drift == "none":
+                assert await _artifact_dependency_identity(connection, pin, actors, address=True) == expected
+            else:
+                with pytest.raises(NetworkCustomAddressSourceError):
+                    await _artifact_dependency_identity(connection, pin, actors, address=True)
+        finally:
+            await changed.rollback()
+        assert (
+            await _artifact_dependency_identity(connection, receipt.address_source, (actor,), address=True) == expected
+        )

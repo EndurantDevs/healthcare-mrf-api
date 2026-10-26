@@ -57,12 +57,22 @@ async def _mixed_fixture(database, monkeypatch, stack, tmp_path, state_by_name, 
     )
     assert await fixture.connection.fetchval("SELECT current_database()") == database.engine.url.database
     assert native.custom is fixture
+    stack.push_async_callback(cms.custody.remove_candidate_schemas, fixture)
     service, recipes, _ = await ptg._review_offices(native)
     assert len(recipes) == 1
     await fixture.connection.execute(
         f'GRANT "{native.fixture.source.roles[2]}" TO "{fixture.executor_role}" '
         "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"
     )
+    assert service.store.owner_role == fixture.roles["owner"] != fixture.custody_roles["owner"]
+    for role in (fixture.executor_role, fixture.custody_roles["custodian"]):
+        assert await fixture.connection.fetchval(
+            "SELECT NOT pg_has_role($1::name,$2::name,'MEMBER') "
+            "AND NOT pg_has_role($1::name,$2::name,'SET') "
+            "AND NOT pg_has_role($1::name,$2::name,'USAGE')",
+            role,
+            service.store.owner_role,
+        )
     engine = create_async_engine(fixture.execution_url, pool_size=1, max_overflow=0, hide_parameters=True)
     stack.push_async_callback(engine.dispose)
     runtime = RegistryPublicationPTGRuntime(
@@ -77,7 +87,7 @@ async def _pin(fixture):
         return await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
 
 
-async def _publish(fixture, runtime, pair, source, recipes, revision, readers):
+async def _publish(fixture, runtime, pair, source_manifest, recipes, revision, readers):
     request = uuid4()
     # Register the deterministic address artifact before native composition creates it.
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
@@ -85,19 +95,26 @@ async def _publish(fixture, runtime, pair, source, recipes, revision, readers):
             fixture.connection, approved_revision=revision, control_schema=fixture.control_schema
         )
     fixture.composition_ids.append(uuid5(request, "address:" + approved.generation_id))
-    target, address = await runtime.compose(
+    address_sources = await fixture.prepare_address_sources(
+        request_id=request,
+        approved_revision=revision,
+        expected_head=source_manifest.generation_id,
+        source_manifest=source_manifest,
+        address_sources=RegistryCompositionAddressSources(pair.address_source, replacement_source_recipes=recipes),
+    )
+    copy_target, address = await runtime.compose(
         fixture.execution_connection,
         request_id=request,
         approved_revision=revision,
-        expected_head=source.generation_id,
-        source_manifest=source,
-        address_sources=RegistryCompositionAddressSources(pair.address_source, replacement_source_recipes=recipes),
+        expected_head=source_manifest.generation_id,
+        source_manifest=source_manifest,
+        address_sources=address_sources,
         writer_roles={**fixture.writer_roles, "reader_roles": readers},
         control_schema=fixture.control_schema,
     )
     await prepare_and_publish_network_candidate(
         fixture.execution_connection,
-        target,
+        copy_target,
         address,
         **{**fixture.writer_roles, "reader_roles": readers},
         control_schema=fixture.control_schema,

@@ -124,3 +124,51 @@ async def test_mixed_batch_excludes_only_scoped_identity_only_nonmembers(native_
         assert all(entry["status"] == 200 for entry in reply.json["items"])
         assert "X-Network-Generation" not in reply.headers
     assert network_address_scope.current_network_address_scope() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_query", [None, {}], ids=("plain_body", "native_query"))
+@pytest.mark.parametrize("scoped", [True, False], ids=("canonical", "unfiltered"))
+async def test_plain_and_native_batches_share_scoped_metadata_projection(
+    native_network_batch, monkeypatch, scoped, native_query
+):
+    """The public body shape must not bypass the existing exact-office metadata projection."""
+    context = native_network_batch
+    context.retained["plans_network_array"] = [-17]
+    context.hydration.return_value = {context.member: [deepcopy(context.retained)]}
+    monkeypatch.setattr(npi, "_attach_selected_address_source_details", AsyncMock())
+
+    async def project(provider_rows, *, session, include_sources, include_evidence):
+        assert session is context.session and include_sources is True and include_evidence is False
+        scope = network_address_scope.current_network_address_scope()
+        if scope is None:
+            return provider_rows
+        assert scope.network_ids == (42,) and scope.access_scope_sha256 == "a" * 64
+        projected = deepcopy(provider_rows)
+        for provider in projected:
+            for office in provider["address_list"]:
+                office.pop("plans_network_array", None)
+                office["network_memberships"] = [{"network_id": 42, "location_id": context.retained["address_key"]}]
+        return projected
+
+    projection = AsyncMock(side_effect=project)
+    monkeypatch.setattr(npi, "_project_provider_network_metadata", projection)
+    suffix = "?network_ids=42&network_generation=12" if scoped else ""
+    request_by_field = {"npis": [context.member, context.nonmember], "include_sources": True}
+    if native_query is not None:
+        request_by_field["native_query"] = native_query
+    _, reply = await context.app.asgi_client.post(
+        "/npi/id/batch" + suffix,
+        headers={"Authorization": "Bearer synthetic-network-batch-token", "X-Network-Access-Scope": "a" * 64},
+        json=request_by_field,
+    )
+    assert reply.status == 200
+    office = reply.json["items"][0]["provider"]["address_list"][0]
+    if scoped:
+        projection.assert_awaited_once()
+        assert "plans_network_array" not in office
+        assert office["network_memberships"] == [{"network_id": 42, "location_id": context.retained["address_key"]}]
+        assert reply.headers["X-Network-Generation"] == "12"
+    else:
+        assert office["plans_network_array"] == [-17] and "network_memberships" not in office
+        assert "X-Network-Generation" not in reply.headers

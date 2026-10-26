@@ -196,6 +196,7 @@ async def test_legacy_mapping_uses_exact_generation_before_native_and_selected_p
     call = composer.resolve_registry_network_catalog_legacy.await_args
     assert call.kwargs["generation_id"] == 9 and call.kwargs["excluded_network_ids"] == (7,)
     assert boundary.state.seen[0][3].network_ids == (84,)
+    assert boundary.state.seen[0][3].legacy_checksums == (42,)
     assert composer.read_registry_provider_plans.await_args.kwargs["network_ids"] == (84,)
     composer._pin.assert_awaited_once()
 
@@ -342,3 +343,13 @@ async def test_native_absence_retains_the_authorized_actual_manifest(detail_boun
     boundary.metadata.assert_not_awaited()
     composer.read_registry_provider_plans.assert_not_awaited()
     assert not boundary.state.active and current_network_address_scope() is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_plan_rows_keep_checksum_scope(detail_boundary):
+    rows = [{"npi_info": {"checksum_network": checksum}} for checksum in (42, 84)]
+    composer.read_registry_provider_plans.return_value["npi_data"] = rows
+    result = await _read(
+        detail_boundary, selector={"namespace": "checksum_network", "values": ["42"]}, include=["plans"]
+    )
+    assert result["data"]["plans_by_npi"]["npi_data"] == rows[:1]

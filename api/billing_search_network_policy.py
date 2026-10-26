@@ -59,6 +59,8 @@ def network_scope_sha256(selection, bindings):
         "raw_bindings": [asdict(binding) for binding in selection.bindings],
         "admitted_coordinates": admitted_coordinates(selection, bindings),
     }
+    if scope.legacy_checksums is not None:
+        document_by_field["legacy_checksums"] = scope.legacy_checksums
     return _framed_sha256(_DOMAIN, _canonical_json_bytes(document_by_field))
 
 

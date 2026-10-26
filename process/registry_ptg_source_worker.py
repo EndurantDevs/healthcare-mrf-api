@@ -29,12 +29,12 @@ from process.registry_publication_worker import (
     _BoundedPool,
     _close_pool,
     _custody_config_url,
-    _custody_runtime,
     _pool_options,
     _ptg_config,
-    _ptg_runtime,
+    _qualified_worker_runtime,
     _sql_limits,
     _verify_custody_config,
+    _worker_backend_qualification,
 )
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_PTG_SOURCE_WORKER"
@@ -158,12 +158,17 @@ async def run_registry_ptg_source_worker(config, *, event=None):
     header = dict(config.event) if event is None and config.event is not None else event
     validate_registry_ptg_source_event(header)
     async with AsyncExitStack() as stack:
-        execution = await asyncpg.create_pool(**_pool_options(config.execution_url, 1, config.sql_limits))
-        stack.push_async_callback(_close_pool, execution)
         reader = await asyncpg.create_pool(**_pool_options(config.notification_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, reader)
-        execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
         reader = _BoundedPool(reader, config.sql_limits.connect_timeout_seconds)
+        async with reader.acquire() as notification:
+            qualification = await _worker_backend_qualification(config, notification, config.reader_role)
+        execution_verifier = qualification.verifier(config.consumer.execution_role)
+        execution = await asyncpg.create_pool(
+            **_pool_options(config.execution_url, 1, config.sql_limits, backend_verifier=execution_verifier)
+        )
+        stack.push_async_callback(_close_pool, execution)
+        execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
         async with execution.acquire() as connection:
             native_identity = await _identity(connection, config, config.consumer.execution_role)
             async with reader.acquire() as notification_connection:
@@ -173,8 +178,7 @@ async def run_registry_ptg_source_worker(config, *, event=None):
                     identity = await qualify_registry_ptg_source_notifications(
                         notification_connection, config.notification_store, reader_role=config.reader_role
                     )
-            consumer = _ptg_runtime(config, stack)
-            consumer = await _custody_runtime(config, stack, consumer, connection)
+            consumer = await _qualified_worker_runtime(config, stack, qualification, connection)
             await consumer.composition_runtime.qualify()
             notification_result = await consume_registry_ptg_source_notification_once(
                 connection=connection,

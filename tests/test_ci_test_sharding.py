@@ -275,14 +275,18 @@ def test_registry_shards_isolate_long_publications_and_preserve_every_case(shard
     shards = [
         SHARDER.select_nodeids(nodeids, shard_count=shard_count, shard_index=index) for index in range(shard_count)
     ]
-    assert len(heavy_nodeids) == 19
-    assert shards[:19] == [[node] for node in heavy_nodeids]
+    assert len(heavy_nodeids) == 21
+    assert heavy_nodeids[-2:] == [
+        "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[legacy]",
+        "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[modern]",
+    ]
+    assert shards[:21] == [[node] for node in heavy_nodeids]
     assert all(shards)
     assert sorted(node for shard in shards for node in shard) == sorted(nodeids)
     assert all(shard == sorted(shard) for shard in shards)
     for node in ordinary_nodeids:
         digest = int.from_bytes(hashlib.sha256(node.encode()).digest(), byteorder="big")
-        assert SHARDER.shard_index_for_nodeid(node, shard_count) == 19 + digest % (shard_count - 19)
+        assert SHARDER.shard_index_for_nodeid(node, shard_count) == 21 + digest % (shard_count - 21)
     assert SHARDER.TEST_PROCESS_TIMEOUT_SECONDS == "295s"
 
 
@@ -348,5 +352,5 @@ def test_main_cost_moves_preserve_other_layouts() -> None:
         for count in (8, 16):
             assert SHARDER.shard_index_for_nodeid(node, count) == digest % count
         for count in (32, 48):
-            assert SHARDER.shard_index_for_nodeid(node, count) == 19 + digest % (count - 19)
+            assert SHARDER.shard_index_for_nodeid(node, count) == 21 + digest % (count - 21)
     assert SHARDER.TEST_PROCESS_TIMEOUT_SECONDS == "295s"

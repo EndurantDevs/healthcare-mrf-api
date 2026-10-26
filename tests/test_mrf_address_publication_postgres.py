@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Source-local address coverage rejects omissions and later relevant edits."""
 
+import asyncio
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -10,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from db.connection import Database
+from process import mrf_address_publication as address
 from process import mrf_publication_receipt as receipt
 from process import reference_family_result_generation as generation
 from process.mrf_address_publication import lock_publication_family
@@ -171,3 +174,111 @@ async def test_address_coverage_and_content_are_bound_to_completion(monkeypatch)
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_accounting_retains_invalid_raw_rows_and_refuses_every_keyable_gap(monkeypatch):
+    """Retain invalid rows while refusing every missing canonical target and interrupted capture."""
+    schema = "mrf_raw_accounting_" + uuid4().hex
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2")
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    database = Database(engine=engine, session_factory=sessions)
+    monkeypatch.setattr(receipt, "db", database)
+    key = uuid4()
+    try:
+        await _create_address_publication_schema(engine, schema, key)
+        await _seed_raw_accounting_exceptions(engine, schema, key)
+        await _complete_address_publication(database, schema)
+        with pytest.raises(RuntimeError, match="coverage is incomplete"):
+            await _require_completed_address_publication(sessions, schema)
+        await _assert_accounted_publication(sessions, schema)
+        await _assert_accounting_cancellation(monkeypatch, sessions, schema)
+        await _assert_keyable_nulls_refused(sessions, schema)
+        await _assert_nonnull_gaps_refused(sessions, schema)
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+async def _seed_raw_accounting_exceptions(engine, schema, key):
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(f"INSERT INTO \"{schema}\".address_archive_v2 VALUES (:key,NULL,16,'original')"), {"key": key}
+        )
+        for name in address.REFERENCES:
+            table = receipt.qualified(schema, name)
+            for column in ("first_line", "second_line", "city_name", "state_name", "postal_code", "country_code"):
+                await connection.execute(text(f'ALTER TABLE {table} ADD COLUMN "{column}" text'))
+            await connection.execute(
+                text(
+                    f"UPDATE {table} SET first_line='10 Main St',city_name='Austin',state_name='TX',postal_code='78701',country_code='US'"
+                )
+            )
+            await connection.execute(
+                text(
+                    f"INSERT INTO {table} (value,first_line,city_name,state_name,postal_code,country_code) VALUES "
+                    "('invalid-state','10 Main St','Austin','invalid','78701','US'),"
+                    "('invalid-zip','10 Main St','Austin','TX','invalid','US')"
+                )
+            )
+        await connection.execute(
+            text(f'CREATE TABLE "{schema}".mrf_canonical_address AS TABLE "{schema}".address_archive_v2')
+        )
+
+
+async def _assert_accounted_publication(sessions, schema):
+    async with sessions() as session, session.begin():
+        await lock_publication_family(session, schema, receipt.qualified)
+        completed = await receipt.require_completed_publication(session, schema, native_set=True)
+        coverage = completed["native_address_coverage"]
+        for name in address.REFERENCES:
+            assert coverage["tables"][name] == {
+                "rows": 3,
+                "covered": 1,
+                "unkeyable_null": 2,
+                "keyable_null": 0,
+                "uncovered_nonnull": 0,
+            }
+            assert completed["address_content"]["tables"][name]["uncovered"] == 2
+            assert len(completed["address_content"]["tables"][name]["sha256"]) == 64
+        await address.validate_canonical_closure(session, "mrf", schema, receipt.qualified, address_coverage=coverage)
+        with pytest.raises(RuntimeError, match="closure is incomplete"):
+            await address.validate_canonical_closure(session, "mrf", schema, receipt.qualified)
+
+
+async def _assert_accounting_cancellation(monkeypatch, sessions, schema):
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(address, "address_key_v1", Mock(side_effect=asyncio.CancelledError()))
+        async with sessions() as session:
+            with pytest.raises(asyncio.CancelledError):
+                async with session.begin():
+                    await address.capture_address_content(session, schema, receipt.qualified, native_set=True)
+            assert not session.in_transaction()
+            assert await session.scalar(text("SELECT 1")) == 1
+
+
+async def _assert_keyable_nulls_refused(sessions, schema):
+    for name in address.REFERENCES:
+        for assignment in ("state_name='TX'", "first_line=NULL,state_name='TX'"):
+            async with sessions() as session, session.begin():
+                await session.execute(text(f"UPDATE \"{schema}\".{name} SET {assignment} WHERE value='invalid-state'"))
+                observed = await address.capture_address_content(session, schema, receipt.qualified, native_set=True)
+                assert observed["tables"][name]["keyable_null"] == 1
+                with pytest.raises(RuntimeError, match="coverage is incomplete"):
+                    address.require_address_coverage(observed)
+                await session.rollback()
+
+
+async def _assert_nonnull_gaps_refused(sessions, schema):
+    for assignment in ("source_bits=0", "merged_into=address_key", "address_key=:other"):
+        async with sessions() as session, session.begin():
+            await session.execute(text(f'UPDATE "{schema}".address_archive_v2 SET {assignment}'), {"other": uuid4()})
+            observed = await address.capture_address_content(session, schema, receipt.qualified, native_set=True)
+            assert all(counts["uncovered_nonnull"] == 1 for counts in observed["tables"].values())
+            with pytest.raises(RuntimeError, match="coverage is incomplete"):
+                address.require_address_coverage(observed)
+            await session.rollback()

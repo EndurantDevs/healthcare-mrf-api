@@ -39,13 +39,13 @@ from process.registry_publication_worker import (
     _BoundedPool,
     _close_pool,
     _custody_config_url,
-    _custody_runtime,
     _initial_sources,
     _pool_options,
     _ptg_config,
-    _ptg_runtime,
+    _qualified_worker_runtime,
     _sql_limits,
     _verify_custody_config,
+    _worker_backend_qualification,
 )
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_ACA_SOURCE_WORKER"
@@ -137,10 +137,14 @@ def parse_registry_aca_source_worker_config(encoded):
 
 
 def _consumer_config(document):
-    """Select exactly one server-held logical worker or global-epoch worker variant."""
+    """Select one closed logical-source, initial-batch or global-epoch worker variant."""
     consumer_fields_map = dict(document)
     required_names = {"control_schema", "execution_role", "owner_role"}
-    if "global_epoch" in consumer_fields_map:
+    if "initial_batch" in consumer_fields_map:
+        required_names.add("initial_batch")
+        if consumer_fields_map["initial_batch"] is not True:
+            _invalid()
+    elif "global_epoch" in consumer_fields_map:
         required_names.add("global_epoch")
         if consumer_fields_map["global_epoch"] is not True:
             _invalid()
@@ -208,14 +212,17 @@ async def run_registry_aca_source_worker(config, *, event=None):
     header = dict(config.event) if event is None and config.event is not None else event
     validate_registry_aca_source_event(header)
     async with AsyncExitStack() as stack:
-        execution = await asyncpg.create_pool(**_pool_options(config.execution_url, 1, config.sql_limits))
-        stack.push_async_callback(_close_pool, execution)
         reader = await asyncpg.create_pool(**_pool_options(config.notification_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, reader)
-        execution, reader = (
-            _BoundedPool(execution, config.sql_limits.connect_timeout_seconds),
-            _BoundedPool(reader, config.sql_limits.connect_timeout_seconds),
+        reader = _BoundedPool(reader, config.sql_limits.connect_timeout_seconds)
+        async with reader.acquire() as notification:
+            qualification = await _worker_backend_qualification(config, notification, config.reader_role)
+        execution_verifier = qualification.verifier(config.consumer.execution_role)
+        execution = await asyncpg.create_pool(
+            **_pool_options(config.execution_url, 1, config.sql_limits, backend_verifier=execution_verifier)
         )
+        stack.push_async_callback(_close_pool, execution)
+        execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
         async with execution.acquire() as connection:
             execution_identity = await _identity(connection, config, config.consumer.execution_role)
             config = await _source_config(config, execution_identity)
@@ -224,8 +231,7 @@ async def run_registry_aca_source_worker(config, *, event=None):
                     _invalid()
                 async with notification.transaction(isolation="repeatable_read", readonly=True):
                     identity = await config.notification_store.qualify(notification, writing=False)
-            consumer = _ptg_runtime(config, stack)
-            consumer = await _custody_runtime(config, stack, consumer, connection)
+            consumer = await _qualified_worker_runtime(config, stack, qualification, connection)
             if consumer.seal_candidate is None:
                 _invalid()
             await consumer.composition_runtime.qualify()

@@ -20,7 +20,7 @@ from process.network_address_projection import _identifier
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_fhir_source_epoch import validate_retained_cms_fhir_source_epoch
-from process.network_legacy_membership_source import PinnedACAMembershipSource
+from process.network_legacy_membership_source import PinnedACAMembershipSource, aca_source_descriptor
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
 from process.reference_family_archive import (
@@ -37,6 +37,7 @@ MAX_SOURCE_RECIPE_BYTES = 524288
 MAX_SOURCE_RECIPE_INPUT_BYTES = 1048576
 RECIPE_DIGEST_KEY = "registry_source_recipes"
 SELECTION_POLICY = "approved-bindings-only"
+_ACA_BATCH_KIND = "aca_initial_batch"
 
 
 class RegistrySourceRecipeError(ValueError):
@@ -66,7 +67,7 @@ def _validate_recipe_scope(recipe):
     elif type(source_pin) is PinnedACAMembershipSource:
         ownership = source_pin.prepared.ownership
         expected_scope = ("aca", source_pin.source_id, ownership.schema_name, str(ownership.dataset_id))
-        if source_pin.prepared.manifest.importer_id != "mrf" or source_pin.prepared.manifest.source_metadata.get(
+        if source_pin.prepared.manifest.importer_id != "mrf" or aca_source_descriptor(source_pin).get(
             "network_bindings"
         ) != {**asdict(coordinates), "source_key_kind": "hios_plan_id"}:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
@@ -214,10 +215,11 @@ def _decode_recipe(document):
 def _decode_fhir_pin(document):
     """Decode the unchanged legacy pin or the complete retained CMS custody pin."""
     all_names = {field.name for field in fields(PinnedFHIRMembershipSource)}
-    custody_names = all_names - {"retained_epoch"}
+    custody_names = all_names - {"retained_epoch", "retained_capture"}
     legacy_names = {name for name in custody_names if not name.startswith("custody_")}
     epoch_names = legacy_names | {"retained_epoch"}
-    if type(document) is not dict or set(document) not in (legacy_names, custody_names, epoch_names):
+    capture_names = legacy_names | {"retained_capture"}
+    if type(document) is not dict or set(document) not in (legacy_names, custody_names, epoch_names, capture_names):
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
     values_by_name = dict(document)
     if set(document) == custody_names:
@@ -228,6 +230,12 @@ def _decode_fhir_pin(document):
         if type(document["retained_epoch"]) is not dict:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         values_by_name["retained_epoch"] = validate_retained_cms_fhir_source_epoch(document["retained_epoch"])
+    if set(document) == capture_names:
+        from process.network_fhir_retained_capture_contract import validate_capture
+
+        if type(document["retained_capture"]) is not dict:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        values_by_name["retained_capture"] = validate_capture(document["retained_capture"])
     return PinnedFHIRMembershipSource(**values_by_name)
 
 
@@ -256,9 +264,7 @@ def _recipe_document(recipe):
                 RegistryNetworkSourceCoordinates(
                     **{
                         key: coordinate_value
-                        for key, coordinate_value in successor.prepared.manifest.source_metadata[
-                            "network_bindings"
-                        ].items()
+                        for key, coordinate_value in aca_source_descriptor(successor)["network_bindings"].items()
                         if key != "source_key_kind"
                     }
                 ),
@@ -302,17 +308,95 @@ def _reject_json_constant(value):
     raise RegistrySourceRecipeError("registry_source_recipes_invalid")
 
 
+def _is_initial_batch_prepared(prepared):
+    """Recognize only the closed initial ACA capture, never an arbitrary shared object."""
+    if type(prepared) is not dict or set(prepared) != {"manifest", "ownership"}:
+        return False
+    manifest = prepared["manifest"]
+    return (
+        type(manifest) is dict
+        and type(manifest.get("source_metadata")) is dict
+        and "registry_aca_initial_batch" in manifest["source_metadata"]
+    )
+
+
+def _pack_recipe_documents(documents):
+    """Share only identical initial-batch capture and validation within this array."""
+    ordinary, batches_by_capture = [], {}
+    for document in sorted(documents, key=_canonical_json):
+        pin = document["source_pin"]
+        if document["source_kind"] != "aca" or not _is_initial_batch_prepared(pin["prepared"]):
+            ordinary.append(document)
+            continue
+        capture_map = {name: pin[name] for name in ("prepared", "validation")}
+        key = _canonical_json(capture_map)
+        if key not in batches_by_capture:
+            batches_by_capture[key] = {"source_kind": _ACA_BATCH_KIND, **capture_map, "recipes": []}
+        batches_by_capture[key]["recipes"].append(
+            {**document, "source_pin": {name: value for name, value in pin.items() if name not in capture_map}}
+        )
+    return sorted([*ordinary, *batches_by_capture.values()], key=_canonical_json)
+
+
+def _batch_recipe_documents(document):
+    """Restore shallow views of one bounded capture; reject overrides and nesting."""
+    if (
+        set(document) != {"source_kind", "prepared", "validation", "recipes"}
+        or not _is_initial_batch_prepared(document["prepared"])
+        or type(document["validation"]) is not dict
+        or type(document["recipes"]) is not list
+        or not 1 <= len(document["recipes"]) <= MAX_SOURCE_RECIPES
+    ):
+        raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    for child in document["recipes"]:
+        if (
+            type(child) is not dict
+            or child.get("source_kind") != "aca"
+            or type(child.get("source_pin")) is not dict
+            or {"prepared", "validation"} & child["source_pin"].keys()
+        ):
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        yield {
+            **child,
+            "source_pin": {
+                **child["source_pin"],
+                "prepared": document["prepared"],
+                "validation": document["validation"],
+            },
+        }
+
+
+def _decode_wire_recipes(documents):
+    """Bound logical recipes before expanding any shared capture or returning output."""
+    count = 0
+    for document in documents:
+        if type(document) is not dict:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        children = document.get("recipes") if document.get("source_kind") == _ACA_BATCH_KIND else None
+        if document.get("source_kind") == _ACA_BATCH_KIND and type(children) is not list:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        count += len(children) if children is not None else 1
+        if count > MAX_SOURCE_RECIPES:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    recipes = []
+    for document in documents:
+        children = _batch_recipe_documents(document) if document.get("source_kind") == _ACA_BATCH_KIND else (document,)
+        recipes.extend(_decode_recipe(child) for child in children)
+    return tuple(recipes)
+
+
 def canonical_registry_source_recipes(recipes) -> str:
     """Validate and sort a complete recipe batch into bounded canonical UTF-8 JSON."""
     try:
         if type(recipes) not in {tuple, list} or len(recipes) > MAX_SOURCE_RECIPES:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        documents = json.loads(_canonical_json([_recipe_document(recipe) for recipe in recipes]))
-        decoded_recipes = [_decode_recipe(document) for document in documents]
+        documents = _pack_recipe_documents([_recipe_document(recipe) for recipe in recipes])
+        canonical = _canonical_json(documents)
+        decoded_recipes = _decode_wire_recipes(json.loads(canonical))
         identities = [(type(recipe.source_pin).__name__, recipe.source_pin.generation_id) for recipe in decoded_recipes]
         if len(set(identities)) != len(identities):
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        return _canonical_json(sorted(documents, key=_canonical_json))
+        return canonical
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError, ReferenceFamilyArchiveError:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid") from None
 
@@ -324,9 +408,9 @@ def decode_registry_source_recipes(value) -> tuple[RegistrySourceMembershipRecip
         if type(documents) is not list or len(documents) > MAX_SOURCE_RECIPES:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         _canonical_json(documents)
-        recipes = tuple(_decode_recipe(document) for document in documents)
+        recipes = _decode_wire_recipes(documents)
         canonical = canonical_registry_source_recipes(recipes)
-        return tuple(_decode_recipe(document) for document in json.loads(canonical))
+        return _decode_wire_recipes(json.loads(canonical))
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError, ReferenceFamilyArchiveError:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid") from None
 

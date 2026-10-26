@@ -236,7 +236,8 @@ async def test_continuation_keeps_http_ceiling_and_existing_operation_cap(monkey
         if global_timeout == 600:
             assert anchor + 302 <= request.operation_deadline <= asyncio.get_running_loop().time() + 300
         else:
-            assert request.operation_deadline == anchor + 299
+            # Preserve the HTTP ceiling's floating-point operation order.
+            assert request.operation_deadline == (anchor + 300) - 1
         absolute.assert_called_once_with(request.operation_deadline)
         relative.assert_not_called()
     else:

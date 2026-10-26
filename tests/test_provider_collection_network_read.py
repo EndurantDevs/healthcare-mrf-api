@@ -144,6 +144,7 @@ async def test_selected_and_retained_scope_precedes_native(boundary, namespace, 
         organization_policy=policy,
     )
     assert boundary.state.seen[0][2].network_ids == (84,)
+    assert boundary.state.seen[0][2].legacy_checksums == ((42,) if namespace == "checksum_network" else None)
     detail._pin.assert_awaited_once_with(boundary.driver, 9, "sample_registry")
     if namespace == "canonical":
         assert boundary.driver.fetchval.await_args.args[1:] == (4, ["84"], ["7"])

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from sqlalchemy import text
 
 from api import custom_import_read_http as transport
-from api.network_address_scope import network_address_read_scope
+from api.network_address_scope import current_network_address_scope, network_address_read_scope
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
 from process.network_serving_read import resolve_network_serving_manifest
 
@@ -38,6 +38,7 @@ class ProviderNetworkBinding:
     manifest_sha256: str
     network_ids: tuple[int, ...]
     access_scope_sha256: str
+    legacy_checksums: tuple[int, ...] | None = None
 
 
 def parse_provider_network_binding(document: dict) -> ProviderNetworkBinding | None:
@@ -47,10 +48,11 @@ def parse_provider_network_binding(document: dict) -> ProviderNetworkBinding | N
         return None
     binding = document["network_binding"]
     invalid = CustomImportReadRequestError("canonical provider binding is invalid")
-    if type(binding) is not dict or set(binding) != _BINDING_FIELDS:
+    if type(binding) is not dict or set(binding) not in (_BINDING_FIELDS, _BINDING_FIELDS | {"legacy_checksums"}):
         raise invalid
     _validate_authority(binding)
     identities = _binding_network_ids(binding)
+    legacy_checksums = _binding_legacy_checksums(binding)
     if type(document["native_query"]) is not dict or set(document["native_query"]) & {
         "plan_network",
         "plan_release_id",
@@ -65,6 +67,7 @@ def parse_provider_network_binding(document: dict) -> ProviderNetworkBinding | N
         binding["manifest_sha256"],
         identities,
         hashlib.sha256(transport._canonical_json_bytes(binding)).hexdigest(),
+        legacy_checksums,
     )
 
 
@@ -113,6 +116,40 @@ def _binding_network_ids(binding):
     return tuple(identities)
 
 
+def _binding_legacy_checksums(binding):
+    """Retain only a closed, signed and canonical legacy office subset."""
+
+    if "legacy_checksums" not in binding:
+        return None
+    checksums = binding["legacy_checksums"]
+    if (
+        type(checksums) is not list
+        or not 1 <= len(checksums) <= 50
+        or any(type(checksum) is not int or not -2147483648 <= checksum <= 2147483647 for checksum in checksums)
+        or checksums != sorted(set(checksums))
+    ):
+        raise CustomImportReadRequestError("canonical provider binding is invalid")
+    return tuple(checksums)
+
+
+async def _require_legacy_mapping(driver, manifest, binding):
+    """Recheck the signed subset against the same pinned approved catalog."""
+
+    from db.registry_schema import registry_schema
+    from process.network_address_projection import _identifier
+    from process.registry_network_catalog_read import _LEGACY_BATCH_SQL
+
+    mapping = await driver.fetchrow(
+        _LEGACY_BATCH_SQL.format(control=_identifier(registry_schema())),
+        manifest.approved_custom_revision,
+        tuple(map(str, binding.legacy_checksums)),
+        "checksum_network",
+        (),
+    )
+    if mapping is None or mapping["complete"] is not True or mapping["network_ids"] != list(binding.network_ids):
+        raise CustomImportReadUnavailableError("canonical provider legacy scope is unavailable")
+
+
 @asynccontextmanager
 async def provider_network_read_scope(session, binding: ProviderNetworkBinding | None):
     """Resolve and hold the eligible retained heap in the caller's Reader transaction."""
@@ -128,7 +165,14 @@ async def provider_network_read_scope(session, binding: ProviderNetworkBinding |
     ):
         raise CustomImportReadUnavailableError("canonical provider generation is unavailable")
     await session.execute(text(f'LOCK TABLE "{manifest.schema_name}".entity_address_unified IN ACCESS SHARE MODE'))
-    with network_address_read_scope(manifest, binding.network_ids, access_scope_sha256=binding.access_scope_sha256):
+    if binding.legacy_checksums is not None:
+        await _require_legacy_mapping(driver, manifest, binding)
+    with network_address_read_scope(
+        manifest,
+        binding.network_ids,
+        access_scope_sha256=binding.access_scope_sha256,
+        legacy_checksums=binding.legacy_checksums,
+    ):
         yield manifest
 
 
@@ -138,4 +182,7 @@ def provider_network_response(body, manifest):
     reply = transport._response(body, 200)
     if manifest is not None:
         reply.headers["X-Network-Generation"] = str(manifest.generation_id)
+        scope = current_network_address_scope()
+        if scope is not None and scope.manifest is manifest and scope.legacy_checksums is not None:
+            reply.headers["X-Network-Legacy-Checksums"] = ",".join(map(str, scope.legacy_checksums))
     return reply

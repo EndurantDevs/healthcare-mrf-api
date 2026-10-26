@@ -3,7 +3,7 @@
 
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from uuid import UUID, uuid5
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
@@ -12,7 +12,15 @@ from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_approved_membership_source import (
     pin_approved_membership_source,
 )
-from process.network_custom_address_source import CustomAddressSourceArguments, prepare_recipe_address_source
+from process.network_custom_address_source import (
+    CustomAddressSourceArguments,
+    CustomAddressSourceReceipt,
+    _artifact_dependency_identity,
+    _require_transaction,
+    _source_identity,
+    prepare_recipe_address_source,
+    verify_custom_address_source,
+)
 from process.network_em_provider_inputs import (
     EMProviderInputs,
     prepare_em_provider_inputs,
@@ -20,6 +28,7 @@ from process.network_em_provider_inputs import (
     resolve_em_provider_inputs,
 )
 from process.network_membership_candidate_lifecycle import (
+    _locked_candidate,
     create_network_candidate,
     seal_network_candidate,
 )
@@ -29,7 +38,10 @@ from process.network_membership_writer_closure import (
     freeze_network_candidate_writers,
     verify_network_candidate_writer_closure,
 )
-from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
+from process.network_serving_read import (
+    PinnedNetworkServingManifest,
+    resolve_network_serving_manifest,
+)
 from process.registry_company_approval_fence import (
     _company_approval_connection,
     _company_approval_snapshot,
@@ -39,7 +51,7 @@ from process.registry_initial_source_composition import (
     SUMMARY_KEY,
     initial_source_office_receipt_sha256,
     prepare_initial_source_offices,
-    record_initial_source_offices,
+    record_initial_source_offices_with_reads,
     validate_initial_source_recipes,
     verify_initial_source_office_receipt,
 )
@@ -49,7 +61,10 @@ from process.registry_membership_composition_stage import (
     stage_approved_membership_commands,
 )
 from process.registry_source_observation_store import _namespace
-from process.registry_source_recipe_composition import RegistrySourceRecipeStage, stage_registry_source_recipes
+from process.registry_source_recipe_composition import (
+    RegistrySourceRecipeStage,
+    stage_registry_source_recipes,
+)
 from process.registry_source_recipe_store import (
     RECIPE_DIGEST_KEY,
     canonical_registry_source_recipes,
@@ -71,6 +86,26 @@ class RegistryCompositionError(ValueError):
 
 
 @dataclass(frozen=True)
+class RegistryRetainedAddressArtifact:
+    """An independently closed base reused without creating a loading-owner copy."""
+
+    address_source: PinnedAddressSource
+    runtime_roles: tuple[str, ...]
+    generation_sha256: str
+    original_source: PinnedAddressSource
+
+
+def _retained_address_artifact(source, runtime_roles):
+    """Keep the source pin while giving non-digest labels a canonical receipt identity."""
+    generation = source.generation_id
+    if len(generation) != 64 or any(character not in "0123456789abcdef" for character in generation):
+        generation = hashlib.sha256(
+            json.dumps(asdict(source), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    return RegistryRetainedAddressArtifact(replace(source, generation_id=generation), runtime_roles, generation, source)
+
+
+@dataclass(frozen=True)
 class RegistryCompositionAddressSources:
     base_source: PinnedAddressSource
     npi_source: PinnedAddressSource | None = None
@@ -79,6 +114,7 @@ class RegistryCompositionAddressSources:
     office_scope_store: object = None
     office_read_budget: object = None
     em_provider_inputs: EMProviderInputs | None = None
+    prepared_address_artifact: CustomAddressSourceReceipt | None = None
 
     def __post_init__(self):
         if type(self.base_source) is not PinnedAddressSource or (
@@ -89,6 +125,11 @@ class RegistryCompositionAddressSources:
             raise RegistryCompositionError("registry_composition_initial_sources_invalid")
         if self.em_provider_inputs is not None and type(self.em_provider_inputs) is not EMProviderInputs:
             raise RegistryCompositionError("registry_composition_em_provider_inputs_invalid")
+        if (
+            self.prepared_address_artifact is not None
+            and type(self.prepared_address_artifact) is not CustomAddressSourceReceipt
+        ):
+            raise RegistryCompositionError("registry_composition_address_artifact_invalid")
         if self.initial_source_recipes and self.replacement_source_recipes:
             raise RegistryCompositionError("registry_composition_initial_sources_invalid")
         for name in ("initial_source_recipes", "replacement_source_recipes"):
@@ -177,7 +218,14 @@ async def _bindings(connection, copy_target, artifact, source_manifest, control_
       provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,
       location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,
       PRIMARY KEY(provider_system,provider_id,location_id))""")
-    bindings = f"SELECT * FROM {custom_namespace}.provider_location_binding"
+    binding_relation = f"{custom_namespace}.provider_location_binding"
+    if await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", binding_relation):
+        bindings = f"SELECT * FROM {binding_relation}"
+    else:
+        bindings = (
+            "SELECT NULL::text AS provider_system,NULL::text AS provider_id,NULL::uuid AS location_id,"
+            "NULL::varchar(64) AS location_key,NULL::text AS entity_type,NULL::text AS entity_id WHERE false"
+        )
     if source_manifest is not None:
         retained = _identifier(source_manifest.schema_name)
         relation, predicate, _ = await _retained_memberships(connection, source_manifest, control_schema)
@@ -276,22 +324,35 @@ async def _composition_sources(
     office_authority=None,
     expected_head=None,
 ):
-    generations_by_source, source_rows = await _retained_source(connection, source_manifest, control_schema)
-    from process.registry_ptg_office_selection import (
-        require_ptg_startup_selection,
+    """Keep standalone source selection's original authority and head arguments."""
+    return await _composition_sources_with_reads(
+        connection,
+        source_manifest,
+        approved,
+        request_id,
+        control_schema,
+        initial_recipes,
+        (office_authority, None),
+        expected_head,
     )
 
-    retained = (
-        await resolve_retained_registry_source_recipes(connection, source_manifest, control_schema=control_schema)
-        if source_manifest is not None and RECIPE_DIGEST_KEY in source_manifest.source_generations
-        else ()
+
+async def _composition_sources_with_reads(
+    connection,
+    source_manifest,
+    approved,
+    request_id,
+    control_schema,
+    initial_recipes,
+    office_phase,
+    expected_head,
+):
+    office_authority, retained_fhir_reads, *verified_inputs = office_phase
+    verified_office_inputs = verified_inputs[0] if verified_inputs else None
+    generations_by_source, source_rows = await _retained_source(connection, source_manifest, control_schema)
+    retained, recipes = await _composition_source_recipes(
+        connection, source_manifest, approved, initial_recipes, control_schema, office_authority, expected_head
     )
-    selected = await _selected_source_recipes(
-        connection, retained, approved, source_manifest, (control_schema, office_authority, expected_head)
-    )
-    if initial_recipes:
-        require_ptg_startup_selection(initial_recipes, selected)
-    recipes = initial_recipes or selected
     has_selection_changed = canonical_registry_source_recipes(recipes) != canonical_registry_source_recipes(retained)
     if (
         not recipes
@@ -309,18 +370,191 @@ async def _composition_sources(
         request_id=request_id,
         control_schema=control_schema,
         office_authority=office_authority,
+        retained_fhir_reads=retained_fhir_reads,
+        verified_office_inputs=verified_office_inputs
+        if approved.total_rows == 0 and _retained_fhir_only(recipes)
+        else None,
     )
     if initial_recipes or has_selection_changed:
         generations_by_source.pop(RECIPE_DIGEST_KEY, None)
     generations_by_source["registry_source_membership"] = source_stage.generation_sha256
-    if initial_recipes:
+    if initial_recipes or source_stage.office_matches is not None:
         generations_by_source.update(
             {
                 f"initial_source_recipe_{index}": generation
-                for index, generation in enumerate(source_stage.source_generations)
+                for index, generation in enumerate(
+                    source_stage.raw_source_generations or source_stage.source_generations
+                )
             }
         )
     return generations_by_source, source_stage.membership_rows, recipes, source_stage
+
+
+async def _composition_source_recipes(
+    connection, source_manifest, approved, introduced, control_schema, office_authority, expected_head
+):
+    """Resolve only exact recipe metadata before any source rows or address artifact are staged."""
+    from process.registry_ptg_office_selection import require_ptg_startup_selection
+
+    retained = (
+        await resolve_retained_registry_source_recipes(connection, source_manifest, control_schema=control_schema)
+        if source_manifest is not None and RECIPE_DIGEST_KEY in source_manifest.source_generations
+        else ()
+    )
+    selected = await _selected_source_recipes(
+        connection, retained, approved, source_manifest, (control_schema, office_authority, expected_head)
+    )
+    if introduced:
+        require_ptg_startup_selection(introduced, selected)
+    return retained, introduced or selected
+
+
+def _address_arguments(request_id, approved, owner_role, runtime_roles, address_sources, control_schema):
+    """Keep the same deterministic address recipe across independent preparation and consumption."""
+    return CustomAddressSourceArguments(
+        composition_id=str(uuid5(request_id, "address:" + approved.generation_id)),
+        approved_revision=approved.approved_revision,
+        owner_role=owner_role,
+        runtime_roles=runtime_roles,
+        control_schema=control_schema,
+        npi_source=address_sources.npi_source,
+    )
+
+
+@dataclass(frozen=True)
+class RegistryAddressArtifactCustody:
+    """Fixed owner and runtime census supplied by the qualified independent custodian."""
+
+    owner_role: str
+    runtime_roles: tuple[str, ...]
+    control_schema: str
+
+    def __post_init__(self):
+        _identifier(self.owner_role)
+        _namespace(self.control_schema)
+        if (
+            type(self.runtime_roles) is not tuple
+            or not 1 <= len(self.runtime_roles) <= 128
+            or any(type(role) is not str for role in self.runtime_roles)
+            or tuple(sorted(set(self.runtime_roles))) != self.runtime_roles
+            or self.owner_role in self.runtime_roles
+        ):
+            raise RegistryCompositionError("registry_composition_address_artifact_roles_differ")
+        for role in self.runtime_roles:
+            _identifier(role)
+
+
+def _retained_fhir_only(recipes):
+    """Recognize the existing no-custom path without treating an empty recipe set as FHIR."""
+    from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+
+    return bool(recipes) and all(
+        type(recipe.source_pin) is PinnedFHIRMembershipSource and recipe.source_pin.retained_capture is not None
+        for recipe in recipes
+    )
+
+
+async def _verify_retained_address_sources(connection, sources, runtime_roles, control_schema):
+    """Keep optional authenticated NPI custody even when no NPI-derived row is constructed."""
+    await _artifact_dependency_identity(
+        connection, sources.base_source, runtime_roles, address=True, control_schema=control_schema
+    )
+    if sources.npi_source is not None:
+        await _artifact_dependency_identity(connection, sources.npi_source, runtime_roles)
+
+
+async def prepare_registry_composition_address_artifact(
+    connection,
+    *,
+    request_id,
+    approved_revision,
+    address_sources,
+    source_manifest,
+    expected_head,
+    custody,
+    office_authority=None,
+):
+    """Prepare one sealed artifact in the independent custodian's caller-owned transaction.
+
+    The trusted caller supplies source selection and the runtime census. Execution
+    replays the exact recipe after commit; publication authority is checked separately.
+    """
+    if (
+        type(request_id) is not UUID
+        or not request_id.int
+        or type(address_sources) is not RegistryCompositionAddressSources
+        or address_sources.prepared_address_artifact is not None
+        or type(custody) is not RegistryAddressArtifactCustody
+    ):
+        raise RegistryCompositionError("registry_composition_address_artifact_invalid")
+    await _require_transaction(connection)
+    actor = await connection.fetchrow(
+        "SELECT session_user::text AS login,current_user::text AS actor,rolcanlogin,rolsuper,rolcreatedb,"
+        "rolcreaterole,rolreplication,rolbypassrls FROM pg_roles WHERE rolname=session_user"
+    )
+    if (
+        not actor
+        or actor["login"] != actor["actor"]
+        or not actor["rolcanlogin"]
+        or any(actor[name] for name in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls"))
+    ):
+        raise RegistryCompositionError("registry_composition_artifact_custodian_invalid")
+    _require_source_recipe_phase(address_sources, source_manifest, expected_head)
+    approved = await pin_approved_membership_source(
+        connection, approved_revision=approved_revision, control_schema=custody.control_schema
+    )
+    _, recipes = await _composition_source_recipes(
+        connection,
+        source_manifest,
+        approved,
+        address_sources.introduced_source_recipes,
+        custody.control_schema,
+        office_authority,
+        expected_head,
+    )
+    if approved.total_rows == 0 and _retained_fhir_only(recipes):
+        await _verify_retained_address_sources(
+            connection, address_sources, custody.runtime_roles, custody.control_schema
+        )
+        return None
+    arguments = _address_arguments(
+        request_id, approved, custody.owner_role, custody.runtime_roles, address_sources, custody.control_schema
+    )
+    return await prepare_recipe_address_source(
+        connection, address_sources.base_source, arguments, (recipes, office_authority)
+    )
+
+
+async def _prepared_address_artifact(
+    connection, receipt, address_sources, request_id, approved, writer_roles, control_schema, office_inputs
+):
+    """Read only: require the exact independently sealed recipe and complete executing-role closure."""
+    actor = await connection.fetchval("SELECT session_user::text")
+    required_roles = {
+        actor,
+        writer_roles["owner_role"],
+        *writer_roles["loader_roles"],
+        *writer_roles["reader_roles"],
+    }
+    if not required_roles <= set(receipt.runtime_roles) or receipt.owner_role in required_roles:
+        raise RegistryCompositionError("registry_composition_address_artifact_roles_differ")
+    await verify_custom_address_source(connection, receipt)
+    arguments = _address_arguments(
+        request_id, approved, receipt.owner_role, receipt.runtime_roles, address_sources, control_schema
+    )
+    if (
+        receipt.composition_id != arguments.composition_id
+        or receipt.approved_revision != arguments.approved_revision
+        or receipt.control_schema != arguments.control_schema
+        or receipt.base_source != address_sources.base_source
+        or arguments.npi_source is not None
+        and receipt.npi_source != arguments.npi_source
+    ):
+        raise RegistryCompositionError("registry_composition_address_artifact_changed")
+    artifact = await prepare_recipe_address_source(connection, address_sources.base_source, arguments, office_inputs)
+    if artifact != receipt:
+        raise RegistryCompositionError("registry_composition_address_artifact_changed")
+    return artifact
 
 
 async def _composition_artifact(
@@ -333,19 +567,93 @@ async def _composition_artifact(
     office_authority=None,
     source_recipes=(),
 ):
-    arguments = CustomAddressSourceArguments(
-        composition_id=str(uuid5(request_id, "address:" + approved.generation_id)),
-        approved_revision=approved.approved_revision,
-        owner_role=writer_roles["owner_role"],
-        runtime_roles=tuple(sorted(set(writer_roles["loader_roles"] + writer_roles["reader_roles"]))),
-        control_schema=control_schema,
-        npi_source=address_sources.npi_source,
+    """Keep standalone address preparation's original recipe and authority arguments."""
+    return await _composition_artifact_with_reads(
+        connection,
+        address_sources,
+        request_id,
+        approved,
+        writer_roles,
+        control_schema,
+        office_authority,
+        (source_recipes, None),
     )
-    artifact = await prepare_recipe_address_source(
-        connection, address_sources.base_source, arguments, (source_recipes, office_authority)
+
+
+async def _composition_artifact_with_reads(
+    connection,
+    address_sources,
+    request_id,
+    approved,
+    writer_roles,
+    control_schema,
+    office_authority,
+    source_phase,
+):
+    """Keep retained office mapping in the same preparation snapshot and scope."""
+    source_recipes = source_phase[0]
+    arguments = _address_arguments(
+        request_id,
+        approved,
+        writer_roles["owner_role"],
+        tuple(sorted(set(writer_roles["loader_roles"] + writer_roles["reader_roles"]))),
+        address_sources,
+        control_schema,
     )
+    if address_sources.prepared_address_artifact is not None:
+        artifact = await _prepared_address_artifact(
+            connection,
+            address_sources.prepared_address_artifact,
+            address_sources,
+            request_id,
+            approved,
+            writer_roles,
+            control_schema,
+            (source_recipes, office_authority),
+        )
+    elif approved.total_rows == 0 and _retained_fhir_only(source_recipes):
+        await _verify_retained_address_sources(connection, address_sources, arguments.runtime_roles, control_schema)
+        artifact = _retained_address_artifact(address_sources.base_source, arguments.runtime_roles)
+    else:
+        artifact = await prepare_recipe_address_source(
+            connection,
+            address_sources.base_source,
+            arguments,
+            (source_recipes, office_authority),
+        )
+    summary = await _composition_office_summary(
+        connection,
+        address_sources,
+        approved,
+        artifact,
+        arguments.runtime_roles,
+        control_schema,
+        office_authority,
+        source_phase,
+    )
+    return artifact, summary
+
+
+async def _composition_office_summary(
+    connection, address_sources, approved, artifact, runtime_roles, control_schema, office_authority, source_phase
+):
+    """Build the receipt from the same verified context or unchanged strict initial source path."""
+    source_recipes, retained_fhir_reads, *verified = source_phase
+    verified_matches = verified[0] if verified else None
     summary = None
-    if address_sources.introduced_source_recipes:
+    if verified_matches is not None:
+        from process.registry_initial_source_composition import verified_retained_source_office_summary
+
+        summary = await verified_retained_source_office_summary(
+            connection,
+            source_recipes,
+            approved,
+            artifact.address_source,
+            runtime_roles,
+            control_schema,
+            verified_matches,
+        )
+    elif address_sources.introduced_source_recipes:
         summary = await prepare_initial_source_offices(
             connection,
             address_sources.introduced_source_recipes,
@@ -354,14 +662,18 @@ async def _composition_artifact(
             runtime_roles=artifact.runtime_roles,
             control_schema=control_schema,
             office_authority=office_authority,
+            retained_fhir_reads=retained_fhir_reads,
         )
-    return artifact, summary
+    return summary
 
 
 async def _record_source_receipts(
     connection, copy_target, recipes, approved, source_stage, artifact, office_phase, control_schema
 ):
-    initial_summary, office_authority = office_phase
+    initial_summary, office_authority, retained_fhir_reads, source_manifest = office_phase
+    verified_matches = source_stage.office_matches
+    if verified_matches is None:
+        await _bindings(connection, copy_target, artifact, source_manifest, control_schema)
     if recipes:
         from process.registry_source_selection_receipt import record_registry_source_selection
 
@@ -369,7 +681,7 @@ async def _record_source_receipts(
             connection, copy_target, recipes, approved, source_stage, control_schema=control_schema
         )
     if initial_summary is not None:
-        await record_initial_source_offices(
+        await record_initial_source_offices_with_reads(
             connection,
             copy_target,
             recipes,
@@ -377,7 +689,7 @@ async def _record_source_receipts(
             artifact.address_source,
             runtime_roles=artifact.runtime_roles,
             control_schema=control_schema,
-            office_authority=office_authority,
+            office_phase=(office_authority, retained_fhir_reads, verified_matches),
         )
 
 
@@ -455,11 +767,25 @@ async def _composition_candidate(
     return candidate
 
 
-def _bind_prepared_generations(generations_by_source, approved, artifact, provider_receipt):
+def _bind_prepared_generations(generations_by_source, approved, artifact, provider_receipt, *, retention=None):
     """Bind current custom and prepared dependency proofs before deriving candidate identity."""
+    if retention is not None:
+        generations_by_source[RETENTION_KEY] = registry_source_retention_sha256(retention)
     generations_by_source.update(custom_membership=approved.generation_id, unified_address=artifact.generation_sha256)
+    if type(artifact) is RegistryRetainedAddressArtifact and artifact.original_source != artifact.address_source:
+        generations_by_source["retained_unified_address"] = artifact.original_source.generation_id
     if provider_receipt is not None:
         generations_by_source["em_provider_inputs"] = provider_receipt["receipt_sha256"]
+
+
+def _verified_office_inputs(address_sources, writer_roles):
+    """Use only an authenticated retained base when no independent artifact is supplied."""
+    if address_sources.prepared_address_artifact is not None:
+        return None
+    return (
+        _retained_address_artifact(address_sources.base_source, ()).address_source,
+        tuple(sorted(set(writer_roles["loader_roles"] + writer_roles["reader_roles"]))),
+    )
 
 
 async def _prepare_composition_snapshot(
@@ -480,24 +806,32 @@ async def _prepare_composition_snapshot(
     approved = await pin_approved_membership_source(
         connection, approved_revision=approved_revision, control_schema=control_schema
     )
-    generations_by_source, source_rows, recipes, source_stage = await _composition_sources(
+    retained_reads_by_capture = {}
+    office_phase = office_context, retained_reads_by_capture, _verified_office_inputs(address_sources, writer_roles)
+    generations_by_source, source_rows, recipes, source_stage = await _composition_sources_with_reads(
         connection,
         source_manifest,
         approved,
         request_id,
         control_schema,
         address_sources.introduced_source_recipes,
-        office_context,
+        office_phase,
         expected_head,
     )
     command_stage, retention = await _composition_retention(
         connection, approved, request_id, source_stage, control_schema
     )
-    generations_by_source[RETENTION_KEY] = registry_source_retention_sha256(retention)
-    artifact, initial_summary = await _composition_artifact(
-        connection, address_sources, request_id, approved, writer_roles, control_schema, office_context, recipes
+    artifact, initial_summary = await _composition_artifact_with_reads(
+        connection,
+        address_sources,
+        request_id,
+        approved,
+        writer_roles,
+        control_schema,
+        office_context,
+        (recipes, retained_reads_by_capture, source_stage.office_matches),
     )
-    _bind_prepared_generations(generations_by_source, approved, artifact, provider_receipt)
+    _bind_prepared_generations(generations_by_source, approved, artifact, provider_receipt, retention=retention)
     copy_target = _target(request_id, approved_revision, expected_head, generations_by_source, initial_summary)
     candidate = await _composition_candidate(
         connection,
@@ -509,16 +843,9 @@ async def _prepare_composition_snapshot(
         control_schema,
     )
     if candidate["state"] == "open":
-        await _bindings(connection, copy_target, artifact, source_manifest, control_schema)
+        office_receipt_phase = initial_summary, office_context, retained_reads_by_capture, source_manifest
         await _record_source_receipts(
-            connection,
-            copy_target,
-            recipes,
-            approved,
-            source_stage,
-            artifact,
-            (initial_summary, office_context),
-            control_schema,
+            connection, copy_target, recipes, approved, source_stage, artifact, office_receipt_phase, control_schema
         )
     return copy_target, artifact.address_source, candidate["state"], source_stage, command_stage, writer_roles
 
@@ -656,39 +983,50 @@ async def _drop_composition_stages(connection, prepared, original_error):
 
 
 async def _complete_composition(connection, prepared, source_manifest, control_schema):
-    copy_target, address_source, state, source_stage, command_stage, writer_roles = prepared
+    copy_target, address_source, _prepared_state, source_stage, command_stage, writer_roles = prepared
     original_error = None
     try:
-        if state not in {"open", "sealed", "validated", "ready", "published"}:
+        if _prepared_state not in {"open", "sealed", "validated", "ready", "published"}:
             raise RegistryCompositionError("registry_composition_candidate_unavailable")
-        if state == "open":
-            await _copy_composition(connection, copy_target, control_schema, source_stage, command_stage, writer_roles)
-        else:
-            async with connection.transaction(isolation="repeatable_read"):
-                custody = None
-                if state in {"ready", "published"}:
-                    from process.network_candidate_custody import verify_network_candidate_custody
-
-                    custody = await verify_network_candidate_custody(
-                        connection, copy_target, control_schema=control_schema, required=False
-                    )
-                if custody is None:
-                    await seal_network_candidate(
-                        connection,
-                        copy_target,
-                        control_schema=control_schema,
-                        source_stage=source_stage,
-                        command_stage=command_stage,
-                    )
-                    await verify_network_candidate_writer_closure(
-                        connection, copy_target, **writer_roles, control_schema=control_schema
-                    )
+        async with connection.transaction(isolation="repeatable_read"):
+            candidate = await _locked_candidate(connection, copy_target, _namespace(control_schema))
+            if candidate["state"] not in {"open", "sealed", "validated", "ready", "published"}:
+                raise RegistryCompositionError("registry_composition_candidate_unavailable")
+            if candidate["state"] == "open":
+                await _copy_composition(
+                    connection, copy_target, control_schema, source_stage, command_stage, writer_roles
+                )
+            else:
+                await _complete_closed_composition(connection, prepared, candidate["state"], control_schema)
     except BaseException as error:
         original_error = error
         raise
     finally:
         await _drop_composition_stages(connection, prepared, original_error)
     return copy_target, address_source
+
+
+async def _complete_closed_composition(connection, prepared, state, control_schema):
+    """Verify a newer completed phase without reopening or recopying its candidate."""
+    copy_target, _address, _old_state, source_stage, command_stage, writer_roles = prepared
+    custody = None
+    if state in {"ready", "published"}:
+        from process.network_candidate_custody import verify_network_candidate_custody
+
+        custody = await verify_network_candidate_custody(
+            connection, copy_target, control_schema=control_schema, required=False
+        )
+    if custody is None:
+        await seal_network_candidate(
+            connection,
+            copy_target,
+            control_schema=control_schema,
+            source_stage=source_stage,
+            command_stage=command_stage,
+        )
+        await verify_network_candidate_writer_closure(
+            connection, copy_target, **writer_roles, control_schema=control_schema
+        )
 
 
 def _require_source_recipe_phase(address_sources, source_manifest, expected_head):

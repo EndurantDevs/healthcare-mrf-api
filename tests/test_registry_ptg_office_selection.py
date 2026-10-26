@@ -10,6 +10,7 @@ import pytest
 from process import registry_ptg_office_selection as selection
 from process.registry_ptg_office_capture import _canonical, _digest
 from process.registry_ptg_office_membership_contract import approved_office_recipe_receipt
+from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 from process.registry_source_recipe_store import decode_registry_source_recipes
 from tests.test_registry_ptg_office_approval import _command
 
@@ -176,7 +177,7 @@ async def test_actual_composer_checks_only_new_recipe_adoption(monkeypatch, reta
     monkeypatch.setattr(
         composition, "resolve_retained_registry_source_recipes", AsyncMock(return_value=(recipe,) if retained else ())
     )
-    stage = SimpleNamespace(generation_sha256="b" * 64, membership_rows=0, source_generations=("c" * 64,))
+    stage = RegistrySourceRecipeStage("source_stage", 0, 0, "b" * 64, ("c" * 64,))
     monkeypatch.setattr(composition, "stage_registry_source_recipes", AsyncMock(return_value=stage))
     monkeypatch.setattr(selection, "resolve_ptg_office_recipe_selection", AsyncMock(return_value=(recipe,)))
     guard = AsyncMock()
@@ -184,7 +185,7 @@ async def test_actual_composer_checks_only_new_recipe_adoption(monkeypatch, reta
     await composition._composition_sources(
         object(),
         manifest,
-        SimpleNamespace(approved_revision=9),
+        SimpleNamespace(approved_revision=9, total_rows=0),
         object(),
         "control",
         (recipe,),
@@ -423,10 +424,10 @@ async def test_default_composer_consumes_shared_selection_without_startup_recipe
     selected = AsyncMock(return_value=(recipe,))
     monkeypatch.setattr(selection, "resolve_ptg_office_recipe_selection", selected)
     monkeypatch.setattr(composition, "_retained_source", AsyncMock(return_value=({}, 0)))
-    stage = SimpleNamespace(generation_sha256="a" * 64, membership_rows=1, source_generations=("b" * 64,))
+    stage = RegistrySourceRecipeStage("source_stage", 1, 0, "a" * 64, ("b" * 64,))
     staged = AsyncMock(return_value=stage)
     monkeypatch.setattr(composition, "stage_registry_source_recipes", staged)
-    approved = SimpleNamespace(approved_revision=9)
+    approved = SimpleNamespace(approved_revision=9, total_rows=0)
     connection = object()
     authority = (object(), object(), object())
     generations, count, recipes, actual_stage = await composition._composition_sources(

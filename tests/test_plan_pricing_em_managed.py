@@ -32,6 +32,7 @@ def held(monkeypatch):
     scope = SimpleNamespace(
         manifest=SimpleNamespace(schema_name="network_candidate_example", approved_custom_revision=17),
         network_ids=None,
+        legacy_checksums=None,
         excluded_network_ids=(7,),
         address_predicate_sql=address_scope._default_address_predicate(),
     )
@@ -408,3 +409,17 @@ async def test_bounded_request_parameters_reach_the_managed_query_unchanged(held
     assert parameters["radius_meters"] == float(radius) * 1609.344
     assert parameters["_network_excluded_ids"] == [7] and parameters["_network_approved_revision"] == 17
     assert response["pagination"]["limit"] == limit and response["pagination"]["offset"] == offset
+
+
+async def test_legacy_em_page_keeps_original_checksum_scope_and_admission(held):
+    held.scope.network_ids = (42,)
+    held.scope.excluded_network_ids = None
+    held.scope.legacy_checksums = (84,)
+    result = await _search(held)
+    assert len(result["items"]) == 2
+    statement, parameters_by_name = held.windows[0]
+    assert "plans_network_array && CAST(:_legacy_network_checksums AS INTEGER[])" in statement
+    assert "canonical_network_ids &&" not in statement
+    assert parameters_by_name["_legacy_network_checksums"] == [84]
+    assert parameters_by_name["_canonical_network_ids"] == [42]
+    assert parameters_by_name["allowed_binding_ordinals"] == [3, 11, 29]

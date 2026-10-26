@@ -14,6 +14,51 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionm
 from process import registry_candidate_composition as composition
 from process import registry_company_approval_fence as fence
 from process.network_address_projection import PinnedAddressSource
+from process.network_membership_copy import MembershipCopyTarget
+
+
+def _copy_target():
+    return MembershipCopyTarget(
+        *(str(UUID(int=identifier_int)) for identifier_int in range(1, 5)), "network_candidate_" + UUID(int=4).hex
+    )
+
+
+def _candidate_record(target, state, *, source_generations=None, retention=None):
+    return {
+        **{field: getattr(target, field) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id")},
+        "schema_name": target.schema_name,
+        "state": state,
+        "source_generations": {} if source_generations is None else source_generations,
+        "validation_json": {} if retention is None else {composition.RETENTION_KEY: retention},
+        "expected_rows": 0 if retention is None else retention["effective_rows"],
+    }
+
+
+@asynccontextmanager
+async def _completion_transaction(**options):
+    assert options == {"isolation": "repeatable_read"}
+    yield
+
+
+def _attach_completion_driver(driver, events):
+    @asynccontextmanager
+    async def transaction(**options):
+        assert options == {"isolation": "repeatable_read"} and not driver.is_in_transaction()
+        driver.has_transaction = True
+        events.append("completion_begin")
+        try:
+            yield
+        finally:
+            driver.has_transaction = False
+
+    async def locked_candidate(sql, candidate_id):
+        assert driver.is_in_transaction()
+        assert sql == 'SELECT * FROM "synthetic_control".network_membership_candidate WHERE candidate_id=$1 FOR UPDATE'
+        assert str(candidate_id) == driver.candidate_record["candidate_id"]
+        return driver.candidate_record
+
+    driver.transaction = transaction
+    driver.fetchrow = AsyncMock(side_effect=locked_candidate)
 
 
 def _bridge_owner(monkeypatch, failure=None):
@@ -21,6 +66,8 @@ def _bridge_owner(monkeypatch, failure=None):
     engine = create_async_engine("postgresql+asyncpg://synthetic@localhost/synthetic", pool_size=1, max_overflow=0)
     driver = SimpleNamespace(has_transaction=False, execute=AsyncMock())
     driver.is_in_transaction = lambda: driver.has_transaction
+
+    _attach_completion_driver(driver, events)
     pooled = MagicMock()
     pooled.driver_connection, pooled.is_valid = driver, True
 
@@ -72,9 +119,9 @@ def _bridge_owner(monkeypatch, failure=None):
 
 def _preparation(monkeypatch, driver, events, failure=None):
     """Keep socket-free source and command stages aligned with the preparation contract."""
-    approved = SimpleNamespace(generation_id="a" * 64, total_rows=0)
+    approved = SimpleNamespace(approved_revision=3, generation_id="a" * 64, total_rows=0)
     artifact = SimpleNamespace(address_source=object(), generation_sha256="b" * 64)
-    stage = SimpleNamespace(table_name="synthetic_stage")
+    stage = SimpleNamespace(table_name="synthetic_stage", office_matches=None)
     commands = SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals")
     retention_by_name = {
         "component": "registry_source_retention",
@@ -96,19 +143,26 @@ def _preparation(monkeypatch, driver, events, failure=None):
         return approved
 
     async def copy(connection, *args):
-        assert connection is driver and not driver.is_in_transaction()
-        assert events.index("prepare_commit") < events.index("unlock") < len(events)
+        assert connection is driver and driver.is_in_transaction()
+        assert events.index("prepare_commit") < events.index("unlock") < events.index("completion_begin")
         events.append("copy")
         if failure == "copy":
             raise RuntimeError("synthetic copy failure")
         if failure == "cancel":
             raise asyncio.CancelledError()
 
+    async def create(connection, target, **options):
+        assert connection is driver and driver.is_in_transaction()
+        driver.candidate_record = _candidate_record(
+            target, "open", source_generations=options["source_generations"], retention=options["source_retention"]
+        )
+        return driver.candidate_record
+
     monkeypatch.setattr(composition, "pin_approved_membership_source", pin)
-    monkeypatch.setattr(composition, "_composition_sources", AsyncMock(return_value=({}, 0, (), stage)))
+    monkeypatch.setattr(composition, "_composition_sources_with_reads", AsyncMock(return_value=({}, 0, (), stage)))
     monkeypatch.setattr(composition, "_composition_retention", AsyncMock(return_value=(commands, retention_by_name)))
-    monkeypatch.setattr(composition, "_composition_artifact", AsyncMock(return_value=(artifact, None)))
-    monkeypatch.setattr(composition, "create_network_candidate", AsyncMock(return_value={"state": "open"}))
+    monkeypatch.setattr(composition, "_composition_artifact_with_reads", AsyncMock(return_value=(artifact, None)))
+    monkeypatch.setattr(composition, "create_network_candidate", create)
     monkeypatch.setattr(composition, "_bindings", AsyncMock())
     monkeypatch.setattr(composition, "_record_source_receipts", AsyncMock())
     monkeypatch.setattr(composition, "_copy_composition", copy)
@@ -123,7 +177,11 @@ def _arguments():
         "address_sources": composition.RegistryCompositionAddressSources(
             PinnedAddressSource("synthetic_address", "entity_address_unified", "c" * 64)
         ),
-        "writer_roles": {},
+        "writer_roles": {
+            "owner_role": "synthetic_owner",
+            "loader_roles": ("synthetic_loader",),
+            "reader_roles": ("synthetic_reader",),
+        },
         "control_schema": "synthetic_control",
     }
 
@@ -164,14 +222,19 @@ async def test_original_failure_or_cancel_retires_real_owner_without_extra_check
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [RuntimeError("original copy failure"), asyncio.CancelledError()])
 async def test_copy_error_keeps_priority_over_stage_cleanup(monkeypatch, failure):
-    driver = SimpleNamespace(execute=AsyncMock(side_effect=RuntimeError("cleanup failed")))
+    target = _copy_target()
+    driver = SimpleNamespace(
+        transaction=_completion_transaction,
+        fetchrow=AsyncMock(return_value=_candidate_record(target, "open")),
+        execute=AsyncMock(side_effect=RuntimeError("cleanup failed")),
+    )
     prepared = (
-        object(),
+        target,
         object(),
         "open",
         SimpleNamespace(table_name="synthetic_stage"),
         SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals"),
-        {},
+        _arguments()["writer_roles"],
     )
     monkeypatch.setattr(composition, "_copy_composition", AsyncMock(side_effect=failure))
     with pytest.raises(type(failure)) as captured:
@@ -193,13 +256,15 @@ async def test_raw_caller_keeps_original_owned_preparation_and_completion(monkey
         events.append("commit")
 
     driver.transaction = transaction
+    copy_target = _copy_target()
+    driver.fetchrow = AsyncMock(return_value=_candidate_record(copy_target, "sealed"))
     prepared = (
-        object(),
+        copy_target,
         object(),
         "sealed",
         SimpleNamespace(table_name="synthetic_stage"),
         SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals"),
-        {},
+        _arguments()["writer_roles"],
     )
     snapshot = AsyncMock(return_value=prepared)
     seal, verify = AsyncMock(), AsyncMock()
@@ -212,7 +277,7 @@ async def test_raw_caller_keeps_original_owned_preparation_and_completion(monkey
     seal.assert_awaited_once_with(
         driver, prepared[0], control_schema="synthetic_control", source_stage=prepared[3], command_stage=prepared[4]
     )
-    verify.assert_awaited_once_with(driver, prepared[0], control_schema="synthetic_control")
+    verify.assert_awaited_once_with(driver, prepared[0], **prepared[-1], control_schema="synthetic_control")
 
 
 @pytest.mark.asyncio
@@ -256,14 +321,19 @@ async def test_terminal_composition_uses_verified_custody_without_resealing(monk
         assert options == {"isolation": "repeatable_read"}
         yield
 
-    driver = SimpleNamespace(transaction=transaction, execute=AsyncMock())
+    copy_target = _copy_target()
+    driver = SimpleNamespace(
+        transaction=transaction,
+        fetchrow=AsyncMock(return_value=_candidate_record(copy_target, state)),
+        execute=AsyncMock(),
+    )
     prepared = (
-        object(),
+        copy_target,
         object(),
         state,
         SimpleNamespace(table_name="source_stage"),
         SimpleNamespace(add_table="adds", remove_table="removes"),
-        {},
+        _arguments()["writer_roles"],
     )
     verify = AsyncMock(
         side_effect=ValueError("custody_changed") if custody == "changed" else None, return_value=custody
@@ -278,44 +348,67 @@ async def test_terminal_composition_uses_verified_custody_without_resealing(monk
     else:
         assert await composition._complete_composition(driver, prepared, None, "control") == prepared[:2]
     assert seal.await_count == legacy.await_count == int(custody is None)
-    assert verify.await_count == 1 and driver.execute.await_count == 3
+    if custody is None:
+        legacy.assert_awaited_once_with(driver, copy_target, **prepared[-1], control_schema="control")
+    verify.assert_awaited_once_with(driver, copy_target, control_schema="control", required=False)
+    driver.fetchrow.assert_awaited_once_with(
+        'SELECT * FROM "control".network_membership_candidate WHERE candidate_id=$1 FOR UPDATE',
+        UUID(copy_target.candidate_id),
+    )
+    assert driver.execute.await_count == 3
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["ready", "published"])
 @pytest.mark.parametrize("missing", ["table", "row"])
 async def test_terminal_legacy_replay_uses_real_missing_custody_boundary(monkeypatch, state, missing):
-    from process.network_membership_copy import MembershipCopyTarget
-
     @asynccontextmanager
     async def transaction(**options):
         assert options == {"isolation": "repeatable_read"}
         yield
 
-    copy_target = MembershipCopyTarget(
-        *(str(UUID(int=identifier_int)) for identifier_int in range(1, 5)), "network_candidate_" + UUID(int=4).hex
-    )
+    copy_target = _copy_target()
     driver = SimpleNamespace(
         transaction=transaction,
         is_in_transaction=lambda: True,
         fetchval=AsyncMock(return_value=None if missing == "table" else 42),
-        fetchrow=AsyncMock(return_value=None),
+        fetchrow=AsyncMock(side_effect=[_candidate_record(copy_target, state), None]),
         execute=AsyncMock(),
     )
     source_stage = SimpleNamespace(table_name="source_stage")
     commands = SimpleNamespace(add_table="adds", remove_table="removes")
-    prepared = (copy_target, object(), state, source_stage, commands, {})
+    prepared = (copy_target, object(), state, source_stage, commands, _arguments()["writer_roles"])
     seal, legacy = AsyncMock(), AsyncMock()
     monkeypatch.setattr(composition, "seal_network_candidate", seal)
     monkeypatch.setattr(composition, "verify_network_candidate_writer_closure", legacy)
 
     assert await composition._complete_composition(driver, prepared, None, "control") == prepared[:2]
     driver.fetchval.assert_awaited_once_with("SELECT to_regclass($1)::oid", '"control".network_candidate_custody')
-    assert driver.fetchrow.await_count == int(missing == "row")
+    expected_queries = [
+        (
+            (
+                'SELECT * FROM "control".network_membership_candidate WHERE candidate_id=$1 FOR UPDATE',
+                UUID(copy_target.candidate_id),
+            ),
+            {},
+        )
+    ]
+    if missing == "row":
+        expected_queries.append(
+            (
+                (
+                    'SELECT seal_sha256,receipt_json::text AS receipt_json FROM "control".network_candidate_custody '
+                    "WHERE candidate_id=$1",
+                    UUID(copy_target.candidate_id),
+                ),
+                {},
+            )
+        )
+    assert driver.fetchrow.await_args_list == expected_queries
     seal.assert_awaited_once_with(
         driver, copy_target, control_schema="control", source_stage=source_stage, command_stage=commands
     )
-    legacy.assert_awaited_once_with(driver, copy_target, control_schema="control")
+    legacy.assert_awaited_once_with(driver, copy_target, **prepared[-1], control_schema="control")
     assert driver.execute.await_count == 3
 
 

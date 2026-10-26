@@ -428,16 +428,16 @@ async def signed_collection_transport(signed_collection_coordinates, managed_imp
     async with context.fixture.engine.begin() as connection:
         await connection.run_sync(model_table.create)
         await connection.execute(text(f'GRANT SELECT ON mrf.nucc_taxonomy TO "{context.role}"'))
-    observed = SimpleNamespace(fixture=fixture, pins=[], accounting=[], import_reads=[], requests=[])
-    original_pin, original_accounting = catalog._pin, catalog._membership_accounting
+    observed = SimpleNamespace(fixture=fixture, pins=[], custody=[], import_reads=[], requests=[])
+    original_pin, original_custody = catalog._pin, catalog.resolve_network_serving_manifest
 
     async def observe_pin(*args, **kwargs):
         observed.pins.append(args)
         return await original_pin(*args, **kwargs)
 
-    async def observe_accounting(*args, **kwargs):
-        observed.accounting.append(args)
-        return await original_accounting(*args, **kwargs)
+    async def observe_custody(*args, **kwargs):
+        observed.custody.append(args)
+        return await original_custody(*args, **kwargs)
 
     def observe_import_method(name):
         original = getattr(CustomImportReadService, name)
@@ -452,7 +452,7 @@ async def signed_collection_transport(signed_collection_coordinates, managed_imp
         monkeypatch.setattr(CustomImportReadService, name, observe)
 
     monkeypatch.setattr(catalog, "_pin", observe_pin)
-    monkeypatch.setattr(catalog, "_membership_accounting", observe_accounting)
+    monkeypatch.setattr(catalog, "resolve_network_serving_manifest", observe_custody)
     for name in ("prepare_npi_entity_relation", "scope_npi_entity_relation", "hydrate_npi_page"):
         observe_import_method(name)
 
@@ -523,7 +523,7 @@ async def _signed_collection_post(case, kind, document, *, invalid_signature=Fal
     context.statements.clear()
     context.transactions.clear()
     case.pins.clear()
-    case.accounting.clear()
+    case.custody.clear()
     case.import_reads.clear()
     _, reply = await context.app.asgi_client.post(path, data=body, headers=headers)
     assert reply.headers["Cache-Control"] == "private, no-store"
@@ -547,7 +547,8 @@ def _signed_collection_success(case, reply, document, *, include_filter, has_row
     assert reply.headers["X-Network-Generation"] == str(context.manifest.generation_id)
     assert reply.headers["X-Network-Access-Scope"] == document["managed_collection"]["access_scope_sha256"]
     _assert_collection_reader(context)
-    assert len(case.pins) == len(case.accounting) == 1
+    assert len(case.pins) == 1 and len(case.custody) == 2
+    assert case.custody[0] == case.custody[1]
     names = [name for name, _ in case.import_reads]
     assert "prepare_npi_entity_relation" in names and "scope_npi_entity_relation" in names
     assert len({session for _, session in case.import_reads}) == 1
@@ -572,7 +573,7 @@ async def test_signed_collection_http_same_reader_policy_and_imports(signed_coll
         case, kind, _signed_collection_document(case, kind, "default", True), invalid_signature=True
     )
     assert invalid.status == 404 and "managed_collection" not in invalid.json
-    assert not case.fixture.context.statements and not case.pins and not case.accounting and not case.import_reads
+    assert not case.fixture.context.statements and not case.pins and not case.custody and not case.import_reads
     for policy in ("default", "selected", "excluded"):
         for include_filter in (True, False):
             document = _signed_collection_document(case, kind, policy, include_filter)
@@ -763,7 +764,7 @@ async def _service_http_post(case, document, *, signed, invalid=False, headers=N
         context.statements,
         context.transactions,
         case.pins,
-        case.accounting,
+        case.custody,
         case.import_reads,
         case.driver_proofs,
         case.native_reads,
@@ -781,8 +782,9 @@ def _service_http_success(case, reply, document, *, signed, include_filter=False
     context = case.fixture.context
     assert reply.status == 200, json.dumps({"response": reply.json, "failures": case.failures})
     _assert_collection_reader(context)
-    assert len(case.pins) == len(case.accounting) == len(case.driver_proofs) == len(case.native_reads) == 1
-    assert case.pins[0][0] is case.accounting[0][0]
+    assert len(case.pins) == len(case.driver_proofs) == len(case.native_reads) == 1
+    assert len(case.custody) == 2 and case.custody[0] == case.custody[1]
+    assert case.pins[0][0] is case.custody[0][0]
     proof = case.driver_proofs[0]
     assert proof[:4] == (context.role, context.role, "on", "repeatable read")
     assert proof[4] == context.statements[0][1][4] and proof[5] == context.transactions[0]
@@ -864,7 +866,8 @@ async def _assert_service_optional_metric_refusal(case):
     assert refused.status == 400
     assert case.failures == [("CustomImportReadRequestError", "metric predicates require imported membership")]
     _assert_collection_reader(case.fixture.context)
-    assert len(case.pins) == len(case.accounting) == 1 and not case.native_reads
+    assert len(case.pins) == 1 and len(case.custody) == 2 and not case.native_reads
+    assert case.custody[0] == case.custody[1]
 
 
 async def _assert_service_empty_required_page(case):

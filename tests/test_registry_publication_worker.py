@@ -6,7 +6,10 @@ import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import asdict, replace
+from datetime import datetime, timedelta, timezone
+from itertools import count
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -314,6 +317,9 @@ def resources(monkeypatch, *, second_failure=False, close_failure=False):
     events, options = [], []
     monkeypatch.setattr(worker.RegistryPublicationPTGRuntime, "qualify", AsyncMock())
     monkeypatch.setattr(
+        worker, "_qualify_fresh_backends", AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock()))
+    )
+    monkeypatch.setattr(
         worker, "RegistryPublicationAuthorityClient", lambda origin, token: Authority(origin, token, events)
     )
 
@@ -327,6 +333,218 @@ def resources(monkeypatch, *, second_failure=False, close_failure=False):
 
     monkeypatch.setattr(worker.asyncpg, "create_pool", create_pool)
     return events, options
+
+
+def _backend_connection(role="worker_execution", **changes):
+    observed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    observed_by_name = {
+        "database_name": "example",
+        "database_oid": 10,
+        "server_address": "127.0.0.1",
+        "server_port": 5432,
+        "server_started": observed_at - timedelta(days=1),
+        "control_oid": 20,
+        "inbox_oid": 20,
+        "current_role": role,
+        "session_role": role,
+        "safe_login": True,
+        "assumed_role": "none",
+        "pid": 100,
+        "backend_start": observed_at,
+        "observed_at": observed_at + timedelta(seconds=1),
+        "backend_type": "client backend",
+        "datid": 10,
+        "usesysid": 30 if role == "worker_execution" else 31,
+        "role_oids": json.dumps({"worker_execution": 30, "worker_lifecycle": 31}),
+    }
+    observed_by_name.update(changes)
+    return SimpleNamespace(
+        fetchrow=AsyncMock(return_value=observed_by_name), is_in_transaction=lambda: False, get_server_pid=lambda: 100
+    )
+
+
+async def _fresh_qualification():
+    lifecycle = _backend_connection("worker_lifecycle")
+    return await worker._qualify_fresh_backends(
+        lifecycle, schema="registry", observer_role="worker_lifecycle", execution_roles=("worker_execution",)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "old",
+        "server",
+        "database",
+        "control",
+        "role_oid",
+        "missing_role",
+        "pid",
+        "login_oid",
+        "datid",
+        "set_role",
+        "session_role",
+        "unsafe",
+        "transaction",
+        "missing",
+        "start_missing",
+        "future_start",
+        "backend_type",
+    ],
+)
+async def test_backend_verifier_refuses_changed_identity(damage):
+    qualification = await _fresh_qualification()
+    connection = _backend_connection(backend_start=qualification.not_before)
+    observed_by_name = connection.fetchrow.return_value
+    changes_by_case = {
+        "old": {"backend_start": qualification.not_before - timedelta(microseconds=1)},
+        "server": {"server_started": qualification.not_before},
+        "database": {"database_oid": 11, "datid": 11},
+        "control": {"control_oid": 21},
+        "role_oid": {"role_oids": '{"worker_execution":32,"worker_lifecycle":31}', "usesysid": 32},
+        "missing_role": {"role_oids": '{"worker_execution":30}'},
+        "pid": {"pid": 101},
+        "login_oid": {"usesysid": 31},
+        "datid": {"datid": 11},
+        "set_role": {"assumed_role": "worker_execution"},
+        "session_role": {"session_role": "worker_lifecycle"},
+        "unsafe": {"safe_login": False},
+        "start_missing": {"backend_start": None},
+        "future_start": {"backend_start": qualification.not_before + timedelta(days=1)},
+        "backend_type": {"backend_type": "parallel worker"},
+    }
+    observed_by_name.update(changes_by_case.get(damage, {}))
+    if damage == "transaction":
+        connection.is_in_transaction = lambda: True
+    if damage == "missing":
+        connection.fetchrow.return_value = None
+    with pytest.raises(ValueError, match="registry_publication_worker_backend_invalid"):
+        await qualification.verifier("worker_execution")(connection)
+
+
+@pytest.mark.asyncio
+async def test_backend_verifier_accepts_new_reconnections():
+    qualification = await _fresh_qualification()
+    verify = qualification.verifier("worker_execution")
+    for seconds in (0, 1):
+        started = qualification.not_before + timedelta(seconds=seconds)
+        connection = _backend_connection(backend_start=started, observed_at=started)
+        await verify(connection)
+        assert connection.fetchrow.await_args.args[1:] == (
+            "registry",
+            "registry",
+            ("worker_execution", "worker_lifecycle"),
+        )
+    with pytest.raises(ValueError, match="backend_invalid"):
+        qualification.verifier("unconfigured_actor")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["unsafe", "assumed", "missing_role", "missing_schema"])
+async def test_backend_anchor_requires_direct_lifecycle(damage):
+    changes_by_case = {
+        "unsafe": {"safe_login": False},
+        "assumed": {"assumed_role": "worker_lifecycle"},
+        "missing_role": {"role_oids": '{"worker_lifecycle":31}'},
+        "missing_schema": {"control_oid": None},
+    }
+    with pytest.raises(ValueError, match="backend_invalid"):
+        await worker._qualify_fresh_backends(
+            _backend_connection("worker_lifecycle", **changes_by_case[damage]),
+            schema="registry",
+            observer_role="worker_lifecycle",
+            execution_roles=("worker_execution",),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ValueError, asyncio.CancelledError])
+async def test_backend_anchor_failure_closes_before_execution(monkeypatch, failure):
+    events, options = resources(monkeypatch)
+    monkeypatch.setattr(worker, "_qualify_fresh_backends", AsyncMock(side_effect=failure("backend_invalid")))
+    consume = AsyncMock()
+    monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
+    with pytest.raises(failure):
+        await worker.run_registry_publication_worker(
+            worker.parse_registry_publication_worker_config(json.dumps(configuration()))
+        )
+    assert len(options) == 1 and consume.await_count == 0
+    assert events == ["authority open", "lifecycle open", "lifecycle close", "authority close"]
+
+
+@pytest.mark.asyncio
+async def test_backend_verification_retains_sql_limits():
+    config = worker.parse_registry_publication_worker_config(json.dumps(configuration()))
+    calls = []
+
+    async def verify_limits(connection):
+        calls.append(("limits", connection))
+
+    async def verify_backend(connection):
+        calls.append(("backend", connection))
+
+    limits = SimpleNamespace(
+        verify=verify_limits, connect_timeout_seconds=5, statement_timeout_ms=1000, server_settings=lambda: {}
+    )
+    options = worker._pool_options(config.execution_url, 1, limits, backend_verifier=verify_backend)
+    connection = object()
+    await options["init"](connection)
+    await options["setup"](connection)
+    assert calls == [("limits", connection), ("backend", connection)] * 2
+
+
+@pytest.mark.asyncio
+async def test_postclaim_backend_refusal_keeps_the_same_durable_request_resumable(monkeypatch):
+    from process import registry_publication_consumer as consumer
+
+    qualification = await _fresh_qualification()
+    checkout_verifier = AsyncMock(wraps=worker._connection_verifier(None, qualification.verifier("worker_execution")))
+    checkout_numbers = count(1)
+
+    @asynccontextmanager
+    async def acquire():
+        connection = _backend_connection(backend_start=qualification.not_before)
+        if next(checkout_numbers) == 2:
+            connection.fetchrow.return_value["server_started"] = qualification.not_before
+        await checkout_verifier(connection)
+        yield connection
+
+    config = worker.parse_registry_publication_worker_config(json.dumps(configuration())).consumer
+    request_by_field = {
+        "request_id": UUID(_ID),
+        "lease_id": UUID("11234567-89ab-4cde-8123-456789abcdef"),
+        "command_json": {"operation": None},
+    }
+    original_request_by_field = deepcopy(request_by_field)
+    claim = AsyncMock(return_value=request_by_field)
+    reject = AsyncMock()
+    complete = AsyncMock(return_value={"generation": 7})
+    monkeypatch.setattr(consumer, "_verify_execution", AsyncMock())
+    monkeypatch.setattr(consumer, "_claim", claim)
+    monkeypatch.setattr(consumer, "_reject", reject)
+    monkeypatch.setattr(consumer, "_ordinary_publication", complete)
+
+    async def heartbeat(*args):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(consumer, "_heartbeat", heartbeat)
+    arguments_by_field = dict(
+        lifecycle_pool=object(), execution_pool=SimpleNamespace(acquire=acquire), authorize=AsyncMock(), config=config
+    )
+    with pytest.raises(RuntimeError, match="registry_publication_consumer_unavailable"):
+        await consumer.consume_registry_publication_once(**arguments_by_field)
+    reject.assert_not_awaited()
+    complete.assert_not_awaited()
+    assert request_by_field == original_request_by_field and claim.await_count == 1
+    assert checkout_verifier.await_count == 2
+    completed_by_field = await consumer.consume_registry_publication_once(**arguments_by_field)
+    assert completed_by_field == {"request_id": _ID, "state": "completed", "result": {"generation": 7}}
+    assert (
+        request_by_field == original_request_by_field and claim.await_count == 2 and checkout_verifier.await_count == 4
+    )
+    reject.assert_not_awaited()
+    complete.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -730,6 +948,7 @@ def test_sql_limits_default_explicit_and_eight_positional_compatibility():
     assert options["server_settings"] == explicit.sql_limits.server_settings()
     assert "temp_file_limit" not in options["server_settings"]
     assert options["timeout"] == 5 and options["command_timeout"] == 6
+    assert options["init"] == explicit.sql_limits.verify
     assert options["setup"] == explicit.sql_limits.verify
     with pytest.raises(ValueError):
         replace(default, sql_limits=asdict(default.sql_limits))
@@ -752,7 +971,7 @@ async def test_sql_limits_verify_actual_effective_values(field, value):
     limits = worker.RegistryPublicationSQLLimits()
     values = asdict(limits)
     values.pop("connect_timeout_seconds")
-    values.update(parallel_query=0, parallel_maintenance=0)
+    values.update(parallel_query=0, parallel_maintenance=0, replication_role="origin")
     values[field] = value
     connection = SimpleNamespace(fetchrow=AsyncMock(return_value=values))
     if field in {"parallel_query", "parallel_maintenance"} and value == 0:
@@ -760,6 +979,17 @@ async def test_sql_limits_verify_actual_effective_values(field, value):
     else:
         with pytest.raises(RuntimeError, match="registry_publication_worker_sql_limits_unavailable"):
             await limits.verify(connection)
+
+
+@pytest.mark.parametrize("mode", ["replica", "local", "", None])
+async def test_sql_limits_refuse_non_origin_backend(mode):
+    limits = worker.RegistryPublicationSQLLimits()
+    values = asdict(limits)
+    values.pop("connect_timeout_seconds")
+    values.update(parallel_query=0, parallel_maintenance=0, replication_role=mode)
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=values))
+    with pytest.raises(RuntimeError, match="registry_publication_worker_sql_limits_unavailable"):
+        await limits.verify(connection)
 
 
 async def test_bounded_pool_preserves_explicit_stricter_checkout():

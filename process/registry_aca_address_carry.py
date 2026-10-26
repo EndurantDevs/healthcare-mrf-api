@@ -224,14 +224,22 @@ async def _page(connection, batch, target_schema, *, writing):
     }, len(bindings)
 
 
-async def _stream_recipe(connection, recipe, approved, control_schema, target_schema, writing, digest):
-    from process.registry_source_recipe_composition import _read_recipe_page
+async def _stream_recipe(
+    connection, recipe, approved, control_schema, target_schema, writing, digest, aca_reads_by_oid=None
+):
+    from process.registry_source_recipe_composition import _read_recipe_page, _require_recipe_custody
 
-    await _require_archive(connection, recipe.source_pin)
+    verified = await _require_recipe_custody(
+        connection, recipe, approved, control_schema, aca_reads_by_oid=aca_reads_by_oid
+    )
+    if verified is None:
+        await _require_archive(connection, recipe.source_pin)
     cursor, limit, generation = None, 1000, None
     pages = office_rows = 0
     while True:
-        batch, next_cursor, limit = await _read_recipe_page(connection, recipe, approved, cursor, control_schema, limit)
+        batch, next_cursor, limit = await _read_recipe_page(
+            connection, recipe, approved, cursor, control_schema, limit, verified
+        )
         if (
             type(batch) is not ACAMembershipBatch
             or batch.source != recipe.source_pin
@@ -294,9 +302,10 @@ async def prepare_aca_address_carry(connection, recipes, approved, control_schem
     digest = hashlib.sha256(canonical_registry_source_recipes(selected_recipes).encode())
     digest.update(_canonical({"approved_generation": approved.generation_id}))
     pages = office_rows = 0
+    aca_reads_by_oid = {}
     for recipe in selected_recipes:
         page_count, row_count = await _stream_recipe(
-            connection, recipe, approved, control_schema, target_schema, writing, digest
+            connection, recipe, approved, control_schema, target_schema, writing, digest, aca_reads_by_oid
         )
         pages += page_count
         office_rows += row_count

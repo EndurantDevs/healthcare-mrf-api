@@ -158,6 +158,12 @@ async def _plans_data(driver, query, manifest, exclusions, network_ids, control_
         manifest.approved_custom_revision
     ):
         raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
+    if (
+        type(query.selector) is RegistryNetworkCatalogLegacyBatchSelector
+        and query.selector.namespace == "checksum_network"
+    ):
+        checksums = {int(value) for value in query.selector.values}
+        plans["npi_data"] = [row for row in plans["npi_data"] if row["npi_info"]["checksum_network"] in checksums]
     return {name: plans[name] for name in ("npi_data", "plan_data", "issuer_data")}
 
 
@@ -196,6 +202,8 @@ async def managed_provider_network_read_scope(
             driver, selector, manifest, exclusions, control_schema, organization_policy
         )
         scope_options = {"excluded_network_ids": exclusions} if network_ids is None else {}
+        if type(selector) is RegistryNetworkCatalogLegacyBatchSelector and selector.namespace == "checksum_network":
+            scope_options["legacy_checksums"] = tuple(sorted(int(value) for value in selector.values))
         with network_address_read_scope(
             manifest,
             network_ids,

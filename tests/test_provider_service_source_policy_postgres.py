@@ -289,7 +289,8 @@ async def _admit(admission, selection, *, excluded=(_EXCLUDED,)):
         finally:
             await asyncio.sleep(0)
             driver.remove_query_logger(queries.append)
-    assert sum("binding_matches AS MATERIALIZED" in query.query for query in queries) == 1
+    assert not any("binding_matches AS MATERIALIZED" in query.query for query in queries)
+    assert sum("to_jsonb(candidate)::text AS candidate_json" in query.query for query in queries) == 2
     assert sum("validation_json::text AS validation_json" in query.query for query in queries) == 1
     batches = [query for query in queries if query.query.startswith("WITH source_rows AS MATERIALIZED")]
     assert len(batches) == 3 and all(query.exception is None for query in batches)

@@ -81,8 +81,12 @@ async def complete_publication(
     generation,
     inputs,
     address_resolution_performed: bool,
+    *,
+    refresh_summary: bool = False,
 ) -> None:
-    """Complete only in the summary rotation/index transaction, after rechecking inputs."""
+    """Validate within the fenced swap transaction, binding its live or fixed refresh heap."""
+    if type(refresh_summary) is not bool:
+        raise ValueError("MRF refresh summary selection must be an explicit boolean")
     # Execution history is separate from the independently verified source content.
     if type(address_resolution_performed) is not bool:
         raise ValueError("MRF address resolution execution must be an explicit boolean")
@@ -99,10 +103,9 @@ async def complete_publication(
     if current != generation or current.relation_oids != oids:
         raise RuntimeError("MRF publication generation changed")
     address_content = await capture_address_content(session, schema, qualified)
+    summary_name = "plan_search_summary_refresh" if refresh_summary else "plan_search_summary"
     summary_oid = (
-        await session.execute(
-            text("SELECT to_regclass(:name)::oid"), {"name": qualified(schema, "plan_search_summary")}
-        )
+        await session.execute(text("SELECT to_regclass(:name)::oid"), {"name": qualified(schema, summary_name)})
     ).scalar_one()
     completed = (
         await session.execute(
@@ -168,6 +171,6 @@ async def require_completed_publication(session, schema: str, *, native_set=Fals
     require_address_coverage(address_content)
     if not native_set and publication_receipt["address_content"] != address_content:
         raise RuntimeError("MRF publication address content differs")
-    # The explicit v2 source proof captures current covered canonical content
-    # under these locks. It does not claim equality to the legacy row-hash proof.
+    # The explicit native proof accounts for the current raw and canonical sets
+    # under these locks. The original strict row-hash receipt remains unchanged.
     return {**dict(publication_receipt), **({"native_address_coverage": address_content} if native_set else {})}

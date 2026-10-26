@@ -139,19 +139,26 @@ async def _source_fence_case(monkeypatch, *, global_epoch):
     """Isolate native metadata IO while executing the complete consumer fence."""
     case = await _notification_case(monkeypatch, global_epoch=global_epoch)
     policy = aca.source_policy.GenericSourcePolicy("mrf", "owner", "publisher", ("source_reader",))
-    publisher = SimpleNamespace(policy=policy)
+    publisher = SimpleNamespace(policy=policy, transaction_isolation="read committed")
     phase = SimpleNamespace(events=[], publisher=publisher)
     session = object()
 
     @asynccontextmanager
     async def source_transaction(database, **options):
-        assert database is aca.db and options == {"isolation": "repeatable read"}
+        assert database is aca.db and options == {"isolation": "read committed"}
         phase.events.append("source_begin")
         try:
             yield session
         finally:
             phase.events.append("source_end")
 
+    async def lock_source_family(actual_session, schema):
+        assert actual_session is session and schema == "mrf"
+        assert phase.events == ["source_begin"]
+        phase.events.append("source_fence")
+
+    family_lock = AsyncMock(side_effect=lock_source_family)
+    monkeypatch.setattr(aca, "_lock_current_source_family", family_lock)
     monkeypatch.setattr(aca.source_policy, "source_transaction", source_transaction)
     monkeypatch.setattr(aca.source_policy, "bound_publisher", lambda: phase.publisher)
     prepared = case.subject.prepared if global_epoch else case.subject.source_pin.prepared
@@ -168,6 +175,7 @@ async def _source_fence_case(monkeypatch, *, global_epoch):
         config=replace(configuration, source_authority_roles=aca.source_authority_roles(policy)),
         phase=phase,
         capture=capture,
+        family_lock=family_lock,
         session=session,
         prepared=prepared,
     )
@@ -198,10 +206,14 @@ async def test_current_source_fence_refuses_drift_and_unwinds_before_return(monk
         expected_error = asyncio.CancelledError if outcome == "cancel" else ValueError
         with pytest.raises(expected_error):
             await enter_fence()
-    expected_events = ["source_begin", "source_end"]
+    expected_events = ["source_begin"]
+    if outcome != "authority":
+        expected_events.append("source_fence")
     if outcome not in {"stale", "authority"}:
-        expected_events.insert(1, "body")
+        expected_events.append("body")
+    expected_events.append("source_end")
     assert case.phase.events == expected_events
+    assert case.family_lock.await_count == int(outcome != "authority")
     assert case.capture.await_count == int(outcome != "authority")
     if outcome == "authority":
         return

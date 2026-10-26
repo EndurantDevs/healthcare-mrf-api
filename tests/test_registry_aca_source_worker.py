@@ -223,3 +223,45 @@ def test_controlled_config_rejects_unqualified_composer_objects():
     parsed = worker.parse_registry_aca_source_worker_config(json.dumps(configuration()))
     with pytest.raises(ValueError):
         replace(parsed, ptg=SimpleNamespace(store=SimpleNamespace(control_schema="registry_control")))
+
+
+def batch_configuration():
+    value = configuration()
+    for key in ("source_id", "producer_id", "issuer_id", "year"):
+        value["consumer"].pop(key)
+    value["consumer"]["initial_batch"] = True
+    value["consumer"]["initial_address_sources"] = {
+        "base_source": {
+            "schema_name": "retained_addresses",
+            "table_name": "entity_address_unified",
+            "generation_id": "a" * 64,
+        }
+    }
+    return value
+
+
+def test_initial_batch_configuration_uses_existing_small_event_and_address_pins():
+    value = batch_configuration()
+    parsed = worker.parse_registry_aca_source_worker_config(json.dumps(value))
+    assert parsed.consumer.initial_batch and not parsed.consumer.global_epoch
+    assert parsed.consumer.initial_address_sources.initial_source_recipes == ()
+    assert parsed.event == event() and parsed.source_authority_roles == ()
+    assert len(json.dumps(value).encode()) < 16384
+
+
+@pytest.mark.parametrize("damage", ["false", "integer", "global", "logical", "callback", "recipes"])
+def test_initial_batch_configuration_refuses_other_modes_and_embedded_authority(damage):
+    value = batch_configuration()
+    settings = value["consumer"]
+    settings.update(
+        {
+            "false": {"initial_batch": False},
+            "integer": {"initial_batch": 1},
+            "global": {"global_epoch": True},
+            "logical": {"source_id": "selected-subset"},
+            "callback": {"on_prepared": "foreign"},
+            "recipes": {"recipes": []},
+        }[damage]
+    )
+    with pytest.raises(ValueError):
+        worker.parse_registry_aca_source_worker_config(json.dumps(value))

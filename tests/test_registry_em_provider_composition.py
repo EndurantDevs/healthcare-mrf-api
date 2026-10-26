@@ -14,6 +14,7 @@ from process import registry_publication_worker as worker
 from process.network_address_projection import PinnedAddressSource
 from process.network_em_provider_inputs import _ROLES, EMProviderInputRelation, EMProviderInputs
 from process.network_serving_read import PinnedNetworkServingManifest
+from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 
 
 def _inputs():
@@ -134,19 +135,22 @@ async def test_provider_digest_enters_identity_before_candidate_creation_and_rec
     request_id = UUID("22222222-2222-4222-8222-222222222222")
     address_sources = _sources(_inputs())
     receipt_by_field = {"receipt_sha256": "a" * 64}
-    approved = SimpleNamespace(approved_revision=2, generation_id="b" * 64)
+    approved = SimpleNamespace(approved_revision=2, generation_id="b" * 64, total_rows=0)
     artifact = SimpleNamespace(generation_sha256="c" * 64, address_source=address_sources.base_source)
-    source_stage, command_stage = object(), object()
+    source_stage = RegistrySourceRecipeStage("source_stage", 0, 0, "e" * 64)
+    command_stage = object()
     calls = []
     monkeypatch.setattr(composition, "_preparation_driver", AsyncMock(return_value=(connection, None)))
     monkeypatch.setattr(composition, "_em_provider_receipt", AsyncMock(return_value=receipt_by_field))
     monkeypatch.setattr(composition, "pin_approved_membership_source", AsyncMock(return_value=approved))
-    monkeypatch.setattr(composition, "_composition_sources", AsyncMock(return_value=({}, 0, (), source_stage)))
+    monkeypatch.setattr(
+        composition, "_composition_sources_with_reads", AsyncMock(return_value=({}, 0, (), source_stage))
+    )
     monkeypatch.setattr(
         composition, "_composition_retention", AsyncMock(return_value=(command_stage, {"effective_rows": 0}))
     )
     monkeypatch.setattr(composition, "registry_source_retention_sha256", lambda _receipt: "d" * 64)
-    monkeypatch.setattr(composition, "_composition_artifact", AsyncMock(return_value=(artifact, None)))
+    monkeypatch.setattr(composition, "_composition_artifact_with_reads", AsyncMock(return_value=(artifact, None)))
     monkeypatch.setattr(composition, "_bindings", AsyncMock())
     monkeypatch.setattr(composition, "_record_source_receipts", AsyncMock())
 
@@ -163,8 +167,9 @@ async def test_provider_digest_enters_identity_before_candidate_creation_and_rec
 
     monkeypatch.setattr(composition, "create_network_candidate", create)
     monkeypatch.setattr(composition, "record_em_provider_inputs", record)
+    roles_by_kind = {"owner_role": "synthetic_owner", "loader_roles": [], "reader_roles": []}
     prepared_snapshot = await composition._prepare_composition_snapshot(
-        connection, request_id, 2, 0, address_sources, None, {"loader_roles": [], "reader_roles": []}, "registry"
+        connection, request_id, 2, 0, address_sources, None, roles_by_kind, "registry"
     )
     assert calls == [("create", prepared_snapshot[0]), ("record", prepared_snapshot[0])]
 

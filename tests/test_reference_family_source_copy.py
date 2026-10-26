@@ -378,6 +378,7 @@ def _clone_case(monkeypatch, importer="mrf"):
     capture = archive.ReferenceFamilySourceCapture(
         SimpleNamespace(
             importer_id=importer,
+            auxiliary=archive._canonical_model_receipt() if importer == "mrf" else None,
             source_capture_contract=None,  # Ordinary COPY retains the real manifest's non-finite default.
             tables=[SimpleNamespace(table_name=name) for name in spec.table_names],
             as_dict=lambda: {
@@ -682,11 +683,17 @@ async def test_native_address_coverage_uses_counts_and_indexed_anti_joins(monkey
         statements.append(str(statement))
         return 10 if "to_regclass" in str(statement) else 0
 
-    session = SimpleNamespace(scalar=scalar, execute=AsyncMock())
+    async def execute(statement):
+        statements.append(str(statement))
+        return SimpleNamespace(
+            mappings=lambda: SimpleNamespace(one_or_none=lambda: {"rows": 0, "null_keys": 0, "uncovered_nonnull": 0})
+        )
+
+    session = SimpleNamespace(scalar=scalar, execute=execute)
     coverage = await address.capture_address_content(
         session, "synthetic", lambda schema, name: f'"{schema}"."{name}"', native_set=True
     )
-    assert coverage["contract"] == "mrf-address-coverage.indexed-set.v2"
+    assert coverage["contract"] == address.ADDRESS_COVERAGE_CONTRACT
     assert all("sha256" not in table for table in coverage["tables"].values())
     assert sum("NOT EXISTS" in statement for statement in statements) == len(address.REFERENCES)
     address.require_address_coverage(coverage)

@@ -191,7 +191,13 @@ def _project_addresses(document):
         raise RegistryNetworkCatalogError("registry_network_catalog_source_unavailable")
     selected_addresses = []
     for entry in addresses:
-        normalized = _normalize_marketplace_address_entry_base(entry)
+        address = entry
+        if type(address) is str:
+            try:
+                address = json.loads(address)
+            except ValueError:
+                continue
+        normalized = _normalize_marketplace_address_entry_base(address)
         if normalized is None:
             continue
         key = address_key_v1(

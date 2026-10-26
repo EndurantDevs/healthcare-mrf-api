@@ -331,7 +331,8 @@ async def _remove_grants(connection: Any, namespace: str, catalog: dict, owner_o
         await connection.execute(statement)
 
 
-async def _transfer_and_grant(connection: Any, target: MembershipCopyTarget, roles: dict, catalog: dict) -> None:
+async def _transfer_ownership(connection, target, roles, catalog, owner_oid):
+    """Keep database CREATE checks on every actual native ownership transfer."""
     if not await connection.fetchval(
         "SELECT has_database_privilege(current_user,current_database(),'CREATE') "
         "AND has_database_privilege($1,current_database(),'CREATE')",
@@ -346,12 +347,26 @@ async def _transfer_and_grant(connection: Any, target: MembershipCopyTarget, rol
     await connection.execute(f"SET LOCAL ROLE {owner}")
     await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {publisher}")
     await connection.execute(f"SET LOCAL ROLE {publisher}")
-    owner_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", roles["owner_role"])
     for table_name in sorted(catalog["heaps"]):
         table_owner = next(row["relowner"] for row in catalog["relations"] if row["relname"] == table_name)
         if table_owner != owner_oid:
             await connection.execute(f"ALTER TABLE {namespace}.{_identifier(table_name)} OWNER TO {owner}")
+
+
+async def _transfer_and_grant(connection: Any, target: MembershipCopyTarget, roles: dict, catalog: dict) -> None:
+    """Close an already owned catalog or perform the original guarded transfer."""
+    namespace = _identifier(target.schema_name)
+    owner = _identifier(roles["owner_role"])
+    publisher = await connection.fetchval("SELECT quote_ident(current_user)")
+    owner_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", roles["owner_role"])
+    already_owned = catalog["namespace"]["nspowner"] == owner_oid and all(
+        relation["relowner"] == owner_oid for relation in catalog["relations"]
+    )
+    if not already_owned:
+        await _transfer_ownership(connection, target, roles, catalog, owner_oid)
     await connection.execute(f"SET LOCAL ROLE {owner}")
+    if already_owned:
+        await _remove_default_grants(connection, namespace, catalog)
     await _remove_grants(connection, namespace, catalog, owner_oid)
     for role_name in sorted(set(roles["loader_roles"] + roles["reader_roles"])):
         await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {_identifier(role_name)}")

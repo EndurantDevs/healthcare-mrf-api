@@ -29,7 +29,7 @@ from tests.test_ptg2_serving_billing_address_lineage import _location_query
 
 
 @contextmanager
-def _scope(*, exclusions=(), networks=None):
+def _scope(*, exclusions=(), networks=None, legacy_checksums=None):
     candidate = "123e4567-e89b-42d3-a456-426614174000"
     manifest = PinnedNetworkServingManifest(
         7, candidate, "network_candidate_" + candidate.replace("-", ""), 1, {}, 4, "a" * 64, 17
@@ -40,6 +40,7 @@ def _scope(*, exclusions=(), networks=None):
         access_scope_sha256="b" * 64,
         excluded_network_ids=exclusions if networks is None else None,
         organization_policy=RegistryOrganizationVisibility(),
+        legacy_checksums=legacy_checksums,
     ):
         yield manifest
 
@@ -267,3 +268,37 @@ async def test_exact_retained_lineage_is_one_set_query_on_same_reader():
     assert arguments[1]["strict_stored_identity"] is True
     assert arguments[1]["_network_excluded_ids"] == [19]
     assert rows == []
+
+
+@pytest.mark.parametrize("next_checksums", [(84,), None])
+def test_billing_cursor_rejects_changed_legacy_alias_or_canonical_namespace(next_checksums):
+    from api.billing_search_cursor_authentication import authenticate_billing_search_sealed_page_cursor
+
+    release = selection()
+    with _scope(networks=(42,), legacy_checksums=(42,)):
+        original_digest = policy.network_scope_sha256(release, release.in_network_bindings)
+    with _scope(networks=(42,), legacy_checksums=next_checksums):
+        changed_digest = policy.network_scope_sha256(release, release.in_network_bindings)
+    assert changed_digest != original_digest
+    request, authority, pin = _request(), _authorization_context(), _pin()
+    first = pagination.build_billing_search_cursor_binding(
+        request, authority, pin, trusted_now=TRUSTED_NOW, network_scope_sha256=original_digest
+    )
+    token = pagination.seal_billing_search_page_cursor(
+        (1, 1000000004, 0, "ptg2:synthetic", "0" * 64, "1" * 64, "2" * 64), keyring=CURSOR_KEYRING, binding=first
+    )
+    _, public_token = authenticate_billing_search_sealed_page_cursor(
+        token,
+        keyring=CURSOR_KEYRING,
+        trusted_now=first.trusted_now,
+        request_fingerprint_sha256=first.request_fingerprint_sha256,
+        authorization_context_sha256=first.authorization_scope_sha256,
+        generation_bundle_sha256=first.generation_bundle_sha256,
+        snapshot_set_sha256=first.snapshot_set_sha256,
+    )
+    continuation = _request(cursor=public_token)
+    second = pagination.build_billing_search_cursor_binding(
+        continuation, authority, pin, trusted_now=TRUSTED_NOW, network_scope_sha256=changed_digest
+    )
+    with pytest.raises(BillingSearchCursorGenerationExpired):
+        pagination.open_billing_search_page_cursor(continuation, keyring=CURSOR_KEYRING, binding=second)

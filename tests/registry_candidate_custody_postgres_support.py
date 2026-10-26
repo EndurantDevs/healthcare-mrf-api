@@ -15,8 +15,8 @@ from process.registry_publication_worker_permissions import _grant_worker
 
 
 async def remove_candidate_schemas(fixture):
-    """Drain only the two registered fixture owners' candidate/composition schemas."""
-    owners = [fixture.roles["owner"], fixture.custody_roles["loading"]]
+    """Drain only registered fixture owners' candidate/composition schemas."""
+    owners = [fixture.roles["owner"], fixture.custody_roles["loading"], fixture.custody_roles["owner"]]
     names = await fixture.connection.fetch(
         "SELECT nspname FROM pg_namespace n JOIN pg_roles r ON r.oid=n.nspowner "
         "WHERE r.rolname=ANY($1::text[]) "
@@ -46,7 +46,10 @@ async def _restore_control_owner(fixture, original):
             reference,
         )
         assert retained is not None and retained["oid"] == relation["oid"]
-        assert retained["rolname"] in (original["rolname"], fixture.roles["owner"])
+        expected_owners = {original["rolname"], fixture.roles["owner"]}
+        if relation["relname"] == "network_candidate_custody":
+            expected_owners.add(fixture.custody_roles["owner"])
+        assert retained["rolname"] in expected_owners
         await fixture.connection.execute(f"ALTER TABLE {reference} OWNER TO {_identifier(original['rolname'])}")
     await fixture.connection.execute(
         f"ALTER SCHEMA {_identifier(fixture.control_schema)} OWNER TO {_identifier(original['rolname'])}"
@@ -69,31 +72,37 @@ async def _create_roles(fixture, attempted_roles, password_by_kind):
     for kind, role in fixture.custody_roles.items():
         assert not await fixture.connection.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role)
         attempted_roles.append(role)
-        login = "NOLOGIN" if kind == "loading" else f"LOGIN PASSWORD '{password_by_kind[kind]}'"
+        login = "NOLOGIN" if kind in {"loading", "owner"} else f"LOGIN PASSWORD '{password_by_kind[kind]}'"
         await fixture.connection.execute(
             f"CREATE ROLE {_identifier(role)} {login} "
             "INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
         )
-        if kind != "loading":
+        if kind not in {"loading", "owner"}:
             await fixture.connection.execute(f"ALTER ROLE {_identifier(role)} SET temp_file_limit='256MB'")
 
 
 async def _install_grants(fixture, original_owner_by_field):
     connection, roles = fixture.connection, fixture.custody_roles
     namespace = _identifier(fixture.control_schema)
-    final_owner = fixture.roles["owner"]
+    control_owner, final_owner = fixture.roles["owner"], roles["owner"]
     async with connection.transaction():
-        await connection.execute(f"ALTER SCHEMA {namespace} OWNER TO {_identifier(final_owner)}")
+        await connection.execute(f"ALTER SCHEMA {namespace} OWNER TO {_identifier(control_owner)}")
         oid = await connection.fetchval("SELECT to_regnamespace($1)::oid", fixture.control_schema)
         tables, sequences = await _catalog(connection, oid)
         controls = await _aca_controls(connection, fixture.control_schema)
-        assert all(relation["relowner"] == original_owner_by_field["owner_oid"] for relation in controls)
-        original_owner_by_field["controls"] = controls
+        ledger = next(relation for relation in tables if relation["relname"] == "network_candidate_custody")
+        candidate = next(relation for relation in tables if relation["relname"] == "network_membership_candidate")
+        # Keep the ledger's existing parent FK intact when the outer fixture retires its control owner.
+        retained_controls = [*controls, candidate, ledger]
+        assert all(relation["relowner"] == original_owner_by_field["owner_oid"] for relation in retained_controls)
+        original_owner_by_field["controls"] = retained_controls
         for relation in tables + controls + sequences:
             kind = "SEQUENCE" if relation in sequences else "TABLE"
+            owner = final_owner if relation is ledger else control_owner
             await connection.execute(
-                f"ALTER {kind} {namespace}.{_identifier(relation['relname'])} OWNER TO {_identifier(final_owner)}"
+                f"ALTER {kind} {namespace}.{_identifier(relation['relname'])} OWNER TO {_identifier(owner)}"
             )
+        await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {_identifier(final_owner)}")
         await _grant_worker(connection, fixture.control_schema, tables, roles["execution"], execution=True)
         await connection.execute(
             f"GRANT USAGE ON SEQUENCE {namespace}.network_serving_manifest_generation_id_seq "
@@ -101,7 +110,8 @@ async def _install_grants(fixture, original_owner_by_field):
         )
         database = _identifier(await connection.fetchval("SELECT current_database()"))
         await connection.execute(
-            f"GRANT CREATE ON DATABASE {database} TO {_identifier(roles['loading'])},{_identifier(final_owner)}"
+            f"GRANT CREATE ON DATABASE {database} TO {_identifier(roles['loading'])},"
+            f"{_identifier(control_owner)},{_identifier(final_owner)}"
         )
         for parent, child, inherit, assume in (
             (roles["loading"], roles["execution"], True, True),
@@ -120,7 +130,7 @@ async def install_candidate_custody(fixture, stack):
     """Register all cleanup before creating the isolated native identities."""
     token = uuid4().hex
     fixture.custody_roles = {
-        kind: "registry_custody_" + kind + "_" + token for kind in ("loading", "execution", "custodian")
+        kind: "registry_custody_" + kind + "_" + token for kind in ("loading", "owner", "execution", "custodian")
     }
     attempted_roles = []
     original_owner_by_field = await fixture.connection.fetchrow(
@@ -195,5 +205,7 @@ async def candidate_custody_consumer(fixture, pair, old, store, composition_runt
     assert set(pair.runtime_roles + old.runtime_roles) <= set(_custody_roles(settings))
     consumer = await _custody_runtime(settings, fixture.custody_stack, consumer, fixture.execution_connection)
     fixture.seal_candidate = consumer.seal_candidate
+    fixture.prepare_address_sources = consumer.prepare_address_sources
     assert callable(fixture.seal_candidate)
+    assert callable(fixture.prepare_address_sources)
     return consumer

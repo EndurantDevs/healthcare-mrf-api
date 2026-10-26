@@ -3,7 +3,7 @@
 
 import json
 import os
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from db.registry_schema import registry_schema
 from process.network_address_projection import (
@@ -68,34 +68,143 @@ async def _catalog_readiness(connection, schema_name):
     return dict(index_state)
 
 
-async def _projection_parity(connection, projection_table, address_table, membership_table, binding_table):
-    parity_counts = await connection.fetchrow(f"""
-        WITH expected_networks AS (
-            SELECT binding.location_key,binding.entity_type,binding.entity_id,
-                array_agg(DISTINCT membership.network_id ORDER BY membership.network_id) AS network_ids
-            FROM {membership_table} membership JOIN {binding_table} binding
-              ON binding.provider_system=membership.provider_system AND binding.provider_id=membership.provider_id
-              AND binding.location_id=membership.location_id
-            GROUP BY binding.location_key,binding.entity_type,binding.entity_id
-        )
+_PARITY_BATCH_ROWS = 4096
+_PARITY_FIELDS = (
+    "source_rows",
+    "address_rows",
+    "missing_locations",
+    "extra_locations",
+    "changed_address_rows",
+    "changed_network_arrays",
+)
+
+
+def _expected_projection_query(membership_table, binding_table, *, bounded=False):
+    bounded_join = "JOIN source selected ON selected.location_key=binding.location_key" if bounded else ""
+    return f"""
+        SELECT binding.location_key,binding.entity_type,binding.entity_id,
+            array_agg(DISTINCT membership.network_id ORDER BY membership.network_id) AS network_ids
+        FROM {membership_table} membership JOIN {binding_table} binding
+          ON binding.provider_system=membership.provider_system AND binding.provider_id=membership.provider_id
+          AND binding.location_id=membership.location_id
+        {bounded_join}
+        GROUP BY binding.location_key,binding.entity_type,binding.entity_id"""
+
+
+async def _expected_projection_networks(connection, membership_table, binding_table):
+    """Materialize exact expected arrays once for all bounded address ranges."""
+    expected_table = "pg_temp." + _identifier("network_parity_expected_" + uuid4().hex)
+    query = _expected_projection_query(membership_table, binding_table)
+    await connection.execute(f"CREATE TEMP TABLE {expected_table} ON COMMIT DROP AS {query}")
+    await connection.execute(f"ALTER TABLE {expected_table} ADD PRIMARY KEY(location_key,entity_type,entity_id)")
+    await connection.execute(f"ANALYZE {expected_table}")
+    return expected_table
+
+
+async def _next_projection_range(connection, projection_table, address_table, lower_key):
+    """Bound both indexed inputs so missing rows and projected-only tails cannot escape."""
+    predicate, arguments = ("", ()) if lower_key is None else ("WHERE location_key>$1", (lower_key,))
+    return await connection.fetchval(
+        f"""SELECT max(location_key) FROM (
+        SELECT location_key FROM (
+            (SELECT location_key FROM {address_table} {predicate} ORDER BY location_key LIMIT {_PARITY_BATCH_ROWS})
+            UNION
+            (SELECT location_key FROM {projection_table} {predicate} ORDER BY location_key LIMIT {_PARITY_BATCH_ROWS})
+        ) available ORDER BY location_key LIMIT {_PARITY_BATCH_ROWS}
+    ) selected""",
+        *arguments,
+    )
+
+
+async def _projection_address_difference(connection, projection_table, address_table):
+    """Skip JSON only for identical binary values with complete, audited column alignment."""
+    json_difference = (
+        "(to_jsonb(source)-'canonical_network_ids') IS DISTINCT FROM (to_jsonb(projected)-'canonical_network_ids')"
+    )
+    columns = await connection.fetch(
+        """SELECT attribute.attrelid=to_regclass($1) AS is_source,attribute.attname,attribute.atttypid,
+            pg_catalog.quote_ident(attribute.attname) AS column_sql,
+            native_type.typnamespace='pg_catalog'::regnamespace AND native_type.typname IN
+                ('bool','int2','int4','int8','float8','numeric','uuid','date','timestamp','text','varchar',
+                 '_int4','_varchar') AS supported
+        FROM pg_catalog.pg_attribute attribute JOIN pg_catalog.pg_type native_type
+            ON native_type.oid=attribute.atttypid
+        WHERE attribute.attrelid IN (to_regclass($1),to_regclass($2)) AND attribute.attnum>0
+            AND NOT attribute.attisdropped AND attribute.attname<>'canonical_network_ids'
+        ORDER BY attribute.attnum""",
+        address_table,
+        projection_table,
+    )
+    source_by_name = {column["attname"]: column["atttypid"] for column in columns if column["is_source"]}
+    projected_by_name = {column["attname"]: column["atttypid"] for column in columns if not column["is_source"]}
+    if not source_by_name or source_by_name != projected_by_name or not all(column["supported"] for column in columns):
+        return json_difference
+    source_columns = ",".join("source." + column["column_sql"] for column in columns if column["is_source"])
+    projected_columns = ",".join("projected." + column["column_sql"] for column in columns if column["is_source"])
+    # Binary COPY can remove an unused array NULL bitmap; unequal bytes still need the original JSON check.
+    return (
+        f"CASE WHEN pg_catalog.record_send(ROW({source_columns}))="
+        f"pg_catalog.record_send(ROW({projected_columns})) THEN false ELSE {json_difference} END"
+    )
+
+
+async def _projection_range_counts(
+    connection, projection_table, address_table, expected_query, address_difference, lower_key, upper_key
+):
+    """Compare every original JSON field and exact canonical array in one bounded range."""
+    predicate, arguments = (
+        ("location_key<=$1", (upper_key,))
+        if lower_key is None
+        else ("location_key>$1 AND location_key<=$2", (lower_key, upper_key))
+    )
+    return await connection.fetchrow(
+        f"""
+        WITH source AS (SELECT * FROM {address_table} WHERE {predicate}),
+            projected AS (SELECT * FROM {projection_table} WHERE {predicate}),
+            expected AS (SELECT * FROM ({expected_query}) expected_networks WHERE {predicate})
         SELECT count(source.location_key) AS source_rows, count(projected.location_key) AS address_rows,
             count(*) FILTER (WHERE source.location_key IS NOT NULL AND projected.location_key IS NULL) AS missing_locations,
             count(*) FILTER (WHERE source.location_key IS NULL) AS extra_locations,
             count(*) FILTER (WHERE source.location_key IS NOT NULL AND projected.location_key IS NOT NULL
-                AND (to_jsonb(source)-'canonical_network_ids') IS DISTINCT FROM
-                    (to_jsonb(projected)-'canonical_network_ids')) AS changed_address_rows,
+                AND ({address_difference})) AS changed_address_rows,
             count(*) FILTER (WHERE projected.location_key IS NOT NULL AND projected.canonical_network_ids
                 IS DISTINCT FROM COALESCE(expected.network_ids,'{{}}'::integer[])) AS changed_network_arrays
-        FROM {address_table} source FULL JOIN {projection_table} projected ON projected.location_key=source.location_key
-        LEFT JOIN expected_networks expected ON expected.location_key=source.location_key
+        FROM source FULL JOIN projected ON projected.location_key=source.location_key
+        LEFT JOIN expected ON expected.location_key=source.location_key
             AND expected.entity_type=source.entity_type AND expected.entity_id=source.entity_id
-    """)
-    if any(
-        parity_counts[field]
-        for field in ("missing_locations", "extra_locations", "changed_address_rows", "changed_network_arrays")
-    ):
+    """,
+        *arguments,
+    )
+
+
+async def _projection_parity(connection, projection_table, address_table, membership_table, binding_table):
+    """Retain the complete six-count comparison without hashing the full address snapshot."""
+    address_difference = await _projection_address_difference(connection, projection_table, address_table)
+    is_read_only = await connection.fetchval("SHOW transaction_read_only") == "on"
+    expected_table = (
+        None if is_read_only else await _expected_projection_networks(connection, membership_table, binding_table)
+    )
+    expected_query = (
+        _expected_projection_query(membership_table, binding_table, bounded=True)
+        if is_read_only
+        else f"SELECT * FROM {expected_table}"
+    )
+    parity_counts = dict.fromkeys(_PARITY_FIELDS, 0)
+    lower_key = None
+    while (
+        upper_key := await _next_projection_range(connection, projection_table, address_table, lower_key)
+    ) is not None:
+        batch_counts = await _projection_range_counts(
+            connection, projection_table, address_table, expected_query, address_difference, lower_key, upper_key
+        )
+        for field in _PARITY_FIELDS:
+            parity_counts[field] += batch_counts[field]
+        lower_key = upper_key
+    if expected_table is not None:
+        await connection.execute(f"DROP TABLE {expected_table}")
+    if any(parity_counts[field] for field in _PARITY_FIELDS[2:]):
         raise NetworkCandidateIndexesError("Candidate address rows or exact canonical arrays differ from pinned inputs")
-    return dict(parity_counts)
+    return parity_counts
 
 
 async def _matching_validation(connection, candidate, copy_target, address_source, control_schema):

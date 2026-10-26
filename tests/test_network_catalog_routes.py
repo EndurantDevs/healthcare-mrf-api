@@ -442,18 +442,23 @@ async def test_database_errors_are_sanitized_and_release_transaction(context, fa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["membership", "arrays", "capability"])
+@pytest.mark.parametrize("failure", ["native_indexes", "retained_indexes", "readiness_receipt", "source", "capability"])
 async def test_retained_proof_and_unproven_capabilities_fail_closed(context, failure):
-    if failure == "membership":
-        context.driver.report["membership_rows"] = 3
-    elif failure == "arrays":
-        context.driver.parity["changed_arrays"] = 1
+    if failure == "native_indexes":
+        context.driver.native_ready = False
+    elif failure == "retained_indexes":
+        context.driver.index_digest = "e" * 64
+    elif failure == "readiness_receipt":
+        context.driver.report.pop("serving_readiness")
+    elif failure == "source":
+        context.manifest.source_generations["custom_membership"] = "c" * 64
     else:
         document = json.loads(context.driver.page["rows_json"])[0]
         document["priceable"] = True
         context.driver.page["rows_json"] = json.dumps([document])
     http_response = await send(context)
     assert http_response.status == 503 and context.session.events[-1][0] == "exit"
+    assert http_response.json == {"error": {"code": "network_catalog_unavailable"}}
 
 
 @pytest.mark.asyncio

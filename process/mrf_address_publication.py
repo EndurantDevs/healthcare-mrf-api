@@ -13,13 +13,16 @@ from sqlalchemy.types import SchemaType
 from db.models import AddressArchiveV2
 from process import entity_address_snapshot_receipt as catalog_identity
 from process.entity_address_snapshot_receipt import _projected_row_identity
-from process.ext.address_canon import CURRENT_ADDRESS_IDENTITY_VERSION, archive_table_name
+from process.ext.address_canon import CURRENT_ADDRESS_IDENTITY_VERSION, address_key_v1, archive_table_name
 from process.ext.address_format import ADDRESS_FORMAT_SOURCE, ADDRESS_FORMAT_VERSION
 from process.reference_family_result_generation import RELATION_NAMES_BY_IMPORTER
 
 STAGE_TABLE = "mrf_canonical_address"
 REFERENCES = ("mrf_address", "mrf_address_evidence")
 MODEL_CLOSURE_CONTRACT = "canonical-address-model-closure.v1"
+ACCOUNTED_MODEL_CLOSURE_CONTRACT = "canonical-address-model-closure.v2"
+MODEL_CLOSURE_CONTRACTS = (MODEL_CLOSURE_CONTRACT, ACCOUNTED_MODEL_CLOSURE_CONTRACT)
+ADDRESS_COVERAGE_CONTRACT = "mrf-address-coverage.indexed-set.v3"
 MERGE_CONTRACT = "canonical-address-model-publication.v1"
 CANONICAL_POLICIES = {"npi": ("npi_canonical_address", 1, 0), "mrf": (STAGE_TABLE, 16, 5)}
 _OUTPUT_PREPARATION_ISSUER = object()
@@ -422,11 +425,19 @@ def _direct_reference_predicate(importer_id, stage, key):
     )
 
 
-async def validate_canonical_closure(session, importer_id, schema, qualified):
+async def validate_canonical_closure(session, importer_id, schema, qualified, *, address_coverage=None):
     """Check complete key closure and declared attribution only after all model indexes exist."""
     table_name, source_bit, _priority = CANONICAL_POLICIES[importer_id]
     stage = qualified(schema, table_name)
     references = ("npi_address",) if importer_id == "npi" else REFERENCES
+    if address_coverage is not None:
+        if importer_id != "mrf" or address_coverage.get("contract") != ADDRESS_COVERAGE_CONTRACT:
+            raise RuntimeError("canonical contribution address accounting differs")
+        require_address_coverage(address_coverage)
+        observed = await _capture_raw_address_counts(session, schema, qualified, stage)
+        if observed != address_coverage["tables"]:
+            raise RuntimeError("canonical contribution address accounting differs")
+        references = ()
     for name in references:
         invalid = await session.scalar(
             text(
@@ -902,6 +913,12 @@ async def capture_address_content(session, schema, qualified, *, native_set=Fals
         # SHARE blocks all archive writers; use immutable contributions if capture contention becomes material.
         await session.execute(text(f"LOCK TABLE {archive} IN SHARE MODE"))
     address_content_map = {"archive_name": archive_name, "archive_oid": archive_oid, "tables": {}}
+    if native_set:
+        address_content_map["contract"] = ADDRESS_COVERAGE_CONTRACT
+        address_content_map["tables"] = await _capture_raw_address_counts(
+            session, schema, qualified, archive if archive_oid is not None else None
+        )
+        return address_content_map
     for name in REFERENCES:
         table = qualified(schema, name)
         if archive_oid is None:
@@ -921,19 +938,99 @@ async def capture_address_content(session, schema, qualified, *, native_set=Fals
             projection = f"""jsonb_build_array(to_jsonb(row_value),
                 (SELECT to_jsonb(canonical) FROM {archive} AS canonical
                  WHERE canonical.address_key=row_value.address_key))"""
-        if native_set:
-            count = await session.scalar(text(f"SELECT count(*) FROM {table}"))
-            address_content_map["tables"][name] = {"rows": count, "uncovered": int(missing)}
-        else:
-            count, digest = await _projected_row_identity(session, schema, name, row_json_sql=projection)
-            address_content_map["tables"][name] = {"rows": count, "sha256": digest, "uncovered": int(missing)}
-    if native_set:
-        address_content_map["contract"] = "mrf-address-coverage.indexed-set.v2"
+        count, digest = await _projected_row_identity(session, schema, name, row_json_sql=projection)
+        address_content_map["tables"][name] = {"rows": count, "sha256": digest, "uncovered": int(missing)}
     return address_content_map
 
 
-def require_address_coverage(content):
-    """Reject publications without a live canonical row for every MRF address."""
+async def _count_unkeyable_null_addresses(session, table, expected_nulls):
+    """Classify only NULL-key exceptions with trusted application code, never schema helpers."""
+    from process.network_cms_registry_address_capture import native_driver
 
+    driver = await native_driver(session)
+    # Reuse the capture statement budget as an overall bound across cursor batches.
+    milliseconds = await driver.fetchval(
+        "SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name='statement_timeout'"
+    )
+    nulls = unkeyable = 0
+    async with asyncio.timeout(milliseconds / 1000 if milliseconds else 5):
+        async for row in driver.cursor(
+            f"SELECT first_line,second_line,city_name,state_name,postal_code,country_code "
+            f"FROM {table} WHERE address_key IS NULL",
+            prefetch=512,
+        ):
+            nulls += 1
+            unkeyable += address_key_v1(*row) is None
+    if nulls != expected_nulls:
+        raise RuntimeError("MRF raw address accounting changed")
+    return unkeyable
+
+
+async def _capture_raw_address_counts(session, schema, qualified, archive):
+    """Partition every retained raw row; canonicalize only the stored NULL-key exceptions."""
+    counts_by_table = {}
+    for name in REFERENCES:
+        table = qualified(schema, name)
+        absent = (
+            "NOT EXISTS (SELECT 1 FROM " + archive + " canonical "
+            "WHERE canonical.address_key=source.address_key AND canonical.merged_into IS NULL "
+            "AND (canonical.source_bits & 16)=16)"
+            if archive is not None
+            else "TRUE"
+        )
+        counts = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT count(*) AS rows,count(*) FILTER (WHERE address_key IS NULL) AS null_keys,"
+                        f"count(*) FILTER (WHERE address_key IS NOT NULL AND {absent}) AS uncovered_nonnull "
+                        f"FROM {table} source"
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        unkeyable = (
+            await _count_unkeyable_null_addresses(session, table, counts["null_keys"]) if counts["null_keys"] else 0
+        )
+        counts_by_table[name] = {
+            "rows": counts["rows"],
+            "covered": counts["rows"] - counts["null_keys"] - counts["uncovered_nonnull"],
+            "unkeyable_null": unkeyable,
+            "keyable_null": counts["null_keys"] - unkeyable,
+            "uncovered_nonnull": counts["uncovered_nonnull"],
+        }
+    return counts_by_table
+
+
+def require_address_coverage(content):
+    """Keep legacy coverage strict; v3 explicitly accounts for every retained raw row."""
+
+    if content.get("contract") == ADDRESS_COVERAGE_CONTRACT:
+        if (
+            set(content) != {"contract", "archive_name", "archive_oid", "tables"}
+            or content["archive_name"] != "address_archive_v2"
+            or type(content["archive_oid"]) is not int
+            or not 0 < content["archive_oid"] < 2**32
+            or type(content["tables"]) is not dict
+            or set(content["tables"]) != set(REFERENCES)
+        ):
+            raise RuntimeError("MRF publication address accounting is invalid")
+        for counts in content["tables"].values():
+            if (
+                type(counts) is not dict
+                or set(counts) != {"rows", "covered", "unkeyable_null", "keyable_null", "uncovered_nonnull"}
+                or any(type(count) is not int or not 0 <= count < 2**63 for count in counts.values())
+                or counts["rows"] != sum(count for name, count in counts.items() if name != "rows")
+            ):
+                raise RuntimeError("MRF publication address accounting is invalid")
+            if counts["keyable_null"] or counts["uncovered_nonnull"]:
+                raise RuntimeError("MRF publication address coverage is incomplete")
+        return
+    if content.get("contract") not in (None, "mrf-address-coverage.indexed-set.v2") or any(
+        set(table) - {"rows", "sha256", "uncovered"} for table in content["tables"].values()
+    ):
+        raise RuntimeError("MRF publication address accounting is invalid")
     if content["archive_oid"] is None or any(table["uncovered"] for table in content["tables"].values()):
         raise RuntimeError("MRF publication address coverage is incomplete")

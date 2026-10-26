@@ -1242,6 +1242,33 @@ async def test_worker_unlimited_temp_refuses_before_claim_or_authority(worker_pe
         assert await _head(fixture) is None
 
 
+@pytest.mark.parametrize("mode", ["replica", "local"])
+async def test_worker_inherited_replication_mode_refuses_before_claim(bounded_worker_permissions, monkeypatch, mode):
+    """No SET privilege does not make an administrator-configured default safe."""
+    from process import registry_publication_worker as worker
+
+    fixture = bounded_worker_permissions
+    async with _consumer(fixture) as (arguments, calls):
+        queued = await _enqueue_ordinary(fixture)
+        connection = fixture.fixture.connection
+        role = fixture.roles_by_kind["execution"]
+        database = await connection.fetchval("SELECT quote_ident(current_database())")
+        await connection.execute(f"ALTER ROLE \"{role}\" IN DATABASE {database} SET session_replication_role='{mode}'")
+        assert not await connection.fetchval(
+            "SELECT has_parameter_privilege($1::name,'session_replication_role','SET')", role
+        )
+
+        @asynccontextmanager
+        async def authority_client(_origin, _token):
+            yield arguments["authorize"]
+
+        monkeypatch.setattr(worker, "RegistryPublicationAuthorityClient", authority_client)
+        with pytest.raises(RuntimeError, match="registry_publication_worker_sql_limits_unavailable"):
+            await worker.run_registry_publication_worker(_deadline_worker_config(fixture, arguments))
+        assert (await _status(fixture, queued))["state"] == "queued" and calls == []
+        assert await _head(fixture) is None
+
+
 async def test_worker_effective_sql_limits_on_raw_and_genuine_ptg_backend(bounded_worker_permissions, monkeypatch):
     from process import registry_publication_worker as worker
 

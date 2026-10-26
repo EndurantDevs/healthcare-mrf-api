@@ -1315,7 +1315,8 @@ async def _assert_full_mrf_stage(native, schema_name, dataset_id, address_key):
             == "5550100"
         )
         assert prepared.manifest.auxiliary["table_name"] == "mrf_canonical_address"
-        assert prepared.manifest.auxiliary == archive._canonical_model_receipt()
+        assert prepared.manifest.auxiliary["contract"] == archive.ACCOUNTED_MODEL_CLOSURE_CONTRACT
+        assert archive._validate_mrf_auxiliary_receipt(prepared.manifest.auxiliary) == prepared.manifest.auxiliary
         assert prepared.ownership.auxiliary_oid is None
         assert "mrf_canonical_address" in dict(prepared.ownership.relation_oids)
         assert (
@@ -1331,7 +1332,7 @@ async def _assert_full_mrf_stage(native, schema_name, dataset_id, address_key):
         await session.execute(
             text(f'UPDATE "{prepared.ownership.schema_name}".mrf_canonical_address SET source_bits=1')
         )
-        with pytest.raises(RuntimeError, match="canonical contribution address scope differs"):
+        with pytest.raises(RuntimeError, match="canonical contribution address accounting differs"):
             await archive.validate_reference_family_stage(
                 session,
                 ownership=prepared.ownership,
@@ -1524,6 +1525,98 @@ async def test_mrf_archive_accepts_normal_published_staging_tables(monkeypatch, 
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{owned_schema}" CASCADE'))
         await _retire_canonical_type(sessions, created)
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_accounted_mrf_clone_and_restore_retain_complete_raw_models(monkeypatch):
+    """Invalid raw evidence survives both native COPY boundaries with exact accounting."""
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    schema = "mrf_accounted_" + uuid4().hex[:10]
+    prepared_id, restored_id = uuid4(), uuid4()
+    owned_schemas = (
+        schema,
+        archive.reference_family_stage_schema(prepared_id),
+        archive.reference_family_stage_schema(restored_id),
+    )
+    created = False, False
+    try:
+        created = await _provision_canonical_type(sessions)
+        await _publish_synthetic_mrf_family(monkeypatch, sessions, schema, uuid4())
+        await _seed_retained_invalid_rows(engine, schema)
+        await _complete_synthetic_publication(monkeypatch, engine, sessions, schema, initialize=False)
+        async with _native_mrf_archive(sessions, schema, None, owned_schemas) as native:
+            manifest, restored = await _prepare_restored_candidate(native, schema, prepared_id, restored_id)
+            await _assert_restored_raw_accounting(sessions, schema, native, manifest, restored)
+    finally:
+        async with engine.begin() as connection:
+            for owned_schema in owned_schemas:
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{owned_schema}" CASCADE'))
+        await _retire_canonical_type(sessions, created)
+        await engine.dispose()
+
+
+async def _seed_retained_invalid_rows(engine, schema):
+    async with engine.begin() as connection:
+        await _prepare_synthetic_publication_schema(connection, schema)
+        for checksum, state, zip_code in ((2, "invalid", "78701"), (3, "TX", "invalid")):
+            parameters_map = {"checksum": checksum, "state": state, "zip": zip_code, "record": str(checksum)}
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema}".mrf_address '
+                    "(checksum,npi,type,first_line,city_name,state_name,postal_code,country_code) "
+                    "VALUES (:checksum,1000000001,'practice','10 Main St','Austin',:state,:zip,'US')"
+                ),
+                parameters_map,
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema}".mrf_address_evidence '
+                    "(evidence_checksum,checksum,npi,type,import_id,source_record_id,first_line,city_name,state_name,postal_code,country_code) "
+                    "VALUES (:checksum,:checksum,1000000001,'practice','synthetic-import',:record,'10 Main St','Austin',:state,:zip,'US')"
+                ),
+                parameters_map,
+            )
+
+
+async def _assert_restored_raw_accounting(sessions, schema, native, manifest, restored):
+    from process.mrf_address_publication import REFERENCES
+
+    assert manifest.auxiliary["contract"] == archive.ACCOUNTED_MODEL_CLOSURE_CONTRACT
+    for counts in manifest.auxiliary["address_coverage"]["tables"].values():
+        assert counts == {
+            "rows": 3,
+            "covered": 1,
+            "unkeyable_null": 2,
+            "keyable_null": 0,
+            "uncovered_nonnull": 0,
+        }
+    async with sessions() as session, session.begin():
+        for model in archive.reference_family_spec("mrf-address").model_types:
+            assert await archive._is_model_table_equal(
+                session,
+                model,
+                left_schema=schema,
+                left_name=model.__tablename__,
+                right_schema=restored.schema_name,
+                right_name=model.__tablename__,
+            )
+        for name in REFERENCES:
+            assert (
+                await session.scalar(
+                    text(f'SELECT count(*) FROM "{restored.schema_name}".{name} WHERE address_key IS NULL')
+                )
+                == 2
+            )
+    async with native.publisher() as session, session.begin():
+        await session.execute(
+            text(
+                f"UPDATE \"{restored.schema_name}\".mrf_address_evidence SET state_name='TX' WHERE evidence_checksum=2"
+            )
+        )
+        with pytest.raises(RuntimeError, match="address accounting differs"):
+            await archive.validate_reference_family_stage(session, ownership=restored, manifest=manifest)
+        await session.rollback()
 
 
 @pytest.mark.asyncio

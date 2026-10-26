@@ -512,7 +512,7 @@ async def source_transport(source_preparation, profile_transport, published_prof
     held.writer_statements.clear()
     held.calls, held.requests, held.source_sql, held.driver_proofs = [], [], [], []
     held.prior = object()
-    original_pin, original_accounting = catalog._pin, catalog._membership_accounting
+    original_pin, original_custody = catalog._pin, catalog.resolve_network_serving_manifest
     original_reader = managed._request_reader
 
     async def pin(*args, **kwargs):
@@ -529,10 +529,10 @@ async def source_transport(source_preparation, profile_transport, published_prof
         held.driver_proofs.append(tuple(proof))
         return await original_pin(*args, **kwargs)
 
-    async def accounting(*args, **kwargs):
-        held.calls.append("accounting")
+    async def custody(*args, **kwargs):
+        held.calls.append("custody")
         assert args[0] is held.active_driver
-        return await original_accounting(*args, **kwargs)
+        return await original_custody(*args, **kwargs)
 
     @contextmanager
     def request_reader(request, session):
@@ -553,7 +553,7 @@ async def source_transport(source_preparation, profile_transport, published_prof
             held.source_sql.append(statement)
 
     monkeypatch.setattr(catalog, "_pin", pin)
-    monkeypatch.setattr(catalog, "_membership_accounting", accounting)
+    monkeypatch.setattr(catalog, "resolve_network_serving_manifest", custody)
     monkeypatch.setattr(managed, "_request_reader", request_reader)
     monkeypatch.setenv(CURSOR_KEY_ENV, base64.urlsafe_b64encode(_SOURCE_KEY).decode().rstrip("="))
     yield held
@@ -575,7 +575,7 @@ async def _source_post(held, document, *, status=200, headers=None):
     if status == 403:
         assert not observed and not held.calls[calls:]
     else:
-        assert held.calls[calls:] == ["pin", "accounting"]
+        assert held.calls[calls:] == ["pin", "custody", "custody"]
         identities = [identity for _statement, identity in observed]
         assert identities and len({identity[4] for identity in identities}) == 1
         assert all(identity[:4] == (held.role, held.role, "on", "repeatable read") for identity in identities)
@@ -891,18 +891,18 @@ async def test_native_reader_prepares_plan_temporary_tables_before_verified_snap
     database = Database()
     database._database_override = held.fixture.engine.url.database
     calls = []
-    original_pin, original_accounting = catalog._pin, catalog._membership_accounting
+    original_pin, original_custody = catalog._pin, catalog.resolve_network_serving_manifest
 
     async def pin(*args, **options):
         calls.append("pin")
         return await original_pin(*args, **options)
 
-    async def accounting(*args, **options):
-        calls.append("accounting")
-        return await original_accounting(*args, **options)
+    async def custody(*args, **options):
+        calls.append("custody")
+        return await original_custody(*args, **options)
 
     monkeypatch.setattr(catalog, "_pin", pin)
-    monkeypatch.setattr(catalog, "_membership_accounting", accounting)
+    monkeypatch.setattr(catalog, "resolve_network_serving_manifest", custody)
     names = [plan.IMPORTED, plan.CANDIDATES, plan.MEMBERSHIPS, plan.OCCURRENCES, plan.PRICES, plan.SELECTED]
     held.writer_statements.clear()
     try:
@@ -925,7 +925,7 @@ async def test_native_reader_prepares_plan_temporary_tables_before_verified_snap
                     )
                     == 0
                 )
-        assert calls == ["pin", "accounting"] * 3
+        assert calls == ["pin", "custody", "custody"] * 3
         assert database.engine is None and not held.writer_statements
     finally:
         await database.disconnect()

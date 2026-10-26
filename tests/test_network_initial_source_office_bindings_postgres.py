@@ -2,6 +2,7 @@
 """Exact ACA/EUA correspondence using real closed archives and native codecs."""
 
 import asyncio
+import copy
 import hashlib
 import importlib
 import json
@@ -34,6 +35,7 @@ from tests.cms_registry_recipe_postgres_support import cms_recipe_template as cm
 from tests.cms_registry_recipe_postgres_support import reviewed_cms_source as reviewed_cms_source
 from tests.cms_registry_recipe_postgres_support import serving_schema as serving_schema
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
+from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
 from tests.test_network_legacy_membership_source_postgres import (
     _aca_binding,
     _approved_aca_pin,
@@ -42,6 +44,7 @@ from tests.test_network_legacy_membership_source_postgres import (
     _seal_reviewed_archive,
     _write_aca_bindings,
 )
+from tests.test_network_serving_schema_postgres import serving_schema as retained_serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _CountedConnection, _create, _draft
 
 pytestmark = pytest.mark.asyncio
@@ -232,7 +235,7 @@ async def _archive(fixture, *, typed=False):
                 "network_bindings": {**asdict(coordinates), "source_key_kind": "hios_plan_id"},
             },
             dependencies={"plan-attributes": "b" * 64},
-            auxiliary={"archive_name": archive.archive_table_name(), "publication_sha256": "a" * 64},
+            auxiliary=None if typed else {"archive_name": archive.archive_table_name(), "publication_sha256": "a" * 64},
         )
         ownership = await archive.capture_model_family_stage_ownership(session, spec, UUID(coordinates.dataset_id))
         owner_oid = await _seal_reviewed_archive(session, ownership, owner, reader)
@@ -619,6 +622,10 @@ def cms_full_office_source(monkeypatch, request):
             resource_rows["Practitioner"][0].pop("identifier", None)
         elif provider_system == "invalid_npi":
             resource_rows["Practitioner"][0]["identifier"][0]["value"] = "malformed"
+        if provider_system == "multi_page":
+            second_role = copy.deepcopy(resource_rows["PractitionerRole"][0])
+            second_role["id"] = "role-second-page"
+            resource_rows["PractitionerRole"].append(second_role)
         resource_rows["Location"][0]["address"] = {
             "line": ["123 Example Street", "Suite 2"],
             "city": "Sample City",
@@ -1114,3 +1121,332 @@ async def test_typed_canonical_model_refuses_changed_native_proof_before_binding
             )
             is None
         )
+
+
+class _CompleteCMSMatchConnection:
+    """Count real complete base joins while preserving the actual native driver."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.complete_matches = 0
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    async def execute(self, query, *arguments):
+        if 'CREATE TEMP TABLE "initial_cms_matches_' in query:
+            self.complete_matches += 1
+        return await self.connection.execute(query, *arguments)
+
+
+@pytest.mark.parametrize("cms_full_office_source", ["multi_page"], indirect=True)
+@pytest.mark.parametrize("damage", [None, "duplicate_custom_key", "missing", "tamper", "child_task", "cancel"])
+async def test_complete_cms_match_pages_keep_exact_refusals_and_cleanup(initial_cms_db, monkeypatch, damage):
+    """Match all genuine pages once; refuse ambiguity and mutable/stale scratch."""
+    from process import registry_initial_source_composition as initial
+    from process.network_approved_membership_source import pin_approved_membership_source
+
+    fixture = initial_cms_db
+    seed, arguments = await _cms_initial_arguments(fixture)
+    original_read = initial._read_recipe_page
+
+    async def single_page(connection, recipe, approved, cursor, schema, limit, source=None):
+        return await original_read(connection, recipe, approved, cursor, schema, min(limit, 1), source)
+
+    monkeypatch.setattr(initial, "_read_recipe_page", single_page)
+    connection = _CompleteCMSMatchConnection(fixture.connection)
+    recipes = arguments["address_sources"].initial_source_recipes
+    relation = f'"{fixture.source_schema}".entity_address_unified'
+    async with connection.transaction(isolation="repeatable_read"):
+        approved = await pin_approved_membership_source(
+            connection, approved_revision=seed.revision, control_schema=fixture.control_schema
+        )
+        if damage == "duplicate_custom_key":
+            await connection.execute(f"""INSERT INTO {relation} SELECT (jsonb_populate_record(NULL::{relation},
+                to_jsonb(address)||jsonb_build_object('location_key',repeat('b',64),'row_origin','network_custom'))).*
+                FROM {relation} address""")
+        elif damage == "missing":
+            await connection.execute(f"DELETE FROM {relation}")
+        await _assert_cms_match_pages(fixture, connection, recipes, approved, damage)
+
+
+async def _assert_cms_match_pages(fixture, connection, recipes, approved, damage):
+    """Verify complete native pages, strict refusal, outer transaction and cleanup."""
+    from process import registry_initial_source_composition as initial
+    from process.network_initial_cms_office_bindings import (
+        InitialCMSOfficeBindingError,
+        pin_cms_office_address_source,
+        prepare_cms_office_matches,
+    )
+
+    pages = initial._fhir_office_pages(connection, recipes, approved, fixture.control_schema, None)
+    expected = (
+        InitialCMSOfficeBindingError
+        if damage in {"duplicate_custom_key", "missing", "tamper", "child_task"}
+        else asyncio.CancelledError
+    )
+    try:
+        async with prepare_cms_office_matches(
+            connection, fixture.base, (fixture.roles["reader"],), pages, control_schema=fixture.control_schema
+        ) as matches:
+            if damage == "tamper":
+                await connection.execute(
+                    f'UPDATE pg_temp."{matches.table_name}" SET office=office||$1::jsonb', '{"extra":true}'
+                )
+            if damage == "child_task":
+                await asyncio.create_task(_child_match_replay(fixture, connection, recipes, approved))
+            seen = office_count = 0
+            async for batch, cursor, retained_read in initial._fhir_office_pages(
+                connection, recipes, approved, fixture.control_schema, None
+            ):
+                pin = await pin_cms_office_address_source(
+                    connection,
+                    batch,
+                    fixture.base,
+                    runtime_roles=(fixture.roles["reader"],),
+                    after_resource=cursor,
+                    control_schema=fixture.control_schema,
+                    retained_read=retained_read,
+                )
+                assert pin.office_count in (0, 1)
+                office_count += pin.office_count
+                seen += 1
+            assert seen >= 2 and office_count == 2
+            if damage == "cancel":
+                raise asyncio.CancelledError
+    except expected:
+        assert damage is not None
+    else:
+        assert damage is None
+    assert connection.complete_matches == 1
+    assert await connection.fetchval("SELECT 1") == 1
+    assert not await connection.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+        "AND (relname LIKE 'initial_cms_inputs_%' OR relname LIKE 'initial_cms_matches_%'))"
+    )
+
+
+@pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
+async def test_complete_match_uses_genuine_publisher_temp_only(legacy_capture_db, retained_serving_schema, monkeypatch):
+    """Use real published Source/Reader and bootstrap proofs with a genuine ordinary login."""
+    from contextlib import aclosing
+
+    from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_fixture
+    from tests.test_network_fhir_retained_capture_postgres import _approved_capture_recipe, _capture
+
+    fixture = legacy_capture_db
+    capture = await _capture(fixture)
+    recipe, approved, _ = await _approved_capture_recipe(fixture, retained_serving_schema, capture)
+    database = await fixture.admin.fetchval("SELECT quote_ident(current_database())")
+    await fixture.admin.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{fixture.role_by_kind["publisher"]}"')
+    await fixture.admin.execute(f'REVOKE "{fixture.role_by_kind["owner"]}" FROM "{fixture.role_by_kind["publisher"]}"')
+    async with aclosing(bootstrap_fixture.__wrapped__(retained_serving_schema, monkeypatch)) as native_base:
+        bootstrap = await anext(native_base)
+        pin = await _publisher_match_bootstrap(fixture, bootstrap)
+        await _assert_publisher_match(fixture, retained_serving_schema, recipe, approved, pin)
+
+
+@pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
+async def test_complete_match_separates_bootstrap_readers_from_output_actors(
+    legacy_capture_db, retained_serving_schema, monkeypatch
+):
+    """A genuine publisher matches and replays exact offices without granting the output API raw input access."""
+    from contextlib import aclosing
+
+    from process import network_bootstrap_read_access as access
+    from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_fixture
+    from tests.test_network_fhir_retained_capture_postgres import _approved_capture_recipe, _capture
+
+    fixture = legacy_capture_db
+    capture = await _capture(fixture)
+    recipe, approved, _ = await _approved_capture_recipe(fixture, retained_serving_schema, capture)
+    database = await fixture.admin.fetchval("SELECT quote_ident(current_database())")
+    await fixture.admin.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{fixture.role_by_kind["publisher"]}"')
+    await fixture.admin.execute(f'REVOKE "{fixture.role_by_kind["owner"]}" FROM "{fixture.role_by_kind["publisher"]}"')
+    actor = "output_api_" + uuid4().hex
+    is_created = False
+    try:
+        await fixture.admin.execute(f"CREATE ROLE \"{actor}\" LOGIN PASSWORD '{uuid4().hex}'")
+        is_created = True
+        async with aclosing(bootstrap_fixture.__wrapped__(retained_serving_schema, monkeypatch)) as native_base:
+            bootstrap = await anext(native_base)
+            pin = await _publisher_match_bootstrap(fixture, bootstrap)
+            before_acl = await access._acl(fixture.admin, pin)
+            assert not await fixture.admin.fetchval(
+                "SELECT has_table_privilege($1,$2::oid,'SELECT')", actor, pin.relation_oids[0][1]
+            )
+            output_roles = tuple(sorted((fixture.role_by_kind["reader"], actor)))
+            assert actor not in pin.runtime_roles and fixture.role_by_kind["publisher"] not in output_roles
+            await _assert_publisher_match(fixture, retained_serving_schema, recipe, approved, pin, roles=output_roles)
+            assert await access._acl(fixture.admin, pin) == before_acl
+    finally:
+        if is_created:
+            await fixture.admin.execute(f'DROP OWNED BY "{actor}"')
+            await fixture.admin.execute(f'DROP ROLE "{actor}"')
+
+
+async def _publisher_match_bootstrap(fixture, bootstrap):
+    """Prepare exact immutable synthetic parents through the existing native lifecycle."""
+    import ptg2_address_canon
+
+    from tests.test_network_custom_address_source_postgres import _bootstrap_prepare, _bootstrap_specification
+
+    address = ("123 Example St", "Suite 1", "Chicago", "IL", "60601", "US")
+    canonical = ptg2_address_canon.canonicalize_batch([address])[0]
+    await bootstrap.connection.execute(
+        f"""UPDATE "{bootstrap.source_schema}".entity_address_unified
+        SET entity_id='1234567893',npi=1234567893,first_line=$1,second_line=$2,city_name=$3,state_name=$4,
+        postal_code=$5,country_code=$6,address_key=$7,premise_key=$8,address_precision='street'""",
+        *address,
+        UUID(canonical["address_key"]),
+        UUID(canonical["premise_key"]),
+    )
+    await bootstrap.connection.execute(f'UPDATE "{bootstrap.source_schema}".npi SET npi=1234567893')
+    specification = await _bootstrap_specification(bootstrap)
+    roles = tuple(sorted((fixture.role_by_kind["reader"], fixture.role_by_kind["publisher"])))
+    return await _bootstrap_prepare(bootstrap, specification, runtime_roles=roles)
+
+
+async def _assert_publisher_match(fixture, serving, recipe, approved, bootstrap, *, roles=None):
+    """Match on the real login with no elevated or source-owner capability."""
+    from process import registry_initial_source_composition as initial
+    from process.network_initial_cms_office_bindings import pin_cms_office_address_source, prepare_cms_office_matches
+
+    publisher = await fixture.connect("publisher")
+    roles = roles or tuple(sorted((fixture.role_by_kind["reader"], fixture.role_by_kind["publisher"])))
+    async with publisher.transaction(isolation="repeatable_read"):
+        assert await publisher.fetchval(
+            "SELECT session_user=current_user AND NOT (rolsuper OR rolcreaterole OR "
+            "rolcreatedb OR rolreplication OR rolbypassrls) FROM pg_roles WHERE rolname=current_user"
+        )
+        assert not await publisher.fetchval(
+            "SELECT has_database_privilege(current_user,current_database(),'CREATE') "
+            "OR has_schema_privilege(current_user,'public','CREATE')"
+        )
+        assert await publisher.fetchval("SELECT has_database_privilege(current_user,current_database(),'TEMP')")
+        pages = initial._fhir_office_pages(publisher, (recipe,), approved, serving[1], None)
+        async with prepare_cms_office_matches(
+            publisher, bootstrap.address_source, roles, pages, control_schema=serving[1]
+        ):
+            count = 0
+            async for batch, cursor, retained_read in initial._fhir_office_pages(
+                publisher, (recipe,), approved, serving[1], None
+            ):
+                receipt = await pin_cms_office_address_source(
+                    publisher,
+                    batch,
+                    bootstrap.address_source,
+                    runtime_roles=roles,
+                    after_resource=cursor,
+                    control_schema=serving[1],
+                    retained_read=retained_read,
+                )
+                assert (
+                    await pin_cms_office_address_source(
+                        publisher,
+                        batch,
+                        bootstrap.address_source,
+                        runtime_roles=roles,
+                        after_resource=cursor,
+                        control_schema=serving[1],
+                        retained_read=retained_read,
+                    )
+                    == receipt
+                )
+                count += receipt.office_count
+            assert count == 1
+        assert await publisher.fetchval("SELECT current_user=session_user")
+        assert not await publisher.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+            "AND (relname LIKE 'initial_cms_inputs_%' OR relname LIKE 'initial_cms_matches_%'))"
+        )
+
+
+async def _child_match_replay(fixture, connection, recipes, approved):
+    """A copied ContextVar must not transfer another task's native match proof."""
+    from process import registry_initial_source_composition as initial
+    from process.network_initial_cms_office_bindings import pin_cms_office_address_source
+
+    async for batch, cursor, retained_read in initial._fhir_office_pages(
+        connection, recipes, approved, fixture.control_schema, None
+    ):
+        await pin_cms_office_address_source(
+            connection,
+            batch,
+            fixture.base,
+            runtime_roles=(fixture.roles["reader"],),
+            after_resource=cursor,
+            control_schema=fixture.control_schema,
+            retained_read=retained_read,
+        )
+
+
+@pytest.mark.parametrize("cms_full_office_source", ["multi_page"], indirect=True)
+async def test_complete_match_copy_cancellation_drains_native_savepoint(initial_cms_db, monkeypatch):
+    """Repeated cancellation must finish native COPY abort before returning."""
+    from process import registry_initial_source_composition as initial
+    from process.network_approved_membership_source import pin_approved_membership_source
+    from process.network_initial_cms_office_bindings import prepare_cms_office_matches
+    from tests.test_network_fhir_retained_capture_postgres import _reader_rollback_barrier
+
+    fixture = initial_cms_db
+    seed, arguments = await _cms_initial_arguments(fixture)
+    started = asyncio.Event()
+    rollback_started, release = _reader_rollback_barrier(monkeypatch, fixture.connection, started, True)
+    connection = _HeldCMSCopy(fixture.connection, started)
+    recipes = arguments["address_sources"].initial_source_recipes
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        vxid = await fixture.connection.fetchval(
+            "SELECT virtualtransaction FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='virtualxid'"
+        )
+        approved = await pin_approved_membership_source(
+            connection, approved_revision=seed.revision, control_schema=fixture.control_schema
+        )
+
+        async def capture():
+            pages = initial._fhir_office_pages(connection, recipes, approved, fixture.control_schema, None)
+            async with prepare_cms_office_matches(
+                connection, fixture.base, (fixture.roles["reader"],), pages, control_schema=fixture.control_schema
+            ):
+                raise AssertionError("native COPY was not interrupted")
+
+        task = asyncio.create_task(capture())
+        await asyncio.wait_for(started.wait(), 10)
+        task.cancel()
+        await asyncio.wait_for(rollback_started.wait(), 10)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await fixture.connection.fetchval("SELECT 1") == 1
+        assert (
+            await fixture.connection.fetchval(
+                "SELECT virtualtransaction FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='virtualxid'"
+            )
+            == vxid
+        )
+        assert not await fixture.connection.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+            "AND (relname LIKE 'initial_cms_inputs_%' OR relname LIKE 'initial_cms_matches_%'))"
+        )
+        assert connection.complete_matches == 0
+
+
+class _HeldCMSCopy(_CompleteCMSMatchConnection):
+    """Hold a real task-owned native COPY after its first office record."""
+
+    def __init__(self, connection, started):
+        super().__init__(connection)
+        self.started = started
+
+    async def copy_records_to_table(self, *arguments, **options):
+        records = options["records"]
+        if records:
+
+            async def held_records():
+                yield records[0]
+                self.started.set()
+                await asyncio.Event().wait()
+
+            options["records"] = held_records()
+        return await self.connection.copy_records_to_table(*arguments, **options)

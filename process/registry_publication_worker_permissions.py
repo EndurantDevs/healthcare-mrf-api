@@ -224,12 +224,15 @@ async def verify_registry_publication_worker_permissions(
         """SELECT pg_has_role($1::name,$2::name,'SET') AS can_set,
       pg_has_role($1::name,$2::name,'USAGE') AS can_inherit,
       has_database_privilege($2::name,current_database(),'CREATE') AS can_create,
+      has_database_privilege($1::name,current_database(),'TEMPORARY') AS can_temp,
       EXISTS(SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid JOIN pg_roles member ON member.oid=m.member WHERE r.rolname=$2 AND member.rolname=$1 AND m.admin_option) AS can_admin""",
         execution_role,
         physical_owner_role,
     )
     if not rights["can_set"] or not rights["can_inherit"] or not rights["can_create"] or rights["can_admin"]:
         raise RegistryPublicationWorkerPermissionError("Execution physical ownership rights differ")
+    if not rights["can_temp"]:
+        raise RegistryPublicationWorkerPermissionError("Execution temporary-table privilege is unavailable")
     await _verify_sequences(connection, sequences, lifecycle_role, execution_role)
     return {
         "control_schema": namespace,
@@ -328,6 +331,9 @@ async def install_registry_publication_worker_permissions(
             await _install_worker_metadata(connection, namespace, tables, sequences, options_by_name, custody_owner)
             await connection.execute(
                 f"GRANT CREATE ON DATABASE {_identifier(await connection.fetchval('SELECT current_database()'))} TO {_identifier(physical_owner_role)}"
+            )
+            await connection.execute(
+                f"GRANT TEMPORARY ON DATABASE {_identifier(await connection.fetchval('SELECT current_database()'))} TO {_identifier(execution_role)}"
             )
             await connection.execute(
                 f"GRANT {_identifier(physical_owner_role)} TO {_identifier(execution_role)} WITH ADMIN FALSE, INHERIT TRUE, SET TRUE"

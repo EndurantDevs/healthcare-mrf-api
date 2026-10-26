@@ -52,9 +52,13 @@ def _publication():
     }
 
 
-async def _global_prepared(monkeypatch, *, import_id=None):
-    prepared, validation = await _prepared(monkeypatch)
+async def _global_prepared(monkeypatch, *, import_id=None, accounted=False):
+    prepared, validation = await _prepared(monkeypatch, accounted=accounted)
     completion = _global_completion()
+    if accounted:
+        from tests.test_mrf_address_accounting import _coverage
+
+        completion["native_address_coverage"] = _coverage()
     if import_id is not None:
         completion["import_id"] = import_id
     monkeypatch.setattr(global_epoch, "require_completed_publication", AsyncMock(return_value=completion))
@@ -62,7 +66,10 @@ async def _global_prepared(monkeypatch, *, import_id=None):
         object(), _publication(), schema="mrf", runtime_roles=_ROLES
     )
     manifest = replace(
-        prepared.manifest, source_metadata=metadata, source_metadata_sha256=archive._source_metadata(metadata)[1]
+        prepared.manifest,
+        source_metadata=metadata,
+        source_metadata_sha256=archive._source_metadata(metadata)[1],
+        auxiliary=archive._canonical_model_receipt(completion) if accounted else prepared.manifest.auxiliary,
     )
     fields_map = validation.as_dict()
     fields_map.pop("validation_sha256")
@@ -123,8 +130,9 @@ async def test_global_epoch_refuses_partial_foreign_or_logical_evidence(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_global_document_roundtrip_bounds_and_full_identity(monkeypatch):
-    prepared, validation = await _global_prepared(monkeypatch)
+@pytest.mark.parametrize("accounted", [False, True])
+async def test_global_document_roundtrip_bounds_and_full_identity(monkeypatch, accounted):
+    prepared, validation = await _global_prepared(monkeypatch, accounted=accounted)
     epoch = global_epoch.PinnedACAGlobalEpoch(prepared, validation, _ROLES)
     assert global_epoch.decode_pinned_aca_global_epoch(epoch.as_dict()) == epoch
     assert global_epoch.decode_pinned_aca_global_epoch(json.dumps(epoch.as_dict())) == epoch
@@ -142,6 +150,34 @@ async def test_global_document_roundtrip_bounds_and_full_identity(monkeypatch):
     ):
         with pytest.raises(ValueError):
             global_epoch.decode_pinned_aca_global_epoch(document)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["partition", "publication", "generation", "digest", "downgrade"])
+async def test_accounted_epoch_requires_the_same_clone_proof_and_publication(monkeypatch, damage):
+    prepared, validation = await _global_prepared(monkeypatch, accounted=True)
+    metadata = deepcopy(prepared.manifest.source_metadata)
+    completion = metadata["registry_aca_global_epoch"]["completed_publication"]
+    if damage == "partition":
+        counts = completion["native_address_coverage"]["tables"]["mrf_address"]
+        counts["covered"] -= 1
+        counts["unkeyable_null"] += 1
+    elif damage == "publication":
+        completion["attempt_id"] = "20000000-0000-0000-0000-000000000001"
+    elif damage == "generation":
+        completion["generation"]["local_generation"] += 1
+    elif damage == "digest":
+        prepared = replace(
+            prepared,
+            manifest=replace(
+                prepared.manifest, auxiliary={**prepared.manifest.auxiliary, "publication_sha256": "f" * 64}
+            ),
+        )
+    else:
+        completion["native_address_coverage"] = _global_completion()["native_address_coverage"]
+    manifest = replace(prepared.manifest, source_metadata=metadata)
+    with pytest.raises(ValueError, match="registry_aca_global_epoch_invalid"):
+        global_epoch._metadata(replace(prepared, manifest=manifest), _ROLES)
 
 
 @pytest.mark.asyncio

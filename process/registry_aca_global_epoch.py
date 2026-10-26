@@ -8,7 +8,7 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from process.mrf_address_publication import REFERENCES, require_address_coverage
+from process.mrf_address_publication import ADDRESS_COVERAGE_CONTRACT, REFERENCES, require_address_coverage
 from process.mrf_publication_receipt import SUMMARY_INPUTS, require_completed_publication
 from process.network_address_projection import _identifier
 from process.network_cms_registry_address_capture import native_driver
@@ -19,6 +19,7 @@ from process.reference_family_archive import (
     ReferenceFamilyValidationReceipt,
     _canonical_json,
     _source_metadata,
+    mrf_publication_digest,
     prepare_reference_family_activation,
     protected_publisher_owner,
     reference_family_profile_contract,
@@ -125,6 +126,9 @@ def _generation(generation, publication):
 def _coverage(coverage):
     if type(coverage) is not dict or set(coverage) != {"contract", "archive_name", "archive_oid", "tables"}:
         _invalid()
+    if coverage["contract"] == ADDRESS_COVERAGE_CONTRACT:
+        require_address_coverage(coverage)
+        return
     if (
         coverage["contract"] != "mrf-address-coverage.indexed-set.v2"
         or coverage["archive_name"] != "address_archive_v2"
@@ -157,6 +161,14 @@ def _metadata(prepared, runtime_roles):
         _invalid()
     serving = _publication(epoch_map["publication"])
     _completion(epoch_map["completed_publication"], epoch_map["publication"])
+    completion = epoch_map["completed_publication"]
+    coverage = completion["native_address_coverage"]
+    auxiliary = prepared.manifest.auxiliary
+    if coverage["contract"] == ADDRESS_COVERAGE_CONTRACT or "address_coverage" in auxiliary:
+        if auxiliary.get("address_coverage") != coverage or auxiliary.get(
+            "publication_sha256"
+        ) != mrf_publication_digest(completion):
+            _invalid()
     if prepared.manifest.source_serving_generation != serving:
         _invalid()
 

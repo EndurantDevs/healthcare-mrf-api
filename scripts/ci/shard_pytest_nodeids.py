@@ -74,6 +74,8 @@ EXCLUSIVE_REGISTRY_TEST_SHARDS = {
     "tests/test_network_registry_cms_prepared_pair_postgres.py::test_native_retained_pair_survives_receipt_head_refresh[copy_bounds1]": 16,
     "tests/test_network_registry_cms_prepared_pair_postgres.py::test_native_retention_address_copy_interruptions_preserve_source[copy_bounds0]": 17,
     "tests/test_network_registry_cms_prepared_pair_postgres.py::test_native_retention_address_copy_interruptions_preserve_source[copy_bounds1]": 18,
+    "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[legacy]": 19,
+    "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[modern]": 20,
 }
 
 

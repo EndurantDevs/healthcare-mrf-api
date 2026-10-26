@@ -12,7 +12,7 @@ from urllib.parse import parse_qs
 from uuid import UUID
 
 import asyncpg
-from sanic.exceptions import InvalidUsage, SanicException, ServiceUnavailable
+from sanic.exceptions import Forbidden, InvalidUsage, SanicException, ServiceUnavailable
 from sqlalchemy import MetaData, String, all_, bindparam, cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import ARRAY, INTEGER
 from sqlalchemy.exc import DBAPIError
@@ -34,6 +34,7 @@ class NetworkAddressReadScope:
     excluded_network_ids: tuple[int, ...] | None = None
     address_predicate_sql: str | None = None
     organization_policy: RegistryOrganizationVisibility | None = None
+    legacy_checksums: tuple[int, ...] | None = None
 
 
 def current_network_address_scope():
@@ -90,7 +91,7 @@ def _default_address_predicate():
 def scoped_address_insurance_predicate():
     """Use visible canonical membership for managed reads and legacy semantics otherwise."""
     scope = current_network_address_scope()
-    if scope is None:
+    if scope is None or scope.legacy_checksums is not None:
         return "NOT (plans_network_array @@ '0'::query_int)"
     if scope.network_ids is not None:
         # The trusted scope already authorizes this exact approved selection.
@@ -101,7 +102,7 @@ def scoped_address_insurance_predicate():
 def scoped_address_aca_insurance_predicate():
     """Require the same visible office membership and an active approved ACA binding."""
     scope = current_network_address_scope()
-    if scope is None:
+    if scope is None or scope.legacy_checksums is not None:
         return "NOT (plans_network_array @@ '0'::query_int)"
     from db.registry_schema import registry_schema
 
@@ -129,7 +130,7 @@ def scoped_address_aca_insurance_predicate():
         AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'plan_id')='string'
         AND aca_binding.record_json->'source_scope_json'->>'plan_id'<>''
         AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'plan_year')='number'
-        AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'issuer_id')='number'
+        AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'issuer_id')='string'
         AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'state')='string'
         AND aca_binding.record_json->'source_scope_json'->>'state'<>''
         AND jsonb_typeof(aca_binding.record_json->'source_scope_json'->'checksum_network')='number'
@@ -217,12 +218,26 @@ def _validate_network_scope_inputs(
 
 @contextmanager
 def network_address_read_scope(
-    manifest, network_ids, *, access_scope_sha256=None, excluded_network_ids=None, organization_policy=None
+    manifest,
+    network_ids,
+    *,
+    access_scope_sha256=None,
+    excluded_network_ids=None,
+    organization_policy=None,
+    legacy_checksums=None,
 ):
     """Keep SQL and hydration on the same filtered physical address heap."""
     _validate_network_scope_inputs(
         manifest, network_ids, access_scope_sha256, excluded_network_ids, organization_policy
     )
+    if legacy_checksums is not None and (
+        network_ids is None
+        or type(legacy_checksums) is not tuple
+        or not 1 <= len(legacy_checksums) <= 50
+        or any(type(checksum) is not int or not -2147483648 <= checksum <= 2147483647 for checksum in legacy_checksums)
+        or legacy_checksums != tuple(sorted(set(legacy_checksums)))
+    ):
+        raise ValueError("network_legacy_scope_invalid")
     physical = EntityAddressUnified.__table__.to_metadata(MetaData(), schema=manifest.schema_name)
     predicate_sql = _default_address_predicate() if network_ids is None else None
     predicate = (
@@ -230,6 +245,10 @@ def network_address_read_scope(
         if predicate_sql is not None
         else physical.c.canonical_network_ids.op("&&")(bindparam("_canonical_network_ids", type_=ARRAY(INTEGER)))
     )
+    if legacy_checksums is not None:
+        predicate = physical.c.plans_network_array.op("&&")(
+            bindparam("_legacy_network_checksums", type_=ARRAY(INTEGER))
+        )
     relation = select(physical).where(predicate).subquery("entity_address_unified")
     token = _SCOPE.set(
         NetworkAddressReadScope(
@@ -240,6 +259,7 @@ def network_address_read_scope(
             excluded_network_ids,
             predicate_sql,
             organization_policy,
+            legacy_checksums,
         )
     )
     try:
@@ -257,10 +277,12 @@ def scoped_address_relation_sql(table_ref):
         return (
             f'(SELECT * FROM "{scope.manifest.schema_name}".entity_address_unified WHERE {scope.address_predicate_sql})'
         )
-    return (
-        f'(SELECT * FROM "{scope.manifest.schema_name}".entity_address_unified '
-        "WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))"
+    predicate = (
+        "plans_network_array && CAST(:_legacy_network_checksums AS INTEGER[])"
+        if scope.legacy_checksums is not None
+        else "canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[])"
     )
+    return f'(SELECT * FROM "{scope.manifest.schema_name}".entity_address_unified WHERE {predicate})'
 
 
 def is_scoped_address_relation(table_ref):
@@ -282,6 +304,16 @@ def scoped_address_parameters(parameters_by_name):
     scope = _SCOPE.get()
     if scope is None:
         return dict(parameters_by_name)
+    legacy_parameters = (
+        {"_legacy_network_checksums": list(scope.legacy_checksums)} if scope.legacy_checksums is not None else {}
+    )
+    if "_legacy_network_checksums" in parameters_by_name and (
+        "_legacy_network_checksums" not in legacy_parameters
+        or not _is_reserved_parameter_equal(
+            parameters_by_name["_legacy_network_checksums"], legacy_parameters["_legacy_network_checksums"]
+        )
+    ):
+        raise ValueError("network_address_reserved_parameter")
     if scope.network_ids is None:
         reserved_by_name = {
             "_network_excluded_ids": list(scope.excluded_network_ids),
@@ -299,7 +331,7 @@ def scoped_address_parameters(parameters_by_name):
         scope.network_ids
     ):
         raise ValueError("network_address_reserved_parameter")
-    return {**parameters_by_name, "_canonical_network_ids": list(scope.network_ids)}
+    return {**parameters_by_name, "_canonical_network_ids": list(scope.network_ids), **legacy_parameters}
 
 
 def scoped_address_statement(statement):
@@ -338,6 +370,7 @@ def scoped_address_cache_key(cache_key):
     return (
         f"{cache_key}|network:{scope.manifest.manifest_sha256}:{','.join(map(str, scope.network_ids))}"
         f":{scope.access_scope_sha256 or ''}"
+        + (f":checksums:{','.join(map(str, scope.legacy_checksums))}" if scope.legacy_checksums is not None else "")
     )
 
 
@@ -377,7 +410,9 @@ def _request_selector(request, native_args):
     )
     absent_selector = object()
     if args.get("network_ids", absent_selector) is absent_selector:
-        if args.get("network_generation", absent_selector) is not absent_selector:
+        if args.get("network_generation", absent_selector) is not absent_selector or (
+            native_args is None and getattr(request, "headers", {}).get("X-Network-Legacy-Checksums") is not None
+        ):
             raise InvalidUsage("network_generation requires network_ids.")
         return None
     if any(
@@ -401,6 +436,27 @@ def _request_selector(request, native_args):
     return args
 
 
+def _request_legacy_checksums(request, args):
+    """Accept a bounded exact checksum scope only beside trusted pinned authorization."""
+    from process.registry_network_catalog_read import RegistryNetworkCatalogLegacyBatchSelector
+
+    raw = request.headers.get("X-Network-Legacy-Checksums")
+    if raw is None:
+        return None
+    if (
+        len(request.headers.getall("X-Network-Legacy-Checksums")) != 1
+        or len(raw) > 600
+        or "network_generation" not in args
+        or request.headers.get("X-Network-Access-Scope") is None
+    ):
+        raise ValueError("network_legacy_scope_invalid")
+    selector = RegistryNetworkCatalogLegacyBatchSelector("checksum_network", tuple(raw.split(",")))
+    checksums = tuple(int(value) for value in selector.values)
+    if checksums != tuple(sorted(checksums)):
+        raise ValueError("network_legacy_scope_invalid")
+    return checksums
+
+
 async def _pin_network_scope(request, args):
     from api.control_auth import require_control_auth
     from process.network_serving_read import parse_canonical_network_ids, resolve_network_serving_manifest
@@ -411,6 +467,7 @@ async def _pin_network_scope(request, args):
         if access_scope_sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", access_scope_sha256) is None:
             raise ValueError("network_access_scope_invalid")
         network_ids = parse_canonical_network_ids(args["network_ids"])
+        legacy_checksums = _request_legacy_checksums(request, args)
         generation = args.get("network_generation")
         if generation is not None:
             if (
@@ -431,7 +488,21 @@ async def _pin_network_scope(request, args):
     driver = (await connection.get_raw_connection()).driver_connection
     manifest = await resolve_network_serving_manifest(driver, generation_id=generation)
     await session.execute(text(f'LOCK TABLE "{manifest.schema_name}".entity_address_unified IN ACCESS SHARE MODE'))
-    return manifest, network_ids, access_scope_sha256
+    if legacy_checksums is not None:
+        from db.registry_schema import registry_schema
+        from process.network_address_projection import _identifier
+        from process.registry_network_catalog_read import _LEGACY_BATCH_SQL
+
+        mapping = await driver.fetchrow(
+            _LEGACY_BATCH_SQL.format(control=_identifier(registry_schema())),
+            manifest.approved_custom_revision,
+            tuple(map(str, legacy_checksums)),
+            "checksum_network",
+            (),
+        )
+        if mapping is None or mapping["complete"] is not True or mapping["network_ids"] != list(network_ids):
+            raise Forbidden("Legacy network scope does not match its authorized canonical identities.")
+    return manifest, network_ids, access_scope_sha256, legacy_checksums
 
 
 def canonical_network_read(handler):
@@ -450,7 +521,7 @@ def canonical_network_read(handler):
         from process.network_serving_read import NetworkServingReadUnavailable
 
         try:
-            manifest, network_ids, access_scope_sha256 = await _pin_network_scope(request, selector)
+            manifest, network_ids, access_scope_sha256, legacy_checksums = await _pin_network_scope(request, selector)
         except SanicException as refusal:
             refusal.headers = {**(refusal.headers or {}), "Cache-Control": "private, no-store"}
             raise
@@ -458,11 +529,15 @@ def canonical_network_read(handler):
             raise ServiceUnavailable(
                 "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
             ) from error
-        with network_address_read_scope(manifest, network_ids, access_scope_sha256=access_scope_sha256):
+        with network_address_read_scope(
+            manifest, network_ids, access_scope_sha256=access_scope_sha256, legacy_checksums=legacy_checksums
+        ):
             pinned_headers_by_name = {
                 "X-Network-Generation": str(manifest.generation_id),
                 "Cache-Control": "private, no-store",
             }
+            if legacy_checksums is not None:
+                pinned_headers_by_name["X-Network-Legacy-Checksums"] = ",".join(map(str, legacy_checksums))
             try:
                 http_response = await handler(request, *args, **kwargs)
             except SanicException as error:

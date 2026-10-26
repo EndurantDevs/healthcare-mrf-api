@@ -868,8 +868,9 @@ async def test_managed_insurance_uses_visible_canonical_membership_before_count_
                 await _assert_insurance_scope_pages(session, request, relation, predicate, parameters, expected)
 
 
+@pytest.mark.parametrize("issuer_id", ["12345", 12345], ids=["approved-string", "invalid-number"])
 async def test_pharmacy_reports_keep_exact_scoped_offices_aca_and_private_policy(
-    default_address_db, default_scope_reader, monkeypatch
+    default_address_db, default_scope_reader, monkeypatch, issuer_id
 ):
     """Run real report SQL as the ordinary Reader, including two offices for one NPI."""
     import datetime
@@ -877,10 +878,10 @@ async def test_pharmacy_reports_keep_exact_scoped_offices_aca_and_private_policy
     from api.endpoint import reports
 
     fixture = default_address_db
-    engine, role = default_scope_reader
-    await _seed_pharmacy_report_evidence(fixture, role, monkeypatch)
+    role = default_scope_reader[1]
+    await _seed_pharmacy_report_evidence(fixture, role, monkeypatch, issuer_id=issuer_id)
     manifest = replace(await _manifest(fixture), approved_custom_revision=8)
-    async with async_sessionmaker(engine)() as session, session.begin():
+    async with async_sessionmaker(default_scope_reader[0])() as session, session.begin():
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         assert (await session.execute(text("SELECT session_user,current_user"))).one() == (role, role)
 
@@ -896,7 +897,9 @@ async def test_pharmacy_reports_keep_exact_scoped_offices_aca_and_private_policy
                 assert summary["pharmacy_npi_count"] == expected_total and helper is False
                 assert summary["insured_pharmacy_npi_count"] == 1
                 states, _ = await reports._query_pharmacy_state_stats(reader)
-                assert sum(state_stats_row["aca_pharmacies"] for state_stats_row in states) == expected_aca
+                assert sum(state_stats_row["aca_pharmacies"] for state_stats_row in states) == (
+                    expected_aca if isinstance(issuer_id, str) else 0
+                )
                 query = reports._MarketSummaryQuery(
                     "state", "pharmacy_count", "desc", datetime.date(2026, 1, 1), True, 1, 0
                 )
@@ -945,7 +948,7 @@ async def _assert_insurance_scope_pages(session, request, relation, predicate, p
     assert pages == expected
 
 
-async def _seed_pharmacy_report_evidence(fixture, role, monkeypatch):
+async def _seed_pharmacy_report_evidence(fixture, role, monkeypatch, *, issuer_id):
     """Seed only task-owned report sources and an approved ACA binding for native reads."""
     from api.endpoint import reports
 
@@ -986,9 +989,9 @@ async def _seed_pharmacy_report_evidence(fixture, role, monkeypatch):
                 "archived": False,
                 "source_system": "aca",
                 "source_scope_json": {
-                    "plan_id": "synthetic-plan",
+                    "plan_id": "12345NY0000001",
                     "plan_year": 2026,
-                    "issuer_id": 1,
+                    "issuer_id": issuer_id,
                     "state": "NY",
                     "checksum_network": -42,
                 },
@@ -1014,3 +1017,149 @@ class _ScopedReportSession:
         ):
             sql = re.sub(r"\bmrf\." + source + r"\b", f'"{self.schema}"."{target}"', sql)
         return await self.session.execute(text(sql), parameters or {})
+
+
+@pytest.mark.asyncio
+async def test_legacy_checksum_membership_matches_original_without_canonical_coverage(
+    serving_indexes_db, serving_schema
+):
+    """One canonical network has two aliases; original_locations NPI-wide offices remain exact."""
+    fixture = serving_indexes_db
+    manifest = await _manifest(fixture)
+    _, _, engine = serving_schema
+    table = f'"{manifest.schema_name}".entity_address_unified'
+    await fixture.connection.execute(
+        f"UPDATE {table} SET plans_network_array=CASE WHEN location_key=$1 THEN ARRAY[84] ELSE ARRAY[42] END, "
+        "canonical_network_ids=CASE WHEN location_key=ANY($2::text[]) THEN ARRAY[42] ELSE ARRAY[]::integer[] END",
+        "c" * 64,
+        ["a" * 64, "c" * 64],
+    )
+    expected_by_selector = {None: ["a", "c"], (42,): ["a", "b", "d"], (84,): ["c"], (42, 84): ["a", "b", "c", "d"]}
+    async with async_sessionmaker(engine)() as session, session.begin():
+        for checksums, expected_keys in expected_by_selector.items():
+            expected_locations = [key * 64 for key in expected_keys]
+            with network_address_read_scope(manifest, (42,), legacy_checksums=checksums):
+                relation = scoped_address_relation_sql("mrf.entity_address_unified")
+                parameters = scoped_address_parameters({})
+                selected_locations = list(
+                    await session.scalars(
+                        text(f"SELECT location_key FROM {relation} addresses ORDER BY location_key"), parameters
+                    )
+                )
+                assert selected_locations == expected_locations
+                statement = scoped_address_statement(
+                    select(EntityAddressUnified.__table__.c.location_key).order_by(
+                        EntityAddressUnified.__table__.c.location_key
+                    )
+                )
+                assert list(await session.scalars(statement, parameters)) == expected_locations
+                assert await session.scalar(text(f"SELECT count(*) FROM {relation} addresses"), parameters) == len(
+                    expected_locations
+                )
+                hydrated = await npi._fetch_npi_location_candidates_map(
+                    [1111111111, 2222222222, 3333333333], session=session
+                )
+                assert (
+                    sorted(address["location_key"] for offices in hydrated.values() for address in offices)
+                    == expected_locations
+                )
+                if checksums is not None:
+                    original_locations = list(
+                        await session.scalars(
+                            text(
+                                f"SELECT location_key FROM {table} WHERE plans_network_array && CAST(:checksums AS INTEGER[]) ORDER BY location_key"
+                            ),
+                            {"checksums": list(checksums)},
+                        )
+                    )
+                    assert selected_locations == original_locations
+
+
+def _legacy_header_mapping_records(ambiguous):
+    """One approved canonical network has two aliases; optionally add a conflicting target."""
+    approved_records = [
+        ("network", str(network_id), {"network_id": network_id, "archived": False}) for network_id in (42, 84)
+    ]
+    approved_records += [
+        (
+            "network_binding",
+            str(checksum),
+            {
+                "network_id": 42,
+                "source_system": "aca",
+                "archived": False,
+                "source_scope_json": {"checksum_network": checksum},
+            },
+        )
+        for checksum in (42, 84)
+    ]
+    if ambiguous:
+        approved_records.append(
+            (
+                "network_binding",
+                "ambiguous",
+                {
+                    "network_id": 84,
+                    "source_system": "aca",
+                    "archived": False,
+                    "source_scope_json": {"checksum_network": 42},
+                },
+            )
+        )
+    return approved_records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "checksums,ids,denied",
+    [
+        ("42", "42", False),
+        ("84", "42", False),
+        ("42", "84", True),
+        ("99", "42", True),
+        ("42,84", "42", False),
+        ("42", "42", True),
+    ],
+)
+async def test_native_legacy_header_mapping_must_equal_authorized_ids(
+    serving_indexes_db, serving_schema, monkeypatch, checksums, ids, denied
+):
+    """Resolve original aliases using actual pinned-revision SQL before reading any office."""
+    from sanic.compat import Header
+    from sanic.exceptions import Forbidden
+
+    from api.network_address_scope import _pin_network_scope
+    from process import network_serving_read
+
+    fixture = serving_indexes_db
+    manifest = replace(await _manifest(fixture), approved_custom_revision=4)
+    _, schema, engine = serving_schema
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-read-token")
+    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", AsyncMock(return_value=manifest))
+    approved_records = _legacy_header_mapping_records(denied and checksums == ids == "42")
+    for kind, key, document in approved_records:
+        await fixture.connection.execute(
+            f'INSERT INTO "{schema}".registry_approved_record(approved_revision,record_kind,record_key,record_revision,custom_revision,record_json) VALUES(4,$1,$2,1,1,$3::jsonb)',
+            kind,
+            key,
+            json.dumps(document),
+        )
+    async with async_sessionmaker(engine)() as session, session.begin():
+        request = SimpleNamespace(
+            headers=Header(
+                {
+                    "Authorization": "Bearer synthetic-network-read-token",
+                    "X-Network-Access-Scope": "b" * 64,
+                    "X-Network-Legacy-Checksums": checksums,
+                }
+            ),
+            ctx=SimpleNamespace(sa_session=session),
+        )
+        arguments_by_name = {"network_ids": ids, "network_generation": "1"}
+        if denied:
+            with pytest.raises(Forbidden):
+                await _pin_network_scope(request, arguments_by_name)
+        else:
+            actual_manifest, network_ids, _, actual_checksums = await _pin_network_scope(request, arguments_by_name)
+            assert actual_manifest is manifest and network_ids == (42,)
+            assert actual_checksums == tuple(map(int, checksums.split(",")))
