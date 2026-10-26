@@ -18,9 +18,9 @@ from pathlib import Path, PurePath
 from urllib.parse import unquote, urlparse
 
 import ijson
-import pylightxl as xl
 from aiocsv import AsyncDictReader
 from aiofile import async_open
+from aiofiles import open as async_text_open
 from arq import create_pool
 from asyncpg import DuplicateTableError
 from dateutil.parser import parse as parse_date
@@ -71,6 +71,7 @@ from process.ext.utils import (
 )
 from process.live_progress import enqueue_live_progress
 from process.mrf_publication_receipt import begin_publication
+from process.mrf_workbook import read_mrf_workbook
 from process.openaddresses import refresh_archive_geocodes_from_openaddresses
 from process.plan_summary import rebuild_plan_search_summary
 from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
@@ -1453,6 +1454,22 @@ async def _prepare_import_tables(import_date: str, test_mode: bool) -> None:
     print("Preparing done")
 
 
+async def _has_valid_mrf_label(entry, field, task, source, import_log):
+    """Reject missing label identities without inventing a tier or pharmacy type."""
+    if isinstance(entry, dict) and isinstance(entry.get(field), str) and entry[field].strip():
+        return True
+    await log_error(
+        "err",
+        f"Mandatory field `{field}` is not present or incorrect.",
+        task.get("issuer_array"),
+        task.get("url"),
+        source,
+        "json",
+        import_log,
+    )
+    return False
+
+
 async def process_plan(ctx, task):
     """
     The process_plan function is responsible for downloading the plan data from the CMS PUF,
@@ -1589,7 +1606,7 @@ async def process_plan(ctx, task):
                                 )
 
                             network_entries = plan_entry.get("network", [])
-                            if isinstance(network_entries, dict):
+                            if not isinstance(network_entries, list):
                                 network_entries = [network_entries]
                             formulary_entries = plan_entry.get("formulary", [])
                             if isinstance(formulary_entries, dict):
@@ -1614,7 +1631,11 @@ async def process_plan(ctx, task):
                                 "marketing_url": plan_entry.get("marketing_url", ""),
                                 "formulary_url": plan_entry.get("formulary_url", ""),
                                 "plan_contact": plan_entry["plan_contact"],
-                                "network": [(k["network_tier"]) for k in network_entries if isinstance(k, dict)],
+                                "network": [
+                                    entry["network_tier"]
+                                    for entry in network_entries
+                                    if await _has_valid_mrf_label(entry, "network_tier", task, "plans", myimportlog)
+                                ],
                                 "benefits": [json.dumps(x) for x in benefits_entries],
                                 "last_updated_on": last_updated_on,
                                 "checksum": return_checksum([plan_id_value.lower(), year], crc=32),
@@ -1656,30 +1677,28 @@ async def process_plan(ctx, task):
                             break
                         if formulary_entries:
                             for formulary in formulary_entries:
-                                if (
-                                    isinstance(formulary, dict)
-                                    and ("cost_sharing" in formulary)
-                                    and formulary["cost_sharing"]
-                                ):
+                                if not await _has_valid_mrf_label(formulary, "drug_tier", task, "plans", myimportlog):
+                                    continue
+                                if formulary.get("cost_sharing"):
                                     try:
-                                        for k in ("drug_tier", "mail_order"):
-                                            if k not in formulary or formulary[k] is None:
-                                                await log_error(
-                                                    "err",
-                                                    f"Mandatory field `{k}` in Formulary (`formulary`) "
-                                                    f"sub-type is "
-                                                    f"not present or "
-                                                    f"incorrect. Plan ID: "
-                                                    f"{plan_id_value}, year: {year}",
-                                                    task.get("issuer_array"),
-                                                    task.get("url"),
-                                                    "plans",
-                                                    "json",
-                                                    myimportlog,
-                                                )
+                                        if formulary.get("mail_order") is None:
+                                            await log_error(
+                                                "err",
+                                                f"Mandatory field `mail_order` in Formulary (`formulary`) "
+                                                f"sub-type is not present or incorrect. Plan ID: "
+                                                f"{plan_id_value}, year: {year}",
+                                                task.get("issuer_array"),
+                                                task.get("url"),
+                                                "plans",
+                                                "json",
+                                                myimportlog,
+                                            )
                                         for cost_sharing in formulary["cost_sharing"]:
+                                            if not await _has_valid_mrf_label(
+                                                cost_sharing, "pharmacy_type", task, "plans", myimportlog
+                                            ):
+                                                continue
                                             for k in (
-                                                "pharmacy_type",
                                                 "copay_amount",
                                                 "copay_opt",
                                                 "coinsurance_rate",
@@ -1702,9 +1721,9 @@ async def process_plan(ctx, task):
                                             formulary_row_dict = {
                                                 "plan_id": plan_id_value,
                                                 "year": int(year),
-                                                "drug_tier": formulary.get("drug_tier", ""),
+                                                "drug_tier": formulary["drug_tier"],
                                                 "mail_order": bool(formulary.get("mail_order")),
-                                                "pharmacy_type": cost_sharing.get("pharmacy_type", ""),
+                                                "pharmacy_type": cost_sharing["pharmacy_type"],
                                                 "copay_amount": (
                                                     float(cost_sharing.get("copay_amount"))
                                                     if cost_sharing.get("copay_amount", None) is not None
@@ -1884,6 +1903,8 @@ async def process_provider(ctx, task):
                     if not provider_record or not provider_record.get("plans"):
                         continue
                     for plan in provider_record["plans"]:
+                        if not await _has_valid_mrf_label(plan, "network_tier", task, "providers", myimportlog):
+                            continue
                         my_years = set()
                         # try:
                         #     for k in (
@@ -1936,7 +1957,7 @@ async def process_provider(ctx, task):
                                 "year": year,
                                 "checksum_network": checksum_network,
                             }
-                    if has_invalid_plan:
+                    if has_invalid_plan or not network_tiers_by_checksum:
                         continue
 
                     provider_name_dict = provider_record.get("name", {})
@@ -2739,7 +2760,7 @@ async def _read_unknown_federal_attribute_file(source_url, plans_by_key, issuers
             with zipfile.ZipFile(archive_path, "r") as zip_ref:
                 zip_ref.extractall(tmpdirname)
         csv_path = glob.glob(f"{tmpdirname}/*.csv")[0]
-        async with async_open(csv_path, "r", encoding="utf-8-sig") as stream:
+        async with async_text_open(csv_path, "r", encoding="utf-8-sig", newline="") as stream:
             async for attribute_row in AsyncDictReader(stream, delimiter=","):
                 if not attribute_row["StandardComponentId"] or not attribute_row["PlanId"]:
                     continue
@@ -2770,7 +2791,7 @@ _STATE_ATTRIBUTE_FIELD_LABELS = (
 async def _state_attribute_field_name_map(csv_path):
     """Resolve upper-case or camel-case state attributes headers."""
     field_name_map = {label: label for label in _STATE_ATTRIBUTE_FIELD_LABELS}
-    async with async_open(csv_path, "r", encoding="utf-8-sig") as stream:
+    async with async_text_open(csv_path, "r", encoding="utf-8-sig", newline="") as stream:
         async for attribute_row in AsyncDictReader(stream, delimiter=","):
             if attribute_row.get("STANDARD COMPONENT ID") and attribute_row.get("PLAN ID"):
                 continue
@@ -2830,7 +2851,7 @@ async def _read_unknown_state_attribute_file(source_url, plans_by_key, issuers_b
         csv_files = glob.glob(f"{tmpdirname}/*Plans*.csv")
         csv_path = csv_files[0] if csv_files else glob.glob(f"{tmpdirname}/*.csv")[0]
         field_name_map = await _state_attribute_field_name_map(csv_path)
-        async with async_open(csv_path, "r", encoding="utf-8-sig") as stream:
+        async with async_text_open(csv_path, "r", encoding="utf-8-sig", newline="") as stream:
             async for attribute_row in AsyncDictReader(stream, delimiter=","):
                 plan_id = attribute_row.get(field_name_map["STANDARD COMPONENT ID"])
                 plan_identifier = attribute_row.get(field_name_map["PLAN ID"])
@@ -2879,7 +2900,7 @@ async def _read_rate_review_issuer_names(csv_files: list[str], row_limit: int | 
     issuers_by_id = {}
     processed_rows = 0
     for csv_path in csv_files:
-        async with async_open(csv_path, "r", encoding="utf-8-sig") as afp:
+        async with async_text_open(csv_path, "r", encoding="utf-8-sig", newline="") as afp:
             async for rate_row in AsyncDictReader(afp, delimiter=","):
                 issuers_by_id[int(rate_row["ISSUER_ID"])] = {
                     "state": str(rate_row["STATE"]).upper(),
@@ -2999,7 +3020,7 @@ async def init_file(ctx, task=None):
                     zip_ref.extractall(tmpdirname)
 
             tmp_filename = glob.glob(f"{tmpdirname}/*.xlsx")[0]
-            xls_file = xl.readxl(tmp_filename)
+            xls_file = read_mrf_workbook(tmp_filename)
             os.unlink(tmp_filename)
 
             obj_list = []
@@ -3013,18 +3034,20 @@ async def init_file(ctx, task=None):
                     "Issuer_Name": "issuer_name",
                     "Issuer_ID": "issuer_id",
                     "Is_Issuer_New_to_Exchange? (Yes_or_No)": "new_issuer_to_exchange",
+                    "Is_Issuer_New_to_Exchange?(Yes_or_No)": "new_issuer_to_exchange",
                     "SADP_Only?": "sadp_only",
+                    "SADP_Only": "sadp_only",
                     "Plan_ID": "plan_id",
                     "QHP/SADP": "qhp_sadp",
+                    "QHP or SADP?": "qhp_sadp",
                     "Plan_Type": "plan_type",
                     "Metal_Level": "metal",
                     "URL_Claims_Payment_Policies": "claims_payment_policies_url",
                 }
-                for _, column_name in column_name_by_heading.items():
-                    column_index_by_name[column_name] = -1
-
                 for worksheet_row in xls_file.ws(ws=ws_name).rows:
                     if count > 2:
+                        if not any(cell_value is not None and str(cell_value).strip() for cell_value in worksheet_row):
+                            continue
                         transparency_row_dict = {}
                         transparency_row_dict["state"] = str(worksheet_row[column_index_by_name["state"]].upper())
                         transparency_row_dict["issuer_name"] = str(worksheet_row[column_index_by_name["issuer_name"]])
@@ -3032,8 +3055,10 @@ async def init_file(ctx, task=None):
                         transparency_row_dict["new_issuer_to_exchange"] = _is_truthy(
                             worksheet_row[column_index_by_name["new_issuer_to_exchange"]], ("yes", "y")
                         )
-                        transparency_row_dict["sadp_only"] = _is_truthy(
-                            worksheet_row[column_index_by_name["sadp_only"]], ("yes", "y")
+                        transparency_row_dict["sadp_only"] = (
+                            _is_truthy(worksheet_row[column_index_by_name["sadp_only"]], ("yes", "y"))
+                            if "sadp_only" in column_index_by_name
+                            else None
                         )
                         transparency_row_dict["plan_id"] = str(worksheet_row[column_index_by_name["plan_id"]])
                         transparency_row_dict["year"] = int(file["year"])
@@ -3060,6 +3085,13 @@ async def init_file(ctx, task=None):
                             if name in column_name_by_heading:
                                 column_index_by_name[column_name_by_heading[name]] = i
                             i += 1
+                        missing_columns = (
+                            set(column_name_by_heading.values()) - column_index_by_name.keys() - {"sadp_only"}
+                        )
+                        if missing_columns:
+                            raise ValueError(
+                                f"Transparency worksheet missing columns: {', '.join(sorted(missing_columns))}"
+                            )
                     count += 1
 
                 await push_objects(obj_list, myplantransparency)
@@ -3091,7 +3123,7 @@ async def init_file(ctx, task=None):
                 continue
 
             for workbook_path in extracted_files:
-                xls_file = xl.readxl(workbook_path)
+                xls_file = read_mrf_workbook(workbook_path)
                 ws_name = xls_file.ws_names[-1]
                 os.unlink(workbook_path)
 
