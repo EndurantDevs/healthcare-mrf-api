@@ -156,9 +156,11 @@ def test_secret_selector_cannot_broaden_source_purpose(admitted, secret_selectio
         workers._is_admitted_importer_selected(secret_selection, SPEC.worker_class, admitted)
 
 
-def test_manifest_keeps_fixed_image_command_actor_and_native_target(admitted, secret_selection, monkeypatch):
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_NAME", "synthetic-work")
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", "/work")
+@pytest.mark.parametrize("has_volume", [False, True])
+def test_manifest_keeps_fixed_image_command_actor_and_native_target(admitted, secret_selection, monkeypatch, has_volume):
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_NAME", "synthetic-work" if has_volume else "")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", "/work" if has_volume else "")
+    monkeypatch.delenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", raising=False)
     manifest = workers._worker_job_manifest(SPEC, admitted, ORDINARY_IMAGE)
     pod = manifest["spec"]["template"]["spec"]
     container = pod["containers"][0]
@@ -166,12 +168,27 @@ def test_manifest_keeps_fixed_image_command_actor_and_native_target(admitted, se
     assert container["command"] == source.COMMAND
     assert container["workingDir"] == "/app"
     assert pod["securityContext"]["runAsUser"] == pod["securityContext"]["runAsGroup"] == 10001
-    assert pod["securityContext"]["fsGroup"] == 10001
+    assert pod["securityContext"].get("fsGroup") == (65534 if has_volume else None)
+    assert pod["securityContext"].get("fsGroupChangePolicy") == ("OnRootMismatch" if has_volume else None)
     assert pod["automountServiceAccountToken"] is False
     env_by_name = {entry["name"]: entry for entry in container["env"]}
     assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"]["value"] == JOB_ID
     assert env_by_name["SOURCE_USER"]["valueFrom"]["secretKeyRef"]["name"] == "synthetic-publisher"
     assert source.is_fhir_source_job_matching(manifest, admitted.fhir_source_launch)
+    if has_volume:
+        pod["securityContext"]["fsGroup"] = 10001
+        assert not source.is_fhir_source_job_matching(manifest, admitted.fhir_source_launch)
+
+
+@pytest.mark.parametrize("has_volume", [False, True])
+def test_unadmitted_spec_keeps_shared_identity(has_volume):
+    """The source-specific actor override never changes ordinary worker security."""
+    pod_spec_dict = {"securityContext": workers._worker_job_pod_security_context(has_group_read_volume=has_volume)}
+    original = deepcopy(pod_spec_dict)
+    labels_by_key = {}
+    source.apply_fhir_source_worker_spec(SPEC, {"run_id": RUN_ID}, labels_by_key, pod_spec_dict)
+    assert pod_spec_dict == original and labels_by_key == {}
+    assert pod_spec_dict["securityContext"]["runAsUser"] == pod_spec_dict["securityContext"]["runAsGroup"] == 65534
 
 
 @pytest.mark.parametrize(
