@@ -89,9 +89,8 @@ def apply_fhir_source_worker_spec(spec, launch_request, labels, pod_spec):
     if authorized_fhir_source_worker_launch(spec, launch_request) is not None:
         labels["healthporta.com/worker-purpose"] = PURPOSE
         security = pod_spec["securityContext"]
+        # Preserve the shared volume group to avoid rewriting existing file ownership.
         security.update(runAsUser=10001, runAsGroup=10001)
-        if "fsGroup" in security:
-            security["fsGroup"] = 10001
 
 
 def is_fhir_source_secret_selected(selection, worker_class, launch_request):
@@ -132,8 +131,6 @@ def is_fhir_source_job_matching(job, launch):
         volumes = [*_worker_job_pvc_volumes(), *_worker_job_secret_volumes(_BY_WORKER_CLASS[_WORKER_CLASS])]
         expected_security = _worker_job_pod_security_context(has_group_read_volume="fsGroup" in security)
         expected_security.update(runAsUser=10001, runAsGroup=10001)
-        if "fsGroup" in expected_security:
-            expected_security["fsGroup"] = 10001
         return (
             job["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
             and template["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
