@@ -454,6 +454,21 @@ def _dense_group_work_bounds(monkeypatch, batch_size):
     monkeypatch.setattr(scoped, "MAX_ZIP_MEMBER_CELL_WORK_ROWS", 8)
 
 
+async def _assert_pending_npi_statistics(session, pending_npis):
+    """Require current batch statistics before any retained factor lookup."""
+    statistics = (
+        await session.execute(
+            text("""SELECT relation.reltuples,statistics.n_distinct,statistics.null_frac
+            FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            LEFT JOIN pg_stats statistics ON statistics.schemaname=namespace.nspname
+                AND statistics.tablename=relation.relname AND statistics.attname='npi'
+            WHERE relation.oid='pg_temp.plan_pricing_provider_npi_pending_stage'::regclass""")
+        )
+    ).one()
+    assert statistics.reltuples == len(pending_npis)
+    assert statistics.n_distinct == -1 and statistics.null_frac == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("batch_size", [1, 2])
 async def test_zip_native_batches_preserve_raw_multisets_and_exact_pages(monkeypatch, batch_size):
@@ -483,9 +498,11 @@ async def test_zip_native_batches_preserve_raw_multisets_and_exact_pages(monkeyp
         visited_npis = []
 
         async def record_memberships(session, *args):
-            visited_npis.extend(
+            pending_npis = list(
                 (await session.execute(text("SELECT npi FROM plan_pricing_provider_npi_pending_stage"))).scalars()
             )
+            await _assert_pending_npi_statistics(session, pending_npis)
+            visited_npis.extend(pending_npis)
             return await memberships(session, *args)
 
         monkeypatch.setattr(scoped, "stage_memberships", record_memberships)

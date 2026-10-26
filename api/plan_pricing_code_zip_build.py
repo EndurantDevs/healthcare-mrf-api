@@ -197,6 +197,8 @@ async def _stage_pending_memberships(session, inputs, code_identity, limits, mea
         if await session.scalar(text("SELECT EXISTS(SELECT 1 FROM plan_pricing_provider_npi_pending_stage)"))
         else ()
     )
+    if pending_inputs:
+        await session.execute(text("ANALYZE plan_pricing_provider_npi_pending_stage"))
     for binding, found in pending_inputs:
         remaining_by_name = {name: limits[name] - work_by_name[name] for name in ("first", "priced", "factor")}
         remaining_by_name["member_cell"] = limits["member_cell"] - measured_by_name["membership_count"]
