@@ -613,7 +613,9 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
     updated = await connection.execute(
         f"UPDATE {snapshot} SET candidate_storage_json=$2::jsonb "
         "WHERE dataset_id=$1 AND candidate_storage_json IS NOT DISTINCT FROM $3::jsonb",
-        identity["dataset_id"], storage._encoded(handoff_by_field), storage._encoded(binding_by_field),
+        identity["dataset_id"],
+        storage._encoded(handoff_by_field),
+        storage._encoded(binding_by_field),
     )
     storage._require(updated == "UPDATE 1", "header_snapshot_changed")
     await storage._store(connection, policy, binding_by_field["identity"], binding_by_field, handoff_by_field)
@@ -638,12 +640,14 @@ async def _prepare_handoff_controls(connection, policy, binding_by_field):
         await connection.execute(f"ALTER TABLE {target} ADD CHECK (dataset_id={literal})")
         columns = await connection.fetch(
             "SELECT attname FROM pg_attribute WHERE attrelid=$1::regclass "
-            "AND attnum>0 AND NOT attisdropped AND attgenerated='' ORDER BY attnum", source,
+            "AND attnum>0 AND NOT attisdropped AND attgenerated='' ORDER BY attnum",
+            source,
         )
         storage._require(bool(columns), "control_snapshot_layout_changed")
         fields = ",".join(storage_identifier(column["attname"]) for column in columns)
         copied = await connection.execute(
-            f"INSERT INTO {target} ({fields}) SELECT {fields} FROM {source} WHERE dataset_id=$1", dataset_id,
+            f"INSERT INTO {target} ({fields}) SELECT {fields} FROM {source} WHERE dataset_id=$1",
+            dataset_id,
         )
         storage._require(root != storage.HEADER or copied == "INSERT 0 1", "header_snapshot_changed")
         names_by_root[root] = name
@@ -656,9 +660,13 @@ async def _verify_handoff_controls(connection, policy, binding_by_field):
     for root in storage.HANDOFF_CONTROL_ROOTS:
         source = storage_relation(policy.schema, root)
         snapshot = storage_relation(policy.schema, binding_by_field["tables"][root]["name"])
+        # The header's native json has no equality operator; preserve its serialized form.
+        comparison = 'row_to_json(control_row)::text COLLATE "C"' if root == storage.HEADER else "control_row.*"
         changed = await connection.fetchval(
-            f"SELECT EXISTS((SELECT * FROM {source} WHERE dataset_id=$1 EXCEPT SELECT * FROM {snapshot}) "
-            f"UNION ALL (SELECT * FROM {snapshot} EXCEPT SELECT * FROM {source} WHERE dataset_id=$1))",
+            f"SELECT EXISTS((SELECT {comparison} FROM {source} AS control_row WHERE dataset_id=$1 "
+            f"EXCEPT SELECT {comparison} FROM {snapshot} AS control_row) "
+            f"UNION ALL (SELECT {comparison} FROM {snapshot} AS control_row "
+            f"EXCEPT SELECT {comparison} FROM {source} AS control_row WHERE dataset_id=$1))",
             dataset_id,
         )
         storage._require(changed is False, "control_snapshot_changed")
@@ -721,7 +729,8 @@ async def _frozen_handoff_header(connection, policy, document):
         header["dataset_id"] == identity["dataset_id"]
         and header["endpoint_id"] == identity["endpoint_id"]
         and header["acquisition_root_run_id"] == identity["acquisition_root_run_id"]
-        and header["status"] == "validated" and header["is_current"] is False
+        and header["status"] == "validated"
+        and header["is_current"] is False
         and storage._json(header["candidate_storage_json"]) == document
         and {key: header[key] for key in storage.HANDOFF_HEADER_FIELDS} == document["admission"]
         and type(metadata) is dict
@@ -734,21 +743,35 @@ async def _frozen_handoff_header(connection, policy, document):
     seal = admission_seal_from_validated_metadata(metadata)
     storage._require(seal is not None, "validated_admission_required")
     actual = (
-        header["content_proof_admission_version"], header["content_proof_admission_kind"],
-        header["content_proof_admission_sha256"], header["content_proof_resource_types"],
-        header["publication_metadata_sha256"], storage._json(header["publication_metadata_summary_json"]),
+        header["content_proof_admission_version"],
+        header["content_proof_admission_kind"],
+        header["content_proof_admission_sha256"],
+        header["content_proof_resource_types"],
+        header["publication_metadata_sha256"],
+        storage._json(header["publication_metadata_summary_json"]),
     )
-    storage._require(actual == (
-        seal.admission_version, seal.admission_kind, seal.proof_sha256, list(seal.resource_types),
-        seal.metadata_sha256, seal.metadata_summary,
-    ) and seal.admission_kind == "generic", "admission_changed")
+    storage._require(
+        actual
+        == (
+            seal.admission_version,
+            seal.admission_kind,
+            seal.proof_sha256,
+            list(seal.resource_types),
+            seal.metadata_sha256,
+            seal.metadata_summary,
+        )
+        and seal.admission_kind == "generic",
+        "admission_changed",
+    )
     return header
 
 
 async def _frozen_content_proof(connection, directory, policy, document, header):
     from process.provider_directory_proof_store import (
-        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY, PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
-        ProviderDirectoryStoredProofOptions, build_stored_dataset_proof,
+        PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY,
+        PROVIDER_DIRECTORY_PROOF_SHARD_TABLE,
+        ProviderDirectoryStoredProofOptions,
+        build_stored_dataset_proof,
     )
 
     identity, reader = document["identity"], _FrozenSourceRows(connection)
@@ -765,18 +788,29 @@ async def _frozen_content_proof(connection, directory, policy, document, header)
     )
     storage._require(invalid_identity is False, "resource_identity_changed")
     stored = await build_stored_dataset_proof(
-        reader, policy.schema, dataset_id=identity["dataset_id"], endpoint_id=identity["endpoint_id"],
+        reader,
+        policy.schema,
+        dataset_id=identity["dataset_id"],
+        endpoint_id=identity["endpoint_id"],
         acquisition_root_run_id=identity["acquisition_root_run_id"],
-        source_ids=identity["metadata"]["source_ids"], selected_resources=resources,
+        source_ids=identity["metadata"]["source_ids"],
+        selected_resources=resources,
         options=ProviderDirectoryStoredProofOptions(
-            scope, contract, projection_date, document["tables"][PROVIDER_DIRECTORY_PROOF_SHARD_TABLE]["name"],
+            scope,
+            contract,
+            projection_date,
+            document["tables"][PROVIDER_DIRECTORY_PROOF_SHARD_TABLE]["name"],
         ),
     )
     storage._require(stored.metadata == metadata.get(PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY), "proof_changed")
     coordinates = (policy.schema, document["tables"][storage.RESOURCE]["name"])
     direct = await directory._endpoint_dataset_content_proof(
-        reader, identity["dataset_id"], scope or resources, verify_payload_hashes=True,
-        resource_hash_contract=contract, resource_relation=coordinates,
+        reader,
+        identity["dataset_id"],
+        scope or resources,
+        verify_payload_hashes=True,
+        resource_hash_contract=contract,
+        resource_relation=coordinates,
     )
     for field in ("dataset_hash", "resource_count", "resource_hashes", "resource_counts"):
         storage._require(getattr(direct, field) == getattr(stored, field), "content_proof_changed")
@@ -797,7 +831,10 @@ async def _frozen_subset_proof(reader, directory, document, header, proof, coord
         selected_resources=tuple(document["identity"]["metadata"]["selected_resources"]),
     )
     acquired = await directory._subset_acquired_resource_hashes(
-        reader, candidate, proof.resource_counts, resource_relation=coordinates,
+        reader,
+        candidate,
+        proof.resource_counts,
+        resource_relation=coordinates,
     )
     dataset = completion["dataset"]
     storage._require(
@@ -813,12 +850,19 @@ async def _frozen_projection_exact(connection, directory, policy, document):
     header, resource = relation(storage.HEADER), relation(storage.RESOURCE)
     parameters_by_name = dict(dataset_id=document["identity"]["dataset_id"])
     reader = _FrozenSourceRows(connection)
-    projection = directory._dataset_insurance_plan_projection_source_ctes(
-        header, resource, relation(storage.RELATIONS[1]), "",
-    ) + directory._dataset_insurance_plan_projection_proof_select()
+    projection = (
+        directory._dataset_insurance_plan_projection_source_ctes(
+            header,
+            resource,
+            relation(storage.RELATIONS[1]),
+            "",
+        )
+        + directory._dataset_insurance_plan_projection_proof_select()
+    )
     proof_rows = await reader.all(projection, **parameters_by_name)
     storage._require(
-        len(proof_rows) == 1 and proof_rows[0]["target_dataset_count"] == 1
+        len(proof_rows) == 1
+        and proof_rows[0]["target_dataset_count"] == 1
         and proof_rows[0]["insurance_plan_resource_count"] == proof_rows[0]["plan_projection_count"]
         and proof_rows[0]["missing_or_mismatched_plan_projection_count"] == 0
         and proof_rows[0]["unexpected_plan_projection_count"] == 0,
@@ -826,15 +870,25 @@ async def _frozen_projection_exact(connection, directory, policy, document):
     )
     pattern = r"(?i)(?:^|/)Organization/([A-Za-z0-9.-]{1,64})(?:/_history/[A-Za-z0-9.-]{1,64})?/?(?:[?#].*)?$"
     for root, source_cte, edge_cte, fields in (
-        (storage.RELATIONS[2], directory._network_plan_source_ctes, directory._network_plan_edge_ctes,
-         "network_resource_id,insurance_plan_resource_id"),
-        (storage.RELATIONS[3], directory._affiliation_org_source_ctes, directory._affiliation_org_edge_ctes,
-         "participating_organization_resource_id,affiliation_resource_id"),
+        (
+            storage.RELATIONS[2],
+            directory._network_plan_source_ctes,
+            directory._network_plan_edge_ctes,
+            "network_resource_id,insurance_plan_resource_id",
+        ),
+        (
+            storage.RELATIONS[3],
+            directory._affiliation_org_source_ctes,
+            directory._affiliation_org_edge_ctes,
+            "participating_organization_resource_id,affiliation_resource_id",
+        ),
     ):
         expected = f"SELECT {fields} FROM expected_edges"
         actual = f"SELECT {fields} FROM {relation(root)}"
-        query = source_cte(header, resource, "") + edge_cte(pattern) + (
-            f" SELECT EXISTS(({expected} EXCEPT {actual}) UNION ALL ({actual} EXCEPT {expected})) AS changed"
+        query = (
+            source_cte(header, resource, "")
+            + edge_cte(pattern)
+            + (f" SELECT EXISTS(({expected} EXCEPT {actual}) UNION ALL ({actual} EXCEPT {expected})) AS changed")
         )
         proof_rows = await reader.all(query, **parameters_by_name)
         storage._require(len(proof_rows) == 1 and proof_rows[0]["changed"] is False, "derived_projection_changed")
@@ -873,9 +927,12 @@ async def validate_frozen_source_handoff(connection, directory, handoff, *, prot
         "transaction_changed",
     )
     return dict(
-        handoff_sha256=handoff.document_sha256, dataset_hash=stored.dataset_hash,
-        resource_count=stored.resource_count, resource_hashes=stored.resource_hashes,
-        resource_counts=stored.resource_counts, proof_sha256=stored.metadata["proof_sha256"],
+        handoff_sha256=handoff.document_sha256,
+        dataset_hash=stored.dataset_hash,
+        resource_count=stored.resource_count,
+        resource_hashes=stored.resource_hashes,
+        resource_counts=stored.resource_counts,
+        proof_sha256=stored.metadata["proof_sha256"],
     )
 
 

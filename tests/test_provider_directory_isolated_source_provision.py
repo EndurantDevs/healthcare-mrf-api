@@ -15,7 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.schema import CreateTable
 
 from db.models.system import ProviderDirectoryEndpointDataset
-from db.plan_release_storage import storage_identifier as quote, storage_relation
+from db.plan_release_storage import storage_identifier as quote
+from db.plan_release_storage import storage_relation
 from process import provider_directory_generic_source_provision as provision
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
@@ -153,7 +154,8 @@ async def _assert_copied_native_layouts(connection, schema):
     layouts_by_key = {(row["nspname"], row["relname"]): row for row in rows}
     for root in provision.ISOLATED_FHIR_ROOTS:
         assert _isolated_layout_shape(layouts_by_key[schema, root], template=False) == _isolated_layout_shape(
-            layouts_by_key["catalog", root], template=True,
+            layouts_by_key["catalog", root],
+            template=True,
         )
 
 
@@ -292,6 +294,7 @@ async def _assert_complete_handoff_copies(writer, policy, binding):
     assert await writer.fetchval(f"SELECT payload FROM {proof}") == b"\x00\xff\x01"
     for statement in (
         f"UPDATE {header} SET publication_metadata_summary_json='{{\"changed\":true}}'::jsonb",
+        f"UPDATE {header} SET publication_metadata_json='{{\"full\": true}}'::json",
         f"UPDATE {proof} SET payload=decode('00ff02','hex')",
     ):
         with pytest.raises(GenericCandidateError, match="control_snapshot_changed"):
@@ -310,6 +313,10 @@ async def _assert_complete_handoff_copies(writer, policy, binding):
 async def test_native_handoff_copies_full_controls_without_blocking_other_dataset(native_bootstrap):
     case, setup = native_bootstrap, native_bootstrap.connection
     await setup.execute(
+        f"ALTER TABLE {storage_relation('catalog', provision.HEADER)} "
+        "ALTER COLUMN publication_metadata_json TYPE json USING publication_metadata_json::json"
+    )
+    await setup.execute(
         f"ALTER TABLE {storage_relation('catalog', provision.PROOF_ROOT)} ADD payload bytea, ADD annotation jsonb"
     )
     async with setup.transaction():
@@ -319,9 +326,12 @@ async def test_native_handoff_copies_full_controls_without_blocking_other_datase
     canonical = storage_relation("catalog", provision.HEADER)
     await setup.execute(f"GRANT USAGE ON SCHEMA catalog TO {quote(case.roles['reader'])}")
     await setup.execute(f"GRANT SELECT ON {canonical} TO {quote(case.roles['reader'])}")
-    binding_by_field = dict(identity={"dataset_id": "selected"}, tables={
-        provision.RELATIONS[0]: {"name": "pdgs_" + "b" * 32 + "_r"},
-    })
+    binding_by_field = dict(
+        identity={"dataset_id": "selected"},
+        tables={
+            provision.RELATIONS[0]: {"name": "pdgs_" + "b" * 32 + "_r"},
+        },
+    )
     async with AsyncExitStack() as cleanup:
         connections = []
         for role in ("publisher", "publisher", "reader"):
@@ -347,7 +357,9 @@ async def test_native_handoff_copies_full_controls_without_blocking_other_datase
                 assert await reader.fetchval(f"SELECT count(*) FROM {canonical}") == 0
             async with other.transaction():
                 await other.execute("SET LOCAL statement_timeout='100ms'")
-                assert await other.execute(f"UPDATE {header} SET resource_count=2 WHERE dataset_id='other'") == "UPDATE 1"
+                assert (
+                    await other.execute(f"UPDATE {header} SET resource_count=2 WHERE dataset_id='other'") == "UPDATE 1"
+                )
 
 
 async def test_native_bootstrap_preserves_guards_reads_and_fk_free_storage(native_bootstrap):
