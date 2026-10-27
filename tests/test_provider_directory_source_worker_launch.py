@@ -5,6 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -40,12 +41,24 @@ async def overlay_admitted(monkeypatch):
 @pytest.fixture
 def source_runtime_mount(monkeypatch):
     """Retain the configured Source-only mount alongside an ordinary credential mount."""
-    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", json.dumps([
-        {"name": "source-runtime", "secretName": "synthetic-source-runtime",
-         "mountPath": "/synthetic/source-policy", "subPath": "policy.json", "defaultMode": 0o444,
-         "workerClasses": [SPEC.worker_class], "purposes": [source.PURPOSE], "importers": ["provider-directory-fhir"]},
-        {"name": "ordinary-credentials", "secretName": "ordinary-credentials", "mountPath": "/credentials"},
-    ]))
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "source-runtime",
+                    "secretName": "synthetic-source-runtime",
+                    "mountPath": "/synthetic/source-policy",
+                    "subPath": "policy.json",
+                    "defaultMode": 0o444,
+                    "workerClasses": [SPEC.worker_class],
+                    "purposes": [source.PURPOSE],
+                    "importers": ["provider-directory-fhir"],
+                },
+                {"name": "ordinary-credentials", "secretName": "ordinary-credentials", "mountPath": "/credentials"},
+            ]
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -103,18 +116,31 @@ def test_overlay_target_rejects_native_drift(overlay_admitted, index):
 
 def test_overlay_serialization_cannot_admit_job(overlay_admitted):
     """Neither JSON markers nor a caller-supplied descriptor create admission."""
-    raw_by_field = {**overlay_admitted, "ordinary_fhir_overlay_job": list(overlay_admitted.admitted_job),
-                    "admitted_job": list(overlay_admitted.admitted_job), "params": _overlay_run()["params"]}
+    raw_by_field = {
+        **overlay_admitted,
+        "ordinary_fhir_overlay_job": list(overlay_admitted.admitted_job),
+        "admitted_job": list(overlay_admitted.admitted_job),
+        "params": _overlay_run()["params"],
+    }
     assert source.admitted_overlay_job(SPEC, raw_by_field) is None
     assert workers._ensure_spec(SPEC, raw_by_field)["status"] == "failed"
 
 
-@pytest.mark.parametrize("extra_by_name", [
-    {"import_resources": True}, {"probe": 0}, {"publish_artifacts_only": 1},
-    {"provider_directory_dataset_followup_version": True}, {"provider_directory_dataset_followup_attempt": False},
-    {"provider_directory_dataset_followup_stage": "profile"}, {"publish_artifacts_targets": "profile"},
-    {"serving_recovery_generation": None}, {"run_id": RUN_ID}, {"test_mode": False},
-])
+@pytest.mark.parametrize(
+    "extra_by_name",
+    [
+        {"import_resources": True},
+        {"probe": 0},
+        {"publish_artifacts_only": 1},
+        {"provider_directory_dataset_followup_version": True},
+        {"provider_directory_dataset_followup_attempt": False},
+        {"provider_directory_dataset_followup_stage": "profile"},
+        {"publish_artifacts_targets": "profile"},
+        {"serving_recovery_generation": None},
+        {"run_id": RUN_ID},
+        {"test_mode": False},
+    ],
+)
 @pytest.mark.asyncio
 async def test_mixed_overlay_never_selects_ordinary(monkeypatch, extra_by_name):
     """Malformed or broader persisted operations cannot use the overlay exception."""
@@ -135,7 +161,8 @@ def test_overlay_uses_no_source_credentials(overlay_admitted, admitted, secret_s
     source_job_by_field = workers._worker_job_manifest(SPEC, admitted, ORDINARY_IMAGE)
     assert source.is_fhir_source_job_matching(source_job_by_field, admitted.fhir_source_launch)
     assert [entry["name"] for entry in source_job_by_field["spec"]["template"]["spec"]["volumes"]] == [
-        "source-runtime", "ordinary-credentials",
+        "source-runtime",
+        "ordinary-credentials",
     ]
 
 
@@ -161,15 +188,21 @@ def _change_overlay_job(job_by_field, drift):
     if drift == "source_mount":
         pod_by_field["volumes"].append({"name": "source", "secret": {"secretName": "synthetic-source-runtime"}})
     if drift == "source_env":
-        container_by_field["env"].append({"name": "SOURCE_DSN", "valueFrom": {
-            "secretKeyRef": {"name": "synthetic-source-runtime", "key": "publisher"}}})
+        container_by_field["env"].append(
+            {
+                "name": "SOURCE_DSN",
+                "valueFrom": {"secretKeyRef": {"name": "synthetic-source-runtime", "key": "publisher"}},
+            }
+        )
     if drift == "purpose":
         job_by_field["metadata"]["labels"]["healthporta.com/worker-purpose"] = source.PURPOSE
     if drift == "service_account":
         pod_by_field["serviceAccountName"] = "other-account"
 
 
-@pytest.mark.parametrize("drift", [None, "image", "command", "target", "source_mount", "source_env", "purpose", "service_account"])
+@pytest.mark.parametrize(
+    "drift", [None, "image", "command", "target", "source_mount", "source_env", "purpose", "service_account"]
+)
 def test_overlay_job_reuse_keeps_native_runtime(overlay_admitted, monkeypatch, source_runtime_mount, drift):
     """Existing Jobs must retain ordinary code, credentials and the exact queued target."""
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", ORDINARY_IMAGE)
@@ -180,7 +213,9 @@ def test_overlay_job_reuse_keeps_native_runtime(overlay_admitted, monkeypatch, s
     job_by_field["status"] = {"active": 1}
     _change_overlay_job(job_by_field, drift)
     api_calls = []
-    monkeypatch.setattr(workers, "_kubernetes_request", lambda *args: api_calls.append(args) or {"items": [job_by_field]})
+    monkeypatch.setattr(
+        workers, "_kubernetes_request", lambda *args: api_calls.append(args) or {"items": [job_by_field]}
+    )
     response_by_field = workers._ensure_spec(SPEC, overlay_admitted)
     assert response_by_field["status"] == ("already_running" if drift is None else "failed")
     assert all(call[0] == "GET" for call in api_calls)
@@ -264,6 +299,244 @@ def test_absent_fhir_image_setting_retains_reference_fallback(monkeypatch):
     assert source.admit_fhir_source_worker_launch(_recorded()).image == IMAGE
 
 
+def _source_route_config():
+    return {
+        "root_run_id": "run_" + "b" * 32,
+        "source_id": "synthetic-source",
+        "endpoint_scope": "https://example.test/fhir",
+        "image": ORDINARY_IMAGE,
+        "secret_name": "synthetic-successor",
+    }
+
+
+def _source_route_run():
+    return {
+        **_recorded(),
+        "params": {
+            "provider_directory_pagination_root_run_id": "run_" + "b" * 32,
+            "source_ids": ["synthetic-source"],
+            "provider_directory_endpoint_scope": "https://example.test/fhir",
+            "retry_of_run_id": "run_" + "c" * 32,
+        },
+    }
+
+
+def _both_source_secrets(monkeypatch):
+    """Configure distinct default and route-only synthetic credentials."""
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_ENV_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "SOURCE_USER",
+                    "secretName": secret,
+                    "key": "username",
+                    "workerClasses": [SPEC.worker_class],
+                    "purposes": [source.PURPOSE],
+                    "importers": ["provider-directory-fhir"],
+                }
+                for secret in ("synthetic-default", "synthetic-successor")
+            ]
+        ),
+    )
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "source-policy",
+                    "secretName": secret,
+                    "mountPath": "/source-policy",
+                    "workerClasses": [SPEC.worker_class],
+                    "purposes": [source.PURPOSE],
+                    "importers": ["provider-directory-fhir"],
+                }
+                for secret in ("synthetic-default", "synthetic-successor")
+            ]
+        ),
+    )
+
+
+def test_exact_server_route_selects_successor_image_and_secret(monkeypatch):
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
+    _both_source_secrets(monkeypatch)
+    recorded = _source_route_run()
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, recorded)
+    request.fhir_source_launch = source.admit_fhir_source_worker_launch(recorded)
+    job = workers._worker_job_manifest(SPEC, request, IMAGE)
+    pod = job["spec"]["template"]["spec"]
+    assert pod["containers"][0]["image"] == ORDINARY_IMAGE
+    assert [
+        entry["valueFrom"]["secretKeyRef"]["name"]
+        for entry in pod["containers"][0]["env"]
+        if entry["name"] == "SOURCE_USER"
+    ] == ["synthetic-successor"]
+    assert [entry["secret"]["secretName"] for entry in pod["volumes"]] == ["synthetic-successor"]
+    assert job["metadata"]["annotations"]["healthporta.com/source-root-run-id"] == _source_route_config()["root_run_id"]
+    assert source.is_fhir_job_set_matching(SPEC, request, [job])
+    job["spec"]["template"]["spec"]["containers"][0]["env"][-1]["valueFrom"]["secretKeyRef"]["name"] = (
+        "synthetic-default"
+    )
+    assert not source.is_fhir_job_set_matching(SPEC, request, [job])
+
+
+@pytest.mark.parametrize("drift", ["malformed_json", "wrong_container", "missing_field", "duplicate_route"])
+def test_invalid_server_route_inventory_refuses_worker_launch(monkeypatch, drift):
+    """Bad trusted route data must never select an image or credential."""
+    route = _source_route_config()
+    routes = [route]
+    if drift == "malformed_json":
+        serialized = "{"
+    elif drift == "wrong_container":
+        serialized = json.dumps(route)
+    else:
+        if drift == "missing_field":
+            del route["secret_name"]
+        else:
+            routes.append(dict(route))
+        serialized = json.dumps(routes)
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    monkeypatch.setenv(source.ROUTES_ENV, serialized)
+    with pytest.raises(ValueError, match="fhir_source_worker_route_invalid"):
+        source.admit_fhir_source_worker_launch(_source_route_run())
+
+
+@pytest.mark.parametrize("field", ["source_ids", "provider_directory_endpoint_scope"])
+def test_exact_route_refuses_other_same_root_identity(monkeypatch, field):
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
+    recorded = _source_route_run()
+    recorded["params"][field] = "changed"
+    with pytest.raises(ValueError, match="fhir_source_worker_route_changed"):
+        source.admit_fhir_source_worker_launch(recorded)
+
+
+@pytest.mark.asyncio
+async def test_route_keeps_image_and_secret_across_valid_later_retries(monkeypatch):
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
+    recorded = _source_route_run()
+    later_parent = "run_" + "d" * 32
+    recorded["params"]["retry_of_run_id"] = later_parent
+    launch = source.admit_fhir_source_worker_launch(recorded)
+    root = _source_route_config()["root_run_id"]
+    current_params = recorded["params"]
+    lineage_rows = [
+        {
+            "run_id": RUN_ID,
+            "importer": "provider-directory-fhir",
+            "status": "queued",
+            "retry_of_run_id": later_parent,
+            "params": current_params,
+        },
+        {
+            "run_id": later_parent,
+            "importer": "provider-directory-fhir",
+            "status": "failed",
+            "retry_of_run_id": "run_" + "c" * 32,
+            "params": {**current_params, "retry_of_run_id": "run_" + "c" * 32},
+        },
+        {
+            "run_id": "run_" + "c" * 32,
+            "importer": "provider-directory-fhir",
+            "status": "failed",
+            "retry_of_run_id": root,
+            "params": {**current_params, "retry_of_run_id": root},
+        },
+        {
+            "run_id": root,
+            "importer": "provider-directory-fhir",
+            "status": "failed",
+            "retry_of_run_id": None,
+            "params": {**current_params, "retry_of_run_id": None},
+        },
+    ]
+    connection = SimpleNamespace(all=AsyncMock(return_value=lineage_rows))
+    await source.require_fhir_source_route_ancestry(connection, launch)
+    lineage_rows[1]["params"] = {**lineage_rows[1]["params"], "source_ids": ["other-source"]}
+    with pytest.raises(ValueError, match="route_changed"):
+        await source.require_fhir_source_route_ancestry(connection, launch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["missing_parent", "root_not_failed", "child_not_queued", "duplicate_id"])
+async def test_route_ancestry_refuses_inconsistent_native_runs(monkeypatch, drift):
+    """A matching configured root cannot excuse a broken persisted retry chain."""
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
+    recorded = _source_route_run()
+    root_id = _source_route_config()["root_run_id"]
+    recorded["params"]["retry_of_run_id"] = root_id
+    launch = source.admit_fhir_source_worker_launch(recorded)
+    lineage_rows = [
+        {"run_id": RUN_ID, "status": "queued", "retry_of_run_id": root_id, "params": recorded["params"]},
+        {"run_id": root_id, "status": "failed", "retry_of_run_id": None, "params": recorded["params"]},
+    ]
+    if drift == "missing_parent":
+        lineage_rows.pop()
+    elif drift == "root_not_failed":
+        lineage_rows[1]["status"] = "succeeded"
+    elif drift == "child_not_queued":
+        lineage_rows[0]["status"] = "failed"
+    else:
+        lineage_rows.append(dict(lineage_rows[0]))
+    connection = SimpleNamespace(all=AsyncMock(return_value=lineage_rows))
+    with pytest.raises(ValueError, match="fhir_source_worker_route_changed"):
+        await source.require_fhir_source_route_ancestry(connection, launch)
+
+
+@pytest.mark.asyncio
+async def test_guarded_ensure_checks_route_ancestry_before_launch(monkeypatch):
+    from api import provider_directory_cms_registry_stop as stop
+
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    request.fhir_source_launch = source.FHIRSourceWorkerLaunch(
+        RUN_ID,
+        JOB_ID,
+        IMAGE,
+        "run_" + "b" * 32,
+        "synthetic-successor",
+        "synthetic-source",
+        "https://example.test/fhir",
+        "run_" + "c" * 32,
+    )
+
+    @asynccontextmanager
+    async def connection():
+        yield object()
+
+    monkeypatch.setattr(workers.db, "acquire", connection)
+    monkeypatch.setattr(workers, "acquire_control_run_worker_action_lock", AsyncMock())
+    monkeypatch.setattr(workers, "_admit_worker_ensure", AsyncMock(return_value=None))
+    verify = AsyncMock(side_effect=ValueError("fhir_source_worker_route_changed"))
+    monkeypatch.setattr(source, "require_fhir_source_route_ancestry", verify)
+    monkeypatch.setattr(workers, "ensure_worker", lambda request: pytest.fail("worker launched"))
+    ensure_result = await stop.guarded_ensure(
+        request, run_id=RUN_ID, importer="provider-directory-fhir", selected_specs=[SPEC]
+    )
+    assert ensure_result["status"] == "failed"
+    verify.assert_awaited_once()
+
+
+def test_unrelated_root_keeps_existing_default_image(monkeypatch):
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
+    _both_source_secrets(monkeypatch)
+    recorded = _recorded()
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, recorded)
+    request.fhir_source_launch = source.admit_fhir_source_worker_launch(recorded)
+    assert request.fhir_source_launch == source.FHIRSourceWorkerLaunch(RUN_ID, JOB_ID, IMAGE)
+    job = workers._worker_job_manifest(SPEC, request, IMAGE)
+    pod = job["spec"]["template"]["spec"]
+    assert pod["containers"][0]["image"] == IMAGE
+    assert [
+        entry["valueFrom"]["secretKeyRef"]["name"]
+        for entry in pod["containers"][0]["env"]
+        if entry["name"] == "SOURCE_USER"
+    ] == ["synthetic-default"]
+    assert [entry["secret"]["secretName"] for entry in pod["volumes"]] == ["synthetic-default"]
+
+
 @pytest.mark.parametrize("image", ["", "example/source-worker:latest", IMAGE[:-1] + "z"])
 def test_absent_fhir_image_setting_rejects_invalid_reference_fallback(monkeypatch, image):
     monkeypatch.delenv(source.IMAGE_ENV, raising=False)
@@ -333,7 +606,9 @@ def test_secret_selector_cannot_broaden_source_purpose(admitted, secret_selectio
 
 
 @pytest.mark.parametrize("has_volume", [False, True])
-def test_manifest_keeps_fixed_image_command_actor_and_native_target(admitted, secret_selection, monkeypatch, has_volume):
+def test_manifest_keeps_fixed_image_command_actor_and_native_target(
+    admitted, secret_selection, monkeypatch, has_volume
+):
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_NAME", "synthetic-work" if has_volume else "")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_MOUNT_PATH", "/work" if has_volume else "")
     monkeypatch.delenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", raising=False)
