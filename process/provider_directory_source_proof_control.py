@@ -81,11 +81,11 @@ async def verify_proof_control(connection, policy, *, storage_binding=None):
     if storage_binding is not None:
         await verify_isolated_source_storage_coordinates(connection, policy, storage_binding)
     owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
-    rows = await connection.fetch(
+    proof_rows = await connection.fetch(
         CATALOG_SQL, [storage_relation(policy.schema, PROOF_ROOT)], owner, readers if storage_binding is None else []
     )
-    _require(len(rows) == 1, "proof_control_missing")
-    proof_by_field = rows[0]
+    _require(len(proof_rows) == 1, "proof_control_missing")
+    proof_by_field = proof_rows[0]
     _require(
         proof_by_field["relname"] == PROOF_ROOT
         and proof_by_field["nspname"] == policy.schema

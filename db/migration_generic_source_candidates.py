@@ -106,17 +106,17 @@ def _require_canonical_copy_guard_observations(reader_valid, triggers):
 
     if reader_valid is not True:
         raise RuntimeError("provider_directory_canonical_copy_preparation_reader_required")
-    expected = {
+    expected_triggers = {
         (
             root,
             "a_pd_candidate_" + operation + "_" + image.lower(),
-            flag,
+            trigger_type,
             (root + "\0" + image + "\0").encode(),
             "affected_rows" if image == "OLD" else None,
             "affected_rows" if image == "NEW" else None,
         )
         for root in TABLES[:4]
-        for operation, image, flag in (
+        for operation, image, trigger_type in (
             ("insert", "NEW", 4),
             ("update", "NEW", 16),
             ("update", "OLD", 16),
@@ -124,13 +124,13 @@ def _require_canonical_copy_guard_observations(reader_valid, triggers):
         )
     }
     if (
-        len(triggers) != len(expected)
-        or any(row["tgenabled"] not in ("O", "A") for row in triggers)
+        len(triggers) != len(expected_triggers)
+        or any(trigger["tgenabled"] not in ("O", "A") for trigger in triggers)
         or {
-            tuple(row[key] for key in ("relname", "tgname", "tgtype", "tgargs", "tgoldtable", "tgnewtable"))
-            for row in triggers
+            tuple(trigger[key] for key in ("relname", "tgname", "tgtype", "tgargs", "tgoldtable", "tgnewtable"))
+            for trigger in triggers
         }
-        != expected
+        != expected_triggers
     ):
         raise RuntimeError("provider_directory_canonical_copy_statement_guards_required")
 

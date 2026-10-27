@@ -78,7 +78,14 @@ async def test_validation_retains_isolated_handoff_proof(monkeypatch, isolated, 
     candidate = SimpleNamespace(dataset_id="dataset-a")
     proof = SimpleNamespace(proof_metadata={"verified": True} if has_proof else None)
     result = await importer._store_dataset_validation_state(
-        connection, candidate, "previous", proof, {}, "validated", [], {},
+        connection,
+        candidate,
+        "previous",
+        proof,
+        {},
+        "validated",
+        [],
+        {},
     )
     persist.assert_awaited_once_with(connection, candidate, "previous", proof, {}, "validated")
     assert result == ("previous", proof, {}, "validated", [], 0, seal)
@@ -13359,11 +13366,13 @@ async def test_finalized_dataset_checkpoint_cleanup_is_verified(
             await importer._clear_finalized_dataset_checkpoints(candidate)
     else:
         assert await importer._clear_finalized_dataset_checkpoints(candidate) == 2
-    assert fenced_coordinates == [{
-        "schema": importer._schema(),
-        "dataset_ids": (candidate.dataset_id,),
-        "root_run_ids": (candidate.acquisition_root_run_id,),
-    }]
+    assert fenced_coordinates == [
+        {
+            "schema": importer._schema(),
+            "dataset_ids": (candidate.dataset_id,),
+            "root_run_ids": (candidate.acquisition_root_run_id,),
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -34472,26 +34481,37 @@ async def test_caresource_candidate_count_reads_valid_dataset(monkeypatch):
 @pytest.mark.asyncio
 async def test_frozen_content_scan_keeps_hash_validation_and_composite_pagination(monkeypatch):
     import hashlib
+
     from tests.test_provider_directory_proof_store import _sample_dataset_resources, _stable_json
 
-    rows = sorted(_sample_dataset_resources(), key=lambda row: (row["resource_type"], row["resource_id"]))
-    connection = SimpleNamespace(all=AsyncMock(side_effect=[[row] for row in rows] + [[]]))
+    resource_rows = sorted(
+        _sample_dataset_resources(),
+        key=lambda resource_row: (resource_row["resource_type"], resource_row["resource_id"]),
+    )
+    connection = SimpleNamespace(all=AsyncMock(side_effect=[[resource_row] for resource_row in resource_rows] + [[]]))
     monkeypatch.setattr(importer, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 1)
     proof = await importer._endpoint_dataset_content_proof(
-        connection, "dataset", verify_payload_hashes=True,
+        connection,
+        "dataset",
+        verify_payload_hashes=True,
         resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
         resource_relation=("closed_source", "closed_resource"),
     )
-    expected = "\n".join(_stable_json((row["resource_type"], row["resource_id"], row["payload_hash"])) for row in rows)
+    expected = "\n".join(
+        _stable_json((resource_row["resource_type"], resource_row["resource_id"], resource_row["payload_hash"]))
+        for resource_row in resource_rows
+    )
     assert proof.dataset_hash == hashlib.sha256(expected.encode()).hexdigest()
-    assert proof.resource_count == len(rows)
+    assert proof.resource_count == len(resource_rows)
     assert all('"closed_source"."closed_resource"' in call.args[0] for call in connection.all.await_args_list)
     assert "after_resource_type" not in connection.all.await_args_list[0].kwargs
-    assert connection.all.await_args_list[1].kwargs["after_resource_id"] == rows[0]["resource_id"]
-    connection.all = AsyncMock(return_value=[{**rows[0], "payload_hash": "0" * 64}])
+    assert connection.all.await_args_list[1].kwargs["after_resource_id"] == resource_rows[0]["resource_id"]
+    connection.all = AsyncMock(return_value=[{**resource_rows[0], "payload_hash": "0" * 64}])
     with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="payload_hash_mismatch"):
         await importer._endpoint_dataset_content_proof(
-            connection, "dataset", verify_payload_hashes=True,
+            connection,
+            "dataset",
+            verify_payload_hashes=True,
             resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
             resource_relation=("closed_source", "closed_resource"),
         )
@@ -35062,8 +35082,15 @@ async def test_detached_acquisition_defers_profile_followup(monkeypatch):
     import_resources.side_effect = acquire
     metrics = await importer.process_data(
         {"context": {}},
-        {"test": True, "run_id": "run_detached", "probe": False, "import_resources": True,
-         "resources": "Location", "publish_artifacts": False, "defer_typed_materialization": True},
+        {
+            "test": True,
+            "run_id": "run_detached",
+            "probe": False,
+            "import_resources": True,
+            "resources": "Location",
+            "publish_artifacts": False,
+            "defer_typed_materialization": True,
+        },
     )
     import_resources.assert_awaited_once()
     followup.assert_not_awaited()
@@ -35123,11 +35150,8 @@ async def test_process_data_publish_artifacts_only_uses_attested_profile(
     monkeypatch,
 ):
     monkeypatch.setattr(importer, "ensure_database", AsyncMock())
-    monkeypatch.setattr(
-        importer,
-        "_ensure_provider_directory_tables",
-        AsyncMock(),
-    )
+    layout_reads = AsyncMock(return_value=[])
+    monkeypatch.setattr(importer.db, "all", layout_reads)
     execution = object()
     monkeypatch.setattr(
         importer,
@@ -35150,6 +35174,7 @@ async def test_process_data_publish_artifacts_only_uses_attested_profile(
     )
 
     assert metrics == {"profile": {"profile_rows": 2}}
+    assert layout_reads.await_count == len(importer.SOURCE_MODELS) + len(importer.CANONICAL_RESOURCE_MODELS)
     publish.assert_awaited_once_with(
         run_id=None,
         control_run_id=None,

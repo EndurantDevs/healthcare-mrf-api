@@ -2,10 +2,10 @@
 """Complete-key semantics, exact raw replay and bounded asynchronous output."""
 
 import hashlib
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -43,10 +43,13 @@ async def _prepared_detached(harness, monkeypatch):
             content_proof_admission_sha256="c" * 64,
         )
         harness.connection.fetchval = AsyncMock(return_value=False)
-        harness.connection.fetch = AsyncMock(side_effect=lambda sql, *args: (
-            [{"attname": "dataset_id"}, {"attname": "candidate_storage_json"}]
-            if sql.startswith("SELECT attname") else []
-        ))
+        harness.connection.fetch = AsyncMock(
+            side_effect=lambda sql, *args: (
+                [{"attname": "dataset_id"}, {"attname": "candidate_storage_json"}]
+                if sql.startswith("SELECT attname")
+                else []
+            )
+        )
         execute = harness.connection.execute.side_effect
         capture = completion.storage._capture.side_effect
 
@@ -76,6 +79,7 @@ async def _prepared_detached(harness, monkeypatch):
 @pytest.mark.asyncio
 async def test_protected_handoff_shape_reuses_checks_without_issuing_source_authority(harness, monkeypatch):
     from copy import deepcopy
+
     from process import provider_directory_generic_source_policy as policy
 
     async with _prepared_detached(harness, monkeypatch) as (publisher, binding):
@@ -87,9 +91,9 @@ async def test_protected_handoff_shape_reuses_checks_without_issuing_source_auth
     with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
         completion.storage._validate_binding(document, document["identity"], phases=("ready_for_freeze",))
     for field, changed in (("phase", "published"), ("auxiliary", {}), ("admission", {}), ("tables", {})):
-        invalid = {**document, field: changed}
+        invalid_by_field = {**document, field: changed}
         with pytest.raises(GenericCandidateError):
-            completion.storage.validate_handoff_document(invalid, expected_storage)
+            completion.storage.validate_handoff_document(invalid_by_field, expected_storage)
     with pytest.raises(GenericCandidateError, match="storage_binding_changed"):
         completion.storage.validate_handoff_document(document, {**expected_storage, "owner_oid": 999})
     assert policy._PUBLISHER.get() is None
@@ -98,11 +102,16 @@ async def test_protected_handoff_shape_reuses_checks_without_issuing_source_auth
 @pytest.mark.asyncio
 async def test_frozen_header_digest_markers_use_detached_header(monkeypatch):
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=False))
-    document = {"identity": {"dataset_id": "dataset"}, "tables": {
-        completion.storage.HEADER: {"name": "closed_header"},
-        completion.storage.RESOURCE: {"name": "closed_resource"},
-    }}
-    await completion._validate_acquired_digest_markers(connection, SimpleNamespace(schema="snapshots"), document)
+    document_by_field = {
+        "identity": {"dataset_id": "dataset"},
+        "tables": {
+            completion.storage.HEADER: {"name": "closed_header"},
+            completion.storage.RESOURCE: {"name": "closed_resource"},
+        },
+    }
+    await completion._validate_acquired_digest_markers(
+        connection, SimpleNamespace(schema="snapshots"), document_by_field
+    )
     query, dataset = connection.fetchval.await_args.args
     assert '"snapshots"."closed_header"' in query
     assert '"snapshots"."closed_resource"' in query
@@ -133,7 +142,9 @@ async def test_detached_handoff_preserves_complete_checks_without_live_ddl_and_r
         assert all(
             table["owner"] == publisher.storage_binding.owner_oid for table in handoff.document["tables"].values()
         )
-        assert set(handoff.document["tables"]) == set(completion.storage.RELATIONS + completion.storage.HANDOFF_CONTROL_ROOTS)
+        assert set(handoff.document["tables"]) == set(
+            completion.storage.RELATIONS + completion.storage.HANDOFF_CONTROL_ROOTS
+        )
         assert handoff.document["admission"] == {
             key: harness.header[key] for key in completion.storage.HANDOFF_HEADER_FIELDS
         }
@@ -207,6 +218,7 @@ async def test_detached_completion_checks_reject_tampering_before_mutation(harne
 @pytest.mark.asyncio
 async def test_validation_summary_retains_handoff_without_claiming_publication(harness, monkeypatch):
     from importlib import import_module
+
     from process import provider_directory_generic_source_adapters as adapters
     from process import provider_directory_generic_source_policy as policy
 
@@ -231,7 +243,8 @@ async def test_validation_summary_retains_handoff_without_claiming_publication(h
         summary = await directory._validate_endpoint_dataset_candidate(candidate, {})
         document = harness.header["candidate_storage_json"]
         assert summary["source_candidate_handoff"] == {
-            "document": document, "sha256": hashlib.sha256(completion.storage._encoded(document).encode()).hexdigest(),
+            "document": document,
+            "sha256": hashlib.sha256(completion.storage._encoded(document).encode()).hexdigest(),
         }
         assert summary["published"] is False and document["phase"] == "ready_for_freeze"
         monkeypatch.setattr(completion, "attach_generic_source_candidate", AsyncMock(return_value=None))
@@ -266,9 +279,12 @@ async def test_run_handoff_requires_committed_native_recheck(harness, monkeypatc
             assert handoffs_by_dataset == {}
             return
         await completion.record_candidate_handoff(harness.directory, harness.candidate, handoffs_by_dataset)
-        assert handoffs_by_dataset == {harness.candidate.dataset_id: {
-            "document": prepared.document, "sha256": prepared.document_sha256,
-        }}
+        assert handoffs_by_dataset == {
+            harness.candidate.dataset_id: {
+                "document": prepared.document,
+                "sha256": prepared.document_sha256,
+            }
+        }
         await completion.record_candidate_handoff(harness.directory, harness.candidate, handoffs_by_dataset)
         handoffs_by_dataset[harness.candidate.dataset_id]["sha256"] = "f" * 64
         with pytest.raises(GenericCandidateError, match="handoff_changed"):
