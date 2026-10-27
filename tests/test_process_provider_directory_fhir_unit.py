@@ -25203,7 +25203,7 @@ async def test_prefetched_page_uses_existing_cooldown_path(monkeypatch, unit_sou
     monkeypatch.setattr(
         importer,
         "_rest_pagination_cooldown_delay_seconds",
-        lambda _payload: 0.0,
+        lambda _status, _payload: 0.0,
     )
     fetch_result = await page_scan.run()
 
@@ -25451,14 +25451,15 @@ def _assert_cooldown_recovery_observability(fetch_result):
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_page_423_cooldown_retries_exact_url_and_recovers(
-    monkeypatch, unit_source_factory, unit_checkpoint_catalog
+@pytest.mark.parametrize("status_code", [423, 429])
+async def test_checkpoint_page_cooldown_retries_exact_url_and_recovers(
+    monkeypatch, unit_source_factory, unit_checkpoint_catalog, status_code
 ):
-    """A locked checkpoint page retries in place without resetting progress."""
+    """A blocked checkpoint page retries in place without resetting progress."""
     resume_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_getpages=locked-token&_count=100"
     responses = [
         (
-            423,
+            status_code,
             {importer.SOURCE_RETRY_AFTER_FIELD: "4", "diagnostics": "private"},
             None,
             5,
@@ -25533,6 +25534,32 @@ async def test_checkpoint_cooldown_fallback_uses_one_second(
     )
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_rate_limit_without_retry_after_uses_long_cooldown(monkeypatch):
+    checkpoint_url = "https://payer.example/fhir/Location?_getpages=rate-limited-token"
+    fetch_source_json = AsyncMock(return_value=(200, {"resourceType": "Bundle", "entry": []}, None, 5))
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
+
+    cooldown_result = await importer._retry_rest_pagination_after_cooldown(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        checkpoint_url,
+        (429, {}, None, 9),
+        timeout=3,
+        deadline_at=None,
+    )
+
+    assert cooldown_result.recovered is True
+    assert cooldown_result.wait_seconds == importer.SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS
+    sleep_mock.assert_awaited_once_with(importer.SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS)
+    fetch_source_json.assert_awaited_once_with(
+        {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
+        checkpoint_url,
+        timeout=3,
+    )
+
+
 def test_checkpoint_cooldown_excludes_other_transient_failures():
     assert not importer._is_rest_pagination_cooldown_failure(503, None)
     assert not importer._is_rest_pagination_cooldown_failure(
@@ -25542,7 +25569,8 @@ def test_checkpoint_cooldown_excludes_other_transient_failures():
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_cooldown_stops_before_resource_deadline(monkeypatch):
+@pytest.mark.parametrize("status_code", [423, 429])
+async def test_checkpoint_cooldown_stops_before_resource_deadline(monkeypatch, status_code):
     fetch_source_json = AsyncMock()
     sleep_mock = AsyncMock()
     monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
@@ -25551,12 +25579,12 @@ async def test_checkpoint_cooldown_stops_before_resource_deadline(monkeypatch):
     cooldown_result = await importer._retry_rest_pagination_after_cooldown(
         {"source_id": "source_a", "api_base": "https://payer.example/fhir"},
         "https://payer.example/fhir/Location?_getpages=deadline-token",
-        (423, {importer.SOURCE_RETRY_AFTER_FIELD: "300"}, None, 9),
+        (status_code, {importer.SOURCE_RETRY_AFTER_FIELD: "300"}, None, 9),
         timeout=3,
         deadline_at=importer.time.monotonic() + 299,
     )
 
-    assert cooldown_result.fetch_result[0] == 423
+    assert cooldown_result.fetch_result[0] == status_code
     assert cooldown_result.retries == 0
     assert cooldown_result.deadline_blocked is True
     sleep_mock.assert_not_awaited()
@@ -25564,12 +25592,11 @@ async def test_checkpoint_cooldown_stops_before_resource_deadline(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_423_cooldown_exhaustion_preserves_resume_checkpoint(
-    monkeypatch,
-):
+@pytest.mark.parametrize("status_code", [423, 429])
+async def test_checkpoint_cooldown_exhaustion_preserves_resume_checkpoint(monkeypatch, status_code):
     """Exhausted cooldowns leave the durable resume checkpoint untouched."""
     resume_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_getpages=locked-token&_count=100"
-    locked_response = (423, {}, None, 5)
+    locked_response = (status_code, {}, None, 5)
     responses = [locked_response] * 3
     request_urls, saved_checkpoints, load_checkpoint, fetch_source_json, save_checkpoint = (
         _cooldown_checkpoint_callbacks(resume_url, responses)
@@ -25600,17 +25627,18 @@ async def test_checkpoint_423_cooldown_exhaustion_preserves_resume_checkpoint(
 
     assert fetch_result is not None
     assert fetch_result.complete is False
-    assert fetch_result.error == "http_423"
+    assert fetch_result.error == f"http_{status_code}"
     assert fetch_result.pages_fetched == 7
     assert fetch_result.rows_fetched == 700
     assert fetch_result.next_url_remaining is True
     assert fetch_result.pagination_cooldown_retries == 2
-    assert fetch_result.pagination_cooldown_wait_seconds == 2.0
+    expected_delay = importer.SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS if status_code == 429 else 1.0
+    assert fetch_result.pagination_cooldown_wait_seconds == 2 * expected_delay
     assert fetch_result.is_pagination_cooldown_exhausted is True
     assert fetch_result.retry_not_before == "2026-07-12T12:00:01Z"
     assert request_urls == [resume_url, resume_url, resume_url]
-    assert [call.args[0] for call in sleep_mock.await_args_list] == [1.0, 1.0]
-    assert transient_retry_not_before.call_args.kwargs["fallback_seconds"] == 1.0
+    assert [call.args[0] for call in sleep_mock.await_args_list] == [expected_delay] * 2
+    assert transient_retry_not_before.call_args.kwargs["fallback_seconds"] == expected_delay
     assert saved_checkpoints == []
     clear_checkpoint.assert_not_awaited()
 

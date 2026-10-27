@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_source_failure_control as failure
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
@@ -39,6 +40,7 @@ def case(monkeypatch):
     publisher = SimpleNamespace(
         connection=connection,
         policy=GenericSourcePolicy("source_schema", "source_owner", "source_publisher", ("source_reader",)),
+        storage_binding=None,
     )
     events = []
 
@@ -54,8 +56,33 @@ def case(monkeypatch):
 
     monkeypatch.setattr(failure, "source_transaction", original_transaction)
     monkeypatch.setattr(failure, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(source_policy, "bound_publisher", lambda: publisher)
     monkeypatch.setattr(failure.storage, "_verify_tables", AsyncMock())
-    return SimpleNamespace(candidate=candidate, directory=directory, header=header, native=connection, events=events)
+    return SimpleNamespace(
+        candidate=candidate,
+        directory=directory,
+        header=header,
+        native=connection,
+        publisher=publisher,
+        events=events,
+    )
+
+
+@pytest.mark.asyncio
+async def test_isolated_failure_marks_with_trusted_source_schema(case):
+    case.directory._schema = lambda: "catalog"
+    with pytest.raises(GenericCandidateError, match="schema_changed"):
+        await failure.mark_source_candidate(case.directory, case.candidate, "failed", {})
+    case.native.fetchrow.assert_not_awaited()
+
+    case.publisher.storage_binding = SimpleNamespace(catalog_schema="catalog", storage_schema="other")
+    with pytest.raises(GenericCandidateError, match="schema_changed"):
+        await failure.mark_source_candidate(case.directory, case.candidate, "failed", {})
+
+    case.publisher.storage_binding = SimpleNamespace(catalog_schema="catalog", storage_schema="source_schema")
+    await failure.mark_source_candidate(case.directory, case.candidate, "failed", {})
+    case.native.execute.assert_awaited_once()
+    assert "publication_metadata_json::jsonb IS NOT DISTINCT FROM" in case.native.execute.await_args.args[0]
 
 
 @pytest.mark.asyncio

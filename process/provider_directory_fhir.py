@@ -41855,8 +41855,8 @@ def _is_rest_pagination_cooldown_failure(
     status_code: int | None,
     fetch_error: str | None,
 ) -> bool:
-    """Limit long in-worker cooldowns to locked pages and transport timeouts."""
-    if status_code == 423:
+    """Wait on rate limits and locked pages without losing the current cursor."""
+    if status_code in {423, 429}:
         return True
     if not fetch_error:
         return False
@@ -41865,12 +41865,13 @@ def _is_rest_pagination_cooldown_failure(
 
 
 def _rest_pagination_cooldown_delay_seconds(
+    status_code: int | None,
     fhir_payload: dict[str, Any] | None,
 ) -> float:
     retry_after_seconds = _source_retry_after_seconds(fhir_payload)
     if retry_after_seconds is not None:
         return retry_after_seconds
-    return REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
+    return SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS if status_code == 429 else REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
 
 
 async def _retry_rest_pagination_after_cooldown(
@@ -41888,7 +41889,7 @@ async def _retry_rest_pagination_after_cooldown(
         status_code, fhir_payload, fetch_error, _elapsed_ms = fetch_result
         if not _is_rest_pagination_cooldown_failure(status_code, fetch_error):
             break
-        delay_seconds = _rest_pagination_cooldown_delay_seconds(fhir_payload)
+        delay_seconds = _rest_pagination_cooldown_delay_seconds(status_code, fhir_payload)
         if deadline_at is not None and time.monotonic() + delay_seconds >= deadline_at:
             return RestPaginationCooldownResult(
                 fetch_result=fetch_result,
@@ -54180,10 +54181,8 @@ async def _fetch_resource_rows(
                         max_delay_seconds=(None if is_current_version_census_enabled else 600.0),
                         fallback_seconds=(
                             REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
-                            if (
-                                is_pagination_cooldown_exhausted
-                                or (is_current_version_census_enabled and status_code != 429)
-                            )
+                            if status_code != 429
+                            and (is_pagination_cooldown_exhausted or is_current_version_census_enabled)
                             else SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS
                         ),
                     )

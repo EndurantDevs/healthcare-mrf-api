@@ -6,6 +6,7 @@ import json
 from db.plan_release_storage import storage_relation
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
+from process.provider_directory_source_storage_binding import require_storage_schema
 
 
 async def mark_source_candidate(directory, candidate, status, metadata):
@@ -14,7 +15,7 @@ async def mark_source_candidate(directory, candidate, status, metadata):
     async with source_transaction(directory.db):
         publisher = bound_publisher()
         connection, policy = publisher.connection, publisher.policy
-        storage._require(policy.schema == directory._schema(), "schema_changed")
+        require_storage_schema(publisher, directory._schema())
         header = storage_relation(policy.schema, storage.HEADER)
         previous = await connection.fetchrow(
             f"SELECT endpoint_id,acquisition_root_run_id,status,is_current,publication_metadata_json,"
@@ -39,7 +40,7 @@ async def mark_source_candidate(directory, candidate, status, metadata):
             f"UPDATE {header} SET status=$2,resource_count=$3,publication_metadata_json=$4::jsonb "
             "WHERE dataset_id=$1 AND endpoint_id=$5 AND acquisition_root_run_id IS NOT DISTINCT FROM $6 "
             "AND status=$7 AND NOT is_current AND candidate_storage_json IS NOT DISTINCT FROM $8::jsonb "
-            "AND publication_metadata_json IS NOT DISTINCT FROM $9::jsonb",
+            "AND publication_metadata_json::jsonb IS NOT DISTINCT FROM $9::jsonb",
             candidate.dataset_id,
             status,
             resource_count,
