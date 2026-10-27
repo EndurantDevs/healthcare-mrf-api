@@ -60004,7 +60004,6 @@ def _assert_compatible_twin_root_baseline(
     dataset_map: dict[str, Any],
 ) -> None:
     """Require one baseline to match every persisted twin-root identity."""
-
     proof = _twin_root_baseline_proof(dataset_map)
     if dataset_map.get("completion_proof_required_version") != (candidate.completion_proof_required_version):
         raise RuntimeError("provider_directory_endpoint_dataset_verification_baseline_incompatible")
@@ -60099,7 +60098,9 @@ def _endpoint_verification_baseline_count_sql(dataset_ref: str) -> str:
 
 def _locked_endpoint_verification_filter_sql(dataset_ref: str, *, private_metadata: bool = False) -> str:
     terminal_successor_sql = _terminal_twin_successor_filter_sql(dataset_ref)
-    validated_candidate_sql = "true" if private_metadata else _validated_endpoint_candidate_blocks_admission_sql(dataset_ref)
+    validated_candidate_sql = (
+        "true" if private_metadata else _validated_endpoint_candidate_blocks_admission_sql(dataset_ref)
+    )
     return f"""
         (
             dataset.is_current = false
@@ -60143,7 +60144,6 @@ def _locked_endpoint_verification_filter_sql(dataset_ref: str, *, private_metada
 
 def _is_ordinary_endpoint_candidate(candidate: EndpointDatasetCandidate) -> bool:
     """Require a fresh singleton candidate with no reviewed profile state."""
-
     return bool(
         len(candidate.source_ids) == 1
         and candidate.expected_resources
@@ -60172,7 +60172,6 @@ def _is_ordinary_endpoint_candidate(candidate: EndpointDatasetCandidate) -> bool
 
 def _retired_partition_source_contract_sql(source_metadata: str) -> str:
     """Require the exact ordinary successor profile for the retired source."""
-
     expected_partition = _sql_string_literal(
         json.dumps(
             {
@@ -60213,7 +60212,6 @@ def _retired_partition_source_contract_sql(source_metadata: str) -> str:
 
 def _retired_partition_source_profile_sql(source_ref: str, metadata: str) -> str:
     """Bind the retired evidence to one exact ordinary source alias."""
-
     source_metadata = "retired_source.metadata_json::jsonb"
     configured_endpoint = f"NULLIF({source_metadata} ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}', '')"
     alias_configured_endpoint = (
@@ -60243,7 +60241,6 @@ def _retired_partition_source_profile_sql(source_ref: str, metadata: str) -> str
 
 def _retired_partition_predecessor_sql(dataset_ref: str) -> str:
     """Bind the fresh and retained candidates to valid endpoint history."""
-
     current_status = ENDPOINT_DATASET_PUBLISHED
     return f"""
         EXISTS (
@@ -60275,7 +60272,6 @@ def _retired_partition_predecessor_sql(dataset_ref: str) -> str:
 
 def _retired_partition_candidate_nonblocking_sql(dataset_ref: str) -> str:
     """Recognize one obsolete twin generation after its source reset."""
-
     metadata = "dataset.publication_metadata_json::jsonb"
     source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
     return f"""
@@ -60407,7 +60403,9 @@ async def _locked_endpoint_verification_state(
 
 def _private_verification_state_sql(dataset_ref: str) -> str:
     """Lock one private contender with bounded metadata and native-only predicates."""
-    receipt_present = f"NOT ({_artifact_admission_seal_absent_sql()}) OR dataset.artifact_selection_receipt_json IS NOT NULL"
+    receipt_present = (
+        f"NOT ({_artifact_admission_seal_absent_sql()}) OR dataset.artifact_selection_receipt_json IS NOT NULL"
+    )
     return f"""
         SELECT dataset.dataset_id, dataset.endpoint_id, dataset.import_run_id,
                dataset.acquisition_root_run_id, dataset.status,
@@ -60462,7 +60460,7 @@ def _is_private_candidate_blocking(state_by_field: dict[str, Any]) -> bool:
     )
     try:
         proof_by_field = _validated_finalized_stored_proof(dataset_by_field, metadata)
-    except (RuntimeError, ValueError, TypeError):
+    except RuntimeError, ValueError, TypeError:
         return False
     return (
         proof_by_field["dataset_hash"] == state_by_field["dataset_hash"]
@@ -64380,7 +64378,8 @@ def _endpoint_dataset_hash_page_sql(
     payload_projection = ", payload_json, acquired_resource_sha256" if include_payload_json else ""
     relation = (
         _qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)
-        if resource_relation is None else storage_relation(*resource_relation)
+        if resource_relation is None
+        else storage_relation(*resource_relation)
     )
     return f"""
         SELECT resource_type, resource_id, payload_hash{payload_projection}
@@ -64801,7 +64800,8 @@ def _subset_acquired_page_sql(has_cursor: bool, *, resource_relation: tuple[str,
     )
     relation = (
         _qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)
-        if resource_relation is None else storage_relation(*resource_relation)
+        if resource_relation is None
+        else storage_relation(*resource_relation)
     )
     return f"""
         SELECT resource_type, resource_id,

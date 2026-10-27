@@ -553,7 +553,7 @@ async def test_fhir_missing_managed_source_refuses_before_create_schema(monkeypa
     directory = importlib.import_module("process.provider_directory_fhir")
     from process import provider_directory_generic_source_adapters as adapters
 
-    monkeypatch.setattr(adapters, "require_generic_source_layout", AsyncMock())
+    monkeypatch.setattr(adapters, "require_generic_source_layout", AsyncMock(return_value=None))
     monkeypatch.setattr(directory, "_is_table_present", AsyncMock(return_value=False))
     monkeypatch.setattr(directory.db, "status", AsyncMock())
     with pytest.raises(RuntimeError, match="administrator_cut_required"):
