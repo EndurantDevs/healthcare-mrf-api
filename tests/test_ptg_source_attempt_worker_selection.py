@@ -66,7 +66,7 @@ def test_running_chunked_import_selects_finish_worker(total_chunks, accepted):
     ),
 )
 def test_worker_selection_uses_the_durable_mrf_finalization_phase(importer, phase, role):
-    outer_run = {"importer": importer, "status": "running", "phase_detail": phase}
+    outer_run_by_field = {"importer": importer, "status": "running", "phase_detail": phase}
     for selected_role in ("start", "finish"):
         selection = actions.PTGWorkerActionSelection(
             request_importer=importer,
@@ -74,10 +74,10 @@ def test_worker_selection_uses_the_durable_mrf_finalization_phase(importer, phas
             allowed_roles=frozenset({selected_role}),
         )
         if selected_role == role:
-            actions._validate_worker_selection(outer_run, selection)
+            actions._validate_worker_selection(outer_run_by_field, selection)
         else:
             with pytest.raises(actions.PTGSourceAttemptIdentityError):
-                actions._validate_worker_selection(outer_run, selection)
+                actions._validate_worker_selection(outer_run_by_field, selection)
 
 
 @pytest.mark.asyncio

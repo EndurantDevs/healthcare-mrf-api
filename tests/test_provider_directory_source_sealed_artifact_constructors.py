@@ -104,7 +104,7 @@ async def test_source_projection_drops_legacy_receipt_authority_but_keeps_seal_c
 
 @pytest.mark.asyncio
 async def test_same_task_physical_binding_selects_source_without_a_factory(monkeypatch):
-    publisher = SimpleNamespace(task=asyncio.current_task())
+    publisher = SimpleNamespace(task=asyncio.current_task(), factory=None, storage_binding=None)
     monkeypatch.setattr(policy, "_PUBLISHER", policy.ContextVar("source_test_publisher", default=publisher))
     monkeypatch.setattr(policy, "_FACTORY", policy.ContextVar("source_test_factory", default=None))
     assert policy.is_source_storage_required() is True

@@ -146,8 +146,8 @@ def source_relation_coordinates(schema, root, scoped_name):
     from process import provider_directory_generic_source_policy as source
     from process.provider_directory_generic_source_storage import HEADER, RELATIONS
     from process.provider_directory_source_checkpoint_catalog import CHECKPOINT_LAYOUTS
-    from process.provider_directory_source_proof_control import PROOF_ROOT
     from process.provider_directory_source_observation import current_storage_binding
+    from process.provider_directory_source_proof_control import PROOF_ROOT
 
     if root in _CATALOG_ROOTS:
         factory = source._FACTORY.get()
@@ -350,19 +350,37 @@ async def _isolated_application_checks(connection, catalog_schema, catalog_oid):
     return required_checks_by_name
 
 
+async def _require_isolated_relation_layouts(connection, policy, roles_by_name, relation_rows):
+    """Check private relation owners, native layouts and checkpoint contracts."""
+    from process.provider_directory_generic_source_storage import _table_proof
+    from process.provider_directory_source_checkpoint_catalog import _NATIVE_SQL, CHECKPOINT_LAYOUTS, _require_layout
+    from process.provider_directory_source_proof_control import PROOF_ROOT, _require_proof_layout
+
+    for relation in relation_rows:
+        _require(
+            relation["nspname"] == policy.schema and relation["relowner"] == roles_by_name[policy.owner_role]["oid"],
+            "storage_owner_changed",
+        )
+        _table_proof(relation, private=True)
+        if relation["relname"] == PROOF_ROOT:
+            _require_proof_layout(relation, isolated=True)
+        if relation["relname"] in CHECKPOINT_LAYOUTS:
+            _require_layout(relation, policy.schema, isolated=True)
+            _require(await connection.fetchval(_NATIVE_SQL, relation["oid"]), "checkpoint_native_contract_changed")
+
+
 async def _isolated_inventory(connection, policy, catalog_schema, roles_by_name):
+    """Verify and return the physical inventory for one isolated source schema."""
     from db.plan_release_storage import storage_relation
     from process.plan_release_storage_catalog import CATALOG_SQL
     from process.provider_directory_generic_source_provision import (
-        ISOLATED_FHIR_ROOTS,
         _ISOLATED_DEPENDENCIES_SQL,
         _ISOLATED_TEMPLATE_SQL,
+        ISOLATED_FHIR_ROOTS,
         _fhir_catalog_row,
         _fhir_physical_inventory,
     )
-    from process.provider_directory_generic_source_storage import _table_proof, require_private_source_readers_closed
-    from process.provider_directory_source_checkpoint_catalog import CHECKPOINT_LAYOUTS, _NATIVE_SQL, _require_layout
-    from process.provider_directory_source_proof_control import PROOF_ROOT, _require_proof_layout
+    from process.provider_directory_generic_source_storage import require_private_source_readers_closed
 
     roots = list(ISOLATED_FHIR_ROOTS)
     relation_rows = await connection.fetch(
@@ -375,17 +393,7 @@ async def _isolated_inventory(connection, policy, catalog_schema, roles_by_name)
         len(relation_rows) == len(roots) and {relation["relname"] for relation in relation_rows} == set(roots),
         "storage_missing",
     )
-    for relation in relation_rows:
-        _require(
-            relation["nspname"] == policy.schema and relation["relowner"] == roles_by_name[policy.owner_role]["oid"],
-            "storage_owner_changed",
-        )
-        _table_proof(relation, private=True)
-        if relation["relname"] == PROOF_ROOT:
-            _require_proof_layout(relation, isolated=True)
-        if relation["relname"] in CHECKPOINT_LAYOUTS:
-            _require_layout(relation, policy.schema, isolated=True)
-            _require(await connection.fetchval(_NATIVE_SQL, relation["oid"]), "checkpoint_native_contract_changed")
+    await _require_isolated_relation_layouts(connection, policy, roles_by_name, relation_rows)
     relation_oids = [relation["oid"] for relation in relation_rows]
     await require_private_source_readers_closed(
         connection, relation_oids, [roles_by_name[name]["oid"] for name in policy.runtime_roles]
@@ -522,9 +530,7 @@ async def _isolated_metadata_rows(connection, catalog_schema, runtime_roles):
         list(signatures_by_name),
     )
     _require(len(named_functions) == len(signatures_by_name), "metadata_missing")
-    signatures_by_oid = {
-        str(function["oid"]): signatures_by_name[function["proname"]] for function in named_functions
-    }
+    signatures_by_oid = {str(function["oid"]): signatures_by_name[function["proname"]] for function in named_functions}
     function_rows = await connection.fetch(
         _FUNCTION_SQL,
         list(signatures_by_oid),
@@ -585,6 +591,25 @@ async def _isolated_metadata_custody(connection, catalog_schema, catalog_oid, ro
     return functions_by_signature
 
 
+async def _require_source_storage_publisher(connection, policy, publication):
+    """Read and check the original publisher identity on this transaction."""
+    import asyncio
+
+    from process.provider_directory_source_callable_custody import _READ_IDENTITY_SQL
+
+    task, identity = asyncio.current_task(), dict(await connection.fetchrow(_READ_IDENTITY_SQL))
+    _require(
+        identity["session"] == identity["current"]
+        and identity["administrator"]
+        or identity["session"] == policy.publisher_role
+        and identity["current"] in (policy.publisher_role, policy.owner_role)
+        or type(publication) is dict
+        and identity["session"] == identity["current"] == publication.get("publisher_role"),
+        "genuine_publisher_required",
+    )
+    return task, identity
+
+
 async def capture_isolated_source_storage_custody(
     connection,
     policy,
@@ -596,6 +621,7 @@ async def capture_isolated_source_storage_custody(
 ):
     """Attest the fixed private storage and canonical rights; never grant activation."""
     import asyncio
+
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
     from process.provider_directory_source_callable_custody import _READ_IDENTITY_SQL
 
@@ -604,16 +630,7 @@ async def capture_isolated_source_storage_custody(
         storage_identifier(schema)
         _require(schema not in {"public", "information_schema"} and not schema.startswith("pg_"), "schema_invalid")
     _require(catalog_schema != policy.schema, "isolated_schema_required")
-    task, identity = asyncio.current_task(), dict(await connection.fetchrow(_READ_IDENTITY_SQL))
-    _require(
-        identity["session"] == identity["current"]
-        and identity["administrator"]
-        or identity["session"] == policy.publisher_role
-        and identity["current"] in (policy.publisher_role, policy.owner_role)
-        or type(publication) is dict
-        and identity["session"] == identity["current"] == publication.get("publisher_role"),
-        "genuine_publisher_required",
-    )
+    task, identity = await _require_source_storage_publisher(connection, policy, publication)
     _require(await connection.fetchval("SHOW session_replication_role") == "origin", "replication_role")
     roles_by_name = await _isolated_roles(connection, policy, migration_role, namespace_owner_role, publication)
     coordinates = await connection.fetchrow(_PRIVATE_COORDINATES_SQL, catalog_schema, policy.schema, policy.owner_role)

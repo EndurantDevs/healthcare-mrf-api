@@ -535,6 +535,48 @@ async def _verify_copy_guard(context):
         )
 
 
+async def _assert_copy_guard_drift_refusals(context, roles, after):
+    """Reject altered readers, triggers, session role and guard body."""
+    await context.connection.execute(
+        f"REVOKE SELECT(publication) ON {context.schema}.preparation FROM {quoted(roles['owner'])}"
+    )
+    with pytest.raises(RuntimeError, match="preparation_reader_required"):
+        await _update_canonical_copy_guard(context)
+    with pytest.raises(RuntimeError, match="preparation_reader_required"):
+        await _verify_copy_guard(context)
+    await context.connection.execute(
+        f"GRANT SELECT(publication) ON {context.schema}.preparation TO {quoted(roles['owner'])}"
+    )
+    await context.connection.execute(
+        f"ALTER TABLE {context.schema}.{TABLES[2]} DISABLE TRIGGER a_pd_candidate_update_old"
+    )
+    with pytest.raises(RuntimeError, match="statement_guards_required"):
+        await _update_canonical_copy_guard(context)
+    with pytest.raises(RuntimeError, match="statement_guards_required"):
+        await _verify_copy_guard(context)
+    await context.connection.execute(
+        f"ALTER TABLE {context.schema}.{TABLES[2]} ENABLE TRIGGER a_pd_candidate_update_old"
+    )
+    assert await _candidate_guard_metadata(context) == after
+    async with context.connection.transaction():
+        await context.connection.execute("SET LOCAL session_replication_role=replica")
+        with pytest.raises(RuntimeError, match="statement_guards_required"):
+            await verify_generic_source_canonical_copy_guard(
+                context.connection, context.schema_name, preparation_schema=context.schema_name
+            )
+    with pytest.raises(RuntimeError, match="guard_transaction_required"):
+        await verify_generic_source_canonical_copy_guard(
+            context.connection, context.schema_name, preparation_schema=context.schema_name
+        )
+    await context.connection.execute(after["definition"].replace("RETURN NULL;", "RETURN NULL; -- unexpected body", 1))
+    changed = await _candidate_guard_metadata(context)
+    with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
+        await _update_canonical_copy_guard(context)
+    with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
+        await _verify_copy_guard(context)
+    assert await _candidate_guard_metadata(context) == changed
+
+
 @pytest.mark.asyncio
 async def test_canonical_copy_guard_update_preserves_native_identity_and_refuses_drift(monkeypatch):
     async with _candidate_test_scope(monkeypatch) as (context, roles):
@@ -566,46 +608,7 @@ async def test_canonical_copy_guard_update_preserves_native_identity_and_refuses
             )
         await _update_canonical_copy_guard(context)
         assert await _candidate_guard_metadata(context) == after
-        await context.connection.execute(
-            f"REVOKE SELECT(publication) ON {context.schema}.preparation FROM {quoted(roles['owner'])}"
-        )
-        with pytest.raises(RuntimeError, match="preparation_reader_required"):
-            await _update_canonical_copy_guard(context)
-        with pytest.raises(RuntimeError, match="preparation_reader_required"):
-            await _verify_copy_guard(context)
-        await context.connection.execute(
-            f"GRANT SELECT(publication) ON {context.schema}.preparation TO {quoted(roles['owner'])}"
-        )
-        await context.connection.execute(
-            f"ALTER TABLE {context.schema}.{TABLES[2]} DISABLE TRIGGER a_pd_candidate_update_old"
-        )
-        with pytest.raises(RuntimeError, match="statement_guards_required"):
-            await _update_canonical_copy_guard(context)
-        with pytest.raises(RuntimeError, match="statement_guards_required"):
-            await _verify_copy_guard(context)
-        await context.connection.execute(
-            f"ALTER TABLE {context.schema}.{TABLES[2]} ENABLE TRIGGER a_pd_candidate_update_old"
-        )
-        assert await _candidate_guard_metadata(context) == after
-        async with context.connection.transaction():
-            await context.connection.execute("SET LOCAL session_replication_role=replica")
-            with pytest.raises(RuntimeError, match="statement_guards_required"):
-                await verify_generic_source_canonical_copy_guard(
-                    context.connection, context.schema_name, preparation_schema=context.schema_name
-                )
-        with pytest.raises(RuntimeError, match="guard_transaction_required"):
-            await verify_generic_source_canonical_copy_guard(
-                context.connection, context.schema_name, preparation_schema=context.schema_name
-            )
-        await context.connection.execute(
-            after["definition"].replace("RETURN NULL;", "RETURN NULL; -- unexpected body", 1)
-        )
-        changed = await _candidate_guard_metadata(context)
-        with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
-            await _update_canonical_copy_guard(context)
-        with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
-            await _verify_copy_guard(context)
-        assert await _candidate_guard_metadata(context) == changed
+        await _assert_copy_guard_drift_refusals(context, roles, after)
 
 
 _COPY_GUARD_COLUMNS = {
@@ -679,6 +682,124 @@ async def _assert_copy_guard_rejects_changes(connection, relation, root, dataset
                 await connection.execute(statement, dataset_id)
 
 
+async def _seed_copy_guard_writer_cases(context, roles):
+    connection, schema = context.connection, context.schema
+    statuses = (
+        "validated",
+        "published",
+        "superseded",
+        "verification_baseline",
+        "verification_mismatch",
+        "acquisition_abandoned",
+        "acquisition_retired",
+    )
+    protected_ids = ["synthetic-protected-" + status for status in statuses]
+    for dataset_id, status in zip(protected_ids, statuses, strict=True):
+        await _seed_copy_guard_dataset(context, dataset_id, status, True)
+        await _record_copy_guard_publication(context, dataset_id)
+    # Mutable canonical metadata cannot reopen a protected publication.
+    await connection.execute(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset SET candidate_storage_json=NULL WHERE dataset_id=$1",
+        protected_ids[0],
+    )
+    await connection.execute(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset SET status='acquiring' WHERE dataset_id=$1",
+        protected_ids[1],
+    )
+    await connection.execute(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset SET status='acquiring',candidate_storage_json=NULL WHERE dataset_id=$1",
+        protected_ids[2],
+    )
+    mutable = (
+        "synthetic-active-copy",
+        "synthetic-independent",
+        "synthetic-legacy-backfill",
+        "synthetic-other-importer",
+        "synthetic-other-contract",
+    )
+    for dataset_id, status, marker in zip(
+        mutable,
+        ("acquiring", "acquiring", "published", "acquiring", "acquiring"),
+        (True, False, False, True, True),
+        strict=True,
+    ):
+        await _seed_copy_guard_dataset(context, dataset_id, status, marker)
+    await _record_copy_guard_publication(context, mutable[0], state="validated")
+    await _record_copy_guard_publication(context, mutable[3], importer="synthetic-importer")
+    await _record_copy_guard_publication(context, mutable[4], contract="synthetic-other-contract")
+    await connection.execute(f"GRANT pg_write_all_data,pg_read_all_data TO {quoted(roles['column'])}")
+    await connection.execute(f"GRANT {quoted(roles['column'])} TO {quoted(roles['member'])}")
+    return protected_ids, mutable
+
+
+async def _grant_copy_guard_relation_access(context, roles):
+    connection, schema = context.connection, context.schema
+    relations = await connection.fetch(
+        "SELECT oid,oid::regclass::text AS relation FROM pg_class WHERE relnamespace=$1::regnamespace "
+        "AND (relname=ANY($2::text[]) OR oid IN (SELECT inhrelid FROM pg_inherits WHERE inhparent="
+        "ANY(SELECT oid FROM pg_class WHERE relnamespace=$1::regnamespace AND relname=ANY($2::text[]))))",
+        schema,
+        list(_COPY_GUARD_COLUMNS),
+    )
+    for relation_row in relations:
+        await connection.execute(
+            f"GRANT SELECT,INSERT,UPDATE,DELETE ON {relation_row['relation']} TO {quoted(roles['generic'])}"
+        )
+    return relations
+
+
+async def _assert_protected_copy_guard_rows(connection, parent, root, key, protected_ids, mutable):
+    for dataset_id in protected_ids:
+        child = await connection.fetchval(
+            f"SELECT tableoid::regclass::text FROM {parent} WHERE dataset_id=$1", dataset_id
+        )
+        for relation in (parent, child):
+            await _assert_copy_guard_rejects_changes(connection, relation, root, dataset_id)
+        for origin, destination in ((dataset_id, mutable[0]), (mutable[0], dataset_id)):
+            with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
+                async with connection.transaction():
+                    await connection.execute(
+                        f"UPDATE {parent} SET dataset_id=$2,{key}='moved' WHERE dataset_id=$1",
+                        origin,
+                        destination,
+                    )
+
+
+async def _assert_mutable_copy_guard_rows(connection, parent, root, key, mutable):
+    for dataset_id in mutable:
+        if root == TABLES[0] and dataset_id == mutable[2]:
+            continue  # Existing published-resource protection remains unchanged.
+        assert (
+            await connection.execute(f"UPDATE {parent} SET {key}={key} WHERE dataset_id=$1", dataset_id) == "UPDATE 1"
+        )
+        await _insert_copy_guard_row(connection, parent, root, dataset_id, "backfill")
+        assert (
+            await connection.execute(f"DELETE FROM {parent} WHERE dataset_id=$1 AND {key}='backfill'", dataset_id)
+            == "DELETE 1"
+        )
+
+
+async def _assert_guarded_copy_batch(connection, context, root, columns, parent, key, mutable, protected_ids):
+    copy_records = [_copy_guard_record(root, dataset_id, "copy-batch") for dataset_id in (mutable[0], protected_ids[1])]
+    with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
+        async with connection.transaction():
+            await connection.copy_records_to_table(
+                root, schema_name=context.schema_name, columns=("dataset_id", *columns), records=copy_records
+            )
+    assert not await connection.fetchval(f"SELECT EXISTS(SELECT FROM {parent} WHERE {key}='copy-batch')")
+
+
+async def _assert_preparation_writes_denied(connection, schema):
+    for statement in (
+        f"UPDATE {schema}.preparation SET state='validated'",
+        f"UPDATE {schema}.preparation SET handoff='{{}}',publication='{{}}'",
+        f"DELETE FROM {schema}.preparation",
+    ):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with connection.transaction():
+                await connection.execute(statement)
+
+
 @pytest.mark.asyncio
 async def test_canonical_copy_guard_closes_only_finalized_copies_across_writer_paths(monkeypatch):
     async with _candidate_test_scope(monkeypatch) as (context, roles):
@@ -687,107 +808,19 @@ async def test_canonical_copy_guard_closes_only_finalized_copies_across_writer_p
         await _prepare_copy_guard_catalog(context, roles)
         await _update_canonical_copy_guard(context, add_column=True)
         connection, schema = context.connection, context.schema
-        statuses = (
-            "validated",
-            "published",
-            "superseded",
-            "verification_baseline",
-            "verification_mismatch",
-            "acquisition_abandoned",
-            "acquisition_retired",
-        )
-        protected = ["synthetic-protected-" + status for status in statuses]
-        for dataset_id, status in zip(protected, statuses, strict=True):
-            await _seed_copy_guard_dataset(context, dataset_id, status, True)
-            await _record_copy_guard_publication(context, dataset_id)
-        # Mutable canonical metadata cannot reopen a protected publication.
-        await connection.execute(
-            f"UPDATE {schema}.provider_directory_endpoint_dataset SET candidate_storage_json=NULL WHERE dataset_id=$1",
-            protected[0],
-        )
-        await connection.execute(
-            f"UPDATE {schema}.provider_directory_endpoint_dataset SET status='acquiring' WHERE dataset_id=$1",
-            protected[1],
-        )
-        await connection.execute(
-            f"UPDATE {schema}.provider_directory_endpoint_dataset SET status='acquiring',candidate_storage_json=NULL WHERE dataset_id=$1",
-            protected[2],
-        )
-        mutable = (
-            "synthetic-active-copy",
-            "synthetic-independent",
-            "synthetic-legacy-backfill",
-            "synthetic-other-importer",
-            "synthetic-other-contract",
-        )
-        for dataset_id, status, marker in zip(
-            mutable,
-            ("acquiring", "acquiring", "published", "acquiring", "acquiring"),
-            (True, False, False, True, True),
-            strict=True,
-        ):
-            await _seed_copy_guard_dataset(context, dataset_id, status, marker)
-        await _record_copy_guard_publication(context, mutable[0], state="validated")
-        await _record_copy_guard_publication(context, mutable[3], importer="synthetic-importer")
-        await _record_copy_guard_publication(context, mutable[4], contract="synthetic-other-contract")
-        await connection.execute(f"GRANT pg_write_all_data,pg_read_all_data TO {quoted(roles['column'])}")
-        await connection.execute(f"GRANT {quoted(roles['column'])} TO {quoted(roles['member'])}")
-        relations = await connection.fetch(
-            "SELECT oid,oid::regclass::text AS relation FROM pg_class WHERE relnamespace=$1::regnamespace "
-            "AND (relname=ANY($2::text[]) OR oid IN (SELECT inhrelid FROM pg_inherits WHERE inhparent="
-            "ANY(SELECT oid FROM pg_class WHERE relnamespace=$1::regnamespace AND relname=ANY($2::text[]))))",
-            schema,
-            list(_COPY_GUARD_COLUMNS),
-        )
-        for row in relations:
-            await connection.execute(
-                f"GRANT SELECT,INSERT,UPDATE,DELETE ON {row['relation']} TO {quoted(roles['generic'])}"
-            )
+        protected_ids, mutable = await _seed_copy_guard_writer_cases(context, roles)
+        relations = await _grant_copy_guard_relation_access(context, roles)
         for role in (roles["generic"], roles["member"]):
             async with connection.transaction():
                 await connection.execute(f"SET LOCAL ROLE {quoted(role)}")
                 for root, columns in _COPY_GUARD_COLUMNS.items():
                     parent, key = f"{schema}.{root}", columns[0]
-                    for dataset_id in protected:
-                        child = await connection.fetchval(
-                            f"SELECT tableoid::regclass::text FROM {parent} WHERE dataset_id=$1", dataset_id
-                        )
-                        for relation in (parent, child):
-                            await _assert_copy_guard_rejects_changes(connection, relation, root, dataset_id)
-                        for origin, destination in ((dataset_id, mutable[0]), (mutable[0], dataset_id)):
-                            with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
-                                async with connection.transaction():
-                                    await connection.execute(
-                                        f"UPDATE {parent} SET dataset_id=$2,{key}='moved' WHERE dataset_id=$1",
-                                        origin,
-                                        destination,
-                                    )
-                    for dataset_id in mutable:
-                        if root == TABLES[0] and dataset_id == mutable[2]:
-                            continue  # Existing published-resource protection remains unchanged.
-                        assert (
-                            await connection.execute(f"UPDATE {parent} SET {key}={key} WHERE dataset_id=$1", dataset_id)
-                            == "UPDATE 1"
-                        )
-                        await _insert_copy_guard_row(connection, parent, root, dataset_id, "backfill")
-                        assert (
-                            await connection.execute(
-                                f"DELETE FROM {parent} WHERE dataset_id=$1 AND {key}='backfill'", dataset_id
-                            )
-                            == "DELETE 1"
-                        )
-                    records = [
-                        _copy_guard_record(root, dataset_id, "copy-batch") for dataset_id in (mutable[0], protected[1])
-                    ]
-                    with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
-                        async with connection.transaction():
-                            await connection.copy_records_to_table(
-                                root, schema_name=context.schema_name, columns=("dataset_id", *columns), records=records
-                            )
-                    assert not await connection.fetchval(
-                        f"SELECT EXISTS(SELECT FROM {parent} WHERE {key}='copy-batch')"
+                    await _assert_protected_copy_guard_rows(connection, parent, root, key, protected_ids, mutable)
+                    await _assert_mutable_copy_guard_rows(connection, parent, root, key, mutable)
+                    await _assert_guarded_copy_batch(
+                        connection, context, root, columns, parent, key, mutable, protected_ids
                     )
-        relation_oids = {row["oid"] for row in relations}
+        relation_oids = {relation_row["oid"] for relation_row in relations}
         assert all(
             not (trigger["tgtype"] & 1)
             for trigger in await _candidate_triggers(context)
@@ -799,14 +832,7 @@ async def test_canonical_copy_guard_closes_only_finalized_copies_across_writer_p
         for role in (roles["generic"], roles["member"], roles["owner"]):
             async with connection.transaction():
                 await connection.execute(f"SET LOCAL ROLE {quoted(role)}")
-                for statement in (
-                    f"UPDATE {schema}.preparation SET state='validated'",
-                    f"UPDATE {schema}.preparation SET handoff='{{}}',publication='{{}}'",
-                    f"DELETE FROM {schema}.preparation",
-                ):
-                    with pytest.raises(asyncpg.InsufficientPrivilegeError):
-                        async with connection.transaction():
-                            await connection.execute(statement)
+                await _assert_preparation_writes_denied(connection, schema)
         with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
             await connection.execute(
                 f"INSERT INTO {schema}.{TABLES[0]}(dataset_id,resource_type,resource_id,payload_hash,payload_json) "

@@ -393,25 +393,31 @@ async def test_frozen_proof_uses_exact_physical_table_and_preserves_all_shard_ch
     expected = await _stored_proof(connection)
     original = connection.all
 
-    async def read_frozen(query, **parameters):
+    async def read_frozen(query, **parameters_by_field):
         assert '"closed_source"."frozen_proof"' in query
         assert '"provider_directory_dataset_proof_shard"' not in query
-        return await original(query, **parameters)
+        return await original(query, **parameters_by_field)
 
     connection.all = read_frozen
-    parameters = dict(
-        dataset_id=DATASET_ID, endpoint_id=ENDPOINT_ID, acquisition_root_run_id=ROOT_RUN_ID,
-        source_ids=SOURCE_IDS, selected_resources=SELECTED_RESOURCES,
+    parameters_by_field = dict(
+        dataset_id=DATASET_ID,
+        endpoint_id=ENDPOINT_ID,
+        acquisition_root_run_id=ROOT_RUN_ID,
+        source_ids=SOURCE_IDS,
+        selected_resources=SELECTED_RESOURCES,
         options=proof_store.ProviderDirectoryStoredProofOptions(proof_table="frozen_proof"),
     )
-    actual = await proof_store.build_stored_dataset_proof(connection, "closed_source", **parameters)
+    actual = await proof_store.build_stored_dataset_proof(connection, "closed_source", **parameters_by_field)
     assert actual == expected
     next(iter(connection.shards.values()))["payload_bytes"] = b"damaged"
     with pytest.raises(ProviderDirectoryProofStoreError):
-        await proof_store.build_stored_dataset_proof(connection, "closed_source", **parameters)
+        await proof_store.build_stored_dataset_proof(connection, "closed_source", **parameters_by_field)
     with pytest.raises(ValueError, match="identifier_invalid"):
         await proof_store.build_stored_dataset_proof(
-            connection, "closed_source", **{
-                **parameters, "options": proof_store.ProviderDirectoryStoredProofOptions(proof_table='wrong";SELECT 1'),
+            connection,
+            "closed_source",
+            **{
+                **parameters_by_field,
+                "options": proof_store.ProviderDirectoryStoredProofOptions(proof_table='wrong";SELECT 1'),
             },
         )
