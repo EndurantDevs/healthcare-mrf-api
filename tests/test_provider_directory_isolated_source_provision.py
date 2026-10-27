@@ -553,7 +553,7 @@ async def _assert_frozen_candidate_guards(driver, storage_policy, roles_by_name)
         )
 
 
-async def test_native_migrated_catalog_supports_isolated_inventory(monkeypatch):
+async def _verify_native_catalog_custody(monkeypatch):
     """Exercise custody and frozen proof checks on migrated PostgreSQL tables."""
     async with source_component_database(monkeypatch) as component:
         driver = await asyncpg.connect(_dsn(component.admin_engine.url))

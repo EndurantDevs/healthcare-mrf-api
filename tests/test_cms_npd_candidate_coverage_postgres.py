@@ -26,6 +26,15 @@ from tests.cms_npd_admission_postgres_support import cms_artifact_root, fhir
 from tests.test_cms_npd_admission_postgres import _write_location_batch
 
 
+async def test_native_isolated_source_custody_and_frozen_proof(monkeypatch):
+    """Exercise migrated storage and proof guards in the native candidate cohort."""
+    from tests.test_provider_directory_isolated_source_provision import (
+        _verify_native_catalog_custody,
+    )
+
+    await _verify_native_catalog_custody(monkeypatch)
+
+
 class _Staged(Exception):
     """Stop a synthetic import at its publication boundary."""
 

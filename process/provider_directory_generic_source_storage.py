@@ -289,8 +289,7 @@ def validate_handoff_completion(header):
     except ValueError as error:
         raise GenericCandidateError("provider_directory_generic_source_completion_proof_invalid") from error
     _require(
-        proof["dataset"]["hash"] == header["dataset_hash"]
-        and proof["dataset"]["count"] == header["resource_count"],
+        proof["dataset"]["hash"] == header["dataset_hash"] and proof["dataset"]["count"] == header["resource_count"],
         "completion_dataset_changed",
     )
 
@@ -681,6 +680,299 @@ async def resolve_existing_source_candidate(database, directory, dataset_id):
         contract = metadata.get(directory.RESOURCE_HASH_CONTRACT_METADATA_KEY)
         _require(contract in directory.RESOURCE_HASH_CONTRACTS, "hash_contract_changed")
         return _StoredCandidate(identity, contract, metadata.get(directory.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY))
+
+
+def _validated_transition_identity(identity_by_field, expected_resource_counts):
+    """Require one exact unpublished dataset and complete resource census."""
+    _require(
+        type(identity_by_field) is dict
+        and set(identity_by_field) == {"dataset_id", "endpoint_id", "acquisition_root_run_id", "failed_run_id"}
+        and type(identity_by_field["dataset_id"]) is str
+        and 1 <= len(identity_by_field["dataset_id"]) <= 96
+        and type(identity_by_field["endpoint_id"]) is str
+        and bool(identity_by_field["endpoint_id"].strip())
+        and all(
+            type(identity_by_field[name]) is str and re.fullmatch(r"run_[0-9a-f]{32}", identity_by_field[name])
+            for name in ("acquisition_root_run_id", "failed_run_id")
+        )
+        and type(expected_resource_counts) is dict
+        and 1 <= len(expected_resource_counts) <= 32
+        and all(
+            type(name) is str and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", name) and type(count) is int and count >= 0
+            for name, count in expected_resource_counts.items()
+        ),
+        "transition_identity_invalid",
+    )
+
+
+def _validated_transition_storage(policy, old_storage, new_storage):
+    """Keep all native coordinates fixed except the issued producer seal."""
+    from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
+
+    binding_fields = set(FHIRSourceStorageBinding.__dataclass_fields__)
+    _require(
+        type(old_storage) is type(new_storage) is dict
+        and set(old_storage) == set(new_storage) == binding_fields | {"producer"},
+        "transition_storage_invalid",
+    )
+    old_binding = FHIRSourceStorageBinding(**{key: old_storage[key] for key in binding_fields})
+    new_binding = FHIRSourceStorageBinding(**{key: new_storage[key] for key in binding_fields})
+    _require(
+        old_binding.storage_schema == new_binding.storage_schema == policy.schema
+        and {key: old_storage[key] for key in binding_fields - {"enrollment_sha256"}}
+        == {key: new_storage[key] for key in binding_fields - {"enrollment_sha256"}}
+        and old_binding.enrollment_sha256 != new_binding.enrollment_sha256
+        and all(
+            type(storage_by_field["producer"]) is list
+            and len(storage_by_field["producer"]) == 2
+            and re.fullmatch(r"[0-9a-f]{40}", storage_by_field["producer"][0])
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", storage_by_field["producer"][1])
+            for storage_by_field in (old_storage, new_storage)
+        )
+        and old_storage["producer"] != new_storage["producer"],
+        "transition_storage_changed",
+    )
+    return old_binding
+
+
+async def _locked_transition_candidate(
+    connection, policy, identity_by_field, old_storage, new_storage, expected_counts
+):
+    """Lock only the private candidate and verify its complete native binding."""
+    endpoint_id = identity_by_field["endpoint_id"]
+    failed_run_id = identity_by_field["failed_run_id"]
+    endpoint_lock_acquired = await connection.fetchval(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))", endpoint_id
+    )
+    _require(endpoint_lock_acquired is True, "transition_endpoint_busy")
+    worker_lock_acquired = await connection.fetchval(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))",
+        "control-run-worker-action:v1:" + failed_run_id,
+    )
+    _require(worker_lock_acquired is True, "transition_worker_action_busy")
+    header = await connection.fetchrow(
+        "SELECT dataset_id,endpoint_id,acquisition_root_run_id,import_run_id,status,is_current,published_at,"
+        "publication_metadata_json,candidate_storage_json FROM "
+        + storage_relation(policy.schema, HEADER)
+        + " WHERE dataset_id=$1 FOR UPDATE NOWAIT",
+        identity_by_field["dataset_id"],
+    )
+    _require(
+        header is not None
+        and all(
+            header[field] == identity_by_field[identity_field]
+            for field, identity_field in (
+                ("dataset_id", "dataset_id"),
+                ("endpoint_id", "endpoint_id"),
+                ("acquisition_root_run_id", "acquisition_root_run_id"),
+                ("import_run_id", "failed_run_id"),
+            )
+        )
+        and header["status"] == "acquiring"
+        and header["is_current"] is False
+        and header["published_at"] is None,
+        "transition_candidate_changed",
+    )
+    candidate_by_field = _json(header["candidate_storage_json"])
+    stored_identity = candidate_by_field.get("identity") if type(candidate_by_field) is dict else None
+    _validate_binding_shape(candidate_by_field, stored_identity, phases=("loading",))
+    _validate_binding_tables(candidate_by_field, stored_identity)
+    _require(
+        candidate_by_field["contract"] == ISOLATED_CONTRACT
+        and candidate_by_field["admission"] is None
+        and candidate_by_field["auxiliary"] is None
+        and all(
+            stored_identity[field] == identity_by_field[field]
+            for field in ("dataset_id", "endpoint_id", "acquisition_root_run_id")
+        )
+        and _json(header["publication_metadata_json"]) == stored_identity["metadata"]
+        and set(stored_identity["metadata"].get("selected_resources", ())) == set(expected_counts)
+        and set(stored_identity["metadata"].get("expected_resources", ())) == set(expected_counts)
+        and candidate_by_field["storage"] in (old_storage, new_storage),
+        "transition_candidate_changed",
+    )
+    await _verify_tables(connection, policy, candidate_by_field)
+    return candidate_by_field
+
+
+async def _verify_transition_run(connection, catalog_schema, identity_by_field, source_ids):
+    """Require the exact latest failed child and no active same-root run."""
+    root_run_id = identity_by_field["acquisition_root_run_id"]
+    run_rows = await connection.fetch(
+        "SELECT run_id,status,finished_at,retry_of_run_id,created_at,"
+        "params::jsonb->>'provider_directory_pagination_root_run_id' AS root_run_id,"
+        "params::jsonb->'source_ids' AS source_ids FROM "
+        + storage_relation(catalog_schema, "import_run")
+        + " WHERE importer='provider-directory-fhir' AND "
+        "(run_id=$1 OR params::jsonb->>'provider_directory_pagination_root_run_id'=$1) "
+        "ORDER BY created_at DESC,run_id DESC LIMIT 65",
+        root_run_id,
+    )
+    run_ids = {run_record["run_id"] for run_record in run_rows}
+    parents_by_id = {run_record["run_id"]: run_record["retry_of_run_id"] for run_record in run_rows}
+    _require(
+        1 <= len(run_rows) <= 64
+        and run_rows[0]["run_id"] == identity_by_field["failed_run_id"]
+        and run_rows[0]["status"] == "failed"
+        and run_rows[0]["finished_at"] is not None
+        and run_rows[0]["root_run_id"] == root_run_id
+        and _json(run_rows[0]["source_ids"]) == source_ids
+        and all(
+            run_record["retry_of_run_id"] is None
+            if run_record["run_id"] == root_run_id
+            else run_record["retry_of_run_id"] in run_ids
+            for run_record in run_rows
+        )
+        and all(
+            _json(run_record["source_ids"]) == source_ids
+            and (run_record["run_id"] == root_run_id or run_record["root_run_id"] == root_run_id)
+            for run_record in run_rows
+        )
+        and all(
+            run_record["status"] not in {"queued", "starting", "running", "finalizing", "canceling"}
+            for run_record in run_rows
+        ),
+        "transition_run_changed",
+    )
+    lineage_cursor = identity_by_field["failed_run_id"]
+    seen_run_ids = set()
+    while lineage_cursor != root_run_id:
+        _require(lineage_cursor in run_ids and lineage_cursor not in seen_run_ids, "transition_run_changed")
+        seen_run_ids.add(lineage_cursor)
+        lineage_cursor = parents_by_id[lineage_cursor]
+    return sorted(run_ids)
+
+
+async def _verify_transition_inputs(connection, policy, candidate_by_field, identity_by_field, expected_counts):
+    """Compare complete checkpoints with every active detached input row."""
+    root_run_id = identity_by_field["acquisition_root_run_id"]
+    dataset_id = identity_by_field["dataset_id"]
+    checkpoint_rows = await connection.fetch(
+        "SELECT resource_type,state,owner_run_id,dataset_id,rows_processed,pages_processed,completed_at FROM "
+        + storage_relation(policy.schema, "provider_directory_pagination_checkpoint")
+        + " WHERE acquisition_root_run_id=$1 FOR SHARE NOWAIT",
+        root_run_id,
+    )
+    _require(
+        len(checkpoint_rows) == len(expected_counts)
+        and {checkpoint_record["resource_type"] for checkpoint_record in checkpoint_rows} == set(expected_counts)
+        and all(
+            checkpoint_record["state"] == "complete"
+            and checkpoint_record["owner_run_id"] == identity_by_field["failed_run_id"]
+            and checkpoint_record["dataset_id"] == dataset_id
+            and checkpoint_record["rows_processed"] == expected_counts[checkpoint_record["resource_type"]]
+            and checkpoint_record["pages_processed"] > 0
+            and checkpoint_record["completed_at"] is not None
+            for checkpoint_record in checkpoint_rows
+        ),
+        "transition_checkpoint_changed",
+    )
+    resource_relation = storage_relation(policy.schema, candidate_by_field["tables"]["resource_input"]["name"])
+    input_rows = await connection.fetch(
+        "SELECT dataset_id,resource_type,count(*) AS total,"
+        "count(*) FILTER (WHERE batch_ordinal > greatest($1::bigint,"
+        "coalesce(($2::jsonb->>resource_type)::bigint,0)) AND batch_ordinal <= $3::bigint) AS active "
+        "FROM " + resource_relation + " GROUP BY dataset_id,resource_type",
+        candidate_by_field["resets"].get("*", 0),
+        _encoded(candidate_by_field["resets"]),
+        candidate_by_field["ordinal"],
+    )
+    input_counts_by_type = {input_record["resource_type"]: input_record["total"] for input_record in input_rows}
+    _require(
+        len(input_counts_by_type) == len(input_rows)
+        and all(
+            input_record["dataset_id"] == dataset_id
+            and input_record["resource_type"] in expected_counts
+            and input_record["total"] == input_record["active"] == expected_counts[input_record["resource_type"]]
+            for input_record in input_rows
+        )
+        and all(
+            input_counts_by_type.get(resource_type, 0) == count for resource_type, count in expected_counts.items()
+        ),
+        "transition_input_changed",
+    )
+    witness_relation = storage_relation(policy.schema, candidate_by_field["tables"]["witness_input"]["name"])
+    _require(
+        await connection.fetchval(
+            "SELECT NOT EXISTS(SELECT FROM " + witness_relation + " WHERE dataset_id<>$1)", dataset_id
+        )
+        is True,
+        "transition_witness_changed",
+    )
+
+
+async def _require_transition_administrator(connection, policy):
+    """Bind the transition to the original independent admin session."""
+    actor = await connection.fetchrow(
+        "SELECT session_user::text AS session,current_user::text AS current,"
+        "(SELECT rolsuper FROM pg_roles WHERE rolname=current_user) AS administrator"
+    )
+    _require(
+        actor is not None
+        and actor["session"] == actor["current"]
+        and actor["administrator"] is True
+        and actor["current"] not in {policy.owner_role, policy.publisher_role, *policy.runtime_roles},
+        "transition_admin_required",
+    )
+
+
+async def transition_isolated_loading_candidate_storage(
+    connection,
+    *,
+    policy,
+    identity_by_field,
+    old_storage,
+    new_storage,
+    expected_resource_counts,
+):
+    """Move one failed private intake to an admin-issued successor producer."""
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+    from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
+
+    _require(type(policy) is GenericSourcePolicy and connection.is_in_transaction(), "transition_transaction_required")
+    _require(await connection.fetchval("SHOW transaction_isolation") == "serializable", "transition_isolation_required")
+    await _require_transition_administrator(connection, policy)
+    _validated_transition_identity(identity_by_field, expected_resource_counts)
+    old_binding = _validated_transition_storage(policy, old_storage, new_storage)
+    await verify_isolated_source_storage_coordinates(connection, policy, old_binding)
+    candidate_by_field = await _locked_transition_candidate(
+        connection,
+        policy,
+        identity_by_field,
+        old_storage,
+        new_storage,
+        expected_resource_counts,
+    )
+    lineage_run_ids = await _verify_transition_run(
+        connection,
+        old_binding.catalog_schema,
+        identity_by_field,
+        candidate_by_field["identity"]["metadata"]["source_ids"],
+    )
+    await _verify_transition_inputs(connection, policy, candidate_by_field, identity_by_field, expected_resource_counts)
+    old_document_by_field = {**candidate_by_field, "storage": old_storage}
+    successor_by_field = {**candidate_by_field, "storage": new_storage}
+    receipt_by_field = {
+        "dataset_id": identity_by_field["dataset_id"],
+        "rows": sum(expected_resource_counts.values()),
+        "lineage_run_ids": lineage_run_ids,
+        "old_binding_sha256": hashlib.sha256(_encoded(old_document_by_field).encode()).hexdigest(),
+        "new_binding_sha256": hashlib.sha256(_encoded(successor_by_field).encode()).hexdigest(),
+    }
+    if candidate_by_field["storage"] == new_storage:
+        return {**receipt_by_field, "already_applied": True}
+    updated = await connection.execute(
+        "UPDATE "
+        + storage_relation(policy.schema, HEADER)
+        + " SET candidate_storage_json=$2::jsonb WHERE dataset_id=$1 "
+        "AND candidate_storage_json IS NOT DISTINCT FROM $3::jsonb "
+        "AND status='acquiring' AND NOT is_current AND published_at IS NULL",
+        identity_by_field["dataset_id"],
+        _encoded(successor_by_field),
+        _encoded(candidate_by_field),
+    )
+    _require(updated == "UPDATE 1", "transition_header_compare_failed")
+    return {**receipt_by_field, "already_applied": False}
 
 
 def _records(rows, columns, ordinal):
