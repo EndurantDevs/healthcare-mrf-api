@@ -63,6 +63,7 @@ class _AdmittedWorkerRequest(dict[str, Any]):
     reference_source_launch: object | None = None
     aca_source_launch: object | None = None
     fhir_source_launch: object | None = None
+    ordinary_fhir_overlay_job: tuple[str, str, str, str, str] | None = None
     npi_source_launch: object | None = None
     pricing_control_admission: object | None = None
 
@@ -315,6 +316,11 @@ async def _admit_source_worker_launches(worker_payload, admitted_run):
             try:
                 worker_payload.fhir_source_launch = provider_directory_source_worker.admit_fhir_source_worker_launch(
                     admitted_run
+                )
+                worker_payload.ordinary_fhir_overlay_job = (
+                    worker_payload.admitted_job
+                    if admitted_run.get("importer") == "provider-directory-fhir" and worker_payload.fhir_source_launch is None
+                    else None
                 )
             except ValueError, RuntimeError:
                 return _failed_worker_admission(worker_payload, "FHIR source worker admission is unavailable")
@@ -661,10 +667,11 @@ def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, 
     aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
     cms_launch = authorized_cms_registry_worker_launch(spec, launch_request)
     fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
+    overlay_job_id = provider_directory_source_worker.admitted_overlay_job(spec, launch_request)
     npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
     if spec.worker_class == "process.NPI" and npi_launch is None:
         return {"status": "failed", "message": "NPI source worker requires exact admitted job"}
-    if spec.worker_class == "process.ProviderDirectoryFHIR" and cms_launch is None and fhir_launch is None:
+    if spec.worker_class == "process.ProviderDirectoryFHIR" and cms_launch is None and fhir_launch is None and overlay_job_id is None:
         return {"status": "failed", "message": "FHIR source worker requires exact admitted job"}
     if spec.worker_class == "process.RegistryACASource" and aca_launch is None:
         return {"status": "failed", "message": "ACA source worker requires exact admitted job"}
@@ -673,6 +680,7 @@ def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, 
     if (
         cms_launch is not None
         or fhir_launch is not None
+        or overlay_job_id is not None
         or npi_launch is not None
         or reference_launch is not None
         or aca_launch is not None
@@ -1019,10 +1027,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
         not registry_aca_source_worker.is_aca_source_job_matching(job, aca_launch) for job in jobs
     ):
         return {**state_base_dict, "job_status": "purpose_mismatch"}
-    fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
-    if fhir_launch is not None and any(
-        not provider_directory_source_worker.is_fhir_source_job_matching(job, fhir_launch) for job in jobs
-    ):
+    if not provider_directory_source_worker.is_fhir_job_set_matching(spec, launch_request, jobs):
         return {**state_base_dict, "job_status": "purpose_mismatch"}
     npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
     if npi_launch is not None and any(
@@ -1278,7 +1283,7 @@ def _worker_job_container(
     pvc_volumes = _worker_job_pvc_volumes()
     from api.plan_pricing_worker_policy import pricing_worker_policy_volumes
 
-    volumes = [*pvc_volumes, *_worker_job_secret_volumes(spec), *pricing_worker_policy_volumes(spec, launch_request)]
+    volumes = [*pvc_volumes, *_worker_job_secret_volumes(spec, fhir_launch), *pricing_worker_policy_volumes(spec, launch_request)]
     if volumes:
         container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
     return container_dict, volumes, run_id
@@ -1677,7 +1682,7 @@ def _worker_job_secret_source(
     return secret_source_by_field
 
 
-def _worker_job_secret_volumes(spec: WorkerSpec) -> list[dict[str, Any]]:
+def _worker_job_secret_volumes(spec: WorkerSpec, fhir_source_launch=None) -> list[dict[str, Any]]:
     """Build validated secret mounts selected for one worker class."""
 
     raw = os.getenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", "").strip()
@@ -1698,6 +1703,10 @@ def _worker_job_secret_volumes(spec: WorkerSpec) -> list[dict[str, Any]]:
         if not _is_worker_class_selected(mount_spec, spec.worker_class):
             continue
         secret_name = str(mount_spec.get("secretName") or mount_spec.get("secret_name") or "").strip()
+        if "purposes" in mount_spec and not provider_directory_source_worker.is_fhir_source_volume_selected(
+            mount_spec, spec.worker_class, fhir_source_launch
+        ):
+            continue
         mount_path = str(mount_spec.get("mountPath") or mount_spec.get("mount_path") or "").strip()
         if not secret_name or not mount_path:
             continue
@@ -1775,7 +1784,7 @@ def _single_job_worker_target(
 ) -> str | None:
     if not _uses_single_job_worker(spec):
         return None
-    source_job_id = _admitted_source_job_target(spec, payload)
+    source_job_id = _admitted_source_job_target(spec, payload) or provider_directory_source_worker.admitted_overlay_job(spec, payload)
     if source_job_id is not None:
         return source_job_id
     queued_job_id = str(payload.get("job_id") or "").strip()

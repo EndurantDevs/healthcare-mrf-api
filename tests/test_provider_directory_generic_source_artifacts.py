@@ -232,10 +232,13 @@ async def test_typed_copy_retains_native_scalar_encoders_and_fixed_reader(case, 
 
 
 @pytest.mark.asyncio
-async def test_prepared_npi_metrics_require_original_native_stages_and_selector(case, monkeypatch):
+@pytest.mark.parametrize("ordinary", [False, True])
+async def test_prepared_npi_metrics_require_original_native_stages_and_selector(case, monkeypatch, ordinary):
     counts_by_resource = dict(Organization=2, Practitioner=3)
     case.admission = replace(
         case.admission,
+        factory=None if ordinary else case.factory,
+        producer=None if ordinary else case.admission.producer,
         task=asyncio.current_task(),
         prepared=dict(
             relations={"typed": ("private_stage", 1, 2, "r", "u")},
@@ -249,6 +252,7 @@ async def test_prepared_npi_metrics_require_original_native_stages_and_selector(
     )
     catalog = AsyncMock(return_value=(1, 2, "r", "u"))
     monkeypatch.setattr(artifacts, "_catalog", catalog)
+    factory_token = artifacts.source._FACTORY.set(None if ordinary else case.factory)
     token = artifacts._ACTIVE.set(case.admission)
     try:
         prepared_counts = await artifacts.prepared_npi_backfill(
@@ -266,6 +270,65 @@ async def test_prepared_npi_metrics_require_original_native_stages_and_selector(
             )
     finally:
         artifacts._ACTIVE.reset(token)
+        artifacts.source._FACTORY.reset(factory_token)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(monkeypatch):
+    import importlib
+
+    directory = importlib.import_module("process.provider_directory_fhir")
+    dataset = SimpleNamespace(source_id="source_a", dataset_id="dataset_a", evidence_run_id="root_a")
+    admission = SimpleNamespace(
+        factory=None, fence=SimpleNamespace(datasets=(dataset,)), resource_types={"Practitioner"},
+        prepared=dict(plan=dict(publish_targets=["address_overlay"], decision_at="2026-01-01T00:00:00")),
+    )
+    session = object()
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(directory.db, "transaction", transaction)
+    monkeypatch.setattr(directory.db, "status", AsyncMock())
+    monkeypatch.setattr(directory, "_create_provider_directory_artifact_scope_layout", AsyncMock())
+    monkeypatch.setattr(directory, "_build_artifact_scope_pk", AsyncMock())
+    monkeypatch.setattr(artifacts, "_catalog", AsyncMock(side_effect=[None, (1, 2, "r", "u")]))
+    copy = AsyncMock()
+    parity = AsyncMock()
+    monkeypatch.setattr(artifacts, "_copy", copy)
+    monkeypatch.setattr(artifacts, "_verify_set_parity", parity)
+    created_by_relation = {}
+    await artifacts._prepare_model(directory, admission, directory.ProviderDirectoryPractitioner, "private_stage", created_by_relation)
+    assert created_by_relation == {"private_stage": (1, 2, "r", "u")}
+    statement, params = copy.await_args.args[-2:]
+    assert "provider_directory_dataset_resource" in statement and "repair_eligible" in statement
+    assert copy.await_args.kwargs == dict(enrichment=admission.prepared, kind="npi")
+    assert params["source_ids"] == ["source_a"] and params["dataset_ids"] == ["dataset_a"]
+    assert params["evidence_run_ids"] == ["root_a"] and params["resource_type"] == "Practitioner"
+    assert parity.await_args.args[0] is session and parity.await_args.args[-1] == params
+    assert "i.resource_id::bigint" in parity.await_args.args[1]
+    assert ":update_timestamp" in parity.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_scope_retains_normal_terminal_fences_and_rejects_factory_rebinding(case):
+    factory_token = artifacts.source._FACTORY.set(None)
+    admission = replace(case.admission, factory=None, producer=None, task=asyncio.current_task())
+    token = artifacts._ACTIVE.set(admission)
+    try:
+        assert artifacts.current(case.directory) is admission
+        async with artifacts.terminal_fence(case.directory):
+            assert artifacts.is_fence_held(case.directory, case.fence, None) is False
+            rebound = artifacts.source._FACTORY.set(case.factory)
+            try:
+                with pytest.raises(RuntimeError, match="rest_artifact_admission_changed"):
+                    artifacts.current(case.directory)
+            finally:
+                artifacts.source._FACTORY.reset(rebound)
+    finally:
+        artifacts._ACTIVE.reset(token)
+        artifacts.source._FACTORY.reset(factory_token)
 
 
 @pytest.mark.asyncio

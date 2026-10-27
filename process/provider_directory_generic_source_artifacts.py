@@ -26,6 +26,74 @@ from process.provider_directory_projection_stage import _copy_driver
 _ACTIVE = ContextVar("provider_directory_rest_artifact_admission", default=None)
 _TERMINAL = ContextVar("provider_directory_rest_artifact_terminal", default=None)
 _SOURCE_ONLY = ContextVar("provider_directory_rest_source_publication", default=None)
+_FOLLOWUP_PREFIX = "provider_directory_dataset_followup_"
+_FOLLOWUP_IDENTITIES = ("source_id", "endpoint_id", "dataset_id", "dataset_hash", "parent_run_id")
+
+
+async def prepare_job_tables(directory, ctx, profile_execution, *, overlay_followup=None):
+    """Keep acquisition setup separate from reads of an already published dataset."""
+    if ctx["context"].get("provider_directory_tables_ready"):
+        return
+    if overlay_followup is not None and not source.is_source_storage_required():
+        # The publication fence validates its inputs without acquisition-table privileges.
+        return
+    if profile_execution is not None and not source.is_source_storage_required():
+        for model in (*directory.SOURCE_MODELS, *directory.CANONICAL_RESOURCE_MODELS):
+            columns = ",".join(directory._q(str(column.name)) for column in model.__table__.columns)
+            await directory.db.all(f"SELECT {columns} FROM {directory._qt(directory._schema(), model.__tablename__)} LIMIT 0")
+        # These reads never mark acquisition preflight complete.
+        return
+    await directory._ensure_provider_directory_tables()
+    ctx["context"]["provider_directory_tables_ready"] = True
+
+
+def ordinary_overlay_followup(directory, task):
+    """Recognize only the closed ordinary overlay request, without granting database authority."""
+    if source.is_source_storage_required() or task.get(_FOLLOWUP_PREFIX + "stage") != "address_overlay":
+        return None
+    markers_by_field = {
+        name: task.get(_FOLLOWUP_PREFIX + name) for name in (*_FOLLOWUP_IDENTITIES, "version", "stage", "attempt")
+    }
+    flags_by_name = {"publish_artifacts_only": True, "publish_corroboration": False, "probe": False, "import_resources": False}
+    expected_fields = {*flags_by_name, "publish_artifacts_targets", "source_ids"} | {
+        _FOLLOWUP_PREFIX + name for name in markers_by_field
+    }
+    require_output(
+        set(task) - {"test_mode", "run_id"} == expected_fields
+        and task.get("test_mode", False) is False
+        and ("run_id" not in task or type(task["run_id"]) is str and bool(task["run_id"])
+             and task["run_id"] == task["run_id"].strip())
+        and all(task.get(name) is enabled for name, enabled in flags_by_name.items())
+        and task.get("publish_artifacts_targets") == "address_overlay"
+        and all(type(markers_by_field[name]) is str and bool(markers_by_field[name])
+                and markers_by_field[name] == markers_by_field[name].strip() for name in _FOLLOWUP_IDENTITIES)
+        and len(markers_by_field["dataset_hash"]) == 64
+        and set(markers_by_field["dataset_hash"]) <= set("0123456789abcdef")
+        and type(markers_by_field["version"]) is int and markers_by_field["version"] == 1
+        and type(markers_by_field["attempt"]) is int and markers_by_field["attempt"] > 0
+        and task.get("source_ids") == [markers_by_field["source_id"]]
+        and markers_by_field["source_id"] not in {"cms-npd", directory.UHC_RETAINED_SOURCE_ID}
+        and not directory.is_uhc_flex_profile_source(markers_by_field["source_id"]),
+        "ordinary_overlay_request_invalid",
+    )
+    return {_FOLLOWUP_PREFIX + name: marker for name, marker in markers_by_field.items()}
+
+
+def require_overlay_followup_fence(directory, fence, metrics):
+    """Bind ordinary followup markers to the current selection before any staging."""
+    if _FOLLOWUP_PREFIX + "version" not in metrics:
+        return
+    if len(fence.datasets) != 1 or fence.promotion_datasets:
+        raise directory.ProviderDirectoryArtifactBuildStale("provider_directory_overlay_followup_selection_changed")
+    dataset = fence.datasets[0]
+    expected_by_field = {name: metrics.get(_FOLLOWUP_PREFIX + name) for name in _FOLLOWUP_IDENTITIES}
+    actual_by_field = dict(source_id=dataset.source_id, endpoint_id=dataset.endpoint_id, dataset_id=dataset.dataset_id,
+                           dataset_hash=dataset.dataset_hash, parent_run_id=dataset.evidence_run_id)
+    if (
+        actual_by_field != expected_by_field or dataset.status != "published" or dataset.is_current is not True
+        or any((alias.serving_endpoint_id or alias.endpoint_id) != alias.endpoint_id for alias in fence.locked_alias_datasets)
+    ):
+        raise directory.ProviderDirectoryArtifactBuildStale("provider_directory_overlay_followup_selection_changed")
 
 
 def validate_source_only_task(directory, task, source_ids, census_request):
@@ -171,7 +239,7 @@ class _Admission:
     fence: object
     fence_hash: str
     resource_types: frozenset
-    producer: tuple
+    producer: tuple | None
     prepared: object = None
     recovery: object = None
 
@@ -185,7 +253,7 @@ def current(directory):
         admission.directory is directory
         and admission.factory is source._FACTORY.get()
         and admission.task is asyncio.current_task()
-        and admission.producer == source.source_producer_identity()
+        and admission.producer == (source.source_producer_identity() if admission.factory is not None else None)
         and admission.fence_hash == desired_fence_hash(admission.fence),
         "rest_artifact_admission_changed",
     )
@@ -294,9 +362,16 @@ async def _prepare_model(directory, admission, model, name, created_by_relation)
             params_by_name = {"source_ids": [dataset.source_id]}
             expected, kind = statement, None
         else:
-            statement, params_by_name = typed_input_projection(
-                directory, model, dataset, inputs.binding(directory, dataset)
-            )
+            if admission.factory is None:
+                statement = directory._provider_directory_artifact_resource_select_sql(model, schema)
+                params_by_name = dict(
+                    source_ids=[dataset.source_id], dataset_ids=[dataset.dataset_id],
+                    evidence_run_ids=[dataset.evidence_run_id], resource_type=directory.RESOURCE_TYPES_BY_MODEL[model],
+                )
+            else:
+                statement, params_by_name = typed_input_projection(
+                    directory, model, dataset, inputs.binding(directory, dataset)
+                )
             statement, expected, params_by_name, kind, _counts = _loading_projection(
                 directory, root, statement, params_by_name, admission.prepared
             )
@@ -416,35 +491,54 @@ def _require_published_overlay(directory, fence, request):
     )
 
 
-@asynccontextmanager
-async def publication_scope(directory, fence, request, resource_types):
-    """Admit only the source-local ordinary overlay recipe, independently of CMS."""
+def _publication_admission(directory, fence, request, resource_types):
+    """Select the existing Source recipe or exact ordinary published-dataset followup."""
     from process.provider_directory_cms_preparation import _ACTIVE as cms_admission
 
+    is_source_required = source.is_source_storage_required()
+    is_ordinary_followup = (
+        not is_source_required
+        and type(request.metrics.get(_FOLLOWUP_PREFIX + "version")) is int
+        and request.metrics[_FOLLOWUP_PREFIX + "version"] == 1
+        and request.metrics.get(_FOLLOWUP_PREFIX + "stage") == "address_overlay"
+    )
     if (
-        not source.is_source_storage_required()
+        (not is_source_required and not is_ordinary_followup)
         or cms_admission.get() is not None
         or directory._provider_directory_profile_capacity_admission() is not None
     ):
         require_output(
             request.metrics.get(recovery.GENERATION_PARAM) is None, "rest_artifact_recovery_admission_required"
         )
-        yield
-        return
+        return None
     _require_published_overlay(directory, fence, request)
     factory = source._FACTORY.get()
-    require_output(callable(getattr(factory, "artifact_fence", None)), "rest_artifact_fence_required")
-    admission = _Admission(
+    if is_ordinary_followup:
+        require_output(request.metrics.get(recovery.GENERATION_PARAM) is None, "rest_artifact_recovery_admission_required")
+        require_overlay_followup_fence(directory, fence, request.metrics)
+    else:
+        require_output(callable(getattr(factory, "artifact_fence", None)), "rest_artifact_fence_required")
+    return _Admission(
         directory,
         factory,
         asyncio.current_task(),
         fence,
         desired_fence_hash(fence),
         frozenset(resource_types),
-        source.source_producer_identity(),
+        source.source_producer_identity() if factory is not None else None,
         {},
-        recovery.overlay_request(fence, request),
+        None if is_ordinary_followup else recovery.overlay_request(fence, request),
     )
+
+
+@asynccontextmanager
+async def publication_scope(directory, fence, request, resource_types):
+    """Prepare the existing recipe and always drain its exact native scratch tables."""
+    admission = _publication_admission(directory, fence, request, resource_types)
+    if admission is None:
+        yield
+        return
+    factory = admission.factory
     relation_by_table = {
         model.__tablename__: "pdra_" + uuid4().hex
         for model in (directory.ProviderDirectorySource, *directory.RESOURCE_MODELS)
@@ -454,7 +548,8 @@ async def publication_scope(directory, fence, request, resource_types):
         try:
             actor = await directory.db.first("SELECT session_user::text,current_user::text")
             require_output(
-                tuple(actor) == (factory.policy.control_runtime_roles[0],) * 2, "rest_artifact_ordinary_actor_required"
+                tuple(actor) == ((factory.policy.control_runtime_roles[0],) * 2 if factory is not None else (actor[0],) * 2),
+                "rest_artifact_ordinary_actor_required",
             )
             projection = await _prepare(directory, admission, relation_by_table, created_by_relation)
             oid_by_table = {root: created_by_relation[name][0] for root, name in relation_by_table.items()}
@@ -566,7 +661,7 @@ async def lock_address_source_fence(directory, database, schema, context):
 async def terminal_fence(directory):
     """Authenticate Source before commit; keep ordinary-owned locks until settlement."""
     admission = current(directory)
-    if admission is None:
+    if admission is None or admission.factory is None:
         yield
         return
     require_output(_TERMINAL.get() is None, "rest_artifact_terminal_nested")
