@@ -21294,12 +21294,12 @@ async def _provider_directory_artifact_dataset_scope(
     resource_types: frozenset[str] | None = None,
 ) -> AsyncIterator[ProviderDirectoryArtifactDatasetFence]:
     """Materialize and clean one bounded alias-aware artifact source scope."""
-    from process.provider_directory_generic_source_artifacts import reuse_artifact_scope
+    from process.provider_directory_generic_source_artifacts import current, reuse_artifact_scope
     from process.provider_directory_generic_source_policy import is_source_storage_required
 
     capacity_admission = _provider_directory_profile_capacity_admission()
     is_source_profile = is_source_storage_required() and capacity_admission is not None
-    if is_source_storage_required() and not is_source_profile:
+    if current(sys.modules[__name__]) is not None or (is_source_storage_required() and not is_source_profile):
         yield await reuse_artifact_scope(sys.modules[__name__], fence, resource_fence, metrics, resource_types)
         return
     schema = _schema()
@@ -24105,10 +24105,13 @@ async def _prepare_artifact_publication_fence(
     should_select_validated_candidates: bool,
     validated_publication_candidate: ValidatedPublicationCandidate | None = None,
 ) -> ProviderDirectoryArtifactDatasetFence:
+    from process.provider_directory_generic_source_artifacts import require_overlay_followup_fence
+
     fence = await _resolve_provider_directory_artifact_datasets(
         source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
     )
+    require_overlay_followup_fence(sys.modules[__name__], fence, metrics)
     _assert_cms_npd_dedicated_candidate_promotion(fence)
     if any(
         dataset.source_id == "cms-npd" for dataset in fence.datasets
@@ -37531,20 +37534,11 @@ async def _is_address_corroboration_published(
     return True
 
 
-async def _prepare_provider_directory_job_tables(ctx, profile_execution) -> None:
-    """Profile reads existing canonical inputs; acquisition still requires its Source binding."""
-    from process.provider_directory_generic_source_policy import is_source_storage_required
+async def _prepare_provider_directory_job_tables(ctx, profile_execution, *, overlay_followup=None) -> None:
+    """Keep acquisition setup separate from reads of an already published dataset."""
+    from process.provider_directory_generic_source_artifacts import prepare_job_tables
 
-    if ctx["context"].get("provider_directory_tables_ready"):
-        return
-    if profile_execution is not None and not is_source_storage_required():
-        for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
-            columns = ",".join(_q(str(column.name)) for column in model.__table__.columns)
-            await db.all(f"SELECT {columns} FROM {_qt(_schema(), model.__tablename__)} LIMIT 0")
-        # Profile's signed admission verifies physical layouts; never mark acquisition preflight complete here.
-        return
-    await _ensure_provider_directory_tables()
-    ctx["context"]["provider_directory_tables_ready"] = True
+    await prepare_job_tables(sys.modules[__name__], ctx, profile_execution, overlay_followup=overlay_followup)
 
 
 async def _ensure_provider_directory_tables() -> None:
@@ -69888,9 +69882,10 @@ async def process_provider_directory_fhir_data(
         task,
         census_request,
     )
-    from process.provider_directory_generic_source_artifacts import validate_source_only_task
+    from process.provider_directory_generic_source_artifacts import ordinary_overlay_followup, validate_source_only_task
 
     validate_source_only_task(sys.modules[__name__], task, requested_source_ids, census_request)
+    overlay_followup = ordinary_overlay_followup(sys.modules[__name__], task)
     from process.provider_directory_cms_npd import validate_source_scope as validate_cms_source_scope
 
     validate_cms_source_scope(task, run_id, requested_source_ids, test_mode)
@@ -70112,7 +70107,7 @@ async def process_provider_directory_fhir_data(
         raise ValueError("provider_directory_reviewed_root_policy_scope_invalid")
     await _raise_if_resource_import_cancelled(ctx, task)
     await ensure_database(test_mode)
-    await _prepare_provider_directory_job_tables(ctx, profile_execution)
+    await _prepare_provider_directory_job_tables(ctx, profile_execution, overlay_followup=overlay_followup)
     if (
         "cms-npd" in requested_source_ids
         and not dataset_rehydrate_only
@@ -70176,6 +70171,7 @@ async def process_provider_directory_fhir_data(
             "publish_artifacts": True,
             "publish_artifacts_only": True,
             "source_ids": requested_source_ids,
+            **(overlay_followup or {}),
             **(
                 {serving_recovery.GENERATION_PARAM: task[serving_recovery.GENERATION_PARAM]}
                 if task.get(serving_recovery.GENERATION_PARAM) is not None
