@@ -21,7 +21,7 @@ from process import provider_directory_generic_source_provision as provision
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from tests.cms_npd_admission_postgres_support import _database_url, _owned_database
-from tests.provider_directory_source_postgres_support import verify_native_source_profile
+from tests.provider_directory_source_postgres_support import source_component_database, verify_native_source_profile
 from tests.test_provider_directory_subset_completion_migration import _load_migration
 
 
@@ -417,6 +417,191 @@ async def test_native_bootstrap_preserves_guards_reads_and_fk_free_storage(nativ
         )
     finally:
         await reader.close()
+
+
+async def test_native_isolated_inventory_rechecks_provisioned_storage(native_bootstrap):
+    from process import provider_directory_source_storage_binding as binding
+
+    case, connection = native_bootstrap, native_bootstrap.connection
+    async with connection.transaction():
+        await _provision(case)
+        roles_by_name = {
+            name: {"oid": await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", name)}
+            for name in (case.policy.owner_role, *case.policy.runtime_roles)
+        }
+        with pytest.raises(GenericCandidateError, match="checkpoint_layout_changed"):
+            await binding._isolated_inventory(connection, case.policy, "catalog", roles_by_name)
+
+
+async def _assert_migrated_isolated_custody(driver, storage_policy, role_names_by_kind):
+    """Verify native storage shape and reject incomplete custody rights."""
+    from process import provider_directory_source_storage_binding as binding
+
+    roles_by_name = {
+        name: {"oid": await driver.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", name)}
+        for name in (storage_policy.owner_role, storage_policy.publisher_role, *storage_policy.runtime_roles)
+    }
+    inventory = await binding._isolated_inventory(driver, storage_policy, "mrf", roles_by_name)
+    assert set(inventory) == set(provision.ISOLATED_FHIR_ROOTS)
+    catalog_oid = await driver.fetchval("SELECT 'mrf'::regnamespace::oid")
+    checks = await binding._isolated_application_checks(driver, "mrf", catalog_oid)
+    assert set(checks) == set(provision._ISOLATED_APPLICATION_CHECKS)
+    admission = await binding._isolated_admission_rows(driver, "mrf", roles_by_name[storage_policy.owner_role]["oid"])
+    assert {relation["relname"] for relation in admission} == binding._CATALOG_ROOTS
+    metadata = await binding._isolated_metadata_rows(driver, "mrf", storage_policy.runtime_roles)
+    assert metadata
+    task, publisher_identity = await binding._require_source_storage_publisher(driver, storage_policy, None)
+    assert task is not None and publisher_identity["administrator"]
+    # Complete the role graph so capture reaches the canonical admission-rights check.
+    await driver.execute(f"REVOKE {quote(role_names_by_kind['owner'])} FROM {quote(role_names_by_kind['publisher'])}")
+    for kind, inherited in (("publisher", False), ("migration", True), ("publication_publisher", True)):
+        await driver.execute(
+            f"GRANT {quote(role_names_by_kind['owner'])} TO {quote(role_names_by_kind[kind])} "
+            f"WITH INHERIT {'TRUE' if inherited else 'FALSE'}"
+        )
+    await driver.execute(
+        f"GRANT {quote(role_names_by_kind['publication_owner'])} "
+        f"TO {quote(role_names_by_kind['publication_publisher'])}"
+    )
+    await driver.execute(
+        f"GRANT CREATE ON SCHEMA {quote(storage_policy.schema)} TO {quote(role_names_by_kind['publication_owner'])}"
+    )
+    with pytest.raises(GenericCandidateError, match="admission_authority_changed"):
+        await binding.capture_isolated_source_storage_custody(
+            driver,
+            storage_policy,
+            catalog_schema="mrf",
+            migration_role=role_names_by_kind["migration"],
+            namespace_owner_role=role_names_by_kind["namespace"],
+            publication={
+                "owner_role": role_names_by_kind["publication_owner"],
+                "publisher_role": role_names_by_kind["publication_publisher"],
+            },
+        )
+    return roles_by_name
+
+
+async def _close_native_role_fixture(driver, created_role_names):
+    """Attempt every exact role drop and always close the connection."""
+    first_failure = None
+    try:
+        for name in reversed(created_role_names):
+            try:
+                await driver.execute("DROP ROLE IF EXISTS " + quote(name))
+                assert not await driver.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", name)
+            except Exception as error:
+                if first_failure is None:
+                    first_failure = error
+    finally:
+        await driver.close()
+    if first_failure is not None:
+        raise first_failure
+
+
+async def _assert_frozen_candidate_guards(driver, storage_policy, roles_by_name):
+    """Reject unfrozen or incomplete proof state in the isolated native tables."""
+    from process import provider_directory_generic_source_completion as completion
+    from process.provider_directory_proof_store import ProviderDirectoryProofStoreError
+    from tests.cms_npd_admission_postgres_support import fhir
+
+    frozen_document_by_field = {
+        "storage": {"owner_oid": roles_by_name[storage_policy.owner_role]["oid"]},
+        "identity": {
+            "dataset_id": "unpublished",
+            "endpoint_id": "endpoint",
+            "acquisition_root_run_id": "root",
+            "metadata": {"selected_resources": ["Organization"], "source_ids": ["source"]},
+        },
+        "tables": {root: {"name": root} for root in provision.ISOLATED_FHIR_ROOTS},
+    }
+    probe_rows = await completion._FrozenSourceRows(driver).all("SELECT 1 AS value")
+    assert probe_rows[0]["value"] == 1
+    with pytest.raises(GenericCandidateError, match="freeze_required"):
+        await completion._frozen_source_inventory(driver, storage_policy, frozen_document_by_field)
+    with pytest.raises(GenericCandidateError, match="header_snapshot_changed"):
+        await completion._frozen_handoff_header(driver, storage_policy, frozen_document_by_field)
+    with pytest.raises(GenericCandidateError, match="plan_projection_changed"):
+        await completion._frozen_projection_exact(driver, fhir, storage_policy, frozen_document_by_field)
+    header = storage_relation(storage_policy.schema, provision.HEADER)
+    await driver.execute(
+        f"INSERT INTO {header}(dataset_id,endpoint_id,acquisition_root_run_id,status,is_current) "
+        "VALUES($1,$2,$3,$4,false)",
+        "unpublished",
+        "endpoint",
+        "root",
+        "acquiring",
+    )
+    await completion._frozen_projection_exact(driver, fhir, storage_policy, frozen_document_by_field)
+    resource = storage_relation(storage_policy.schema, provision.RELATIONS[0])
+    await driver.execute(
+        f"INSERT INTO {resource}(dataset_id,resource_type,resource_id,payload_hash,payload_json) "
+        "VALUES($1,$2,$3,$4,$5::jsonb)",
+        "unpublished",
+        "Practitioner",
+        "out-of-scope",
+        "0" * 64,
+        "{}",
+    )
+    with pytest.raises(GenericCandidateError, match="resource_identity_changed"):
+        await completion._frozen_content_proof(
+            driver, fhir, storage_policy, frozen_document_by_field, {"publication_metadata_json": "{}"}
+        )
+    await driver.execute(f"DELETE FROM {resource}")
+    with pytest.raises(ProviderDirectoryProofStoreError, match="durable proof shards are missing"):
+        await completion._frozen_content_proof(
+            driver, fhir, storage_policy, frozen_document_by_field, {"publication_metadata_json": "{}"}
+        )
+
+
+async def test_native_migrated_catalog_supports_isolated_inventory(monkeypatch):
+    """Exercise custody and frozen proof checks on migrated PostgreSQL tables."""
+    async with source_component_database(monkeypatch) as component:
+        driver = await asyncpg.connect(_dsn(component.admin_engine.url))
+        role_names_by_kind = {
+            kind: "isolated_" + kind + "_" + uuid4().hex[:16]
+            for kind in (
+                "owner",
+                "publisher",
+                "reader",
+                "namespace",
+                "migration",
+                "publication_owner",
+                "publication_publisher",
+            )
+        }
+        created_role_names = []
+        try:
+            for kind, name in role_names_by_kind.items():
+                await driver.execute(
+                    f"CREATE ROLE {quote(name)} "
+                    + ("NOLOGIN" if kind in {"owner", "namespace", "publication_owner"} else "LOGIN")
+                )
+                created_role_names.append(name)
+            await driver.execute(
+                f"GRANT {quote(role_names_by_kind['owner'])} TO {quote(role_names_by_kind['publisher'])}"
+            )
+            storage_policy = GenericSourcePolicy(
+                "private_source",
+                role_names_by_kind["owner"],
+                role_names_by_kind["publisher"],
+                (role_names_by_kind["reader"],),
+            )
+            transaction = driver.transaction()
+            await transaction.start()
+            try:
+                await provision.provision_isolated_fhir_source_storage(
+                    driver,
+                    storage_policy,
+                    catalog_schema="mrf",
+                    namespace_owner=role_names_by_kind["namespace"],
+                    verify_role_profile=verify_native_source_profile,
+                )
+                roles_by_name = await _assert_migrated_isolated_custody(driver, storage_policy, role_names_by_kind)
+                await _assert_frozen_candidate_guards(driver, storage_policy, roles_by_name)
+            finally:
+                await transaction.rollback()
+        finally:
+            await _close_native_role_fixture(driver, created_role_names)
 
 
 @pytest.mark.parametrize("kind", ["check", "default", "index", "sequence", "same_named_check"])
