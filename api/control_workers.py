@@ -319,7 +319,8 @@ async def _admit_source_worker_launches(worker_payload, admitted_run):
                 )
                 worker_payload.ordinary_fhir_overlay_job = (
                     worker_payload.admitted_job
-                    if admitted_run.get("importer") == "provider-directory-fhir" and worker_payload.fhir_source_launch is None
+                    if admitted_run.get("importer") == "provider-directory-fhir"
+                    and worker_payload.fhir_source_launch is None
                     else None
                 )
             except ValueError, RuntimeError:
@@ -671,7 +672,12 @@ def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, 
     npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
     if spec.worker_class == "process.NPI" and npi_launch is None:
         return {"status": "failed", "message": "NPI source worker requires exact admitted job"}
-    if spec.worker_class == "process.ProviderDirectoryFHIR" and cms_launch is None and fhir_launch is None and overlay_job_id is None:
+    if (
+        spec.worker_class == "process.ProviderDirectoryFHIR"
+        and cms_launch is None
+        and fhir_launch is None
+        and overlay_job_id is None
+    ):
         return {"status": "failed", "message": "FHIR source worker requires exact admitted job"}
     if spec.worker_class == "process.RegistryACASource" and aca_launch is None:
         return {"status": "failed", "message": "ACA source worker requires exact admitted job"}
@@ -1283,7 +1289,11 @@ def _worker_job_container(
     pvc_volumes = _worker_job_pvc_volumes()
     from api.plan_pricing_worker_policy import pricing_worker_policy_volumes
 
-    volumes = [*pvc_volumes, *_worker_job_secret_volumes(spec, fhir_launch), *pricing_worker_policy_volumes(spec, launch_request)]
+    volumes = [
+        *pvc_volumes,
+        *_worker_job_secret_volumes(spec, fhir_launch),
+        *pricing_worker_policy_volumes(spec, launch_request),
+    ]
     if volumes:
         container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
     return container_dict, volumes, run_id
@@ -1393,18 +1403,22 @@ def _worker_job_manifest(
         spec, launch_request, labels_by_key, job_spec_dict["template"]["spec"]
     )
 
+    fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
+    annotations_by_key = {
+        "healthporta.com/queue": spec.queue,
+        "healthporta.com/worker-class": spec.worker_class,
+        "healthporta.com/importers": ",".join(spec.importers),
+        "healthporta.com/run-id": run_id,
+    }
+    if fhir_launch is not None and fhir_launch.root_run_id:
+        annotations_by_key["healthporta.com/source-root-run-id"] = fhir_launch.root_run_id
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": job_name,
             "labels": labels_by_key,
-            "annotations": {
-                "healthporta.com/queue": spec.queue,
-                "healthporta.com/worker-class": spec.worker_class,
-                "healthporta.com/importers": ",".join(spec.importers),
-                "healthporta.com/run-id": run_id,
-            },
+            "annotations": annotations_by_key,
         },
         "spec": job_spec_dict,
     }
@@ -1780,17 +1794,19 @@ def _admitted_source_job_target(spec, payload):
 
 def _single_job_worker_target(
     spec: WorkerSpec,
-    payload: dict[str, Any],
+    launch_payload: dict[str, Any],
 ) -> str | None:
     if not _uses_single_job_worker(spec):
         return None
-    source_job_id = _admitted_source_job_target(spec, payload) or provider_directory_source_worker.admitted_overlay_job(spec, payload)
+    source_job_id = _admitted_source_job_target(
+        spec, launch_payload
+    ) or provider_directory_source_worker.admitted_overlay_job(spec, launch_payload)
     if source_job_id is not None:
         return source_job_id
-    queued_job_id = str(payload.get("job_id") or "").strip()
+    queued_job_id = str(launch_payload.get("job_id") or "").strip()
     if queued_job_id:
         return queued_job_id
-    run_id = str(payload.get("run_id") or "").strip()
+    run_id = str(launch_payload.get("run_id") or "").strip()
     projection_job_prefix_by_importer = {
         "ptg-provider-membership-projection": "ptg_provider_membership_projection",
         "plan-pricing-code-projection": "plan_pricing_code_projection",
@@ -1799,7 +1815,7 @@ def _single_job_worker_target(
         "plan-pricing-em-distance": "plan_pricing_em_distance",
         "plan-pricing-em-attribution": "plan_pricing_em_attribution",
     }
-    importer = str(payload.get("importer") or "").strip()
+    importer = str(launch_payload.get("importer") or "").strip()
     if importer in projection_job_prefix_by_importer and run_id:
         return f"{projection_job_prefix_by_importer[importer]}_{run_id}"
     if spec.worker_class.startswith("process.PTG") and run_id:

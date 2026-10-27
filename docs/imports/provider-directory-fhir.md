@@ -54,6 +54,12 @@ FHIR Source image. When that setting is absent, the existing
 `HLTHPRT_REFERENCE_SOURCE_WORKER_IMAGE` remains the fallback. An explicitly empty
 or invalid FHIR image setting refuses admission; it does not use the fallback.
 The FHIR setting does not change the reference worker's image selection.
+For a retained candidate that must resume with a newly issued producer, the
+server may configure `HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_ROUTES_JSON` as
+a list of exact `root_run_id`, `source_id`, `endpoint_scope`, immutable `image`,
+and `secret_name` records. The launcher verifies the admitted stored run's
+failed-parent chain back to that root. Other roots keep the default image and
+purpose-scoped secrets; a mismatched run within a configured root is refused.
 Publisher secret selectors must name only that exact purpose,
 importer and worker class. Missing image configuration or an existing worker
 with changed purpose, target or process isolation is refused. The separately
