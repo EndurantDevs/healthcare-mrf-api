@@ -19,6 +19,182 @@ ORDINARY_IMAGE = "example/ordinary-worker@sha256:" + "d" * 64
 SPEC = workers._BY_WORKER_CLASS["process.ProviderDirectoryFHIR"]
 
 
+def _overlay_run():
+    """Use the same closed persisted descriptor as the ordinary execution regression."""
+    from tests.test_provider_directory_artifact_followup import _overlay_followup_params
+
+    return {**_recorded(), "params": _overlay_followup_params()}
+
+
+@pytest.fixture
+async def overlay_admitted(monkeypatch):
+    """Classify a persisted run without any Source image or manifest configuration."""
+    monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.delenv(source.REFERENCE_IMAGE_ENV, raising=False)
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, _overlay_run())
+    assert await workers._admit_source_worker_launches(request, _overlay_run()) is None
+    return request
+
+
+@pytest.fixture
+def source_runtime_mount(monkeypatch):
+    """Retain the configured Source-only mount alongside an ordinary credential mount."""
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", json.dumps([
+        {"name": "source-runtime", "secretName": "synthetic-source-runtime",
+         "mountPath": "/synthetic/source-policy", "subPath": "policy.json", "defaultMode": 0o444,
+         "workerClasses": [SPEC.worker_class], "purposes": [source.PURPOSE], "importers": ["provider-directory-fhir"]},
+        {"name": "ordinary-credentials", "secretName": "ordinary-credentials", "mountPath": "/credentials"},
+    ]))
+
+
+@pytest.mark.asyncio
+async def test_overlay_ensure_uses_native_ordinary_job(monkeypatch, secret_selection, source_runtime_mount):
+    """The real ensure path chooses ordinary code only from persisted overlay parameters."""
+    monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.delenv(source.REFERENCE_IMAGE_ENV, raising=False)
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", ORDINARY_IMAGE)
+    monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(workers, "admit_existing_outer_run_action", AsyncMock(return_value=_overlay_run()))
+    monkeypatch.setattr(workers, "acquire_control_run_worker_action_lock", AsyncMock())
+    api_calls = []
+    monkeypatch.setattr(workers, "_kubernetes_request", lambda *args: api_calls.append(args) or {"items": []})
+
+    @asynccontextmanager
+    async def connection():
+        """Keep the actual exact-run admission path while replacing connection I/O."""
+        yield object()
+
+    monkeypatch.setattr(workers.db, "acquire", connection)
+    response_by_field = await workers.guarded_ensure_worker({"run_id": RUN_ID, "importer": "provider-directory-fhir"})
+    assert response_by_field["status"] == "started"
+    posted_jobs = [call[2] for call in api_calls if call[0] == "POST"]
+    assert len(posted_jobs) == 1
+    pod_by_field = posted_jobs[0]["spec"]["template"]["spec"]
+    container_by_field = pod_by_field["containers"][0]
+    assert container_by_field["image"] == ORDINARY_IMAGE
+    assert container_by_field["command"] == workers._worker_command(workers._worker_python(), SPEC)
+    assert pod_by_field["securityContext"]["runAsUser"] == 65534
+    assert "healthporta.com/worker-purpose" not in posted_jobs[0]["metadata"]["labels"]
+    environment_by_name = {entry["name"]: entry for entry in container_by_field["env"]}
+    assert environment_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"]["value"] == JOB_ID
+    assert "SOURCE_USER" not in environment_by_name
+    assert [entry["name"] for entry in pod_by_field["volumes"]] == ["ordinary-credentials"]
+
+
+@pytest.mark.parametrize("field", ["run_id", "importer", "job_id"])
+def test_overlay_target_rejects_request_drift(overlay_admitted, field):
+    """The request cannot redirect the persisted overlay classification."""
+    overlay_admitted[field] = "different"
+    with pytest.raises(ValueError, match="admission_unavailable"):
+        workers._single_job_worker_target(SPEC, overlay_admitted)
+
+
+@pytest.mark.parametrize("index", range(5))
+def test_overlay_target_rejects_native_drift(overlay_admitted, index):
+    """Every observed coordinate remains required by ordinary routing."""
+    identity_values = list(overlay_admitted.admitted_job)
+    identity_values[index] = "different"
+    overlay_admitted.admitted_job = tuple(identity_values)
+    with pytest.raises(ValueError, match="admission_unavailable"):
+        workers._single_job_worker_target(SPEC, overlay_admitted)
+
+
+def test_overlay_serialization_cannot_admit_job(overlay_admitted):
+    """Neither JSON markers nor a caller-supplied descriptor create admission."""
+    raw_by_field = {**overlay_admitted, "ordinary_fhir_overlay_job": list(overlay_admitted.admitted_job),
+                    "admitted_job": list(overlay_admitted.admitted_job), "params": _overlay_run()["params"]}
+    assert source.admitted_overlay_job(SPEC, raw_by_field) is None
+    assert workers._ensure_spec(SPEC, raw_by_field)["status"] == "failed"
+
+
+@pytest.mark.parametrize("extra_by_name", [
+    {"import_resources": True}, {"probe": 0}, {"publish_artifacts_only": 1},
+    {"provider_directory_dataset_followup_version": True}, {"provider_directory_dataset_followup_attempt": False},
+    {"provider_directory_dataset_followup_stage": "profile"}, {"publish_artifacts_targets": "profile"},
+    {"serving_recovery_generation": None}, {"run_id": RUN_ID}, {"test_mode": False},
+])
+@pytest.mark.asyncio
+async def test_mixed_overlay_never_selects_ordinary(monkeypatch, extra_by_name):
+    """Malformed or broader persisted operations cannot use the overlay exception."""
+    monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.delenv(source.REFERENCE_IMAGE_ENV, raising=False)
+    native_run_by_field = _overlay_run()
+    native_run_by_field["params"].update(extra_by_name)
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, native_run_by_field)
+    assert (await workers._admit_source_worker_launches(request, native_run_by_field))["status"] == "failed"
+    assert request.ordinary_fhir_overlay_job is None
+
+
+def test_overlay_uses_no_source_credentials(overlay_admitted, admitted, secret_selection, source_runtime_mount):
+    """Only the existing Source capability selects the configured private mount."""
+    assert workers._worker_job_secret_env(SPEC.worker_class, launch_request=overlay_admitted) == []
+    assert [entry["volume"]["name"] for entry in workers._worker_job_secret_volumes(SPEC)] == ["ordinary-credentials"]
+    source_job_by_field = workers._worker_job_manifest(SPEC, admitted, ORDINARY_IMAGE)
+    assert source.is_fhir_source_job_matching(source_job_by_field, admitted.fhir_source_launch)
+    assert [entry["name"] for entry in source_job_by_field["spec"]["template"]["spec"]["volumes"]] == [
+        "source-runtime", "ordinary-credentials",
+    ]
+
+
+@pytest.mark.parametrize("field", ["purposes", "importers", "workerClasses"])
+def test_source_mount_rejects_broader_scope(admitted, monkeypatch, source_runtime_mount, field):
+    """A mount cannot widen the existing exact Source credential selector."""
+    setting = "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON"
+    selectors = json.loads(workers.os.environ[setting])
+    selectors[0][field].append("other")
+    monkeypatch.setenv(setting, json.dumps(selectors))
+    with pytest.raises(ValueError, match="selector is invalid"):
+        workers._worker_job_manifest(SPEC, admitted, ORDINARY_IMAGE)
+
+
+def _change_overlay_job(job_by_field, drift):
+    """Mutate one admitted runtime boundary at a time."""
+    pod_by_field = job_by_field["spec"]["template"]["spec"]
+    container_by_field = pod_by_field["containers"][0]
+    if drift in {"image", "command"}:
+        container_by_field[drift] = IMAGE if drift == "image" else source.COMMAND
+    if drift == "target":
+        _change_target(container_by_field, "target")
+    if drift == "source_mount":
+        pod_by_field["volumes"].append({"name": "source", "secret": {"secretName": "synthetic-source-runtime"}})
+    if drift == "source_env":
+        container_by_field["env"].append({"name": "SOURCE_DSN", "valueFrom": {
+            "secretKeyRef": {"name": "synthetic-source-runtime", "key": "publisher"}}})
+    if drift == "purpose":
+        job_by_field["metadata"]["labels"]["healthporta.com/worker-purpose"] = source.PURPOSE
+    if drift == "service_account":
+        pod_by_field["serviceAccountName"] = "other-account"
+
+
+@pytest.mark.parametrize("drift", [None, "image", "command", "target", "source_mount", "source_env", "purpose", "service_account"])
+def test_overlay_job_reuse_keeps_native_runtime(overlay_admitted, monkeypatch, source_runtime_mount, drift):
+    """Existing Jobs must retain ordinary code, credentials and the exact queued target."""
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", ORDINARY_IMAGE)
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SERVICE_ACCOUNT", "synthetic-worker")
+    monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(workers, "_launcher_mode", lambda: "kubernetes")
+    job_by_field = workers._worker_job_manifest(SPEC, overlay_admitted, ORDINARY_IMAGE)
+    job_by_field["status"] = {"active": 1}
+    _change_overlay_job(job_by_field, drift)
+    api_calls = []
+    monkeypatch.setattr(workers, "_kubernetes_request", lambda *args: api_calls.append(args) or {"items": [job_by_field]})
+    response_by_field = workers._ensure_spec(SPEC, overlay_admitted)
+    assert response_by_field["status"] == ("already_running" if drift is None else "failed")
+    assert all(call[0] == "GET" for call in api_calls)
+
+
+@pytest.mark.asyncio
+async def test_overlay_request_cannot_reclassify_acquisition(admitted):
+    """Caller parameters never replace the actual stored operation."""
+    admitted["params"] = _overlay_run()["params"]
+    assert await workers._admit_source_worker_launches(admitted, _recorded()) is None
+    assert source.admitted_overlay_job(SPEC, admitted) is None
+    assert source.authorized_fhir_source_worker_launch(SPEC, admitted).job_id == JOB_ID
+
+
 def _recorded():
     return {
         "run_id": RUN_ID,
