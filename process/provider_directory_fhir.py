@@ -64438,7 +64438,7 @@ async def _endpoint_dataset_content_proof(
                 resource_hasher.update(b"\n")
             resource_hasher.update(identity_bytes)
             resource_count_by_type[resource_type] = resource_count_by_type.get(resource_type, 0) + 1
-            if resource_count % 1_000 == 0:
+            if resource_count % 256 == 0:
                 await asyncio.sleep(0)
         after_resource_type, after_resource_id, _payload_hash = _endpoint_dataset_hash_identity(resource_rows[-1])
         if len(resource_rows) < batch_size:
@@ -64740,12 +64740,12 @@ async def _subset_acquired_resource_hashes(
         )
         if not acquired_resource_rows:
             break
-        for acquired_resource_row in acquired_resource_rows:
+        for row_number, acquired_resource_row in enumerate(acquired_resource_rows, 1):
             after_resource_type, after_resource_id = _update_subset_acquired_hash(
-                acquired_resource_row,
-                hasher_by_type,
-                count_by_type,
+                acquired_resource_row, hasher_by_type, count_by_type
             )
+            if row_number % 256 == 0:
+                await asyncio.sleep(0)
         if len(acquired_resource_rows) < batch_size:
             break
     if any(
