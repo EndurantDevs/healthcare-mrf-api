@@ -132,6 +132,24 @@ def activate_geo_assurance_candidate_sql(db_schema: str) -> str:
     """
 
 
+async def preflight_publication_dependencies(database, schema_name, ctx):
+    """Fail before staging; publication independently reacquires these input locks."""
+    from process.entity_address_native_publication import _native, controlled_publication_enabled
+
+    native = _native()
+    live_models = (
+        (EntityAddressUnified,)
+        if ctx["context"]["serving_only_refresh"]
+        else (EntityAddressUnified, *native.SUPPORT_TABLE_MODELS)
+    )
+    await native._assert_cutover_has_no_dependent_views(schema_name, [model.__main_table__ for model in live_models])
+    if not native.candidate_preparation.geo_dependency_options():
+        async with native.selected_publication_dependencies(
+            database, schema_name, **({"control_context": ctx} if controlled_publication_enabled(ctx) else {})
+        ):
+            return
+
+
 @asynccontextmanager
 async def selected_publication_dependencies(database, schema_name, *, control_context=None):
     """Hold complete protected input families through the ordinary native finalizer."""
@@ -151,7 +169,10 @@ async def selected_publication_dependencies(database, schema_name, *, control_co
                 text("""SELECT EXISTS(SELECT 1 FROM pg_inherits
                 WHERE inhparent IN (to_regclass('tiger.zip_state'),to_regclass('tiger.zcta5')))""")
             ):
-                raise RuntimeError("entity-address inherited TIGER publication requires protected captured inputs")
+                raise RuntimeError(
+                    "entity-address inherited TIGER publication requires protected captured inputs; "
+                    "capture and select a protected TIGER source before retrying"
+                )
             if not captured:
                 yield None
                 return
