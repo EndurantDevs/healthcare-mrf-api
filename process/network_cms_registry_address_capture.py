@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Close the complete native address clone without changing its origin authority."""
 
+import asyncio
 import hashlib
 import json
 
@@ -98,13 +99,18 @@ class NativeReceiptSession:
             attribute.name for attribute in prepared.get_attributes() if attribute.type.name in {"json", "jsonb"}
         }
         records = await prepared.fetch(*(compiled.params[name] for name in compiled.positiontup or ()))
-        return _NativeMappings(
-            {
-                name: json.loads(value) if name in json_names and isinstance(value, str) else value
-                for name, value in record.items()
-            }
-            for record in records
-        )
+        rows = _NativeMappings()
+        for row_number, record in enumerate(records, 1):
+            rows.append(
+                {
+                    name: json.loads(value) if name in json_names and isinstance(value, str) else value
+                    for name, value in record.items()
+                }
+            )
+            # Large proof pages must not starve concurrent lease renewals.
+            if row_number % 256 == 0:
+                await asyncio.sleep(0)
+        return rows
 
     async def scalar(self, statement, parameters=None):
         """Read the first native result value without changing transaction ownership."""
