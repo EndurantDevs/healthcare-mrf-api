@@ -337,6 +337,21 @@ def _both_source_secrets(monkeypatch):
                 }
                 for secret in ("synthetic-default", "synthetic-successor")
             ]
+            + [
+                {
+                    "name": name,
+                    "secretName": secret,
+                    "key": "dsn",
+                    "workerClasses": [SPEC.worker_class],
+                    "purposes": [source.PURPOSE],
+                    "importers": ["provider-directory-fhir"],
+                    "sharedForRoutes": True,
+                }
+                for name, secret in (
+                    ("SHARED_DATABASE_DSN", "synthetic-database"),
+                    ("SHARED_CATALOG_DSN", "synthetic-catalog"),
+                )
+            ]
         ),
     )
     monkeypatch.setenv(
@@ -373,6 +388,14 @@ def test_exact_server_route_selects_successor_image_and_secret(monkeypatch):
         for entry in pod["containers"][0]["env"]
         if entry["name"] == "SOURCE_USER"
     ] == ["synthetic-successor"]
+    assert {
+        entry["name"]: entry["valueFrom"]["secretKeyRef"]["name"]
+        for entry in pod["containers"][0]["env"]
+        if entry["name"] in {"SHARED_DATABASE_DSN", "SHARED_CATALOG_DSN"}
+    } == {
+        "SHARED_DATABASE_DSN": "synthetic-database",
+        "SHARED_CATALOG_DSN": "synthetic-catalog",
+    }
     assert [entry["secret"]["secretName"] for entry in pod["volumes"]] == ["synthetic-successor"]
     assert job["metadata"]["annotations"]["healthporta.com/source-root-run-id"] == _source_route_config()["root_run_id"]
     assert source.is_fhir_job_set_matching(SPEC, request, [job])
@@ -380,6 +403,27 @@ def test_exact_server_route_selects_successor_image_and_secret(monkeypatch):
         "synthetic-default"
     )
     assert not source.is_fhir_job_set_matching(SPEC, request, [job])
+
+
+@pytest.mark.parametrize(
+    ("secret_name", "shared_marker"),
+    [("synthetic-successor", True), (" synthetic-successor ", True), ("synthetic-successor", "true")],
+)
+def test_route_secret_cannot_claim_shared_selection(monkeypatch, secret_name, shared_marker):
+    """A route-owned credential cannot impersonate a shared selector."""
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
+    selection_by_field = {
+        "name": "ROUTE_USER",
+        "secretName": secret_name,
+        "key": "username",
+        "workerClasses": [SPEC.worker_class],
+        "purposes": [source.PURPOSE],
+        "importers": ["provider-directory-fhir"],
+        "sharedForRoutes": shared_marker,
+    }
+    launch = source.FHIRSourceWorkerLaunch(RUN_ID, JOB_ID, IMAGE, secret_name="synthetic-successor")
+    with pytest.raises(ValueError, match="shared secret selector is invalid"):
+        source._is_launch_secret_selected(selection_by_field, launch, allow_shared=True)
 
 
 @pytest.mark.parametrize("drift", ["malformed_json", "wrong_container", "missing_field", "duplicate_route"])
