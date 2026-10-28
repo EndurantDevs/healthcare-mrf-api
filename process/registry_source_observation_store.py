@@ -34,8 +34,12 @@ def _identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
-def _namespace(control_schema: str | None) -> str:
+def source_observation_namespace(control_schema: str | None) -> str:
+    """Resolve and quote the selected registry control schema."""
     return _identifier(control_schema if control_schema is not None else registry_schema())
+
+
+_namespace = source_observation_namespace
 
 
 @dataclass(frozen=True)

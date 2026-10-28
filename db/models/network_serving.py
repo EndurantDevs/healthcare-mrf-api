@@ -153,11 +153,16 @@ class NetworkServingControl(Base):
     __table_args__ = (
         CheckConstraint("id = 1", name="network_serving_singleton"),
         CheckConstraint("generation_id IS NULL OR generation_id > 0", name="network_serving_generation"),
+        CheckConstraint(
+            "metadata_generation IS NULL OR metadata_generation ~ '^[0-9a-f]{64}$'",
+            name="network_serving_metadata_generation",
+        ),
         {"schema": _SCHEMA},
     )
 
     id = Column(Integer, primary_key=True, autoincrement=False)
     generation_id = Column(BigInteger, ForeignKey(f"{_SCHEMA}.network_serving_manifest.generation_id"))
+    metadata_generation = Column(String(64))
 
 
 class NetworkCandidateCustody(Base):

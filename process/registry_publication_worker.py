@@ -68,7 +68,8 @@ def _invalid(_value=None):
     raise ValueError("registry_publication_worker_config_invalid")
 
 
-def _unique_fields(pairs):
+def unique_json_fields(pairs):
+    """Decode configuration fields while rejecting duplicate names."""
     configured_by_name = {}
     for name, configured in pairs:
         if name in configured_by_name:
@@ -77,7 +78,11 @@ def _unique_fields(pairs):
     return configured_by_name
 
 
-def _consumer_config(configured):
+_unique_fields = unique_json_fields
+
+
+def parse_publication_consumer_config(configured):
+    """Validate distinct publication roles and bounded optional reader and loader identities."""
     required = _ROLES | {"control_schema"}
     if (
         type(configured) is not dict
@@ -100,6 +105,9 @@ def _consumer_config(configured):
     if len({getattr(consumer, name) for name in _ROLES}) != len(_ROLES):
         _invalid()
     return consumer
+
+
+_consumer_config = parse_publication_consumer_config
 
 
 def _address_pin(configured):

@@ -157,6 +157,7 @@ ALL_STATUS_IDEMPOTENCY_IMPORTERS = frozenset(
         "registry-ptg-source-worker",
         "registry-aca-source-worker",
         "registry-source-check",
+        "registry-fhir-catalog-sync",
         "plan-pricing-projection",
         "plan-pricing-prewarm",
         "plan-pricing-em-distance",
@@ -231,6 +232,14 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_module": "process.registry_source_check",
         "target_function": "control_start",
         "job_prefix": "registry_source_check",
+    },
+    "registry-fhir-catalog-sync": {
+        "queue": "arq:RegistryFHIRCatalogSync",
+        "function": "control_single_job_start",
+        "payload": "control_wrapped",
+        "target_module": "process.registry_fhir_catalog_worker",
+        "target_function": "control_start",
+        "job_prefix": "registry_fhir_catalog_sync",
     },
     "registry-ptg-source-worker": {
         "queue": "arq:RegistryPTGSource",
@@ -610,6 +619,7 @@ _CANCELABLE_IMPORTERS = {
     "registry-aca-source-worker",
     "registry-cms-source-worker",
     "registry-source-check",
+    "registry-fhir-catalog-sync",
     "new-york-nypp-profile",
     "tennessee-tdh-profile",
     "rhode-island-doh-profile",
@@ -683,6 +693,8 @@ def _control_param_schema(
     command: click.Command,
 ) -> list[dict[str, Any]]:
     """Hide CLI-only controls from the authenticated import API catalog."""
+    if importer == "registry-fhir-catalog-sync":
+        return []
 
     if importer == "registry-source-check":
         return [
@@ -953,6 +965,7 @@ def importer_registry() -> list[dict[str, Any]]:
                         "registry-ptg-source-worker",
                         "registry-aca-source-worker",
                         "registry-source-check",
+                        "registry-fhir-catalog-sync",
                     }
                     else {}
                 ),
@@ -2575,6 +2588,12 @@ async def _idempotent_import_run(
 
 def _validate_registry_cms_source_params(importer, params, existing=None):
     """Reject event/configuration overrides before durable admission or queue access."""
+    if importer == "registry-fhir-catalog-sync":
+        from process.registry_fhir_catalog_worker import validate_fhir_catalog_sync_params
+
+        validate_fhir_catalog_sync_params(params)
+        if existing is not None and (existing.get("importer") != importer or existing.get("params") != params):
+            raise ValueError("registry_fhir_catalog_sync_parameters_invalid")
     if importer == "registry-source-check":
         from process.registry_source_check import validate_registry_source_check_scope
 
@@ -4103,6 +4122,7 @@ def _control_wrapped_adapter_payload(
         "registry-ptg-source-worker",
         "registry-aca-source-worker",
         "registry-source-check",
+        "registry-fhir-catalog-sync",
     }:
         task_payload_map = dict(params)
     if import_run_values_by_name.get("importer") == "openaddresses":

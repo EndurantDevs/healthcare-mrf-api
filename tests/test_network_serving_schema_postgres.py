@@ -41,6 +41,8 @@ _SERVING_MIGRATIONS = (
     "20261013010000_registry_custom_history_events.py",
     "20261018011000_network_candidate_custody.py",
     "20261018040000_registry_aca_source_notifications.py",
+    "20261025010000_company_affiliation_states.py",
+    "20261028010000_registry_fhir_catalog.py",
 )
 
 

@@ -176,7 +176,8 @@ def _retained_manifest(manifest, readiness, *, replayed):
     }
 
 
-async def _lock_publication_controls(connection, namespace):
+async def lock_publication_controls(connection, namespace):
+    """Lock revision and serving singletons in publication order and return their current generations."""
     revision_control = await connection.fetchrow(
         f"SELECT approved_revision FROM {namespace}.registry_revision_control WHERE id=1 FOR UPDATE"
     )
@@ -186,6 +187,9 @@ async def _lock_publication_controls(connection, namespace):
     if revision_control is None or serving_control is None:
         raise NetworkPublicationError("Publication singleton controls are missing")
     return revision_control["approved_revision"], serving_control["generation_id"] or 0
+
+
+_lock_publication_controls = lock_publication_controls
 
 
 async def _insert_manifest(connection, namespace, candidate, readiness):

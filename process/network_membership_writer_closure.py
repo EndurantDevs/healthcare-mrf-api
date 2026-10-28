@@ -78,7 +78,8 @@ SELECT (SELECT schema_oid IS NOT NULL AND owner_oid IS NOT NULL AND cardinality(
 """
 
 
-def _role_names(owner_role: str, loader_roles: tuple[str, ...], reader_roles: tuple[str, ...]) -> dict:
+def writer_role_names(owner_role: str, loader_roles: tuple[str, ...], reader_roles: tuple[str, ...]) -> dict:
+    """Validate bounded role names and keep the protected owner separate from runtime identities."""
     _identifier(owner_role)
     for role_names in (loader_roles, reader_roles):
         if type(role_names) is not tuple or len(role_names) > 32:
@@ -95,7 +96,11 @@ def _role_names(owner_role: str, loader_roles: tuple[str, ...], reader_roles: tu
     }
 
 
-async def _check_roles(connection: Any, roles: dict) -> None:
+_role_names = writer_role_names
+
+
+async def verify_writer_roles(connection: Any, roles: dict) -> None:
+    """Require a protected owner and runtime roles unable to bypass its custody."""
     owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", roles["owner_role"])
     if not _protected_owner(owner):
         raise NetworkWriterClosureError("Owner must be an existing protected native role")
@@ -111,6 +116,9 @@ async def _check_roles(connection: Any, roles: dict) -> None:
         raise NetworkWriterClosureError("Runtime role can bypass protected ownership")
     if not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", roles["owner_role"]):
         raise NetworkWriterClosureError("Publisher must be able to assume the protected owner")
+
+
+_check_roles = verify_writer_roles
 
 
 async def _catalog(connection: Any, copy_target: MembershipCopyTarget, candidate: dict) -> dict:
@@ -151,7 +159,8 @@ async def _catalog(connection: Any, copy_target: MembershipCopyTarget, candidate
     }
 
 
-def _receipt(target: MembershipCopyTarget, roles: dict, catalog: dict) -> dict:
+def writer_closure_receipt(target: MembershipCopyTarget, roles: dict, catalog: dict) -> dict:
+    """Bind candidate scope, configured roles and physical relation identities in one receipt."""
     indexes = [row for row in catalog["relations"] if row["relkind"] == b"i"]
     return {
         "component": "network_candidate_writer_closure",
@@ -168,6 +177,9 @@ def _receipt(target: MembershipCopyTarget, roles: dict, catalog: dict) -> dict:
     }
 
 
+_receipt = writer_closure_receipt
+
+
 def _retained(candidate: dict) -> dict | None:
     validation = candidate["validation_json"]
     if isinstance(validation, str):
@@ -182,7 +194,8 @@ def _retained(candidate: dict) -> dict | None:
     return retained
 
 
-def _check_identity(current: dict, retained: dict | None, *, extending: bool) -> None:
+def verify_writer_closure_identity(current: dict, retained: dict | None, *, extending: bool) -> None:
+    """Reject retained ownership or physical identity drift outside an explicitly allowed extension."""
     if retained is None:
         return
     if (
@@ -213,6 +226,9 @@ def _check_identity(current: dict, retained: dict | None, *, extending: bool) ->
             raise NetworkWriterClosureError("Retained candidate object identity changed")
         if not allow_growth and current[key] != previous:
             raise NetworkWriterClosureError("Closed candidate object set changed")
+
+
+_check_identity = verify_writer_closure_identity
 
 
 async def _lock_catalog(connection: Any, target: MembershipCopyTarget, roles: dict, candidate: dict) -> dict:
@@ -292,7 +308,8 @@ async def _remove_default_grants(connection: Any, namespace: str, catalog: dict)
         )
 
 
-async def _check_closed(connection: Any, roles: dict, catalog: dict, *, retained: dict | None = None) -> None:
+async def verify_writer_closure(connection: Any, roles: dict, catalog: dict, *, retained: dict | None = None) -> None:
+    """Require protected ownership and closed runtime writes for the selected candidate relations."""
     owner_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", roles["owner_role"])
     relations = catalog["relations"]
     if retained is not None:
@@ -312,6 +329,9 @@ async def _check_closed(connection: Any, roles: dict, catalog: dict, *, retained
     )
     if is_closed is not True:
         raise NetworkWriterClosureError("Candidate native ACLs or effective runtime roles are not closed")
+
+
+_check_closed = verify_writer_closure
 
 
 async def _remove_grants(connection: Any, namespace: str, catalog: dict, owner_oid: int) -> None:
@@ -353,7 +373,9 @@ async def _transfer_ownership(connection, target, roles, catalog, owner_oid):
             await connection.execute(f"ALTER TABLE {namespace}.{_identifier(table_name)} OWNER TO {owner}")
 
 
-async def _transfer_and_grant(connection: Any, target: MembershipCopyTarget, roles: dict, catalog: dict) -> None:
+async def transfer_and_grant_writer_closure(
+    connection: Any, target: MembershipCopyTarget, roles: dict, catalog: dict
+) -> None:
     """Close an already owned catalog or perform the original guarded transfer."""
     namespace = _identifier(target.schema_name)
     owner = _identifier(roles["owner_role"])
@@ -375,6 +397,9 @@ async def _transfer_and_grant(connection: Any, target: MembershipCopyTarget, rol
                 f"GRANT SELECT ON TABLE {namespace}.{_identifier(table_name)} TO {_identifier(role_name)}"
             )
     await connection.execute(f"SET LOCAL ROLE {publisher}")
+
+
+_transfer_and_grant = transfer_and_grant_writer_closure
 
 
 async def _candidate_context(

@@ -36,6 +36,7 @@ async def test_omitted_family_cannot_fall_back_to_unfiltered_claim():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_by_name", [{}, {"request_id": UUID(int=1)}])
 @pytest.mark.parametrize(
     "family,ordinary,operations",
     [
@@ -52,19 +53,37 @@ async def test_omitted_family_cannot_fall_back_to_unfiltered_claim():
         ("office", False, ("prepare_ptg_office_capture", "approve_ptg_office_capture")),
     ],
 )
-async def test_family_claim_has_closed_parameters_for_queued_and_expired_rows(family, ordinary, operations):
+async def test_family_claim_has_closed_parameters_for_queued_and_expired_rows(
+    family, ordinary, operations, request_by_name
+):
     connection = _Connection()
     assert (
-        await claim_registry_publication_request(connection, operation_family=family, control_schema="registry") is None
+        await claim_registry_publication_request(
+            connection, operation_family=family, control_schema="registry", **request_by_name
+        )
+        is None
     )
     connection.fetchrow.assert_awaited_once()
-    query, lease_id, seconds, accepts_absent_operation, accepted_operations = connection.fetchrow.await_args.args
+    query, lease_id, seconds, accepts_absent_operation, accepted_operations, selected_request_id = (
+        connection.fetchrow.await_args.args
+    )
     assert isinstance(lease_id, UUID) and lease_id.int and seconds == 300
     assert accepts_absent_operation is ordinary and accepted_operations == operations
+    assert selected_request_id == request_by_name.get("request_id")
     assert "WHERE (state='queued' OR state='running' AND lease_expires_at<=clock_timestamp())" in query
+    assert "AND ($5::uuid IS NULL OR request_id=$5)" in query
     assert "jsonb_typeof(command_json->'operation')='string'" in query
     assert "NOT (command_json ? 'operation')" in query
     assert "ORDER BY created_at,request_id FOR UPDATE SKIP LOCKED LIMIT 1" in query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_id", [UUID(int=0), "00000000-0000-0000-0000-000000000001", 1, True])
+async def test_malformed_request_identity_refuses_before_claim(request_id):
+    connection = _Connection()
+    with pytest.raises(ValueError, match="registry_queue_request_identity_invalid"):
+        await claim_registry_publication_request(connection, operation_family="publication", request_id=request_id)
+    connection.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio

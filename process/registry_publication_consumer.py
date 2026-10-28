@@ -5,6 +5,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from uuid import UUID
 
 import asyncpg
 
@@ -14,6 +15,10 @@ from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
+)
+from process.registry_fhir_catalog_publication import (
+    FHIRCatalogPublicationRuntime,
+    complete_queued_fhir_catalog_publication,
 )
 from process.registry_publication_execution import (
     _command_actor,
@@ -59,8 +64,19 @@ class RegistryPublicationConsumerConfig:
     prepare_address_sources: Callable[..., Awaitable[RegistryCompositionAddressSources]] | None = field(
         default=None, repr=False
     )
+    metadata_runtime: FHIRCatalogPublicationRuntime | None = field(default=None, repr=False)
+    metadata_only: bool = False
+    only_request_id: UUID | None = None
 
     def __post_init__(self):
+        if type(self.metadata_only) is not bool or self.metadata_only and self.metadata_runtime is None:
+            raise ValueError("registry_publication_consumer_config_invalid")
+        if self.only_request_id is not None and (
+            type(self.only_request_id) is not UUID or not self.only_request_id.int
+        ):
+            raise ValueError("registry_publication_consumer_config_invalid")
+        if self.metadata_runtime is not None and type(self.metadata_runtime) is not FHIRCatalogPublicationRuntime:
+            raise ValueError("registry_publication_consumer_config_invalid")
         if self.seal_candidate is not None and not callable(self.seal_candidate):
             raise ValueError("registry_publication_consumer_config_invalid")
         if self.prepare_address_sources is not None and not callable(self.prepare_address_sources):
@@ -117,6 +133,10 @@ async def _verify_lifecycle(connection, config):
 
 async def _verify_execution(connection, config):
     async with connection.transaction(readonly=True):
+        if config.metadata_only:
+            from process.registry_fhir_catalog_permissions import verify_fhir_catalog_publication_permissions
+
+            return await verify_fhir_catalog_publication_permissions(connection, config, role=config.execution_role)
         await verify_registry_publication_worker_permissions(
             connection, **config.permission_roles, control_schema=config.control_schema, role=config.execution_role
         )
@@ -130,6 +150,9 @@ async def _claim(lifecycle_pool, config):
             operation_family="publication",
             lease_seconds=_LEASE_SECONDS,
             control_schema=config.control_schema,
+            allow_metadata=config.metadata_runtime is not None,
+            metadata_only=config.metadata_only,
+            request_id=config.only_request_id,
         )
 
 
@@ -287,6 +310,18 @@ async def _execute_publication_request(
             raise RuntimeError("registry_publication_consumer_unavailable") from None
         command_by_name = _document(request_record["command_json"])
         operation = command_by_name.get("operation")
+        if operation == "publish_fhir_catalog":
+            if config.metadata_runtime is None:
+                raise ValueError("registry_fhir_catalog_runtime_unavailable")
+            return await complete_queued_fhir_catalog_publication(
+                connection,
+                request_record["request_id"],
+                request_record["lease_id"],
+                authorize_metadata=config.metadata_runtime.authorize_metadata,
+                verify_sources=config.metadata_runtime.verify_sources,
+                control_schema=config.control_schema,
+                source_fence=config.metadata_runtime.source_fence,
+            )
         options_by_name = dict(authorize=authorize, control_schema=config.control_schema)
         if operation is None:
             return await _ordinary_publication(

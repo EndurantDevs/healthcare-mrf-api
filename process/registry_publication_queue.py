@@ -23,17 +23,26 @@ _CLAIM_OPERATIONS = {
         "prepare_source_rollback",
         "publish_source_rollback",
         "publish_initial_inventory",
+        "publish_fhir_catalog",
     ),
     "office": ("prepare_ptg_office_capture", "approve_ptg_office_capture"),
 }
 
 
-def _json(document):
+def publication_json(document):
+    """Serialize publication identity deterministically and reject non-finite values."""
     return json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _document(value):
+_json = publication_json
+
+
+def publication_document(value):
+    """Decode stored JSON text while preserving already-decoded queue documents."""
     return json.loads(value) if isinstance(value, str) else value
+
+
+_document = publication_document
 
 
 def _wire_actor(value):
@@ -497,13 +506,17 @@ def _reactivation_result(result_by_name, command, state):
         raise ValueError("registry_reactivation_result_invalid")
 
 
-def _queued_receipt(row, replayed):
+def queued_publication_receipt(row, replayed):
+    """Return only the request identity, state, timestamp and replay flag."""
     return {
         "request_id": str(row["request_id"]),
         "state": row["state"],
         "created_at": row["created_at"].isoformat(),
         "replayed": replayed,
     }
+
+
+_queued_receipt = queued_publication_receipt
 
 
 def _queue_metadata(command, actor_document, selected_versions_json, session_hash, expected_generation):
@@ -518,7 +531,8 @@ def _queue_metadata(command, actor_document, selected_versions_json, session_has
     return _request_metadata(command_by_name, actor_document, session_hash, command.idempotency_key)
 
 
-def _request_metadata(command_by_name, actor_document, session_hash, idempotency_key):
+def publication_request_metadata(command_by_name, actor_document, session_hash, idempotency_key):
+    """Bind the command, actor, session hash and idempotency key to stable digests."""
     actor_json = _json(actor_document)
     request_json = _json(
         {
@@ -534,6 +548,9 @@ def _request_metadata(command_by_name, actor_document, session_hash, idempotency
         "command_json": _json(command_by_name),
         "request_sha256": hashlib.sha256(request_json.encode()).hexdigest(),
     }
+
+
+_request_metadata = publication_request_metadata
 
 
 async def enqueue_registry_reactivation(connection, command, actor, *, session_token_sha256, control_schema=None):
@@ -654,7 +671,8 @@ async def _require_empty_initial_inventory(connection, namespace):
         raise RegistryApprovalConflict("registry_initial_inventory_not_empty")
 
 
-async def _existing_request(connection, namespace, metadata, idempotency_key):
+async def existing_publication_request(connection, namespace, metadata, idempotency_key):
+    """Return an exact idempotent replay or reject a conflicting request body."""
     existing = await connection.fetchrow(
         f"SELECT * FROM {namespace}.registry_publication_request WHERE actor_key=$1 AND idempotency_key=$2",
         metadata["actor_key"],
@@ -665,6 +683,9 @@ async def _existing_request(connection, namespace, metadata, idempotency_key):
     if existing["request_sha256"] != metadata["request_sha256"]:
         raise RegistryApprovalConflict("registry_queue_idempotency_conflict")
     return _queued_receipt(existing, True)
+
+
+_existing_request = existing_publication_request
 
 
 async def enqueue_registry_publication(
@@ -722,12 +743,43 @@ async def enqueue_registry_publication(
         return _queued_receipt(inserted, False)
 
 
+def _publication_operation_command(request_record, command_by_name, status_by_name):
+    """Validate operation-specific identity and results before exposing their digest."""
+    operation = command_by_name["operation"]
+    if operation == "publish_fhir_catalog":
+        from process.registry_fhir_catalog_publication import validated_fhir_catalog_request_status
+
+        return validated_fhir_catalog_request_status(request_record)
+    if operation == "publish_initial_inventory":
+        operation_command_by_name, _actor = _initial_inventory_record(request_record)
+        _initial_inventory_result(status_by_name["result"], operation_command_by_name, status_by_name["state"])
+    elif operation == "publish_source_rollback":
+        operation_command_by_name, _actor = _source_rollback_publication_record(request_record)
+        _source_rollback_publication_result(
+            status_by_name["result"], operation_command_by_name, status_by_name["state"]
+        )
+    elif operation in {"reactivate_generation", "prepare_source_rollback"}:
+        parsed, _actor = _retained_operation_record(request_record, operation)
+        validator = _reactivation_result if operation == "reactivate_generation" else _source_rollback_result
+        validator(status_by_name["result"], parsed, status_by_name["state"])
+        operation_command_by_name = {
+            **_reactivation_document(parsed),
+            "operation": operation,
+            "idempotency_key": parsed.idempotency_key,
+        }
+    else:
+        raise ValueError("registry_reactivation_command_invalid")
+    return operation_command_by_name
+
+
 async def read_registry_publication_request(connection, request_id: UUID, *, control_schema=None):
     """Return a bounded status receipt without the session hash or raw command."""
     if not isinstance(request_id, UUID) or not request_id.int:
         raise ValueError("registry_request_identity_invalid")
     request_record = await connection.fetchrow(
-        f"SELECT request_id,state,actor_json,command_json,idempotency_key,result_json,created_at,updated_at FROM {_namespace(control_schema)}.registry_publication_request WHERE request_id=$1",
+        f"SELECT request_id,state,actor_json,command_json,idempotency_key,result_json,created_at,updated_at,"
+        "actor_key,session_token_sha256,request_sha256 "
+        f"FROM {_namespace(control_schema)}.registry_publication_request WHERE request_id=$1",
         request_id,
     )
     if request_record is None:
@@ -743,25 +795,7 @@ async def read_registry_publication_request(connection, request_id: UUID, *, con
     command_by_name = _document(request_record["command_json"])
     if "operation" in command_by_name:
         operation = command_by_name["operation"]
-        if operation == "publish_initial_inventory":
-            operation_command_by_name, _actor = _initial_inventory_record(request_record)
-            _initial_inventory_result(status_by_name["result"], operation_command_by_name, status_by_name["state"])
-        elif operation == "publish_source_rollback":
-            operation_command_by_name, _actor = _source_rollback_publication_record(request_record)
-            _source_rollback_publication_result(
-                status_by_name["result"], operation_command_by_name, status_by_name["state"]
-            )
-        elif operation in {"reactivate_generation", "prepare_source_rollback"}:
-            parsed, _actor = _retained_operation_record(request_record, operation)
-            validator = _reactivation_result if operation == "reactivate_generation" else _source_rollback_result
-            validator(status_by_name["result"], parsed, status_by_name["state"])
-            operation_command_by_name = {
-                **_reactivation_document(parsed),
-                "operation": operation,
-                "idempotency_key": parsed.idempotency_key,
-            }
-        else:
-            raise ValueError("registry_reactivation_command_invalid")
+        operation_command_by_name = _publication_operation_command(request_record, command_by_name, status_by_name)
         status_by_name.update(
             operation=operation, command_sha256=hashlib.sha256(_json(operation_command_by_name).encode()).hexdigest()
         )
@@ -771,17 +805,31 @@ async def read_registry_publication_request(connection, request_id: UUID, *, con
 
 
 async def claim_registry_publication_request(
-    connection, *, operation_family: Literal["publication", "office"], lease_seconds=300, control_schema=None
+    connection,
+    *,
+    operation_family: Literal["publication", "office"],
+    lease_seconds=300,
+    control_schema=None,
+    allow_metadata=False,
+    metadata_only=False,
+    request_id=None,
 ):
     """Claim only the explicit worker family, including expired running requests."""
     if type(operation_family) is not str or operation_family not in _CLAIM_OPERATIONS:
         raise ValueError("registry_queue_operation_family_invalid")
+    if type(allow_metadata) is not bool:
+        raise ValueError("registry_queue_operation_family_invalid")
+    if type(metadata_only) is not bool or metadata_only and (not allow_metadata or operation_family != "publication"):
+        raise ValueError("registry_queue_operation_family_invalid")
+    if request_id is not None and (type(request_id) is not UUID or not request_id.int):
+        raise ValueError("registry_queue_request_identity_invalid")
     if not connection.is_in_transaction() or type(lease_seconds) is not int or not 30 <= lease_seconds <= 900:
         raise ValueError("registry_queue_lease_invalid")
-    row = await connection.fetchrow(
+    request_record = await connection.fetchrow(
         f"""WITH selected AS (
         SELECT request_id FROM {_namespace(control_schema)}.registry_publication_request
         WHERE (state='queued' OR state='running' AND lease_expires_at<=clock_timestamp())
+          AND ($5::uuid IS NULL OR request_id=$5)
           AND jsonb_typeof(command_json)='object'
           AND (($3::boolean AND NOT (command_json ? 'operation'))
             OR (jsonb_typeof(command_json->'operation')='string'
@@ -792,10 +840,16 @@ async def claim_registry_publication_request(
         FROM selected WHERE request.request_id=selected.request_id RETURNING request.*""",
         uuid4(),
         lease_seconds,
-        operation_family == "publication",
-        _CLAIM_OPERATIONS[operation_family],
+        operation_family == "publication" and not metadata_only,
+        tuple(
+            operation
+            for operation in _CLAIM_OPERATIONS[operation_family]
+            if (allow_metadata or operation != "publish_fhir_catalog")
+            and (not metadata_only or operation == "publish_fhir_catalog")
+        ),
+        request_id,
     )
-    return None if row is None else dict(row)
+    return None if request_record is None else dict(request_record)
 
 
 async def renew_registry_publication_lease(connection, request_id, lease_id, *, lease_seconds=300, control_schema=None):

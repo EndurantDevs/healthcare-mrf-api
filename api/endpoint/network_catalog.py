@@ -14,6 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.control_auth import require_registry_auth
+from api.network_catalog_fhir_query import FHIRCatalogSelection, parse_fhir_catalog_query
 from api.provider_collection_network_contract import parse_managed_collection_query
 from api.provider_collection_network_read import ProviderCollectionServiceRefusal, read_managed_provider_collection
 from api.provider_detail_network_contract import parse_managed_detail_query
@@ -24,6 +25,7 @@ from api.provider_profile_network_contract import parse_managed_profile_query
 from api.provider_profile_network_read import read_managed_provider_profile
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.registry_catalog_policy import POLICY_V2, RegistryOrganizationVisibility
+from process.registry_fhir_catalog_read import read_fhir_catalog
 from process.registry_network_catalog_read import (
     MAX_EXCLUSIONS,
     MAX_RESPONSE_BYTES,
@@ -250,17 +252,9 @@ def _provider_selector(query_by_field, kind):
     raise ValueError("invalid provider read")
 
 
-def _query_selector(query_by_field, kind):
-    """Keep canonical and legacy selectors distinct and source coordinates complete."""
+def _validate_catalog_query_fields(query_by_field, kind):
+    """Require each catalog selector's closed fields before decoding its values."""
     common_fields = {"network_generation"}
-    if kind == "directory":
-        return parse_managed_directory_query(query_by_field), None
-    if kind == "autocomplete":
-        return _autocomplete_selector(query_by_field)
-    if kind.startswith("provider-"):
-        return _provider_selector(query_by_field, kind)
-    if kind.startswith("organization"):
-        return _organization_selector(query_by_field, kind)
     if kind == "list":
         _object(
             query_by_field, allowed=common_fields | {"limit", "offset", "search", "archived", "source", "benefit_code"}
@@ -277,6 +271,21 @@ def _query_selector(query_by_field, kind):
             allowed=common_fields | {"namespace", "value", "source_scope", "source"},
             required={"namespace", "value", "source_scope", "source"},
         )
+
+
+def _query_selector(query_by_field, kind):
+    """Keep canonical and legacy selectors distinct and source coordinates complete."""
+    if type(query_by_field) is dict and "view" in query_by_field:
+        return parse_fhir_catalog_query(query_by_field, kind)
+    if kind == "directory":
+        return parse_managed_directory_query(query_by_field), None
+    if kind == "autocomplete":
+        return _autocomplete_selector(query_by_field)
+    if kind.startswith("provider-"):
+        return _provider_selector(query_by_field, kind)
+    if kind.startswith("organization"):
+        return _organization_selector(query_by_field, kind)
+    _validate_catalog_query_fields(query_by_field, kind)
     generation = _decimal(query_by_field["network_generation"], 1) if "network_generation" in query_by_field else None
     if kind == "list":
         if "search" in query_by_field and type(query_by_field["search"]) is not str:
@@ -340,10 +349,16 @@ def _parameters(request, kind):
     _object(document_by_field, allowed=fields, required=fields)
     policy_by_field, excluded_ids, scope = _policy_parameters(document_by_field)
     selector, generation = _query_selector(document_by_field["query"], kind)
+    if isinstance(selector, FHIRCatalogSelection) and policy_by_field.get("contract_version") != POLICY_V2:
+        raise ValueError("full policy version required")
     return policy_by_field, excluded_ids, selector, generation, scope
 
 
 async def _read_catalog_page(driver, kind, selector, generation, excluded, options):
+    if isinstance(selector, FHIRCatalogSelection):
+        return await read_fhir_catalog(
+            driver, selector.query, excluded_network_ids=excluded, network_id=selector.network_id, **options
+        )
     if kind == "autocomplete":
         return await read_registry_network_autocomplete(driver, selector, excluded_network_ids=excluded)
     if kind == "provider-plans":
@@ -384,6 +399,28 @@ def _detail_absence_response(error, kind, visibility, policy_by_field, scope):
     )
 
 
+async def _read_catalog_snapshot(request, kind, selector, generation, excluded, options):
+    """Read the selected catalog within one request-owned, read-only snapshot."""
+    session = request.ctx.sa_session
+    async with session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        await session.execute(text("SET LOCAL lock_timeout='1s'"))
+        connection = await session.connection()
+        driver = (await connection.get_raw_connection()).driver_connection
+        return await _read_catalog_page(driver, kind, selector, generation, excluded, options)
+
+
+def _catalog_response_headers(selector, page, scope):
+    headers = _HEADERS | {"X-Network-Access-Scope": scope}
+    if page["generation"] is None:
+        if not isinstance(selector, FHIRCatalogSelection) or page["approved_custom_revision"] is not None:
+            raise ValueError("invalid unattached metadata catalog response")
+    else:
+        _decimal(page["generation"], 1)
+        headers["X-Network-Generation"] = page["generation"]
+    return headers
+
+
 async def _catalog_response(request, kind):
     """Authorize first, then pin approved metadata in one read-only snapshot."""
     try:
@@ -399,6 +436,8 @@ async def _catalog_response(request, kind):
     try:
         visibility = _catalog_visibility(policy_by_field)
         options = {} if visibility is None else {"organization_policy": visibility}
+        if isinstance(selector, FHIRCatalogSelection):
+            options["access_scope_sha256"] = scope
         if kind == "directory":
             return await read_managed_directory(
                 request, selector, policy=policy_by_field, exclusions=excluded, access_scope_sha256=scope
@@ -411,19 +450,12 @@ async def _catalog_response(request, kind):
                 page.headers.update(_HEADERS | {"X-Network-Access-Scope": scope})
                 return page if len(page.body) <= MAX_RESPONSE_BYTES else _error(503, scope)
         else:
-            session = request.ctx.sa_session
-            async with session.begin():
-                await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-                await session.execute(text("SET LOCAL lock_timeout='1s'"))
-                connection = await session.connection()
-                driver = (await connection.get_raw_connection()).driver_connection
-                page = await _read_catalog_page(driver, kind, selector, generation, excluded, options)
+            page = await _read_catalog_snapshot(request, kind, selector, generation, excluded, options)
         if kind == "organization-detail" and (page["total"] != 1 or len(page["items"]) != 1):
             return _error(404, scope)
-        _decimal(page["generation"], 1)
         http_response = response.json(
             {"client_id": policy_by_field["client_id"], "policy_revision": policy_by_field["policy_revision"]} | page,
-            headers=_HEADERS | {"X-Network-Generation": page["generation"], "X-Network-Access-Scope": scope},
+            headers=_catalog_response_headers(selector, page, scope),
         )
         maximum = MAX_DETAIL_BYTES if kind in {"provider-detail", "provider-collection"} else MAX_RESPONSE_BYTES
         error_scope = scope if visibility is not None else None
@@ -435,7 +467,9 @@ async def _catalog_response(request, kind):
     except ManagedProviderDetailAbsent as error:
         return _detail_absence_response(error, kind, visibility, policy_by_field, scope)
     except RegistryNetworkCatalogError as error:
-        return _catalog_reader_error(error, kind, visibility, scope)
+        return _catalog_reader_error(
+            error, kind, visibility, scope, enriched=isinstance(selector, FHIRCatalogSelection)
+        )
     except DirectoryReadError as error:
         return _directory_error(error, selector, scope) if kind == "directory" else _error(error.status, scope)
     except SanicException as error:
@@ -446,10 +480,12 @@ async def _catalog_response(request, kind):
         return _error(503, scope if visibility is not None else None)
 
 
-def _catalog_reader_error(error, kind, visibility, scope):
+def _catalog_reader_error(error, kind, visibility, scope, *, enriched=False):
     code = str(error)
     if code == "registry_network_catalog_source_changed" and (
-        kind == "directory" or (visibility is not None and (kind == "legacy" or kind in _MANAGED_PROVIDER_KINDS))
+        enriched
+        or kind == "directory"
+        or (visibility is not None and (kind == "legacy" or kind in _MANAGED_PROVIDER_KINDS))
     ):
         return _error(409, scope)
     status = {

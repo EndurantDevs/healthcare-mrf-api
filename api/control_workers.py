@@ -73,6 +73,7 @@ _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS = 144 * 60 * 60
 
 
 _START_WORKERS: tuple[WorkerSpec, ...] = (
+    WorkerSpec("arq:RegistryFHIRCatalogSync", "process.RegistryFHIRCatalogSync", ("registry-fhir-catalog-sync",)),
     WorkerSpec("arq:RegistrySourceCheck", "process.RegistrySourceCheck", ("registry-source-check",)),
     WorkerSpec("arq:RegistryACASource", "process.RegistryACASource", ("registry-aca-source-worker",)),
     WorkerSpec("arq:RegistryPTGSource", "process.RegistryPTGSource", ("registry-ptg-source-worker",)),

@@ -38,13 +38,18 @@ class RegistryNetworkCatalogError(ValueError):
     """The request, retained proof or approved metadata is unavailable."""
 
 
-def _integer(number, maximum, *, minimum=1):
+def catalog_integer(number, maximum, *, minimum=1):
+    """Require an actual integer within the inclusive request bounds."""
     if type(number) is not int or not minimum <= number <= maximum:
         raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
     return number
 
 
-def _text(text, maximum):
+_integer = catalog_integer
+
+
+def catalog_text(text, maximum):
+    """Require bounded, trimmed UTF-8 request text without control characters."""
     if (
         type(text) is not str
         or not text
@@ -60,7 +65,11 @@ def _text(text, maximum):
     return text
 
 
-def _uuid(identifier):
+_text = catalog_text
+
+
+def catalog_uuid(identifier):
+    """Require a nonzero UUID encoded in its canonical string form."""
     try:
         parsed = UUID(identifier) if type(identifier) is str else None
     except ValueError:
@@ -68,6 +77,9 @@ def _uuid(identifier):
     if parsed is None or not parsed.int or str(parsed) != identifier:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     return identifier
+
+
+_uuid = catalog_uuid
 
 
 def _retained_fhir_scope(scope, producer_id):
@@ -141,7 +153,8 @@ def _source_scope(system, scope, *, producer_id=None):
     return scope
 
 
-def _exclusions(network_ids):
+def catalog_exclusions(network_ids):
+    """Require bounded, strictly increasing positive network identifiers."""
     if type(network_ids) is not tuple or len(network_ids) > MAX_EXCLUSIONS:
         raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
     previous = 0
@@ -151,6 +164,9 @@ def _exclusions(network_ids):
             raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
         previous = network_id
     return network_ids
+
+
+_exclusions = catalog_exclusions
 
 
 @dataclass(frozen=True)
@@ -180,7 +196,8 @@ class RegistryNetworkCatalogQuery:
             raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
 
 
-def _closed_json(encoded, maximum):
+def catalog_closed_json(encoded, maximum):
+    """Decode bounded JSON while rejecting duplicate keys and nonfinite constants."""
     if type(encoded) is not bytes or len(encoded) > maximum:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
 
@@ -199,6 +216,9 @@ def _closed_json(encoded, maximum):
         return json.loads(encoded, object_pairs_hook=_object_pairs, parse_constant=_invalid_constant)
     except ValueError, UnicodeError:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid") from None
+
+
+_closed_json = catalog_closed_json
 
 
 @dataclass(frozen=True)
@@ -368,7 +388,8 @@ _ORGANIZATION_SQL = _BASE_SQL.replace(
 )
 
 
-async def _pin(connection, generation_id, control_schema):
+async def catalog_pin(connection, generation_id, control_schema):
+    """Pin a verified catalog generation and approved membership in the caller-owned read-only snapshot."""
     if not connection.is_in_transaction():
         raise RegistryNetworkCatalogError("registry_network_catalog_transaction_required")
     transaction = await connection.fetchrow(
@@ -424,6 +445,9 @@ async def _pin(connection, generation_id, control_schema):
     return manifest
 
 
+_pin = catalog_pin
+
+
 @asynccontextmanager
 async def registry_catalog_read_snapshot(connection, generation_id, control_schema):
     """Reuse only a manifest verified on this connection in the active read scope."""
@@ -476,7 +500,8 @@ def _company_document(company):
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
 
 
-def _binding_document(binding):
+def catalog_binding_document(binding):
+    """Validate a closed source binding and its canonical coordinates and evidence."""
     coordinates = {"source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id"}
     fields = coordinates | {
         "namespace",
@@ -499,7 +524,11 @@ def _binding_document(binding):
     _source_scope(binding["source_system"], binding["source_scope"], producer_id=binding["producer_id"])
 
 
-def _network_document(document):
+_binding_document = catalog_binding_document
+
+
+def catalog_network_document(document):
+    """Validate the closed network response and its nested companies and source bindings."""
     fields = {
         "network_id",
         "display_name",
@@ -542,6 +571,9 @@ def _network_document(document):
         if len({entry[identity] for entry in entries}) != len(entries):
             raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     return document
+
+
+_network_document = catalog_network_document
 
 
 async def _page(connection, manifest, query, exclusions, control_schema, network_ids=None, organization_policy=None):

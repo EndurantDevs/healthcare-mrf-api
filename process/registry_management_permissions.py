@@ -37,6 +37,7 @@ from db.models.registry_network_binding import RegistryNetworkBinding, RegistryN
 from db.models.registry_publication_request import RegistryPublicationRequest
 from db.models.registry_revision import RegistryRecordHistory, RegistryRevisionControl
 from db.models.registry_site_binding import RegistrySiteBinding
+from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
 from process.network_address_projection import _identifier
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_membership_writer_closure import _NATIVE_RUNTIME_ROLE_UNSAFE_SQL, _protected_owner
@@ -80,7 +81,9 @@ _MODELS = _HEAD_MODELS + (
     RegistryCompanyLinkBatch,
     RegistryNetworkBindingBatch,
 )
-_TABLES = {model.__tablename__: tuple(model.__table__.columns.keys()) for model in _MODELS}
+REGISTRY_TABLES = {model.__tablename__: tuple(model.__table__.columns.keys()) for model in _MODELS}
+
+_TABLES = REGISTRY_TABLES
 _PTG_TABLES = {
     "registry_ptg_producer_scope": (
         "scope_id",
@@ -111,6 +114,7 @@ _PTG_TABLES = {
     "registry_ptg_office_hold": ("capture_id", "approval_sha256", "hold_sha256", "hold_json", "created_at"),
 }
 _TABLES.update(_PTG_TABLES)
+_TABLES["registry_fhir_catalog_snapshot"] = SNAPSHOT_COLUMNS
 _INSERT_COLUMNS = {
     model.__tablename__: tuple(column for column in model.__table__.columns.keys() if column != "created_at")
     for model in _HEAD_MODELS

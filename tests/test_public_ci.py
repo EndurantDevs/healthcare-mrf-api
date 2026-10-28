@@ -17,6 +17,7 @@ PYTHON_DEPENDENCY_JOBS = {
     "security",
     "worker-queue-smoke",
     "address-canonical-db-tests",
+    "fhir-catalog-integration",
 }
 LOCAL_SETUP_ACTION = "./ci/scripts/healthcare/setup"
 COMMON_TEST_JOBS = {"python-tests", "capacity-evidence"}
@@ -33,6 +34,7 @@ JOB_LABELS = {
     "security": "Security scans",
     "worker-queue-smoke": "Worker queue tests",
     "address-canonical-db-tests": "${{ matrix.label }}",
+    "fhir-catalog-integration": "FHIR catalog integration",
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
     "dev-image-publication": "DEV image publication",
@@ -411,6 +413,26 @@ def test_public_test_matrices_preserve_independent_database_shards():
         mode = "python-main" if job_id == "python-tests" else "postgres"
         assert f'bash "$CI_ROOT/scripts/healthcare/check" {mode} "$CI_SHARD"' in stage["run"]
         _assert_matrix_artifact_identity(job_id, job)
+
+
+def test_catalog_integration_is_required_and_capability_gated():
+    workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+    jobs = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))["jobs"]
+    job = jobs["fhir-catalog-integration"]
+    assert job["timeout-minutes"] == 30
+    assert job["needs"] == ["public-hygiene", "readability-preflight"]
+    assert job["env"]["CI_SHARD"] == "fhir-catalog-integration"
+    probe = next(step for step in job["steps"] if step.get("id") == "catalog-capability")
+    assert 'fhir-catalog-capability >> "$GITHUB_OUTPUT"' in probe["run"]
+    stage = next(step for step in job["steps"] if step.get("name") == "Run complete validation stage")
+    assert stage["if"] == "steps.catalog-capability.outputs.present == 'true'"
+    assert 'postgres "$CI_SHARD"' in stage["run"]
+    artifact = next(
+        step for step in job["steps"] if step.get("name") == "Upload exact-source catalog integration evidence"
+    )
+    assert artifact["if"] == stage["if"]
+    assert artifact["with"]["if-no-files-found"] == "error"
+    assert "fhir-catalog-integration" in jobs["measurement"]["needs"]
 
 
 def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():

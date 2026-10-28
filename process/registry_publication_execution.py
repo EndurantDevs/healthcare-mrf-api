@@ -64,7 +64,8 @@ from process.registry_source_observation_store import _namespace
 from process.registry_source_selection_receipt import verify_registry_source_selection_receipt
 
 
-async def _request(connection, request_id, lease_id, namespace, *, lock=False):
+async def publication_request(connection, request_id, lease_id, namespace, *, lock=False):
+    """Read an active, unexpired publication lease and optionally lock its exact request."""
     if not isinstance(request_id, UUID) or not request_id.int or not isinstance(lease_id, UUID) or not lease_id.int:
         raise ValueError("registry_queue_lease_invalid")
     request_record = await connection.fetchrow(
@@ -77,6 +78,9 @@ async def _request(connection, request_id, lease_id, namespace, *, lock=False):
     if request_record is None:
         raise RegistryApprovalConflict("registry_queue_lease_conflict")
     return dict(request_record)
+
+
+_request = publication_request
 
 
 def _command_actor(request_record):
@@ -145,7 +149,7 @@ def _require_outside_transaction(connection):
 
 
 @asynccontextmanager
-async def _locked_request_transaction(connection, request_id, lease_id, namespace):
+async def locked_publication_request_transaction(connection, request_id, lease_id, namespace):
     """Refresh a snapshot raced by renewal before any publication work starts."""
     _require_outside_transaction(connection)
     for attempt in range(3):
@@ -159,6 +163,9 @@ async def _locked_request_transaction(connection, request_id, lease_id, namespac
         except asyncpg.SerializationError:
             if has_request_lock or attempt == 2 or connection.is_in_transaction():
                 raise
+
+
+_locked_request_transaction = locked_publication_request_transaction
 
 
 async def _fresh_operation_authority(authorize, request_record, operation):

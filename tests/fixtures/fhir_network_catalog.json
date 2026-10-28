@@ -1,0 +1,92 @@
+{
+  "client_id": "client_42",
+  "policy_revision": "7",
+  "generation": "9",
+  "approved_custom_revision": "4",
+  "view": "fhir-plans-v1",
+  "metadata_generation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "metadata_approved_revision": "6",
+  "continuation_scope_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "total": 1,
+  "offset": 0,
+  "limit": 25,
+  "next_offset": null,
+  "items": [
+    {
+      "network_id": 7,
+      "display_name": "Example Network",
+      "aliases": [
+        "Example Alias"
+      ],
+      "archived": false,
+      "revision": 3,
+      "directory_available": true,
+      "priceable": null,
+      "benefit_codes": null,
+      "matching_relationships": {
+        "total": 1,
+        "offset": 0,
+        "limit": 5,
+        "next_offset": null,
+        "items": [
+          {
+            "relationship_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "source_id": "sample-fhir",
+            "plan": {
+              "resource_id": "plan-one",
+              "scope_path": "InsurancePlan/plan-one/plan/0",
+              "display_name": "Example Gold Plan",
+              "valid_from": null,
+              "valid_to": null
+            },
+            "organization_reference": "Organization/insurer-one",
+            "company_role": "insurer",
+            "company": {
+              "company_id": "11111111-1111-4111-8111-111111111111",
+              "display_name": "Example Insurance"
+            },
+            "group": {
+              "group_id": "33333333-3333-4333-8333-333333333333",
+              "display_name": "Example Parent",
+              "group_kind": "corporate_parent",
+              "relationship_kind": "verified_ownership",
+              "valid_from": "2025-01-01",
+              "valid_to": null
+            },
+            "resolution_status": "resolved",
+            "resolution_reason": null
+          }
+        ]
+      },
+      "source_bindings": {
+        "total": 1,
+        "offset": 0,
+        "limit": 5,
+        "next_offset": null,
+        "items": [
+          {
+            "namespace": "source_binding",
+            "binding_id": "44444444-4444-4444-8444-444444444444",
+            "revision": 1,
+            "source_system": "fhir",
+            "source_id": "sample-fhir",
+            "dataset_schema": "sample_source",
+            "dataset_id": "capture-one",
+            "producer_id": "registry-fhir-catalog-v1",
+            "edition_id": "edition-one",
+            "source_key": "network-one",
+            "source_scope": {
+              "organization_id": "network-one",
+              "source_generation": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "evidence_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc:Organization/network-one",
+            "evidence_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "metadata_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "accepted_at": "2026-01-01T00:00:00Z",
+            "status": "current"
+          }
+        ]
+      }
+    }
+  ]
+}
