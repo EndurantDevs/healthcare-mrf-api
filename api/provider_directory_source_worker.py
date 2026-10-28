@@ -93,12 +93,20 @@ def _source_route(admitted_run):
     return matches[0]
 
 
-def _is_launch_secret_selected(selection, launch):
-    """Keep route-only credentials out of every unrouted lineage."""
-    secret_name = selection.get("secretName", selection.get("secret_name"))
+def _is_launch_secret_selected(selection, launch, *, allow_shared=False):
+    """Keep routed credentials isolated while allowing explicitly shared env."""
+    secret_name = str(selection.get("secretName") or selection.get("secret_name") or "").strip()
+    route_secret_names = {route["secret_name"] for route in _configured_routes()}
+    shared_for_routes = selection.get("sharedForRoutes", False)
+    if type(shared_for_routes) is not bool or (shared_for_routes and not allow_shared):
+        raise ValueError("worker purpose shared secret selector is invalid")
+    if shared_for_routes:
+        if secret_name in route_secret_names:
+            raise ValueError("worker purpose shared secret selector is invalid")
+        return True
     if launch.secret_name:
         return secret_name == launch.secret_name
-    return secret_name not in {route["secret_name"] for route in _configured_routes()}
+    return secret_name not in route_secret_names
 
 
 def admit_fhir_source_worker_launch(admitted_run):
@@ -311,7 +319,7 @@ def is_fhir_source_secret_selected(selection, worker_class, launch_request):
 
     spec = _BY_WORKER_CLASS.get(_WORKER_CLASS)
     launch = authorized_fhir_source_worker_launch(spec, launch_request) if spec is not None else None
-    return launch is not None and _is_launch_secret_selected(selection, launch)
+    return launch is not None and _is_launch_secret_selected(selection, launch, allow_shared=True)
 
 
 def is_fhir_source_volume_selected(selection, worker_class, launch):
