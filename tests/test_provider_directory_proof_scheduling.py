@@ -12,7 +12,7 @@ import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -163,7 +163,7 @@ async def test_shard_loading_advances_another_task(tmp_path):
 @pytest.mark.parametrize("corrupt", (False, True))
 async def test_direct_content_proof_yields_without_skipping_payload_verification(monkeypatch, corrupt):
     monkeypatch.setattr(fhir, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 10_000)
-    resource_rows = [_dataset_resource("Practitioner", f"person-{index:06d}", {"npi": "123"}) for index in range(2_001)]
+    resource_rows = [_dataset_resource("Practitioner", f"person-{index:06d}", {"npi": "123"}) for index in range(513)]
     expected_hash = hashlib.sha256(
         b"\n".join(
             proof._stable_json(
@@ -176,27 +176,60 @@ async def test_direct_content_proof_yields_without_skipping_payload_verification
         resource_rows[-1]["payload_hash"] = "0" * 64
     before = copy.deepcopy(resource_rows)
     connection = SimpleNamespace(all=AsyncMock(return_value=resource_rows))
-    ticks, stop = [], asyncio.Event()
-    observer = asyncio.create_task(_observe(ticks, stop))
-    try:
-        if corrupt:
-            with pytest.raises(RuntimeError, match="payload_hash"):
-                await fhir._endpoint_dataset_content_proof(
-                    connection,
-                    DATASET_ID,
-                    verify_payload_hashes=True,
-                    resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
-                )
-        else:
-            completed_proof = await fhir._endpoint_dataset_content_proof(
-                connection, DATASET_ID, verify_payload_hashes=True, resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT
+    verify_payload_hash = Mock(wraps=fhir._assert_endpoint_dataset_resource_payload_hash)
+    monkeypatch.setattr(fhir, "_assert_endpoint_dataset_resource_payload_hash", verify_payload_hash)
+    task = asyncio.create_task(
+        fhir._endpoint_dataset_content_proof(
+            connection, DATASET_ID, verify_payload_hashes=True, resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT
+        )
+    )
+    for expected_count in (256, 512):
+        await asyncio.sleep(0)
+        assert verify_payload_hash.call_count == expected_count
+    if corrupt:
+        with pytest.raises(RuntimeError, match="payload_hash"):
+            await task
+    else:
+        completed_proof = await task
+        assert completed_proof.dataset_hash == expected_hash
+        assert completed_proof.resource_count == len(resource_rows)
+    assert verify_payload_hash.call_count == len(resource_rows)
+    assert resource_rows == before
+    assert connection.all.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", (False, True))
+async def test_acquired_resource_hashes_yield_without_changing_content(monkeypatch, cancel):
+    monkeypatch.setattr(fhir, "ENDPOINT_DATASET_HASH_BATCH_SIZE", 10_000)
+    resource_rows = [
+        {"resource_type": "Practitioner", "resource_id": f"person-{index:06d}", "acquired_resource_sha256": "a" * 64}
+        for index in range(513)
+    ]
+    before = copy.deepcopy(resource_rows)
+    connection = SimpleNamespace(all=AsyncMock(return_value=resource_rows))
+    candidate = SimpleNamespace(dataset_id=DATASET_ID, selected_resources=("Practitioner",))
+    update_hash = Mock(wraps=fhir._update_subset_acquired_hash)
+    monkeypatch.setattr(fhir, "_update_subset_acquired_hash", update_hash)
+    task = asyncio.create_task(fhir._subset_acquired_resource_hashes(connection, candidate, {"Practitioner": 513}))
+    await asyncio.sleep(0)
+    assert update_hash.call_count == 256
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert update_hash.call_count == 256
+    else:
+        await asyncio.sleep(0)
+        assert update_hash.call_count == 512
+        assert await task == {
+            "Practitioner": fhir.subset_canonical_sha256(
+                [
+                    {"resource_id": resource_row["resource_id"], "sha256": resource_row["acquired_resource_sha256"]}
+                    for resource_row in resource_rows
+                ]
             )
-            assert completed_proof.dataset_hash == expected_hash
-            assert completed_proof.resource_count == len(resource_rows)
-    finally:
-        stop.set()
-        await observer
-    assert ticks
+        }
     assert resource_rows == before
     assert connection.all.await_count == 1
 
