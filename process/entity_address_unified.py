@@ -64,10 +64,11 @@ from process.entity_address_dependency_bindings import (
     activate_geo_assurance_candidate_sql as _activate_geo_assurance_candidate_sql,
 )
 from process.entity_address_dependency_bindings import (
-    record_geo_assurance_candidate_sql as _record_geo_assurance_candidate_sql,
+    preflight_publication_dependencies,
+    selected_publication_dependencies,
 )
 from process.entity_address_dependency_bindings import (
-    selected_publication_dependencies,
+    record_geo_assurance_candidate_sql as _record_geo_assurance_candidate_sql,
 )
 from process.entity_address_dependency_bindings import (
     validate_schema_name as _validate_schema_name,
@@ -11784,11 +11785,7 @@ async def process_entity_address_unified_data(ctx, task=None):
         )
 
     if context["publish_requested"] and not context.get("cutover_dependency_preflight"):
-        live_models = (EntityAddressUnified,) if serving_only_refresh else (EntityAddressUnified, *SUPPORT_TABLE_MODELS)
-        await _assert_cutover_has_no_dependent_views(
-            db_schema,
-            [model.__main_table__ for model in live_models],
-        )
+        await preflight_publication_dependencies(db, db_schema, ctx)
         context["cutover_dependency_preflight"] = True
 
     if not ctx["context"].get("stage_prepared"):
