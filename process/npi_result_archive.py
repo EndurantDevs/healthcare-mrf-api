@@ -56,6 +56,8 @@ from process.npi_result_generation import (
 
 CONTRACT = "npi-result-family.postgres.v1"
 MODEL_CONTRACT = "npi-result-family.postgres.v2"
+ALIAS_MODEL_CONTRACT = "npi-result-family.postgres.alias.v1"
+MODEL_CONTRACTS = (MODEL_CONTRACT, ALIAS_MODEL_CONTRACT)
 CANONICAL_TABLE = "npi_canonical_address"
 VALIDATION_CONTRACT = "npi-result-family.validation.v1"
 _STAGE_PREFIX = "npi_result_archive_"
@@ -537,6 +539,18 @@ def _validate_tables(value: object, *, canonical=False) -> tuple[NpiTableReceipt
     return tuple(receipts)
 
 
+def _validate_address_metadata(metadata, contract):
+    if "npi_address_witness" in metadata and contract != ALIAS_MODEL_CONTRACT:
+        raise NpiResultArchiveError("NPI alias witness profile differs")
+    if contract == ALIAS_MODEL_CONTRACT:
+        from process.npi_alias_witness import METADATA_KEY, validate_npi_address_witness
+
+        try:
+            validate_npi_address_witness(metadata[METADATA_KEY])
+        except KeyError, RuntimeError:
+            raise NpiResultArchiveError("NPI alias witness is unavailable") from None
+
+
 def validate_npi_result_manifest(manifest_value: object) -> NpiResultManifest:
     """Validate content evidence without upgrading legacy ordering authority."""
 
@@ -554,13 +568,14 @@ def validate_npi_result_manifest(manifest_value: object) -> NpiResultManifest:
     }
     if not isinstance(manifest_value, Mapping) or set(manifest_value) != expected_fields:
         raise NpiResultArchiveError("NPI archive manifest is invalid")
-    if manifest_value["contract"] not in (CONTRACT, MODEL_CONTRACT) or manifest_value["capture_authority"] not in {
+    if manifest_value["contract"] not in (CONTRACT, *MODEL_CONTRACTS) or manifest_value["capture_authority"] not in {
         "tracked-generation",
         "legacy-manual",
     }:
         raise NpiResultArchiveError("NPI archive authority classification is invalid")
     metadata, metadata_sha256 = _source_metadata(manifest_value["source_metadata"])
-    tables = _validate_tables(manifest_value["tables"], canonical=manifest_value["contract"] == MODEL_CONTRACT)
+    _validate_address_metadata(metadata, manifest_value["contract"])
+    tables = _validate_tables(manifest_value["tables"], canonical=manifest_value["contract"] in MODEL_CONTRACTS)
     try:
         serving_generation = (
             None
@@ -631,6 +646,8 @@ async def capture_npi_source(
             await source_metadata_factory(session) if source_metadata_factory is not None else source_metadata
         )
         metadata, metadata_sha256 = _source_metadata(captured_metadata)
+        if "npi_address_witness" in metadata:
+            raise NpiResultArchiveError("NPI alias output requires direct native seven-table capture")
         snapshot = (await session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
         if not isinstance(snapshot, str) or _SNAPSHOT.fullmatch(snapshot) is None:
             raise NpiResultArchiveError("NPI source snapshot is invalid")
@@ -1328,19 +1345,69 @@ async def _validate_stage_manifest(
     manifest: NpiResultManifest,
     *,
     ownership_verified: bool = False,
+    npi_alias_authority=None,
 ) -> tuple[NpiTableReceipt, ...]:
     if not ownership_verified:
         await verify_npi_stage_ownership(session, ownership)
     observed_tables = await _manifest_tables(
-        session, ownership.schema_name, canonical=manifest.contract == MODEL_CONTRACT
+        session, ownership.schema_name, canonical=manifest.contract in MODEL_CONTRACTS
     )
     if observed_tables != manifest.tables:
         raise NpiResultArchiveError("NPI restored stage differs")
-    if manifest.contract == MODEL_CONTRACT:
+    alias_arguments = await _alias_arguments(session, manifest, npi_alias_authority)
+    if manifest.contract in MODEL_CONTRACTS:
         await validate_canonical_closure(
-            session, "npi", ownership.schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
+            session,
+            "npi",
+            ownership.schema_name,
+            lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}",
+            **alias_arguments,
         )
     return observed_tables
+
+
+async def _alias_arguments(session, manifest, authority):
+    """A new profile never upgrades portable JSON into local native authority."""
+    if manifest.contract != ALIAS_MODEL_CONTRACT:
+        if authority is not None:
+            raise NpiResultArchiveError("NPI alias authority profile differs")
+        return {}
+    from process.npi_alias_witness import METADATA_KEY, require_npi_alias_authority
+
+    await require_npi_alias_authority(session, authority, manifest.source_metadata[METADATA_KEY])
+    return {"npi_alias_authority": authority}
+
+
+async def capture_npi_alias_manifest(session, ownership, source_metadata, *, npi_alias_authority):
+    """Capture already-produced private heaps, without legacy global-source cloning."""
+    from process.npi_alias_witness import METADATA_KEY, require_npi_alias_authority
+
+    _require_transaction(session)
+    if not _has_canonical(ownership) or ownership.freeze_function_oid is not None or ownership.freeze_trigger_oids:
+        raise NpiResultArchiveError("NPI alias source requires native closed custody")
+    await verify_npi_stage_ownership(session, ownership)
+    metadata, metadata_sha = _source_metadata(source_metadata)
+    await require_npi_alias_authority(session, npi_alias_authority, metadata.get(METADATA_KEY))
+    await validate_canonical_closure(
+        session,
+        "npi",
+        ownership.schema_name,
+        lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}",
+        npi_alias_authority=npi_alias_authority,
+    )
+    tables = await _manifest_tables(session, ownership.schema_name, canonical=True)
+    return validate_npi_result_manifest(
+        NpiResultManifest(
+            tables,
+            metadata,
+            metadata_sha,
+            _schema_digest(tables),
+            "legacy-manual",
+            None,
+            None,
+            ALIAS_MODEL_CONTRACT,
+        )
+    )
 
 
 async def cleanup_npi_stage(session: Any, ownership: NpiStageOwnership) -> None:
@@ -1471,6 +1538,7 @@ async def export_prepared_npi_archive(
     prepared: NpiPreparedSource,
     archive_copy: Callable[[NpiStageCapture], Awaitable[None]],
     verify_custody: Callable[..., Awaitable[None]] | None = None,
+    authenticate_npi_alias=None,
 ) -> NpiResultManifest:
     """Dump one committed protected clone; only historical v1 may use freeze-only custody."""
 
@@ -1479,7 +1547,7 @@ async def export_prepared_npi_archive(
     if verify_custody is not None and not callable(verify_custody):
         raise NpiResultArchiveError("NPI prepared source custody verifier is invalid")
     manifest = validate_npi_result_manifest(prepared.manifest)
-    if manifest.contract == MODEL_CONTRACT and verify_custody is None:
+    if manifest.contract in MODEL_CONTRACTS and verify_custody is None:
         raise NpiResultArchiveError("NPI canonical prepared source requires a custody verifier")
     if verify_custody is None and (
         prepared.ownership.freeze_function_oid is None or not prepared.ownership.freeze_trigger_oids
@@ -1497,11 +1565,19 @@ async def export_prepared_npi_archive(
             await verify_npi_stage_ownership(stage_session, prepared.ownership)
         if verify_custody is not None:
             await verify_custody(stage_session, prepared)
+        alias_authority = None
+        if manifest.contract == ALIAS_MODEL_CONTRACT:
+            from process.npi_alias_witness import METADATA_KEY
+
+            if not callable(authenticate_npi_alias) or prepared.ownership.freeze_function_oid is not None:
+                raise NpiResultArchiveError("NPI alias native custody is unavailable")
+            alias_authority = await authenticate_npi_alias(stage_session, manifest.source_metadata[METADATA_KEY])
         await _validate_stage_manifest(
             stage_session,
             prepared.ownership,
             manifest,
             ownership_verified=True,
+            **({"npi_alias_authority": alias_authority} if alias_authority is not None else {}),
         )
         async with _bounded_catalog_work(stage_session):
             snapshot = await _export_stage_snapshot(stage_session)
@@ -1640,7 +1716,7 @@ async def precreate_npi_restore(
     return await capture_npi_stage_ownership(session, dataset_id=dataset_id, canonical=canonical)
 
 
-async def complete_npi_restore(session: Any, ownership: NpiStageOwnership) -> None:
+async def complete_npi_restore(session: Any, ownership: NpiStageOwnership, *, npi_alias_authority=None) -> None:
     """Finish native keys, checks and all model indexes before stage validation."""
 
     _require_transaction(session)
@@ -1679,7 +1755,11 @@ async def complete_npi_restore(session: Any, ownership: NpiStageOwnership) -> No
         await native_archive._create_table_constraints(session, table, backing_indexes=False)
     if _has_canonical(ownership):
         await validate_canonical_closure(
-            session, "npi", ownership.schema_name, lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}"
+            session,
+            "npi",
+            ownership.schema_name,
+            lambda schema, name: f"{_quoted(schema)}.{_quoted(name)}",
+            **({"npi_alias_authority": npi_alias_authority} if npi_alias_authority is not None else {}),
         )
     for child_name in ("npi_address", "npi_taxonomy", "npi_taxonomy_group", "npi_other_identifier"):
         child = f"{_quoted(ownership.schema_name)}.{_quoted(child_name)}"
@@ -1696,6 +1776,7 @@ async def validate_npi_stage(
     *,
     ownership: NpiStageOwnership,
     manifest: Mapping[str, Any] | NpiResultManifest,
+    npi_alias_authority=None,
 ) -> tuple[NpiTableReceipt, ...]:
     """Validate restored schema/count semantics under an ownership lock."""
 
@@ -1711,6 +1792,7 @@ async def validate_npi_stage(
         ownership,
         validated,
         ownership_verified=True,
+        **({"npi_alias_authority": npi_alias_authority} if npi_alias_authority is not None else {}),
     )
 
 
@@ -1796,7 +1878,7 @@ def validate_npi_validation_receipt(receipt_value: object) -> NpiValidationRecei
         raise NpiResultArchiveError("NPI validation receipt is invalid")
     if (
         receipt_value["contract"] != VALIDATION_CONTRACT
-        or receipt_value["profile_contract"] not in (CONTRACT, MODEL_CONTRACT)
+        or receipt_value["profile_contract"] not in (CONTRACT, *MODEL_CONTRACTS)
         or _SHA256.fullmatch(str(receipt_value["package_id"])) is None
         or _SHA256.fullmatch(str(receipt_value["manifest_sha256"])) is None
         or type(receipt_value["stage_schema_oid"]) is not int
@@ -1806,7 +1888,7 @@ def validate_npi_validation_receipt(receipt_value: object) -> NpiValidationRecei
     ):
         raise NpiResultArchiveError("NPI validation receipt is invalid")
     schema_name = _schema_name(receipt_value["stage_schema"])
-    has_canonical = receipt_value["profile_contract"] == MODEL_CONTRACT
+    has_canonical = receipt_value["profile_contract"] in MODEL_CONTRACTS
     relation_oids = _validation_inventory(receipt_value["relation_oids"], canonical=has_canonical)
     tables = _validate_tables(receipt_value["tables"], canonical=has_canonical)
     digest_by_field = {key: receipt_value[key] for key in expected_fields - {"validation_sha256"}}
@@ -1832,6 +1914,7 @@ async def prepare_npi_activation(
     manifest: Mapping[str, Any] | NpiResultManifest,
     package_id: str,
     sealed_owner_oid: int,
+    npi_alias_authority=None,
 ) -> NpiValidationReceipt:
     """Perform long validation over an already publisher-frozen stage."""
 
@@ -1842,7 +1925,12 @@ async def prepare_npi_activation(
     await verify_npi_stage_ownership(session, ownership)
     await _verify_stage_owner(session, ownership, sealed_owner_oid)
     await _advance_and_verify_stage_sequences(session, ownership)
-    tables = await _validate_stage_manifest(session, ownership, validated)
+    tables = await _validate_stage_manifest(
+        session,
+        ownership,
+        validated,
+        **({"npi_alias_authority": npi_alias_authority} if npi_alias_authority is not None else {}),
+    )
     digest_by_field = {
         "contract": VALIDATION_CONTRACT,
         "package_id": package_id,
@@ -2053,7 +2141,7 @@ async def _activate_npi_relations(
     ):
         raise NpiResultArchiveError("NPI activated relation identity differs")
     canonical_publication = None
-    if manifest.contract == MODEL_CONTRACT:
+    if manifest.contract in MODEL_CONTRACTS:
         canonical_publication = await merge_canonical_contribution(
             session,
             "npi",
@@ -2064,7 +2152,7 @@ async def _activate_npi_relations(
         session,
         schema_name=incumbent.schema_name,
         source_generation=manifest.source_serving_generation,
-        canonical_provenance=None if manifest.contract == MODEL_CONTRACT else manifest.canonical_provenance,
+        canonical_provenance=None if manifest.contract in MODEL_CONTRACTS else manifest.canonical_provenance,
     )
     ordered_oids = tuple(int(dict(live_pairs)[name]) for name in RELATION_NAMES)
     if manifest.source_serving_generation is None:
@@ -2105,10 +2193,12 @@ async def activate_validated_npi_stage(
     if not callable(on_activated):
         raise NpiResultArchiveError("NPI activation record callback is required")
     validated_manifest = validate_npi_result_manifest(manifest)
+    if validated_manifest.contract == ALIAS_MODEL_CONTRACT:
+        raise NpiResultArchiveError("NPI alias output requires constructor-owned activation")
     validation = validate_npi_validation_receipt(validation_receipt)
     _validate_cutover_bindings(ownership, validated_manifest, validation, cutover)
     if tuple(name for name, _oid in incumbent.relation_oids) != npi_archive_names(
-        canonical=validated_manifest.contract == MODEL_CONTRACT
+        canonical=validated_manifest.contract in MODEL_CONTRACTS
     ):
         raise NpiResultArchiveError("NPI incumbent activation inventory differs")
     await _lock_and_verify_activation(session, ownership, incumbent)
@@ -2141,6 +2231,9 @@ async def activate_validated_npi_stage(
 
 __all__ = [
     "CONTRACT",
+    "ALIAS_MODEL_CONTRACT",
+    "MODEL_CONTRACT",
+    "MODEL_CONTRACTS",
     "VALIDATION_CONTRACT",
     "NpiActivationReceipt",
     "NpiCutoverAuthority",
@@ -2155,6 +2248,7 @@ __all__ = [
     "NpiValidationReceipt",
     "activate_validated_npi_stage",
     "capture_npi_incumbent",
+    "capture_npi_alias_manifest",
     "capture_npi_source",
     "capture_npi_stage_ownership",
     "cleanup_npi_stage",

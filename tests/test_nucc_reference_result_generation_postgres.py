@@ -1,13 +1,20 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Taxonomy authority starts empty and advances only at actual writer boundaries."""
 
+import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from process import nucc_protected_source as source
+from tests.test_nucc_protected_source import closed_marker, copying_marker, ready_input, source_run
 from tests.test_reference_source_generation_postgres import (
     _observe,
     _read_authority,
@@ -107,3 +114,89 @@ async def test_taxonomy_generation_rejects_a_multi_relation_identity(monkeypatch
                     )
                 )
         assert rejected.value.orig.sqlstate == "23514"
+
+
+@asynccontextmanager
+async def _contended_poll_row(engine, lock_row, monkeypatch, attempts, failures):
+    sleeps = []
+    async with engine.connect() as holder:
+        await holder.begin()
+        assert await holder.scalar(lock_row) == 1
+
+        async def backoff(seconds):
+            sleeps.append(seconds)
+            assert seconds == source.POLL_SECONDS and len(attempts) == 1
+            session, (backend_pid, _transaction_id) = attempts[0]
+            assert not session.in_transaction() and failures == ["55P03"]
+            assert (
+                await holder.scalar(
+                    text("SELECT xact_start IS NULL FROM pg_stat_activity WHERE pid=:pid"), {"pid": backend_pid}
+                )
+                is True
+            )
+            await holder.rollback()
+
+        monkeypatch.setattr(source, "asyncio", SimpleNamespace(timeout=asyncio.timeout, sleep=backoff))
+        try:
+            yield sleeps
+        finally:
+            await holder.rollback()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("poll", ["stage", "handoff"])
+async def test_source_poll_retries_native_row_contention_after_rollback(monkeypatch, poll):
+    async with _source_family(monkeypatch) as (engine, schema, sessions):
+        marker = copying_marker() if poll == "stage" else closed_marker()
+        ready = ready_input(marker)
+        stage = replace(source.NuccSourceStage.from_wire(marker), ready=ready)
+        run = source_run(marker, ready=ready, status="running" if poll == "stage" else "finalizing")
+        if poll == "handoff":
+            run["metrics"]["nucc_handoff"] = marker["handoff"]
+        lock_row = text(f'SELECT id FROM "{schema}".geo_zip_census_profile WHERE id=1 FOR UPDATE NOWAIT')
+        attempts, failures = [], []
+
+        async def locked_row(session, *_arguments):
+            identity = (await session.execute(text("SELECT pg_backend_pid(),pg_current_xact_id()::text"))).one()
+            attempts.append((session, identity))
+            try:
+                assert await session.scalar(lock_row) == 1
+            except DBAPIError as error:
+                failures.append(error.orig.sqlstate)
+                raise
+
+        async def stage_state(session, received, **options):
+            assert received.marker == marker
+            assert options == (
+                {"copying": True, "allow_pending_retry": True} if poll == "stage" else {"copying": False}
+            )
+            if poll == "handoff":
+                await locked_row(session)
+            return run, marker
+
+        monkeypatch.setattr(source, "_source_stage_state", stage_state)
+        if poll == "stage":
+            monkeypatch.setattr(source.control, "_source_transaction", AsyncMock(return_value={}))
+            monkeypatch.setattr(source.control, "reconcile_source_publication", locked_row)
+            monkeypatch.setattr(source.control, "_locked_source_run", AsyncMock(return_value=run))
+        async with _contended_poll_row(engine, lock_row, monkeypatch, attempts, failures) as sleeps:
+            database = SimpleNamespace(transaction=sessions.begin)
+            if poll == "stage":
+                context_by_field = {
+                    "control_run_id": marker["run_id"],
+                    "context": {
+                        "_control_attempt_id": marker["attempt_id"],
+                        "_control_attempt_started_at": marker["attempt_started_at"],
+                    },
+                }
+                assert (await source.wait_nucc_source_stage(database, context_by_field)).marker == marker
+            else:
+                assert await source.wait_nucc_source_handoff(database, stage) == marker["handoff"]
+        assert sleeps == [source.POLL_SECONDS] and failures == ["55P03"] and len(attempts) == 2
+        assert attempts[0][0] is not attempts[1][0] and attempts[0][1][1] != attempts[1][1][1]
+        assert all(not session.in_transaction() for session, _identity in attempts)
+    try:
+        async with engine.connect() as observer:
+            assert await observer.scalar(text("SELECT to_regnamespace(:schema) IS NULL"), {"schema": schema}) is True
+    finally:
+        await engine.dispose()

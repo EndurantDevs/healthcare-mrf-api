@@ -8,8 +8,8 @@ import asyncio
 from db import nppes_evidence_callable_contract as callable_contract
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_source_policy as source_policy
+from process.nppes_isolated_catalog import _FIXED_CATALOG_SQL as CATALOG_SQL
 from process.nppes_public_evidence_writer_contract import writer_error
-from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import storage_roles
 from process.plan_release_storage_provision import _GRANTEES_SQL
 

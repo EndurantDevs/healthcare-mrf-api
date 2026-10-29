@@ -228,6 +228,7 @@ from process.reference_family_result_generation import (
     _rotate_family_relations as _rotate_family_relations,
 )
 from process.reference_family_source_capture_contract import _validate_source_capture_contract
+from process.selected_canonical_archive import selected_canonical_archive
 
 logger = logging.getLogger(__name__)
 
@@ -4427,62 +4428,6 @@ async def _merge_mrf_canonical_address(session, ownership, destination_schema, a
         """)
         )
     await session.execute(text(f"DROP TABLE {stage} RESTRICT"))
-
-
-@asynccontextmanager
-async def selected_canonical_archive(
-    session, *, schema_name, owner_oid, selected_relations, authenticate_inventory, authenticate_base=None
-):
-    """Use only complete authenticated NPI/MRF native heaps for future canonical coverage."""
-    from process.entity_address_snapshot_preparation import _publisher_authority
-    from process.mrf_address_publication import (
-        canonical_archive_projection,
-        require_canonical_publication_catalog,
-        validate_canonical_contributions,
-    )
-
-    _require_transaction(session)
-    if not callable(authenticate_inventory) or await _publisher_authority(session) != owner_oid:
-        raise ReferenceFamilyArchiveError("selected canonical publisher authority differs")
-    inventories = await authenticate_inventory(session)
-    if not isinstance(inventories, Mapping) or not inventories or not set(inventories) <= {"npi", "mrf"}:
-        raise ReferenceFamilyArchiveError("selected canonical contribution scope differs")
-    relations, contributions = _selected_canonical_sources(inventories, selected_relations, owner_oid)
-    archive = f"{_quoted(schema_name)}.{_quoted(archive_table_name())}"
-    await session.execute(text(f"LOCK TABLE {archive} IN SHARE ROW EXCLUSIVE MODE NOWAIT"))
-    if authenticate_base is None:
-        await require_canonical_publication_catalog(session, archive)
-    else:
-        from process.mrf_address_publication import require_canonical_output_base
-
-        await require_canonical_output_base(session, archive, await authenticate_base(session, archive))
-    await session.execute(
-        text(
-            "LOCK TABLE "
-            + ",".join(
-                f"{_quoted(relation['schema_name'])}.{_quoted(relation['relation_name'])}"
-                for relation in sorted(relations, key=lambda relation: relation["relation_oid"])
-            )
-            + " IN ACCESS SHARE MODE NOWAIT"
-        )
-    )
-    await _require_selected_mrf_catalog(
-        session, sorted(relations, key=lambda relation: relation["relation_oid"]), owner_oid
-    )
-    await validate_canonical_contributions(session, contributions, archive)
-    view_name = "address_canonical_validation_" + uuid4().hex
-    await session.execute(
-        text(f"CREATE TEMP VIEW {_quoted(view_name)} AS " + canonical_archive_projection(contributions, archive))
-    )
-    temporary_schema = await session.scalar(
-        text("SELECT nspname::text FROM pg_catalog.pg_namespace WHERE oid=pg_catalog.pg_my_temp_schema()")
-    )
-    try:
-        yield (_schema_name(temporary_schema), view_name)
-    except BaseException:
-        raise
-    else:
-        await session.execute(text(f"DROP VIEW {_quoted(temporary_schema)}.{_quoted(view_name)} RESTRICT"))
 
 
 def _selected_canonical_sources(inventories, selected_relations, owner_oid):
