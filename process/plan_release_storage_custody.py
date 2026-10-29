@@ -55,6 +55,12 @@ async def storage_roles(connection, schema_name, owner_role, publisher_role, rea
     await connection.execute("SET LOCAL search_path=pg_catalog,pg_temp")
     names = storage_profile(owner_role, publisher_role, reader_roles, control_reader_roles)
     role_rows = await connection.fetch(ROLE_SQL, list(names), owner_role, publisher_role, schema_name)
+    return _require_storage_roles(role_rows, owner_role, publisher_role, reader_roles, control_reader_roles)
+
+
+def _require_storage_roles(role_rows, owner_role, publisher_role, reader_roles, control_reader_roles=()):
+    """Apply the same role admission to a native row set captured in one query."""
+    names = (owner_role, publisher_role, *reader_roles)
     roles_by_name = {role["rolname"]: role for role in role_rows}
     _require(set(roles_by_name) == set(names), "roles_missing")
     owner = roles_by_name[owner_role]
