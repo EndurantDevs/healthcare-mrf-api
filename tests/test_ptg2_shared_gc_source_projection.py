@@ -15,20 +15,18 @@ from db.connection import Database
 from process.ptg_parts import ptg2_shared_gc as shared_gc
 from process.ptg_parts import ptg2_source_snapshot_gc as source_snapshot_gc
 from process.ptg_parts import snapshot_cleanup
-
 from tests.ptg2_shared_gc_test_support import (
-    _SharedGCExecutor,
-    _SourceGCProjectionExecutor,
     _hash,
     _patch_v4_abandonment_pipeline,
+    _SharedGCExecutor,
+    _SourceGCProjectionExecutor,
 )
+
 
 @pytest.mark.asyncio
 async def test_source_snapshot_gc_does_not_project_unrelated_shared_layout_bytes():
     """Verify source snapshot gc does not project unrelated shared layout bytes."""
-    plan = await source_snapshot_gc.build_ptg2_source_snapshot_gc_plan(
-        executor=_SourceGCProjectionExecutor()
-    )
+    plan = await source_snapshot_gc.build_ptg2_source_snapshot_gc_plan(executor=_SourceGCProjectionExecutor())
 
     assert plan.shared_snapshot_ids == ("shared-old",)
     assert plan.shared_layout_count == 1
@@ -57,14 +55,15 @@ async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(mo
 
     class _Connection:
         async def all(self, statement, **_params):
+            if 'DELETE FROM "mrf".ptg2_snapshot' in statement:
+                events.append("logical-delete")
+                return [{"snapshot_id": "shared-old"}]
             assert "SELECT DISTINCT snapshot_key" in statement
             return [{"snapshot_key": 10}]
 
         async def status(self, statement, **_params):
             if 'DELETE FROM "mrf".ptg2_v3_snapshot_binding' in statement:
                 events.append("binding-delete")
-            if 'DELETE FROM "mrf".ptg2_snapshot' in statement:
-                events.append("logical-delete")
             return 1
 
     class _DB:
@@ -111,6 +110,8 @@ async def test_source_snapshot_gc_releases_unbound_layout_in_same_transaction(mo
 async def test_source_snapshot_gc_skips_layout_release_without_deleted_binding(monkeypatch):
     class _Connection:
         async def all(self, statement, **_params):
+            if 'DELETE FROM "mrf".ptg2_snapshot' in statement:
+                return [{"snapshot_id": "shared-old"}]
             assert "SELECT DISTINCT snapshot_key" in statement
             return [{"snapshot_key": 10}]
 
@@ -143,9 +144,7 @@ async def test_source_snapshot_gc_skips_layout_release_without_deleted_binding(m
         release,
     )
 
-    gc_result = await source_snapshot_gc.execute_ptg2_source_snapshot_gc_plan(
-        max_bytes=100
-    )
+    gc_result = await source_snapshot_gc.execute_ptg2_source_snapshot_gc_plan(max_bytes=100)
 
     assert gc_result is plan
     release.assert_not_awaited()

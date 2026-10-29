@@ -7,11 +7,10 @@ from process.ptg_parts import ptg2_source_snapshot_gc as snapshot_gc
 
 class _BacklogExecutor:
     async def all(self, statement, **_params):
+        if "AS bindings_exist" in statement:
+            return [{"bindings_exist": False, "source_header_exists": False, "header_exists": False}]
         if "FROM information_schema.tables" in statement:
-            return [
-                {"table_name": table_name}
-                for table_name in snapshot_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES
-            ]
+            return [{"table_name": table_name} for table_name in snapshot_gc.PTG2_V3_MIGRATION_OWNED_TABLE_NAMES]
         if "SELECT DISTINCT snapshot_id" in statement:
             return []
         if 'FROM "mrf".ptg2_snapshot' in statement:
