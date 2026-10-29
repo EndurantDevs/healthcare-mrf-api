@@ -112,3 +112,46 @@ async def test_preflight_preserves_prepared_inputs_and_controlled_selection_scop
 
     expected = {"control_context": import_context_by_key} if protected and not test_mode else {}
     assert observed_options == ([expected] if publish and not prepared else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handoff", (False, True))
+async def test_lost_dependency_owner_blocks_native_publication_entry(monkeypatch, handoff):
+    """Both publication paths check the original owner before writing serving authority."""
+    from process import entity_address_snapshot_adoption as adoption
+
+    fence = AsyncMock(side_effect=RuntimeError("synthetic dependency owner lost"))
+    swap, capture, write = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(entity_address, "lock_selected_publication_dependencies", fence)
+    monkeypatch.setattr(adoption, "_publish_result_swaps", swap)
+    monkeypatch.setattr(entity_address_native_publication, "_capture_handoff", capture)
+    monkeypatch.setattr(entity_address_native_publication, "_write_handoff", write)
+    monkeypatch.setattr(entity_address_native_publication, "_complete_indexes", AsyncMock())
+
+    @asynccontextmanager
+    async def transaction(*_args):
+        yield SimpleNamespace()
+
+    monkeypatch.setattr(entity_address.serving_recovery, "address_transaction", transaction)
+    monkeypatch.setattr(entity_address.db, "transaction", transaction)
+    with pytest.raises(RuntimeError, match="synthetic dependency owner lost"):
+        if handoff:
+            await entity_address_native_publication.handoff_entity_address_generation(
+                {
+                    "control_run_id": "run_test",
+                    "context": {
+                        "_control_attempt_id": "run_test:" + "a" * 32,
+                        "_control_attempt_started_at": "2026-01-01T00:00:00.000000+00:00",
+                    },
+                },
+                schema_name="mrf",
+                import_date="20260101",
+                dependency_bindings={},
+                row_count=1,
+            )
+        else:
+            await entity_address._run_entity_address_cutover("mrf", [], [], [], [], {})
+    fence.assert_awaited_once_with(entity_address.db, "mrf")
+    swap.assert_not_awaited()
+    capture.assert_not_awaited()
+    write.assert_not_awaited()

@@ -329,7 +329,9 @@ async def test_publication_fences_missing_or_stale_inputs(monkeypatch, change):
         return _binding_result(row)
 
     session = SimpleNamespace(
-        execute=AsyncMock(side_effect=execute), scalar=AsyncMock(return_value=change != "physical")
+        execute=AsyncMock(side_effect=execute),
+        scalar=AsyncMock(return_value=change != "physical"),
+        get_transaction=lambda: transaction,
     )
 
     @asynccontextmanager
@@ -339,7 +341,7 @@ async def test_publication_fences_missing_or_stale_inputs(monkeypatch, change):
     session.begin = transaction
     inventory_by_field = {
         "relations": [
-            {"relation_name": name.split(".")[1], "schema_name": binding["schema_name"]}
+            {"relation_name": name.split(".")[1], **binding}
             for name, binding in bindings.items()
             if name.startswith("tiger.")
         ]
@@ -349,7 +351,7 @@ async def test_publication_fences_missing_or_stale_inputs(monkeypatch, change):
     if change is None:
         async with manager as observed:
             assert observed == bindings
-            assert len(session.execute.await_args_list) == 7
+            assert len(session.execute.await_args_list) == 8
     else:
         with pytest.raises(RuntimeError, match="publication dependency"):
             async with manager:
@@ -357,11 +359,11 @@ async def test_publication_fences_missing_or_stale_inputs(monkeypatch, change):
     if change == "missing":
         session.scalar.assert_not_awaited()
     else:
-        assert str(session.execute.await_args_list[-1].args[0]) == projection.projection_dependency_lock_sql(
+        assert str(session.execute.await_args_list[6].args[0]) == projection.projection_dependency_lock_sql(
             "mrf", dependency_bindings=bindings
         )
         assert str(
-            session.scalar.await_args.args[0]
+            session.scalar.await_args_list[0].args[0]
         ) == "SELECT " + projection.projection_dependency_bindings_match_sql("mrf", bindings)
 
 
