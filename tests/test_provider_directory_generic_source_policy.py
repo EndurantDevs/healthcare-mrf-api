@@ -2,6 +2,7 @@
 """Physical publisher custody and refusal before source target access."""
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from types import SimpleNamespace
@@ -11,8 +12,8 @@ import pytest
 
 from db.connection import Database
 from process import provider_directory_generic_source_policy as policy
-from process.provider_directory_generic_candidate import GenericCandidateError
 from process import provider_directory_source_storage_binding as isolated
+from process.provider_directory_generic_candidate import GenericCandidateError
 
 
 @asynccontextmanager
@@ -279,6 +280,7 @@ async def test_metadata_validators_keep_canonical_function_qualification(monkeyp
 @pytest.mark.asyncio
 async def test_private_candidate_admission_needs_no_canonical_functions(monkeypatch, custody):
     from importlib import import_module
+
     from process.provider_directory_generic_source_storage import HEADER
 
     directory = import_module("process.provider_directory_fhir")
@@ -306,6 +308,7 @@ async def test_private_candidate_admission_needs_no_canonical_functions(monkeypa
 async def test_private_admission_routes_through_original_binding(monkeypatch, custody):
     """A competing validated private header blocks without canonical callable access."""
     from importlib import import_module
+
     from tests.test_provider_directory_twin_root_verification import _candidate, _private_header
 
     directory = import_module("process.provider_directory_fhir")
@@ -331,20 +334,24 @@ async def test_private_admission_routes_through_original_binding(monkeypatch, cu
 async def test_private_custody_requires_no_metadata_execution(monkeypatch, closed, function_owner):
     """Both private principals must lack effective execution; canonical ACLs stay captured."""
     from copy import deepcopy
+
     from process import provider_directory_source_callable_custody as callables
     from tests.test_provider_directory_source_callable_custody import _entry
 
     signature = "provider_directory_subset_canonical_sha256(jsonb)"
     function_by_field = _entry(signature, owner=function_owner)
     function_by_field["signature"] = '"sample".' + signature
-    native_functions = [deepcopy(function_by_field)]
+    native_functions = [dict(deepcopy(function_by_field), authority_closed=closed)]
     monkeypatch.setattr(isolated, "_isolated_metadata_rows", AsyncMock(return_value=native_functions))
     monkeypatch.setattr(callables, "_body_digest", lambda body, schema: body)
     configured = _policy()
-    roles_by_name = {name: {"oid": oid} for name, oid in zip(
-        (configured.owner_role, configured.publisher_role, *configured.runtime_roles), (101, 102, 103), strict=True
-    )}
-    connection = SimpleNamespace(fetchval=AsyncMock(return_value=closed))
+    roles_by_name = {
+        name: {"oid": oid}
+        for name, oid in zip(
+            (configured.owner_role, configured.publisher_role, *configured.runtime_roles), (101, 102, 103), strict=True
+        )
+    }
+    connection = SimpleNamespace()
     if closed:
         captured = await isolated._isolated_metadata_custody(connection, "sample", 201, roles_by_name, configured)
         assert captured[signature]["definition"] == function_by_field["definition"]
@@ -354,12 +361,171 @@ async def test_private_custody_requires_no_metadata_execution(monkeypatch, close
     else:
         with pytest.raises(GenericCandidateError, match="metadata_authority_changed"):
             await isolated._isolated_metadata_custody(connection, "sample", 201, roles_by_name, configured)
-    query, owner_checked_oids, owner_oid, execution_checked_oids, function_oid = connection.fetchval.await_args.args
-    assert "AND NOT EXISTS(SELECT FROM unnest($3::oid[])" in query
-    assert "has_function_privilege(actor.oid,$4::oid,'EXECUTE')" in query
-    assert (owner_checked_oids, owner_oid, execution_checked_oids, function_oid) == (
-        [101, 102], function_owner, [101, 102], 501
+    isolated._isolated_metadata_rows.assert_awaited_once_with(
+        connection, "sample", configured.runtime_roles, [101, 102]
     )
+
+
+@pytest.mark.parametrize("changed", [None, "missing", "layout", "authority", "physical"])
+def test_admission_batch_preserves_scoped_physical_identity(changed):
+    """Private observations cannot replace an authorized catalog table's physical identity."""
+    relations = [
+        dict(
+            scope="admission",
+            oid=101 + ordinal,
+            relname=name,
+            nspname="catalog",
+            relkind="r",
+            relpersistence="p",
+            relrowsecurity=False,
+            relforcerowsecurity=False,
+            columns='[["identifier", "text"]]',
+        )
+        for ordinal, name in enumerate(sorted(isolated._CATALOG_ROOTS))
+    ]
+    evidence_by_field = dict(
+        catalog=[*relations, dict(relations[0], scope="private", oid=999, nspname="private")],
+        physical=[dict(oid=101 + ordinal, relfilenode=201 + ordinal, column_acls="[[1, null]]") for ordinal in range(3)]
+        + [dict(oid=999, relfilenode=999)],
+        admission_rights=[dict(oid=relation["oid"], closed=True) for relation in relations],
+    )
+    if changed == "missing":
+        evidence_by_field["catalog"].pop(0)
+    elif changed == "layout":
+        relations[0]["relkind"] = "p"
+    elif changed == "authority":
+        evidence_by_field["admission_rights"][0]["closed"] = False
+    elif changed == "physical":
+        evidence_by_field["physical"].pop(0)
+    if changed:
+        errors_by_case = dict(
+            missing="admission_missing",
+            layout="admission_layout_changed",
+            authority="admission_authority_changed",
+            physical="protected_fhir_inventory_changed",
+        )
+        with pytest.raises(GenericCandidateError, match=errors_by_case[changed]):
+            isolated._isolated_admission_rights("catalog", evidence_by_field)
+    else:
+        captured = isolated._isolated_admission_rights("catalog", evidence_by_field)
+        assert set(captured) == isolated._CATALOG_ROOTS
+        for ordinal, name in enumerate(sorted(captured)):
+            assert captured[name]["oid"] == 101 + ordinal
+            assert captured[name]["relfilenode"] == 201 + ordinal
+            assert captured[name]["column_acls"] == [[1, None]]
+            assert captured[name]["columns"] == [["identifier", "text"]]
+            assert "scope" not in captured[name]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "missing", "overload", "substituted"])
+async def test_metadata_batch_requires_fixed_census(change):
+    from process.provider_directory_source_control_privileges import METADATA_FUNCTIONS
+
+    native_functions = [
+        dict(proname=signature.split("(")[0], signature=str(501 + ordinal), authority_closed=True)
+        for ordinal, signature in enumerate(METADATA_FUNCTIONS)
+    ]
+    if change == "missing":
+        native_functions.pop()
+    elif change == "overload":
+        native_functions.append(dict(native_functions[0], signature="999"))
+    elif change == "substituted":
+        native_functions[-1] = dict(native_functions[0], signature="999")
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=native_functions))
+    if change is None:
+        captured = await isolated._isolated_metadata_rows(connection, "sample", ("reader",), [101, 102])
+        assert {function["signature"] for function in captured} == {
+            '"sample"."' + signature.split("(")[0] + '"(' + signature.split("(", 1)[1]
+            for signature in METADATA_FUNCTIONS
+        }
+    else:
+        with pytest.raises(GenericCandidateError, match="metadata_missing"):
+            await isolated._isolated_metadata_rows(connection, "sample", ("reader",), [101, 102])
+    query, schema, names, readers, private_oids = connection.fetch.await_args.args
+    assert (schema, set(names), readers, private_oids) == (
+        "sample",
+        {signature.split("(")[0] for signature in METADATA_FUNCTIONS},
+        ["reader"],
+        [101, 102],
+    )
+    assert "pg_has_role(actor.oid,(definition->>'proowner')::oid,'SET')" in query
+    assert "pg_has_role(actor.oid,(definition->>'proowner')::oid,'USAGE')" in query
+    assert "has_function_privilege(actor.oid,(definition->>'oid')::oid,'EXECUTE')" in query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoded", [False, True])
+@pytest.mark.parametrize(
+    "changed", [None, "edges", "forward_only", "owner_closed", "publication_closed", "publication_available"]
+)
+async def test_delegation_batch_preserves_codec_and_refusals(encoded, changed):
+    configured = _policy()
+    role_names = (
+        configured.owner_role,
+        configured.publisher_role,
+        *configured.runtime_roles,
+        "migration",
+        "namespace",
+        "publication_owner",
+        "publication_publisher",
+    )
+    roles_by_name = {
+        name: {"oid": 101 + ordinal, "rolcanlogin": name == "publication_publisher"}
+        for ordinal, name in enumerate(role_names)
+    }
+    delegation_by_field = dict(
+        edges=[[102, False, True, False], [104, True, True, False], [107, True, True, False]],
+        forward_only=True,
+        owner_closed=True,
+        publication_closed=True,
+        publication_available=True,
+    )
+    if changed == "edges":
+        delegation_by_field["edges"].pop()
+    elif changed:
+        delegation_by_field[changed] = False
+    if encoded:
+        delegation_by_field["edges"] = json.dumps(delegation_by_field["edges"])
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=delegation_by_field))
+    arguments = (
+        connection,
+        configured,
+        roles_by_name,
+        "migration",
+        "namespace",
+        dict(owner_role="publication_owner", publisher_role="publication_publisher"),
+    )
+    if changed:
+        errors_by_field = {
+            "publication_closed": "publication_reverse_delegation",
+            "publication_available": "publication_custody_unavailable",
+        }
+        with pytest.raises(GenericCandidateError, match=errors_by_field.get(changed, "source_delegation_changed")):
+            await isolated._isolated_delegation(*arguments)
+    else:
+        await isolated._isolated_delegation(*arguments)
+    connection.fetchrow.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoded", [False, True])
+async def test_catalog_batch_preserves_json_codec(encoded):
+    configured = _policy()
+    role_names = (configured.owner_role, configured.publisher_role, *configured.runtime_roles)
+    roles_by_name = {name: {"oid": 101 + ordinal} for ordinal, name in enumerate(role_names)}
+    evidence_by_field = {
+        name: [{"oid": 201, "nested": [None, True, "native"]}]
+        for name in ("catalog", "templates", "physical", "layouts", "admission_rights", "checkpoints")
+    }
+    native_by_field = {name: json.dumps(entries) if encoded else entries for name, entries in evidence_by_field.items()}
+    native_by_field.update(catalog_prefix='"catalog".', readers_closed=True, dependencies_closed=True)
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=native_by_field))
+    captured = await isolated._isolated_catalog_rows(connection, configured, "catalog", roles_by_name)
+    assert captured == dict(
+        evidence_by_field, catalog_prefix='"catalog".', readers_closed=True, dependencies_closed=True
+    )
+    connection.fetchrow.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -378,7 +544,10 @@ async def test_cms_dispositions_remain_scoped_to_shared_headers(custody):
     async with _callable_binding(factory, connection):
         assert candidate_available_sql("dataset", "catalog_schema", dataset_relation=private) == "TRUE"
         assert candidate_available_sql("dataset", "catalog_schema", dataset_relation=canonical) == legacy_predicate
-        assert candidate_available_sql("dataset", "catalog_schema", dataset_relation='"other"."header"') == legacy_predicate
+        assert (
+            candidate_available_sql("dataset", "catalog_schema", dataset_relation='"other"."header"')
+            == legacy_predicate
+        )
         assert candidate_available_sql("dataset", "catalog_schema") == legacy_predicate
         with pytest.raises(GenericCandidateError, match="schema_changed"):
             candidate_available_sql("dataset", "wrong_schema", dataset_relation=private)
@@ -391,12 +560,19 @@ async def test_validation_preserves_private_predecessor_and_legacy_current_fence
 
     directory = import_module("process.provider_directory_fhir")
     candidate = directory.EndpointDatasetCandidate(
-        endpoint_id="endpoint", dataset_id="candidate", acquisition_root_run_id="run",
-        source_ids=("source",), selected_resources=("Location",), expected_resources=("Location",),
-        import_run_id="run", previous_dataset_id="incumbent", semantic_projection_as_of="2026-01-01",
+        endpoint_id="endpoint",
+        dataset_id="candidate",
+        acquisition_root_run_id="run",
+        source_ids=("source",),
+        selected_resources=("Location",),
+        expected_resources=("Location",),
+        import_run_id="run",
+        previous_dataset_id="incumbent",
+        semantic_projection_as_of="2026-01-01",
     )
     locked_by_field = {
-        "acquisition_root_run_id": "run", "is_current": False,
+        "acquisition_root_run_id": "run",
+        "is_current": False,
         "status": directory.ENDPOINT_DATASET_PUBLISHED if case == "immutable" else directory.ENDPOINT_DATASET_ACQUIRING,
         "previous_dataset_id": {"changed": "other", "whitespace": " incumbent "}.get(case, "incumbent"),
         "publication_metadata_json": directory._endpoint_dataset_candidate_metadata(candidate),
@@ -458,6 +634,7 @@ async def test_isolated_binding_is_same_original_factory_object_before_routing(c
 @pytest.mark.parametrize("changed", [None, "canonical_schema", "native_owner"])
 async def test_isolated_startup_recaptures_storage_and_never_issues_legacy_ddl(custody, monkeypatch, changed):
     from importlib import import_module
+
     from process import provider_directory_generic_source_adapters as adapters
 
     directory = import_module("process.provider_directory_fhir")
@@ -470,7 +647,9 @@ async def test_isolated_startup_recaptures_storage_and_never_issues_legacy_ddl(c
         yield
 
     monkeypatch.setattr(adapters, "source_transaction", original_transaction)
-    monkeypatch.setattr(directory, "_schema", lambda: "wrong_catalog" if changed == "canonical_schema" else "catalog_schema")
+    monkeypatch.setattr(
+        directory, "_schema", lambda: "wrong_catalog" if changed == "canonical_schema" else "catalog_schema"
+    )
     legacy_probe = AsyncMock(side_effect=AssertionError("legacy schema mutation path reached"))
     monkeypatch.setattr(directory, "_is_table_present", legacy_probe)
     async with _callable_binding(factory, connection):
@@ -535,8 +714,9 @@ async def test_isolated_binding_requires_original_factory_and_identity_after_awa
 @pytest.mark.asyncio
 async def test_isolated_relation_routing_preserves_catalog_and_refuses_unverified_overrides(custody):
     from importlib import import_module
+
     from process.provider_directory_generic_source_storage import HEADER, RELATIONS
-    from process.provider_directory_proof_store import _proof_relation, PROVIDER_DIRECTORY_PROOF_SHARD_TABLE
+    from process.provider_directory_proof_store import PROVIDER_DIRECTORY_PROOF_SHARD_TABLE, _proof_relation
     from process.provider_directory_source_checkpoint_catalog import CHECKPOINT_LAYOUTS
 
     directory = import_module("process.provider_directory_fhir")
@@ -583,7 +763,8 @@ async def test_isolated_routing_refuses_unbound_or_inherited_transaction_and_pub
     factory.publication_session_factory = AsyncMock()
     async with policy.bind_generic_source_transaction_factory(factory):
         assert isolated.source_relation_coordinates("catalog_schema", "import_run", "import_run") == (
-            "catalog_schema", "import_run"
+            "catalog_schema",
+            "import_run",
         )
         with pytest.raises(GenericCandidateError, match="isolated_transaction_required"):
             isolated.source_relation_coordinates(

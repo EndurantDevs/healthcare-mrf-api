@@ -678,16 +678,26 @@ async def _fhir_input_identity(connection):
     )
 
 
+_FHIR_PHYSICAL_SQL = (
+    "SELECT c.oid::bigint,pg_relation_filenode(c.oid)::bigint AS relfilenode,"
+    "n.oid::bigint AS schema_oid,n.nspowner::bigint AS schema_owner_oid,"
+    "c.relacl::text AS raw_acl,n.nspacl::text AS raw_schema_acl,"
+    "(SELECT coalesce(jsonb_agg(jsonb_build_array(attnum,attacl::text) ORDER BY attnum),'[]'::jsonb) "
+    "FROM pg_attribute WHERE attrelid=c.oid AND attnum>0 AND NOT attisdropped AND attacl IS NOT NULL) AS column_acls "
+    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=ANY($1::oid[]) ORDER BY c.oid"
+)
+
+
 async def _fhir_physical_inventory(connection, selected_rows):
     physical_rows = await connection.fetch(
-        "SELECT c.oid::bigint,pg_relation_filenode(c.oid)::bigint AS relfilenode,"
-        "n.oid::bigint AS schema_oid,n.nspowner::bigint AS schema_owner_oid,"
-        "c.relacl::text AS raw_acl,n.nspacl::text AS raw_schema_acl,"
-        "(SELECT coalesce(jsonb_agg(jsonb_build_array(attnum,attacl::text) ORDER BY attnum),'[]'::jsonb) "
-        "FROM pg_attribute WHERE attrelid=c.oid AND attnum>0 AND NOT attisdropped AND attacl IS NOT NULL) AS column_acls "
-        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=ANY($1::oid[]) ORDER BY c.oid",
+        _FHIR_PHYSICAL_SQL,
         [relation_by_field["oid"] for relation_by_field in selected_rows],
     )
+    return _fhir_physical_rows(selected_rows, physical_rows)
+
+
+def _fhir_physical_rows(selected_rows, physical_rows):
+    """Attach physical coordinates only after exact native identity agreement."""
     by_oid = {relation_by_field["oid"]: _fhir_catalog_row(relation_by_field) for relation_by_field in physical_rows}
     _require(
         set(by_oid) == {relation_by_field["oid"] for relation_by_field in selected_rows},
