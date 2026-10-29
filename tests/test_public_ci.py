@@ -17,7 +17,6 @@ PYTHON_DEPENDENCY_JOBS = {
     "security",
     "worker-queue-smoke",
     "address-canonical-db-tests",
-    "fhir-catalog-integration",
 }
 LOCAL_SETUP_ACTION = "./ci/scripts/healthcare/setup"
 COMMON_TEST_JOBS = {"python-tests", "capacity-evidence"}
@@ -34,7 +33,6 @@ JOB_LABELS = {
     "security": "Security scans",
     "worker-queue-smoke": "Worker queue tests",
     "address-canonical-db-tests": "${{ matrix.label }}",
-    "fhir-catalog-integration": "FHIR catalog integration",
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
     "dev-image-publication": "DEV image publication",

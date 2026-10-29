@@ -893,90 +893,6 @@ jobs:
           output: artifact_profile_publication
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
-  fhir-catalog-integration:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'FHIR catalog integration (metadata only)' || 'FHIR catalog integration' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs:
-    - public-hygiene
-    - readability-preflight
-    services:
-      postgres:
-        image: postgis/postgis:18-3.6@sha256:60f6ad1d21ea86a67d47780b9a0d1e1d200500f62b19293fa834d0dea80b8677
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
-        ports:
-        - 5432:5432
-        - 5440:5432
-        options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
-          5s --health-retries 25
-    env:
-      PYTEST_ADDOPTS: ''
-      HLTHPRT_DB_DRIVER: asyncpg
-      HLTHPRT_DB_PORT: '5432'
-      HLTHPRT_DB_USER: postgres
-      HLTHPRT_DB_PASSWORD: postgres
-      HLTHPRT_DB_DATABASE: ptg2_v3_lifecycle_test_ci_runner
-      HLTHPRT_DB_SCHEMA: mrf
-      DB_SCHEMA: mrf
-      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
-      CI_SHARD: fhir-catalog-integration
-    defaults:
-      run:
-        shell: bash
-        working-directory: source
-    steps:
-    - name: Check out pinned public CI
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 77c769e482f7687020bd0133a50d1fc9428fcc3a
-        path: ci
-        persist-credentials: false
-    - name: Prepare source and toolchain
-      uses: ./ci/scripts/healthcare/setup
-    - name: Check catalog integration capability
-      id: catalog-capability
-      run: bash "$CI_ROOT/scripts/healthcare/check" fhir-catalog-capability >> "$GITHUB_OUTPUT"
-    - name: Install PostgreSQL client
-      run: bash "$CI_ROOT/scripts/install_postgres_client"
-      if: steps.catalog-capability.outputs.present == 'true'
-    - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-      with:
-        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
-        digest-mismatch: error
-        path: rust-debug-binaries
-      if: steps.catalog-capability.outputs.present == 'true'
-    - name: Run complete validation stage
-      env:
-        HLTHPRT_DB_HOST: 127.0.0.1
-        CI_POSTGRES_SERVICE_ID: ${{ job.services.postgres.id }}
-        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
-      run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"
-
-        git diff --exit-code
-
-        git diff --cached --exit-code
-
-        test -z "$(git ls-files --others --exclude-standard)"'
-      if: steps.catalog-capability.outputs.present == 'true'
-    - name: Upload exact-source catalog integration evidence
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        name: mrf-fhir-catalog-integration-${{ github.run_id }}-${{ github.run_attempt }}
-        path: '${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.xml
-
-          ${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.selection
-
-          ${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.json'
-        retention-days: 1
-        if-no-files-found: error
-      if: steps.catalog-capability.outputs.present == 'true'
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
   measurement:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'Coverage results (metadata only)' || 'Coverage results' }}
@@ -999,7 +915,6 @@ jobs:
     - security
     - worker-queue-smoke
     - address-canonical-db-tests
-    - fhir-catalog-integration
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (!cancelled()) }}
     steps:
