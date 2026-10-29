@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import subprocess
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -12,6 +15,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import MetaData
+
+from process import entity_address_dependency_bindings as dependencies
+from process import tiger_held_inputs
+from tests.test_entity_address_snapshot_destination import _owned_native_database
+from tests.test_entity_address_snapshot_stage_postgres import _native_test_connection
 
 source = importlib.import_module("process.entity_address_snapshot_source")
 
@@ -138,3 +146,152 @@ async def test_receipt_normalization_respects_stricter_memory_budget(initial_mb,
             )
     finally:
         await engine.dispose()
+
+
+async def _create_selected_inputs(database):
+    for schema in ("mrf", "tiger"):
+        await database.status(f"CREATE SCHEMA {schema}")
+    names = [f"{schema or 'mrf'}.{name}" for schema, name in dependencies.projection._PROJECTION_DEPENDENCIES]
+    names.append("tiger.captured_support")
+    for name in names:
+        await database.status(f"CREATE TABLE {name} (marker text)")
+    await database.status("CREATE TABLE mrf.publication (marker text)")
+    await database.status("INSERT INTO mrf.publication VALUES ('old')")
+    relations = await database.all(
+        "SELECT n.nspname AS schema_name,c.relname AS relation_name,c.oid::bigint AS relation_oid,"
+        "pg_relation_filenode(c.oid)::bigint AS relfilenode "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='tiger'"
+    )
+    return names, {"relations": [dict(relation._mapping) for relation in relations]}
+
+
+@asynccontextmanager
+async def _selected_inputs(monkeypatch):
+    """Own all native fixture state and close the short-timeout guard on every exit."""
+    dsn, _ = _native_test_connection()
+    async with _owned_native_database(dsn, monkeypatch) as database:
+        names, inventory_by_field = await _create_selected_inputs(database)
+
+        async def capture(session, **_options):
+            await session.execute(
+                text("LOCK TABLE tiger.zip_state,tiger.zcta5,tiger.captured_support IN ACCESS SHARE MODE")
+            )
+            return {"tiger": inventory_by_field}
+
+        monkeypatch.setattr(tiger_held_inputs, "selected_captured_inventories", capture)
+        monkeypatch.setattr(tiger_held_inputs, "selected_tiger_inventory", AsyncMock(side_effect=AssertionError))
+        guard_engine = create_async_engine(
+            database.engine.url,
+            pool_size=1,
+            max_overflow=0,
+            connect_args={
+                "server_settings": {
+                    "idle_in_transaction_session_timeout": "1s",
+                    "transaction_timeout": "2s",
+                }
+            },
+        )
+        factory = database.session_factory
+        guard_factory = async_sessionmaker(guard_engine, expire_on_commit=False)
+        try:
+            # Only the dependency owner has the short timeout; cutover keeps its ordinary pool.
+            database.session_factory = guard_factory
+            manager = dependencies.selected_publication_dependencies(database, "mrf")
+            selected = await manager.__aenter__()
+            database.session_factory = factory
+            try:
+                yield database, selected, names, guard_engine
+            except BaseException as error:
+                await manager.__aexit__(type(error), error, error.__traceback__)
+                raise
+            else:
+                await manager.__aexit__(None, None, None)
+                async with guard_engine.connect() as released:
+                    assert await released.scalar(text("SHOW idle_in_transaction_session_timeout")) == "1s"
+                    assert await released.scalar(text("SHOW transaction_timeout")) == "2s"
+        finally:
+            database.session_factory = factory
+            await guard_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_guard_survives_idle_timeout_and_overlaps_complete_family_locks(monkeypatch):
+    async with _selected_inputs(monkeypatch) as (database, selected, names, guard_engine):
+        held = dependencies._HELD_PUBLICATION_DEPENDENCIES.get()
+        assert len(selected) == 6 and len(held.relations_by_name) == 7
+        assert await held.session.scalar(text("SHOW idle_in_transaction_session_timeout")) == "0"
+        assert await held.session.scalar(text("SHOW transaction_timeout")) == "0"
+        await asyncio.sleep(2.2)
+        async with database.transaction() as cutover:
+            await dependencies.lock_selected_publication_dependencies(database, "mrf")
+            owner_count = await cutover.scalar(
+                text(
+                    "SELECT count(DISTINCT pid) FROM pg_locks WHERE granted AND mode='AccessShareLock' "
+                    "AND relation='tiger.captured_support'::regclass"
+                )
+            )
+            assert owner_count == 2
+            await database.status("UPDATE mrf.publication SET marker='new'")
+        assert await held.session.scalar(text("SELECT pg_backend_pid()")) == held.backend_id
+        assert await database.scalar("SELECT marker FROM mrf.publication") == "new"
+        assert len(names) == 7
+    assert dependencies._HELD_PUBLICATION_DEPENDENCIES.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_overlap", (False, True))
+async def test_native_lost_dependency_owner_prevents_publication(monkeypatch, after_overlap):
+    async with (
+        _selected_inputs(monkeypatch) as (database, _selected, _names, _engine),
+        database.engine.connect() as observer,
+    ):
+        held = dependencies._HELD_PUBLICATION_DEPENDENCIES.get()
+
+        async def terminate():
+            assert await observer.scalar(text("SELECT pg_terminate_backend(:pid)"), {"pid": held.backend_id})
+
+        if not after_overlap:
+            await terminate()
+        with pytest.raises(DBAPIError) as disconnected:
+            async with database.transaction() as cutover:
+                execute = cutover.execute
+
+                async def overlap_then_terminate(statement, *args, **kwargs):
+                    result = await execute(statement, *args, **kwargs)
+                    if str(statement).startswith("LOCK TABLE"):
+                        await terminate()
+                    return result
+
+                if after_overlap:
+                    monkeypatch.setattr(cutover, "execute", overlap_then_terminate)
+                await dependencies.lock_selected_publication_dependencies(database, "mrf")
+                await database.status("UPDATE mrf.publication SET marker='new'")
+        assert disconnected.value.connection_invalidated
+        assert await database.scalar("SELECT marker FROM mrf.publication") == "old"
+        # End the failed, read-only owner transaction without attempting its COMMIT.
+        await held.session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_native_cutover_retains_family_locks_after_original_owner_disconnects(monkeypatch):
+    is_body_complete = False
+    with pytest.raises(DBAPIError) as disconnected:
+        async with (
+            _selected_inputs(monkeypatch) as (database, _selected, _names, _engine),
+            database.engine.connect() as observer,
+        ):
+            held = dependencies._HELD_PUBLICATION_DEPENDENCIES.get()
+            async with database.transaction():
+                await dependencies.lock_selected_publication_dependencies(database, "mrf")
+                assert await observer.scalar(text("SELECT pg_terminate_backend(:pid)"), {"pid": held.backend_id})
+                with pytest.raises(DBAPIError) as blocked:
+                    await observer.execute(text("LOCK TABLE tiger.captured_support IN ACCESS EXCLUSIVE MODE NOWAIT"))
+                assert blocked.value.orig.sqlstate == "55P03"
+                await observer.rollback()
+                await database.status("UPDATE mrf.publication SET marker='new'")
+            assert await database.scalar("SELECT marker FROM mrf.publication") == "new"
+            await observer.execute(text("LOCK TABLE tiger.captured_support IN ACCESS EXCLUSIVE MODE NOWAIT"))
+            await observer.rollback()
+            is_body_complete = True
+    assert is_body_complete
+    assert disconnected.value.connection_invalidated
