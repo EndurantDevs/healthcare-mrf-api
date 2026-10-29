@@ -16,6 +16,10 @@ from process.ptg_parts.ptg2_candidate_attestation import (
 )
 from process.ptg_parts.ptg2_shared_gc import release_unbound_ptg2_shared_layouts
 from process.ptg_parts.snapshot_cleanup import is_shared_snapshot_control_manifest
+from process.ptg_parts.source_pointers import (
+    PTG2SourcePointerConflict,
+    activate_ptg2_source_candidate,
+)
 from process.ptg_parts.source_snapshot_control_lifecycle import (
     lock_source_pointer_gc as _lock_source_pointer_gc,
 )
@@ -25,15 +29,19 @@ from process.ptg_parts.source_snapshot_control_policy import (
     retirement_manifest_source_key,
     snapshot_remove_reasons,
 )
-from process.ptg_parts.source_pointers import (
-    PTG2SourcePointerConflict,
-    activate_ptg2_source_candidate,
-)
 from process.ptg_parts.source_snapshot_control_results import (
     executed_empty_remove_plan as _executed_empty_remove_plan,
+)
+from process.ptg_parts.source_snapshot_control_results import (
     executed_snapshot_remove_plan as _executed_snapshot_remove_plan,
+)
+from process.ptg_parts.source_snapshot_control_results import (
     missing_snapshot_remove_plan as _missing_snapshot_remove_plan,
+)
+from process.ptg_parts.source_snapshot_control_results import (
     supported_snapshot_remove_plan as _supported_snapshot_remove_plan,
+)
+from process.ptg_parts.source_snapshot_control_results import (
     unsupported_snapshot_remove_plan as _unsupported_snapshot_remove_plan,
 )
 from process.ptg_parts.source_snapshot_references import (
@@ -44,6 +52,7 @@ from process.ptg_parts.source_snapshot_shared_layout import (
     bound_shared_layout_keys,
     validate_retirement_shared_layout,
 )
+
 
 class SourceSnapshotConflict(ValueError):
     """Raised when a source snapshot pointer changed between plan and execute."""
@@ -71,6 +80,7 @@ class _TransactionExecutor:
         )
         return getattr(result, "rowcount", None)
 
+
 def _schema_name() -> str:
     return os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
 
@@ -97,9 +107,7 @@ async def promote_ptg2_source_snapshot(
     if not source_key or not snapshot_id:
         raise ValueError("source_key and snapshot_id are required")
     approval_digest = (
-        parse_candidate_attestation_digest(
-            expected_audit_only_attestation_digest
-        )
+        parse_candidate_attestation_digest(expected_audit_only_attestation_digest)
         if expected_audit_only_attestation_digest is not None
         else None
     )
@@ -136,9 +144,7 @@ async def build_source_snapshot_remove_plan(
         return _missing_snapshot_remove_plan(snapshot_id, source_key)
     manifest = manifest_dict(snapshot.get("manifest"))
     serving_index = manifest.get("serving_index") if isinstance(manifest.get("serving_index"), dict) else {}
-    storage_generation = str(
-        serving_index.get("storage_generation") or ""
-    ).strip().lower()
+    storage_generation = str(serving_index.get("storage_generation") or "").strip().lower()
     if not is_shared_snapshot_control_manifest(serving_index):
         return _unsupported_snapshot_remove_plan(
             snapshot_id=snapshot_id,
@@ -180,16 +186,14 @@ async def _delete_snapshot_metadata(
     count_by_field = {
         "deleted_v3_snapshot_scopes": int(
             await db.status(
-                f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_scope "
-                "WHERE snapshot_id = :snapshot_id",
+                f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_scope WHERE snapshot_id = :snapshot_id",
                 snapshot_id=snapshot_id,
             )
             or 0
         ),
         "deleted_v3_snapshot_bindings": int(
             await db.status(
-                f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_binding "
-                "WHERE snapshot_id = :snapshot_id",
+                f"DELETE FROM {_quote_ident(schema)}.ptg2_v3_snapshot_binding WHERE snapshot_id = :snapshot_id",
                 snapshot_id=snapshot_id,
             )
             or 0
@@ -199,8 +203,7 @@ async def _delete_snapshot_metadata(
     if artifact_ids:
         count_by_field["deleted_artifact_chunks"] = int(
             await db.status(
-                f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_blob_chunk "
-                "WHERE artifact_id = ANY(:artifact_ids)",
+                f"DELETE FROM {_quote_ident(schema)}.ptg2_artifact_blob_chunk WHERE artifact_id = ANY(:artifact_ids)",
                 artifact_ids=artifact_ids,
             )
             or 0
@@ -211,8 +214,7 @@ async def _delete_snapshot_metadata(
     ):
         count_by_field[count_name] = int(
             await db.status(
-                f"DELETE FROM {_quote_ident(schema)}.{table_name} "
-                "WHERE snapshot_id = :snapshot_id",
+                f"DELETE FROM {_quote_ident(schema)}.{table_name} WHERE snapshot_id = :snapshot_id",
                 snapshot_id=snapshot_id,
             )
             or 0
@@ -262,22 +264,16 @@ async def remove_ptg2_source_snapshot(
             raise ValueError(str(plan.get("reason") or "snapshot is not removable"))
         if not plan.get("exists"):
             return _executed_empty_remove_plan(plan)
-        storage_generation = str(
-            plan.get("storage_generation") or ""
-        ).strip().lower()
+        storage_generation = str(plan.get("storage_generation") or "").strip().lower()
         layout_keys = await bound_shared_layout_keys(
             session,
             schema=schema,
             snapshot_id=snapshot_id,
             expected_generation=storage_generation,
             expected_snapshot_key=plan.get("shared_snapshot_key"),
-            allow_missing_binding=str(plan.get("status") or "").strip().lower()
-            == "failed",
+            allow_missing_binding=str(plan.get("status") or "").strip().lower() == "failed",
         )
-        artifact_ids = [
-            str(artifact_id)
-            for artifact_id in plan.get("artifact_manifest_ids") or []
-        ]
+        artifact_ids = [str(artifact_id) for artifact_id in plan.get("artifact_manifest_ids") or []]
         deletion_counts = await _delete_snapshot_metadata(
             schema,
             snapshot_id,
@@ -332,12 +328,10 @@ async def retire_ptg2_source_snapshot(
             )
         ):
             raise ValueError("snapshot is referenced by a previous snapshot pointer")
-        deleted_plan_pointers, deleted_source_pointers = (
-            await _delete_retired_source_pointers(
-                schema,
-                snapshot_id=snapshot_id,
-                source_key=source_key,
-            )
+        deleted_plan_pointers, deleted_source_pointers = await _delete_retired_source_pointers(
+            schema,
+            snapshot_id=snapshot_id,
+            source_key=source_key,
         )
         after = await _current_references(schema, snapshot_id)
     _clear_ptg2_snapshot_cache()
@@ -429,14 +423,11 @@ async def _current_references(schema: str, snapshot_id: str) -> dict[str, list[s
         schema,
         snapshot_id,
         _snapshot_reference_rows,
+        db,
     )
     return {
-        "global_slots": reference_string_values(
-            reference_rows_by_kind["global"], "slot", _row_mapping
-        ),
-        "source_keys": reference_string_values(
-            reference_rows_by_kind["source"], "source_key", _row_mapping
-        ),
+        "global_slots": reference_string_values(reference_rows_by_kind["global"], "slot", _row_mapping),
+        "source_keys": reference_string_values(reference_rows_by_kind["source"], "source_key", _row_mapping),
         "plan_source_keys": reference_string_values(
             reference_rows_by_kind["plan"],
             "plan_source_key",
@@ -458,8 +449,7 @@ async def _current_references(schema: str, snapshot_id: str) -> dict[str, list[s
             _row_mapping,
         ),
         "plan_release_pins": [
-            f"{_row_mapping(reference_row).get('owner_type')}:"
-            f"{_row_mapping(reference_row).get('owner_id')}"
+            f"{_row_mapping(reference_row).get('owner_type')}:{_row_mapping(reference_row).get('owner_id')}"
             for reference_row in reference_rows_by_kind["pin"]
         ],
         "plan_release_bindings": [

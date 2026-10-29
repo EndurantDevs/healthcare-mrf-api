@@ -20,6 +20,8 @@ class _Session:
 
     async def execute(self, statement, params):
         self.calls.append((str(statement), params))
+        if "AS storage_present" in str(statement):
+            return []
         if "AS readable" in str(statement):
             return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
         return list(self.rows)
@@ -32,6 +34,8 @@ class _SequenceSession:
 
     async def execute(self, statement, params):
         self.calls.append((str(statement), params))
+        if "AS storage_present" in str(statement):
+            return []
         if "AS readable" in str(statement):
             return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
         return list(self.results.pop(0))
@@ -114,7 +118,7 @@ def test_typed_resolution_marks_existing_unpublished_release_unavailable():
 
     assert serving_resolution.state == "unavailable"
     assert serving_resolution.selection is None
-    assert len(session.calls) == 3
+    assert len(session.calls) == 4
 
 
 def test_existence_probe_detects_release_without_snapshot_bindings():
@@ -132,8 +136,8 @@ def test_existence_probe_detects_release_without_snapshot_bindings():
         )
     )
 
-    ready_sql = session.calls[1][0]
-    existence_sql = session.calls[2][0]
+    ready_sql = session.calls[2][0]
+    existence_sql = session.calls[3][0]
     assert "plan_release_snapshot_binding" in ready_sql
     assert "plan_release_snapshot_binding" not in existence_sql
     assert serving_resolution.state == "unavailable"
@@ -189,8 +193,8 @@ def test_typed_resolution_rejects_release_binding_fanout_before_readiness(
 
     assert serving_resolution.state == "unavailable"
     assert serving_resolution.selection is None
-    assert len(session.calls) == 2
-    assert f"LIMIT {row_limit}" in session.calls[1][0]
+    assert len(session.calls) == 3
+    assert f"LIMIT {row_limit}" in session.calls[2][0]
     readiness.assert_not_awaited()
 
 

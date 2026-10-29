@@ -59,8 +59,8 @@ def test_retry_uses_first_query_value_without_mutation(is_sanic_args, field, val
 @pytest.mark.parametrize(
     ("order_by", "status", "query_count"),
     [
-        ("distance", 200, 3),
-        ("total_allowed_amount", 422, 2),
+        ("distance", 200, 4),
+        ("total_allowed_amount", 422, 3),
     ],
 )
 async def test_native_query_args_use_projection_resolution_and_retry(monkeypatch, order_by, status, query_count):
@@ -76,6 +76,7 @@ async def test_native_query_args_use_projection_resolution_and_retry(monkeypatch
     assert response.status == status
     assert len(session.calls) == query_count
     assert "AS readable" in session.calls[0][0]
+    assert "AS storage_present" in session.calls[1][0]
     if status == 422:
         assert json.loads(response.body)["fix_it"]["retry_options"] == [RETRY_BY_FIELD]
         search.assert_not_awaited()

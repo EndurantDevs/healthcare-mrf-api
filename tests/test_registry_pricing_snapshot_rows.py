@@ -239,7 +239,8 @@ async def test_actual_metadata_consumer_checks_all_sibling_snapshots(monkeypatch
         control_schema="sample_control",
         max_report_bytes=16 * 1024 * 1024,
     )
-    assert len(driver.calls) == 7 and driver.lifecycle == ["start", "release"] * 3
+    assert len(driver.calls) == 8 and driver.lifecycle == ["start", "release"] * 3
+    assert sum("AS storage_present" in sql for sql, _ in driver.calls) == 1
     assert sum("AS readable" in sql for sql, _ in driver.calls) == 1
     provenance = extended_report["provenance"]["pricing_binding_metadata"]
     assert provenance["snapshot_row_checks"]["sibling"]["status"] == "unavailable"

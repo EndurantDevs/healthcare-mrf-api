@@ -55,7 +55,7 @@ async def native_admission(monkeypatch):
                 (serving_revision_id text, published_at timestamptz, plan_release_id text,
                  healthporta_plan_id text, plan_version_id text, release_month text,
                  release_status text, expected_binding_count integer, binding_set_digest text,
-                 serving_status text, is_current boolean);
+                 serving_status text, is_current boolean, source_manifest jsonb NOT NULL DEFAULT '{{}}'::jsonb);
             CREATE TABLE {schema}.plan_release_snapshot_binding
                 (serving_revision_id text, binding_ordinal integer, snapshot_id text,
                  source_key text, plan_id text, plan_market_type text, role text, required boolean);

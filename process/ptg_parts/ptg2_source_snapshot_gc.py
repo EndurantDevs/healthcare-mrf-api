@@ -29,6 +29,7 @@ from process.ptg_parts.ptg2_shared_gc import (
 from process.ptg_parts.snapshot_cleanup import (
     is_shared_snapshot_control_manifest,
 )
+from process.ptg_parts.source_snapshot_references import source_binding_schema
 
 _GC_CANDIDATE_STATUSES = frozenset({"published", "failed"})
 _AGE_GC_PROTECTED_STATUSES = frozenset({"validated"})
@@ -59,6 +60,7 @@ SELECT DISTINCT snapshot_id
         UNION ALL
         SELECT snapshot_id FROM __SCHEMA__.plan_release_snapshot_binding
          WHERE snapshot_id IS NOT NULL
+        /* __SOURCE_BINDINGS__ */
   ) refs
  ORDER BY snapshot_id
 """
@@ -147,6 +149,7 @@ DELETE FROM __SCHEMA__.ptg2_snapshot
             )) = 'true'
         )
    )
+RETURNING snapshot_id
 """
 
 
@@ -295,7 +298,17 @@ async def _load_current_snapshot_ids(
     executor: Any,
     schema_name: str,
 ) -> tuple[str, ...]:
-    pointer_records = await executor.all(_schema_sql(_CURRENT_SNAPSHOT_IDS_SQL, schema_name))
+    control_schema = await source_binding_schema(executor, schema_name)
+    source_bindings = (
+        f"UNION ALL SELECT snapshot_id FROM {_quote_ident(control_schema)}.hp_plan_release_binding "
+        "WHERE snapshot_id IS NOT NULL"
+        if control_schema is not None
+        else ""
+    )
+    statement = _schema_sql(_CURRENT_SNAPSHOT_IDS_SQL, schema_name).replace(
+        "/* __SOURCE_BINDINGS__ */", source_bindings
+    )
+    pointer_records = await executor.all(statement)
     return tuple(str(_row_mapping(pointer_record).get("snapshot_id")) for pointer_record in pointer_records)
 
 
@@ -658,12 +671,18 @@ async def _delete_snapshot_gc_metadata(
         _schema_sql(_DELETE_ARTIFACT_MANIFEST_SQL, schema_name),
         **query_parameters_by_name,
     )
-    await connection.status(
+    deleted_snapshots = await connection.all(
         _schema_sql(_DELETE_GC_SNAPSHOTS_SQL, schema_name),
         **query_parameters_by_name,
         allowed_amount_contract=PTG2_ALLOWED_AMOUNT_CONTRACT,
         shared_generations=list(_PTG2_SOURCE_GC_SHARED_GENERATIONS),
     )
+    expected_snapshot_ids = set(candidate_snapshot_ids)
+    if (
+        len(deleted_snapshots) != len(expected_snapshot_ids)
+        or {_row_mapping(snapshot_row)["snapshot_id"] for snapshot_row in deleted_snapshots} != expected_snapshot_ids
+    ):
+        raise RuntimeError("Refusing cleanup: snapshot deletion set changed")
     return int(deleted_binding_count or 0)
 
 
