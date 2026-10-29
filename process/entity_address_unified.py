@@ -64,6 +64,7 @@ from process.entity_address_dependency_bindings import (
     activate_geo_assurance_candidate_sql as _activate_geo_assurance_candidate_sql,
 )
 from process.entity_address_dependency_bindings import (
+    lock_selected_publication_dependencies,
     preflight_publication_dependencies,
     selected_publication_dependencies,
 )
@@ -2157,6 +2158,7 @@ async def _run_entity_address_cutover(
     if require_caller_owned_transaction:
         require_caller_owned_cutover_transaction(db)
     async with serving_recovery.address_transaction(db, lock_timeout, _sql_literal, context):
+        await lock_selected_publication_dependencies(db, db_schema)
         directory = importlib.import_module("process.provider_directory_fhir")
         await lock_address_source_fence(directory, db, db_schema, context)
         await preparation_admission.read_scalar(db, address_alias_sql.alias_advisory_xact_lock_sql())
@@ -13801,22 +13803,6 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
                 time.monotonic() - started,
                 None,
             )
-            await mark_control_run(
-                run_id,
-                status="succeeded",
-                phase_detail="entity-address-unified post-publish validation complete",
-                progress_message="post-publish validation complete",
-                progress={
-                    "unit": "rows",
-                    "done": published_rows,
-                    "total": published_rows,
-                    "pct": 100,
-                    "message": "post-publish validation complete",
-                    "phase": "entity-address-unified post-publish validation complete",
-                },
-                metrics=_published_metrics(),
-            )
-            context["preserve_control_run_finished_at"] = True
         except Exception as exc:
             context["publish_validation"] = {
                 "deferred": True,
@@ -13840,6 +13826,23 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
                 metrics=_published_metrics(),
             )
             raise
+        await mark_control_run(
+            run_id,
+            status="succeeded",
+            phase_detail="entity-address-unified post-publish validation complete",
+            progress_message="post-publish validation complete",
+            progress={
+                "unit": "rows",
+                "done": published_rows,
+                "total": published_rows,
+                "pct": 100,
+                "message": "post-publish validation complete",
+                "phase": "entity-address-unified post-publish validation complete",
+            },
+            metrics=_published_metrics(),
+            committed_context=context,
+        )
+        context["preserve_control_run_finished_at"] = True
     else:
         await mark_control_run(
             run_id,
@@ -13855,6 +13858,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
                 "phase": "entity-address-unified published",
             },
             metrics=_published_metrics(),
+            committed_context=context,
         )
         context["preserve_control_run_finished_at"] = True
     if context["post_publish_index_profile"] != "none":
@@ -13864,41 +13868,33 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
                 "EntityAddressUnified post-publish index warmup complete: profile=%s",
                 context["post_publish_index_profile"],
             )
-            await mark_control_run(
-                run_id,
-                status="succeeded",
-                phase_detail="entity-address-unified post-publish indexes warmed",
-                progress_message="post-publish indexes warmed",
-                progress={
-                    "unit": "rows",
-                    "done": published_rows,
-                    "total": published_rows,
-                    "pct": 100,
-                    "message": "post-publish indexes warmed",
-                    "phase": "entity-address-unified post-publish indexes warmed",
-                },
-                metrics=_published_metrics(),
-                preserve_finished_at=True,
-            )
         except Exception as exc:  # pragma: no cover - defensive; publish already succeeded
             context["post_publish_index_error"] = str(exc)
             logger.exception("EntityAddressUnified post-publish index warmup failed: %s", exc)
-            await mark_control_run(
-                run_id,
-                status="succeeded",
-                phase_detail="entity-address-unified post-publish index warmup failed",
-                progress_message="published; post-publish index warmup failed",
-                progress={
-                    "unit": "rows",
-                    "done": published_rows,
-                    "total": published_rows,
-                    "pct": 100,
-                    "message": "published; post-publish index warmup failed",
-                    "phase": "entity-address-unified post-publish index warmup failed",
-                },
-                metrics=_published_metrics(),
-                preserve_finished_at=True,
-            )
+        warmup_failed = bool(context.get("post_publish_index_error"))
+        warmup_phase = "entity-address-unified post-publish " + (
+            "index warmup failed" if warmup_failed else "indexes warmed"
+        )
+        warmup_message = (
+            "published; post-publish index warmup failed" if warmup_failed else "post-publish indexes warmed"
+        )
+        await mark_control_run(
+            run_id,
+            status="succeeded",
+            phase_detail=warmup_phase,
+            progress_message=warmup_message,
+            progress={
+                "unit": "rows",
+                "done": published_rows,
+                "total": published_rows,
+                "pct": 100,
+                "message": warmup_message,
+                "phase": warmup_phase,
+            },
+            metrics=_published_metrics(),
+            preserve_finished_at=True,
+            committed_context=context if context.get("control_run_terminal_committed") else None,
+        )
     print_time_info(context.get("start"))
 
 

@@ -787,6 +787,7 @@ async def handoff_entity_address_generation(ctx, *, schema_name, import_date, de
     async with suppress_control_run_heartbeat_persistence(handoff_by_field["run_id"]):
         try:
             async with native.db.transaction() as session:
+                await native.lock_selected_publication_dependencies(native.db, schema_name)
                 captured = await _capture_handoff(session, ctx, handoff_by_field)
                 await _write_handoff(session, captured)
         except Exception, asyncio.CancelledError:

@@ -4,6 +4,8 @@
 import json
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 
 from sqlalchemy import text
 
@@ -11,6 +13,19 @@ from api import ptg2_geo_projection as projection
 from db.models import EntityAddressUnified
 
 PUBLISHER_SELECTED_INPUTS_CONTRACT = "entity-address-publisher-selected-inputs.v1"
+
+
+@dataclass(frozen=True)
+class _HeldPublicationDependencies:
+    database: object
+    schema: str
+    session: object
+    transaction: object
+    backend_id: int
+    relations_by_name: dict
+
+
+_HELD_PUBLICATION_DEPENDENCIES = ContextVar("held_address_publication_dependencies", default=None)
 
 
 def validate_publisher_selected_inputs(schema_name, value):
@@ -205,7 +220,73 @@ async def selected_publication_dependencies(database, schema_name, *, control_co
             text("SELECT " + projection.projection_dependency_bindings_match_sql(schema, bindings))
         ):
             raise RuntimeError("entity-address publication dependency changed")
-        yield bindings
+        async with _hold_publication_dependencies(database, schema, session, by_name, bindings):
+            yield bindings
+
+
+@asynccontextmanager
+async def _hold_publication_dependencies(database, schema, session, captured_relations_by_name, bindings):
+    """Retain the original lock owner while independent backends prepare its publication."""
+    await session.execute(
+        text(
+            "SELECT set_config('idle_in_transaction_session_timeout', '0', true), "
+            "CASE WHEN current_setting('transaction_timeout', true) IS NOT NULL "
+            "THEN set_config('transaction_timeout', '0', true) END"
+        )
+    )
+    relations_by_name = {}
+    for relation in [*captured_relations_by_name.values(), *bindings.values()]:
+        namespace = projection._sql_identifier(relation["schema_name"], field_name="dependency schema")
+        name = projection._sql_identifier(
+            relation.get("table_name", relation.get("relation_name")), field_name="dependency table"
+        )
+        relations_by_name[f'"{namespace}"."{name}"'] = (relation["relation_oid"], relation["relfilenode"])
+    held = _HeldPublicationDependencies(
+        database,
+        schema,
+        session,
+        session.get_transaction(),
+        await session.scalar(text("SELECT pg_backend_pid()")),
+        relations_by_name,
+    )
+    token = _HELD_PUBLICATION_DEPENDENCIES.set(held)
+    try:
+        yield
+    finally:
+        _HELD_PUBLICATION_DEPENDENCIES.reset(token)
+
+
+async def lock_selected_publication_dependencies(database, schema_name):
+    """Overlap the build's physical locks with cutover before checking its original owner."""
+    held = _HELD_PUBLICATION_DEPENDENCIES.get()
+    if held is None:
+        return
+    binding = database._transaction_binding()
+    if held.database is not database or held.schema != schema_name or binding is None:
+        raise RuntimeError("entity-address publication dependency transaction changed")
+    session = binding.session
+    names = sorted(held.relations_by_name)
+    await session.execute(
+        text("LOCK TABLE " + ", ".join("ONLY " + name for name in names) + " IN ACCESS SHARE MODE NOWAIT")
+    )
+    observed = (
+        await session.execute(
+            text(
+                "SELECT name, to_regclass(name)::oid::bigint, "
+                "pg_relation_filenode(to_regclass(name))::bigint "
+                "FROM unnest(CAST(:names AS text[])) AS name"
+            ),
+            {"names": names},
+        )
+    ).all()
+    if {name: (oid, filenode) for name, oid, filenode in observed} != held.relations_by_name:
+        raise RuntimeError("entity-address publication dependency changed")
+    if (
+        held.session.get_transaction() is not held.transaction
+        or not held.session.in_transaction()
+        or await held.session.scalar(text("SELECT pg_backend_pid()")) != held.backend_id
+    ):
+        raise RuntimeError("entity-address publication dependency lock owner changed")
 
 
 async def read_active_bindings(session, schema_name):

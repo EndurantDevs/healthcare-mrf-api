@@ -97,6 +97,7 @@ def _committed_target_result(
         not in {
             "process.nucc",
             "process.npi",
+            "process.entity_address_unified",
             "process.massachusetts_profile",
             "process.kentucky_profile",
             "process.tennessee_profile",
@@ -954,17 +955,17 @@ def _control_transition_times(
         committed_finished = _committed_control_timestamp(database_finished_at)
     else:
         committed_heartbeat = None
-        committed_finished = None
+        committed_finished = (
+            _committed_control_timestamp(database_finished_at)
+            if preserve_finished_at and database_finished_at is not None
+            else None
+        )
     return _ControlTransitionTimes(
         now,
         committed_heartbeat,
         committed_finished,
         (attempt_started_at or now) if status == "running" else None,
-        (
-            committed_finished
-            if database_state_committed
-            else (now if is_terminal and not preserve_finished_at else None)
-        ),
+        committed_finished or (now if is_terminal and not preserve_finished_at else None),
     )
 
 
@@ -986,11 +987,20 @@ async def mark_control_run(
     database_finished_at: object = None,
     expected_state: tuple[str, str] | None = None,
     pricing_claim_task: dict[str, Any] | None = None,
+    committed_context: dict[str, Any] | None = None,
 ):
     """Persist and publish one authoritative control-run lifecycle transition."""
 
     if not run_id:
         return _CONTROL_RUN_NOT_MARKED
+    if committed_context is not None and (
+        status != "succeeded"
+        or database_state_committed
+        or db._transaction_binding() is not None
+        or preserve_finished_at
+        and not committed_context.get("control_run_terminal_committed")
+    ):
+        raise ValueError("committed control context requires an owned terminal transition")
     attempt_id, attempt_started_at = _control_attempt_for_run(
         run_id,
         attempt_id=attempt_id,
@@ -1012,7 +1022,11 @@ async def mark_control_run(
         preserve_finished_at=preserve_finished_at,
         database_state_committed=database_state_committed,
         database_heartbeat_at=database_heartbeat_at,
-        database_finished_at=database_finished_at,
+        database_finished_at=(
+            committed_context["_control_committed_finished_at"]
+            if preserve_finished_at and committed_context is not None
+            else database_finished_at
+        ),
     )
     update_values_by_field: dict[str, Any] = {
         "status": status,
@@ -1035,7 +1049,7 @@ async def mark_control_run(
         update_values_by_field["finished_at"] = None
     if status in _TERMINAL_STATUSES and not preserve_finished_at:
         update_values_by_field["finished_at"] = transition_times.now
-    should_update_database = not database_state_committed and (
+    if not database_state_committed and (
         bool(status == "running" and attempt_id and attempt_started_at)
         or await _should_update_control_run_db(
             run_id=run_id,
@@ -1044,8 +1058,7 @@ async def mark_control_run(
             error=error,
             snapshot_id=snapshot_id,
         )
-    )
-    if should_update_database:
+    ):
         stmt = _where_no_places_handoff(update(ImportRun).where(ImportRun.run_id == run_id))
         if expected_state is not None:
             stmt = stmt.where(
@@ -1101,6 +1114,17 @@ async def mark_control_run(
             return affected_rows
         if affected_rows != 1:
             return _CONTROL_RUN_NOT_MARKED
+        if committed_context is not None:
+            committed_context.update(
+                control_run_terminal_committed=True,
+                _control_committed_result={**(metrics or {}), "terminal_progress": progress_by_field},
+                _control_committed_heartbeat_at=isoformat_utc(transition_times.now, timespec="microseconds"),
+                _control_committed_finished_at=(
+                    committed_context["_control_committed_finished_at"]
+                    if preserve_finished_at
+                    else isoformat_utc(transition_times.now, timespec="microseconds")
+                ),
+            )
     live_update_by_field = {
         **progress_by_field,
         "run_id": run_id,
