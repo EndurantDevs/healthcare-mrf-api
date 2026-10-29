@@ -256,3 +256,39 @@ async def test_lifecycle_v2_admits_and_seals_observed_as_of_shapes(
             assert tuple(tuple(lifecycle_row.values()) for lifecycle_row in lifecycle_rows) == EXPECTED_LIFECYCLE_ROWS
         finally:
             await connection.close()
+
+
+# Collect isolated native proof in the existing database lane with its required DSN.
+from tests.nppes_isolated_catalog_postgres_support import (
+    runtime as runtime,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_busy_source_table_refuses_freeze_then_resumes as test_busy_source_table_refuses_freeze_then_resumes,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_candidate_inherited_child_refuses_freeze_then_rollback_resumes as test_candidate_inherited_child_refuses_freeze_then_rollback_resumes,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_controller_cancellation_rolls_back_seal_and_resumes as test_controller_cancellation_rolls_back_seal_and_resumes,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_fixed_catalog_matches_recursive_native_descriptors as test_fixed_catalog_matches_recursive_native_descriptors,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_fixed_catalog_rejects_inheritance_and_reopens_after_rollback as test_fixed_catalog_rejects_inheritance_and_reopens_after_rollback,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_freeze_rechecks_complete_rows_and_rolls_back_ownership as test_freeze_rechecks_complete_rows_and_rolls_back_ownership,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_missing_or_dishonest_controller_cannot_publish as test_missing_or_dishonest_controller_cannot_publish,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_original_native_receipt_rejects_control_authority_drift as test_original_native_receipt_rejects_control_authority_drift,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_prepared_source_resumes_only_through_independent_freeze as test_prepared_source_resumes_only_through_independent_freeze,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
+    test_private_catalog_has_only_native_inert_relations as test_private_catalog_has_only_native_inert_relations,
+)

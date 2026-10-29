@@ -711,8 +711,11 @@ def _has_candidate_triggers(records, schema):
 async def assert_nppes_candidate_catalog(connection, schema, policy):
     """Require authenticated control custody before accepting retired archive guards."""
     try:
+        from process.nppes_isolated_catalog import verified_isolated_nppes_catalog
         from process.nppes_public_evidence_control_custody import assert_nppes_control_custody
 
+        if await verified_isolated_nppes_catalog(connection, schema, policy) is not None:
+            return
         await assert_nppes_control_custody(connection, schema, policy)
         if (
             not _has_candidate_columns(await _column_records(connection, schema, _CONTROL_COLUMNS))

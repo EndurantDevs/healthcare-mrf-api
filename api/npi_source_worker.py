@@ -4,7 +4,10 @@
 import os
 from dataclasses import dataclass
 
-from api.reference_source_worker import _IMAGE, IMAGE_ENV
+from api.reference_source_worker import _IMAGE
+from api.reference_source_worker import IMAGE_ENV as REFERENCE_IMAGE_ENV
+
+IMAGE_ENV = "HLTHPRT_NPI_SOURCE_WORKER_IMAGE"
 
 PURPOSE = "npi-source"
 COMMAND = ["/usr/local/bin/npi-source-worker"]
@@ -28,7 +31,7 @@ def admit_npi_source_worker_launch(admitted_run):
     if admitted_run.get("importer") != _IMPORTER:
         return None
     metrics = admitted_run.get("metrics")
-    image = os.getenv(IMAGE_ENV, "")
+    image = os.environ.get(IMAGE_ENV, os.getenv(REFERENCE_IMAGE_ENV, ""))
     if (
         not isinstance(metrics, dict)
         or metrics.get("queue") != _QUEUE

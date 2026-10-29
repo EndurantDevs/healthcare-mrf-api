@@ -425,8 +425,17 @@ def _direct_reference_predicate(importer_id, stage, key):
     )
 
 
-async def validate_canonical_closure(session, importer_id, schema, qualified, *, address_coverage=None):
+async def validate_canonical_closure(
+    session, importer_id, schema, qualified, *, address_coverage=None, npi_alias_authority=None
+):
     """Check complete key closure and declared attribution only after all model indexes exist."""
+    if npi_alias_authority is not None:
+        from process.npi_alias_witness import validate_npi_alias_contribution
+
+        if importer_id != "npi" or address_coverage is not None:
+            raise RuntimeError("NPI alias profile differs")
+        await validate_npi_alias_contribution(session, schema, npi_alias_authority)
+        return
     table_name, source_bit, _priority = CANONICAL_POLICIES[importer_id]
     stage = qualified(schema, table_name)
     references = ("npi_address",) if importer_id == "npi" else REFERENCES
@@ -508,10 +517,17 @@ async def validate_canonical_merge(session, stage, archive):
         raise RuntimeError("canonical destination identity conflicts")
 
 
-async def validate_canonical_contributions(session, contributions, archive):
+async def validate_canonical_contributions(session, contributions, archive, *, npi_alias_authority=None):
     """Authenticate every identity pair before publishing either selected contribution."""
     if not contributions or not set(contributions) <= set(CANONICAL_POLICIES):
         raise RuntimeError("canonical contribution scope differs")
+    if npi_alias_authority is not None:
+        from process.npi_alias_witness import validate_npi_alias_contribution
+
+        if "npi" not in contributions:
+            raise RuntimeError("NPI alias contribution is unavailable")
+        schema = contributions["npi"].split(".", 1)[0].strip('"')
+        await validate_npi_alias_contribution(session, schema, npi_alias_authority)
     for importer_id, stage in sorted(contributions.items()):
         await validate_canonical_merge(session, stage, archive)
         for other_id, other_stage in sorted(contributions.items()):
@@ -519,10 +535,14 @@ async def validate_canonical_contributions(session, contributions, archive):
                 await validate_canonical_merge(session, stage, other_stage)
 
 
-def canonical_archive_projection(contributions, archive):
+def canonical_archive_projection(contributions, archive, *, npi_alias_authority=None):
     """Project the serial fixed-priority merge, including unchanged and inserted rows."""
     if not contributions or not set(contributions) <= set(CANONICAL_POLICIES):
         raise RuntimeError("canonical contribution scope differs")
+    if npi_alias_authority is not None:
+        from process.npi_alias_witness import npi_alias_archive_projection
+
+        return npi_alias_archive_projection(contributions, archive, npi_alias_authority)
     columns = tuple(column.name for column in AddressArchiveV2.__table__.columns)
     selected = sorted(contributions, key=lambda importer: CANONICAL_POLICIES[importer][2])
     joins = " ".join(
@@ -546,7 +566,7 @@ def canonical_archive_projection(contributions, archive):
     return " UNION ALL ".join(statements)
 
 
-def canonical_resolution_projection(importer_id, *, archive, deduplicated, strict, formatted):
+def canonical_resolution_projection(importer_id, *, archive, deduplicated, strict, formatted, observed_at=None):
     """Project whole ordinary output, preserving strict raw keys and effective alias targets."""
     _table, bit, priority = CANONICAL_POLICIES[importer_id]
     changed = (
@@ -554,7 +574,7 @@ def canonical_resolution_projection(importer_id, *, archive, deduplicated, stric
         f"OR {priority}<incumbent.display_priority))"
     )
     columns = [
-        f"{_resolution_column(column.name, bit, priority, changed)} AS {column.name}"
+        f"{_resolution_column(column.name, bit, priority, changed, observed_at=observed_at)} AS {column.name}"
         for column in AddressArchiveV2.__table__.columns
     ]
     return (
@@ -567,9 +587,14 @@ def canonical_resolution_projection(importer_id, *, archive, deduplicated, stric
     )
 
 
-def _resolution_column(name, bit, priority, changed):
+def _resolution_column(name, bit, priority, changed, *, observed_at=None):
     """Mirror ordinary no-op timestamp, display priority and fixed source attribution semantics."""
     observed = "strict.address_key IS NOT NULL"
+    timestamp = "transaction_timestamp()"
+    if observed_at is not None:
+        from process.npi_alias_witness import observation_time
+
+        timestamp = "TIMESTAMPTZ '" + observation_time(observed_at).isoformat(timespec="microseconds") + "'"
     if name == "source_bits":
         return f"COALESCE(incumbent.source_bits,0) | CASE WHEN incoming.address_key IS NOT NULL OR {observed} THEN {bit} ELSE 0 END"
     if name == "strict_source_bits":
@@ -578,7 +603,7 @@ def _resolution_column(name, bit, priority, changed):
         return (
             f"CASE WHEN incumbent.address_key IS NULL OR {changed} OR ({observed} AND "
             f"((incumbent.source_bits & {bit})=0 OR (incumbent.strict_source_bits & {bit})=0)) "
-            "THEN transaction_timestamp() ELSE incumbent.last_seen_at END"
+            f"THEN {timestamp} ELSE incumbent.last_seen_at END"
         )
     if name == "display_priority":
         return (
@@ -603,7 +628,7 @@ def _resolution_column(name, bit, priority, changed):
         "identity_version": f"{CURRENT_ADDRESS_IDENTITY_VERSION}::smallint",
         "precision": "CASE WHEN split_part(incoming.identity_key,'|',8)='city_zip' THEN 'city_zip' ELSE 'street' END",
         "unit_norm": "COALESCE(incoming.unit_norm,'')",
-        "first_seen_at": "transaction_timestamp()",
+        "first_seen_at": timestamp,
     }.get(name, f"incoming.{name}" if name in IDENTITY_COLUMNS else "NULL")
     return f"CASE WHEN incumbent.address_key IS NULL THEN {fresh} ELSE incumbent.{name} END"
 
@@ -778,8 +803,23 @@ def _qualified(schema, name):
     return f"{_quoted(schema)}.{_quoted(name)}"
 
 
-async def merge_canonical_contribution(session, importer_id, stage, archive):
+async def canonical_merge_receipt(session, archive, stage, source_bit, priority):
+    """Observe the exact five-field canonical merge result after native validation."""
+    return {
+        "contract": MERGE_CONTRACT,
+        "source_bit": source_bit,
+        "display_priority": priority,
+        "archive_oid": await session.scalar(text("SELECT to_regclass(:archive)::oid"), {"archive": archive}),
+        "contribution_oid": await session.scalar(text("SELECT to_regclass(:stage)::oid"), {"stage": stage}),
+    }
+
+
+async def merge_canonical_contribution(session, importer_id, stage, archive, *, npi_alias_authority=None):
     """One application-owned set merge in the actual final attachment transaction."""
+    if npi_alias_authority is not None:
+        from process.npi_alias_witness import merge_npi_alias_contribution
+
+        return await merge_npi_alias_contribution(session, stage, archive, npi_alias_authority, importer_id=importer_id)
     _name, source_bit, priority = CANONICAL_POLICIES[importer_id]
     await session.execute(text(f"LOCK TABLE {archive} IN SHARE ROW EXCLUSIVE MODE NOWAIT"))
     await require_canonical_publication_capability(session, archive)
@@ -829,13 +869,7 @@ async def merge_canonical_contribution(session, importer_id, stage, archive):
         is not False
     ):
         raise RuntimeError("canonical contribution publication differs")
-    return {
-        "contract": MERGE_CONTRACT,
-        "source_bit": source_bit,
-        "display_priority": priority,
-        "archive_oid": await session.scalar(text("SELECT to_regclass(:archive)::oid"), {"archive": archive}),
-        "contribution_oid": await session.scalar(text("SELECT to_regclass(:stage)::oid"), {"stage": stage}),
-    }
+    return await canonical_merge_receipt(session, archive, stage, source_bit, priority)
 
 
 async def require_canonical_publication_capability(session, archive):
