@@ -86,6 +86,12 @@ def _committed_target_result(
     """Return a supported importer's result committed with its database state."""
 
     context = control_context.get("context")
+    if target_module == "process.npi":
+        from process.npi_isolated_execution import committed_npi_isolated_handoff
+
+        handoff = committed_npi_isolated_handoff(control_context)
+        if handoff is not None:
+            return handoff
     if (
         target_module in _HANDOFF_MODULES
         and isinstance(context, dict)
@@ -374,6 +380,14 @@ async def control_single_job_start(
             if shutdown_result is not None:
                 target_result = shutdown_result
             ctx.setdefault("context", {})["run"] = 0
+        if target_module == "process.npi":
+            from process.npi_isolated_execution import current_npi_isolated_execution
+
+            if (
+                current_npi_isolated_execution() is not None
+                and _committed_target_result(ctx, target_module=target_module) is None
+            ):
+                raise RuntimeError("Isolated NPI completion requires an authenticated handoff")
     except ImportCancelledError:
         if _has_unknown_native_commit(ctx, target_module):
             raise
@@ -449,6 +463,11 @@ async def control_single_job_start(
     committed_result = _committed_target_result(ctx, target_module=target_module)
     if committed_result is not None:
         target_result = committed_result
+    if target_module == "process.npi":
+        from process.npi_isolated_execution import committed_npi_isolated_handoff
+
+        if committed_npi_isolated_handoff(ctx) is not None:
+            return {"status": "finalizing", "run_id": run_id, "result": target_result}
     if target_module in _HANDOFF_MODULES and ctx["context"].get("control_run_handoff_committed") is True:
         return {"status": "finalizing", "run_id": run_id, "result": target_result}
     await _project_control_target_success(
@@ -493,6 +512,10 @@ async def _invoke_control_target(
 
 def _has_unknown_native_commit(ctx, target_module):
     context = ctx.get("context") or {}
+    if target_module == "process.npi":
+        from process.npi_isolated_execution import has_unknown_npi_isolated_handoff
+
+        return has_unknown_npi_isolated_handoff(ctx)
     return (
         target_module == "process.nucc"
         and context.get("nucc_native_commit_unknown") is True

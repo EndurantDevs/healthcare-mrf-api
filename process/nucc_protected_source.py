@@ -11,6 +11,7 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from process import nucc_protected_control as control
 from process import nucc_protected_stage as stages
@@ -18,6 +19,7 @@ from process import nucc_snapshot_partition as partition
 from process import reference_family_archive as native
 from process.control_cancel import ImportCancelledError
 from process.control_lifecycle import _is_protected_nucc_claim_parent
+from process.entity_address_cutover_contract import postgres_sqlstate
 
 MAX_BATCH_ROWS = stages.MAX_BATCH_ROWS
 STAGE_CONTRACT = "nucc-protected-source-stage.v3"
@@ -323,32 +325,46 @@ async def _source_stage_state(session, stage, *, copying, allow_pending_retry=Fa
     return run, marker
 
 
+async def _wait_nucc_source_poll(database, poll):
+    """Retry only rolled-back lock contention within the existing Source wait budget."""
+    async with asyncio.timeout(WAIT_SECONDS):
+        while True:
+            try:
+                async with database.transaction() as session:
+                    result = await poll(session)
+                if result is not None:
+                    return result
+            except DBAPIError as error:
+                if postgres_sqlstate(error) != "55P03":
+                    raise
+            await asyncio.sleep(POLL_SECONDS)
+
+
 async def wait_nucc_source_stage(database, ctx):
     """Wait for a genuine Owner-created heap without holding a Source transaction between polls."""
     run_id, attempt, started, _suffix = native._nucc_attempt(ctx)
-    async with asyncio.timeout(WAIT_SECONDS):
-        while True:
-            async with database.transaction() as session:
-                actor = await control._source_transaction(session)
-                _require(
-                    await control.reconcile_source_publication(session, run_id) is None, "Source already published"
-                )
-                run = await control._locked_source_run(session, run_id)
-                _require(
-                    run["status"] == "running"
-                    and (run["progress"] or {}).get("attempt_id") == attempt
-                    and (run["progress"] or {}).get("attempt_started_at") == started,
-                    "Source wait attempt changed",
-                )
-                locator = (run["metrics"] or {}).get("nucc_source_stage")
-                if locator is not None:
-                    stage = NuccSourceStage.from_wire(locator)
-                    _require(stage.marker["run_id"] == run_id, "locator run differs")
-                    _current, marker = await _source_stage_state(session, stage, copying=True, allow_pending_retry=True)
-                if locator is not None and marker["attempt_id"] == attempt and marker["attempt_started_at"] == started:
-                    return stage
-                await control._recheck_source_transaction(session, actor)
-            await asyncio.sleep(POLL_SECONDS)
+
+    async def poll(session):
+        """Authenticate the current allocation in this polling transaction."""
+        actor = await control._source_transaction(session)
+        _require(await control.reconcile_source_publication(session, run_id) is None, "Source already published")
+        run = await control._locked_source_run(session, run_id)
+        _require(
+            run["status"] == "running"
+            and (run["progress"] or {}).get("attempt_id") == attempt
+            and (run["progress"] or {}).get("attempt_started_at") == started,
+            "Source wait attempt changed",
+        )
+        locator = (run["metrics"] or {}).get("nucc_source_stage")
+        if locator is not None:
+            stage = NuccSourceStage.from_wire(locator)
+            _require(stage.marker["run_id"] == run_id, "locator run differs")
+            _current, marker = await _source_stage_state(session, stage, copying=True, allow_pending_retry=True)
+        if locator is not None and marker["attempt_id"] == attempt and marker["attempt_started_at"] == started:
+            return stage
+        await control._recheck_source_transaction(session, actor)
+
+    return await _wait_nucc_source_poll(database, poll)
 
 
 async def copy_nucc_source_batch(session, stage, model_rows):
@@ -552,29 +568,30 @@ async def wait_nucc_source_handoff(database, stage):
     """Return only a committed original Source handoff equal to the real closed Owner marker."""
     _require(isinstance(stage, NuccSourceStage) and type(stage.ready) is dict, "ready stage differs")
     validate_source_ready(stage.ready, stage.marker)
-    async with asyncio.timeout(WAIT_SECONDS):
-        while True:
-            async with database.transaction() as session:
-                run, marker = await _source_stage_state(session, stage, copying=False)
-                actual_ready = (run["metrics"] or {}).get("nucc_source_ready")
-                if actual_ready is None and marker["phase"] == "copying" and run["status"] == "running":
-                    raise NuccSourceReadyNotCommittedError("NUCC Source ready transition did not commit")
-                _require(actual_ready == stage.ready, "committed ready input differs")
-                handoff = (run["metrics"] or {}).get("nucc_handoff")
-                if handoff is not None:
-                    handoff = control.validate_handoff(handoff)
-                    _require(
-                        marker["phase"] == "closed"
-                        and marker["handoff"] == handoff
-                        and run["status"] in {"finalizing", "succeeded"},
-                        "closed Source handoff differs",
-                    )
-                    _require(handoff["row_count"] == stage.ready["total_rows"], "closed input census differs")
-                    return handoff
-                if run["status"] in {"canceling", "canceled", "cancelled"}:
-                    raise ImportCancelledError("taxonomy Source cancellation is pending")
-                _require(run["status"] == "running", "Source input failed before handoff")
-            await asyncio.sleep(POLL_SECONDS)
+
+    async def poll(session):
+        """Authenticate the committed handoff in this polling transaction."""
+        run, marker = await _source_stage_state(session, stage, copying=False)
+        actual_ready = (run["metrics"] or {}).get("nucc_source_ready")
+        if actual_ready is None and marker["phase"] == "copying" and run["status"] == "running":
+            raise NuccSourceReadyNotCommittedError("NUCC Source ready transition did not commit")
+        _require(actual_ready == stage.ready, "committed ready input differs")
+        handoff = (run["metrics"] or {}).get("nucc_handoff")
+        if handoff is not None:
+            handoff = control.validate_handoff(handoff)
+            _require(
+                marker["phase"] == "closed"
+                and marker["handoff"] == handoff
+                and run["status"] in {"finalizing", "succeeded"},
+                "closed Source handoff differs",
+            )
+            _require(handoff["row_count"] == stage.ready["total_rows"], "closed input census differs")
+            return handoff
+        if run["status"] in {"canceling", "canceled", "cancelled"}:
+            raise ImportCancelledError("taxonomy Source cancellation is pending")
+        _require(run["status"] == "running", "Source input failed before handoff")
+
+    return await _wait_nucc_source_poll(database, poll)
 
 
 def _require_cancel_inputs(stage, run):

@@ -53,6 +53,7 @@ from api.npi_detail_cache_identity import (
 from api.npi_detail_cache_identity import (
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
+from api.npi_native_cache_identity import npi_publication_cache_identity
 from api.provider_demographic_filters import normalize_provider_sex_code
 from api.provider_detail_sql import _npi_detail_address_filters, _npi_detail_taxonomy_aggregate
 from api.provider_directory_dataset_sql import (
@@ -13181,18 +13182,7 @@ async def _npi_canonical_publication_identity(
             type(exc).__name__,
         )
         return None
-    if len(identity_rows) != 1:
-        return None
-    publication_generation, publication_ref = identity_rows[0]
-    if (
-        type(publication_generation) is not int
-        or publication_generation < 1
-        or type(publication_ref) is not str
-        or len(publication_ref) != 50
-        or not publication_ref.startswith("nppub1_")
-    ):
-        return None
-    return f"{publication_generation}:{publication_ref}"
+    return await npi_publication_cache_identity(identity_rows, _execute_stmt, schema, logger, session=session)
 
 
 async def _npi_count_cache_identity(address_model: Any) -> str | None:

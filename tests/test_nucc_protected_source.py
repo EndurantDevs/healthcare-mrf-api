@@ -4,10 +4,12 @@
 import asyncio
 import importlib
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 nucc = importlib.import_module("process.nucc")
 from process import nucc_protected_source as source
@@ -153,6 +155,96 @@ def source_run(marker, *, ready=None, status="running"):
         "progress": {key: marker[key] for key in ("attempt_id", "attempt_started_at")},
         "metrics": {"nucc_source_stage": marker, **({"nucc_source_ready": ready} if ready is not None else {})},
     }
+
+
+@pytest.fixture(params=["stage", "handoff"])
+def source_poll(monkeypatch, request):
+    marker = copying_marker()
+    stage = source.NuccSourceStage.from_wire(marker)
+    if request.param == "handoff":
+        stage = replace(stage, ready=ready_input(marker))
+        observed = closed_marker()
+        run = source_run(marker, ready=stage.ready, status="finalizing")
+        run["metrics"]["nucc_handoff"] = observed["handoff"]
+        expected = observed["handoff"]
+    else:
+        observed, run, expected = marker, source_run(marker), stage
+    state = AsyncMock(return_value=(run, observed))
+    monkeypatch.setattr(source, "_source_stage_state", state)
+    monkeypatch.setattr(source.control, "_source_transaction", AsyncMock(return_value="actor"))
+    monkeypatch.setattr(source.control, "reconcile_source_publication", AsyncMock(return_value=None))
+    monkeypatch.setattr(source.control, "_locked_source_run", AsyncMock(return_value=run))
+
+    async def poll(transaction):
+        database = SimpleNamespace(transaction=transaction)
+        if request.param == "handoff":
+            return await source.wait_nucc_source_handoff(database, stage)
+        context_by_field = {
+            "control_run_id": marker["run_id"],
+            "context": {
+                "_control_attempt_id": marker["attempt_id"],
+                "_control_attempt_started_at": marker["attempt_started_at"],
+            },
+        }
+        return await source.wait_nucc_source_stage(database, context_by_field)
+
+    return SimpleNamespace(state=state, poll=poll, expected=expected)
+
+
+@pytest.mark.parametrize("fault", ["lock", "commit-lock", "other-db", "custody", "cancel", "timeout"])
+async def test_source_poll_retries_only_lock_contention_after_rollback(monkeypatch, source_poll, fault):
+    driver_error = RuntimeError("synthetic database error")
+    driver_error.sqlstate = "55P03" if fault in {"lock", "commit-lock", "timeout"} else "42501"
+    failure = DBAPIError("synthetic poll", {}, driver_error)
+    if fault == "custody":
+        failure = RuntimeError("synthetic custody refusal")
+    if fault == "cancel":
+        failure = asyncio.CancelledError()
+    poll_result = source_poll.state.return_value
+    if fault != "commit-lock":
+        source_poll.state.side_effect = [failure, poll_result] if fault == "lock" else failure
+    events = []
+    transaction_state = SimpleNamespace(is_active=False)
+
+    @asynccontextmanager
+    async def transaction():
+        assert transaction_state.is_active is False
+        transaction_state.is_active = True
+        events.append("begin")
+        try:
+            yield object()
+            if fault == "commit-lock" and events.count("begin") == 1:
+                raise failure
+        except BaseException:
+            events.append("rollback")
+            raise
+        else:
+            events.append("commit")
+        finally:
+            transaction_state.is_active = False
+
+    original_sleep = asyncio.sleep
+
+    async def sleep(seconds):
+        assert transaction_state.is_active is False and seconds == source.POLL_SECONDS
+        events.append("sleep")
+        await original_sleep(1 if fault == "timeout" else 0)
+
+    monkeypatch.setattr(source.asyncio, "sleep", sleep)
+    if fault == "timeout":
+        monkeypatch.setattr(source, "WAIT_SECONDS", 0.01)
+        with pytest.raises(TimeoutError):
+            await source_poll.poll(transaction)
+        assert events == ["begin", "rollback", "sleep"]
+    elif fault in {"lock", "commit-lock"}:
+        assert await source_poll.poll(transaction) == source_poll.expected
+        assert events == ["begin", "rollback", "sleep", "begin", "commit"]
+        assert source_poll.state.await_count == 2
+    else:
+        with pytest.raises(type(failure)) as caught:
+            await source_poll.poll(transaction)
+        assert caught.value is failure and events == ["begin", "rollback"]
+    assert transaction_state.is_active is False
 
 
 def test_stage_and_ready_codecs_are_closed_local_copies():

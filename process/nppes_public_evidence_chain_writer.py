@@ -177,6 +177,16 @@ async def _admit_chain(
     database: object,
     cancel_check,
 ) -> NppesPublicEvidenceChainReceipt:
+    from process.nppes_isolated_catalog import issued_isolated_nppes_catalog, publish_isolated_nppes_chain
+
+    isolated_catalog = issued_isolated_nppes_catalog()
+    if isolated_catalog is not None:
+        if isolated_catalog.schema != schema:
+            raise writer_error()
+        await _invoke(cancel_check)
+        await publish_isolated_nppes_chain(database, receipt)
+        await _invoke(cancel_check)
+        return receipt
     admission, archives = build_nppes_chain_storage_rows(receipt)
     async with source_transaction(database):
         publisher = bound_publisher()

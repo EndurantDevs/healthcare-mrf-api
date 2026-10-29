@@ -16,6 +16,7 @@ from uuid import uuid4
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_source_policy as source_policy
 from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.nppes_isolated_catalog import _FIXED_CATALOG_SQL as CATALOG_SQL
 from process.nppes_public_evidence_prepared_chunks import chunk_payloads
 from process.nppes_public_evidence_rows import (
     ADMISSION_COLUMNS,
@@ -31,7 +32,6 @@ from process.nppes_public_evidence_rows import (
     source_release_values,
 )
 from process.nppes_public_evidence_writer_contract import writer_error
-from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import storage_roles
 from process.plan_release_storage_provision import _GRANTEES_SQL
 from process.provider_directory_generic_candidate import COPY_FRAME_BYTES, COPY_MAX_BYTES, COPY_MAX_ROWS
@@ -325,6 +325,10 @@ async def _transaction(database):
 
 
 async def _header_custody(connection, policy):
+    from process.nppes_isolated_catalog import verified_isolated_nppes_catalog
+
+    if await verified_isolated_nppes_catalog(connection, policy.schema, policy) is not None:
+        return
     owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
     rows = await connection.fetch(CATALOG_SQL, [storage_relation(policy.schema, HEADER)], owner, readers)
     _require(len(rows) == 1)
@@ -345,12 +349,23 @@ async def _header_custody(connection, policy):
     )
 
 
+async def _header_lock(connection, source_release_ref):
+    from process.nppes_isolated_catalog import issued_isolated_nppes_catalog
+
+    if issued_isolated_nppes_catalog() is None:
+        return " FOR UPDATE"
+    # Row-lock SELECT applies UPDATE RLS and cannot see protected PREPARED rows.
+    await connection.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", source_release_ref)
+    return ""
+
+
 async def _locked(connection, policy, candidate, *, phases=("loading", "prepared", "published")):
     _require(type(candidate) is NppesEvidenceCandidate)
     await _header_custody(connection, policy)
+    lock_clause = await _header_lock(connection, candidate.identity["source_release_ref"])
     row = await connection.fetchrow(
         f"SELECT source_release_ref,candidate_storage_json FROM {storage_relation(policy.schema, HEADER)} "
-        "WHERE admission_ref=$1 FOR UPDATE",
+        "WHERE admission_ref=$1" + lock_clause,
         candidate.identity["admission_ref"],
     )
     _require(row is not None and row["source_release_ref"] == candidate.identity["source_release_ref"])
@@ -414,8 +429,20 @@ def _require_native_table(catalog_row, policy, owner, root, readable):
     return columns, constraints, indexes
 
 
-async def _capture(connection, policy, tables, *, indexed, readable=False):
+async def _capture(connection, policy, tables, *, indexed, readable=False, retained_catalog=None):
     owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
+    if readable:
+        from process import nppes_isolated_catalog as isolated
+
+        catalog = retained_catalog or isolated.issued_isolated_nppes_catalog()
+        if catalog is not None:
+            await isolated.verify_isolated_nppes_catalog(connection, policy, catalog)
+            _, owner, _, readers = await isolated._role_oids(
+                connection,
+                policy,
+                catalog.retained_owner_role,
+                catalog.retained_publisher_role,
+            )
     catalog_rows = await connection.fetch(
         CATALOG_SQL,
         [storage_relation(policy.schema, name) for name in tables.values()],
@@ -469,9 +496,20 @@ async def _verify(connection, policy, binding):
     return tables_by_root
 
 
-async def _capture_chunks(connection, policy, name):
+async def _capture_chunks(connection, policy, name, *, retained_catalog=None):
     owner, _ = await storage_roles(connection, policy.schema, **policy.role_arguments())
-    relations = await connection.fetch(CATALOG_SQL, [storage_relation(policy.schema, name)], owner, [])
+    readers = []
+    if retained_catalog is not None:
+        from process import nppes_isolated_catalog as isolated
+
+        await isolated.verify_isolated_nppes_catalog(connection, policy, retained_catalog)
+        _, owner, _, readers = await isolated._role_oids(
+            connection,
+            policy,
+            retained_catalog.retained_owner_role,
+            retained_catalog.retained_publisher_role,
+        )
+    relations = await connection.fetch(CATALOG_SQL, [storage_relation(policy.schema, name)], owner, readers)
     _require(len(relations) == 1)
     chunk_relation = relations[0]
     columns, constraints, indexes = (_json(chunk_relation[key]) for key in ("columns", "constraints", "indexes"))
@@ -587,7 +625,7 @@ async def prepare_nppes_evidence_candidate(database, prepared, *, producer_ident
                 return _candidate(binding_by_field)
         await connection.execute("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", identity["source_release_ref"])
         header_row = await connection.fetchrow(
-            select + " FOR UPDATE",
+            select + await _header_lock(connection, identity["source_release_ref"]),
             identity["source_release_ref"],
         )
         if header_row is not None:
@@ -830,6 +868,17 @@ async def prepare_nppes_evidence_publication(database, candidate, prepared, *, c
 
 async def publish_nppes_evidence_candidate(database, candidate, prepared, *, cancel_check=None):
     """Atomically publish verified candidate controls while retaining exact replay identity."""
+    from process.nppes_isolated_catalog import issued_isolated_nppes_catalog, publish_isolated_nppes_candidate
+
+    if issued_isolated_nppes_catalog() is not None:
+        await _invoke(cancel_check)
+        outcome = await publish_isolated_nppes_candidate(database, candidate, prepared)
+        await _invoke(cancel_check)
+        return outcome
+    return await _publish_legacy_candidate(database, candidate, prepared, cancel_check=cancel_check)
+
+
+async def _publish_legacy_candidate(database, candidate, prepared, *, cancel_check):
     from process.nppes_public_evidence_writer import _insert_single
 
     _require(candidate.identity == _identity(prepared))
