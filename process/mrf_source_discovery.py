@@ -13,13 +13,13 @@ import io
 import ipaddress
 import json
 import logging
-import multiprocessing as mp
 import os
 import re
 import socket
 import ssl
 import uuid
 import zipfile
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -44,9 +44,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from api.mrf_discovery_catalog_manifest import (
     CATALOG_PAGING_MANIFEST_METADATA_KEY,
 )
-from process.mrf_discovery_catalog_manifest import (
-    refresh_catalog_paging_manifests,
-)
 from db.connection import init_db
 from db.models import (
     MRFCrawlRun,
@@ -66,9 +63,8 @@ from process.import_status_events import (
     flush_terminal_status_event,
 )
 from process.live_progress import enqueue_live_progress
-from process.mrf_discovery_post_resolvers import (
-    _resolve_bcbsnc_aso_employer_search,
-    post_discovery_text,
+from process.mrf_discovery_catalog_manifest import (
+    refresh_catalog_paging_manifests,
 )
 from process.mrf_discovery_checkpoints import (
     DatabaseDiscoveryCheckpointStore,
@@ -77,6 +73,20 @@ from process.mrf_discovery_checkpoints import (
     SourceProcessResult,
     execute_checkpointed_source_batch,
 )
+from process.mrf_discovery_post_resolvers import (
+    _resolve_bcbsnc_aso_employer_search,
+    post_discovery_text,
+)
+from process.mrf_discovery_process_pool import DiscoverySourceProcessPool
+from process.mrf_discovery_toc_crawl import (
+    PersistedTocResult,
+    is_streaming_toc,
+    managed_resolver_results,
+    stream_toc_target,
+    toc_rows_from_entries,
+    toc_spool_bytes,
+)
+from process.mrf_toc_spool import IncompleteToc
 from process.ptg_parts.canonical import canonicalize_url, semantic_hash
 from process.ptg_parts.healthsparq_source_jobs import healthsparq_plan_engine_hash
 from process.ptg_parts.source_jobs import parse_toc_catalog_entries
@@ -97,13 +107,9 @@ DISCOVERY_TABLES = (
     MRFPayerScorecard,
     MRFUrlObservation,
 )
-MAX_TOC_BYTES_DEFAULT = int(
-    os.getenv("HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES", str(25 * 1024 * 1024))
-)
+MAX_TOC_BYTES_DEFAULT = int(os.getenv("HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES", str(25 * 1024 * 1024)))
 DEFAULT_CONCURRENCY = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_CONCURRENCY", "10")), 1)
-WRITE_BATCH_SIZE = max(
-    int(os.getenv("HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE", "2000")), 1
-)
+WRITE_BATCH_SIZE = max(int(os.getenv("HLTHPRT_MRF_DISCOVERY_WRITE_BATCH_SIZE", "2000")), 1)
 WRITE_BATCH_BYTES = max(
     int(
         os.getenv(
@@ -122,15 +128,10 @@ DISCOVERY_PROCESS_WORKERS_ENV = "HLTHPRT_MRF_DISCOVERY_PROCESS_WORKERS"
 MAX_DISCOVERY_PROCESS_WORKERS = 8
 DISCOVERY_TARGET_CONCURRENCY_ENV = "HLTHPRT_MRF_DISCOVERY_TARGET_CONCURRENCY"
 MAX_DISCOVERY_TARGET_CONCURRENCY = 16
-DISCOVERY_HTTP_CONNECTION_LIMIT_ENV = (
-    "HLTHPRT_MRF_DISCOVERY_HTTP_CONNECTION_LIMIT"
-)
-DISCOVERY_HTTP_PER_HOST_LIMIT_ENV = (
-    "HLTHPRT_MRF_DISCOVERY_HTTP_PER_HOST_LIMIT"
-)
+DISCOVERY_HTTP_CONNECTION_LIMIT_ENV = "HLTHPRT_MRF_DISCOVERY_HTTP_CONNECTION_LIMIT"
+DISCOVERY_HTTP_PER_HOST_LIMIT_ENV = "HLTHPRT_MRF_DISCOVERY_HTTP_PER_HOST_LIMIT"
 BROWSER_FALLBACK_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 _BROWSER_FALLBACK_HTTP_STATUSES = {403, 406}
 MRF_URL_OBSERVATION_NULLABLE_KEYS = (
@@ -344,11 +345,7 @@ def _incomplete_tls_chain_hosts() -> set[str]:
     raw = os.getenv(INCOMPLETE_TLS_CHAIN_HOSTS_ENV)
     if raw is None:
         return set(DEFAULT_INCOMPLETE_TLS_CHAIN_HOSTS)
-    return {
-        value.strip().lower()
-        for value in re.split(r"[, ]+", raw)
-        if value.strip()
-    }
+    return {value.strip().lower() for value in re.split(r"[, ]+", raw) if value.strip()}
 
 
 def _request_ssl_kwargs(url: str | None) -> dict[str, Any]:
@@ -387,8 +384,7 @@ TOC_LEVEL_QUERY_EXPANSION_RESOLVERS = frozenset(
     }
 )
 SOURCE_QUERY_EXPANSION_PLATFORM_RANK = {
-    platform: rank
-    for rank, platform in enumerate(TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS)
+    platform: rank for rank, platform in enumerate(TARGETED_SOURCE_QUERY_EXPANSION_PLATFORMS)
 }
 
 
@@ -415,11 +411,7 @@ def _source_query_expansion_platforms() -> set[str]:
     values = _source_config().get("source_query_expansion_platforms")
     if not isinstance(values, list):
         values = list(DEFAULT_SOURCE_QUERY_EXPANSION_PLATFORMS)
-    return {
-        str(value or "").strip()
-        for value in values
-        if str(value or "").strip()
-    }
+    return {str(value or "").strip() for value in values if str(value or "").strip()}
 
 
 def _seed_list_config(name: str | None) -> dict[str, Any]:
@@ -445,13 +437,8 @@ def _load_seed_list_rows(name: str | None) -> list[dict[str, str]]:
         required_fields = {"group_number", "status"}
         missing = sorted(required_fields - fieldnames)
         if missing:
-            raise ValueError(
-                f"seed list {name} missing required column(s): {', '.join(missing)}"
-            )
-        rows = [
-            {key: str(value or "").strip() for key, value in row.items()}
-            for row in reader
-        ]
+            raise ValueError(f"seed list {name} missing required column(s): {', '.join(missing)}")
+        rows = [{key: str(value or "").strip() for key, value in row.items()} for row in reader]
     return _merge_private_seed_context_rows(name, rows)
 
 
@@ -467,9 +454,7 @@ def _private_context_paths(
         configured_value = configured_value.strip()
         if not configured_value:
             continue
-        is_optional_path = supports_optional_paths and configured_value.lower().startswith(
-            "optional="
-        )
+        is_optional_path = supports_optional_paths and configured_value.lower().startswith("optional=")
         if is_optional_path:
             configured_value = configured_value[len("optional=") :].strip()
             if not configured_value:
@@ -479,18 +464,14 @@ def _private_context_paths(
             resolved_paths.append(context_path)
             continue
         if is_optional_path:
-            logging.getLogger(__name__).warning(
-                "%s file not mounted: %s", context_label, context_path
-            )
+            logging.getLogger(__name__).warning("%s file not mounted: %s", context_label, context_path)
             continue
         raise ValueError(f"{context_label} file does not exist: {context_path}")
     return resolved_paths
 
 
 def _private_seed_context_paths() -> list[Path]:
-    return _private_context_paths(
-        PRIVATE_SEED_CONTEXT_PATHS_ENV, "private seed context"
-    )
+    return _private_context_paths(PRIVATE_SEED_CONTEXT_PATHS_ENV, "private seed context")
 
 
 def _private_seed_context_rows(seed_list_name: str | None) -> list[dict[str, str]]:
@@ -499,23 +480,16 @@ def _private_seed_context_rows(seed_list_name: str | None) -> list[dict[str, str
         with context_path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             if "group_number" not in set(reader.fieldnames or ()):
-                raise ValueError(
-                    f"private seed context {context_path} missing group_number"
-                )
+                raise ValueError(f"private seed context {context_path} missing group_number")
             for context_row in reader:
-                context_by_field = {
-                    key: str(field_value or "").strip()
-                    for key, field_value in context_row.items()
-                }
+                context_by_field = {key: str(field_value or "").strip() for key, field_value in context_row.items()}
                 configured_seed_list = (
                     context_by_field.get("seed_list")
                     or context_by_field.get("seed_list_name")
                     or context_by_field.get("list_name")
                     or ""
                 ).strip()
-                if configured_seed_list and configured_seed_list != str(
-                    seed_list_name or ""
-                ):
+                if configured_seed_list and configured_seed_list != str(seed_list_name or ""):
                     continue
                 context_rows.append(context_by_field)
     return context_rows
@@ -542,8 +516,7 @@ def _merge_private_seed_context_rows(
             {
                 key: field_value
                 for key, field_value in private_row.items()
-                if key not in {"seed_list", "seed_list_name", "list_name"}
-                and field_value
+                if key not in {"seed_list", "seed_list_name", "list_name"} and field_value
             }
         )
         merged_by_field.setdefault("status", "active")
@@ -567,20 +540,14 @@ def _private_query_context_rows() -> list[dict[str, str]]:
     for context_path in _private_query_context_paths():
         with context_path.open("r", encoding="utf-8-sig", newline="") as handle:
             for context_row in csv.DictReader(handle):
-                context_by_field = {
-                    key: str(field_value or "").strip()
-                    for key, field_value in context_row.items()
-                }
+                context_by_field = {key: str(field_value or "").strip() for key, field_value in context_row.items()}
                 context_by_field["_query_context_scope"] = "private"
                 context_rows.append(context_by_field)
     return context_rows
 
 
 def _context_field_value(context_row: dict[str, str], *keys: str) -> str:
-    value_by_key = {
-        str(key or "").strip().lower(): field_value
-        for key, field_value in context_row.items()
-    }
+    value_by_key = {str(key or "").strip().lower(): field_value for key, field_value in context_row.items()}
     for key in keys:
         field_value = str(value_by_key.get(key.lower()) or "").strip()
         if field_value:
@@ -598,11 +565,7 @@ def _split_private_context_cell(cell_value: Any) -> list[str]:
         parsed_json = None
     if isinstance(parsed_json, list):
         return [_clean_text(entry) for entry in parsed_json if _clean_text(entry)]
-    return [
-        part.strip(" \t-*")
-        for part in re.split(r"\r?\n|;", raw_text)
-        if part.strip(" \t-*")
-    ]
+    return [part.strip(" \t-*") for part in re.split(r"\r?\n|;", raw_text) if part.strip(" \t-*")]
 
 
 def _private_context_list(context_row: dict[str, str], *keys: str) -> list[str]:
@@ -615,35 +578,22 @@ def _private_context_value_at(entries: list[str], index: int) -> str | None:
     return entries[0] if len(entries) == 1 else None
 
 
-def _private_query_employer_metadata(
-    context_row: dict[str, str], employer_query: str
-) -> dict[str, Any]:
+def _private_query_employer_metadata(context_row: dict[str, str], employer_query: str) -> dict[str, Any]:
     metadata_by_key: dict[str, Any] = {
         "query_context_employer_name": employer_query,
-        "query_context_scope": _context_field_value(
-            context_row, "_query_context_scope"
-        )
-        or "private",
+        "query_context_scope": _context_field_value(context_row, "_query_context_scope") or "private",
         "query_context_employer_aliases": _private_context_list(
             context_row, "employer_aliases", "aliases", "company_aliases"
         ),
-        "query_context_employer_ein": _context_field_value(
-            context_row, "ein", "employer_ein"
-        ),
-        "query_context_erisa_plan_number": _context_field_value(
-            context_row, "erisa_plan_number", "plan_number"
-        ),
-        "query_context_evidence_plan_year": _context_field_value(
-            context_row, "evidence_plan_year", "plan_year"
-        ),
+        "query_context_employer_ein": _context_field_value(context_row, "ein", "employer_ein"),
+        "query_context_erisa_plan_number": _context_field_value(context_row, "erisa_plan_number", "plan_number"),
+        "query_context_evidence_plan_year": _context_field_value(context_row, "evidence_plan_year", "plan_year"),
         "query_context_verification_status": _context_field_value(
             context_row, "current_verification_status", "verification_status"
         ),
     }
     return {
-        key: metadata_value
-        for key, metadata_value in metadata_by_key.items()
-        if metadata_value not in (None, "", [])
+        key: metadata_value for key, metadata_value in metadata_by_key.items() if metadata_value not in (None, "", [])
     }
 
 
@@ -667,16 +617,10 @@ def _private_query_carrier_metadata(
         ),
     }
     metadata_by_key = {
-        metadata_key: _private_context_value_at(
-            _private_context_list(context_row, *field_names), carrier_index
-        )
+        metadata_key: _private_context_value_at(_private_context_list(context_row, *field_names), carrier_index)
         for metadata_key, field_names in field_names_by_metadata_key.items()
     }
-    return {
-        key: metadata_value
-        for key, metadata_value in metadata_by_key.items()
-        if metadata_value not in (None, "")
-    }
+    return {key: metadata_value for key, metadata_value in metadata_by_key.items() if metadata_value not in (None, "")}
 
 
 _PRIVATE_QUERY_CONTEXT_LINE_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -701,16 +645,12 @@ def _private_query_context_entries() -> list[PrivateQueryContext]:
         )
         if not employer_query:
             continue
-        employer_metadata = _private_query_employer_metadata(
-            context_row, employer_query
-        )
+        employer_metadata = _private_query_employer_metadata(context_row, employer_query)
         for benefit_line, carrier_columns in _PRIVATE_QUERY_CONTEXT_LINE_COLUMNS:
             carrier_queries = [
                 carrier_query
                 for column in carrier_columns
-                for carrier_query in _split_private_context_cell(
-                    _context_field_value(context_row, column)
-                )
+                for carrier_query in _split_private_context_cell(_context_field_value(context_row, column))
             ]
             for carrier_index, carrier_query in enumerate(carrier_queries):
                 context_entries.append(
@@ -720,25 +660,19 @@ def _private_query_context_entries() -> list[PrivateQueryContext]:
                         benefit_line=benefit_line,
                         metadata_by_key={
                             **employer_metadata,
-                            **_private_query_carrier_metadata(
-                                context_row, benefit_line, carrier_index
-                            ),
+                            **_private_query_carrier_metadata(context_row, benefit_line, carrier_index),
                         },
                     )
                 )
     return [entry for entry in context_entries if entry.carrier_query]
 
 
-def _supports_candidate_benefit_line(
-    candidate: SourceCandidate, benefit_line: str
-) -> bool:
+def _supports_candidate_benefit_line(candidate: SourceCandidate, benefit_line: str) -> bool:
     normalized_line = _clean_text(benefit_line).lower()
     if not normalized_line:
         return True
     supported_lines = _normalize_benefit_lines(candidate.benefit_lines)
-    return not supported_lines or bool(
-        {normalized_line, "mixed", "unknown"}.intersection(supported_lines)
-    )
+    return not supported_lines or bool({normalized_line, "mixed", "unknown"}.intersection(supported_lines))
 
 
 def _private_query_context_limit() -> int:
@@ -765,12 +699,8 @@ def _private_candidate_key(
     )
 
 
-def _private_context_candidate(
-    candidate: SourceCandidate, context: PrivateQueryContext
-) -> SourceCandidate:
-    expanded_candidate = _candidate_with_target_payer_query(
-        candidate, context.target_payer_query
-    )
+def _private_context_candidate(candidate: SourceCandidate, context: PrivateQueryContext) -> SourceCandidate:
+    expanded_candidate = _candidate_with_target_payer_query(candidate, context.target_payer_query)
     return replace(
         expanded_candidate,
         raw_payload={
@@ -790,9 +720,7 @@ def _private_context_candidate_matches(
         candidate
         for candidate in eligible_candidates
         if _supports_candidate_benefit_line(candidate, context.benefit_line)
-        and _is_candidate_text_filter_match(
-            candidate, entity_types=(), payer_query=context.carrier_query
-        )
+        and _is_candidate_text_filter_match(candidate, entity_types=(), payer_query=context.carrier_query)
     ]
 
 
@@ -802,8 +730,7 @@ def _private_query_expanded_candidates(
     eligible_candidates = [
         candidate
         for candidate in candidates
-        if _is_candidate_importable_source(candidate)
-        and _is_candidate_query_expansion_supported(candidate)
+        if _is_candidate_importable_source(candidate) and _is_candidate_query_expansion_supported(candidate)
     ]
     matches_by_context: dict[tuple[str, str], list[SourceCandidate]] = {}
     expanded_candidates: list[SourceCandidate] = []
@@ -812,9 +739,7 @@ def _private_query_expanded_candidates(
     for context in _private_query_context_entries():
         match_key = _private_context_match_key(context)
         if match_key not in matches_by_context:
-            matches_by_context[match_key] = _private_context_candidate_matches(
-                eligible_candidates, context
-            )
+            matches_by_context[match_key] = _private_context_candidate_matches(eligible_candidates, context)
         for candidate in matches_by_context[match_key]:
             candidate_key = _private_candidate_key(candidate, context)
             if candidate_key in seen_keys:
@@ -892,7 +817,7 @@ def _as_int(value: Any) -> int | None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -910,9 +835,7 @@ def _parse_size_bytes(size_value: Any) -> int | None:
     text = str(size_value or "").strip().replace(",", "")
     if not text:
         return None
-    match = re.match(
-        r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[kmgtp]?i?b|bytes?)?$", text, flags=re.I
-    )
+    match = re.match(r"^(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[kmgtp]?i?b|bytes?)?$", text, flags=re.I)
     if not match:
         return None
     number = float(match.group("number"))
@@ -992,25 +915,15 @@ def _mrf_file_type_from_text(url: str | None, label: str | None = None) -> str |
         or re.search(r"(^|[-/_.])oon([-/_.]|$)", text)
     ):
         return "allowed-amounts"
-    if (
-        "in-network" in text
-        or "in network" in text
-        or "innetwork" in compact
-        or "negotiated-rate" in text
-    ):
+    if "in-network" in text or "in network" in text or "innetwork" in compact or "negotiated-rate" in text:
         return "in-network"
     if "payer-drug" in text or "prescription-drug" in text or "drug-file" in text:
         return "payer-drug"
-    if (
-        "table-of-content" in text
-        or "toc" in text
-        or re.search(r"(^|[/_-])index(?:\.json|[/?#]|$)", text)
-    ):
+    if "table-of-content" in text or "toc" in text or re.search(r"(^|[/_-])index(?:\.json|[/?#]|$)", text):
         return "table-of-contents"
     file_name = Path(urlsplit(str(url or "")).path.lower()).name.replace("_", "-")
     if re.search(r"(^|-)index(?:-[a-z0-9]+)?\.zip$", file_name) and any(
-        token in text
-        for token in ("mrf", "machine-readable", "price-transparency", "transparency")
+        token in text for token in ("mrf", "machine-readable", "price-transparency", "transparency")
     ):
         return "table-of-contents"
     return None
@@ -1090,10 +1003,7 @@ def _is_static_non_tic_reference(
 
 def _is_explicit_tic_index_reference(file_name: str, path: str) -> bool:
     """Return whether a dated MRF index filename is explicitly TiC-shaped."""
-    return bool(
-        re.match(r"^\d{4}-\d{2}-\d{2}[-_].*[-_]index\.json$", file_name)
-        and re.search(r"/(?:mrf|mrfs)/", path)
-    )
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}[-_].*[-_]index\.json$", file_name) and re.search(r"/(?:mrf|mrfs)/", path))
 
 
 def _is_tic_table_of_contents_reference(
@@ -1168,16 +1078,12 @@ def _is_non_tic_mrf_reference(url: str | None, label: str | None = None) -> bool
         return True
     if _is_explicit_tic_index_reference(file_name, path):
         return False
-    if _is_tic_table_of_contents_reference(
-        url, label, file_name=file_name, text=text
-    ):
+    if _is_tic_table_of_contents_reference(url, label, file_name=file_name, text=text):
         return False
     return _is_non_tic_plan_reference(file_name, text)
 
 
-def _mrf_body_file_type_from_text(
-    url: str | None, label: str | None = None
-) -> str | None:
+def _mrf_body_file_type_from_text(url: str | None, label: str | None = None) -> str | None:
     if _is_non_tic_mrf_reference(url, label):
         return None
     inferred = _mrf_file_type_from_text(url, label)
@@ -1282,8 +1188,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
     ):
         return "humana_pct_file_list"
     if host in {"www.fchn.com", "fchn.com"} and (
-        path.startswith("/machine-readable-files")
-        or path.startswith("/payorsearch")
+        path.startswith("/machine-readable-files") or path.startswith("/payorsearch")
     ):
         return "fchn_payor_search"
     if host in {"ehptransparency.org", "www.ehptransparency.org"}:
@@ -1293,8 +1198,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
     if host == "api.midlandschoice.com" and path.startswith("/mrf"):
         return "midlandschoice_mrf"
     if host in {"www.vivahealth.com", "vivahealth.com"} and (
-        path.startswith("/mrf")
-        or path.startswith("/files/mrf/viva-health-commercial-")
+        path.startswith("/mrf") or path.startswith("/files/mrf/viva-health-commercial-")
     ):
         return "viva_health_mrf"
     if (
@@ -1314,23 +1218,13 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "anthem_s3_mrf"
     if host in {"www.hcsc.com", "hcsc.com"} and "transparency-in-coverage" in path:
         return "hcsc_asomrf_landing"
-    if (
-        host in {"bcbsglobalsolutions.com", "www.bcbsglobalsolutions.com"}
-        and "transparency-in-coverage" in path
-    ) or (
-        host == "groupadmin.bcbsglobalsolutions.com"
-        and path.startswith("/transparency-in-coverage")
+    if (host in {"bcbsglobalsolutions.com", "www.bcbsglobalsolutions.com"} and "transparency-in-coverage" in path) or (
+        host == "groupadmin.bcbsglobalsolutions.com" and path.startswith("/transparency-in-coverage")
     ):
         return "bcbs_global_solutions_mrf"
     if (
-        (
-            host in {"www.harvardpilgrim.org", "harvardpilgrim.org"}
-            and "machine-readable-files" in path
-        )
-        or (
-            host in {"tuftshealthplan.com", "www.tuftshealthplan.com"}
-            and "machine-readable-files" in path
-        )
+        (host in {"www.harvardpilgrim.org", "harvardpilgrim.org"} and "machine-readable-files" in path)
+        or (host in {"tuftshealthplan.com", "www.tuftshealthplan.com"} and "machine-readable-files" in path)
         or (
             host
             in {
@@ -1347,163 +1241,82 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "kaiser_mrf_inventory"
     if (
         (host in {"www.pbaclaims.com", "pbaclaims.com"} and path.startswith("/mrfs"))
-        or (
-            host in {"healthy.kaiserpermanente.org", "www.kaiserpermanente.org"}
-            and "machine-readable" in path
-        )
-        or (
-            host in {"www.alliedbenefit.com", "alliedbenefit.com"}
-            and "transparency" in path
-        )
+        or (host in {"healthy.kaiserpermanente.org", "www.kaiserpermanente.org"} and "machine-readable" in path)
+        or (host in {"www.alliedbenefit.com", "alliedbenefit.com"} and "transparency" in path)
         or (host in {"www.webtpa.com", "webtpa.com"} and "rights-protections" in path)
-        or (
-            host in {"www.healthnet.com", "healthnet.com"}
-            and "transparency-files" in path
-        )
-        or (
-            host in {"www.bcbsnd.com", "bcbsnd.com"}
-            and "transparency-in-coverage" in path
-        )
-        or (
-            host in {"www.lacare.org", "lacare.org"}
-            and "transparency-coverage-machine-readable-files" in path
-        )
-        or (
-            host in {"www.gravie.com", "gravie.com"}
-            and "transparency-in-coverage" in path
-        )
-        or (
-            host in {"www.priorityhealth.com", "priorityhealth.com"}
-            and path.startswith("/landing/transparency")
-        )
-        or (
-            host in {"www.mvphealthcare.com", "mvphealthcare.com"}
-            and "machine-readable-files" in path
-        )
-        or (
-            host in {"www.novahealthcare.com", "novahealthcare.com"}
-            and path.startswith("/resources/mrf")
-        )
+        or (host in {"www.healthnet.com", "healthnet.com"} and "transparency-files" in path)
+        or (host in {"www.bcbsnd.com", "bcbsnd.com"} and "transparency-in-coverage" in path)
+        or (host in {"www.lacare.org", "lacare.org"} and "transparency-coverage-machine-readable-files" in path)
+        or (host in {"www.gravie.com", "gravie.com"} and "transparency-in-coverage" in path)
+        or (host in {"www.priorityhealth.com", "priorityhealth.com"} and path.startswith("/landing/transparency"))
+        or (host in {"www.mvphealthcare.com", "mvphealthcare.com"} and "machine-readable-files" in path)
+        or (host in {"www.novahealthcare.com", "novahealthcare.com"} and path.startswith("/resources/mrf"))
         or (host in {"www.hnas.com", "hnas.com"} and "machine-readable-files" in path)
-        or (
-            host in {"www.anglehealth.com", "anglehealth.com"}
-            and "machine-readable-files" in path
-        )
+        or (host in {"www.anglehealth.com", "anglehealth.com"} and "machine-readable-files" in path)
         or (
             host in {"apatpa.com", "www.apatpa.com"}
             and "disclosures" in path
             and "american-plan-administrators" in path
         )
-        or (
-            host in {"www.simplepayhealth.com", "simplepayhealth.com"}
-            and path in {"", "/"}
-        )
+        or (host in {"www.simplepayhealth.com", "simplepayhealth.com"} and path in {"", "/"})
         or host == "transparency.abadmin.com"
     ):
         return "html_delegated_mrf_links"
     if host.endswith(".mrf.payercompass.com") or host == "mrf.payercompass.com":
         return "payercompass_mrf"
-    if (
-        host in {"www.molinamarketplace.com", "molinamarketplace.com"}
-        and "pricingtransparency" in path
-    ):
+    if host in {"www.molinamarketplace.com", "molinamarketplace.com"} and "pricingtransparency" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.hioscar.com", "hioscar.com"}
-        and "transparency-in-coverage-files" in path
-    ):
+    if host in {"www.hioscar.com", "hioscar.com"} and "transparency-in-coverage-files" in path:
         return "oscar_s3_monthly_toc"
     if (
         host in {"thealliance.health", "www.thealliance.health"}
         and "transparency-in-coverage-cms-9915-machine-readable-files" in path
     ):
         return "html_mrf_links"
-    if (
-        host in {"alamedaalliance.org", "www.alamedaalliance.org"}
-        and "pricing-transparency" in path
-    ):
+    if host in {"alamedaalliance.org", "www.alamedaalliance.org"} and "pricing-transparency" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.arkansasbluecross.com", "arkansasbluecross.com"}
-        and "machine-readable-files" in path
-    ):
+    if host in {"www.arkansasbluecross.com", "arkansasbluecross.com"} and "machine-readable-files" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.healthadvantage-hmo.com", "healthadvantage-hmo.com"}
-        and "machine-readable-files" in path
-    ):
+    if host in {"www.healthadvantage-hmo.com", "healthadvantage-hmo.com"} and "machine-readable-files" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.amerihealthcaritas.com", "amerihealthcaritas.com"}
-        and "price-transparency" in path
-    ):
+    if host in {"www.amerihealthcaritas.com", "amerihealthcaritas.com"} and "price-transparency" in path:
         return "html_mrf_links"
     if host == "sisconosurprise.com" and path.startswith("/ppo/"):
         return "html_mrf_links"
     if host == "caa.imagine360.com" and path.endswith("/index.html"):
         return "html_mrf_links"
-    if (
-        host in {"www.ccok.com", "ccok.com"}
-        and "/price-transparency/machine-readable" in path
-    ):
+    if host in {"www.ccok.com", "ccok.com"} and "/price-transparency/machine-readable" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.uofmhealthplan.org", "uofmhealthplan.org"}
-        and "price-transparency-and-interoperability" in path
-    ):
+    if host in {"www.uofmhealthplan.org", "uofmhealthplan.org"} and "price-transparency-and-interoperability" in path:
         return "html_mrf_links"
-    if (
-        host == "services.phpni.com"
-        and path.startswith("/machine-readable-files/files/")
-    ):
+    if host == "services.phpni.com" and path.startswith("/machine-readable-files/files/"):
         return "html_mrf_links"
-    if host == "portal.90degreebenefits.com" and path.startswith(
-        "/memberportal/machinereadablefiles"
-    ):
+    if host == "portal.90degreebenefits.com" and path.startswith("/memberportal/machinereadablefiles"):
         return "healthspace_machine_readable_files"
     if host == "transparency-in-coverage.collectivehealth.com":
         return "html_mrf_links"
-    if (
-        host in {"www.modahealth.com", "modahealth.com"}
-        and "machine-readable-files" in path
-    ):
+    if host in {"www.modahealth.com", "modahealth.com"} and "machine-readable-files" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.selecthealth.org", "selecthealth.org"}
-        and "machine-readable-data" in path
-    ):
+    if host in {"www.selecthealth.org", "selecthealth.org"} and "machine-readable-data" in path:
         return "html_mrf_links"
-    if host in {"www.emihealth.com", "emihealth.com"} and path.startswith(
-        "/machinereadables"
-    ):
+    if host in {"www.emihealth.com", "emihealth.com"} and path.startswith("/machinereadables"):
         return "html_mrf_links"
     if host in {"peakhealth.org", "www.peakhealth.org"}:
         if path.endswith(".zip") and re.search(r"[_-]index\.zip$", path):
             return "direct_toc"
         if path.startswith("/transparency"):
             return "html_mrf_links"
-    if host == "eldoradocomputing.hosted-by-files.com" and path.startswith(
-        "/centivopublic"
-    ):
+    if host == "eldoradocomputing.hosted-by-files.com" and path.startswith("/centivopublic"):
         return "html_mrf_links"
     if host == "boonchapman-mrf.zakipointhealth.com":
         return "html_mrf_links_mixed_directories"
-    if (
-        host in {"www.boonchapman.com", "boonchapman.com"}
-        and "machine-readable-files" in path
-    ):
+    if host in {"www.boonchapman.com", "boonchapman.com"} and "machine-readable-files" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.talltreeadmin.com", "talltreeadmin.com"}
-        and "machine-readable-files" in path
-    ):
+    if host in {"www.talltreeadmin.com", "talltreeadmin.com"} and "machine-readable-files" in path:
         return "html_mrf_links"
     if host in {"www.ebam.com", "ebam.com"} and "machine-readable-files" in path:
         return "wordpress_elfinder_mrf_links"
-    if (
-        host in {"www.motivhealth.com", "motivhealth.com"}
-        and "machinereadablefiles" in path
-    ):
+    if host in {"www.motivhealth.com", "motivhealth.com"} and "machinereadablefiles" in path:
         return "html_mrf_links"
     if host in {"www.cbabluevt.com", "cbabluevt.com"} and "employer-resources" in path:
         return "html_mrf_links"
@@ -1512,9 +1325,7 @@ def classify_hosting_platform(url: str | None) -> str | None:
         and "machine-readable-file" in path
     ):
         return "html_mrf_links"
-    if host in {"healthezbenefits.com", "www.healthezbenefits.com"} and path.startswith(
-        "/plandocuments"
-    ):
+    if host in {"healthezbenefits.com", "www.healthezbenefits.com"} and path.startswith("/plandocuments"):
         return "healthez_benefits_mrf"
     if host == "mrf.pacificsource.com" and path.startswith("/file/visit"):
         return "pacificsource_azure_mrf_listing"
@@ -1525,115 +1336,58 @@ def classify_hosting_platform(url: str | None) -> str | None:
         "sawus2prdticmrfrgaut.blob.core.windows.net",
     }:
         return "html_mrf_links"
-    if (
-        host in {"www.sanfordhealthplan.com", "sanfordhealthplan.com"}
-        and "transparency-in-coverage-rule" in path
+    if host in {"www.sanfordhealthplan.com", "sanfordhealthplan.com"} and "transparency-in-coverage-rule" in path:
+        return "html_mrf_links"
+    if (host in {"www.optimahealth.com", "optimahealth.com"} and "transparency-in-coverage" in path) or (
+        host in {"www.healthpartners.com", "healthpartners.com"} and "transparency" in path
     ):
         return "html_mrf_links"
-    if (
-        (
-            host in {"www.optimahealth.com", "optimahealth.com"}
-            and "transparency-in-coverage" in path
-        )
-        or (
-            host in {"www.healthpartners.com", "healthpartners.com"}
-            and "transparency" in path
-        )
-    ):
+    if host in {"www.scrippshealthplan.com", "scrippshealthplan.com"} and "transparency-in-coverage" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.scrippshealthplan.com", "scrippshealthplan.com"}
-        and "transparency-in-coverage" in path
-    ):
-        return "html_mrf_links"
-    if (
-        host in {"www.sutterhealthplan.org", "sutterhealthplan.org"}
-        and (
-            "healthcare-cost-transparency" in path
-            or "technical-information" in path
-        )
+    if host in {"www.sutterhealthplan.org", "sutterhealthplan.org"} and (
+        "healthcare-cost-transparency" in path or "technical-information" in path
     ):
         return "sutter_health_plan_sitecore"
-    if (
-        host in {"www.sharphealthplan.com", "sharphealthplan.com"}
-        and "api-access-for-developers" in path
-    ):
+    if host in {"www.sharphealthplan.com", "sharphealthplan.com"} and "api-access-for-developers" in path:
         return "html_mrf_links"
-    if (
-        host in {"group-health.com", "www.group-health.com"}
-        and "price-transparency" in path
-    ):
+    if host in {"group-health.com", "www.group-health.com"} and "price-transparency" in path:
         return "html_mrf_links"
-    if (
-        host in {"chorushealthplans.org", "www.chorushealthplans.org"}
-        and "transparency-in-coverage" in path
-    ):
+    if host in {"chorushealthplans.org", "www.chorushealthplans.org"} and "transparency-in-coverage" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.mclarenhealthplan.org", "mclarenhealthplan.org"}
-        and "transparency-in-coverage" in path
-    ):
+    if host in {"www.mclarenhealthplan.org", "mclarenhealthplan.org"} and "transparency-in-coverage" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.wpshealth.com", "wpshealth.com"}
-        and "price-transparency" in path
-    ):
+    if host in {"www.wpshealth.com", "wpshealth.com"} and "price-transparency" in path:
         return "html_mrf_links"
-    if (
-        host in {"ghcscw.com", "www.ghcscw.com"}
-        and "transparency-in-coverage" in path
-    ):
+    if host in {"ghcscw.com", "www.ghcscw.com"} and "transparency-in-coverage" in path:
         return "ghcscw_azure_mrf_listing"
-    if (
-        host in {"uhealthplan.utah.edu", "www.uhealthplan.utah.edu"}
-        and "machine-readable-data" in path
-    ):
+    if host in {"uhealthplan.utah.edu", "www.uhealthplan.utah.edu"} and "machine-readable-data" in path:
         return "html_mrf_links"
-    if (
-        host in {"www.ucare.org", "ucare.org"}
-        and "transparency-in-coverage" in path
-    ):
+    if host in {"www.ucare.org", "ucare.org"} and "transparency-in-coverage" in path:
         return "html_mrf_links"
     if host == "stmercycaremrf.z14.web.core.windows.net":
         return "html_mrf_links"
     if host == "files.myplancentral.com" and path.startswith("/tic/toc"):
         return "html_mrf_links"
     if host in {"www.healthplan.org", "healthplan.org"} and (
-        path.startswith("/machine_readable_files")
-        or path.startswith("/multiplan_mrfs")
-        or path.endswith("_mrfs")
+        path.startswith("/machine_readable_files") or path.startswith("/multiplan_mrfs") or path.endswith("_mrfs")
     ):
         return "healthplan_html_mrf_links"
-    if (
-        host in {"www.westernhealth.com", "westernhealth.com"}
-        and "price-transparency" in path
-    ):
+    if host in {"www.westernhealth.com", "westernhealth.com"} and "price-transparency" in path:
         return "html_mrf_links"
-    if host in {"www.firstchoicenext.com", "firstchoicenext.com"} and path.startswith(
-        "/json"
-    ):
+    if host in {"www.firstchoicenext.com", "firstchoicenext.com"} and path.startswith("/json"):
         return "html_mrf_links"
-    if (
-        host in {"www.amerihealthcaritasnext.com", "amerihealthcaritasnext.com"}
-        and path.startswith("/json")
-    ):
+    if host in {"www.amerihealthcaritasnext.com", "amerihealthcaritasnext.com"} and path.startswith("/json"):
         return "html_mrf_links"
     if host in {"www.avmed.org", "avmed.org"} and path.startswith("/en/for-developers"):
         return "avmed_html_mrf_links"
-    if (
-        host in {"www.centene.com", "centene.com"}
-        and "price-transparency-files" in path
-    ):
+    if host in {"www.centene.com", "centene.com"} and "price-transparency-files" in path:
         return "html_mrf_links"
     if host in {"www.bcbsal.org", "bcbsal.org"} and path.startswith("/web/tcr"):
         return "bcbsal_html_mrf_links"
     if (
         (host in {"www.bcbsks.com", "bcbsks.com"} and path.startswith("/mrf"))
         or (host in {"www.bcbsm.com", "bcbsm.com"} and path.startswith("/mrf/index"))
-        or (
-            host in {"www.bcbsms.com", "bcbsms.com"}
-            and "transparency-in-coverage" in path
-        )
+        or (host in {"www.bcbsms.com", "bcbsms.com"} and "transparency-in-coverage" in path)
         or (
             host
             in {
@@ -1650,102 +1404,45 @@ def classify_hosting_platform(url: str | None) -> str | None:
         )
         or (
             host in {"www.bluecrossnc.com", "bluecrossnc.com"}
-            and (
-                "transparency-coverage-mrf" in path
-                or "machine-readable-files" in path
-            )
+            and ("transparency-coverage-mrf" in path or "machine-readable-files" in path)
         )
-        or (
-            host in {"www.southcarolinablues.com", "southcarolinablues.com"}
-            and "transparency-in-coverage" in path
-        )
-        or (
-            host in {"www.bluecrossvt.org", "bluecrossvt.org"}
-            and "machine-readable-files" in path
-        )
+        or (host in {"www.southcarolinablues.com", "southcarolinablues.com"} and "transparency-in-coverage" in path)
+        or (host in {"www.bluecrossvt.org", "bluecrossvt.org"} and "machine-readable-files" in path)
         or (host in {"individual.carefirst.com"} and "machine-readable-file" in path)
-        or (
-            host in {"www.floridablue.com", "floridablue.com"}
-            and "machine-readable-files" in path
-        )
+        or (host in {"www.floridablue.com", "floridablue.com"} and "machine-readable-files" in path)
         or (
             host in {"www.asuris.com", "asuris.com", "www.regence.com", "regence.com"}
             and "transparency-in-coverage" in path
         )
-        or (
-            host in {"www.cdphp.com", "cdphp.com"}
-            and "machine-readable-pricing-data-files" in path
-        )
-        or (
-            host in {"www.healthoptions.org", "healthoptions.org"}
-            and "policies-notices" in path
-        )
-        or (
-            host in {"www.bswhealthplan.com", "bswhealthplan.com"}
-            and path.startswith("/transparency")
-        )
-        or (
-            host in {"capitalhealth.com", "www.capitalhealth.com"}
-            and "transparency-in-coverage" in path
-        )
-        or (
-            host in {"chppayment.christushealth.org"}
-            and path.startswith("/documents/atex")
-        )
-        or (
-            host in {"ebu.intermountainhealthcare.org"}
-            and path.startswith("/selecthealth/transparencyincoverage")
-        )
-        or (
-            host in {"www.wellsense.org", "wellsense.org"}
-            and path.startswith("/about-us/interoperability")
-        )
-        or (
-            host in {"www.securityhealth.org", "securityhealth.org"}
-            and path.startswith("/insurance-resources/json")
-        )
-        or (
-            host in {"www.nhpri.org", "nhpri.org"}
-            and "price-transparency-machine-readable-files" in path
-        )
+        or (host in {"www.cdphp.com", "cdphp.com"} and "machine-readable-pricing-data-files" in path)
+        or (host in {"www.healthoptions.org", "healthoptions.org"} and "policies-notices" in path)
+        or (host in {"www.bswhealthplan.com", "bswhealthplan.com"} and path.startswith("/transparency"))
+        or (host in {"capitalhealth.com", "www.capitalhealth.com"} and "transparency-in-coverage" in path)
+        or (host in {"chppayment.christushealth.org"} and path.startswith("/documents/atex"))
+        or (host in {"ebu.intermountainhealthcare.org"} and path.startswith("/selecthealth/transparencyincoverage"))
+        or (host in {"www.wellsense.org", "wellsense.org"} and path.startswith("/about-us/interoperability"))
+        or (host in {"www.securityhealth.org", "securityhealth.org"} and path.startswith("/insurance-resources/json"))
+        or (host in {"www.nhpri.org", "nhpri.org"} and "price-transparency-machine-readable-files" in path)
         or (host in {"transparency.connecticare.com", "transparency.emblemhealth.com"})
-        or (
-            host in {"www.sidecarhealth.com", "sidecarhealth.com"}
-            and "transparency-in-coverage" in path
-        )
-        or (
-            host in {"metroplus.org", "www.metroplus.org"}
-            and "machine-readable-files" in path
-        )
+        or (host in {"www.sidecarhealth.com", "sidecarhealth.com"} and "transparency-in-coverage" in path)
+        or (host in {"metroplus.org", "www.metroplus.org"} and "machine-readable-files" in path)
         or (host in {"www.pehp.org", "pehp.org"} and "machinereadablefiles" in path)
-        or (
-            host in {"curative.com", "www.curative.com"}
-            and "transparency-in-coverage-rates" in path
-        )
-        or (
-            host in {"www.groupadministrators.com", "groupadministrators.com"}
-            and "machinereadablefiles" in path
-        )
+        or (host in {"curative.com", "www.curative.com"} and "transparency-in-coverage-rates" in path)
+        or (host in {"www.groupadministrators.com", "groupadministrators.com"} and "machinereadablefiles" in path)
         or (host == "mrf.mmsanalytics.com" and (path == "/" or path.endswith("/")))
     ):
         return "html_mrf_links"
-    if host in {"www.hmsa.com", "hmsa.com"} and (
-        "transparency-in-coverage-machine-readable-files" in path
-    ):
+    if host in {"www.hmsa.com", "hmsa.com"} and ("transparency-in-coverage-machine-readable-files" in path):
         return "hmsa_monthly_toc"
-    if (
-        host in {"salud.grupotriples.com", "www.salud.grupotriples.com"}
-        and (
-            "transparency-in-coverage-machine-readable-files" in path
-            or path.startswith("/en/wp-json/app/v1/mtt")
-            or path.startswith("/wp-json/app/v1/mtt")
-        )
+    if host in {"salud.grupotriples.com", "www.salud.grupotriples.com"} and (
+        "transparency-in-coverage-machine-readable-files" in path
+        or path.startswith("/en/wp-json/app/v1/mtt")
+        or path.startswith("/wp-json/app/v1/mtt")
     ):
         return "triples_mtt_api"
-    if (
-        host in {"www.uhahealth.com", "uhahealth.com"}
-        and "transparency-in-coverage" in path
-    ) or (host == "app.uhahealth.com" and path.startswith("/mrf")):
+    if (host in {"www.uhahealth.com", "uhahealth.com"} and "transparency-in-coverage" in path) or (
+        host == "app.uhahealth.com" and path.startswith("/mrf")
+    ):
         return "uha_monthly_toc"
     if host == "mrfhub.providencehealthplan.com":
         return "providence_mrf_api"
@@ -1753,21 +1450,12 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "lacare_s3_listing"
     if host in {"www.bcbsri.com", "bcbsri.com"} and path.startswith("/developers"):
         return "bcbsri_azure_mrf_listing"
-    if (
-        host
-        in {
-            "hostedjson.z5.web.core.windows.net",
-            "hostedjson.blob.core.windows.net",
-        }
-        or (
-            host in {"www.cchealth.org", "cchealth.org"}
-            and "transparency-in-coverage" in path
-        )
-    ):
+    if host in {
+        "hostedjson.z5.web.core.windows.net",
+        "hostedjson.blob.core.windows.net",
+    } or (host in {"www.cchealth.org", "cchealth.org"} and "transparency-in-coverage" in path):
         return "hostedjson_azure_mrf_listing"
-    if host in {"alliantplans.com", "www.alliantplans.com"} and path.startswith(
-        "/json/pt/"
-    ):
+    if host in {"alliantplans.com", "www.alliantplans.com"} and path.startswith("/json/pt/"):
         return "html_mrf_links"
     if host in {"aultcare.com", "www.aultcare.com"} and "price-transparency" in path:
         return "html_mrf_links"
@@ -1786,34 +1474,21 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "cmstic_file_info"
     if _is_cmstic_keyed_toc_url(raw):
         return "cmstic_keyed_toc_redirect"
-    if host in {"www.reliancematrix.com", "reliancematrix.com"} and (
-        "transparency-in-coverage" in path
-    ):
+    if host in {"www.reliancematrix.com", "reliancematrix.com"} and ("transparency-in-coverage" in path):
         return "html_delegated_mrf_links"
-    if host == "www.myhealthbenefits.com" and path.startswith(
-        "/myhealthbenefits/home/mrfs"
-    ):
+    if host == "www.myhealthbenefits.com" and path.startswith("/myhealthbenefits/home/mrfs"):
         return "html_mrf_with_healthcarebluebook"
-    if host.endswith("lucenthealth.com") and path.startswith(
-        "/transparency-in-coverage"
-    ):
+    if host.endswith("lucenthealth.com") and path.startswith("/transparency-in-coverage"):
         return "html_mrf_with_healthcarebluebook"
-    if (
-        host in {"hpitpa.com", "www.hpitpa.com"}
-        and "transparency-in-coverage-machine-readable-files" in path
-    ):
+    if host in {"hpitpa.com", "www.hpitpa.com"} and "transparency-in-coverage-machine-readable-files" in path:
         return "html_mrf_with_healthcarebluebook"
-    if host == "transparency.auxiant.com" and not path.startswith(
-        ("/wp-admin/", "/wp-content/", "/wp-includes/")
-    ):
+    if host == "transparency.auxiant.com" and not path.startswith(("/wp-admin/", "/wp-content/", "/wp-includes/")):
         return "auxiant_wordpress"
     if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(
         "/mrf-search/diversified-group"
     ):
         return "mymedicalshopper_talon_bounded"
-    if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(
-        ("/mrf-search/", "/mrf/")
-    ):
+    if host in {"www.mymedicalshopper.com", "mymedicalshopper.com"} and path.startswith(("/mrf-search/", "/mrf/")):
         return "mymedicalshopper_talon"
     if host == "www.asrhealthbenefits.com" and path.startswith(
         ("/mrf", "/umbraco/surface/mrfdownload", "/home/umbraco/surface/mrfdownload")
@@ -1821,61 +1496,36 @@ def classify_hosting_platform(url: str | None) -> str | None:
         return "asr_health_benefits"
     if host in {"www.paisc.com", "paisc.com"} and "machine-readable-files" in path:
         return "html_mrf_links"
-    if host in {"www.redirecthealth.com", "redirecthealth.com"} and (
-        "machine-readable-data" in path
-    ):
+    if host in {"www.redirecthealth.com", "redirecthealth.com"} and ("machine-readable-data" in path):
         return "html_mrf_links"
-    if host in {"www.blueadvantagearkansas.com", "blueadvantagearkansas.com"} and (
-        "machine-readable-files" in path
-    ):
+    if host in {"www.blueadvantagearkansas.com", "blueadvantagearkansas.com"} and ("machine-readable-files" in path):
         return "blueadvantage_html_mrf_links"
-    if host in {"www.geha.com", "geha.com"} and path.startswith(
-        "/transparency-in-coverage"
-    ):
+    if host in {"www.geha.com", "geha.com"} and path.startswith("/transparency-in-coverage"):
         return "html_delegated_mrf_links"
     if host in {
         "transparency-in-coverage.uhc.com",
         "transparency-in-coverage.optum.com",
     }:
         return "uhc_public_blobs"
-    if host == "providermrf.uhc.com" and path.startswith(
-        ("/ifp", "/cs", "/api/files/ui/", "/api/stream/ui/")
-    ):
+    if host == "providermrf.uhc.com" and path.startswith(("/ifp", "/cs", "/api/files/ui/", "/api/stream/ui/")):
         return "uhc_provider_mrf_files"
     if host == "transparency-in-coverage.bluecrossma.com":
         return "bcbsma_monthly_tocs"
-    if (
-        host in {"www.bcbswy.com", "bcbswy.com"}
-        and "machine-readable-files" in path
-    ):
+    if host in {"www.bcbswy.com", "bcbswy.com"} and "machine-readable-files" in path:
         return "bcbswy_hmhs_monthly_toc"
-    if (
-        host in {"www.bluecrossmn.com", "bluecrossmn.com"}
-        and "transparency-coverage-machine-readable-files" in path
-    ):
+    if host in {"www.bluecrossmn.com", "bluecrossmn.com"} and "transparency-coverage-machine-readable-files" in path:
         return "bcbsmn_monthly_toc"
-    if (
-        host in {"www.upmchealthplan.com", "upmchealthplan.com"}
-        and "transparency-in-coverage/mrf" in path
-    ):
+    if host in {"www.upmchealthplan.com", "upmchealthplan.com"} and "transparency-in-coverage/mrf" in path:
         return "upmc_monthly_toc"
-    if host.endswith("cigna.com") and (
-        "machine-readable" in path or "/static/mrf/" in path
-    ):
+    if host.endswith("cigna.com") and ("machine-readable" in path or "/static/mrf/" in path):
         return "cigna_static_mrf_lookup"
     if "healthsparq.com" in host:
         return "healthsparq"
     if "sapphiremrfhub.com" in host:
         return "sapphire"
-    if path.endswith("_directory.json") and any(
-        token in path for token in ("mrf", "tcr", "toc", "aso")
-    ):
+    if path.endswith("_directory.json") and any(token in path for token in ("mrf", "tcr", "toc", "aso")):
         return "json_mrf_directory_links"
-    if (
-        "health1.aetna.com" in host
-        or "health1.firsthealth.com" in host
-        or "health1.meritain.com" in host
-    ):
+    if "health1.aetna.com" in host or "health1.firsthealth.com" in host or "health1.meritain.com" in host:
         return "aetna_health1"
     if "mrfdata.hmhs.com" in host:
         return "highmark_hmhs"
@@ -1890,25 +1540,15 @@ def classify_hosting_platform(url: str | None) -> str | None:
     return "custom" if host else None
 
 
-def _master_list_url_cell(
-    cells: list[str], type_value: str | None
-) -> tuple[str | None, str, str]:
+def _master_list_url_cell(cells: list[str], type_value: str | None) -> tuple[str | None, str, str]:
     if len(cells) == 3:
         middle, tail = cells[1], cells[2]
-        if (
-            _http_urls(middle)
-            or _is_placeholder_source_url(middle)
-            or middle.strip() in {"", "-", "—"}
-        ):
+        if _http_urls(middle) or _is_placeholder_source_url(middle) or middle.strip() in {"", "-", "—"}:
             return type_value, middle, tail
         return type_value, tail, ""
     second, third, fourth = cells[1], cells[2], cells[3]
     normalized_type = _normalize_entity_type(second) or type_value
-    if (
-        _http_urls(third)
-        or _is_placeholder_source_url(third)
-        or third.strip() in {"", "-", "—"}
-    ):
+    if _http_urls(third) or _is_placeholder_source_url(third) or third.strip() in {"", "-", "—"}:
         return normalized_type, third, fourth
     return normalized_type, fourth, ""
 
@@ -1931,9 +1571,7 @@ def _master_list_aliases(notes: str) -> tuple[str, ...]:
 
 
 def _master_list_target_payer_query(notes: str) -> str | None:
-    values = _master_list_note_values(
-        notes, r"target[-_\s]*(?:payer[-_\s]*)?quer(?:y|ies)"
-    )
+    values = _master_list_note_values(notes, r"target[-_\s]*(?:payer[-_\s]*)?quer(?:y|ies)")
     return values[0] if values else None
 
 
@@ -1948,7 +1586,7 @@ def _master_list_note_values(notes: str, label_pattern: str) -> tuple[str, ...]:
     raw_values = match.group("values")
     try:
         parsed_values = next(csv.reader([raw_values], skipinitialspace=True))
-    except (csv.Error, StopIteration):
+    except csv.Error, StopIteration:
         parsed_values = raw_values.split(",")
     values: list[str] = []
     seen_values: set[str] = set()
@@ -2064,8 +1702,7 @@ def _infer_benefit_lines_from_text(*values: Any) -> tuple[str, ...]:
 def _source_benefit_lines(source: dict[str, Any]) -> tuple[str, ...]:
     metadata = dict((source or {}).get("metadata_json") or {})
     return _normalize_benefit_lines(
-        _benefit_line_values(metadata.get("benefit_lines"))
-        + _benefit_line_values(metadata.get("benefit_line"))
+        _benefit_line_values(metadata.get("benefit_lines")) + _benefit_line_values(metadata.get("benefit_line"))
     )
 
 
@@ -2095,9 +1732,7 @@ def _master_list_candidates_from_cells(
         return []
     entity_type = _infer_entity_type(current_section, raw_payer_name)
     entity_type, url_cell, notes_text = _master_list_url_cell(cells, entity_type)
-    urls = tuple(
-        url for url in _http_urls(url_cell) if not _is_placeholder_source_url(url)
-    ) or (None,)
+    urls = tuple(url for url in _http_urls(url_cell) if not _is_placeholder_source_url(url)) or (None,)
     raw_payload_by_field = {
         "section": current_section,
         "raw_payer_name": raw_payer_name,
@@ -2122,13 +1757,9 @@ def _master_list_candidates_from_cells(
             aliases=_master_list_aliases(notes_text),
             benefit_lines=_master_list_benefit_lines(notes_text),
             source_tier=_master_list_source_tier(notes_text, url),
-            source_coverage=_master_list_note_values(
-                notes_text, r"source[-_\s]*coverage"
-            ),
+            source_coverage=_master_list_note_values(notes_text, r"source[-_\s]*coverage"),
             vendor_names=_master_list_note_values(notes_text, r"vendor[-_\s]*names?"),
-            network_names=_master_list_note_values(
-                notes_text, r"network[-_\s]*names?"
-            ),
+            network_names=_master_list_note_values(notes_text, r"network[-_\s]*names?"),
             plan_names=_master_list_note_values(notes_text, r"plan[-_\s]*names?"),
             confidence=85 if url else 45,
             license_status="curated_public_research",
@@ -2242,15 +1873,9 @@ def _dedupe_candidates(candidates: list[SourceCandidate]) -> list[SourceCandidat
 
 def _parse_provider_list(provider: str | None, *, test_mode: bool) -> list[str]:
     if not provider or provider == "all":
-        return _configured_provider_names(
-            "test_providers" if test_mode else "default_providers"
-        )
-    parts = [
-        item.strip().lower() for item in re.split(r"[, ]+", provider) if item.strip()
-    ]
-    return parts or _configured_provider_names(
-        "test_providers" if test_mode else "default_providers"
-    )
+        return _configured_provider_names("test_providers" if test_mode else "default_providers")
+    parts = [item.strip().lower() for item in re.split(r"[, ]+", provider) if item.strip()]
+    return parts or _configured_provider_names("test_providers" if test_mode else "default_providers")
 
 
 class _BrowserFallbackRequired(Exception):
@@ -2270,8 +1895,7 @@ async def _read_text_response(
     if expect_json and allow_browser_fallback and response.status in _BROWSER_FALLBACK_HTTP_STATUSES:
         raise _BrowserFallbackRequired()
     if expect_json and any(
-        marker in content_type
-        for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
+        marker in content_type for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
     ):
         if allow_browser_fallback:
             raise _BrowserFallbackRequired()
@@ -2281,7 +1905,7 @@ async def _read_text_response(
     async for chunk in response.content.iter_chunked(64 * 1024):
         total += len(chunk)
         if total > max_bytes:
-            raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+            raise IncompleteToc(f"response exceeds {max_bytes} byte discovery limit")
         if expect_json and not chunks:
             prefix = chunk.lstrip()[:64].lower()
             if prefix.startswith((b"<!doctype", b"<html", b"<?xml")):
@@ -2301,9 +1925,7 @@ async def _fetch_text_with_session(
 ) -> str:
     """Fetch bounded text with a supplied session and browser-header retry."""
     try:
-        async with session.get(
-            url, allow_redirects=True, **_request_ssl_kwargs(url)
-        ) as response:
+        async with session.get(url, allow_redirects=True, **_request_ssl_kwargs(url)) as response:
             body, charset = await _read_text_response(
                 response,
                 max_bytes=max_bytes,
@@ -2330,16 +1952,14 @@ async def _fetch_text_with_session(
             connector=retry_connector,
             trust_env=False,
         ) as retry_session:
-            async with retry_session.get(
-                url, allow_redirects=True, **_request_ssl_kwargs(url)
-            ) as response:
+            async with retry_session.get(url, allow_redirects=True, **_request_ssl_kwargs(url)) as response:
                 body, charset = await _read_text_response(
                     response,
                     max_bytes=max_bytes,
                     expect_json=expect_json,
                     allow_browser_fallback=False,
                 )
-    return _decode_response_body(body, charset=charset)
+    return _decode_response_body(body, charset=charset, max_bytes=max_bytes)
 
 
 async def _fetch_text(
@@ -2358,9 +1978,7 @@ async def _fetch_text(
             session=session,
             expect_json=expect_json,
         )
-    timeout = aiohttp.ClientTimeout(
-        total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
-    )
+    timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
     connector = _tcp_connector(limit=0)
     async with aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
@@ -2368,9 +1986,7 @@ async def _fetch_text(
         connector=connector,
         trust_env=False,
     ) as owned_session:
-        return await _fetch_text(
-            url, max_bytes=max_bytes, session=owned_session, expect_json=expect_json
-        )
+        return await _fetch_text(url, max_bytes=max_bytes, session=owned_session, expect_json=expect_json)
 
 
 async def _fetch_bytes(
@@ -2381,9 +1997,7 @@ async def _fetch_bytes(
 ) -> bytes:
     await _assert_fetch_url_allowed(url)
     if session is None:
-        timeout = aiohttp.ClientTimeout(
-            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
-        )
+        timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
         connector = _tcp_connector(limit=0)
         async with aiohttp.ClientSession(
             headers={"User-Agent": USER_AGENT},
@@ -2396,23 +2010,35 @@ async def _fetch_bytes(
                 max_bytes=max_bytes,
                 session=owned_session,
             )
-    async with session.get(
-        url, allow_redirects=True, **_request_ssl_kwargs(url)
-    ) as resp:
+    async with session.get(url, allow_redirects=True, **_request_ssl_kwargs(url)) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         chunks: list[bytes] = []
         total = 0
         async for chunk in resp.content.iter_chunked(64 * 1024):
             total += len(chunk)
             if total > max_bytes:
-                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+                raise IncompleteToc(f"response exceeds {max_bytes} byte discovery limit")
             chunks.append(chunk)
     return b"".join(chunks)
 
 
-def _decode_response_body(body: bytes, *, charset: str = "utf-8") -> str:
+def _decode_response_body(
+    body: bytes,
+    *,
+    charset: str = "utf-8",
+    max_bytes: int = MAX_TOC_BYTES_DEFAULT,
+) -> str:
+    """Bound raw-gzip expansion before constructing decoded text."""
+    if len(body) > max_bytes:
+        raise IncompleteToc("response exceeds the discovery byte limit")
     if body.startswith(b"\x1f\x8b"):
-        body = gzip.decompress(body)
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(body)) as stream:
+                body = stream.read(max_bytes + 1)
+        except (EOFError, OSError, zlib.error) as exc:
+            raise IncompleteToc("invalid or truncated compressed response") from exc
+        if len(body) > max_bytes:
+            raise IncompleteToc("decoded response exceeds the discovery byte limit")
     return body.decode(charset or "utf-8", errors="replace")
 
 
@@ -2441,9 +2067,7 @@ class _BoundedAsyncReader:
         chunk = await self._reader.read(size)
         self._bytes_read += len(chunk)
         if self._bytes_read > self._max_bytes:
-            raise ValueError(
-                f"response exceeds {self._max_bytes} byte discovery limit"
-            )
+            raise IncompleteToc(f"response exceeds {self._max_bytes} byte discovery limit")
         return chunk
 
 
@@ -2460,7 +2084,7 @@ async def _read_query_matching_structures(
         raise ValueError(f"TOC request failed with HTTP {response.status}")
     content_length = _as_int(response.headers.get("Content-Length"))
     if content_length and content_length > max_bytes:
-        raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+        raise IncompleteToc(f"response exceeds {max_bytes} byte discovery limit")
 
     matching_structures: list[dict[str, Any]] = []
     bounded_reader = _BoundedAsyncReader(response.content, max_bytes)
@@ -2475,8 +2099,7 @@ async def _read_query_matching_structures(
         matching_plans = [
             plan
             for plan in (structure.get("reporting_plans") or [])
-            if isinstance(plan, dict)
-            and _is_plan_info_query_match(plan, target_queries)
+            if isinstance(plan, dict) and _is_plan_info_query_match(plan, target_queries)
         ]
         if matching_plans:
             structure["reporting_plans"] = matching_plans
@@ -2518,9 +2141,7 @@ async def _fetch_query_filtered_toc(
         raise ValueError("target payer query is required for filtered TOC streaming")
     await _assert_fetch_url_allowed(crawl_target.url)
     if session is None:
-        timeout = aiohttp.ClientTimeout(
-            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
-        )
+        timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
         connector = _tcp_connector(limit=0)
         async with aiohttp.ClientSession(
             headers={"User-Agent": USER_AGENT},
@@ -2545,9 +2166,7 @@ async def _fetch_query_filtered_toc(
             target_queries=target_queries,
             max_bytes=max_bytes,
         )
-    return _query_filtered_toc_document(
-        dict(crawl_target.metadata or {}), matching_structures
-    )
+    return _query_filtered_toc_document(dict(crawl_target.metadata or {}), matching_structures)
 
 
 async def _post_form_json_value(
@@ -2559,9 +2178,7 @@ async def _post_form_json_value(
 ) -> Any:
     await _assert_fetch_url_allowed(url)
     if session is None:
-        timeout = aiohttp.ClientTimeout(
-            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
-        )
+        timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
         connector = _tcp_connector(limit=0)
         async with aiohttp.ClientSession(
             headers={"User-Agent": USER_AGENT},
@@ -2569,9 +2186,7 @@ async def _post_form_json_value(
             connector=connector,
             trust_env=False,
         ) as owned_session:
-            return await _post_form_json_value(
-                url, form_fields, max_bytes=max_bytes, session=owned_session
-            )
+            return await _post_form_json_value(url, form_fields, max_bytes=max_bytes, session=owned_session)
     chunks: list[bytes] = []
     total = 0
     async with session.post(
@@ -2588,9 +2203,9 @@ async def _post_form_json_value(
         async for chunk in resp.content.iter_chunked(64 * 1024):
             total += len(chunk)
             if total > max_bytes:
-                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+                raise IncompleteToc(f"response exceeds {max_bytes} byte discovery limit")
             chunks.append(chunk)
-        text = _decode_response_body(b"".join(chunks), charset=resp.charset or "utf-8")
+        text = _decode_response_body(b"".join(chunks), charset=resp.charset or "utf-8", max_bytes=max_bytes)
     return _loads_mrf_json_value(text)
 
 
@@ -2600,9 +2215,7 @@ async def _fetch_json_value(
     max_bytes: int = MAX_TOC_BYTES_DEFAULT,
     session: aiohttp.ClientSession | None = None,
 ) -> Any:
-    text = await _fetch_text(
-        url, max_bytes=max_bytes, session=session, expect_json=True
-    )
+    text = await _fetch_text(url, max_bytes=max_bytes, session=session, expect_json=True)
     return _loads_mrf_json_value(text)
 
 
@@ -2668,15 +2281,13 @@ def _json_values_from_zip_bytes(
     max_bytes: int = MAX_TOC_BYTES_DEFAULT,
 ) -> list[tuple[str, Any]]:
     json_members: list[tuple[str, Any]] = []
+    decoded_bytes = 0
     try:
         with zipfile.ZipFile(io.BytesIO(body)) as archive:
             infos = sorted(
                 (info for info in archive.infolist() if not info.is_dir()),
                 key=lambda info: (
-                    0
-                    if _mrf_file_type_from_text(info.filename, info.filename)
-                    == "table-of-contents"
-                    else 1,
+                    0 if _mrf_file_type_from_text(info.filename, info.filename) == "table-of-contents" else 1,
                     info.filename,
                 ),
             )
@@ -2686,11 +2297,12 @@ def _json_values_from_zip_bytes(
                 if not lower_name.endswith((".json", ".json.gz")):
                     continue
                 if info.file_size > max_bytes:
-                    raise ValueError(
-                        f"zip member {name} exceeds {max_bytes} byte discovery limit"
-                    )
+                    raise IncompleteToc(f"zip member {name} exceeds {max_bytes} byte discovery limit")
                 member_bytes = archive.read(info)
-                text = _decode_response_body(member_bytes)
+                text = _decode_response_body(member_bytes, max_bytes=max_bytes)
+                decoded_bytes += len(text.encode("utf-8"))
+                if decoded_bytes > max_bytes:
+                    raise IncompleteToc("ZIP JSON members exceed the combined discovery byte limit")
                 json_members.append((name, _loads_mrf_json_value(text)))
     except zipfile.BadZipFile as exc:
         raise ValueError("response body is not a readable ZIP archive") from exc
@@ -2731,9 +2343,7 @@ async def _post_json_value(
 ) -> Any:
     await _assert_fetch_url_allowed(url)
     if session is None:
-        timeout = aiohttp.ClientTimeout(
-            total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
-        )
+        timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
         connector = _tcp_connector(limit=0)
         async with aiohttp.ClientSession(
             headers={"User-Agent": USER_AGENT},
@@ -2741,27 +2351,18 @@ async def _post_json_value(
             connector=connector,
             trust_env=False,
         ) as owned_session:
-            return await _post_json_value(
-                url, request_payload, max_bytes=max_bytes, session=owned_session
-            )
-    async with session.post(
-        url, json=request_payload, allow_redirects=True, **_request_ssl_kwargs(url)
-    ) as resp:
+            return await _post_json_value(url, request_payload, max_bytes=max_bytes, session=owned_session)
+    async with session.post(url, json=request_payload, allow_redirects=True, **_request_ssl_kwargs(url)) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         content_type = str(resp.headers.get("Content-Type") or "").lower()
-        if any(
-            marker in content_type
-            for marker in ("text/html", "application/xhtml", "application/pdf", "xml")
-        ):
-            raise ValueError(
-                f"response content-type is not JSON: {content_type or 'unknown'}"
-            )
+        if any(marker in content_type for marker in ("text/html", "application/xhtml", "application/pdf", "xml")):
+            raise ValueError(f"response content-type is not JSON: {content_type or 'unknown'}")
         chunks: list[bytes] = []
         total = 0
         async for chunk in resp.content.iter_chunked(64 * 1024):
             total += len(chunk)
             if total > max_bytes:
-                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+                raise IncompleteToc(f"response exceeds {max_bytes} byte discovery limit")
             if not chunks:
                 prefix = chunk.lstrip()[:64].lower()
                 if prefix.startswith((b"<!doctype", b"<html", b"<?xml")):
@@ -2790,9 +2391,7 @@ async def _post_text(
     )
 
 
-async def _load_candidates(
-    provider: str, *, test_mode: bool, limit: int | None
-) -> list[SourceCandidate]:
+async def _load_candidates(provider: str, *, test_mode: bool, limit: int | None) -> list[SourceCandidate]:
     config = _provider_config(provider)
     parser = str(config.get("parser") or provider).strip().lower()
     if parser == "master-list":
@@ -2833,9 +2432,7 @@ async def _assert_fetch_url_allowed(url: str) -> None:
         try:
             _assert_public_ip(ipaddress.ip_address(address))
         except ValueError as exc:
-            raise ValueError(
-                f"URL resolves to a non-public address: {address}"
-            ) from exc
+            raise ValueError(f"URL resolves to a non-public address: {address}") from exc
 
 
 def _assert_public_ip(ip: ipaddress._BaseAddress) -> None:
@@ -2852,9 +2449,7 @@ def _assert_public_ip(ip: ipaddress._BaseAddress) -> None:
         raise ValueError(f"non-public IP address is not allowed: {ip}")
 
 
-async def _head_url(
-    url: str, session: aiohttp.ClientSession | None = None
-) -> dict[str, Any]:
+async def _head_url(url: str, session: aiohttp.ClientSession | None = None) -> dict[str, Any]:
     checked_at = _utc_now()
     try:
         await _assert_fetch_url_allowed(url)
@@ -2864,9 +2459,7 @@ async def _head_url(
                 headers={"User-Agent": USER_AGENT}, timeout=timeout, trust_env=False
             ) as owned_session:
                 return await _head_url(url, owned_session)
-        async with session.head(
-            url, allow_redirects=True, **_request_ssl_kwargs(url)
-        ) as resp:
+        async with session.head(url, allow_redirects=True, **_request_ssl_kwargs(url)) as resp:
             await _assert_fetch_url_allowed(str(resp.url))
             length = resp.headers.get("Content-Length")
             return {
@@ -2958,13 +2551,10 @@ def _candidate_source_row(
     return {
         "source_id": source_id,
         "payer_id": payer_id,
-        "source_key": _candidate_source_key(
-            candidate, source_url, target_payer_query, source_id
-        ),
+        "source_key": _candidate_source_key(candidate, source_url, target_payer_query, source_id),
         "display_name": _clean_text(candidate.payer_name),
         "source_type": candidate.source_type,
-        "hosting_platform": candidate.hosting_platform
-        or classify_hosting_platform(source_url),
+        "hosting_platform": candidate.hosting_platform or classify_hosting_platform(source_url),
         "access_model": candidate.access_model,
         "index_url": candidate.index_url,
         "human_url": candidate.human_url,
@@ -3011,9 +2601,7 @@ def _candidate_to_rows(
     candidate_metadata = _candidate_metadata(candidate, aliases)
     target_payer_query = _candidate_target_payer_query(candidate)
     source_id = source_id or f"mrfsource_{uuid.uuid4().hex}"
-    payer_row_dict = _candidate_payer_row(
-        candidate, now, payer_id, aliases, candidate_metadata
-    )
+    payer_row_dict = _candidate_payer_row(candidate, now, payer_id, aliases, candidate_metadata)
     if not source_url:
         return payer_row_dict, None
     return payer_row_dict, _candidate_source_row(
@@ -3028,9 +2616,7 @@ def _candidate_to_rows(
     )
 
 
-def _candidate_metadata(
-    candidate: SourceCandidate, aliases: list[str] | tuple[str, ...]
-) -> dict[str, Any]:
+def _candidate_metadata(candidate: SourceCandidate, aliases: list[str] | tuple[str, ...]) -> dict[str, Any]:
     target_payer_query = _candidate_target_payer_query_display(candidate)
     metadata: dict[str, Any] = {
         "aliases": list(aliases),
@@ -3051,9 +2637,7 @@ def _candidate_metadata(
         ),
     }
     for key, values in optional_values_by_field.items():
-        cleaned_values = [
-            _clean_text(value) for value in values if _clean_text(value)
-        ]
+        cleaned_values = [_clean_text(value) for value in values if _clean_text(value)]
         if cleaned_values:
             metadata[key] = list(dict.fromkeys(cleaned_values))
     return metadata
@@ -3067,23 +2651,14 @@ def _merge_payer_candidate_row(
     """Merge one additional source candidate into its payer row."""
 
     existing_payer_row["aliases"] = sorted(
-        set(
-            (existing_payer_row.get("aliases") or [])
-            + (payer_row.get("aliases") or [])
-        )
+        set((existing_payer_row.get("aliases") or []) + (payer_row.get("aliases") or []))
     )
     existing_payer_row["source_coverage"] = sorted(
-        set(
-            (existing_payer_row.get("source_coverage") or [])
-            + (payer_row.get("source_coverage") or [])
-        )
+        set((existing_payer_row.get("source_coverage") or []) + (payer_row.get("source_coverage") or []))
     )
     existing_metadata_by_field = dict(existing_payer_row.get("metadata_json") or {})
     existing_metadata_by_field["benefit_lines"] = sorted(
-        set(
-            (existing_metadata_by_field.get("benefit_lines") or [])
-            + list(candidate.benefit_lines)
-        )
+        set((existing_metadata_by_field.get("benefit_lines") or []) + list(candidate.benefit_lines))
     )
     payer_metadata_by_field = payer_row.get("metadata_json") or {}
     for key in (
@@ -3094,20 +2669,14 @@ def _merge_payer_candidate_row(
         "plan_names",
     ):
         existing_metadata_by_field[key] = sorted(
-            set(
-                (existing_metadata_by_field.get(key) or [])
-                + (payer_metadata_by_field.get(key) or [])
-            )
+            set((existing_metadata_by_field.get(key) or []) + (payer_metadata_by_field.get(key) or []))
         )
     existing_metadata_by_field["source_tier"] = _normalize_source_tier(
-        existing_metadata_by_field.get("source_tier")
-        or payer_metadata_by_field.get("source_tier")
+        existing_metadata_by_field.get("source_tier") or payer_metadata_by_field.get("source_tier")
     )
     existing_payer_row["metadata_json"] = {
         **existing_metadata_by_field,
-        "providers": sorted(
-            set(existing_metadata_by_field.get("providers", []) + [candidate.provider])
-        ),
+        "providers": sorted(set(existing_metadata_by_field.get("providers", []) + [candidate.provider])),
     }
 
 
@@ -3116,17 +2685,25 @@ from process.mrf_payer_identity import (
     _curated_payer_row_key,
     _preserved_payer_updates,
     _preserved_source_updates,
+)
+from process.mrf_payer_identity import (
     discovery_control_metrics as _discovery_control_metrics,
+)
+from process.mrf_payer_identity import (
     is_candidate_bound_to_source as _candidate_matches_stored_source,
+)
+from process.mrf_payer_identity import (
     load_pending_identity_errors as _load_pending_identity_errors,
+)
+from process.mrf_payer_identity import (
     persist_running_identity_errors as _persist_running_identity_errors,
+)
+from process.mrf_payer_identity import (
     store_candidates as _store_candidates,
 )
 
 
-async def _retag_sources_for_discovery_run(
-    source_rows: list[dict[str, Any]], discovery_run_id: str
-) -> None:
+async def _retag_sources_for_discovery_run(source_rows: list[dict[str, Any]], discovery_run_id: str) -> None:
     """Expose a resumed frozen source set through the current catalog run."""
 
     updated_at = _utc_now()
@@ -3260,9 +2837,7 @@ async def _store_observations(
 
 
 def _healthsparq_file_type(file_schema: Any) -> str:
-    normalized = re.sub(
-        r"[^a-z0-9]+", "_", str(file_schema or "").strip().lower()
-    ).strip("_")
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(file_schema or "").strip().lower()).strip("_")
     if normalized in {"in_network_rates", "in_network"}:
         return "in-network"
     if normalized in {"allowed_amounts", "allowed_amount"}:
@@ -3325,9 +2900,7 @@ def _healthsparq_plan_value(plan: dict[str, Any], *keys: str) -> Any:
 
 
 def _healthsparq_file_name(file_item: dict[str, Any]) -> str | None:
-    return _clean_text(
-        _healthsparq_value(file_item, "fileName", "file_name", "filename", "name")
-    )
+    return _clean_text(_healthsparq_value(file_item, "fileName", "file_name", "filename", "name"))
 
 
 def _healthsparq_file_path(file_item: dict[str, Any]) -> Any:
@@ -3345,27 +2918,19 @@ def _healthsparq_file_path(file_item: dict[str, Any]) -> Any:
 
 
 def _healthsparq_file_schema(file_item: dict[str, Any]) -> Any:
-    return _healthsparq_value(
-        file_item, "fileSchema", "file_schema", "schema", "fileType", "file_type"
-    )
+    return _healthsparq_value(file_item, "fileSchema", "file_schema", "schema", "fileType", "file_type")
 
 
 def _healthsparq_reporting_entity_name(file_item: dict[str, Any]) -> Any:
-    return _healthsparq_value(
-        file_item, "reportingEntityName", "reporting_entity_name", "reportingEntity"
-    )
+    return _healthsparq_value(file_item, "reportingEntityName", "reporting_entity_name", "reportingEntity")
 
 
 def _healthsparq_reporting_entity_type(file_item: dict[str, Any]) -> Any:
-    return _healthsparq_value(
-        file_item, "reportingEntityType", "reporting_entity_type"
-    )
+    return _healthsparq_value(file_item, "reportingEntityType", "reporting_entity_type")
 
 
 def _healthsparq_last_updated_on(file_item: dict[str, Any]) -> Any:
-    return _healthsparq_value(
-        file_item, "lastUpdatedOn", "last_updated_on", "updatedAt", "updated_at"
-    )
+    return _healthsparq_value(file_item, "lastUpdatedOn", "last_updated_on", "updatedAt", "updated_at")
 
 
 def _healthsparq_plan_row(
@@ -3378,12 +2943,8 @@ def _healthsparq_plan_row(
 ) -> tuple[str, dict[str, Any]]:
     """Build one normalized plan row from a HealthSparq reporting plan."""
     plan_id = str(_healthsparq_plan_value(plan, "planId", "plan_id") or "").strip()
-    plan_name = normalized_plan.get("plan_name") or _healthsparq_plan_value(
-        plan, "planName", "plan_name", "name"
-    )
-    market_type = _healthsparq_plan_value(
-        plan, "planMarketType", "plan_market_type", "marketType"
-    )
+    plan_name = normalized_plan.get("plan_name") or _healthsparq_plan_value(plan, "planName", "plan_name", "name")
+    market_type = _healthsparq_plan_value(plan, "planMarketType", "plan_market_type", "marketType")
     plan_row_id = _id(
         "mrfplan",
         {
@@ -3415,8 +2976,13 @@ def _healthsparq_plan_row(
 
 
 def _healthsparq_file_row(
-    source_row_dict: dict[str, Any], file_item: dict[str, Any], file_url: str,
-    *, metadata_url: str, plan_info: list[dict[str, Any]], now: dt.datetime,
+    source_row_dict: dict[str, Any],
+    file_item: dict[str, Any],
+    file_url: str,
+    *,
+    metadata_url: str,
+    plan_info: list[dict[str, Any]],
+    now: dt.datetime,
 ) -> tuple[str, dict[str, Any]]:
     """Build one normalized MRF file row from a HealthSparq metadata file."""
     file_type = _healthsparq_file_type(_healthsparq_file_schema(file_item))
@@ -3442,13 +3008,7 @@ def _healthsparq_file_row(
         "network_name": file_name,
         "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
         "plan_names": [plan.get("plan_name") for plan in plan_info if plan.get("plan_name")],
-        "market_types": sorted(
-            {
-                plan.get("plan_market_type")
-                for plan in plan_info
-                if plan.get("plan_market_type")
-            }
-        ),
+        "market_types": sorted({plan.get("plan_market_type") for plan in plan_info if plan.get("plan_market_type")}),
         "is_signed_url": _is_signed(file_url),
         "size_bytes": None,
         "schema_version": None,
@@ -3478,9 +3038,7 @@ def _healthsparq_rows_from_metadata(
     metadata_payload: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Convert HealthSparq metadata into normalized plan and file rows."""
-    files = _healthsparq_metadata_files(
-        metadata_payload if isinstance(metadata_payload, dict) else {}
-    )
+    files = _healthsparq_metadata_files(metadata_payload if isinstance(metadata_payload, dict) else {})
     now = _utc_now()
     target_query = _source_target_payer_query(source_row_dict)
     plan_rows_by_id: dict[str, dict[str, Any]] = {}
@@ -3511,9 +3069,7 @@ def _healthsparq_rows_from_metadata(
     return list(plan_rows_by_id.values()), list(file_rows_by_id.values())
 
 
-def _toc_plan_row(
-    source_row_dict: dict[str, Any], entry: Any, plan: dict[str, Any]
-) -> tuple[str, dict[str, Any]]:
+def _toc_plan_row(source_row_dict: dict[str, Any], entry: Any, plan: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Build one normalized plan row from a parsed table-of-contents entry."""
     plan_id = str(plan.get("plan_id") or "").strip()
     plan_name = plan.get("plan_name")
@@ -3571,13 +3127,7 @@ def _toc_file_row(
         "network_name": entry.description,
         "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
         "plan_names": [plan.get("plan_name") for plan in plan_info if plan.get("plan_name")],
-        "market_types": sorted(
-            {
-                plan.get("plan_market_type")
-                for plan in plan_info
-                if plan.get("plan_market_type")
-            }
-        ),
+        "market_types": sorted({plan.get("plan_market_type") for plan in plan_info if plan.get("plan_market_type")}),
         "is_signed_url": _is_signed(entry.original_url),
         "size_bytes": None,
         "schema_version": schema_version,
@@ -3608,47 +3158,21 @@ def _toc_rows_from_content(
     """Convert TOC content into plan and file rows."""
     if isinstance(toc.get("files"), list):
         return _healthsparq_rows_from_metadata(source_row_dict, url, toc)
-    plan_rows_by_id: dict[str, dict[str, Any]] = {}
-    file_rows: list[dict[str, Any]] = []
-    target_query = _source_target_payer_query(source_row_dict)
     target_queries = _source_payer_query_candidates(source_row_dict)
-    plan_predicate = None
+    predicate = None
     if filter_to_target_query and target_queries:
-        plan_predicate = lambda plan: _is_plan_info_query_match(plan, target_queries)
-    if plan_predicate is None:
-        entries = parse_toc_catalog_entries(toc, str(url))
-    else:
-        entries = parse_toc_catalog_entries(
-            toc,
-            str(url),
-            plan_predicate=plan_predicate,
-        )
-    schema_version = _truncate_text(toc.get("version"), 32)
-    for entry in entries:
-        plan_info = _query_expanded_plan_info(
-            entry.plan_info or (),
-            target_query,
-            filter_to_target_query=filter_to_target_query,
-            target_queries=target_queries,
-        )
-        if filter_to_target_query and target_queries and not plan_info:
-            continue
-        for plan in plan_info:
-            plan_row_id, plan_row = _toc_plan_row(source_row_dict, entry, plan)
-            plan_rows_by_id[plan_row_id] = plan_row
-        if (
-            entry.source_type != "table-of-contents"
-            and str(entry.original_url or "").startswith(("http://", "https://"))
-        ):
-            file_rows.append(
-                _toc_file_row(
-                    source_row_dict,
-                    entry,
-                    plan_info,
-                    schema_version=schema_version,
-                )
-            )
-    return list(plan_rows_by_id.values()), file_rows
+        predicate = lambda plan: _is_plan_info_query_match(plan, target_queries)
+    entries = (
+        parse_toc_catalog_entries(toc, str(url))
+        if predicate is None
+        else parse_toc_catalog_entries(toc, str(url), plan_predicate=predicate)
+    )
+    return toc_rows_from_entries(
+        source_row_dict,
+        entries,
+        _truncate_text(toc.get("version"), 32),
+        filter_to_target_query=filter_to_target_query,
+    )
 
 
 def _metadata_text_file_type(value: Any) -> str:
@@ -3729,9 +3253,7 @@ def _metadata_text_file_row(
     now: dt.datetime,
 ) -> tuple[str, dict[str, Any]]:
     """Build one file row from parsed text metadata."""
-    file_type = _metadata_text_file_type(
-        fields_by_name.get("file scope") or fields_by_name.get("scope")
-    )
+    file_type = _metadata_text_file_type(fields_by_name.get("file scope") or fields_by_name.get("scope"))
     plan_name = fields_by_name.get("plan name")
     sponsor_ein = fields_by_name.get("sponsor ein") or fields_by_name.get("ein")
     canonical_url = _canonical_or_none(file_url) or file_url
@@ -3851,11 +3373,7 @@ def _label_from_index_name(name: str) -> str:
 def _parse_uhc_blob_listing(
     listing_payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    blobs = (
-        listing_payload.get("blobs")
-        if isinstance(listing_payload, dict)
-        else None
-    )
+    blobs = listing_payload.get("blobs") if isinstance(listing_payload, dict) else None
     if not isinstance(blobs, list):
         return []
     blob_targets: list[dict[str, Any]] = []
@@ -3874,22 +3392,12 @@ def _parse_uhc_blob_listing(
         )
         if "_index.json" not in lower_name and not has_direct_embedded_vision:
             continue
-        target_kind = (
-            "file_reference" if has_direct_embedded_vision else "toc_json"
-        )
-        target_file_type = (
-            "in-network"
-            if has_direct_embedded_vision
-            else "table-of-contents"
-        )
+        target_kind = "file_reference" if has_direct_embedded_vision else "toc_json"
+        target_file_type = "in-network" if has_direct_embedded_vision else "table-of-contents"
         blob_targets.append(
             {
                 "url": url,
-                "label": (
-                    "UHC Vision"
-                    if has_direct_embedded_vision
-                    else _label_from_index_name(name)
-                ),
+                "label": ("UHC Vision" if has_direct_embedded_vision else _label_from_index_name(name)),
                 "name": name,
                 "size": _as_int(blob.get("size")),
                 "target_kind": target_kind,
@@ -3900,9 +3408,7 @@ def _parse_uhc_blob_listing(
     return blob_targets
 
 
-def _uhc_blob_targets_matching_query(
-    targets: list[dict[str, Any]], query: str | None
-) -> list[dict[str, Any]]:
+def _uhc_blob_targets_matching_query(targets: list[dict[str, Any]], query: str | None) -> list[dict[str, Any]]:
     if not _clean_text(query):
         return targets
     return [
@@ -3920,11 +3426,7 @@ def _uhc_blob_targets_matching_query(
 
 
 def _uhc_provider_mrf_collection_from_url(url: str | None) -> str:
-    parts = [
-        part.lower()
-        for part in urlsplit(str(url or "")).path.strip("/").split("/")
-        if part
-    ]
+    parts = [part.lower() for part in urlsplit(str(url or "")).path.strip("/").split("/") if part]
     if parts:
         if parts[0] in {"ifp", "cs"}:
             return parts[0]
@@ -4024,18 +3526,14 @@ def _uhc_provider_mrf_targets_from_payload(
 
 
 def _mymedicalshopper_entity_slug_from_url(url: str | None) -> str | None:
-    parts = [
-        part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part
-    ]
+    parts = [part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part]
     if len(parts) >= 2 and parts[0].lower() == "mrf-search":
         return parts[1]
     return None
 
 
 def _mymedicalshopper_employer_slug_from_url(url: str | None) -> str | None:
-    parts = [
-        part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part
-    ]
+    parts = [part for part in urlsplit(str(url or "")).path.strip("/").split("/") if part]
     if len(parts) >= 2 and parts[0].lower() == "mrf":
         return parts[1]
     return None
@@ -4066,9 +3564,7 @@ def _slug_label(value: str | None) -> str | None:
     return re.sub(r"\s+", " ", text.replace("_", " ").replace("-", " ")).strip().title()
 
 
-def _mymedicalshopper_employer_selector(
-    entity_slug: str, *, all_employers_searchable: bool
-) -> dict[str, Any]:
+def _mymedicalshopper_employer_selector(entity_slug: str, *, all_employers_searchable: bool) -> dict[str, Any]:
     selector_by_field: dict[str, Any] = {
         "tpaSlug": entity_slug,
         "status": "Enabled",
@@ -4114,9 +3610,7 @@ def _mymedicalshopper_entity_employer_selectors(
     source: dict[str, Any] | None,
     resolver: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    base_selector = _mymedicalshopper_employer_selector(
-        entity_slug, all_employers_searchable=all_employers_searchable
-    )
+    base_selector = _mymedicalshopper_employer_selector(entity_slug, all_employers_searchable=all_employers_searchable)
     search_selector = _mymedicalshopper_employer_search_selector(
         base_selector, _source_target_payer_query(source or {})
     )
@@ -4171,12 +3665,8 @@ def _mymedicalshopper_sockjs_messages(frame: str) -> list[dict[str, Any]]:
     return messages
 
 
-async def _mymedicalshopper_ddp_send(
-    ws: aiohttp.ClientWebSocketResponse, payload: dict[str, Any]
-) -> None:
-    encoded = json.dumps(
-        [json.dumps(payload, separators=(",", ":"))], separators=(",", ":")
-    )
+async def _mymedicalshopper_ddp_send(ws: aiohttp.ClientWebSocketResponse, payload: dict[str, Any]) -> None:
+    encoded = json.dumps([json.dumps(payload, separators=(",", ":"))], separators=(",", ":"))
     await ws.send_str(encoded)
 
 
@@ -4192,16 +3682,12 @@ async def _mymedicalshopper_ddp_recv(
         if deadline is not None:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise TimeoutError(
-                    f"MyMedicalShopper DDP {operation} timed out after {timeout_seconds:g}s"
-                )
+                raise TimeoutError(f"MyMedicalShopper DDP {operation} timed out after {timeout_seconds:g}s")
             frame_timeout = min(timeout_seconds, remaining)
         try:
             frame = await asyncio.wait_for(ws.receive(), timeout=frame_timeout)
         except TimeoutError as exc:
-            raise TimeoutError(
-                f"MyMedicalShopper DDP {operation} timed out after {timeout_seconds:g}s"
-            ) from exc
+            raise TimeoutError(f"MyMedicalShopper DDP {operation} timed out after {timeout_seconds:g}s") from exc
         if frame.type == aiohttp.WSMsgType.TEXT:
             messages = _mymedicalshopper_sockjs_messages(str(frame.data))
             returned_messages: list[dict[str, Any]] = []
@@ -4221,9 +3707,7 @@ async def _mymedicalshopper_ddp_recv(
             aiohttp.WSMsgType.CLOSED,
             aiohttp.WSMsgType.CLOSING,
         }:
-            raise ValueError(
-                "MyMedicalShopper DDP websocket closed before a response was received"
-            )
+            raise ValueError("MyMedicalShopper DDP websocket closed before a response was received")
         if frame.type == aiohttp.WSMsgType.ERROR:
             raise ValueError(f"MyMedicalShopper DDP websocket error: {ws.exception()}")
 
@@ -4243,13 +3727,9 @@ async def _mymedicalshopper_ddp_connect(
         timeout=timeout_seconds,
     )
     await asyncio.wait_for(ws.receive(), timeout=timeout_seconds)
-    await _mymedicalshopper_ddp_send(
-        ws, {"msg": "connect", "version": "1", "support": ["1", "pre2", "pre1"]}
-    )
+    await _mymedicalshopper_ddp_send(ws, {"msg": "connect", "version": "1", "support": ["1", "pre2", "pre1"]})
     while True:
-        for message in await _mymedicalshopper_ddp_recv(
-            ws, timeout_seconds=timeout_seconds
-        ):
+        for message in await _mymedicalshopper_ddp_recv(ws, timeout_seconds=timeout_seconds):
             if message.get("msg") == "connected":
                 return ws
             if message.get("msg") == "failed":
@@ -4264,9 +3744,7 @@ async def _mymedicalshopper_ddp_call(
     request_id: str,
     timeout_seconds: float,
 ) -> Any:
-    await _mymedicalshopper_ddp_send(
-        ws, {"msg": "method", "id": request_id, "method": method, "params": params}
-    )
+    await _mymedicalshopper_ddp_send(ws, {"msg": "method", "id": request_id, "method": method, "params": params})
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
         for message in await _mymedicalshopper_ddp_recv(
@@ -4278,9 +3756,7 @@ async def _mymedicalshopper_ddp_call(
             if message.get("msg") != "result" or message.get("id") != request_id:
                 continue
             if message.get("error"):
-                raise ValueError(
-                    f"MyMedicalShopper DDP method {method} failed: {message['error']}"
-                )
+                raise ValueError(f"MyMedicalShopper DDP method {method} failed: {message['error']}")
             return message.get("result")
 
 
@@ -4292,9 +3768,7 @@ async def _mymedicalshopper_ddp_subscribe_collect(
     sub_id: str,
     timeout_seconds: float,
 ) -> list[dict[str, Any]]:
-    await _mymedicalshopper_ddp_send(
-        ws, {"msg": "sub", "id": sub_id, "name": name, "params": params}
-    )
+    await _mymedicalshopper_ddp_send(ws, {"msg": "sub", "id": sub_id, "name": name, "params": params})
     collected_messages: list[dict[str, Any]] = []
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
@@ -4310,28 +3784,20 @@ async def _mymedicalshopper_ddp_subscribe_collect(
             if message.get("msg") == "ready" and sub_id in (message.get("subs") or []):
                 return collected_messages
             if message.get("msg") == "nosub" and message.get("id") == sub_id:
-                raise ValueError(
-                    f"MyMedicalShopper DDP subscription {name} failed: {message.get('error') or message}"
-                )
+                raise ValueError(f"MyMedicalShopper DDP subscription {name} failed: {message.get('error') or message}")
 
 
-def _mymedicalshopper_entity_config_from_messages(
-    messages: list[dict[str, Any]], entity_slug: str
-) -> dict[str, Any]:
+def _mymedicalshopper_entity_config_from_messages(messages: list[dict[str, Any]], entity_slug: str) -> dict[str, Any]:
     for message in messages:
         if message.get("collection") != "thirdPartyAdministrators":
             continue
-        fields = (
-            message.get("fields") if isinstance(message.get("fields"), dict) else {}
-        )
+        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
         if str(fields.get("slug") or "").strip() == entity_slug:
             return dict(fields)
     return {}
 
 
-def _mymedicalshopper_tpa_name_from_config(
-    config: dict[str, Any], entity_slug: str | None
-) -> str | None:
+def _mymedicalshopper_tpa_name_from_config(config: dict[str, Any], entity_slug: str | None) -> str | None:
     for key in (
         "name",
         "displayName",
@@ -4361,23 +3827,13 @@ def _mymedicalshopper_tabular_info_from_messages(
         "records_filtered": 0,
     }
     for message in messages:
-        if (
-            message.get("collection") != "tabular_records"
-            or message.get("id") != table_id
-        ):
+        if message.get("collection") != "tabular_records" or message.get("id") != table_id:
             continue
-        fields = (
-            message.get("fields") if isinstance(message.get("fields"), dict) else {}
-        )
+        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
         ids = fields.get("ids") if isinstance(fields.get("ids"), list) else []
         info_by_field["ids"] = ids
-        info_by_field["records_total"] = (
-            _as_int(fields.get("recordsTotal")) or len(ids)
-        )
-        info_by_field["records_filtered"] = (
-            _as_int(fields.get("recordsFiltered"))
-            or info_by_field["records_total"]
-        )
+        info_by_field["records_total"] = _as_int(fields.get("recordsTotal")) or len(ids)
+        info_by_field["records_filtered"] = _as_int(fields.get("recordsFiltered")) or info_by_field["records_total"]
     return info_by_field
 
 
@@ -4391,9 +3847,7 @@ def _mymedicalshopper_employer_docs_from_messages(
             "changed",
         }:
             continue
-        fields = (
-            message.get("fields") if isinstance(message.get("fields"), dict) else {}
-        )
+        fields = message.get("fields") if isinstance(message.get("fields"), dict) else {}
         slug = str(fields.get("slug") or "").strip()
         if not slug:
             continue
@@ -4416,12 +3870,8 @@ def _mymedicalshopper_employer_search_values(employer: dict[str, Any]) -> list[A
     ]
 
 
-def _has_mymedicalshopper_employer_query_match(
-    employer: dict[str, Any], query: str | None
-) -> bool:
-    return _is_search_value_query_match(
-        _mymedicalshopper_employer_search_values(employer), query
-    )
+def _has_mymedicalshopper_employer_query_match(employer: dict[str, Any], query: str | None) -> bool:
+    return _is_search_value_query_match(_mymedicalshopper_employer_search_values(employer), query)
 
 
 def _mymedicalshopper_query_fallback_max_employers(
@@ -4479,26 +3929,18 @@ async def _mymedicalshopper_entity_employer_page(
             offset,
             batch_size,
         ],
-        sub_id=(
-            "mms-info-"
-            f"{employer_query.entity_slug}-{employer_query.selector_label}-{offset}"
-        ),
+        sub_id=(f"mms-info-{employer_query.entity_slug}-{employer_query.selector_label}-{offset}"),
         timeout_seconds=employer_query.timeout_seconds,
     )
     table_info = _mymedicalshopper_tabular_info_from_messages(info_messages)
-    employer_ids = [
-        employer_id for employer_id in table_info.get("ids") or [] if employer_id
-    ]
+    employer_ids = [employer_id for employer_id in table_info.get("ids") or [] if employer_id]
     if not employer_ids:
         return table_info, [], 0
     doc_messages = await _mymedicalshopper_ddp_subscribe_collect(
         ws,
         name="entityMRFEmployers",
         params=["EntityMRFEmployers", employer_ids, employer_query.fields],
-        sub_id=(
-            "mms-employers-"
-            f"{employer_query.entity_slug}-{employer_query.selector_label}-{offset}"
-        ),
+        sub_id=(f"mms-employers-{employer_query.entity_slug}-{employer_query.selector_label}-{offset}"),
         timeout_seconds=employer_query.timeout_seconds,
     )
     return (
@@ -4514,27 +3956,19 @@ async def _mymedicalshopper_entity_employers_for_query(
 ) -> dict[str, dict[str, Any]]:
     employers_by_slug: dict[str, dict[str, Any]] = {}
     offset = 0
-    while (
-        offset < employer_query.max_employers
-        and len(employers_by_slug) < employer_query.max_employers
-    ):
+    while offset < employer_query.max_employers and len(employers_by_slug) < employer_query.max_employers:
         batch_size = min(
             employer_query.page_size,
             employer_query.max_employers - len(employers_by_slug),
         )
-        table_info, employer_docs, employer_id_count = (
-            await _mymedicalshopper_entity_employer_page(
-                ws, employer_query, offset, batch_size
-            )
+        table_info, employer_docs, employer_id_count = await _mymedicalshopper_entity_employer_page(
+            ws, employer_query, offset, batch_size
         )
         if not employer_docs:
             break
         for employer in employer_docs:
-            if (
-                employer_query.query_filter
-                and not _has_mymedicalshopper_employer_query_match(
-                    employer, employer_query.query_filter
-                )
+            if employer_query.query_filter and not _has_mymedicalshopper_employer_query_match(
+                employer, employer_query.query_filter
             ):
                 continue
             slug = str(employer.get("slug") or "").strip()
@@ -4542,21 +3976,21 @@ async def _mymedicalshopper_entity_employers_for_query(
                 employer_payload_dict = dict(employer)
                 employer_payload_dict.setdefault("tpaSlug", employer_query.entity_slug)
                 if employer_query.tpa_name:
-                    employer_payload_dict.setdefault(
-                        "tpaName", employer_query.tpa_name
-                    )
+                    employer_payload_dict.setdefault("tpaName", employer_query.tpa_name)
                 employers_by_slug[slug] = employer_payload_dict
         offset += employer_id_count
-        if offset >= (
-            _as_int(table_info.get("records_filtered")) or employer_id_count
-        ):
+        if offset >= (_as_int(table_info.get("records_filtered")) or employer_id_count):
             break
     return employers_by_slug
 
 
 async def _mymedicalshopper_employer_discovery_context(
-    ws: aiohttp.ClientWebSocketResponse, *, source_record: dict[str, Any] | None = None,
-    entity_slug: str, resolver: dict[str, Any], timeout_seconds: float,
+    ws: aiohttp.ClientWebSocketResponse,
+    *,
+    source_record: dict[str, Any] | None = None,
+    entity_slug: str,
+    resolver: dict[str, Any],
+    timeout_seconds: float,
 ) -> _MmsEmployerDiscoveryContext:
     """Load bounded selector and paging settings for an entity employer crawl."""
     config_messages = await _mymedicalshopper_ddp_subscribe_collect(
@@ -4569,18 +4003,12 @@ async def _mymedicalshopper_employer_discovery_context(
     config = _mymedicalshopper_entity_config_from_messages(config_messages, entity_slug)
     tpa_name = _mymedicalshopper_tpa_name_from_config(config, entity_slug)
     machine_readable_files = (
-        config.get("machineReadableFiles")
-        if isinstance(config.get("machineReadableFiles"), dict)
-        else {}
+        config.get("machineReadableFiles") if isinstance(config.get("machineReadableFiles"), dict) else {}
     )
     all_employers_searchable = bool(machine_readable_files.get("allEmployersSearchable"))
     target_query = _source_target_payer_query(source_record or {})
-    base_selector = _mymedicalshopper_employer_selector(
-        entity_slug, all_employers_searchable=all_employers_searchable
-    )
-    search_selector = _mymedicalshopper_employer_search_selector(
-        base_selector, target_query
-    )
+    base_selector = _mymedicalshopper_employer_selector(entity_slug, all_employers_searchable=all_employers_searchable)
+    search_selector = _mymedicalshopper_employer_search_selector(base_selector, target_query)
     selectors = _mymedicalshopper_entity_employer_selectors(
         entity_slug,
         all_employers_searchable=all_employers_searchable,
@@ -4647,9 +4075,7 @@ async def _mymedicalshopper_entity_employers_for_context(
         employers_by_slug.update(
             await _mymedicalshopper_entity_employers_for_query(
                 ws,
-                _mymedicalshopper_employer_query(
-                    context, selector=selector, selector_label=str(selector_index)
-                ),
+                _mymedicalshopper_employer_query(context, selector=selector, selector_label=str(selector_index)),
             )
         )
     if (
@@ -4658,9 +4084,7 @@ async def _mymedicalshopper_entity_employers_for_context(
         and context.search_selector is not None
         and not context.resolver.get("query_search_include_full_table")
     ):
-        fallback_max_employers = _mymedicalshopper_query_fallback_max_employers(
-            context.resolver, context.max_employers
-        )
+        fallback_max_employers = _mymedicalshopper_query_fallback_max_employers(context.resolver, context.max_employers)
         employers_by_slug.update(
             await _mymedicalshopper_entity_employers_for_query(
                 ws,
@@ -4691,9 +4115,7 @@ async def _mymedicalshopper_entity_employers(
         resolver=resolver,
         timeout_seconds=timeout_seconds,
     )
-    employers_by_slug = await _mymedicalshopper_entity_employers_for_context(
-        ws, context
-    )
+    employers_by_slug = await _mymedicalshopper_entity_employers_for_context(ws, context)
     return list(employers_by_slug.values())
 
 
@@ -4736,9 +4158,7 @@ def _mymedicalshopper_generated_entries(generated: Any) -> list[dict[str, Any]]:
     return [generated]
 
 
-def _mymedicalshopper_entry_plan_value(
-    entry: dict[str, Any], keys: tuple[str, ...]
-) -> Any:
+def _mymedicalshopper_entry_plan_value(entry: dict[str, Any], keys: tuple[str, ...]) -> Any:
     for key in keys:
         value = entry.get(key)
         if value not in (None, ""):
@@ -4759,24 +4179,18 @@ def _mymedicalshopper_entry_history(entry: dict[str, Any]) -> list[dict[str, Any
     return []
 
 
-def _mymedicalshopper_employer_target_context(
-    employer: dict[str, Any], *, entity_slug: str | None
-) -> dict[str, Any]:
+def _mymedicalshopper_employer_target_context(employer: dict[str, Any], *, entity_slug: str | None) -> dict[str, Any]:
     """Return stable employer metadata shared by generated MRF targets."""
     employer_slug = str(employer.get("slug") or "").strip()
     employer_name = _clean_text(employer.get("name") or employer_slug)
-    employer_id = (
-        _mymedicalshopper_oid_value(employer.get("_id") or employer.get("id")) or None
-    )
+    employer_id = _mymedicalshopper_oid_value(employer.get("_id") or employer.get("id")) or None
     group_id = str(
         employer.get("groupId") or employer.get("group_id") or ""
     ).strip() or _mymedicalshopper_group_id_from_employer_slug(employer_slug)
     tpa_slug = str(
         employer.get("tpaSlug") or employer.get("tpa_slug") or entity_slug or ""
     ).strip() or _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug)
-    tpa_name = _clean_text(
-        employer.get("tpaName") or employer.get("tpa_name")
-    ) or _slug_label(tpa_slug)
+    tpa_name = _clean_text(employer.get("tpaName") or employer.get("tpa_name")) or _slug_label(tpa_slug)
     ein = str(employer.get("ein") or employer.get("EIN") or "").strip() or None
     return {
         "entity_slug": entity_slug or tpa_slug,
@@ -4801,22 +4215,15 @@ def _mymedicalshopper_generated_target(
     resolved_from_url: str,
 ) -> tuple[str, CrawlTarget] | None:
     """Convert one generated MyMedicalShopper record to its latest crawl target."""
-    plan_id = _mymedicalshopper_entry_plan_value(
-        entry, ("planId", "plan_id", "id", "_id")
-    )
-    plan_name = _clean_text(
-        _mymedicalshopper_entry_plan_value(entry, ("planName", "plan_name", "name"))
-        or ""
-    )
+    plan_id = _mymedicalshopper_entry_plan_value(entry, ("planId", "plan_id", "id", "_id"))
+    plan_name = _clean_text(_mymedicalshopper_entry_plan_value(entry, ("planName", "plan_name", "name")) or "")
     history = _mymedicalshopper_entry_history(entry)
     latest = sorted(
         (
             generation_record
             for generation_record in history
             if generation_record.get("mrfGenerated") is True
-            and str(generation_record.get("link") or "")
-            .strip()
-            .startswith(("http://", "https://"))
+            and str(generation_record.get("link") or "").strip().startswith(("http://", "https://"))
         ),
         key=lambda generation_record: str(generation_record.get("month") or ""),
         reverse=True,
@@ -4856,9 +4263,7 @@ def _mymedicalshopper_targets_from_generated(
     resolved_from_url: str,
 ) -> list[CrawlTarget]:
     """Convert generated MyMedicalShopper records into crawl targets."""
-    context = _mymedicalshopper_employer_target_context(
-        employer, entity_slug=entity_slug
-    )
+    context = _mymedicalshopper_employer_target_context(employer, entity_slug=entity_slug)
     targets_by_url: dict[str, CrawlTarget] = {}
     for entry in _mymedicalshopper_generated_entries(generated):
         target_by_url = _mymedicalshopper_generated_target(
@@ -5026,20 +4431,14 @@ def _viva_health_commercial_target(
     )
 
 
-def _collect_viva_health_commercial_targets(
-    source: dict[str, Any], url: str
-) -> list[CrawlTarget]:
+def _collect_viva_health_commercial_targets(source: dict[str, Any], url: str) -> list[CrawlTarget]:
     canonical_url = _canonical_or_none(url) or url
     targets: list[CrawlTarget] = []
     for file_info in _VIVA_HEALTH_COMMERCIAL_MRF_FILES:
         file_url = file_info["url"]
-        if urlsplit(url).path.startswith("/files/mrf/") and (
-            _canonical_or_none(file_url) or file_url
-        ) != canonical_url:
+        if urlsplit(url).path.startswith("/files/mrf/") and (_canonical_or_none(file_url) or file_url) != canonical_url:
             continue
-        targets.append(
-            _viva_health_commercial_target(source, file_info, resolved_from_url=url)
-        )
+        targets.append(_viva_health_commercial_target(source, file_info, resolved_from_url=url))
     return targets
 
 
@@ -5051,9 +4450,7 @@ def _viva_health_employer_landing_target(
 ) -> CrawlTarget:
     employer_slug = _mymedicalshopper_employer_slug_from_url(employer_url)
     group_id = _mymedicalshopper_group_id_from_employer_slug(employer_slug)
-    tpa_slug = _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug) or (
-        "viva-health" if group_id else None
-    )
+    tpa_slug = _mymedicalshopper_tpa_slug_from_employer_slug(employer_slug) or ("viva-health" if group_id else None)
     employer_name = _slug_label(employer_slug)
     plan_info_rows = []
     if employer_name or group_id:
@@ -5104,9 +4501,7 @@ async def _collect_viva_health_employer_landing_targets(
     urls = _delegated_mrf_source_urls_from_html(html_text, base_url=employer_page_url)
     max_links = _as_int(resolver.get("max_employer_links")) or 40
     return [
-        _viva_health_employer_landing_target(
-            source, employer_url=employer_url, employer_page_url=employer_page_url
-        )
+        _viva_health_employer_landing_target(source, employer_url=employer_url, employer_page_url=employer_page_url)
         for employer_url in urls[:max_links]
         if classify_hosting_platform(employer_url) == "mymedicalshopper_talon"
     ]
@@ -5128,9 +4523,7 @@ async def _resolve_viva_health_mrf(
     if resolver.get("include_commercial_static", True):
         crawl_targets.extend(_collect_viva_health_commercial_targets(source_record, url))
     if resolver.get("include_employer_mrf_links", True):
-        employer_url = urljoin(
-            url, str(resolver.get("employer_path") or "/mrf/employers/")
-        )
+        employer_url = urljoin(url, str(resolver.get("employer_path") or "/mrf/employers/"))
         try:
             employer_targets = await _collect_viva_health_employer_landing_targets(
                 source_record,
@@ -5138,6 +4531,8 @@ async def _resolve_viva_health_mrf(
                 resolver=resolver,
                 session=session,
             )
+        except IncompleteToc:
+            raise
         except Exception:
             employer_targets = []
         crawl_targets.extend(employer_targets)
@@ -5153,25 +4548,21 @@ async def _resolve_viva_health_mrf(
 def _magnacare_results_url(base_url: str, search_term: str) -> str:
     parsed = urlsplit(str(base_url or ""))
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
-    return (
-        f"{origin}/Transparency/magnacare/results?"
-        + urlencode(
-            {
-                "filters": f"search-by:{search_term}",
-                "orderBy": "",
-                "pageNumber": "",
-                "perPageCount": "0",
-            }
-        )
+    return f"{origin}/Transparency/magnacare/results?" + urlencode(
+        {
+            "filters": f"search-by:{search_term}",
+            "orderBy": "",
+            "pageNumber": "",
+            "perPageCount": "0",
+        }
     )
 
 
 def _magnacare_download_url(base_url: str, run_history_id: str, ip_address: str) -> str:
     parsed = urlsplit(str(base_url or ""))
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc}"
-    return (
-        f"{origin}/Transparency/magnacare/download-file?"
-        + urlencode({"runHistoryID": run_history_id, "ipAddress": ip_address})
+    return f"{origin}/Transparency/magnacare/download-file?" + urlencode(
+        {"runHistoryID": run_history_id, "ipAddress": ip_address}
     )
 
 
@@ -5182,9 +4573,7 @@ def _magnacare_html_attrs(fragment: str) -> dict[str, str]:
         fragment or "",
         flags=re.S,
     ):
-        attributes_by_name[match.group("name").lower()] = html.unescape(
-            match.group("value")
-        )
+        attributes_by_name[match.group("name").lower()] = html.unescape(match.group("value"))
     return attributes_by_name
 
 
@@ -5206,7 +4595,8 @@ def _magnacare_row_plan_info(row: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     return [
         {
-            "plan_id": plan_id or semantic_hash(
+            "plan_id": plan_id
+            or semantic_hash(
                 {"plan_name": plan_name, "market_type": market_type},
                 domain="magnacare_plan",
             )[:32],
@@ -5230,9 +4620,7 @@ def _magnacare_result_rows(html_text: str) -> list[dict[str, Any]]:
         body = row_match.group("body") or ""
         columns = [
             _strip_html_tags(match.group("body") or "")
-            for match in re.finditer(
-                r"<td\b[^>]*>(?P<body>.*?)</td>", body, flags=re.I | re.S
-            )
+            for match in re.finditer(r"<td\b[^>]*>(?P<body>.*?)</td>", body, flags=re.I | re.S)
         ]
         link_match = re.search(r"<a\b(?P<attrs>[^>]*)>", body, flags=re.I | re.S)
         if len(columns) < 7 or not link_match:
@@ -5315,9 +4703,7 @@ async def _magnacare_grouped_results(
     max_targets = _as_int(resolver.get("max_targets"))
     for search_term in _magnacare_search_terms(source_record, resolver):
         results_url = _magnacare_results_url(url, search_term)
-        for result_row in _magnacare_result_rows(
-            await _fetch_text(results_url, max_bytes=max_bytes, session=session)
-        ):
+        for result_row in _magnacare_result_rows(await _fetch_text(results_url, max_bytes=max_bytes, session=session)):
             run_history_id = _clean_text(result_row.get("run_history_id"))
             if not run_history_id or run_history_id == "0":
                 continue
@@ -5370,17 +4756,11 @@ async def _magnacare_crawl_target(
     result_row = grouped_result["row"]
     run_history_id = _clean_text(result_row.get("run_history_id"))
     dynamic_download_url = _magnacare_download_url(url, run_history_id, ip_address)
-    download_payload = await _fetch_json(
-        dynamic_download_url, max_bytes=max_bytes, session=session
-    )
-    file_url = _clean_text(
-        download_payload.get("Data") if isinstance(download_payload, dict) else ""
-    )
+    download_payload = await _fetch_json(dynamic_download_url, max_bytes=max_bytes, session=session)
+    file_url = _clean_text(download_payload.get("Data") if isinstance(download_payload, dict) else "")
     if not file_url.startswith(("http://", "https://")):
         return None
-    file_name = _clean_text(result_row.get("file_name")) or Path(
-        urlsplit(file_url).path
-    ).name
+    file_name = _clean_text(result_row.get("file_name")) or Path(urlsplit(file_url).path).name
     network_name = _clean_text(result_row.get("network_name"))
     file_type = grouped_result["file_type"]
     label = " - ".join(
@@ -5425,9 +4805,7 @@ async def _resolve_magnacare_transparency_mrf(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     """Resolve MagnaCare transparency search results into crawl targets."""
-    grouped_by_target_key = await _magnacare_grouped_results(
-        source_record, url, resolver, session
-    )
+    grouped_by_target_key = await _magnacare_grouped_results(source_record, url, resolver, session)
     if not grouped_by_target_key:
         raise ValueError(f"no MagnaCare transparency MRF rows found for {url}")
     resolver_type = str(resolver.get("type") or "magnacare_transparency_mrf")
@@ -5435,12 +4813,15 @@ async def _resolve_magnacare_transparency_mrf(
     ip_address = str(resolver.get("download_ip_address") or "127.0.0.1")
     max_targets = _as_int(resolver.get("max_targets"))
     crawl_targets: list[CrawlTarget] = []
-    for grouped_result in list(grouped_by_target_key.values())[
-        : max_targets or len(grouped_by_target_key)
-    ]:
+    for grouped_result in list(grouped_by_target_key.values())[: max_targets or len(grouped_by_target_key)]:
         crawl_target = await _magnacare_crawl_target(
-            source_record, url, resolver_type, grouped_result,
-            ip_address, max_bytes, session,
+            source_record,
+            url,
+            resolver_type,
+            grouped_result,
+            ip_address,
+            max_bytes,
+            session,
         )
         if crawl_target is not None:
             crawl_targets.append(crawl_target)
@@ -5451,24 +4832,15 @@ async def _resolve_magnacare_transparency_mrf(
 
 def _asr_group_number_from_url(url: str | None) -> str | None:
     query_params_by_name = {
-        key.lower(): value
-        for key, value in parse_qsl(
-            urlsplit(str(url or "")).query, keep_blank_values=True
-        )
+        key.lower(): value for key, value in parse_qsl(urlsplit(str(url or "")).query, keep_blank_values=True)
     }
-    group_number = str(
-        query_params_by_name.get("groupnumber")
-        or query_params_by_name.get("g")
-        or ""
-    ).strip()
+    group_number = str(query_params_by_name.get("groupnumber") or query_params_by_name.get("g") or "").strip()
     return group_number or None
 
 
 def _crawl_target_context_metadata(crawl_target: CrawlTarget) -> dict[str, Any]:
     metadata = dict(crawl_target.metadata or {})
-    source_metadata_dict = dict(
-        (crawl_target.source or {}).get("metadata_json") or {}
-    )
+    source_metadata_dict = dict((crawl_target.source or {}).get("metadata_json") or {})
     group_number = (
         str(metadata.get("group_number") or metadata.get("group_id") or "").strip()
         or _asr_group_number_from_url(crawl_target.url)
@@ -5511,17 +4883,13 @@ def _crawl_target_context_metadata(crawl_target: CrawlTarget) -> dict[str, Any]:
         if metadata_text:
             context_metadata_dict[key] = metadata_text
     if not context_metadata_dict.get("company_name"):
-        source_display_name = str(
-            (crawl_target.source or {}).get("display_name") or ""
-        ).strip()
+        source_display_name = str((crawl_target.source or {}).get("display_name") or "").strip()
         if source_display_name:
             context_metadata_dict["company_name"] = source_display_name
     return context_metadata_dict
 
 
-def _apply_crawl_context_to_file_rows(
-    file_rows: list[dict[str, Any]], target: CrawlTarget
-) -> list[dict[str, Any]]:
+def _apply_crawl_context_to_file_rows(file_rows: list[dict[str, Any]], target: CrawlTarget) -> list[dict[str, Any]]:
     context = _crawl_target_context_metadata(target)
     target_plan_info = _metadata_plan_info(dict(target.metadata or {}))
     if not context and not target_plan_info:
@@ -5548,17 +4916,11 @@ def _plan_info_match_key(plan: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-def _merge_crawl_target_plan_info(
-    metadata: dict[str, Any], target_plan_info: list[dict[str, Any]]
-) -> dict[str, Any]:
+def _merge_crawl_target_plan_info(metadata: dict[str, Any], target_plan_info: list[dict[str, Any]]) -> dict[str, Any]:
     plan_info = metadata.get("plan_info")
     if not isinstance(plan_info, list):
         return metadata
-    target_by_key = {
-        _plan_info_match_key(plan): plan
-        for plan in target_plan_info
-        if isinstance(plan, dict)
-    }
+    target_by_key = {_plan_info_match_key(plan): plan for plan in target_plan_info if isinstance(plan, dict)}
     if not target_by_key:
         return metadata
     merged_plans: list[Any] = []
@@ -5568,9 +4930,7 @@ def _merge_crawl_target_plan_info(
             merged_plans.append(plan)
             continue
         next_plan_by_field = dict(plan)
-        target_plan = (
-            target_by_key.get(_plan_info_match_key(next_plan_by_field)) or {}
-        )
+        target_plan = target_by_key.get(_plan_info_match_key(next_plan_by_field)) or {}
         for key in (
             "engine_plan_hash",
             "issuer_name",
@@ -5587,11 +4947,7 @@ def _merge_crawl_target_plan_info(
 
 
 def _asr_group_numbers_from_seed_list(seed_list_name: str | None) -> list[str]:
-    return [
-        row["group_number"]
-        for row in _asr_seed_rows_from_seed_list(seed_list_name)
-        if row.get("group_number")
-    ]
+    return [row["group_number"] for row in _asr_seed_rows_from_seed_list(seed_list_name) if row.get("group_number")]
 
 
 def _asr_seed_rows_from_seed_list(seed_list_name: str | None) -> list[dict[str, str]]:
@@ -5603,9 +4959,7 @@ def _asr_seed_rows_from_seed_list(seed_list_name: str | None) -> list[dict[str, 
             continue
         group_number = str(row.get("group_number") or "").strip()
         if not re.fullmatch(r"\d{4}", group_number):
-            raise ValueError(
-                f"ASR seed list {seed_list_name} contains a non-4-digit group number"
-            )
+            raise ValueError(f"ASR seed list {seed_list_name} contains a non-4-digit group number")
         seed_rows.append({**row, "group_number": group_number})
     return seed_rows
 
@@ -5638,14 +4992,8 @@ def _asr_seed_context_metadata(row: dict[str, Any]) -> dict[str, str]:
 
 def _asr_configured_group_numbers(resolver: dict[str, Any]) -> list[str]:
     group_numbers: list[str] = []
-    group_numbers.extend(
-        _asr_group_numbers_from_seed_list(
-            str(resolver.get("seed_list") or "").strip() or None
-        )
-    )
-    group_numbers.extend(
-        str(value).strip() for value in (resolver.get("group_numbers") or ())
-    )
+    group_numbers.extend(_asr_group_numbers_from_seed_list(str(resolver.get("seed_list") or "").strip() or None))
+    group_numbers.extend(str(value).strip() for value in (resolver.get("group_numbers") or ()))
     for group_number in group_numbers:
         if group_number and not re.fullmatch(r"\d{4}", group_number):
             raise ValueError("ASR configured group numbers must be 4 digits")
@@ -5677,9 +5025,7 @@ def _asr_group_targets_for_source(url: str, resolver: dict[str, Any]) -> list[di
         group_targets.append(target_by_field)
 
     add_group(_asr_group_number_from_url(url))
-    for seed_row in _asr_seed_rows_from_seed_list(
-        str(resolver.get("seed_list") or "").strip() or None
-    ):
+    for seed_row in _asr_seed_rows_from_seed_list(str(resolver.get("seed_list") or "").strip() or None):
         add_group(
             seed_row.get("group_number"),
             _asr_seed_context_metadata(seed_row),
@@ -5716,10 +5062,7 @@ def _resolve_asr_health_benefits_mrf(
             for metadata_key, metadata_value in group_target.items()
             if metadata_key != "group_number" and metadata_value not in (None, "")
         }
-        label = (
-            f"{source_record.get('display_name') or 'ASR Health Benefits'} "
-            f"group {group_number}"
-        )
+        label = f"{source_record.get('display_name') or 'ASR Health Benefits'} group {group_number}"
         employer_label = (
             context_metadata_by_field.get("company_name")
             or context_metadata_by_field.get("employer_name")
@@ -5756,10 +5099,7 @@ def _wordpress_entry_content(html_text: str) -> str:
 
 
 def _auxiant_directory_url(url: str, resolver: dict[str, Any]) -> str:
-    path = (
-        str(resolver.get("directory_path") or "/directory-of-data-sources/").strip()
-        or "/directory-of-data-sources/"
-    )
+    path = str(resolver.get("directory_path") or "/directory-of-data-sources/").strip() or "/directory-of-data-sources/"
     return urljoin(_url_origin(url) + "/", path.lstrip("/"))
 
 
@@ -5784,9 +5124,7 @@ def _auxiant_anchor_links(html_text: str, *, base_url: str) -> list[dict[str, st
         raw = html.unescape(str(href_match.group("value") or "")).strip()
         if not raw or raw.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
             continue
-        label = html.unescape(
-            re.sub(r"<[^>]+>", " ", match.group("label") or "")
-        ).replace("\xa0", " ")
+        label = html.unescape(re.sub(r"<[^>]+>", " ", match.group("label") or "")).replace("\xa0", " ")
         label = re.sub(r"\s+", " ", label).strip()
         links.append({"url": urljoin(base_url, raw), "label": label})
     return links
@@ -5831,9 +5169,7 @@ def _parse_auxiant_directory_networks(
     return list(network_by_url.values())
 
 
-def _auxiant_download_extension(
-    url: str | None, label: str | None = None
-) -> str | None:
+def _auxiant_download_extension(url: str | None, label: str | None = None) -> str | None:
     parsed = urlsplit(str(url or ""))
     text = f"{parsed.path} {parsed.query} {label or ''}".lower()
     for extension in (".json.gz", ".json.zip", ".zip", ".7z", ".json", ".csv", ".gz"):
@@ -5864,10 +5200,7 @@ def _is_auxiant_download_link(url: str | None, label: str | None = None) -> bool
     if path.startswith(("/wp-content/", "/wp-includes/")):
         return False
     if path.startswith("/wp-admin/admin-ajax.php"):
-        query_params_by_name = {
-            key.lower(): value
-            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        }
+        query_params_by_name = {key.lower(): value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
         return query_params_by_name.get("cmd") == "file"
     return True
 
@@ -5887,10 +5220,7 @@ def _auxiant_file_type(url: str | None, label: str | None = None) -> str:
         )
     ):
         return "allowed-amounts"
-    if any(
-        token in text
-        for token in ("payer-drug", "prescription-drug", "pharmacy", " rx ", "/rx/")
-    ):
+    if any(token in text for token in ("payer-drug", "prescription-drug", "pharmacy", " rx ", "/rx/")):
         return "payer-drug"
     return _mrf_file_type_from_text(url, label) or "in-network"
 
@@ -5905,11 +5235,7 @@ def _parse_auxiant_page_links(html_text: str, *, base_url: str) -> list[dict[str
         url = str(candidate.get("url") or "").strip()
         if not url:
             continue
-        label = (
-            _clean_text(candidate.get("label"))
-            or Path(urlsplit(url).path).name
-            or "MRF file"
-        )
+        label = _clean_text(candidate.get("label")) or Path(urlsplit(url).path).name or "MRF file"
         if "return to list" in label.lower():
             continue
         parsed = urlsplit(url)
@@ -5992,9 +5318,7 @@ def _auxiant_landing_target(
             "external_hosting_platform": classify_hosting_platform(landing_url),
             "landing_label": landing_label,
             "landing_reason": (
-                "auxiant_page_without_file_links"
-                if landing_url == page_url
-                else "external_landing_no_concrete_targets"
+                "auxiant_page_without_file_links" if landing_url == page_url else "external_landing_no_concrete_targets"
             ),
             "nested_error": _truncate_text(nested_error, 500),
         },
@@ -6052,9 +5376,9 @@ async def _auxiant_nested_link_targets(
     }
     nested_error: str | None = None
     try:
-        nested_targets = await _crawl_targets_for_source(
-            nested_source_by_field, external_url, session
-        )
+        nested_targets = await _crawl_targets_for_source(nested_source_by_field, external_url, session)
+    except IncompleteToc:
+        raise
     except Exception as exc:
         nested_targets = []
         nested_error = f"{type(exc).__name__}: {exc}"
@@ -6095,9 +5419,7 @@ async def _auxiant_network_targets(
 ) -> list[CrawlTarget]:
     page_url = str(network["url"])
     network_name = str(network["label"])
-    page_html = await _fetch_text(
-        page_url, max_bytes=page_max_bytes, session=session
-    )
+    page_html = await _fetch_text(page_url, max_bytes=page_max_bytes, session=session)
     page_links = _parse_auxiant_page_links(page_html, base_url=page_url)
     crawl_targets: list[CrawlTarget] = []
     for link in page_links:
@@ -6115,8 +5437,13 @@ async def _auxiant_network_targets(
         else:
             crawl_targets.extend(
                 await _auxiant_nested_link_targets(
-                    source_record, link, network_name, page_url,
-                    directory_url, resolver_type, session,
+                    source_record,
+                    link,
+                    network_name,
+                    page_url,
+                    directory_url,
+                    resolver_type,
+                    session,
                 )
             )
     if not page_links:
@@ -6173,7 +5500,10 @@ async def _resolve_auxiant_wordpress_directory(
     for network in networks:
         crawl_targets.extend(
             await _auxiant_network_targets(
-                source_record, network, directory_url, resolver_type,
+                source_record,
+                network,
+                directory_url,
+                resolver_type,
                 int(resolver.get("page_max_bytes") or 10 * 1024 * 1024),
                 session,
             )
@@ -6214,11 +5544,7 @@ def _sapphire_toc_target(
     }
     if clean_label.lower() in generic_labels:
         clean_label = ""
-    inferred_label = (
-        clean_label
-        or inferred_payer_name
-        or _label_from_index_name(inferred_file_name or Path(path).name)
-    )
+    inferred_label = clean_label or inferred_payer_name or _label_from_index_name(inferred_file_name or Path(path).name)
     if not _is_html_mrf_toc_url(url, inferred_file_name or inferred_label):
         return None
     target_by_field: dict[str, Any] = {
@@ -6242,9 +5568,7 @@ def _parse_sapphire_toc_links(html_text: str, *, base_url: str) -> list[dict[str
         )
         if not target:
             continue
-        target_by_url[
-            _canonical_or_none(str(target["url"])) or str(target["url"])
-        ] = target
+        target_by_url[_canonical_or_none(str(target["url"])) or str(target["url"])] = target
     decoded_text = (html_text or "").replace("\\/", "/")
     for match in re.finditer(
         r"""(?P<quote>["'])(?P<url>(?:https?://[^"']+)?/tocs/[^"']+)(?P=quote)""",
@@ -6399,8 +5723,7 @@ def _collect_sapphire_mapping_toc_links(
         )
         if toc_target:
             target_by_url.setdefault(
-                _canonical_or_none(str(toc_target["url"]))
-                or str(toc_target["url"]),
+                _canonical_or_none(str(toc_target["url"])) or str(toc_target["url"]),
                 toc_target,
             )
     for child in node_by_field.values():
@@ -6441,23 +5764,16 @@ def _collect_sapphire_query_toc_links(
             node,
             base_url=base_url,
             label=(
-                context_by_field.get("label")
-                or context_by_field.get("title")
-                or context_by_field.get("name")
+                context_by_field.get("label") or context_by_field.get("title") or context_by_field.get("name")
                 if context_by_field
                 else None
             ),
-            file_name=(
-                context_by_field.get("file_name") if context_by_field else None
-            ),
-            payer_name=(
-                context_by_field.get("payer_name") if context_by_field else None
-            ),
+            file_name=(context_by_field.get("file_name") if context_by_field else None),
+            payer_name=(context_by_field.get("payer_name") if context_by_field else None),
         )
         if toc_target:
             target_by_url.setdefault(
-                _canonical_or_none(str(toc_target["url"]))
-                or str(toc_target["url"]),
+                _canonical_or_none(str(toc_target["url"])) or str(toc_target["url"]),
                 toc_target,
             )
 
@@ -6496,12 +5812,8 @@ async def _resolve_sapphire_static_query_toc_links(
     max_queries = _as_int(resolver.get("max_static_queries")) or 8
     max_targets = _as_int(resolver.get("max_targets"))
     targets_by_url: dict[str, dict[str, Any]] = {}
-    for target_by_field in _parse_sapphire_static_query_toc_links(
-        page_data_text, base_url=url
-    ):
-        key = _canonical_or_none(str(target_by_field.get("url") or "")) or str(
-            target_by_field.get("url") or ""
-        )
+    for target_by_field in _parse_sapphire_static_query_toc_links(page_data_text, base_url=url):
+        key = _canonical_or_none(str(target_by_field.get("url") or "")) or str(target_by_field.get("url") or "")
         if key:
             targets_by_url[key] = target_by_field
         if max_targets and len(targets_by_url) >= max_targets:
@@ -6515,14 +5827,8 @@ async def _resolve_sapphire_static_query_toc_links(
             session=session,
             expect_json=True,
         )
-        for target_by_field in _parse_sapphire_static_query_toc_links(
-            query_text, base_url=url
-        ):
-            key = _canonical_or_none(
-                str(target_by_field.get("url") or "")
-            ) or str(
-                target_by_field.get("url") or ""
-            )
+        for target_by_field in _parse_sapphire_static_query_toc_links(query_text, base_url=url):
+            key = _canonical_or_none(str(target_by_field.get("url") or "")) or str(target_by_field.get("url") or "")
             if key:
                 targets_by_url[key] = target_by_field
             if max_targets and len(targets_by_url) >= max_targets:
@@ -6530,9 +5836,7 @@ async def _resolve_sapphire_static_query_toc_links(
     return list(targets_by_url.values())
 
 
-def _parse_healthgram_network_pages(
-    html_text: str, *, base_url: str
-) -> list[dict[str, Any]]:
+def _parse_healthgram_network_pages(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     page_by_url: dict[str, dict[str, Any]] = {}
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "").strip()
@@ -6560,21 +5864,13 @@ async def _healthgram_network_page_targets(
 ) -> list[CrawlTarget]:
     """Resolve one Healthgram network page into TOC targets."""
     page_url = str(network_page.get("url") or "").strip()
-    page_label = (
-        _clean_text(network_page.get("label"))
-        or source_record.get("display_name")
-        or "Healthgram"
-    )
+    page_label = _clean_text(network_page.get("label")) or source_record.get("display_name") or "Healthgram"
     page_html = (
         landing_html
         if page_url == landing_url
         else await _fetch_text(
             page_url,
-            max_bytes=int(
-                resolver.get("network_page_max_bytes")
-                or resolver.get("max_bytes")
-                or 5 * 1024 * 1024
-            ),
+            max_bytes=int(resolver.get("network_page_max_bytes") or resolver.get("max_bytes") or 5 * 1024 * 1024),
             session=session,
         )
     )
@@ -6597,9 +5893,7 @@ async def _healthgram_network_page_targets(
                     "target_file_type": "table-of-contents",
                     "container_format": parsed_target.get("container_format"),
                     "html_attr": parsed_target.get("html_attr"),
-                    "healthgram_index_label": _clean_text(
-                        parsed_target.get("label")
-                    ),
+                    "healthgram_index_label": _clean_text(parsed_target.get("label")),
                     "healthgram_landing_url": landing_url,
                     "healthgram_network_page_url": page_url,
                     "healthgram_network_name": page_label,
@@ -6659,9 +5953,7 @@ async def _resolve_anthem_s3_context_files(
     source_url: str,
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget] | None:
-    employer_ein = _source_query_context_text(
-        source_row, "query_context_employer_ein"
-    )
+    employer_ein = _source_query_context_text(source_row, "query_context_employer_ein")
     employer_names = _anthem_s3_employer_name_queries(source_row)
     if not employer_ein and not employer_names:
         return None
@@ -6675,9 +5967,7 @@ async def _resolve_anthem_s3_context_files(
     lookup_context = AnthemLookupContext(
         base_url=base_url,
         prefix=toc_patterns[0][0] if toc_patterns else "anthem",
-        catalog_url=(
-            current_catalog_targets[0].url if current_catalog_targets else None
-        ),
+        catalog_url=(current_catalog_targets[0].url if current_catalog_targets else None),
         resolver_by_key=resolver_by_key,
         source_url=source_url,
         session=session,
@@ -6696,15 +5986,12 @@ async def _resolve_anthem_s3_mrf(
     resolver: dict[str, Any],
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
-    html_text = await _fetch_text(
-        url, max_bytes=int(resolver.get("max_bytes") or 1024 * 1024), session=session
-    )
+    html_text = await _fetch_text(url, max_bytes=int(resolver.get("max_bytes") or 1024 * 1024), session=session)
     script_urls = [
         str(candidate.get("url") or "")
         for candidate in _html_link_candidates(html_text, base_url=url)
         if urlsplit(str(candidate.get("url") or "")).path.endswith(".js")
-        and "script"
-        in Path(urlsplit(str(candidate.get("url") or "")).path).name.lower()
+        and "script" in Path(urlsplit(str(candidate.get("url") or "")).path).name.lower()
     ]
     configured_script = str(resolver.get("script_path") or "").strip()
     if configured_script:
@@ -6719,6 +6006,8 @@ async def _resolve_anthem_s3_mrf(
             )
             if script_text:
                 break
+        except IncompleteToc:
+            raise
         except Exception:
             continue
     bases = _anthem_s3_bases_from_script(script_text)
@@ -6730,9 +6019,7 @@ async def _resolve_anthem_s3_mrf(
     if not bases:
         bases = ["https://antm-pt-prod-dataz-nogbd-nophi-us-east1.s3.amazonaws.com/"]
     patterns = _anthem_s3_toc_patterns_from_script(script_text, source_url=url)
-    context_targets = await _resolve_anthem_s3_context_files(
-        source_row, resolver, patterns, bases[0], url, session
-    )
+    context_targets = await _resolve_anthem_s3_context_files(source_row, resolver, patterns, bases[0], url, session)
     if context_targets is not None:
         return context_targets
     crawl_targets = _anthem_s3_toc_targets(
@@ -6775,9 +6062,7 @@ async def _resolve_hcsc_asomrf_landing(
                 metadata = {
                     **dict(delegated_target.metadata or {}),
                     "resolver": "hcsc_asomrf_landing",
-                    "delegated_resolver": (delegated_target.metadata or {}).get(
-                        "resolver"
-                    ),
+                    "delegated_resolver": (delegated_target.metadata or {}).get("resolver"),
                     "delegated_source_url": state_url,
                     "hcsc_landing_url": url,
                 }
@@ -6790,6 +6075,8 @@ async def _resolve_hcsc_asomrf_landing(
                         metadata=metadata,
                     )
                 )
+        except IncompleteToc:
+            raise
         except Exception:
             continue
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
@@ -6936,9 +6223,7 @@ async def _resolve_html_delegated_mrf_links(
         resolver="html_delegated_mrf_links",
     )
     max_links = _as_int(resolver.get("max_links")) or 40
-    for delegated_url in _delegated_mrf_source_urls_from_html(html_text, base_url=url)[
-        :max_links
-    ]:
+    for delegated_url in _delegated_mrf_source_urls_from_html(html_text, base_url=url)[:max_links]:
         platform = classify_hosting_platform(delegated_url)
         nested_source_by_field = {
             **source_record,
@@ -6953,6 +6238,8 @@ async def _resolve_html_delegated_mrf_links(
                 session,
                 target_limit=_as_int(resolver.get("max_targets")),
             )
+        except IncompleteToc:
+            raise
         except Exception:
             continue
         for delegated_target in delegated_targets:
@@ -6976,11 +6263,7 @@ async def _resolve_html_delegated_mrf_links(
 
 def _is_target_url_pattern_match(target: CrawlTarget, patterns: Iterable[Any]) -> bool:
     url = str(target.url or "")
-    return any(
-        str(pattern or "").strip()
-        and re.search(str(pattern), url, flags=re.IGNORECASE)
-        for pattern in patterns
-    )
+    return any(str(pattern or "").strip() and re.search(str(pattern), url, flags=re.IGNORECASE) for pattern in patterns)
 
 
 def _filter_crawl_targets_by_resolver_patterns(
@@ -6989,17 +6272,9 @@ def _filter_crawl_targets_by_resolver_patterns(
     include_patterns = list(resolver.get("include_url_patterns") or [])
     exclude_patterns = list(resolver.get("exclude_url_patterns") or [])
     if include_patterns:
-        targets = [
-            target
-            for target in targets
-            if _is_target_url_pattern_match(target, include_patterns)
-        ]
+        targets = [target for target in targets if _is_target_url_pattern_match(target, include_patterns)]
     if exclude_patterns:
-        targets = [
-            target
-            for target in targets
-            if not _is_target_url_pattern_match(target, exclude_patterns)
-        ]
+        targets = [target for target in targets if not _is_target_url_pattern_match(target, exclude_patterns)]
     return targets
 
 
@@ -7035,14 +6310,8 @@ async def _nested_html_directory_targets(
         directory_html,
         base_url=directory_url,
     )
-    max_nested_directories = (
-        _as_int(resolver.get("max_nested_directories_per_directory")) or 5
-    )
-    directory_max_bytes = int(
-        resolver.get("directory_max_bytes")
-        or resolver.get("max_bytes")
-        or 5 * 1024 * 1024
-    )
+    max_nested_directories = _as_int(resolver.get("max_nested_directories_per_directory")) or 5
+    directory_max_bytes = int(resolver.get("directory_max_bytes") or resolver.get("max_bytes") or 5 * 1024 * 1024)
     for nested_directory_url in nested_directory_urls[:max_nested_directories]:
         try:
             nested_directory_html = await _fetch_text(
@@ -7050,6 +6319,8 @@ async def _nested_html_directory_targets(
                 max_bytes=directory_max_bytes,
                 session=session,
             )
+        except IncompleteToc:
+            raise
         except Exception:
             continue
         crawl_targets = _crawl_targets_from_html_mrf_links(
@@ -7083,11 +6354,7 @@ async def _html_directory_targets(
     crawl_targets: list[CrawlTarget] = []
     directory_urls = _html_mrf_directory_urls(html_text, base_url=url)
     max_directories = _as_int(resolver.get("max_directories")) or 10
-    directory_max_bytes = int(
-        resolver.get("directory_max_bytes")
-        or resolver.get("max_bytes")
-        or 5 * 1024 * 1024
-    )
+    directory_max_bytes = int(resolver.get("directory_max_bytes") or resolver.get("max_bytes") or 5 * 1024 * 1024)
     for directory_url in directory_urls[:max_directories]:
         try:
             directory_html = await _fetch_text(
@@ -7095,6 +6362,8 @@ async def _html_directory_targets(
                 max_bytes=directory_max_bytes,
                 session=session,
             )
+        except IncompleteToc:
+            raise
         except Exception:
             continue
         directory_targets = _crawl_targets_from_html_mrf_links(
@@ -7151,6 +6420,8 @@ async def _html_frame_targets(
                 max_bytes=frame_max_bytes,
                 session=session,
             )
+        except IncompleteToc:
+            raise
         except Exception:
             continue
         frame_targets = _crawl_targets_from_html_mrf_links(
@@ -7161,8 +6432,7 @@ async def _html_frame_targets(
             target_max_bytes=target_max_bytes,
         )
         crawl_targets.extend(
-            _crawl_target_with_context(crawl_target, frame_url=frame_url)
-            for crawl_target in frame_targets
+            _crawl_target_with_context(crawl_target, frame_url=frame_url) for crawl_target in frame_targets
         )
     return crawl_targets
 
@@ -7260,9 +6530,7 @@ def _wordpress_elfinder_js_string(value: str | None) -> str:
     return text.replace("\\/", "/").replace("\\u0026", "&")
 
 
-def _wordpress_elfinder_configs_from_html(
-    html_text: str, *, base_url: str
-) -> list[dict[str, str]]:
+def _wordpress_elfinder_configs_from_html(html_text: str, *, base_url: str) -> list[dict[str, str]]:
     text = html.unescape(str(html_text or ""))
     manager_configs: list[dict[str, str]] = []
     seen_manager_keys: set[tuple[str, str]] = set()
@@ -7286,9 +6554,7 @@ def _wordpress_elfinder_configs_from_html(
         nonce_matches = list(nonce_pattern.finditer(prefix + suffix))
         if not url_matches or not nonce_matches:
             continue
-        service_url = urljoin(
-            base_url, _wordpress_elfinder_js_string(url_matches[-1].group("value"))
-        )
+        service_url = urljoin(base_url, _wordpress_elfinder_js_string(url_matches[-1].group("value")))
         data_key = _wordpress_elfinder_js_string(data_match.group("value"))
         nonce = _wordpress_elfinder_js_string(nonce_matches[-1].group("value"))
         if not service_url or not data_key or not nonce:
@@ -7304,9 +6570,7 @@ def _wordpress_elfinder_configs_from_html(
             "nonce": nonce,
         }
         if file_manager_matches:
-            manager_config_by_field["file_manager_id"] = file_manager_matches[
-                -1
-            ].group(1)
+            manager_config_by_field["file_manager_id"] = file_manager_matches[-1].group(1)
         manager_configs.append(manager_config_by_field)
     return manager_configs
 
@@ -7333,9 +6597,7 @@ def _wordpress_elfinder_root_url(payload: dict[str, Any]) -> str | None:
     return _clean_text(root_url) or None
 
 
-def _wordpress_elfinder_file_url(
-    root_url: str | None, file_item: dict[str, Any]
-) -> str | None:
+def _wordpress_elfinder_file_url(root_url: str | None, file_item: dict[str, Any]) -> str | None:
     direct_url = _clean_text(file_item.get("url"))
     if direct_url and urlsplit(direct_url).scheme in {"http", "https"}:
         return direct_url
@@ -7361,11 +6623,7 @@ def _wordpress_elfinder_directory_hashes(payload: dict[str, Any]) -> list[str]:
         if str(file_entry.get("mime") or "").lower() != "directory":
             continue
         directory_hash = str(file_entry.get("hash") or "").strip()
-        if (
-            not directory_hash
-            or not file_entry.get("phash")
-            or directory_hash in seen_directory_hashes
-        ):
+        if not directory_hash or not file_entry.get("phash") or directory_hash in seen_directory_hashes:
             continue
         seen_directory_hashes.add(directory_hash)
         directory_hashes.append(directory_hash)
@@ -7411,9 +6669,7 @@ def _wordpress_elfinder_targets_from_payload(
                 label=file_name,
                 resolved_from_url=resolved_from_url,
                 metadata={
-                    key: entry_value
-                    for key, entry_value in metadata.items()
-                    if entry_value not in (None, "", [])
+                    key: entry_value for key, entry_value in metadata.items() if entry_value not in (None, "", [])
                 },
             )
         )
@@ -7428,9 +6684,7 @@ def _wordpress_elfinder_target_sort_key(target: CrawlTarget) -> tuple[int, int, 
     }.get(str((target.metadata or {}).get("target_file_type") or ""), 9)
     text = f"{target.label or ''} {target.url or ''}"
     date_match = re.search(r"(20\d{2})[-_](\d{2})[-_](\d{2})", text)
-    date_rank = (
-        -int("".join(date_match.groups())) if date_match is not None else 0
-    )
+    date_rank = -int("".join(date_match.groups())) if date_match is not None else 0
     return (file_type_rank, date_rank, str(target.label or target.url or ""))
 
 
@@ -7467,9 +6721,9 @@ async def _wordpress_elfinder_manager_targets(
     browser_session: aiohttp.ClientSession,
 ) -> tuple[list[CrawlTarget], int, Exception | None]:
     try:
-        root_payload = await _wordpress_elfinder_open_payload(
-            manager_config, None, ajax_max_bytes, browser_session
-        )
+        root_payload = await _wordpress_elfinder_open_payload(manager_config, None, ajax_max_bytes, browser_session)
+    except IncompleteToc:
+        raise
     except Exception as exc:
         return [], opened_directories, exc
     if not isinstance(root_payload, dict):
@@ -7492,6 +6746,8 @@ async def _wordpress_elfinder_manager_targets(
             directory_payload = await _wordpress_elfinder_open_payload(
                 manager_config, directory_hash, ajax_max_bytes, browser_session
             )
+        except IncompleteToc:
+            raise
         except Exception as exc:
             last_error = exc
             continue
@@ -7549,12 +6805,14 @@ async def _resolve_wordpress_elfinder_mrf_links(
         opened_directories = 0
         last_error: Exception | None = None
         for manager_config in manager_configs[:max_file_managers]:
-            manager_targets, opened_directories, manager_error = (
-                await _wordpress_elfinder_manager_targets(
-                    source_row_dict, manager_config, resolver_type,
-                    ajax_max_bytes, max_directories, opened_directories,
-                    browser_session,
-                )
+            manager_targets, opened_directories, manager_error = await _wordpress_elfinder_manager_targets(
+                source_row_dict,
+                manager_config,
+                resolver_type,
+                ajax_max_bytes,
+                max_directories,
+                opened_directories,
+                browser_session,
             )
             crawl_targets.extend(manager_targets)
             if manager_error is not None:
@@ -7562,12 +6820,10 @@ async def _resolve_wordpress_elfinder_mrf_links(
         crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
         crawl_targets = _filter_crawl_targets_by_resolver_patterns(crawl_targets, resolver)
         crawl_targets = sorted(crawl_targets, key=_wordpress_elfinder_target_sort_key)
-        if max_targets and max_targets > 0:
-            crawl_targets = crawl_targets[:max_targets]
         if not crawl_targets:
             detail = f": {last_error}" if last_error else ""
             raise ValueError(f"no WordPress elFinder MRF links found for {url}{detail}")
-        return crawl_targets
+        return crawl_targets[:max_targets] if max_targets and max_targets > 0 else crawl_targets
 
 
 def _ebms_index_page_urls(html_text: str, *, base_url: str) -> list[tuple[str, str]]:
@@ -7600,14 +6856,11 @@ async def _ebms_page_targets(
     session: aiohttp.ClientSession,
 ) -> tuple[list[CrawlTarget], str]:
     configured_max_bytes = (
-        resolver.get("nested_page_max_bytes")
-        or resolver.get("client_page_max_bytes")
+        resolver.get("nested_page_max_bytes") or resolver.get("client_page_max_bytes")
         if nested_url
         else resolver.get("client_page_max_bytes")
     )
-    max_bytes = int(
-        configured_max_bytes or resolver.get("max_bytes") or 5 * 1024 * 1024
-    )
+    max_bytes = int(configured_max_bytes or resolver.get("max_bytes") or 5 * 1024 * 1024)
     page_html = await _fetch_text(page_url, max_bytes=max_bytes, session=session)
     page_crawl_targets = _crawl_targets_from_html_mrf_links(
         source_record,
@@ -7649,23 +6902,35 @@ async def _ebms_client_targets(
 ) -> list[CrawlTarget]:
     try:
         client_targets, client_html = await _ebms_page_targets(
-            source_record, client_url, client_url, client_label,
-            None, resolver, session,
+            source_record,
+            client_url,
+            client_url,
+            client_label,
+            None,
+            resolver,
+            session,
         )
+    except IncompleteToc:
+        raise
     except Exception:
         return []
     if client_targets:
         return client_targets
     max_nested = _as_int(resolver.get("max_nested_pages_per_client")) or 20
-    for nested_url, _nested_label in _ebms_index_page_urls(
-        client_html, base_url=client_url
-    )[:max_nested]:
+    for nested_url, _nested_label in _ebms_index_page_urls(client_html, base_url=client_url)[:max_nested]:
         try:
             nested_targets, _nested_html = await _ebms_page_targets(
-                source_record, nested_url, client_url, client_label,
-                nested_url, resolver, session,
+                source_record,
+                nested_url,
+                client_url,
+                client_label,
+                nested_url,
+                resolver,
+                session,
             )
             client_targets.extend(nested_targets)
+        except IncompleteToc:
+            raise
         except Exception:
             continue
         if len(client_targets) >= target_limit:
@@ -7688,13 +6953,9 @@ async def _resolve_ebms_caa_directory(
     resolver_by_key = {
         **resolver,
         "toc_max_bytes": _parse_size_bytes(resolver.get("toc_max_bytes")),
-        "max_nested_pages_per_client": (
-            _as_int(resolver.get("max_nested_pages_per_client")) or 20
-        ),
+        "max_nested_pages_per_client": (_as_int(resolver.get("max_nested_pages_per_client")) or 20),
         "client_page_max_bytes": int(
-            resolver.get("client_page_max_bytes")
-            or resolver.get("max_bytes")
-            or 5 * 1024 * 1024
+            resolver.get("client_page_max_bytes") or resolver.get("max_bytes") or 5 * 1024 * 1024
         ),
         "nested_page_max_bytes": int(
             resolver.get("nested_page_max_bytes")
@@ -7706,14 +6967,16 @@ async def _resolve_ebms_caa_directory(
     max_targets = _as_int(resolver_by_key.get("max_targets")) or 5000
     max_clients = _as_int(resolver_by_key.get("max_clients")) or 500
     crawl_targets: list[CrawlTarget] = []
-    for client_url, client_label in _ebms_index_page_urls(root_html, base_url=url)[
-        :max_clients
-    ]:
+    for client_url, client_label in _ebms_index_page_urls(root_html, base_url=url)[:max_clients]:
         remaining = max_targets - len(crawl_targets)
         crawl_targets.extend(
             await _ebms_client_targets(
-                source_record, client_url, client_label, resolver_by_key,
-                remaining, session,
+                source_record,
+                client_url,
+                client_label,
+                resolver_by_key,
+                remaining,
+                session,
             )
         )
         if len(crawl_targets) >= max_targets:
@@ -7752,12 +7015,7 @@ def _html_mrf_directory_urls(html_text: str, *, base_url: str) -> list[str]:
             and path.endswith("/")
             and re.search(r"/[a-z]+-20\d{2}/?$", path.replace("_", "-"))
         )
-        if not (
-            path.endswith("/")
-            or "." not in file_name
-            or is_azure_html_mrf_listing
-            or autoindex_month_directory
-        ):
+        if not (path.endswith("/") or "." not in file_name or is_azure_html_mrf_listing or autoindex_month_directory):
             continue
         if not path.endswith("/") and "." not in file_name:
             base_host = urlsplit(base_url).netloc.lower()
@@ -7792,8 +7050,7 @@ def _json_mrf_directory_links_from_html(html_text: str, *, base_url: str) -> lis
     urls: list[str] = []
     seen_url_keys: set[str] = set()
     candidates = [
-        str(link_candidate.get("url") or "")
-        for link_candidate in _html_link_candidates(html_text, base_url=base_url)
+        str(link_candidate.get("url") or "") for link_candidate in _html_link_candidates(html_text, base_url=base_url)
     ]
     candidates.extend(_embedded_http_urls(html_text))
     for url in candidates:
@@ -7863,9 +7120,7 @@ def _json_mrf_directory_crawl_target(
         return None
     if not target_file_type:
         return None
-    plan_info = (
-        _plan_info_from_label(label) if target_kind == "file_reference" else []
-    )
+    plan_info = _plan_info_from_label(label) if target_kind == "file_reference" else []
     metadata_by_field = {
         "resolver": resolver_type,
         "target_kind": target_kind,
@@ -8025,9 +7280,7 @@ def _humana_pct_file_name_from_row(row: Any) -> str | None:
     text = html.unescape(_humana_pct_row_text(row))
     for url in _embedded_http_urls(text):
         parsed = urlsplit(url)
-        values = parse_qs(parsed.query).get("fileName") or parse_qs(parsed.query).get(
-            "filename"
-        )
+        values = parse_qs(parsed.query).get("fileName") or parse_qs(parsed.query).get("filename")
         if values:
             return _clean_text(values[0])
         file_name = Path(parsed.path).name
@@ -8045,9 +7298,7 @@ def _humana_pct_file_name_from_row(row: Any) -> str | None:
 
 
 def _humana_pct_download_url(base_url: str, resolver: dict[str, Any], file_name: str) -> str:
-    download_path = str(
-        resolver.get("download_path") or "/syntheticdata/Resource/DownloadTOCFile"
-    )
+    download_path = str(resolver.get("download_path") or "/syntheticdata/Resource/DownloadTOCFile")
     return urljoin(base_url, download_path) + "?" + urlencode({"fileName": file_name})
 
 
@@ -8089,9 +7340,7 @@ def _humana_pct_targets_from_payload(
             "container_format": _container_format(file_name),
             "humana_file_name": file_name,
             "humana_api_url": api_url,
-            "plan_info": (
-                _plan_info_from_label(file_name) if target_kind == "file_reference" else []
-            ),
+            "plan_info": (_plan_info_from_label(file_name) if target_kind == "file_reference" else []),
         }
         crawl_targets.append(
             CrawlTarget(
@@ -8127,13 +7376,17 @@ async def _humana_pct_file_type_targets(
     crawl_targets: list[CrawlTarget] = []
     for page in range(max_pages):
         start = page * page_size
-        page_url = api_url + "?" + urlencode(
-            {
-                "fileType": file_type,
-                "iDisplayStart": start,
-                "iDisplayLength": page_size,
-                "sEcho": page + 1,
-            }
+        page_url = (
+            api_url
+            + "?"
+            + urlencode(
+                {
+                    "fileType": file_type,
+                    "iDisplayStart": start,
+                    "iDisplayLength": page_size,
+                    "sEcho": page + 1,
+                }
+            )
         )
         page_payload = await _fetch_json(
             page_url,
@@ -8173,10 +7426,7 @@ async def _resolve_humana_pct_file_list(
 ) -> list[CrawlTarget]:
     """Resolve Humana PCT file-list endpoints into crawl targets."""
     resolver_type = str(resolver.get("type") or "humana_pct_file_list")
-    api_url = str(
-        resolver.get("api_url")
-        or urljoin(url, "/syntheticdata/Resource/GetData")
-    )
+    api_url = str(resolver.get("api_url") or urljoin(url, "/syntheticdata/Resource/GetData"))
     file_types = [
         str(file_type_value).strip()
         for file_type_value in (resolver.get("file_types") or ["innetwork"])
@@ -8246,11 +7496,7 @@ def _fchn_targets_from_detail_html(
     )
     enriched_targets: list[CrawlTarget] = []
     detail_id = next(
-        (
-            part
-            for part in reversed([part for part in urlsplit(detail_url).path.split("/") if part])
-            if part.isdigit()
-        ),
+        (part for part in reversed([part for part in urlsplit(detail_url).path.split("/") if part]) if part.isdigit()),
         None,
     )
     for crawl_target in crawl_targets:
@@ -8292,11 +7538,7 @@ async def _resolve_fchn_payor_search(
     max_details = _as_int(resolver.get("max_details")) or 100
     max_targets = _as_int(resolver.get("max_targets")) or 1000
     detail_urls = _fchn_payor_detail_urls_from_html(html_text, base_url=url)
-    detail_max_bytes = int(
-        resolver.get("detail_max_bytes")
-        or resolver.get("max_bytes")
-        or 5 * 1024 * 1024
-    )
+    detail_max_bytes = int(resolver.get("detail_max_bytes") or resolver.get("max_bytes") or 5 * 1024 * 1024)
     for detail_url in detail_urls[:max_details]:
         if len(crawl_targets) >= max_targets:
             break
@@ -8306,6 +7548,8 @@ async def _resolve_fchn_payor_search(
                 max_bytes=detail_max_bytes,
                 session=session,
             )
+        except IncompleteToc:
+            raise
         except Exception:
             continue
         if _is_html_cloudflare_challenge(detail_html):
@@ -8335,9 +7579,7 @@ def _payercompass_file_type(frame: dict[str, Any], label: str | None = None) -> 
     return inferred or "in-network"
 
 
-def _payercompass_download_url(
-    base_url: str, resolver: dict[str, Any], file_id: str
-) -> str:
+def _payercompass_download_url(base_url: str, resolver: dict[str, Any], file_id: str) -> str:
     download_path = str(resolver.get("download_path") or "/api/File/Download")
     download_url = urljoin(base_url, download_path)
     return f"{download_url}?{urlencode({'Id': file_id})}"
@@ -8391,22 +7633,14 @@ def _payercompass_target_for_file(
     frame: dict[str, Any],
     file_item: dict[str, Any],
 ) -> CrawlTarget | None:
-    file_id = str(
-        _payercompass_value(file_item, _PAYERCOMPASS_FILE_ID_KEYS)
-        or frame.get("id")
-        or ""
-    ).strip()
+    file_id = str(_payercompass_value(file_item, _PAYERCOMPASS_FILE_ID_KEYS) or frame.get("id") or "").strip()
     if not file_id:
         return None
     file_name = str(
-        _payercompass_value(file_item, _PAYERCOMPASS_FILE_NAME_KEYS)
-        or frame.get("name")
-        or file_id
+        _payercompass_value(file_item, _PAYERCOMPASS_FILE_NAME_KEYS) or frame.get("name") or file_id
     ).strip()
     file_type = _payercompass_file_type(frame, file_name)
-    size_bytes = _parse_size_bytes(
-        _payercompass_value(file_item, _PAYERCOMPASS_FILE_SIZE_KEYS)
-    )
+    size_bytes = _parse_size_bytes(_payercompass_value(file_item, _PAYERCOMPASS_FILE_SIZE_KEYS))
     metadata = {
         "resolver": "payercompass_mrf",
         "target_kind": "file_reference",
@@ -8521,12 +7755,9 @@ def _payercompass_normalized_plan_info(plan: dict[str, Any]) -> dict[str, Any] |
         return None
     normalized_plan_by_field = {
         "plan_id": plan_id or None,
-        "plan_id_type": _clean_text(plan.get("plan_id_type") or plan.get("planIdType"))
-        or None,
+        "plan_id_type": _clean_text(plan.get("plan_id_type") or plan.get("planIdType")) or None,
         "plan_market_type": _clean_text(
-            plan.get("plan_market_type")
-            or plan.get("planMarketType")
-            or plan.get("market_type")
+            plan.get("plan_market_type") or plan.get("planMarketType") or plan.get("market_type")
         )
         or "group",
         "plan_name": plan_name or None,
@@ -8588,9 +7819,7 @@ def _payercompass_plan_info_by_file_key(
         for file_entry in _payercompass_as_list(structure.get("in_network_files")):
             if not isinstance(file_entry, dict):
                 continue
-            keys = _payercompass_file_match_keys(
-                file_entry.get("location"), file_entry.get("description")
-            )
+            keys = _payercompass_file_match_keys(file_entry.get("location"), file_entry.get("description"))
             for key in keys:
                 _payercompass_add_plan_info(plan_info_by_key, key, plans)
     return plan_info_by_key, toc_metadata_by_field
@@ -8601,9 +7830,7 @@ def _is_payercompass_index_target(target: CrawlTarget) -> bool:
     file_name = str(metadata.get("payercompass_file_name") or target.label or "")
     normalized = file_name.lower()
     return (
-        "index" in normalized
-        and ".json" in normalized
-        and str(metadata.get("container_format") or "").lower() == "zip"
+        "index" in normalized and ".json" in normalized and str(metadata.get("container_format") or "").lower() == "zip"
     )
 
 
@@ -8641,10 +7868,10 @@ async def _payercompass_plan_index(
                 max_bytes=index_fetch_max_bytes,
                 session=session,
             )
+        except IncompleteToc:
+            raise
         except Exception as exc:
-            logging.getLogger(__name__).debug(
-                "failed to fetch PayerCompass index %s: %s", crawl_target.url, exc
-            )
+            logging.getLogger(__name__).debug("failed to fetch PayerCompass index %s: %s", crawl_target.url, exc)
             continue
         for _member_name, toc in toc_values:
             if not isinstance(toc, dict):
@@ -8667,9 +7894,7 @@ async def _enrich_payercompass_target_plan_info(
 ) -> list[CrawlTarget]:
     """Add index plan metadata to PayerCompass crawl targets."""
     index_fetch_max_bytes = (
-        _as_int(resolver.get("index_max_bytes"))
-        or _as_int(resolver.get("max_index_bytes"))
-        or max_bytes
+        _as_int(resolver.get("index_max_bytes")) or _as_int(resolver.get("max_index_bytes")) or max_bytes
     )
     plan_info_by_key, toc_metadata_by_field = await _payercompass_plan_index(
         crawl_targets,
@@ -8712,9 +7937,7 @@ def _payercompass_targets_from_structure(
     file_lists: dict[str, list[dict[str, Any]]],
 ) -> list[CrawlTarget]:
     mrf_config = structure.get("mrfConfig") if isinstance(structure, dict) else None
-    frames = (
-        (mrf_config or {}).get("timeFrames") if isinstance(mrf_config, dict) else []
-    )
+    frames = (mrf_config or {}).get("timeFrames") if isinstance(mrf_config, dict) else []
     if not isinstance(frames, list):
         return []
     crawl_targets: list[CrawlTarget] = []
@@ -8727,9 +7950,7 @@ def _payercompass_targets_from_structure(
             continue
         file_entries = file_lists.get(timeframe_id) or []
         if not file_entries and (_as_int(frame.get("fileCount")) or 0) in {1}:
-            file_entries = [
-                {"id": timeframe_id, "name": str(frame.get("name") or timeframe_id)}
-            ]
+            file_entries = [{"id": timeframe_id, "name": str(frame.get("name") or timeframe_id)}]
         for file_item in file_entries:
             if not isinstance(file_item, dict):
                 continue
@@ -8760,13 +7981,9 @@ async def _resolve_payercompass_mrf(
     structure_url = urljoin(url, structure_path)
     file_list_url = urljoin(url, file_list_path)
     max_bytes = int(resolver.get("max_bytes") or 10 * 1024 * 1024)
-    structure = await _post_json(
-        structure_url, {}, max_bytes=max_bytes, session=session
-    )
+    structure = await _post_json(structure_url, {}, max_bytes=max_bytes, session=session)
     mrf_config = structure.get("mrfConfig") if isinstance(structure, dict) else None
-    frames = (
-        (mrf_config or {}).get("timeFrames") if isinstance(mrf_config, dict) else []
-    )
+    frames = (mrf_config or {}).get("timeFrames") if isinstance(mrf_config, dict) else []
     if not isinstance(frames, list):
         frames = []
     max_timeframes = _as_int(resolver.get("max_timeframes")) or len(frames)
@@ -8855,9 +8072,7 @@ def _webtpa_record_target(
     plan_id = _webtpa_plan_id(plan)
     plan_name = _webtpa_plan_name(plan)
     file_id = _webtpa_file_id(file_record, file_type)
-    file_name = _clean_text(
-        file_record.get("fileName") or file_record.get("name")
-    )
+    file_name = _clean_text(file_record.get("fileName") or file_record.get("name"))
     label = " - ".join(part for part in (plan_name, file_name) if part)
     plan_info_rows: list[dict[str, Any]] = []
     if plan_id or plan_name:
@@ -8894,10 +8109,7 @@ def _webtpa_endpoint_specs(
     return (
         (
             "in-network",
-            str(
-                resolver.get("in_network_path_template")
-                or "/machinereadablefile/plans/{plan_id}/in-network-rates"
-            ),
+            str(resolver.get("in_network_path_template") or "/machinereadablefile/plans/{plan_id}/in-network-rates"),
             str(
                 resolver.get("in_network_location_path_template")
                 or "/machinereadablefile/in-network-rates/{file_id}/location"
@@ -8906,8 +8118,7 @@ def _webtpa_endpoint_specs(
         (
             "allowed-amounts",
             str(
-                resolver.get("allowed_amounts_path_template")
-                or "/machinereadablefile/plans/{plan_id}/allowed-amounts"
+                resolver.get("allowed_amounts_path_template") or "/machinereadablefile/plans/{plan_id}/allowed-amounts"
             ),
             "",
         ),
@@ -8938,6 +8149,8 @@ async def _webtpa_file_location(
             max_bytes=1024 * 1024,
             session=session,
         )
+    except IncompleteToc:
+        raise
     except Exception:
         location_by_field = {}
     if not isinstance(location_by_field, dict):
@@ -8959,9 +8172,7 @@ async def _webtpa_targets_for_plan(
     if not plan_id:
         return []
     crawl_targets: list[CrawlTarget] = []
-    for file_type, list_template, location_template in _webtpa_endpoint_specs(
-        resolver
-    ):
+    for file_type, list_template, location_template in _webtpa_endpoint_specs(resolver):
         list_url = urljoin(base_url, list_template.format(plan_id=quote(plan_id)))
         file_records = await _fetch_json_value(
             list_url,
@@ -8970,9 +8181,7 @@ async def _webtpa_targets_for_plan(
         )
         if not isinstance(file_records, list):
             continue
-        for file_record in (
-            api_entry for api_entry in file_records if isinstance(api_entry, dict)
-        ):
+        for file_record in (api_entry for api_entry in file_records if isinstance(api_entry, dict)):
             file_url, resolved_from_url = await _webtpa_file_location(
                 file_record,
                 file_type=file_type,
@@ -9018,9 +8227,7 @@ async def _resolve_webtpa_mrf_api(
     max_targets = _as_int(resolver.get("max_targets"))
     crawl_targets: list[CrawlTarget] = []
     for plan in [api_entry for api_entry in plans if isinstance(api_entry, dict)][:max_plans]:
-        remaining_targets = (
-            max_targets - len(crawl_targets) if max_targets else None
-        )
+        remaining_targets = max_targets - len(crawl_targets) if max_targets else None
         crawl_targets.extend(
             await _webtpa_targets_for_plan(
                 source_row_dict,
@@ -9152,9 +8359,7 @@ async def _resolve_cmstic_keyed_toc_redirect(
     if not _is_cmstic_keyed_toc_url(url):
         raise ValueError(f"unsupported CMSTIC keyed TOC URL: {url}")
     await _assert_fetch_url_allowed(url)
-    async with session.head(
-        url, allow_redirects=True, **_request_ssl_kwargs(url)
-    ) as resp:
+    async with session.head(url, allow_redirects=True, **_request_ssl_kwargs(url)) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         if resp.status >= 400:
             raise ValueError(f"CMSTIC keyed TOC redirect returned HTTP {resp.status}")
@@ -9231,9 +8436,7 @@ async def _resolve_cmstic_file_info(
             max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
             session=session,
         )
-        target = _cmstic_target_from_payload(
-            source, payload, api_url=api_url, resolver_type="cmstic_file_info"
-        )
+        target = _cmstic_target_from_payload(source, payload, api_url=api_url, resolver_type="cmstic_file_info")
         if target:
             targets.append(target)
     targets = _dedupe_crawl_targets_by_url(targets)
@@ -9362,9 +8565,7 @@ async def _resolve_github_repo_mrf(
     )
     tree = tree_payload.get("tree")
     if not isinstance(tree, list):
-        raise ValueError(
-            f"GitHub MRF tree response did not include file list for {owner}/{repo}"
-        )
+        raise ValueError(f"GitHub MRF tree response did not include file list for {owner}/{repo}")
     crawl_targets: list[CrawlTarget] = []
     prefix = (path_prefix or "").strip("/")
     for tree_entry in tree:
@@ -9474,17 +8675,11 @@ class _MRFHtmlLinkParser(HTMLParser):
         start = self._offset()
         end = self._tag_end(start)
         if tag == "a":
-            self._anchor_stack.append(
-                {"attrs": attrs, "label_parts": [], "html_start": start}
-            )
+            self._anchor_stack.append({"attrs": attrs, "label_parts": [], "html_start": start})
             return
-        self._append_attr_candidates(
-            attrs, label="", html_start=start, html_end=end, include_href=False
-        )
+        self._append_attr_candidates(attrs, label="", html_start=start, html_end=end, include_href=False)
 
-    def handle_startendtag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         """Process self-closing HTML tags that may contain link attributes."""
         start = self._offset()
         end = self._tag_end(start)
@@ -9532,16 +8727,11 @@ def _html_link_candidates(html_text: str, *, base_url: str) -> list[dict[str, An
     except Exception:
         logging.getLogger(__name__).debug("failed to parse HTML links with HTMLParser", exc_info=True)
     for url in _embedded_mrf_urls(embedded_source, base_url=base_url):
-        candidates.append(
-            {"attr": "text", "value": url, "label": Path(urlsplit(url).path).name}
-        )
+        candidates.append({"attr": "text", "value": url, "label": Path(urlsplit(url).path).name})
     if embedded_source != (html_text or ""):
         for url in _embedded_mrf_urls(html_text or "", base_url=base_url):
             label = Path(urlsplit(url).path).name
-            if not (
-                _is_html_mrf_toc_url(url, label)
-                or _is_html_mrf_body_reference(url, label)
-            ):
+            if not (_is_html_mrf_toc_url(url, label) or _is_html_mrf_body_reference(url, label)):
                 continue
             candidates.append({"attr": "text", "value": url, "label": label})
     normalized_candidates: list[dict[str, Any]] = []
@@ -9623,9 +8813,7 @@ class _MidlandsChoiceMrfParser(HTMLParser):
             self._current_cell = None
 
 
-def _parse_midlandschoice_mrf_rows(
-    html_text: str, *, base_url: str
-) -> list[dict[str, str]]:
+def _parse_midlandschoice_mrf_rows(html_text: str, *, base_url: str) -> list[dict[str, str]]:
     parser = _MidlandsChoiceMrfParser()
     parser.feed(html_text or "")
     parser.close()
@@ -9643,9 +8831,8 @@ def _parse_midlandschoice_mrf_rows(
         if not href or network_code.lower() == "network":
             continue
         file_url = urljoin(base_url, href)
-        target_file_type = (
-            _mrf_body_file_type_from_text(file_url, file_type or file_name)
-            or _metadata_text_file_type(file_type)
+        target_file_type = _mrf_body_file_type_from_text(file_url, file_type or file_name) or _metadata_text_file_type(
+            file_type
         )
         if target_file_type not in {"in-network", "allowed-amounts"}:
             continue
@@ -9692,8 +8879,7 @@ async def _resolve_midlandschoice_mrf(
                     "network_name": file_row.get("network_name"),
                     "file_name": file_row.get("file_name"),
                     "midlandschoice_file_type": file_row.get("file_type"),
-                    "reporting_entity_name": source_row_dict.get("display_name")
-                    or "Midlands Choice",
+                    "reporting_entity_name": source_row_dict.get("display_name") or "Midlands Choice",
                     "reporting_entity_type": "third_party_administrator",
                     "plan_info": _plan_info_from_label(
                         label,
@@ -9720,9 +8906,7 @@ def _embedded_http_urls(value: str | None) -> list[str]:
     seen_urls: set[str] = set()
     for match in re.finditer(r"https?://[^\s\"'<>]+", text, flags=re.I):
         url = match.group(0).rstrip("\\,.;)")
-        while url.endswith(("]", "}")) and (
-            url.count("[") < url.count("]") or url.count("{") < url.count("}")
-        ):
+        while url.endswith(("]", "}")) and (url.count("[") < url.count("]") or url.count("{") < url.count("}")):
             url = url[:-1]
         if not url:
             continue
@@ -9820,9 +9004,7 @@ def _is_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
     text = f"{path} {query} {label or ''}".lower().replace("_", "-")
     if _is_non_tic_mrf_reference(url, label):
         return False
-    has_provider_only_text = any(
-        token in text for token in ("formulary", "provider-data", "provider ")
-    ) and not any(
+    has_provider_only_text = any(token in text for token in ("formulary", "provider-data", "provider ")) and not any(
         token in text
         for token in (
             "allowed",
@@ -9847,11 +9029,7 @@ def _is_html_mrf_toc_url(url: str | None, label: str | None = None) -> bool:
         return True
     if any(token in text for token in ("/toc-json", "table-of-contents.json")):
         return True
-    if (
-        "mrf" in path
-        and "toc" in text
-        and any(token in text for token in ("index", "table-of-contents"))
-    ):
+    if "mrf" in path and "toc" in text and any(token in text for token in ("index", "table-of-contents")):
         return True
     return _is_extensionless_html_mrf_toc(path, text)
 
@@ -9866,10 +9044,7 @@ def _is_extensionless_html_mrf_body_text(
         "allowed-amounts",
     } and (
         re.search(r"(?:^|[-/])20\d{2}[-/]\d{2}[-/]\d{2}(?:[-/]|$)", text)
-        or any(
-            token in text
-            for token in ("large-group", "small-group", "individual-and-family")
-        )
+        or any(token in text for token in ("large-group", "small-group", "individual-and-family"))
     )
     has_mrf_context = has_body_context or any(
         token in text
@@ -9912,8 +9087,7 @@ def _is_html_mrf_body_reference(url: str | None, label: str | None = None) -> bo
     text = f"{path} {label or ''} {query_file_name or ''}".lower().replace("_", "-")
     inferred_file_type = _mrf_file_type_from_text(url, label)
     if not direct_body and (
-        "." in Path(path).name
-        or not _is_extensionless_html_mrf_body_text(text, inferred_file_type)
+        "." in Path(path).name or not _is_extensionless_html_mrf_body_text(text, inferred_file_type)
     ):
         return False
     if any(token in text for token in ("formulary", "provider-data", "provider ")):
@@ -9943,9 +9117,7 @@ def _html_mrf_frame_urls(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
     seen_urls: set[str] = set()
     base_key = _canonical_or_none(base_url) or base_url
-    for match in re.finditer(
-        r"<iframe\b(?P<attrs>[^>]*)>", html_text or "", flags=re.I | re.S
-    ):
+    for match in re.finditer(r"<iframe\b(?P<attrs>[^>]*)>", html_text or "", flags=re.I | re.S):
         attrs = match.group("attrs") or ""
         src_match = re.search(
             r"""src\s*=\s*(?P<quote>["'])(?P<value>.*?)(?P=quote)""",
@@ -9961,10 +9133,7 @@ def _html_mrf_frame_urls(html_text: str, *, base_url: str) -> list[str]:
         parsed = urlsplit(url)
         path = parsed.path.lower()
         text = f"{path} {parsed.query}".replace("_", "-")
-        if not any(
-            token in text
-            for token in ("mrf", "machine-readable", "transparency", "tic")
-        ):
+        if not any(token in text for token in ("mrf", "machine-readable", "transparency", "tic")):
             continue
         key = _canonical_or_none(url) or url
         if key == base_key or key in seen_urls:
@@ -10009,9 +9178,7 @@ def _is_html_label_planish(label: str | None) -> bool:
     return bool(re.search(r"[a-z]", normalized))
 
 
-def _mrf_type_from_html_link_context(
-    html_text: str, html_start: int | None, html_end: int | None
-) -> str | None:
+def _mrf_type_from_html_link_context(html_text: str, html_start: int | None, html_end: int | None) -> str | None:
     if not isinstance(html_start, int) or not isinstance(html_end, int):
         return None
     after = html_text[html_end : html_end + 700]
@@ -10047,16 +9214,13 @@ def _html_mrf_target_identity(
         html_end,
     )
     if path.endswith(".txt") and any(
-        token in label_or_path
-        for token in ("meta", "mrf", "machine-readable", "transparency")
+        token in label_or_path for token in ("meta", "mrf", "machine-readable", "transparency")
     ):
         return "metadata_text", "metadata-index", "html_metadata_text", label
     if _is_html_mrf_toc_url(url, label):
         return "toc_json", "table-of-contents", "html_mrf_link", label
     is_body_reference = _is_html_mrf_body_reference(url, label) or (
-        direct_body
-        and (link_file_type or section_file_type)
-        and not _is_non_tic_mrf_reference(url, label)
+        direct_body and (link_file_type or section_file_type) and not _is_non_tic_mrf_reference(url, label)
     )
     if not is_body_reference:
         return None
@@ -10066,11 +9230,7 @@ def _html_mrf_target_identity(
     if not target_file_type:
         return None
     inferred_label = _mrf_file_plan_label(path)
-    if (
-        _is_direct_mrf_body_url(url)
-        and inferred_label
-        and _is_html_label_fileish(label, path)
-    ):
+    if _is_direct_mrf_body_url(url) and inferred_label and _is_html_label_fileish(label, path):
         label = inferred_label
     return "file_reference", target_file_type, "html_file_reference", label
 
@@ -10084,11 +9244,7 @@ def _parsed_html_mrf_link(
     """Normalize one candidate HTML link into its deduplication key and row."""
     url = str(candidate["url"])
     path = urlsplit(url).path.lower()
-    label = (
-        _clean_text(candidate.get("label"))
-        or Path(urlsplit(url).path).name
-        or "MRF file"
-    )
+    label = _clean_text(candidate.get("label")) or Path(urlsplit(url).path).name or "MRF file"
     html_start = candidate.get("html_start")
     html_end = candidate.get("html_end")
     target_identity = _html_mrf_target_identity(
@@ -10127,9 +9283,7 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         html_start = candidate.get("html_start")
         if isinstance(html_start, int):
-            section = _mrf_file_type_from_html_section(
-                html_text[last_html_position:html_start]
-            )
+            section = _mrf_file_type_from_html_section(html_text[last_html_position:html_start])
             if section:
                 section_file_type = section
             html_end = candidate.get("html_end")
@@ -10144,10 +9298,7 @@ def _parse_html_mrf_links(html_text: str, *, base_url: str) -> list[dict[str, An
             continue
         key, parsed_link_dict = parsed_link
         existing = links_by_key.get(key)
-        if existing is None or (
-            existing.get("html_attr") == "text"
-            and parsed_link_dict.get("html_attr") != "text"
-        ):
+        if existing is None or (existing.get("html_attr") == "text" and parsed_link_dict.get("html_attr") != "text"):
             links_by_key[key] = parsed_link_dict
     return list(links_by_key.values())
 
@@ -10178,21 +9329,13 @@ def _crawl_targets_from_html_mrf_links(
             "container_format": parsed_target.get("container_format"),
             "html_attr": parsed_target.get("html_attr"),
             "plan_info": parsed_target.get("plan_info"),
-            "target_max_bytes": (
-                target_max_bytes
-                if parsed_target.get("target_kind") == "toc_json"
-                else None
-            ),
+            "target_max_bytes": (target_max_bytes if parsed_target.get("target_kind") == "toc_json" else None),
         }
         crawl_targets.append(
             CrawlTarget(
                 source=source_record,
                 url=str(parsed_target["url"]),
-                label=str(
-                    parsed_target.get("label")
-                    or source_record.get("display_name")
-                    or ""
-                ),
+                label=str(parsed_target.get("label") or source_record.get("display_name") or ""),
                 resolved_from_url=base_url,
                 metadata={
                     metadata_key: metadata_value
@@ -10239,10 +9382,7 @@ def _embedded_mrf_host_urls(raw_html_text: str | None) -> list[str]:
 def _delegated_mrf_source_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
     seen_urls: set[str] = set()
-    candidates = [
-        str(item.get("url") or "")
-        for item in _html_link_candidates(html_text, base_url=base_url)
-    ]
+    candidates = [str(item.get("url") or "") for item in _html_link_candidates(html_text, base_url=base_url)]
     candidates.extend(_embedded_mrf_host_urls(html_text))
     source_key = _canonical_or_none(base_url) or base_url
     for url in candidates:
@@ -10283,10 +9423,7 @@ def _hcsc_asomrf_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
 def _point32_directory_urls_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
     seen_urls: set[str] = set()
-    candidates = [
-        str(item.get("url") or "")
-        for item in _html_link_candidates(html_text, base_url=base_url)
-    ]
+    candidates = [str(item.get("url") or "") for item in _html_link_candidates(html_text, base_url=base_url)]
     candidates.extend(_embedded_http_urls(html_text))
     for url in candidates:
         parsed = urlsplit(url)
@@ -10308,9 +9445,7 @@ _LEGACY_SOURCE_QUERY_CONTEXT_KEYS = {
     "query_context_employer_aliases": "private_context_employer_aliases",
     "query_context_employer_ein": "private_context_employer_ein",
     "query_context_erisa_plan_number": "private_context_erisa_plan_number",
-    "query_context_carrier_policy_number": (
-        "private_context_carrier_policy_number"
-    ),
+    "query_context_carrier_policy_number": ("private_context_carrier_policy_number"),
     "query_context_carrier_region": "private_context_carrier_region",
     "query_context_lookup_type": "private_context_lookup_type",
     "query_context_evidence_plan_year": "private_context_evidence_plan_year",
@@ -10338,19 +9473,11 @@ def _source_query_context_text(source: dict[str, Any], key: str) -> str:
     return _clean_text(_source_query_context_value(source, key))
 
 
-def _source_private_context_values(
-    source: dict[str, Any], key: str
-) -> tuple[str, ...]:
+def _source_private_context_values(source: dict[str, Any], key: str) -> tuple[str, ...]:
     """Return normalized list values from one source-context field."""
     context_value = _source_query_context_value(source, key)
-    values = (
-        context_value
-        if isinstance(context_value, (list, tuple, set))
-        else [context_value]
-    )
-    return tuple(
-        dict.fromkeys(_clean_text(item) for item in values if _clean_text(item))
-    )
+    values = context_value if isinstance(context_value, (list, tuple, set)) else [context_value]
+    return tuple(dict.fromkeys(_clean_text(item) for item in values if _clean_text(item)))
 
 
 def _source_query_context_metadata(source: dict[str, Any]) -> dict[str, Any]:
@@ -10405,12 +9532,8 @@ def _anthem_s3_employer_name_queries(source_row: dict[str, Any]) -> tuple[str, .
     """Return private employer names suitable for Anthem's name index."""
     query_values = [
         _source_target_payer_query(source_row),
-        _source_query_context_text(
-            source_row, "query_context_employer_name"
-        ),
-        *_source_private_context_values(
-            source_row, "query_context_employer_aliases"
-        ),
+        _source_query_context_text(source_row, "query_context_employer_name"),
+        *_source_private_context_values(source_row, "query_context_employer_aliases"),
     ]
     queries_by_key: dict[str, str] = {}
     for query_value in query_values:
@@ -10435,11 +9558,7 @@ def _anthem_s3_name_index_matches(
 ) -> list[dict[str, str]]:
     """Select valid EIN records using Anthem's case-insensitive substring rule."""
     normalized_queries = tuple(
-        query
-        for query in (
-            _clean_text(query_value).lower() for query_value in queries
-        )
-        if query
+        query for query in (_clean_text(query_value).lower() for query_value in queries) if query
     )
     matches_by_ein: dict[str, dict[str, str]] = {}
     for raw_record in name_index.get("namesearch") or []:
@@ -10447,15 +9566,9 @@ def _anthem_s3_name_index_matches(
             continue
         employer_name = _clean_text(raw_record.get("name"))
         normalized_name = employer_name.lower()
-        if not employer_name or not any(
-            query in normalized_name for query in normalized_queries
-        ):
+        if not employer_name or not any(query in normalized_name for query in normalized_queries):
             continue
-        ein_digits = "".join(
-            character
-            for character in _clean_text(raw_record.get("ein"))
-            if character.isdigit()
-        )
+        ein_digits = "".join(character for character in _clean_text(raw_record.get("ein")) if character.isdigit())
         if len(ein_digits) != 9:
             continue
         matches_by_ein.setdefault(
@@ -10488,19 +9601,17 @@ async def _fetch_anthem_s3_name_matches(
     max_matches = _as_int(resolver_by_key.get("max_name_matches")) or 50
     matches_by_ein: dict[str, dict[str, str]] = {}
     for index_key, index_queries in queries_by_index.items():
-        index_url = urljoin(
-            base_url.rstrip("/") + "/", f"namesearch/{index_key}.json"
-        )
+        index_url = urljoin(base_url.rstrip("/") + "/", f"namesearch/{index_key}.json")
         try:
             name_index = await _fetch_json(
                 index_url,
                 max_bytes=max_bytes,
                 session=session,
             )
+        except IncompleteToc:
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-            raise ValueError(
-                f"Anthem name index fetch failed for {index_url}"
-            ) from exc
+            raise ValueError(f"Anthem name index fetch failed for {index_url}") from exc
         for match in _anthem_s3_name_index_matches(
             name_index,
             index_queries,
@@ -10509,9 +9620,7 @@ async def _fetch_anthem_s3_name_matches(
             if match["ein"] in matches_by_ein:
                 continue
             if len(matches_by_ein) >= max_matches:
-                raise ValueError(
-                    "Anthem name index result exceeds configured match limit"
-                )
+                raise ValueError("Anthem name index result exceeds configured match limit")
             matches_by_ein[match["ein"]] = match
     return list(matches_by_ein.values())
 
@@ -10524,15 +9633,10 @@ def _anthem_s3_employer_identity(
 ) -> tuple[dict[str, Any], str, str, list[dict[str, Any]]]:
     context_by_key = _source_query_context_metadata(source_row)
     employer_name = _clean_text(
-        context_by_key.get("employer_name")
-        or _source_target_payer_query(source_row)
-        or source_row.get("display_name")
+        context_by_key.get("employer_name") or _source_target_payer_query(source_row) or source_row.get("display_name")
     )
     employer_ein = _clean_text(
-        context_by_key.get("ein")
-        or _source_query_context_text(
-            source_row, "query_context_employer_ein"
-        )
+        context_by_key.get("ein") or _source_query_context_text(source_row, "query_context_employer_ein")
     )
     resolved_employer_name = _clean_text(matched_employer_name) or employer_name
     resolved_ein = _clean_text(matched_ein) or employer_ein
@@ -10560,12 +9664,10 @@ def _anthem_s3_employer_target_metadata(
     matched_ein: str | None = None,
     name_index_url: str | None = None,
 ) -> tuple[dict[str, Any], str]:
-    context_by_key, employer_name, employer_ein, plan_records = (
-        _anthem_s3_employer_identity(
-            source_row,
-            matched_employer_name=matched_employer_name,
-            matched_ein=matched_ein,
-        )
+    context_by_key, employer_name, employer_ein, plan_records = _anthem_s3_employer_identity(
+        source_row,
+        matched_employer_name=matched_employer_name,
+        matched_ein=matched_ein,
     )
     resolved_employer_name = _clean_text(matched_employer_name) or employer_name
     resolved_ein = _clean_text(matched_ein) or employer_ein
@@ -10636,9 +9738,7 @@ def _anthem_s3_employer_targets(
             if key in seen_urls:
                 continue
             seen_urls.add(key)
-            label = _clean_text(raw_item.get("displayname")) or Path(
-                urlsplit(target_url).path
-            ).name
+            label = _clean_text(raw_item.get("displayname")) or Path(urlsplit(target_url).path).name
             crawl_targets.append(
                 CrawlTarget(
                     source=source_row,
@@ -10666,9 +9766,7 @@ async def _resolve_anthem_s3_employer_files(
     matched_employer_name: str | None = None,
     name_index_url: str | None = None,
 ) -> list[CrawlTarget]:
-    ein_digits = "".join(
-        character for character in employer_ein if character.isdigit()
-    )
+    ein_digits = "".join(character for character in employer_ein if character.isdigit())
     if len(ein_digits) != 9:
         raise ValueError(f"invalid Anthem employer EIN: {employer_ein!r}")
     lookup_url = urljoin(
@@ -10678,15 +9776,13 @@ async def _resolve_anthem_s3_employer_files(
     try:
         employer_result = await _fetch_json(
             lookup_url,
-            max_bytes=int(
-                lookup_context.resolver_by_key.get("max_bytes") or 1024 * 1024
-            ),
+            max_bytes=int(lookup_context.resolver_by_key.get("max_bytes") or 1024 * 1024),
             session=lookup_context.session,
         )
+    except IncompleteToc:
+        raise
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-        raise ValueError(
-            f"no current Anthem employer MRF result for EIN {employer_ein}"
-        ) from exc
+        raise ValueError(f"no current Anthem employer MRF result for EIN {employer_ein}") from exc
     crawl_targets = _anthem_s3_employer_targets(
         source_row,
         employer_result,
@@ -10697,9 +9793,7 @@ async def _resolve_anthem_s3_employer_files(
         name_index_url=name_index_url,
     )
     if not crawl_targets:
-        raise ValueError(
-            f"Anthem employer MRF result for EIN {employer_ein} has no file links"
-        )
+        raise ValueError(f"Anthem employer MRF result for EIN {employer_ein} has no file links")
     return crawl_targets
 
 
@@ -10734,9 +9828,7 @@ def _merge_anthem_employer_matches(
     existing_matches: Iterable[Any], incoming_matches: Iterable[Any]
 ) -> list[dict[str, Any]]:
     """Merge employer match records by current EIN."""
-    employer_matches = [
-        match for match in existing_matches if isinstance(match, dict)
-    ]
+    employer_matches = [match for match in existing_matches if isinstance(match, dict)]
     known_match_eins = {match.get("ein") for match in employer_matches}
     for employer_match in incoming_matches:
         if not isinstance(employer_match, dict):
@@ -10747,17 +9839,9 @@ def _merge_anthem_employer_matches(
     return employer_matches
 
 
-def _anthem_employer_match_values(
-    employer_matches: Iterable[dict[str, Any]], key: str
-) -> list[str]:
+def _anthem_employer_match_values(employer_matches: Iterable[dict[str, Any]], key: str) -> list[str]:
     """Return distinct non-empty values from employer match records."""
-    return list(
-        dict.fromkeys(
-            _clean_text(match.get(key))
-            for match in employer_matches
-            if _clean_text(match.get(key))
-        )
-    )
+    return list(dict.fromkeys(_clean_text(match.get(key)) for match in employer_matches if _clean_text(match.get(key))))
 
 
 def _apply_anthem_merged_identity(
@@ -10767,9 +9851,7 @@ def _apply_anthem_merged_identity(
     match_names = _anthem_employer_match_values(employer_matches, "name")
     match_eins = _anthem_employer_match_values(employer_matches, "ein")
     lookup_urls = _anthem_employer_match_values(employer_matches, "lookup_url")
-    name_index_urls = _anthem_employer_match_values(
-        employer_matches, "name_index_url"
-    )
+    name_index_urls = _anthem_employer_match_values(employer_matches, "name_index_url")
     metadata_by_key["anthem_matched_employer_names"] = match_names
     metadata_by_key["anthem_matched_eins"] = match_eins
     metadata_by_key["anthem_employer_lookup_urls"] = lookup_urls
@@ -10780,9 +9862,7 @@ def _apply_anthem_merged_identity(
         metadata_by_key["employer_name"] = match_names[0]
     else:
         metadata_by_key.pop("anthem_matched_employer_name", None)
-        requested_name = _clean_text(
-            metadata_by_key.get("anthem_requested_employer_name")
-        )
+        requested_name = _clean_text(metadata_by_key.get("anthem_requested_employer_name"))
         for name_key in ("company_name", "employer_name"):
             if requested_name:
                 metadata_by_key[name_key] = requested_name
@@ -10858,9 +9938,7 @@ async def _resolve_configured_anthem_s3_targets(
     lookup_context: AnthemLookupContext,
 ) -> list[CrawlTarget]:
     """Resolve a trusted configured EIN when it is valid and current."""
-    configured_ein = "".join(
-        character for character in employer_ein if character.isdigit()
-    )
+    configured_ein = "".join(character for character in employer_ein if character.isdigit())
     if len(configured_ein) != 9:
         return []
     try:
@@ -10869,6 +9947,8 @@ async def _resolve_configured_anthem_s3_targets(
             employer_ein=configured_ein,
             lookup_context=lookup_context,
         )
+    except IncompleteToc:
+        raise
     except ValueError:
         return []
 
@@ -10902,9 +9982,7 @@ def _strict_anthem_context_ein(
             "query_context_lookup_type",
         ).lower(),
     ).strip("_")
-    ein_digits = "".join(
-        character for character in configured_ein if character.isdigit()
-    )
+    ein_digits = "".join(character for character in configured_ein if character.isdigit())
     if lookup_type == "employer_ein" and len(ein_digits) == 9:
         return ein_digits
     return ""
@@ -10919,11 +9997,7 @@ def _anthem_name_matches_for_context(
     strict_ein = _strict_anthem_context_ein(source_row, configured_ein)
     eligible_matches = list(name_matches)
     if strict_ein:
-        eligible_matches = [
-            name_match
-            for name_match in eligible_matches
-            if name_match["ein"] == strict_ein
-        ]
+        eligible_matches = [name_match for name_match in eligible_matches if name_match["ein"] == strict_ein]
     return strict_ein, eligible_matches
 
 
@@ -10935,17 +10009,12 @@ def _anthem_candidate_matches(
     name_matches: Iterable[dict[str, str]],
 ) -> tuple[dict[str, dict[str, str]], set[str]]:
     """Validate resolved employer candidates before fetching their file lists."""
-    candidates_by_ein = {
-        name_match["ein"]: name_match for name_match in name_matches
-    }
+    candidates_by_ein = {name_match["ein"]: name_match for name_match in name_matches}
     indexed_eins = set(candidates_by_ein)
     if candidates_by_ein or direct_targets:
         return candidates_by_ein, indexed_eins
     if strict_ein:
-        raise ValueError(
-            "no current Anthem employer MRF result for configured EIN "
-            f"{employer_ein}"
-        )
+        raise ValueError(f"no current Anthem employer MRF result for configured EIN {employer_ein}")
     if employer_ein:
         raise ValueError("no current Anthem employer MRF results matched context")
     raise ValueError("no current Anthem employer name-index match")
@@ -10968,11 +10037,11 @@ async def _resolve_anthem_candidate_targets(
                 matched_employer_name=candidate_match.get("name"),
                 name_index_url=candidate_match.get("name_index_url"),
             )
+        except IncompleteToc:
+            raise
         except ValueError as exc:
             if candidate_match["ein"] in indexed_eins:
-                raise ValueError(
-                    "Anthem name-index employer result could not be resolved"
-                ) from exc
+                raise ValueError("Anthem name-index employer result could not be resolved") from exc
             continue
         resolved_targets.extend(candidate_targets)
     return resolved_targets
@@ -10991,9 +10060,7 @@ async def _resolve_anthem_s3_context(
         employer_ein,
         lookup_context,
     )
-    configured_ein = "".join(
-        character for character in employer_ein if character.isdigit()
-    )
+    configured_ein = "".join(character for character in employer_ein if character.isdigit())
     try:
         name_matches = await _fetch_anthem_s3_name_matches(
             lookup_context.base_url,
@@ -11001,6 +10068,8 @@ async def _resolve_anthem_s3_context(
             lookup_context.resolver_by_key,
             lookup_context.session,
         )
+    except IncompleteToc:
+        raise
     except ValueError:
         if direct_targets:
             return _mark_anthem_name_index_fallback(direct_targets)
@@ -11017,9 +10086,7 @@ async def _resolve_anthem_s3_context(
         name_matches=name_matches,
     )
 
-    resolved_targets = (
-        list(direct_targets) if configured_ein not in indexed_eins else []
-    )
+    resolved_targets = list(direct_targets) if configured_ein not in indexed_eins else []
     resolved_targets.extend(
         await _resolve_anthem_candidate_targets(
             source_row,
@@ -11038,8 +10105,7 @@ def _anthem_status_urls_from_script(script_text: str) -> list[str]:
     return [
         url
         for url in _embedded_http_urls(script_text)
-        if urlsplit(url).netloc.endswith("amazonaws.com")
-        and urlsplit(url).path.endswith("/status.json")
+        if urlsplit(url).netloc.endswith("amazonaws.com") and urlsplit(url).path.endswith("/status.json")
     ]
 
 
@@ -11063,9 +10129,7 @@ def _anthem_s3_bases_from_script(script_text: str) -> list[str]:
     return bases
 
 
-def _anthem_toc_patterns_from_script(
-    script_text: str, *, source_url: str
-) -> list[tuple[str, str, str]]:
+def _anthem_toc_patterns_from_script(script_text: str, *, source_url: str) -> list[tuple[str, str, str]]:
     patterns: list[tuple[str, str, str]] = []
     seen_patterns: set[tuple[str, str, str]] = set()
     regex = re.compile(
@@ -11114,9 +10178,7 @@ def _anthem_s3_toc_targets(
         month_start = month_date.strftime("%Y-%m-01")
         for prefix, slug, extension in patterns:
             file_name = f"{month_start}_{slug}_index{extension}"
-            target_url = urljoin(
-                base_url.rstrip("/") + "/", f"{prefix.strip('/')}/{file_name}"
-            )
+            target_url = urljoin(base_url.rstrip("/") + "/", f"{prefix.strip('/')}/{file_name}")
             crawl_targets.append(
                 CrawlTarget(
                     source=source_record,
@@ -11136,9 +10198,7 @@ def _anthem_s3_toc_targets(
     return _dedupe_crawl_targets_by_url(crawl_targets)
 
 
-def _parse_html_mrf_metadata_links(
-    html_text: str, *, base_url: str
-) -> list[dict[str, Any]]:
+def _parse_html_mrf_metadata_links(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     return [
         {
             "url": target["url"],
@@ -11186,17 +10246,9 @@ def _metadata_plan_info(metadata: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         plan_row_by_field = dict(item)
-        if (
-            "plan_market_type" not in plan_row_by_field
-            and plan_row_by_field.get("market_type")
-        ):
-            plan_row_by_field["plan_market_type"] = plan_row_by_field.get(
-                "market_type"
-            )
-        if not any(
-            plan_row_by_field.get(key)
-            for key in ("plan_id", "plan_name", "plan_sponsor_name", "issuer_name")
-        ):
+        if "plan_market_type" not in plan_row_by_field and plan_row_by_field.get("market_type"):
+            plan_row_by_field["plan_market_type"] = plan_row_by_field.get("market_type")
+        if not any(plan_row_by_field.get(key) for key in ("plan_id", "plan_name", "plan_sponsor_name", "issuer_name")):
             continue
         plan_info_rows.append(plan_row_by_field)
     return plan_info_rows
@@ -11211,10 +10263,7 @@ def _plan_rows_from_target_metadata(crawl_target: CrawlTarget) -> list[dict[str,
     for plan in _metadata_plan_info(metadata):
         plan_id = str(plan.get("plan_id") or "").strip()
         plan_name = (
-            plan.get("plan_name")
-            or plan.get("plan_sponsor_name")
-            or plan.get("issuer_name")
-            or crawl_target.label
+            plan.get("plan_name") or plan.get("plan_sponsor_name") or plan.get("issuer_name") or crawl_target.label
         )
         market_type = plan.get("plan_market_type")
         row_id = _id(
@@ -11235,10 +10284,8 @@ def _plan_rows_from_target_metadata(crawl_target: CrawlTarget) -> list[dict[str,
             "plan_id_type": plan.get("plan_id_type"),
             "plan_name": plan_name,
             "market_type": market_type,
-            "reporting_entity_name": metadata.get("reporting_entity_name")
-            or source_row.get("display_name"),
-            "reporting_entity_type": metadata.get("reporting_entity_type")
-            or "third_party_administrator",
+            "reporting_entity_name": metadata.get("reporting_entity_name") or source_row.get("display_name"),
+            "reporting_entity_type": metadata.get("reporting_entity_type") or "third_party_administrator",
             "metadata_json": {
                 "raw_plan": plan,
                 "resolver": metadata.get("resolver"),
@@ -11282,9 +10329,7 @@ def _parse_meritain_mrf_search_targets(
         if str(params.get("insurerCode") or "").upper() != "MERITAIN_I":
             continue
         group_id = _meritain_group_id_from_healthsparq_url(url)
-        label = _clean_text(candidate.get("label")) or (
-            f"Meritain group {group_id}" if group_id else "Meritain Health"
-        )
+        label = _clean_text(candidate.get("label")) or (f"Meritain group {group_id}" if group_id else "Meritain Health")
         plan_info = _plan_info_from_label(
             f"Meritain group {group_id}" if group_id else label,
             plan_id=group_id,
@@ -11381,9 +10426,7 @@ def _html_enclosing_fragment(html_text: str, start: int, end: int) -> str:
     return best
 
 
-def _healthcarebluebook_link_items_from_context(
-    html_text: str, *, base_url: str
-) -> list[dict[str, Any]]:
+def _healthcarebluebook_link_items_from_context(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     link_item_list: list[dict[str, Any]] = []
     seen_links: set[str] = set()
     for candidate in _html_link_candidates(html_text or "", base_url=base_url):
@@ -11408,22 +10451,14 @@ def _healthcarebluebook_link_items_from_context(
         context_text = _strip_html_tags(context_html or html_text or "")
         label = _clean_text(candidate.get("label"))
         path_label = Path(urlsplit(link_url).path).name
-        if context_text and (
-            not label
-            or label.lower() in {"download", "view", "open", "file"}
-            or label == path_label
-        ):
+        if context_text and (not label or label.lower() in {"download", "view", "open", "file"} or label == path_label):
             label = context_text or Path(urlsplit(link_url).path).name
         link_item_list.append({"url": link_url, "label": label, "text": label})
-        link_item_list.append(
-            {"url": None, "label": context_text, "text": context_text}
-        )
+        link_item_list.append({"url": None, "label": context_text, "text": context_text})
     return link_item_list
 
 
-def _healthcarebluebook_grid_items(
-    html_text: str, *, base_url: str
-) -> list[dict[str, Any]]:
+def _healthcarebluebook_grid_items(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     pattern = re.compile(
         r"""<div\b[^>]*class=(?P<quote>["'])(?=[^"']*\bgrid-item\b)[^"']*(?P=quote)[^>]*>(?P<content>.*?)</div>""",
@@ -11448,9 +10483,7 @@ def _healthcarebluebook_grid_items(
 
 def _is_healthcarebluebook_relative_file_url(url: str) -> bool:
     parsed = urlsplit(url)
-    return parsed.netloc.lower() == "mrf.healthcarebluebook.com" and bool(
-        re.match(r"^/[^/]+/\d+/?$", parsed.path)
-    )
+    return parsed.netloc.lower() == "mrf.healthcarebluebook.com" and bool(re.match(r"^/[^/]+/\d+/?$", parsed.path))
 
 
 async def _is_healthcarebluebook_numeric_url_downloadable(
@@ -11464,18 +10497,13 @@ async def _is_healthcarebluebook_numeric_url_downloadable(
     if status == "failed":
         return True
     final_url = str(probe.get("final_url") or url)
-    if final_url != url and (
-        _container_format(final_url) or _is_direct_mrf_body_url(final_url)
-    ):
+    if final_url != url and (_container_format(final_url) or _is_direct_mrf_body_url(final_url)):
         return True
     http_status = _as_int(probe.get("http_status"))
     if http_status in (404, 410):
         return False
     content_type = str(probe.get("content_type") or "").lower()
-    if any(
-        marker in content_type
-        for marker in ("text/html", "application/xhtml", "xml")
-    ):
+    if any(marker in content_type for marker in ("text/html", "application/xhtml", "xml")):
         return False
     return True
 
@@ -11542,16 +10570,8 @@ def _healthcarebluebook_item_values(
     link_url = str(listing_item.get("url") or "").strip()
     if not link_url:
         return None
-    label = (
-        _clean_text(listing_item.get("label"))
-        or Path(urlsplit(link_url).path).name
-        or "MRF file"
-    )
-    type_text = (
-        listing_items[index + 1].get("text")
-        if index + 1 < len(listing_items)
-        else ""
-    )
+    label = _clean_text(listing_item.get("label")) or Path(urlsplit(link_url).path).name or "MRF file"
+    type_text = listing_items[index + 1].get("text") if index + 1 < len(listing_items) else ""
     file_type = _healthcarebluebook_file_type(type_text, label, link_url)
     if not file_type or not _is_healthcarebluebook_item_query_match(
         listing_item,
@@ -11575,16 +10595,13 @@ async def _healthcarebluebook_direct_target(
     is_hbb_numeric_file = _is_healthcarebluebook_relative_file_url(link_url)
     if not (is_hbb_numeric_file or _is_direct_mrf_body_url(link_url)):
         return None
-    if is_hbb_numeric_file and not await _is_healthcarebluebook_numeric_url_downloadable(
-        link_url, session
-    ):
+    if is_hbb_numeric_file and not await _is_healthcarebluebook_numeric_url_downloadable(link_url, session):
         return None
     metadata = {
         "resolver": resolver_type,
         "target_kind": "file_reference",
         "target_file_type": file_type,
-        "container_format": _container_format(link_url)
-        or ("zip" if is_hbb_numeric_file else None),
+        "container_format": _container_format(link_url) or ("zip" if is_hbb_numeric_file else None),
         "source_format": _healthcarebluebook_source_format(link_url),
         "healthcarebluebook_listing_url": listing_url,
         "healthcarebluebook_file_type": _clean_text(type_text),
@@ -11626,13 +10643,11 @@ async def _healthcarebluebook_nested_targets(
             session,
             target_limit=target_limit,
         )
+    except IncompleteToc:
+        raise
     except Exception:
         return []
-    bounded_targets = (
-        nested_targets[:target_limit]
-        if target_limit is not None
-        else nested_targets
-    )
+    bounded_targets = nested_targets[:target_limit] if target_limit is not None else nested_targets
     return [
         _annotate_healthcarebluebook_nested_target(
             nested_target,
@@ -11667,26 +10682,24 @@ async def _resolve_healthcarebluebook_mrf(
     for index in range(len(listing_items)):
         if max_targets and len(targets_by_url) >= max_targets:
             break
-        item_values = _healthcarebluebook_item_values(
-            listing_items, index, target_query
-        )
+        item_values = _healthcarebluebook_item_values(listing_items, index, target_query)
         if item_values is None:
             continue
-        direct_target = await _healthcarebluebook_direct_target(
-            source_record, url, item_values, resolver_type, session
-        )
+        direct_target = await _healthcarebluebook_direct_target(source_record, url, item_values, resolver_type, session)
         link_url = item_values[0]
-        if _is_healthcarebluebook_relative_file_url(
-            link_url
-        ) or _is_direct_mrf_body_url(link_url):
+        if _is_healthcarebluebook_relative_file_url(link_url) or _is_direct_mrf_body_url(link_url):
             if direct_target is not None:
                 key = _canonical_or_none(direct_target.url) or direct_target.url
                 targets_by_url[key] = direct_target
             continue
         nested_target_limit = max_targets - len(targets_by_url) if max_targets else None
         for annotated in await _healthcarebluebook_nested_targets(
-            source_record, url, item_values, resolver_type,
-            nested_target_limit, session,
+            source_record,
+            url,
+            item_values,
+            resolver_type,
+            nested_target_limit,
+            session,
         ):
             key = _canonical_or_none(annotated.url) or annotated.url
             targets_by_url[key] = annotated
@@ -11709,9 +10722,7 @@ def _html_mrf_direct_targets(
     targets_by_url: dict[str, CrawlTarget] = {}
     for parsed_target in _parse_html_mrf_links(html_text, base_url=landing_url):
         target_url = str(parsed_target["url"])
-        source_format = (
-            "csv" if urlsplit(target_url).path.lower().endswith(".csv") else None
-        )
+        source_format = "csv" if urlsplit(target_url).path.lower().endswith(".csv") else None
         metadata = {
             "resolver": parsed_target.get("resolver") or resolver_type,
             "target_kind": parsed_target.get("target_kind"),
@@ -11726,11 +10737,7 @@ def _html_mrf_direct_targets(
         targets_by_url[key] = CrawlTarget(
             source=source_record,
             url=target_url,
-            label=str(
-                parsed_target.get("label")
-                or source_record.get("display_name")
-                or ""
-            ),
+            label=str(parsed_target.get("label") or source_record.get("display_name") or ""),
             resolved_from_url=landing_url,
             metadata={
                 metadata_key: metadata_value
@@ -11783,17 +10790,14 @@ async def _html_healthcarebluebook_targets(
             **source_record,
             "hosting_platform": "healthcarebluebook_mrf",
         }
-        nested_resolver_by_field = (
-            _platform_resolver_config("healthcarebluebook_mrf")
-            or {"type": "healthcarebluebook_mrf"}
-        )
+        nested_resolver_by_field = _platform_resolver_config("healthcarebluebook_mrf") or {
+            "type": "healthcarebluebook_mrf"
+        }
         max_targets = _as_int(resolver.get("max_targets"))
         if max_targets:
             existing_nested_max = _as_int(nested_resolver_by_field.get("max_targets"))
             nested_resolver_by_field["max_targets"] = (
-                min(existing_nested_max, max_targets)
-                if existing_nested_max
-                else max_targets
+                min(existing_nested_max, max_targets) if existing_nested_max else max_targets
             )
         try:
             nested_targets = await _resolve_healthcarebluebook_mrf(
@@ -11802,6 +10806,8 @@ async def _html_healthcarebluebook_targets(
                 nested_resolver_by_field,
                 session,
             )
+        except IncompleteToc:
+            raise
         except Exception as exc:
             logging.getLogger(__name__).debug(
                 "failed to resolve nested Healthcare Bluebook MRF %s from %s: %s",
@@ -11811,9 +10817,7 @@ async def _html_healthcarebluebook_targets(
             )
             nested_targets = []
         crawl_targets.extend(
-            _annotate_html_healthcarebluebook_target(
-                nested_target, source_record, landing_url, link_url, resolver_type
-            )
+            _annotate_html_healthcarebluebook_target(nested_target, source_record, landing_url, link_url, resolver_type)
             for nested_target in nested_targets
         )
     return crawl_targets
@@ -11832,9 +10836,7 @@ async def _resolve_html_mrf_with_healthcarebluebook(
         max_bytes=int(resolver.get("max_bytes") or 10 * 1024 * 1024),
         session=session,
     )
-    targets_by_url = _html_mrf_direct_targets(
-        source_record, url, html_text, resolver_type
-    )
+    targets_by_url = _html_mrf_direct_targets(source_record, url, html_text, resolver_type)
     for nested_target in await _html_healthcarebluebook_targets(
         source_record, url, html_text, resolver, resolver_type, session
     ):
@@ -11881,9 +10883,7 @@ def _socrata_dataset_download(dataset: dict[str, Any]) -> tuple[str | None, str 
     return candidates[0]
 
 
-def _socrata_dataset_id(
-    dataset: dict[str, Any], download_url: str | None
-) -> str | None:
+def _socrata_dataset_id(dataset: dict[str, Any], download_url: str | None) -> str | None:
     for value in (dataset.get("identifier"), dataset.get("landingPage"), download_url):
         parsed = urlsplit(str(value or ""))
         parts = [part for part in parsed.path.split("/") if part]
@@ -11932,12 +10932,8 @@ def _socrata_market_type(title: str) -> str | None:
     return None
 
 
-def _socrata_benefit_metadata(
-    title: str, description: str, download_url: str
-) -> dict[str, Any]:
-    lines = _infer_benefit_lines_from_text(title, description, download_url) or (
-        "medical",
-    )
+def _socrata_benefit_metadata(title: str, description: str, download_url: str) -> dict[str, Any]:
+    lines = _infer_benefit_lines_from_text(title, description, download_url) or ("medical",)
     metadata: dict[str, Any] = {"benefit_lines": list(lines)}
     if len(lines) in {1}:
         metadata["benefit_line"] = lines[0]
@@ -11967,19 +10963,13 @@ def _is_socrata_dataset_match(dataset: dict[str, Any], resolver: dict[str, Any])
         return False
     if not _is_regex_config_match(title, resolver.get("title_regex")):
         return False
-    if not _is_regex_config_match(
-        _socrata_dataset_contact_text(dataset), resolver.get("contact_regex")
-    ):
+    if not _is_regex_config_match(_socrata_dataset_contact_text(dataset), resolver.get("contact_regex")):
         return False
     keyword_filters = [
-        str(item or "").strip().lower()
-        for item in (resolver.get("keyword_any") or [])
-        if str(item or "").strip()
+        str(item or "").strip().lower() for item in (resolver.get("keyword_any") or []) if str(item or "").strip()
     ]
     if keyword_filters:
-        keyword_text = " ".join(
-            str(item or "").lower() for item in (dataset.get("keyword") or [])
-        )
+        keyword_text = " ".join(str(item or "").lower() for item in (dataset.get("keyword") or []))
         if not any(keyword in keyword_text for keyword in keyword_filters):
             return False
     download_url, _media_type = _socrata_dataset_download(dataset)
@@ -12021,11 +11011,7 @@ def _socrata_target_from_dataset(
         "socrata_media_type": media_type,
         "socrata_issued": dataset.get("issued"),
         "socrata_modified": dataset.get("modified"),
-        "socrata_coverage_month": (
-            f"{coverage_month[0]:04d}-{coverage_month[1]:02d}"
-            if coverage_month
-            else None
-        ),
+        "socrata_coverage_month": (f"{coverage_month[0]:04d}-{coverage_month[1]:02d}" if coverage_month else None),
         "reporting_entity_name": source_row_dict.get("display_name"),
         "reporting_entity_type": "health_insurance_issuer",
         "plan_info": plan_info,
@@ -12063,8 +11049,7 @@ async def _resolve_socrata_data_json_mrf_catalog(
         coverage_months = [
             month
             for month in (
-                _socrata_coverage_month(_clean_text(dataset_entry.get("title")))
-                for dataset_entry in datasets
+                _socrata_coverage_month(_clean_text(dataset_entry.get("title"))) for dataset_entry in datasets
             )
             if month
         ]
@@ -12073,8 +11058,7 @@ async def _resolve_socrata_data_json_mrf_catalog(
             datasets = [
                 dataset_entry
                 for dataset_entry in datasets
-                if _socrata_coverage_month(_clean_text(dataset_entry.get("title")))
-                == latest_month
+                if _socrata_coverage_month(_clean_text(dataset_entry.get("title"))) == latest_month
             ]
     crawl_targets: list[CrawlTarget] = []
     for dataset in sorted(datasets, key=lambda dataset_entry: _clean_text(dataset_entry.get("title"))):
@@ -12094,9 +11078,7 @@ async def _resolve_socrata_data_json_mrf_catalog(
     return crawl_targets
 
 
-def _cigna_lookup_urls_from_html(
-    html_text: str, *, base_url: str, resolver: dict[str, Any]
-) -> list[str]:
+def _cigna_lookup_urls_from_html(html_text: str, *, base_url: str, resolver: dict[str, Any]) -> list[str]:
     urls: list[str] = []
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         attr = str(candidate.get("attr") or "").lower()
@@ -12121,15 +11103,11 @@ def _first_dict_value(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
 
 
 def _cigna_file_url(item: dict[str, Any]) -> str | None:
-    value = _first_dict_value(
-        item, ("url", "download_url", "downloadUrl", "location", "file_url", "fileUrl")
-    )
+    value = _first_dict_value(item, ("url", "download_url", "downloadUrl", "location", "file_url", "fileUrl"))
     return str(value).strip() if value else None
 
 
-def _cigna_group_value(
-    file_item: dict[str, Any], group: dict[str, Any], keys: tuple[str, ...]
-) -> Any:
+def _cigna_group_value(file_item: dict[str, Any], group: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return _first_dict_value(file_item, keys) or _first_dict_value(group, keys)
 
 
@@ -12168,15 +11146,9 @@ def _cigna_lookup_metadata(
             group,
             ("reporting_entity_type", "reportingEntityType", "entity_type", "entityType"),
         ),
-        "last_updated_on": _cigna_group_value(
-            file_item, group, ("last_updated_on", "lastUpdatedOn")
-        ),
-        "reporting_month": _cigna_group_value(
-            file_item, group, ("reporting_month", "reportingMonth")
-        ),
-        "product_type": _cigna_group_value(
-            file_item, group, ("product_type", "productType")
-        ),
+        "last_updated_on": _cigna_group_value(file_item, group, ("last_updated_on", "lastUpdatedOn")),
+        "reporting_month": _cigna_group_value(file_item, group, ("reporting_month", "reportingMonth")),
+        "product_type": _cigna_group_value(file_item, group, ("product_type", "productType")),
     }
 
 
@@ -12196,10 +11168,7 @@ def _cigna_lookup_target(
         _cigna_group_value(file_item, group, ("file_name", "fileName", "name", "label"))
         or Path(urlsplit(file_url).path).name
     )
-    if not (
-        _is_direct_toc_url(file_url)
-        or _mrf_file_type_from_text(file_url, file_name) == "table-of-contents"
-    ):
+    if not (_is_direct_toc_url(file_url) or _mrf_file_type_from_text(file_url, file_name) == "table-of-contents"):
         return None
     metadata = _cigna_lookup_metadata(
         file_item,
@@ -12214,11 +11183,7 @@ def _cigna_lookup_target(
         url=file_url,
         label=file_name or str(source_row_dict.get("display_name") or "Cigna MRF index"),
         resolved_from_url=lookup_url,
-        metadata={
-            key: metadata_value
-            for key, metadata_value in metadata.items()
-            if metadata_value not in (None, "")
-        },
+        metadata={key: metadata_value for key, metadata_value in metadata.items() if metadata_value not in (None, "")},
     )
 
 
@@ -12230,20 +11195,10 @@ def _parse_cigna_lookup_targets(
     resolver: dict[str, Any],
 ) -> list[CrawlTarget]:
     """Convert a Cigna lookup payload into crawl targets."""
-    toc_max_bytes = (
-        _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
-    )
-    groups = (
-        lookup_payload.get("mrfs")
-        if isinstance(lookup_payload.get("mrfs"), list)
-        else None
-    )
+    toc_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
+    groups = lookup_payload.get("mrfs") if isinstance(lookup_payload.get("mrfs"), list) else None
     if groups is None:
-        groups = (
-            lookup_payload.get("mrf")
-            if isinstance(lookup_payload.get("mrf"), list)
-            else None
-        )
+        groups = lookup_payload.get("mrf") if isinstance(lookup_payload.get("mrf"), list) else None
     if groups is None:
         groups = [lookup_payload]
     targets_by_url: dict[str, CrawlTarget] = {}
@@ -12276,19 +11231,14 @@ def _parse_bcbs_asomrf_filelist_targets(
 ) -> list[CrawlTarget]:
     if not isinstance(filelist_payload, list):
         raise ValueError("expected BCBS ASO filelist JSON array")
-    toc_max_bytes = (
-        _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
-    )
+    toc_max_bytes = _parse_size_bytes(resolver.get("toc_max_bytes")) or 100 * 1024 * 1024
     targets_by_url: dict[str, CrawlTarget] = {}
     for file_entry in filelist_payload:
         if not isinstance(file_entry, dict):
             continue
         file_url = str(file_entry.get("url") or "").strip()
         file_name = _clean_text(file_entry.get("name")) or Path(urlsplit(file_url).path).name
-        if (
-            not file_url
-            or _mrf_file_type_from_text(file_url, file_name) != "table-of-contents"
-        ):
+        if not file_url or _mrf_file_type_from_text(file_url, file_name) != "table-of-contents":
             continue
         metadata = {
             "resolver": "bcbs_asomrf_filelist",
@@ -12305,17 +11255,14 @@ def _parse_bcbs_asomrf_filelist_targets(
         targets_by_url[key] = CrawlTarget(
             source=source_row_dict,
             url=file_url,
-            label=file_name
-            or str(source_row_dict.get("display_name") or "BCBS ASO MRF index"),
+            label=file_name or str(source_row_dict.get("display_name") or "BCBS ASO MRF index"),
             resolved_from_url=filelist_url,
             metadata={
                 key: metadata_value for key, metadata_value in metadata.items() if metadata_value not in (None, "")
             },
         )
     crawl_targets = list(targets_by_url.values())
-    return _limit_crawl_targets_round_robin(
-        crawl_targets, "state", _as_int(resolver.get("max_targets"))
-    )
+    return _limit_crawl_targets_round_robin(crawl_targets, "state", _as_int(resolver.get("max_targets")))
 
 
 def _limit_crawl_targets_round_robin(
@@ -12341,9 +11288,7 @@ def _limit_crawl_targets_round_robin(
     return limited_targets
 
 
-def _bcbs_global_toc_links_from_html(
-    html_text: str, *, base_url: str
-) -> list[dict[str, str]]:
+def _bcbs_global_toc_links_from_html(html_text: str, *, base_url: str) -> list[dict[str, str]]:
     links_by_url: dict[str, dict[str, str]] = {}
     for candidate in _html_link_candidates(html_text, base_url=base_url):
         url = str(candidate.get("url") or "").strip()
@@ -12362,9 +11307,7 @@ def _bcbs_global_toc_links_from_html(
 _bcbs_global_solutions_toc_links_from_html = _bcbs_global_toc_links_from_html
 
 
-def _bcbs_global_landing_links_from_html(
-    html_text: str, *, base_url: str
-) -> list[str]:
+def _bcbs_global_landing_links_from_html(html_text: str, *, base_url: str) -> list[str]:
     urls: list[str] = []
     seen_urls: set[str] = set()
     for candidate in _html_link_candidates(html_text, base_url=base_url):
@@ -12382,9 +11325,7 @@ def _bcbs_global_landing_links_from_html(
     return urls
 
 
-_bcbs_global_solutions_landing_links_from_html = (
-    _bcbs_global_landing_links_from_html
-)
+_bcbs_global_solutions_landing_links_from_html = _bcbs_global_landing_links_from_html
 
 
 def _is_bcbs_toc_in_network(payload: Any) -> bool:
@@ -12394,9 +11335,7 @@ def _is_bcbs_toc_in_network(payload: Any) -> bool:
     if not isinstance(reporting_structure, list):
         return False
     return any(
-        isinstance(item, dict)
-        and isinstance(item.get("in_network_files"), list)
-        and bool(item.get("in_network_files"))
+        isinstance(item, dict) and isinstance(item.get("in_network_files"), list) and bool(item.get("in_network_files"))
         for item in reporting_structure
     )
 
@@ -12438,16 +11377,12 @@ async def _bcbs_global_solutions_toc_links(
             max_bytes=max_bytes,
             session=session,
         )
-        for link in _bcbs_global_solutions_toc_links_from_html(
-            html_text, base_url=page_url
-        ):
+        for link in _bcbs_global_solutions_toc_links_from_html(html_text, base_url=page_url):
             link_url = str(link.get("url") or "")
             link_key = _canonical_or_none(link_url) or link_url
             if link_key:
                 toc_links_by_url[link_key] = link
-        for landing_url in _bcbs_global_solutions_landing_links_from_html(
-            html_text, base_url=page_url
-        ):
+        for landing_url in _bcbs_global_solutions_landing_links_from_html(html_text, base_url=page_url):
             landing_key = _canonical_or_none(landing_url) or landing_url
             if landing_key not in seen_pages and landing_url not in page_urls:
                 page_urls.append(landing_url)
@@ -12473,6 +11408,8 @@ async def _bcbs_global_solutions_toc_target(
             max_bytes=toc_max_bytes,
             session=session,
         )
+    except IncompleteToc:
+        raise
     except Exception:
         return None
     if not _is_bcbs_toc_in_network(toc_payload):
@@ -12604,9 +11541,7 @@ def _bcbsma_monthly_toc_targets(
     if not base_url:
         raise ValueError("BCBSMA resolver requires base_url or source URL")
     suffixes = [
-        str(suffix_value).strip()
-        for suffix_value in (resolver.get("toc_suffixes") or ())
-        if str(suffix_value).strip()
+        str(suffix_value).strip() for suffix_value in (resolver.get("toc_suffixes") or ()) if str(suffix_value).strip()
     ]
     if not suffixes:
         raise ValueError("BCBSMA resolver requires toc_suffixes")
@@ -12642,9 +11577,7 @@ def _bcbsma_monthly_toc_targets(
                         "target_file_type": "table-of-contents",
                         "month_start": month_start,
                         "file_name": file_name,
-                        "issuer_slug": suffix.removeprefix("-01_").removesuffix(
-                            "_index.json"
-                        ),
+                        "issuer_slug": suffix.removeprefix("-01_").removesuffix("_index.json"),
                     },
                 )
             )
@@ -12764,9 +11697,7 @@ def _kaiser_inventory_target_metadata(
 ) -> dict[str, Any]:
     metadata_by_name = {
         "resolver": context.resolver_type,
-        "target_kind": (
-            "toc_json" if file_type == "table-of-contents" else "file_reference"
-        ),
+        "target_kind": ("toc_json" if file_type == "table-of-contents" else "file_reference"),
         "target_file_type": file_type,
         "container_format": _container_format(target_url),
         "file_name": file_name,
@@ -12778,9 +11709,7 @@ def _kaiser_inventory_target_metadata(
         "kaiser_state_file": path_parts[0].lower() == "state",
         "kaiser_external_data": path_parts[0].lower() == "externaldata",
         "plan_info": _plan_info_from_label(file_name),
-        "target_max_bytes": (
-            context.toc_max_bytes if file_type == "table-of-contents" else None
-        ),
+        "target_max_bytes": (context.toc_max_bytes if file_type == "table-of-contents" else None),
     }
     return {
         metadata_key: metadata_value
@@ -12804,9 +11733,7 @@ def _kaiser_inventory_target_from_line(
     if is_external_data and not context.include_external_data:
         return None
     region_code = (
-        path_parts[1].lower()
-        if path_parts[0].lower() == "state" and len(path_parts) > 2
-        else path_parts[0].lower()
+        path_parts[1].lower() if path_parts[0].lower() == "state" and len(path_parts) > 2 else path_parts[0].lower()
     )
     if context.configured_regions and region_code not in context.configured_regions:
         return None
@@ -12857,9 +11784,7 @@ def _kaiser_inventory_targets_from_text(
         inventory_month=inventory_month,
         category=category,
         resolver_type=str(resolver.get("type") or "kaiser_monthly_inventory"),
-        toc_max_bytes=(
-            _parse_size_bytes(resolver.get("toc_max_bytes")) or 5 * 1024 * 1024
-        ),
+        toc_max_bytes=(_parse_size_bytes(resolver.get("toc_max_bytes")) or 5 * 1024 * 1024),
         include_external_data=resolver.get("include_external_data") is True,
         configured_regions=frozenset(
             str(region_value or "").strip().lower()
@@ -12870,14 +11795,11 @@ def _kaiser_inventory_targets_from_text(
     return [
         crawl_target
         for raw_line in (inventory_text or "").splitlines()
-        if (crawl_target := _kaiser_inventory_target_from_line(context, raw_line))
-        is not None
+        if (crawl_target := _kaiser_inventory_target_from_line(context, raw_line)) is not None
     ]
 
 
-def _kaiser_inventory_months(
-    resolver: dict[str, Any], *, now: dt.datetime | None = None
-) -> list[str]:
+def _kaiser_inventory_months(resolver: dict[str, Any], *, now: dt.datetime | None = None) -> list[str]:
     month_offsets = resolver.get("month_offsets")
     if not isinstance(month_offsets, list) or not month_offsets:
         month_offsets = [0, -1]
@@ -12900,19 +11822,12 @@ async def _resolve_kaiser_monthly_inventory(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     """Resolve Kaiser's current regional in-network and allowed inventories."""
-    base_url = str(
-        resolver.get("base_url")
-        or "https://healthy.kaiserpermanente.org/pricing/"
-    ).rstrip("/")
-    inventory_max_bytes = int(
-        resolver.get("inventory_max_bytes") or 2 * 1024 * 1024
-    )
+    base_url = str(resolver.get("base_url") or "https://healthy.kaiserpermanente.org/pricing/").rstrip("/")
+    inventory_max_bytes = int(resolver.get("inventory_max_bytes") or 2 * 1024 * 1024)
     crawl_targets: list[CrawlTarget] = []
     for category in ("innetwork", "outofnetwork"):
         for inventory_month in _kaiser_inventory_months(resolver):
-            inventory_url = (
-                f"{base_url}/{category}/{inventory_month}_List.txt"
-            )
+            inventory_url = f"{base_url}/{category}/{inventory_month}_List.txt"
             inventory_text = await _fetch_text(
                 inventory_url,
                 max_bytes=inventory_max_bytes,
@@ -12931,9 +11846,7 @@ async def _resolve_kaiser_monthly_inventory(
                 break
     crawl_targets = _dedupe_crawl_targets_by_url(crawl_targets)
     max_targets = _as_int(resolver.get("max_targets"))
-    crawl_targets = _limit_crawl_targets_round_robin(
-        crawl_targets, "kaiser_region_code", max_targets
-    )
+    crawl_targets = _limit_crawl_targets_round_robin(crawl_targets, "kaiser_region_code", max_targets)
     if not crawl_targets:
         raise ValueError(f"no Kaiser MRF inventory targets found for {url}")
     return crawl_targets
@@ -12990,9 +11903,7 @@ def _azure_mrf_listing_targets_from_xml(
                     "content_type": blob.findtext("Properties/Content-Type"),
                     "etag": blob.findtext("Properties/Etag"),
                     "last_modified": blob.findtext("Properties/Last-Modified"),
-                    "target_max_bytes": (
-                        target_max_bytes if target_kind == "toc_json" else None
-                    ),
+                    "target_max_bytes": (target_max_bytes if target_kind == "toc_json" else None),
                 },
             )
         )
@@ -13068,12 +11979,12 @@ def _triples_mtt_latest_year_month(payload: Any) -> tuple[str | None, str | None
         for item in selects.get("year") or ():
             try:
                 years.append(int(str(item.get("year") or "").strip()))
-            except (AttributeError, TypeError, ValueError):
+            except AttributeError, TypeError, ValueError:
                 continue
         for item in selects.get("month") or ():
             try:
                 months.append(int(str(item.get("month") or "").strip()))
-            except (AttributeError, TypeError, ValueError):
+            except AttributeError, TypeError, ValueError:
                 continue
     for item in payload.get("list") or ():
         if not isinstance(item, dict):
@@ -13081,7 +11992,7 @@ def _triples_mtt_latest_year_month(payload: Any) -> tuple[str | None, str | None
         try:
             years.append(int(str(item.get("year") or "").strip()))
             months.append(int(str(item.get("month") or "").strip()))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     if not years or not months:
         return None, None
@@ -13109,8 +12020,7 @@ def _latest_triples_file_entries(
     return [
         file_entry
         for file_entry in file_entries
-        if (str(file_entry.get("year") or ""), str(file_entry.get("month") or ""))
-        == latest
+        if (str(file_entry.get("year") or ""), str(file_entry.get("month") or "")) == latest
     ]
 
 
@@ -13123,9 +12033,7 @@ def _triples_mtt_crawl_target(
 ) -> CrawlTarget | None:
     """Build one typed Triples MTT crawl target."""
     file_url = _clean_text(file_entry.get("url"))
-    label = _clean_text(file_entry.get("marketing")) or Path(
-        urlsplit(file_url).path
-    ).name
+    label = _clean_text(file_entry.get("marketing")) or Path(urlsplit(file_url).path).name
     file_type = _mrf_file_type_from_text(file_url, label)
     if not file_url or not file_type:
         return None
@@ -13144,11 +12052,7 @@ def _triples_mtt_crawl_target(
         resolved_from_url=resolved_from_url,
         metadata={
             "resolver": resolver_type,
-            "target_kind": (
-                "toc_json"
-                if file_type == "table-of-contents"
-                else "file_reference"
-            ),
+            "target_kind": ("toc_json" if file_type == "table-of-contents" else "file_reference"),
             "target_file_type": file_type,
             "container_format": _container_format(file_url),
             "triples_id": file_entry.get("id"),
@@ -13180,11 +12084,7 @@ def _triples_mtt_targets_from_payload(
     if not isinstance(payload_by_field, dict):
         return []
     resolver_type = str(resolver.get("type") or "triples_mtt_api")
-    file_entries = [
-        file_entry
-        for file_entry in payload_by_field.get("list") or ()
-        if isinstance(file_entry, dict)
-    ]
+    file_entries = [file_entry for file_entry in payload_by_field.get("list") or () if isinstance(file_entry, dict)]
     file_entries = _latest_triples_file_entries(
         file_entries,
         latest_month_only=resolver.get("latest_month_only", True),
@@ -13307,10 +12207,7 @@ def _healthspace_mrf_target_from_element(
 ) -> CrawlTarget | None:
     """Build one crawl target from a HealthSpace SOAP file element."""
     url = _clean_text(file_element.attrib.get("FilePathURL"))
-    file_name = (
-        _clean_text(file_element.attrib.get("FileName"))
-        or Path(urlsplit(url).path).name
-    )
+    file_name = _clean_text(file_element.attrib.get("FileName")) or Path(urlsplit(url).path).name
     if not url:
         return None
     file_type = _mrf_file_type_from_text(url, file_name)
@@ -13320,8 +12217,7 @@ def _healthspace_mrf_target_from_element(
         return None
     target_kind = (
         "toc_json"
-        if file_type == "table-of-contents"
-        and urlsplit(url).path.lower().endswith((".json", ".json.gz"))
+        if file_type == "table-of-contents" and urlsplit(url).path.lower().endswith((".json", ".json.gz"))
         else "file_reference"
     )
     company_id = _clean_text(file_element.attrib.get("CompanyId"))
@@ -13401,12 +12297,8 @@ async def _resolve_healthspace_machine_readable_files(
     session_id = _healthspace_session_id_from_html(page_html)
     if not session_id:
         raise ValueError("Healthspace public page did not expose a session id")
-    service_url = urljoin(
-        url, str(resolver.get("service_path") or "/Healthspace/Healthspace.svc")
-    )
-    operation_id = str(
-        resolver.get("operation_id") or "P2PHC.Document.GetMachineReadableFiles"
-    )
+    service_url = urljoin(url, str(resolver.get("service_path") or "/Healthspace/Healthspace.svc"))
+    operation_id = str(resolver.get("operation_id") or "P2PHC.Document.GetMachineReadableFiles")
     soap_text = await _post_text(
         service_url,
         _healthspace_execute_soap_envelope(
@@ -13438,9 +12330,7 @@ async def _resolve_healthspace_machine_readable_files(
 
 def _healthez_outbound_file_type(url: str | None, label: str | None = None) -> str | None:
     parsed = urlsplit(str(url or ""))
-    query_params_by_name = {
-        key.lower(): value for key, value in parse_qsl(parsed.query)
-    }
+    query_params_by_name = {key.lower(): value for key, value in parse_qsl(parsed.query)}
     file_type = str(query_params_by_name.get("filetype") or "").strip().lower()
     if file_type == "innetwork":
         return "in-network"
@@ -13451,9 +12341,7 @@ def _healthez_outbound_file_type(url: str | None, label: str | None = None) -> s
 
 def _healthez_normalized_outbound_url(url: str | None) -> str | None:
     parsed = urlsplit(str(url or ""))
-    if not parsed.scheme or not parsed.netloc or not parsed.path.endswith(
-        "/api/outbound/latest"
-    ):
+    if not parsed.scheme or not parsed.netloc or not parsed.path.endswith("/api/outbound/latest"):
         return None
     pairs = parse_qsl(parsed.query, keep_blank_values=True)
     normalized_pairs: list[tuple[str, str]] = []
@@ -13473,9 +12361,7 @@ def _healthez_normalized_outbound_url(url: str | None) -> str | None:
 
 
 def _healthez_plan_label(url: str, label: str | None) -> str:
-    query_params_by_name = {
-        key.lower(): value for key, value in parse_qsl(urlsplit(url).query)
-    }
+    query_params_by_name = {key.lower(): value for key, value in parse_qsl(urlsplit(url).query)}
     network = str(query_params_by_name.get("network") or "").strip().upper()
     if network in {"AP", "AE"}:
         return f"HealthEZ {network}"
@@ -13536,9 +12422,7 @@ async def _resolve_healthez_benefits_mrf(
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
         session=session,
     )
-    targets = _healthez_targets_from_html(
-        source, html_text, base_url=url, resolver_type=resolver_type
-    )
+    targets = _healthez_targets_from_html(source, html_text, base_url=url, resolver_type=resolver_type)
     targets = _dedupe_crawl_targets_by_url(targets)
     max_targets = _as_int(resolver.get("max_targets"))
     if max_targets and max_targets > 0:
@@ -13689,17 +12573,13 @@ async def _resolve_cigna_static_mrf_lookup(
         max_bytes=int(resolver.get("max_bytes") or 5 * 1024 * 1024),
         session=session,
     )
-    lookup_urls = _cigna_lookup_urls_from_html(
-        html_text, base_url=url, resolver=resolver
-    )
+    lookup_urls = _cigna_lookup_urls_from_html(html_text, base_url=url, resolver=resolver)
     if not lookup_urls:
         raise ValueError(f"no Cigna MRF lookup URLs found in {url}")
     lookup_max_bytes = int(resolver.get("lookup_max_bytes") or 2 * 1024 * 1024)
     crawl_targets: list[CrawlTarget] = []
     for lookup_url in lookup_urls:
-        lookup_payload = await _fetch_json(
-            lookup_url, max_bytes=lookup_max_bytes, session=session
-        )
+        lookup_payload = await _fetch_json(lookup_url, max_bytes=lookup_max_bytes, session=session)
         crawl_targets.extend(
             _parse_cigna_lookup_targets(
                 lookup_payload,
@@ -13747,9 +12627,7 @@ def _healthsparq_public_params(url: str) -> dict[str, str]:
             }
         )
     if "insurerCode" not in params_by_key or "brandCode" not in params_by_key:
-        raise ValueError(
-            "HealthSparq public URL must include insurerCode and brandCode"
-        )
+        raise ValueError("HealthSparq public URL must include insurerCode and brandCode")
     return params_by_key
 
 
@@ -13760,29 +12638,17 @@ def _url_origin(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _healthsparq_service_url(
-    source_url: str, resolver: dict[str, Any], path_key: str
-) -> str:
-    service_path = str(
-        resolver.get("public_service_path") or "/healthsparq/public/service"
-    ).strip()
+def _healthsparq_service_url(source_url: str, resolver: dict[str, Any], path_key: str) -> str:
+    service_path = str(resolver.get("public_service_path") or "/healthsparq/public/service").strip()
     path = str(resolver.get(path_key) or "").strip()
     if not path:
         raise ValueError(f"HealthSparq resolver missing {path_key}")
-    return urljoin(
-        _url_origin(source_url) + "/", f"{service_path.strip('/')}/{path.lstrip('/')}"
-    )
+    return urljoin(_url_origin(source_url) + "/", f"{service_path.strip('/')}/{path.lstrip('/')}")
 
 
-def _healthsparq_tenant(
-    params: dict[str, str], resolver: dict[str, Any] | None = None
-) -> str:
+def _healthsparq_tenant(params: dict[str, str], resolver: dict[str, Any] | None = None) -> str:
     resolver = resolver or {}
-    overrides = (
-        resolver.get("tenant_overrides")
-        if isinstance(resolver.get("tenant_overrides"), dict)
-        else {}
-    )
+    overrides = resolver.get("tenant_overrides") if isinstance(resolver.get("tenant_overrides"), dict) else {}
     insurer_code = str(params.get("insurerCode") or "").strip()
     for key in (insurer_code, insurer_code.upper(), insurer_code.lower()):
         override = str(overrides.get(key) or "").strip()
@@ -13793,9 +12659,7 @@ def _healthsparq_tenant(
     return re.sub(r"[^a-z0-9]+", "-", tenant).strip("-")
 
 
-def _healthsparq_direct_metadata_url(
-    resolver: dict[str, Any], params: dict[str, str]
-) -> str | None:
+def _healthsparq_direct_metadata_url(resolver: dict[str, Any], params: dict[str, str]) -> str | None:
     if params.get("reportingEntityType"):
         return None
     template = str(resolver.get("metadata_url_template") or "").strip()
@@ -13804,9 +12668,7 @@ def _healthsparq_direct_metadata_url(
     tenant = _healthsparq_tenant(params, resolver)
     if not tenant:
         return None
-    return template.format(
-        tenant=tenant, insurerCode=params["insurerCode"], brandCode=params["brandCode"]
-    )
+    return template.format(tenant=tenant, insurerCode=params["insurerCode"], brandCode=params["brandCode"])
 
 
 def _healthsparq_metadata_params_from_url(url: str) -> dict[str, str]:
@@ -13820,16 +12682,10 @@ def _healthsparq_metadata_params_from_url(url: str) -> dict[str, str]:
         if insurer_code and brand_code:
             params_by_key = {"insurerCode": insurer_code, "brandCode": brand_code}
             params_by_key.update(
-                {
-                    key: value
-                    for key, value in parse_qsl(parsed.query, keep_blank_values=False)
-                    if key and value
-                }
+                {key: value for key, value in parse_qsl(parsed.query, keep_blank_values=False) if key and value}
             )
             return params_by_key
-    raise ValueError(
-        "HealthSparq metadata URL must include /prd/mrf/{insurerCode}/{brandCode}/"
-    )
+    raise ValueError("HealthSparq metadata URL must include /prd/mrf/{insurerCode}/{brandCode}/")
 
 
 def _healthsparq_target(
@@ -13860,9 +12716,7 @@ def _healthsparq_target(
     )
 
 
-def _healthsparq_query_plan_label(
-    plan_name: Any, target_query: str | None
-) -> tuple[str | None, str | None]:
+def _healthsparq_query_plan_label(plan_name: Any, target_query: str | None) -> tuple[str | None, str | None]:
     raw_name = _clean_text(plan_name)
     query = _clean_text(target_query)
     if not raw_name:
@@ -13899,8 +12753,7 @@ def _query_expanded_plan_info(
             continue
         normalized_plan_dict = dict(raw_plan)
         plan_name, sponsor_name = _healthsparq_query_plan_label(
-            normalized_plan_dict.get("plan_name")
-            or normalized_plan_dict.get("planName"),
+            normalized_plan_dict.get("plan_name") or normalized_plan_dict.get("planName"),
             matching_query or query,
         )
         if plan_name:
@@ -13919,13 +12772,7 @@ def _plan_info_query_values(
 ) -> tuple[str, ...]:
     """Coerce one or many plan search values into a stable query tuple."""
     raw_queries = [query] if isinstance(query, str) or query is None else query
-    return tuple(
-        dict.fromkeys(
-            _clean_text(query_value)
-            for query_value in raw_queries
-            if _clean_text(query_value)
-        )
-    )
+    return tuple(dict.fromkeys(_clean_text(query_value) for query_value in raw_queries if _clean_text(query_value)))
 
 
 def _plan_info_search_values(plan: dict[str, Any]) -> tuple[Any, ...]:
@@ -13947,9 +12794,7 @@ def _plan_info_search_values(plan: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _matching_plan_info_query(
-    plan: dict[str, Any], query: str | Iterable[str] | None
-) -> str | None:
+def _matching_plan_info_query(plan: dict[str, Any], query: str | Iterable[str] | None) -> str | None:
     """Return the first employer identity that matches one reporting plan."""
     search_values = _plan_info_search_values(plan)
     return next(
@@ -13962,17 +12807,13 @@ def _matching_plan_info_query(
     )
 
 
-def _is_plan_info_query_match(
-    plan: dict[str, Any], query: str | Iterable[str] | None
-) -> bool:
+def _is_plan_info_query_match(plan: dict[str, Any], query: str | Iterable[str] | None) -> bool:
     """Return whether a plan matches any requested employer identity."""
     query_values = _plan_info_query_values(query)
     return not query_values or bool(_matching_plan_info_query(plan, query_values))
 
 
-def _healthsparq_plan_info(
-    file_item: dict[str, Any], *, target_query: str | None = None
-) -> list[dict[str, Any]]:
+def _healthsparq_plan_info(file_item: dict[str, Any], *, target_query: str | None = None) -> list[dict[str, Any]]:
     reporting_plans = _healthsparq_reporting_plans(file_item)
     plan_info_records: list[dict[str, Any]] = []
     for plan in reporting_plans:
@@ -13983,9 +12824,7 @@ def _healthsparq_plan_info(
         plan_info_by_field = {
             "plan_id": _healthsparq_plan_value(plan, "planId", "plan_id"),
             "plan_id_type": _healthsparq_plan_value(plan, "planIdType", "plan_id_type"),
-            "plan_market_type": _healthsparq_plan_value(
-                plan, "planMarketType", "plan_market_type", "marketType"
-            ),
+            "plan_market_type": _healthsparq_plan_value(plan, "planMarketType", "plan_market_type", "marketType"),
             "plan_name": plan_name,
             "engine_plan_hash": healthsparq_plan_engine_hash(file_item, plan),
         }
@@ -13996,9 +12835,7 @@ def _healthsparq_plan_info(
     return plan_info_records
 
 
-def _is_healthsparq_file_query_match(
-    file_item: dict[str, Any], query: str | None
-) -> bool:
+def _is_healthsparq_file_query_match(file_item: dict[str, Any], query: str | None) -> bool:
     if not query:
         return True
     return _is_search_value_query_match(
@@ -14014,9 +12851,7 @@ def _is_healthsparq_file_query_match(
                     _healthsparq_plan_value(plan, "planName", "plan_name", "name"),
                     _healthsparq_plan_value(plan, "planId", "plan_id"),
                     _healthsparq_plan_value(plan, "planIdType", "plan_id_type"),
-                    _healthsparq_plan_value(
-                        plan, "planMarketType", "plan_market_type", "marketType"
-                    ),
+                    _healthsparq_plan_value(plan, "planMarketType", "plan_market_type", "marketType"),
                 )
             ),
         ],
@@ -14032,9 +12867,7 @@ def _healthsparq_targets_from_metadata(
     resolved_from_url: str,
     params: dict[str, str],
 ) -> list[CrawlTarget]:
-    files = _healthsparq_metadata_files(
-        metadata_payload if isinstance(metadata_payload, dict) else {}
-    )
+    files = _healthsparq_metadata_files(metadata_payload if isinstance(metadata_payload, dict) else {})
     target_query = _source_target_payer_query(source_row_dict)
     targets_by_key: dict[tuple[str, str], CrawlTarget] = {}
     for file_item in files:
@@ -14060,8 +12893,7 @@ def _healthsparq_targets_from_metadata(
             "container_format": _container_format(file_url),
             "insurer_code": params["insurerCode"],
             "brand_code": params["brandCode"],
-            "reporting_entity_type": _healthsparq_reporting_entity_type(file_item)
-            or params.get("reportingEntityType"),
+            "reporting_entity_type": _healthsparq_reporting_entity_type(file_item) or params.get("reportingEntityType"),
             "reporting_entity_name": _healthsparq_reporting_entity_name(file_item),
             "search_term": params.get("searchTerm"),
             "source_format": "healthsparq_metadata",
@@ -14070,9 +12902,7 @@ def _healthsparq_targets_from_metadata(
             "file_path": _healthsparq_file_path(file_item),
             "file_schema": _healthsparq_file_schema(file_item),
             "last_updated_on": _healthsparq_last_updated_on(file_item),
-            "plan_info": _healthsparq_plan_info(
-                file_item, target_query=target_query
-            ),
+            "plan_info": _healthsparq_plan_info(file_item, target_query=target_query),
         }
         key = (target_kind, _canonical_or_none(file_url) or file_url)
         targets_by_key[key] = CrawlTarget(
@@ -14098,6 +12928,8 @@ async def _resolve_healthsparq_direct_metadata(
             max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
             session=session,
         )
+    except IncompleteToc:
+        raise
     except Exception:
         return [_healthsparq_target(source, url, url, params)]
     targets = _healthsparq_targets_from_metadata(
@@ -14132,6 +12964,8 @@ async def _healthsparq_metadata_targets_or_fallback(
             max_bytes=int(resolver.get("max_bytes") or 50 * 1024 * 1024),
             session=session,
         )
+    except IncompleteToc:
+        raise
     except Exception:
         return [_healthsparq_target(source_row_dict, metadata_url, fallback_url, params)]
     crawl_targets = _healthsparq_targets_from_metadata(
@@ -14232,19 +13066,17 @@ async def _fetch_json_with_headers(
     session: aiohttp.ClientSession,
 ) -> dict[str, Any]:
     await _assert_fetch_url_allowed(url)
-    async with session.get(
-        url, headers=headers, allow_redirects=True, **_request_ssl_kwargs(url)
-    ) as resp:
+    async with session.get(url, headers=headers, allow_redirects=True, **_request_ssl_kwargs(url)) as resp:
         await _assert_fetch_url_allowed(str(resp.url))
         chunks: list[bytes] = []
         total = 0
         async for chunk in resp.content.iter_chunked(64 * 1024):
             total += len(chunk)
             if total > max_bytes:
-                raise ValueError(f"response exceeds {max_bytes} byte discovery limit")
+                raise IncompleteToc(f"response exceeds {max_bytes} byte discovery limit")
             chunks.append(chunk)
         payload = json.loads(
-            _decode_response_body(b"".join(chunks), charset=resp.charset or "utf-8")
+            _decode_response_body(b"".join(chunks), charset=resp.charset or "utf-8", max_bytes=max_bytes)
         )
     if not isinstance(payload, dict):
         raise ValueError("expected JSON object")
@@ -14423,9 +13255,7 @@ def _is_direct_toc_url(url: str | None) -> bool:
         return True
     if host in {"www.hmaa.com", "hmaa.com"} and path.endswith("/mrf_hmaa.zip"):
         return True
-    if path.endswith((".json", ".json.gz")) and (
-        _mrf_file_type_from_text(url) == "table-of-contents"
-    ):
+    if path.endswith((".json", ".json.gz")) and (_mrf_file_type_from_text(url) == "table-of-contents"):
         return True
     if "sapphiremrfhub.com" in host and "/tocs/" in path:
         return True
@@ -14434,11 +13264,7 @@ def _is_direct_toc_url(url: str | None) -> bool:
     if "/toc-json" in path:
         return True
     file_name = Path(path).name.replace("_", "-")
-    return (
-        "." not in file_name
-        and file_name.endswith(("-index", "-toc"))
-        and "/mrf/" in path
-    )
+    return "." not in file_name and file_name.endswith(("-index", "-toc")) and "/mrf/" in path
 
 
 async def _resolve_uhc_blob_listing(
@@ -14448,11 +13274,7 @@ async def _resolve_uhc_blob_listing(
     session: aiohttp.ClientSession,
 ) -> list[CrawlTarget]:
     host = _domain(url) or ""
-    configured_paths = (
-        resolver.get("optum_path_templates")
-        if "optum.com" in host
-        else resolver.get("path_templates")
-    )
+    configured_paths = resolver.get("optum_path_templates") if "optum.com" in host else resolver.get("path_templates")
     paths = [str(path) for path in configured_paths or () if str(path).strip()]
     target_query = _source_target_payer_query(source_row)
     max_targets = _as_int(resolver.get("max_targets"))
@@ -14464,20 +13286,14 @@ async def _resolve_uhc_blob_listing(
             max_bytes=int(resolver.get("max_bytes") or 64 * 1024 * 1024),
             session=session,
         )
-        parsed_targets = _uhc_blob_targets_matching_query(
-            _parse_uhc_blob_listing(listing), target_query
-        )
+        parsed_targets = _uhc_blob_targets_matching_query(_parse_uhc_blob_listing(listing), target_query)
         if max_targets and max_targets > 0:
             parsed_targets = parsed_targets[: max_targets - len(crawl_targets)]
         crawl_targets.extend(
             CrawlTarget(
                 source=source_row,
                 url=str(parsed_target["url"]),
-                label=str(
-                    parsed_target.get("label")
-                    or source_row.get("display_name")
-                    or ""
-                ),
+                label=str(parsed_target.get("label") or source_row.get("display_name") or ""),
                 resolved_from_url=listing_url,
                 metadata={
                     "resolver": "uhc_blob_listing",
@@ -14572,9 +13388,7 @@ async def _configured_crawl_targets(
             return [crawl_target]
         raise ValueError(f"no direct MRF TOC target found for {url}")
     if resolver_type == "direct_mrf_body":
-        crawl_target = _direct_mrf_body_crawl_target(
-            source_row, url, resolver=resolver_type
-        )
+        crawl_target = _direct_mrf_body_crawl_target(source_row, url, resolver=resolver_type)
         if crawl_target:
             return [crawl_target]
         raise ValueError(f"no direct MRF body target found for {url}")
@@ -14587,9 +13401,7 @@ async def _highmark_script_crawl_targets(
     session: aiohttp.ClientSession,
     resolver_by_key: dict[str, Any],
 ) -> list[CrawlTarget]:
-    script_url = urljoin(
-        url, str(resolver_by_key.get("script_path") or "/js/script.js")
-    )
+    script_url = urljoin(url, str(resolver_by_key.get("script_path") or "/js/script.js"))
     script_text = await _fetch_text(
         script_url,
         max_bytes=int(resolver_by_key.get("max_bytes") or 1024 * 1024),
@@ -14666,9 +13478,7 @@ async def _sapphire_html_crawl_targets(
     )
     parsed_targets = _parse_sapphire_toc_links(html_text, base_url=url)
     if not parsed_targets:
-        parsed_targets = await _resolve_sapphire_static_query_toc_links(
-            url, resolver_by_key, session
-        )
+        parsed_targets = await _resolve_sapphire_static_query_toc_links(url, resolver_by_key, session)
     if not parsed_targets:
         raise ValueError(f"no Sapphire TOC links found for {url}")
     return [
@@ -14755,9 +13565,7 @@ async def _fallback_crawl_targets(
     ]
     if html_targets:
         return html_targets
-    return await _delegated_crawl_targets(
-        source_row, url, html_text, session, target_limit
-    )
+    return await _delegated_crawl_targets(source_row, url, html_text, session, target_limit)
 
 
 async def _crawl_targets_for_source(
@@ -14774,34 +13582,22 @@ async def _crawl_targets_for_source(
         resolver_by_key = dict(resolver_by_key)
         existing_max_targets = _as_int(resolver_by_key.get("max_targets"))
         resolver_by_key["max_targets"] = (
-            min(existing_max_targets, target_limit)
-            if existing_max_targets
-            else target_limit
+            min(existing_max_targets, target_limit) if existing_max_targets else target_limit
         )
-    configured_targets = await _configured_crawl_targets(
-        source_row, url, session, resolver_by_key
-    )
+    configured_targets = await _configured_crawl_targets(source_row, url, session, resolver_by_key)
     if configured_targets is not None:
         return configured_targets
     resolver_type = str(resolver_by_key.get("type") or "").strip()
     if resolver_type == "highmark_hmhs_script":
-        return await _highmark_script_crawl_targets(
-            source_row, url, session, resolver_by_key
-        )
+        return await _highmark_script_crawl_targets(source_row, url, session, resolver_by_key)
     if resolver_type == "uhc_provider_mrf_files":
-        return await _uhc_provider_crawl_targets(
-            source_row, url, session, resolver_by_key
-        )
+        return await _uhc_provider_crawl_targets(source_row, url, session, resolver_by_key)
     if resolver_type == "sapphire_html_tocs":
-        return await _sapphire_html_crawl_targets(
-            source_row, url, session, resolver_by_key
-        )
+        return await _sapphire_html_crawl_targets(source_row, url, session, resolver_by_key)
     return await _fallback_crawl_targets(source_row, url, session, target_limit)
 
 
-def _crawl_skipped_observation(
-    source: dict[str, Any], url: str, reason: str, run_id: str | None
-) -> dict[str, Any]:
+def _crawl_skipped_observation(source: dict[str, Any], url: str, reason: str, run_id: str | None) -> dict[str, Any]:
     checked_at = _utc_now()
     return {
         "observation_id": _id(
@@ -14824,9 +13620,7 @@ def _crawl_skipped_observation(
     }
 
 
-def _crawl_failed_observation(
-    source: dict[str, Any], url: str, exc: Exception, run_id: str | None
-) -> dict[str, Any]:
+def _crawl_failed_observation(source: dict[str, Any], url: str, exc: Exception, run_id: str | None) -> dict[str, Any]:
     checked_at = _utc_now()
     return {
         "observation_id": _id(
@@ -14849,9 +13643,7 @@ def _crawl_failed_observation(
     }
 
 
-def _crawl_ok_observation(
-    target: CrawlTarget, *, run_id: str | None, plans: int, files: int
-) -> dict[str, Any]:
+def _crawl_ok_observation(target: CrawlTarget, *, run_id: str | None, plans: int, files: int) -> dict[str, Any]:
     checked_at = _utc_now()
     return {
         "observation_id": _id(
@@ -14884,9 +13676,7 @@ def _source_target_payer_query(source: dict[str, Any]) -> str | None:
     metadata = dict((source or {}).get("metadata_json") or {})
     raw = metadata.get("raw")
     raw = raw if isinstance(raw, dict) else {}
-    return _clean_text(
-        metadata.get("target_payer_query") or raw.get("target_payer_query")
-    ) or None
+    return _clean_text(metadata.get("target_payer_query") or raw.get("target_payer_query")) or None
 
 
 def _source_payer_query_candidates(source_row: dict[str, Any]) -> tuple[str, ...]:
@@ -14895,16 +13685,10 @@ def _source_payer_query_candidates(source_row: dict[str, Any]) -> tuple[str, ...
     canonical_query = _source_target_payer_query(source_row)
     if canonical_query:
         query_values.append(canonical_query)
-    employer_name = _source_query_context_text(
-        source_row, "query_context_employer_name"
-    )
+    employer_name = _source_query_context_text(source_row, "query_context_employer_name")
     if employer_name:
         query_values.append(employer_name)
-    query_values.extend(
-        _source_private_context_values(
-            source_row, "query_context_employer_aliases"
-        )
-    )
+    query_values.extend(_source_private_context_values(source_row, "query_context_employer_aliases"))
     for identifier_key in (
         "query_context_employer_ein",
         "query_context_carrier_policy_number",
@@ -14913,18 +13697,14 @@ def _source_payer_query_candidates(source_row: dict[str, Any]) -> tuple[str, ...
         if not identifier:
             continue
         query_values.append(identifier)
-        identifier_digits = "".join(
-            character for character in identifier if character.isdigit()
-        )
+        identifier_digits = "".join(character for character in identifier if character.isdigit())
         if len(identifier_digits) >= 6 and identifier_digits != identifier:
             query_values.append(identifier_digits)
     queries_by_normalized_value: dict[str, str] = {}
     for query_value in query_values:
         normalized_query_value = _clean_text(query_value)
         if normalized_query_value:
-            queries_by_normalized_value.setdefault(
-                normalized_query_value.lower(), normalized_query_value
-            )
+            queries_by_normalized_value.setdefault(normalized_query_value.lower(), normalized_query_value)
     return tuple(queries_by_normalized_value.values())
 
 
@@ -14977,9 +13757,7 @@ def _with_query_expansion_match(
     )
 
 
-def _matched_query_expansion_target(
-    crawl_target: CrawlTarget, query: str | None
-) -> CrawlTarget | None:
+def _matched_query_expansion_target(crawl_target: CrawlTarget, query: str | None) -> CrawlTarget | None:
     if not query:
         return crawl_target
     metadata = dict(crawl_target.metadata or {})
@@ -15006,9 +13784,7 @@ def _supports_toc_plan_query_scan(target: CrawlTarget) -> bool:
     return resolver_type in TOC_LEVEL_QUERY_EXPANSION_RESOLVERS
 
 
-def _toc_level_query_expansion_target(
-    target: CrawlTarget, query: str | None
-) -> CrawlTarget:
+def _toc_level_query_expansion_target(target: CrawlTarget, query: str | None) -> CrawlTarget:
     return _with_query_expansion_match(
         target,
         query,
@@ -15060,15 +13836,13 @@ async def _query_probe_targets(
     if not query:
         return []
     try:
-        probe_targets = await _sapphire_query_probe_targets(
-            source_row, url_text, query, context.session
-        )
+        probe_targets = await _sapphire_query_probe_targets(source_row, url_text, query, context.session)
+    except IncompleteToc:
+        raise
     except Exception:
         return []
     return [
-        matched
-        for target in probe_targets
-        if (matched := _matched_query_expansion_target(target, query)) is not None
+        matched for target in probe_targets if (matched := _matched_query_expansion_target(target, query)) is not None
     ]
 
 
@@ -15091,9 +13865,7 @@ async def _resolve_one_crawl_source(
         )
         had_resolved_targets = bool(resolved_targets)
         if target_query:
-            resolved_targets.extend(
-                await _query_probe_targets(source_row, url_text, target_query, context)
-            )
+            resolved_targets.extend(await _query_probe_targets(source_row, url_text, target_query, context))
             resolved_targets = _filter_query_expansion_targets(
                 resolved_targets,
                 target_query,
@@ -15106,30 +13878,23 @@ async def _resolve_one_crawl_source(
             if target_query and had_resolved_targets
             else "no configured resolver and URL is not a direct JSON TOC"
         )
-        return idx, [], [
-            _crawl_skipped_observation(source_row, url_text, skip_reason, context.run_id)
-        ]
+        return idx, [], [_crawl_skipped_observation(source_row, url_text, skip_reason, context.run_id)]
 
     async with context.semaphore:
         try:
             if context.source_resolve_timeout > 0:
-                return await asyncio.wait_for(
-                    resolve_body(), timeout=context.source_resolve_timeout
-                )
+                return await asyncio.wait_for(resolve_body(), timeout=context.source_resolve_timeout)
             return await resolve_body()
         except TimeoutError as exc:
-            return idx, [], [
-                _crawl_failed_observation(source_row, url_text, exc, context.run_id)
-            ]
+            return idx, [], [_crawl_failed_observation(source_row, url_text, exc, context.run_id)]
+        except IncompleteToc as exc:
+            await _persist_incomplete_toc(source_row, url_text, exc, context.run_id)
+            raise
         except Exception as exc:
-            probe_targets = await _query_probe_targets(
-                source_row, url_text, target_query, context
-            )
+            probe_targets = await _query_probe_targets(source_row, url_text, target_query, context)
             if probe_targets:
                 return idx, probe_targets, []
-            return idx, [], [
-                _crawl_failed_observation(source_row, url_text, exc, context.run_id)
-            ]
+            return idx, [], [_crawl_failed_observation(source_row, url_text, exc, context.run_id)]
 
 
 async def _resolve_crawl_targets(
@@ -15150,13 +13915,8 @@ async def _resolve_crawl_targets(
     total = len(source_items)
     crawl_targets: list[CrawlTarget] = []
     observations: list[dict[str, Any]] = []
-    source_resolve_timeout = _float_env(
-        "HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60.0
-    )
-    pending_label_by_index = {
-        idx: _source_progress_label(source_row, url)
-        for idx, source_row, url in source_items
-    }
+    source_resolve_timeout = _float_env("HLTHPRT_MRF_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60.0)
+    pending_label_by_index = {idx: _source_progress_label(source_row, url) for idx, source_row, url in source_items}
     context = _CrawlTargetResolverContext(
         session=session,
         run_id=run_id,
@@ -15168,38 +13928,34 @@ async def _resolve_crawl_targets(
         asyncio.create_task(_resolve_one_crawl_source(idx, source_row, url, context))
         for idx, source_row, url in source_items
     ]
-    for done, task in enumerate(asyncio.as_completed(tasks), start=1):
-        idx, resolved_targets, resolved_observations = await task
-        pending_label_by_index.pop(idx, None)
-        crawl_targets.extend(resolved_targets)
-        observations.extend(resolved_observations)
-        if progress_run_id:
-            sample = list(pending_label_by_index.values())[:5]
-            remaining = len(pending_label_by_index) - len(sample)
-            pending_detail = f"waiting on: {', '.join(sample)}"
-            if remaining > 0:
-                pending_detail = f"{pending_detail} +{remaining}"
-            enqueue_live_progress(
-                run_id=progress_run_id,
-                importer="mrf-source-discovery",
-                status="running",
-                phase="resolving source pages",
-                unit="sources",
-                done=done,
-                total=total,
-                message=f"resolved {done}/{total} source pages",
-                detail=pending_detail if sample else None,
-            )
+    async with managed_resolver_results(tasks) as completed_tasks:
+        for done, task in enumerate(completed_tasks, start=1):
+            idx, resolved_targets, resolved_observations = await task
+            pending_label_by_index.pop(idx, None)
+            crawl_targets.extend(resolved_targets)
+            observations.extend(resolved_observations)
+            if progress_run_id:
+                sample = list(pending_label_by_index.values())[:5]
+                remaining = len(pending_label_by_index) - len(sample)
+                pending_detail = f"waiting on: {', '.join(sample)}"
+                if remaining > 0:
+                    pending_detail = f"{pending_detail} +{remaining}"
+                enqueue_live_progress(
+                    run_id=progress_run_id,
+                    importer="mrf-source-discovery",
+                    status="running",
+                    phase="resolving source pages",
+                    unit="sources",
+                    done=done,
+                    total=total,
+                    message=f"resolved {done}/{total} source pages",
+                    detail=pending_detail if sample else None,
+                )
     return crawl_targets, observations
 
 
 def _source_progress_label(source: dict[str, Any], url: Any) -> str:
-    label = str(
-        source.get("display_name")
-        or source.get("payer_name")
-        or source.get("source_id")
-        or ""
-    ).strip()
+    label = str(source.get("display_name") or source.get("payer_name") or source.get("source_id") or "").strip()
     if not label:
         parsed = urlsplit(str(url or ""))
         label = parsed.netloc or str(url or "").strip() or "source"
@@ -15227,9 +13983,7 @@ def _direct_mrf_body_crawl_target(
 ) -> CrawlTarget | None:
     if not _is_direct_mrf_body_url(url):
         return None
-    file_type = _mrf_body_file_type_from_text(
-        url, str(source_record.get("display_name") or "")
-    )
+    file_type = _mrf_body_file_type_from_text(url, str(source_record.get("display_name") or ""))
     if file_type == "table-of-contents":
         return None
     if not file_type:
@@ -15295,19 +14049,9 @@ def _toc_target_plan_fields(
     """Build normalized plan fields for a persisted TOC target row."""
     plan_info = _metadata_plan_info(target_metadata_by_field)
     return {
-        "plan_ids": [
-            plan.get("plan_id") for plan in plan_info if plan.get("plan_id")
-        ],
-        "plan_names": [
-            plan.get("plan_name") for plan in plan_info if plan.get("plan_name")
-        ],
-        "market_types": sorted(
-            {
-                plan.get("plan_market_type")
-                for plan in plan_info
-                if plan.get("plan_market_type")
-            }
-        ),
+        "plan_ids": [plan.get("plan_id") for plan in plan_info if plan.get("plan_id")],
+        "plan_names": [plan.get("plan_name") for plan in plan_info if plan.get("plan_name")],
+        "market_types": sorted({plan.get("plan_market_type") for plan in plan_info if plan.get("plan_market_type")}),
     }
 
 
@@ -15321,10 +14065,7 @@ def _toc_target_file_row(crawl_target: CrawlTarget) -> dict[str, Any]:
         if metadata_value not in (None, "")
     }
     context_metadata = _crawl_target_context_metadata(crawl_target)
-    file_type = str(
-        target_metadata_by_field.get("target_file_type")
-        or "table-of-contents"
-    )
+    file_type = str(target_metadata_by_field.get("target_file_type") or "table-of-contents")
     size_bytes = (
         _parse_size_bytes(target_metadata_by_field.get("blob_size"))
         or _parse_size_bytes(target_metadata_by_field.get("size_bytes"))
@@ -15354,8 +14095,7 @@ def _toc_target_file_row(crawl_target: CrawlTarget) -> dict[str, Any]:
         "last_modified": target_metadata_by_field.get("last_modified"),
         "schema_version": None,
         "metadata_json": {
-            "container_format": target_metadata_by_field.get("container_format")
-            or _container_format(crawl_target.url),
+            "container_format": target_metadata_by_field.get("container_format") or _container_format(crawl_target.url),
             "resolved_from_url": crawl_target.resolved_from_url,
             "target_label": crawl_target.label,
             **target_metadata_by_field,
@@ -15389,16 +14129,12 @@ def _crawl_source_identity_key(source: dict[str, Any]) -> str:
     if not url:
         return str(source.get("source_id") or source.get("source_key") or "")
     resolver = _platform_resolver_config(source.get("hosting_platform"))
-    context_suffix = (
-        f"#target_payer_query={_clean_text(target_query).lower()}"
-        if target_query
-        else ""
-    )
+    context_suffix = f"#target_payer_query={_clean_text(target_query).lower()}" if target_query else ""
     if str(resolver.get("type") or "").strip() == "healthsparq_public_mrf":
         try:
             params = _healthsparq_public_params(url)
             metadata_url = _healthsparq_direct_metadata_url(resolver, params)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             metadata_url = None
         if metadata_url:
             return f"{_canonical_or_none(metadata_url) or metadata_url}{context_suffix}"
@@ -15418,9 +14154,7 @@ def _dedupe_source_rows_for_crawl(
             continue
         key = _crawl_source_identity_key(source)
         previous = by_url.get(key)
-        if previous is None or _crawl_source_score(source) > _crawl_source_score(
-            previous
-        ):
+        if previous is None or _crawl_source_score(source) > _crawl_source_score(previous):
             by_url[key] = source
     return list(by_url.values()) + no_url_rows
 
@@ -15434,16 +14168,13 @@ def _crawl_representative_source_ids(
         (
             source_row
             for source_row in source_rows
-            if (source_row.get("index_url") or source_row.get("human_url"))
-            and _is_source_row_importable(source_row)
+            if (source_row.get("index_url") or source_row.get("human_url")) and _is_source_row_importable(source_row)
         ),
         key=lambda source_row: str(source_row.get("source_id") or ""),
     )
     return frozenset(
         str(source_row.get("source_id") or "").strip()
-        for source_row in _dedupe_source_rows_for_crawl(
-            crawl_eligible_source_rows
-        )
+        for source_row in _dedupe_source_rows_for_crawl(crawl_eligible_source_rows)
         if str(source_row.get("source_id") or "").strip()
     )
 
@@ -15601,10 +14332,7 @@ def _is_candidate_text_filter_match(
             *candidate.aliases,
             target_payer_query or "",
         )
-        if not any(
-            _is_candidate_search_name_match(name, query)
-            for name in searchable_names
-        ):
+        if not any(_is_candidate_search_name_match(name, query) for name in searchable_names):
             return False
     return True
 
@@ -15622,18 +14350,12 @@ def _is_candidate_search_name_match(name: str, query: str) -> bool:
 
 
 def _query_tokens(value: Any) -> tuple[str, ...]:
-    return tuple(
-        token.lower()
-        for token in re.findall(r"[a-z0-9]+", _clean_text(value).lower())
-        if token
-    )
+    return tuple(token.lower() for token in re.findall(r"[a-z0-9]+", _clean_text(value).lower()) if token)
 
 
 def _query_match_tokens(value: Any) -> tuple[str, ...]:
     tokens = _query_tokens(value)
-    substantive_tokens = tuple(
-        token for token in tokens if token not in LEGAL_ENTITY_QUERY_STOPWORDS
-    )
+    substantive_tokens = tuple(token for token in tokens if token not in LEGAL_ENTITY_QUERY_STOPWORDS)
     return substantive_tokens or tokens
 
 
@@ -15642,11 +14364,7 @@ def _query_token_variants(token: str) -> tuple[str, ...]:
     variants = [token] if token else []
     if len(token) > 4 and token.endswith("ies"):
         variants.append(f"{token[:-3]}y")
-    elif (
-        len(token) > 4
-        and token.endswith("s")
-        and not token.endswith(("ss", "us", "is"))
-    ):
+    elif len(token) > 4 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
         variants.append(token[:-1])
     return tuple(dict.fromkeys(variant for variant in variants if variant))
 
@@ -15665,18 +14383,9 @@ def _is_search_value_query_match(values: Iterable[Any], query: str | None) -> bo
         if query_tokens:
             value_tokens = set(_query_tokens(text))
             token_variants = [_query_token_variants(token) for token in query_tokens]
-            if all(
-                any(variant in value_tokens for variant in variants)
-                for variants in token_variants
-            ):
+            if all(any(variant in value_tokens for variant in variants) for variants in token_variants):
                 return True
-            if all(
-                any(
-                    len(variant) >= 3 and variant in text
-                    for variant in variants
-                )
-                for variants in token_variants
-            ):
+            if all(any(len(variant) >= 3 and variant in text for variant in variants) for variants in token_variants):
                 return True
     return False
 
@@ -15685,9 +14394,7 @@ def _search_match_text(value: Any) -> str:
     text = _clean_text(value).lower()
     parsed = urlsplit(str(value or "").strip())
     if parsed.scheme in {"http", "https"} and parsed.netloc:
-        text = _clean_text(
-            " ".join(part for part in (unquote(parsed.path), unquote(parsed.query)) if part)
-        ).lower()
+        text = _clean_text(" ".join(part for part in (unquote(parsed.path), unquote(parsed.query)) if part)).lower()
     return text
 
 
@@ -15726,9 +14433,7 @@ def _rank_query_expansion_candidates(
     ]
 
 
-def _candidate_with_target_payer_query(
-    candidate: SourceCandidate, query: str
-) -> SourceCandidate:
+def _candidate_with_target_payer_query(candidate: SourceCandidate, query: str) -> SourceCandidate:
     return replace(
         candidate,
         raw_payload={
@@ -15756,10 +14461,7 @@ def _source_row_source_tier(row: dict[str, Any]) -> str:
 
 def _is_source_row_importable(row: dict[str, Any]) -> bool:
     status = str(row.get("status") or "active").strip().lower()
-    return (
-        _source_row_source_tier(row) == "mrf_importable"
-        and status not in NON_IMPORTABLE_SOURCE_STATUSES
-    )
+    return _source_row_source_tier(row) == "mrf_importable" and status not in NON_IMPORTABLE_SOURCE_STATUSES
 
 
 def _has_candidate_catalog_source(candidate: SourceCandidate) -> bool:
@@ -15808,11 +14510,7 @@ async def _load_file_probe_targets(
     )
     if entity_types:
         entity_value = func.lower(func.coalesce(MRFPayer.entity_type, ""))
-        stmt = stmt.where(
-            or_(
-                *[entity_value.like(f"%{entity_type}%") for entity_type in entity_types]
-            )
-        )
+        stmt = stmt.where(or_(*[entity_value.like(f"%{entity_type}%") for entity_type in entity_types]))
     if payer_query:
         payer_value = func.lower(func.coalesce(MRFPayer.canonical_name, ""))
         stmt = stmt.where(payer_value.like(f"%{payer_query.lower()}%"))
@@ -15856,9 +14554,7 @@ def _interleave_file_probe_targets_by_host(
     return interleaved_targets
 
 
-def _file_probe_observation(
-    probe_target: dict[str, Any], head: dict[str, Any], run_id: str | None
-) -> dict[str, Any]:
+def _file_probe_observation(probe_target: dict[str, Any], head: dict[str, Any], run_id: str | None) -> dict[str, Any]:
     checked_at = head["checked_at"]
     return {
         "observation_id": _id(
@@ -15893,9 +14589,7 @@ def _file_probe_observation(
     }
 
 
-def _file_probe_update_values(
-    target: dict[str, Any], head: dict[str, Any]
-) -> dict[str, Any]:
+def _file_probe_update_values(target: dict[str, Any], head: dict[str, Any]) -> dict[str, Any]:
     if str(head.get("status") or "") != "ok":
         return {}
     update_values_by_field: dict[str, Any] = {}
@@ -15922,16 +14616,12 @@ async def _update_mrf_file_probe_metadata(updates: list[dict[str, Any]]) -> None
         for update_row in updates:
             file_id = update_row.get("mrf_file_id")
             update_values_by_field = {
-                field_name: field_value
-                for field_name, field_value in update_row.items()
-                if field_name != "mrf_file_id"
+                field_name: field_value for field_name, field_value in update_row.items() if field_name != "mrf_file_id"
             }
             if not file_id or not update_values_by_field:
                 continue
             await session.execute(
-                update(MRFFile)
-                .where(MRFFile.mrf_file_id == file_id)
-                .values(**update_values_by_field)
+                update(MRFFile).where(MRFFile.mrf_file_id == file_id).values(**update_values_by_field)
             )
 
 
@@ -16006,9 +14696,7 @@ async def _file_probe_writer(
         done += 1
         if str(head.get("status") or "") == "ok":
             ok_count += 1
-        observation = _file_probe_observation(
-            probe_target, head, execution_context.run_id
-        )
+        observation = _file_probe_observation(probe_target, head, execution_context.run_id)
         all_observations.append(observation)
         observation_rows.append(observation)
         update_values = _file_probe_update_values(probe_target, head)
@@ -16051,8 +14739,8 @@ async def _probe_mrf_file_heads(
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
     connector = _tcp_connector(limit=worker_count * 2)
     target_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-    result_queue: asyncio.Queue[tuple[dict[str, Any], dict[str, Any]] | None] = (
-        asyncio.Queue(maxsize=max(worker_count * 4, 1))
+    result_queue: asyncio.Queue[tuple[dict[str, Any], dict[str, Any]] | None] = asyncio.Queue(
+        maxsize=max(worker_count * 4, 1)
     )
     for probe_target in probe_targets:
         target_queue.put_nowait(probe_target)
@@ -16073,10 +14761,7 @@ async def _probe_mrf_file_heads(
         connector=connector,
         trust_env=False,
     ) as session:
-        workers = [
-            asyncio.create_task(_file_probe_worker(execution_context, session))
-            for _ in range(worker_count)
-        ]
+        workers = [asyncio.create_task(_file_probe_worker(execution_context, session)) for _ in range(worker_count)]
         writer_task = asyncio.create_task(_file_probe_writer(execution_context))
         await target_queue.join()
         await asyncio.gather(*workers)
@@ -16091,110 +14776,18 @@ class _CrawlExecutionContext:
     target_semaphore: asyncio.Semaphore | None = None
 
 
-async def _crawl_toc_file_reference_rows(
-    toc_target: CrawlTarget,
-    session: aiohttp.ClientSession,
-    *,
-    target_max_bytes: int,
-    should_filter_to_target_query: bool,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if (toc_target.metadata or {}).get("container_format") == "zip":
-        toc_values = await _fetch_zip_json_values(
-            toc_target.url,
-            max_bytes=target_max_bytes,
-            session=session,
-        )
-    else:
-        toc_values = [
-            (
-                Path(urlsplit(toc_target.url).path).name,
-                await _fetch_query_filtered_toc(
-                    toc_target,
-                    max_bytes=target_max_bytes,
-                    session=session,
-                )
-                if should_filter_to_target_query
-                else await _fetch_json(
-                    toc_target.url,
-                    max_bytes=target_max_bytes,
-                    session=session,
-                ),
-            )
-        ]
-    plan_rows: list[dict[str, Any]] = []
-    file_rows: list[dict[str, Any]] = []
-    for _member_name, toc in toc_values:
-        if not isinstance(toc, dict):
-            raise ValueError("expected JSON object")
-        if should_filter_to_target_query:
-            member_plan_rows, member_file_rows = _toc_rows_from_content(
-                toc_target.source,
-                toc_target.url,
-                toc,
-                filter_to_target_query=True,
-            )
-        else:
-            member_plan_rows, member_file_rows = _toc_rows_from_content(
-                toc_target.source, toc_target.url, toc
-            )
-        plan_rows.extend(member_plan_rows)
-        file_rows.extend(
-            _apply_crawl_target_context_to_file_rows(member_file_rows, toc_target)
-        )
-    return plan_rows, file_rows
-
-
 async def _crawl_target_rows(
     toc_target: CrawlTarget,
     session: aiohttp.ClientSession,
     *,
     target_max_bytes: int,
-    should_filter_to_target_query: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
-    target_kind = (toc_target.metadata or {}).get("target_kind")
-    target_file_type = (toc_target.metadata or {}).get("target_file_type")
-    if target_kind == "file_reference" and target_file_type == "table-of-contents":
-        plan_rows, file_rows = await _crawl_toc_file_reference_rows(
-            toc_target,
-            session,
-            target_max_bytes=target_max_bytes,
-            should_filter_to_target_query=should_filter_to_target_query,
-        )
-        return plan_rows, file_rows, len(file_rows)
-    if target_kind in {"file_reference", "source_landing_page"}:
+    """Retain small text/reference adapters; JSON targets use the awaited spool."""
+    if (toc_target.metadata or {}).get("target_kind") != "metadata_text":
         return _plan_rows_from_target_metadata(toc_target), [], 1
-    if target_kind == "metadata_text":
-        text = await _fetch_text(
-            toc_target.url, max_bytes=target_max_bytes, session=session
-        )
-        plan_rows, file_rows = _metadata_text_rows_from_content(
-            toc_target.source, toc_target.url, text
-        )
-    else:
-        toc = (
-            await _fetch_query_filtered_toc(
-                toc_target,
-                max_bytes=target_max_bytes,
-                session=session,
-            )
-            if should_filter_to_target_query
-            else await _fetch_json(
-                toc_target.url, max_bytes=target_max_bytes, session=session
-            )
-        )
-        if should_filter_to_target_query:
-            plan_rows, file_rows = _toc_rows_from_content(
-                toc_target.source,
-                toc_target.url,
-                toc,
-                filter_to_target_query=True,
-            )
-        else:
-            plan_rows, file_rows = _toc_rows_from_content(
-                toc_target.source, toc_target.url, toc
-            )
-        file_rows = _apply_crawl_target_context_to_file_rows(file_rows, toc_target)
-    return plan_rows, file_rows, len(file_rows)
+    text = await _fetch_text(toc_target.url, max_bytes=target_max_bytes, session=session)
+    plans, files = _metadata_text_rows_from_content(toc_target.source, toc_target.url, text)
+    return plans, files, len(files)
 
 
 async def _crawl_one_toc_target(
@@ -16203,30 +14796,46 @@ async def _crawl_one_toc_target(
     *,
     max_toc_bytes: int,
     run_id: str | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
+) -> PersistedTocResult | tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
     try:
-        should_filter_to_target_query = (
-            (toc_target.metadata or {}).get("query_expansion_match_scope") == "toc_plan"
-            and _supports_toc_plan_query_scan(toc_target)
-        )
-        plan_rows, file_rows, observed_file_count = await _crawl_target_rows(
+        target_max_bytes = _target_fetch_max_bytes(toc_target, max_toc_bytes)
+        if is_streaming_toc(toc_target):
+            plans, files = await stream_toc_target(
+                toc_target,
+                session,
+                max_bytes=target_max_bytes,
+                run_id=run_id,
+            )
+            observation = _crawl_ok_observation(toc_target, run_id=run_id, plans=plans, files=files)
+            return PersistedTocResult(plans, files, [observation], toc_target.url)
+        plan_rows, file_rows, observed_files = await _crawl_target_rows(
             toc_target,
             session,
-            target_max_bytes=_target_fetch_max_bytes(toc_target, max_toc_bytes),
-            should_filter_to_target_query=should_filter_to_target_query,
+            target_max_bytes=target_max_bytes,
         )
         observation = _crawl_ok_observation(
             toc_target,
             run_id=run_id,
             plans=len(plan_rows),
-            files=observed_file_count,
+            files=observed_files,
         )
         return plan_rows, file_rows, [observation], toc_target.url
+    except IncompleteToc as exc:
+        await _persist_incomplete_toc(toc_target.source, toc_target.url, exc, run_id)
+        raise
     except Exception as exc:
-        observation = _crawl_failed_observation(
-            toc_target.source, toc_target.url, exc, run_id
-        )
-        return [], [], [observation], toc_target.url
+        return [], [], [_crawl_failed_observation(toc_target.source, toc_target.url, exc, run_id)], toc_target.url
+
+
+async def _persist_incomplete_toc(source, url, error, run_id) -> None:
+    """Keep diagnostics durable even when a target cannot complete its source."""
+    await _push_crawl_row_batches(
+        [],
+        [],
+        [_crawl_failed_observation(source, url, error, run_id)],
+        batch_size=WRITE_BATCH_SIZE,
+        row_write_timeout=_float_env("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", 0.0),
+    )
 
 
 async def _resolve_toc_crawl_targets(
@@ -16253,9 +14862,7 @@ async def _resolve_toc_crawl_targets(
         toc_targets = toc_targets[: max(1, int(crawl_target_limit))]
     target_rows = [_toc_target_file_row(toc_target) for toc_target in toc_targets]
     target_row_count = len(target_rows)
-    resolver_observation_ids = {
-        observation["observation_id"] for observation in resolver_observations
-    }
+    resolver_observation_ids = {observation["observation_id"] for observation in resolver_observations}
     await _push_crawl_row_batches(
         [],
         target_rows,
@@ -16265,10 +14872,7 @@ async def _resolve_toc_crawl_targets(
     )
     if progress_run_id:
         total = len(toc_targets)
-        message = (
-            f"resolved {expanded_target_count} TOC targets from "
-            f"{len(crawl_source_rows)} source pages"
-        )
+        message = f"resolved {expanded_target_count} TOC targets from {len(crawl_source_rows)} source pages"
         if total != expanded_target_count:
             message = f"{message}; crawling first {total}"
         enqueue_live_progress(
@@ -16306,11 +14910,13 @@ async def _crawl_toc_target_with_limits(
                 run_id=run_id,
             )
             if target_crawl_timeout > 0:
-                return await asyncio.wait_for(
-                    crawl_request, timeout=target_crawl_timeout
-                )
+                return await asyncio.wait_for(crawl_request, timeout=target_crawl_timeout)
             return await crawl_request
-        except TimeoutError:
+        except TimeoutError as exc:
+            if is_streaming_toc(crawl_target):
+                incomplete = IncompleteToc(f"TOC target crawl timed out after {target_crawl_timeout:g}s")
+                await _persist_incomplete_toc(crawl_target.source, crawl_target.url, incomplete, run_id)
+                raise incomplete from exc
             return (
                 [],
                 [],
@@ -16318,9 +14924,7 @@ async def _crawl_toc_target_with_limits(
                     _crawl_failed_observation(
                         crawl_target.source,
                         crawl_target.url,
-                        TimeoutError(
-                            f"TOC target crawl timed out after {target_crawl_timeout:g}s"
-                        ),
+                        TimeoutError(f"TOC target crawl timed out after {target_crawl_timeout:g}s"),
                         run_id,
                     )
                 ],
@@ -16368,13 +14972,17 @@ class _TocCrawlAccumulator:
 
     async def record_completed_target(self, target_result) -> None:
         """Accumulate, checkpoint, and report one completed target result."""
-        plan_rows, file_rows, crawl_observations, result_url = target_result
+        if isinstance(target_result, PersistedTocResult):
+            self.plan_count += target_result.plan_count
+            self.file_count += target_result.file_count
+            plan_rows, file_rows = [], []
+            crawl_observations, result_url = target_result.observations, target_result.url
+        else:
+            plan_rows, file_rows, crawl_observations, result_url = target_result
         self.completed_target_count += 1
         self.plan_count += len(plan_rows)
         self.file_count += len(file_rows)
-        self.observation_ids.update(
-            observation["observation_id"] for observation in crawl_observations
-        )
+        self.observation_ids.update(observation["observation_id"] for observation in crawl_observations)
         self.pending_plan_rows.extend(plan_rows)
         self.pending_file_rows.extend(file_rows)
         self.pending_observation_rows.extend(crawl_observations)
@@ -16410,10 +15018,7 @@ class _TocCrawlAccumulator:
                 unit="targets",
                 done=self.completed_target_count,
                 total=self.total,
-                message=(
-                    f"writing final rows for {self.completed_target_count}/{self.total} "
-                    "TOC targets"
-                ),
+                message=(f"writing final rows for {self.completed_target_count}/{self.total} TOC targets"),
             )
         await self._push_pending_rows()
 
@@ -16422,10 +15027,7 @@ class _TocCrawlAccumulator:
         return (
             self.plan_count,
             self.file_count,
-            [
-                {"observation_id": observation_id}
-                for observation_id in self.observation_ids
-            ],
+            [{"observation_id": observation_id} for observation_id in self.observation_ids],
         )
 
 
@@ -16443,11 +15045,10 @@ async def _crawl_toc_metadata(
     """Crawl TOC targets, derive rows, and persist crawl observations."""
     if test_mode:
         return 0, 0, []
+    toc_spool_bytes()
     worker_count = max(1, int(concurrency or DEFAULT_CONCURRENCY))
     active_context = execution_context or _CrawlExecutionContext()
-    timeout = aiohttp.ClientTimeout(
-        total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT
-    )
+    timeout = aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT, connect=15, sock_read=HTTP_READ_TIMEOUT)
     target_crawl_timeout = _float_env("HLTHPRT_MRF_TOC_TARGET_TIMEOUT_SECONDS", 180.0)
     row_write_timeout = _float_env("HLTHPRT_MRF_CRAWL_ROW_WRITE_TIMEOUT_SECONDS", 0.0)
     async with _discovery_http_session(
@@ -16471,6 +15072,7 @@ async def _crawl_toc_metadata(
             file_count=target_file_count,
             observation_ids=observation_ids,
         )
+
         async def _crawl_target(crawl_target: CrawlTarget):
             return await _crawl_toc_target_with_limits(
                 crawl_target,
@@ -16595,9 +15197,7 @@ def _discovery_crawl_run_row(
     }
 
 
-async def _persist_failed_discovery_crawl_row(
-    failure_context_dict: dict[str, Any]
-) -> None:
+async def _persist_failed_discovery_crawl_row(failure_context_dict: dict[str, Any]) -> None:
     """Persist the crawl-run row for an already-announced discovery failure."""
     discovery_result = failure_context_dict["result"]
     error_dict = failure_context_dict["error_dict"]
@@ -16625,9 +15225,7 @@ async def _persist_failed_discovery_crawl_row(
         )
 
 
-async def _publish_failed_discovery_state(
-    failure_context_dict: dict[str, Any]
-) -> None:
+async def _publish_failed_discovery_state(failure_context_dict: dict[str, Any]) -> None:
     """Publish terminal progress/events for an already-announced discovery failure."""
     discovery_result = failure_context_dict["result"]
     failure_message = failure_context_dict["message"]
@@ -16671,9 +15269,7 @@ async def _publish_failed_discovery_state(
     await _flush_discovery_control_events(control_run_id)
 
 
-async def _record_failed_discovery_state(
-    failure_context_dict: dict[str, Any]
-) -> None:
+async def _record_failed_discovery_state(failure_context_dict: dict[str, Any]) -> None:
     """Persist and publish terminal state for an already-announced discovery failure."""
     await _persist_failed_discovery_crawl_row(failure_context_dict)
     await _publish_failed_discovery_state(failure_context_dict)
@@ -16716,9 +15312,7 @@ def _emit_discovery_control_event(
 
 
 async def _flush_discovery_control_events(control_run_id: str) -> None:
-    timeout = float(
-        os.getenv("HLTHPRT_MRF_DISCOVERY_CONTROL_EVENT_FLUSH_SECONDS", "1.0")
-    )
+    timeout = float(os.getenv("HLTHPRT_MRF_DISCOVERY_CONTROL_EVENT_FLUSH_SECONDS", "1.0"))
     if timeout <= 0:
         return
     await flush_terminal_status_event(control_run_id, timeout_seconds=timeout)
@@ -16892,8 +15486,7 @@ async def _process_discovery_source_record(
             plans_discovered=plans_discovered,
             files_discovered=files_discovered,
             bytes_streamed=sum(
-                int(source_observation.get("content_length") or 0)
-                for source_observation in source_observations
+                int(source_observation.get("content_length") or 0) for source_observation in source_observations
             ),
         )
 
@@ -16908,8 +15501,7 @@ def _run_discovery_source_process(
         """Process one source inside a fresh child-process event loop."""
 
         should_connect_database = bool(
-            processing_options.check_urls
-            or (processing_options.crawl and not processing_options.test_mode)
+            processing_options.check_urls or (processing_options.crawl and not processing_options.test_mode)
         )
         try:
             if should_connect_database:
@@ -16923,46 +15515,6 @@ def _run_discovery_source_process(
                 await db.disconnect()
 
     return asyncio.run(run_source())
-
-
-class DiscoverySourceProcessPool:
-    """Bridge cancellable asyncio source tasks to reusable spawned processes."""
-
-    def __init__(self, process_workers: int) -> None:
-        process_context = mp.get_context("spawn")
-        self._process_pool = process_context.Pool(processes=process_workers)
-        self._is_closed = False
-
-    async def process_source(
-        self,
-        source_record: dict[str, Any],
-        processing_options: DiscoverySourceProcessingOptions,
-    ) -> SourceProcessResult:
-        """Submit one source and await its process result without blocking asyncio."""
-
-        process_result = self._process_pool.apply_async(
-            _run_discovery_source_process,
-            (source_record, processing_options),
-        )
-        return await asyncio.to_thread(process_result.get)
-
-    async def close(self) -> None:
-        """Finish submitted source work and stop the process pool cleanly."""
-
-        if self._is_closed:
-            return
-        self._is_closed = True
-        self._process_pool.close()
-        await asyncio.to_thread(self._process_pool.join)
-
-    async def terminate(self) -> None:
-        """Kill process work before canceled source claims become retryable."""
-
-        if self._is_closed:
-            return
-        self._is_closed = True
-        self._process_pool.terminate()
-        await asyncio.to_thread(self._process_pool.join)
 
 
 def _source_checkpoint_progress_reporter(control_run_id: str):
@@ -16984,6 +15536,7 @@ def _source_checkpoint_progress_reporter(control_run_id: str):
             unit="sources",
             done=completed_count,
             total=total_count,
+            pct=(100.0 * completed_count / total_count) if total_count > 0 else 0.0,
             message=f"checkpointed {completed_count}/{total_count} discovery sources",
             label=source_id,
             detail={"source_status": checkpoint_status},
@@ -16998,9 +15551,7 @@ async def _execute_discovery_source_batch(
 ) -> SourceBatchSummary:
     """Execute one source batch in-process or across configured CPU workers."""
 
-    checkpoint_reporter = _source_checkpoint_progress_reporter(
-        batch_context.owner_run_id
-    )
+    checkpoint_reporter = _source_checkpoint_progress_reporter(batch_context.owner_run_id)
     executor_arguments_by_name = {
         "root_run_id": batch_context.root_run_id,
         "owner_run_id": batch_context.owner_run_id,
@@ -17009,9 +15560,7 @@ async def _execute_discovery_source_batch(
         "checkpoint_store": checkpoint_store,
         "on_source_checkpoint": checkpoint_reporter,
     }
-    crawl_representative_source_ids = _crawl_representative_source_ids(
-        batch_context.source_records
-    )
+    crawl_representative_source_ids = _crawl_representative_source_ids(batch_context.source_records)
     if batch_context.process_workers > 1:
         return await _execute_process_discovery_source_batch(
             batch_context,
@@ -17044,10 +15593,7 @@ async def _execute_process_discovery_source_batch(
             source_record,
             replace(
                 batch_context.processing_options,
-                crawl=(
-                    batch_context.processing_options.crawl
-                    and source_id in crawl_representative_source_ids
-                ),
+                crawl=(batch_context.processing_options.crawl and source_id in crawl_representative_source_ids),
             ),
         )
 
@@ -17088,8 +15634,7 @@ async def _execute_shared_discovery_source_batch(
         timeout=shared_timeout,
         connector_limit=shared_connection_limit,
         connector_limit_per_host=(
-            batch_context.processing_options.http_per_host_limit
-            or _discovery_http_per_host_limit()
+            batch_context.processing_options.http_per_host_limit or _discovery_http_per_host_limit()
         ),
     ) as shared_session:
 
@@ -17103,10 +15648,7 @@ async def _execute_shared_discovery_source_batch(
                 source_record,
                 replace(
                     batch_context.processing_options,
-                    crawl=(
-                        batch_context.processing_options.crawl
-                        and source_id in crawl_representative_source_ids
-                    ),
+                    crawl=(batch_context.processing_options.crawl and source_id in crawl_representative_source_ids),
                 ),
                 session=shared_session,
                 target_semaphore=shared_target_semaphore,
@@ -17168,48 +15710,28 @@ class _DiscoveryCommandState:
 def _normalize_discovery_command_state(state: _DiscoveryCommandState) -> None:
     state.max_toc_bytes = state.max_toc_bytes or MAX_TOC_BYTES_DEFAULT
     state.concurrency = max(1, int(state.concurrency or DEFAULT_CONCURRENCY))
-    state.crawl_target_limit = (
-        max(1, int(state.crawl_target_limit)) if state.crawl_target_limit else None
-    )
-    state.parsed_source_entity_types = _parse_text_filter_values(
-        state.source_entity_types
-    )
+    state.crawl_target_limit = max(1, int(state.crawl_target_limit)) if state.crawl_target_limit else None
+    state.parsed_source_entity_types = _parse_text_filter_values(state.source_entity_types)
     state.parsed_source_payer_query = _normalize_text_query(state.source_payer_query)
-    state.file_probe_limit = (
-        max(1, int(state.file_probe_limit)) if state.file_probe_limit else None
-    )
+    state.file_probe_limit = max(1, int(state.file_probe_limit)) if state.file_probe_limit else None
     state.parsed_file_probe_types = _parse_file_probe_types(state.file_probe_types)
-    state.parsed_file_probe_entity_types = _parse_text_filter_values(
-        state.file_probe_entity_types
-    )
-    state.parsed_file_probe_payer_query = _normalize_text_query(
-        state.file_probe_payer_query
-    )
+    state.parsed_file_probe_entity_types = _parse_text_filter_values(state.file_probe_entity_types)
+    state.parsed_file_probe_payer_query = _normalize_text_query(state.file_probe_payer_query)
     state.providers = _parse_provider_list(state.provider, test_mode=state.test_mode)
-    state.bounded_limit = (
-        max(1, int(state.limit))
-        if state.limit
-        else (25 if state.test_mode else None)
-    )
+    state.bounded_limit = max(1, int(state.limit)) if state.limit else (25 if state.test_mode else None)
     state.process_workers = (
-        1
-        if state.test_mode or state.dry_run
-        else _discovery_process_worker_count(state.concurrency)
+        1 if state.test_mode or state.dry_run else _discovery_process_worker_count(state.concurrency)
     )
     state.target_concurrency = 1 if state.test_mode else _discovery_target_concurrency()
 
 
 def _initialize_discovery_command_context(state: _DiscoveryCommandState) -> None:
-    global_connection_limit = _discovery_http_connection_limit(
-        state.concurrency, state.target_concurrency
-    )
+    global_connection_limit = _discovery_http_connection_limit(state.concurrency, state.target_concurrency)
     global_per_host_limit = _discovery_http_per_host_limit()
-    state.source_http_connection_limit, state.source_http_per_host_limit = (
-        _discovery_process_http_limits(
-            global_connection_limit,
-            global_per_host_limit,
-            state.process_workers,
-        )
+    state.source_http_connection_limit, state.source_http_per_host_limit = _discovery_process_http_limits(
+        global_connection_limit,
+        global_per_host_limit,
+        state.process_workers,
     )
     state.result = DiscoveryResult(
         providers=state.providers,
@@ -17309,9 +15831,7 @@ def _announce_discovery_run(state: _DiscoveryCommandState) -> None:
         )
 
 
-async def _record_discovery_command_failure(
-    state: _DiscoveryCommandState, exc: BaseException
-) -> None:
+async def _record_discovery_command_failure(state: _DiscoveryCommandState, exc: BaseException) -> None:
     if state.control_run_id in state.recorded_failure_run_ids:
         return
     state.recorded_failure_run_ids.add(state.control_run_id)
@@ -17333,9 +15853,7 @@ async def _record_discovery_command_failure(
 async def _initialize_discovery_persistence(state: _DiscoveryCommandState) -> None:
     state.retry_parent_run_id = str(state.retry_of_run_id or "").strip() or None
     requested_root_run_id = str(
-        state.mrf_discovery_root_run_id
-        or state.retry_parent_run_id
-        or state.control_run_id
+        state.mrf_discovery_root_run_id or state.retry_parent_run_id or state.control_run_id
     ).strip()
     state.checkpoint_root_run_id = requested_root_run_id
     state.checkpoint_store = DatabaseDiscoveryCheckpointStore()
@@ -17345,8 +15863,7 @@ async def _initialize_discovery_persistence(state: _DiscoveryCommandState) -> No
             await ensure_database(state.test_mode)
             await _ensure_catalog_tables()
             pending_identity_errors = (
-                await _load_pending_identity_errors(state.retry_parent_run_id)
-                if state.retry_parent_run_id else []
+                await _load_pending_identity_errors(state.retry_parent_run_id) if state.retry_parent_run_id else []
             )
             state.result.errors.extend(pending_identity_errors)
             await _persist_running_identity_errors(state.run_context_dict, state.result)
@@ -17362,9 +15879,7 @@ async def _initialize_discovery_persistence(state: _DiscoveryCommandState) -> No
             await _record_discovery_command_failure(state, exc)
             raise
     state.run_params_dict["mrf_discovery_root_run_id"] = state.checkpoint_root_run_id
-    state.needs_source_load = bool(
-        state.dry_run or state.check_urls or state.crawl or not state.probe_files
-    )
+    state.needs_source_load = bool(state.dry_run or state.check_urls or state.crawl or not state.probe_files)
 
 
 async def _load_discovery_candidates(
@@ -17374,9 +15889,7 @@ async def _load_discovery_candidates(
     if not state.needs_source_load or state.resumed_source_rows is not None:
         return candidates
     provider_load_limit = (
-        None
-        if state.parsed_source_entity_types or state.parsed_source_payer_query
-        else state.bounded_limit
+        None if state.parsed_source_entity_types or state.parsed_source_payer_query else state.bounded_limit
     )
     for index, provider_name in enumerate(state.providers):
         try:
@@ -17388,9 +15901,7 @@ async def _load_discovery_candidates(
                 )
             )
         except Exception as exc:
-            state.result.errors.append(
-                {"provider": provider_name, "message": str(exc)}
-            )
+            state.result.errors.append({"provider": provider_name, "message": str(exc)})
         if state.control_run_id and not state.dry_run:
             enqueue_live_progress(
                 run_id=state.control_run_id,
@@ -17414,11 +15925,7 @@ def _filter_discovery_candidates(
         expansion_candidates: list[SourceCandidate] = []
         query_can_expand = bool(
             state.parsed_source_payer_query
-            and sum(
-                len(token)
-                for token in _query_tokens(state.parsed_source_payer_query)
-            )
-            >= 3
+            and sum(len(token) for token in _query_tokens(state.parsed_source_payer_query)) >= 3
         )
         for candidate in candidates:
             if _is_candidate_text_filter_match(
@@ -17429,16 +15936,10 @@ def _filter_discovery_candidates(
                 filtered_candidates.append(candidate)
             elif query_can_expand and _is_candidate_query_expansion_supported(candidate):
                 expansion_candidates.append(
-                    _candidate_with_target_payer_query(
-                        candidate, state.parsed_source_payer_query or ""
-                    )
+                    _candidate_with_target_payer_query(candidate, state.parsed_source_payer_query or "")
                 )
-        candidates = _dedupe_candidates(
-            filtered_candidates + _rank_query_expansion_candidates(expansion_candidates)
-        )
-    candidates = [
-        candidate for candidate in candidates if _has_candidate_catalog_source(candidate)
-    ]
+        candidates = _dedupe_candidates(filtered_candidates + _rank_query_expansion_candidates(expansion_candidates))
+    candidates = [candidate for candidate in candidates if _has_candidate_catalog_source(candidate)]
     return candidates[: state.bounded_limit] if state.bounded_limit else candidates
 
 
@@ -17446,12 +15947,9 @@ async def _store_discovery_sources(
     state: _DiscoveryCommandState, candidates: list[SourceCandidate]
 ) -> list[dict[str, Any]]:
     if state.resumed_source_rows is None and any(
-        error.get("code") != SOURCE_IDENTITY_AMBIGUOUS
-        for error in state.result.errors
+        error.get("code") != SOURCE_IDENTITY_AMBIGUOUS for error in state.result.errors
     ):
-        provider_error = RuntimeError(
-            "MRF discovery provider loading failed; source set was not frozen"
-        )
+        provider_error = RuntimeError("MRF discovery provider loading failed; source set was not frozen")
         await _record_discovery_command_failure(state, provider_error)
         raise provider_error
     if state.resumed_source_rows is None:
@@ -17489,9 +15987,7 @@ async def _store_discovery_sources(
     return source_rows
 
 
-async def _execute_discovery_source_work(
-    state: _DiscoveryCommandState, source_rows: list[dict[str, Any]]
-) -> None:
+async def _execute_discovery_source_work(state: _DiscoveryCommandState, source_rows: list[dict[str, Any]]) -> None:
     if not state.needs_source_load:
         return
     try:
@@ -17562,9 +16058,7 @@ async def _persist_discovery_success(
 ) -> tuple[str, dt.datetime, int]:
     crawl_status = "succeeded" if not state.result.errors else "succeeded_with_errors"
     finished_at = _utc_now()
-    bytes_streamed = sum(
-        int(observation.get("content_length") or 0) for observation in observations
-    )
+    bytes_streamed = sum(int(observation.get("content_length") or 0) for observation in observations)
     if state.result.source_batch_summary is not None:
         bytes_streamed += state.result.source_batch_summary.bytes_streamed
     try:
@@ -17638,20 +16132,12 @@ async def _execute_discovery_command(state: _DiscoveryCommandState) -> dict[str,
     _initialize_discovery_command_context(state)
     _announce_discovery_run(state)
     await _initialize_discovery_persistence(state)
-    candidates = _filter_discovery_candidates(
-        state, await _load_discovery_candidates(state)
-    )
+    candidates = _filter_discovery_candidates(state, await _load_discovery_candidates(state))
     state.result.candidates = len(candidates)
     if state.dry_run:
-        state.result.payers = len(
-            {_clean_text(candidate.payer_name).lower() for candidate in candidates}
-        )
+        state.result.payers = len({_clean_text(candidate.payer_name).lower() for candidate in candidates})
         state.result.sources = len(
-            [
-                candidate
-                for candidate in candidates
-                if candidate.index_url or candidate.human_url
-            ]
+            [candidate for candidate in candidates if candidate.index_url or candidate.human_url]
         )
         return state.result.as_dict()
     source_rows = await _store_discovery_sources(state, candidates)
@@ -17662,20 +16148,14 @@ async def _execute_discovery_command(state: _DiscoveryCommandState) -> dict[str,
         and not state.parsed_source_entity_types
         and not state.parsed_source_payer_query
     ):
-        empty_source_error = RuntimeError(
-            "unbounded MRF discovery resolved an empty source set"
-        )
+        empty_source_error = RuntimeError("unbounded MRF discovery resolved an empty source set")
         await _record_discovery_command_failure(state, empty_source_error)
         raise empty_source_error
     state.result.sources = len(source_rows)
     await _execute_discovery_source_work(state, source_rows)
     observations = await _probe_discovery_files(state)
-    crawl_status, finished_at, bytes_streamed = await _persist_discovery_success(
-        state, observations
-    )
-    await _publish_discovery_success(
-        state, crawl_status, finished_at, bytes_streamed
-    )
+    crawl_status, finished_at, bytes_streamed = await _persist_discovery_success(state, observations)
+    await _publish_discovery_success(state, crawl_status, finished_at, bytes_streamed)
     return state.result.as_dict()
 
 
@@ -17762,12 +16242,8 @@ async def process_mrf_source_discovery_data(
         concurrency=int(task.get("concurrency") or DEFAULT_CONCURRENCY),
         crawl_target_limit=_as_int(task.get("crawl_target_limit")),
         run_id=run_id,
-        retry_of_run_id=(
-            str(task.get("retry_of_run_id") or "").strip() or None
-        ),
-        mrf_discovery_root_run_id=(
-            str(task.get("mrf_discovery_root_run_id") or "").strip() or None
-        ),
+        retry_of_run_id=(str(task.get("retry_of_run_id") or "").strip() or None),
+        mrf_discovery_root_run_id=(str(task.get("mrf_discovery_root_run_id") or "").strip() or None),
     )
 
 

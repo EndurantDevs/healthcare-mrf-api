@@ -785,6 +785,14 @@ def _launcher_mode() -> str:
     return os.getenv("HLTHPRT_WORKER_LAUNCHER", "process").strip().lower()
 
 
+def _configured_worker_job_image(spec: WorkerSpec) -> str:
+    """Select the optional discovery image while preserving the shared fallback."""
+    generic_image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
+    if spec.importers == ("mrf-source-discovery",):
+        return os.getenv("HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE", "").strip() or generic_image
+    return generic_image
+
+
 def _ensure_kubernetes_job(
     spec: WorkerSpec,
     launch_request: dict[str, Any],
@@ -801,7 +809,7 @@ def _ensure_kubernetes_job(
     launch = reference_launch if reference_launch is not None else launch
     aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
     launch = aca_launch if aca_launch is not None else launch
-    image = launch.image if launch is not None else os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
+    image = launch.image if launch is not None else _configured_worker_job_image(spec)
     if not image:
         return {**state, "status": "failed", "message": "HLTHPRT_WORKER_JOB_IMAGE is not configured"}
 
