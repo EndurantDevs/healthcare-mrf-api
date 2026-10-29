@@ -23,6 +23,11 @@ from api.plan_release_serving_metadata import (
 from api.plan_release_serving_metadata import (
     single_text_value as _single_text_value,
 )
+from api.plan_release_source_bindings import (
+    NOT_CURRENT_SOURCE_RELEASE,
+    discover_source_bindings,
+    load_source_binding_rows,
+)
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
@@ -335,6 +340,24 @@ async def _is_release_binding_set_serving_ready(
     return True
 
 
+async def _legacy_plan_release_rows(session, plan_release_id, include_projection, *, retained):
+    """Keep the original retained/native storage decision and predicates intact."""
+    release_sql = (
+        plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=include_projection, retained=True)
+        if retained
+        else _PLAN_RELEASE_SERVING_SQL
+        if include_projection
+        else _PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL
+    )
+    return await session.execute(
+        text(release_sql),
+        {
+            "plan_release_id": plan_release_id,
+            "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
+        },
+    )
+
+
 async def resolve_plan_release_serving(
     session: Any,
     plan_release_id: Any,
@@ -350,21 +373,21 @@ async def resolve_plan_release_serving(
     if normalized_release_id is None:
         return None
     retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    admission = await discover_source_bindings(session, PTG2_SCHEMA, normalized_release_id)
+    if admission == NOT_CURRENT_SOURCE_RELEASE:
+        return None
     include_projection = await has_pricing_projection_relation(session, PTG2_SCHEMA)
-    release_sql = (
-        plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=include_projection, retained=True)
-        if retained
-        else _PLAN_RELEASE_SERVING_SQL
-        if include_projection
-        else _PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL
-    )
-    release_query_result = await session.execute(
-        text(release_sql),
-        {
-            "plan_release_id": normalized_release_id,
-            "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
-        },
-    )
+    if admission is not None:
+        release_query_result = await load_source_binding_rows(
+            session,
+            PTG2_SCHEMA,
+            admission,
+            include_pricing_projection=include_projection,
+        )
+    else:
+        release_query_result = await _legacy_plan_release_rows(
+            session, normalized_release_id, include_projection, retained=retained
+        )
     selection = _selection_from_rows(
         normalized_release_id,
         release_query_result,

@@ -18,6 +18,11 @@ from api.plan_release_serving import (
     _selection_from_rows,
     normalize_plan_release_id,
 )
+from api.plan_release_source_bindings import (
+    NOT_CURRENT_SOURCE_RELEASE,
+    discover_source_bindings,
+    load_source_binding_rows,
+)
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
@@ -128,20 +133,32 @@ async def _load_release_rows(
     plan_release_id: str,
 ) -> list[Any]:
     retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    admission = await discover_source_bindings(session, PTG2_SCHEMA, plan_release_id)
+    if admission == NOT_CURRENT_SOURCE_RELEASE:
+        return []
+    if admission is not None:
+        if admission.expected_binding_count > MAX_BILLING_SEARCH_RELEASE_BINDINGS:
+            return []
+        return await load_source_binding_rows(
+            session,
+            PTG2_SCHEMA,
+            admission,
+            include_pricing_projection=False,
+        )
     sql = (
         plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=False, retained=True)
         + f"\n LIMIT {MAX_BILLING_SEARCH_RELEASE_BINDINGS + 1}"
         if retained
         else _PLAN_RELEASE_SERVING_SQL
     )
-    result = await session.execute(
+    release_query_result = await session.execute(
         text(sql),
         {
             "plan_release_id": plan_release_id,
             "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
         },
     )
-    return list(result)
+    return list(release_query_result)
 
 
 def _release_market_type_for_guard(
@@ -169,16 +186,27 @@ async def resolve_plan_release_guard_selection(
     if normalized is None:
         return None
     retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    admission = await discover_source_bindings(session, PTG2_SCHEMA, normalized)
+    if admission == NOT_CURRENT_SOURCE_RELEASE:
+        return None
+    if admission is not None:
+        canonical_rows = await load_source_binding_rows(
+            session,
+            PTG2_SCHEMA,
+            admission,
+            include_pricing_projection=False,
+        )
+        return _selection_from_rows(normalized, canonical_rows)
     sql = (
         plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=False, retained=True)
         if retained
         else _PLAN_RELEASE_GUARD_SQL
     )
-    result = await session.execute(
+    release_query_result = await session.execute(
         text(sql),
         {"plan_release_id": normalized, "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE},
     )
-    return _selection_from_rows(normalized, result)
+    return _selection_from_rows(normalized, release_query_result)
 
 
 async def _has_release_revision(session: Any, plan_release_id: str) -> bool:

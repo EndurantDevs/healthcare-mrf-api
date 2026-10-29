@@ -143,7 +143,7 @@ async def test_external_pin_is_preserved_and_vetoes_retirement(monkeypatch):
         external_pin_by_field
     ]
     with pytest.raises(PTG2ManifestArtifactError, match="still has retention references"):
-        await storage._require_no_references(object(), '"synthetic"', PARAMS)
+        await storage._require_no_references(object(), PARAMS)
     sibling.assert_not_awaited()
 
 

@@ -60,6 +60,17 @@ def test_attachment_identifier_contains_full_digest_within_native_name_limit():
     assert name != attachment_name(PARAMS | {"snapshot_id": "next-snapshot"})
 
 
+def _missing_source_catalog(parameters):
+    assert parameters == {
+        "source_header": None,
+        "bindings": None,
+        "header": '"synthetic_schema".plan_release_serving_revision',
+    }
+    return SimpleNamespace(
+        all=lambda: [{"source_header_exists": False, "bindings_exist": False, "header_exists": False}]
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "blocking_group",
@@ -76,10 +87,13 @@ def test_attachment_identifier_contains_full_digest_within_native_name_limit():
         "release_pin",
     ],
 )
-async def test_retirement_reads_all_reference_groups_and_refuses_every_external_reference(blocking_group):
+async def test_retirement_reads_all_reference_groups_and_refuses_every_external_reference(monkeypatch, blocking_group):
     """Use the shared loader, including default snapshot scope and ordered release pins."""
+    monkeypatch.setattr(serving, "PTG2_SCHEMA", "synthetic_schema")
+    monkeypatch.delenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", raising=False)
     own_pin = storage._pin(PARAMS)
     queries = []
+    catalog_queries = []
     specs = [
         ("global", "ptg2_current_snapshot", "slot", "snapshot_id", "slot"),
         ("source", "ptg2_current_source_snapshot", "source_key", "snapshot_id", "source_key"),
@@ -106,6 +120,9 @@ async def test_retirement_reads_all_reference_groups_and_refuses_every_external_
 
     async def execute(statement, parameters):
         query = str(statement)
+        if "AS source_header_exists" in query:
+            catalog_queries.append(query)
+            return _missing_source_catalog(parameters)
         group, table, selected, reference, order = specs[len(queries)]
         assert query == (
             f'SELECT {selected} FROM "synthetic_schema"."{table}" WHERE "{reference}"=:snapshot_id ORDER BY {order}'
@@ -119,11 +136,12 @@ async def test_retirement_reads_all_reference_groups_and_refuses_every_external_
 
     session = SimpleNamespace(execute=AsyncMock(side_effect=execute))
     if blocking_group is None:
-        assert await storage._require_no_references(session, '"synthetic_schema"', PARAMS) == own_pin
+        assert await storage._require_no_references(session, PARAMS) == own_pin
     else:
         with pytest.raises(PTG2ManifestArtifactError, match="retention references"):
-            await storage._require_no_references(session, '"synthetic_schema"', PARAMS)
+            await storage._require_no_references(session, PARAMS)
     assert len(queries) == len(specs)
+    assert len(catalog_queries) == 1
 
 
 def _request(**overrides):

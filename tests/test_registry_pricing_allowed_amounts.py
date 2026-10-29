@@ -246,8 +246,9 @@ async def test_retained_report_consumes_unreferenced_amount_siblings(monkeypatch
     assert provenance["networks"][0]["pricing_refs"][0]["resolved"] is False
     assert provenance["full_readiness"] == "not_assessed"
     assert actual["targets"] == REPORT["targets"] and actual["totals"] == REPORT["totals"]
-    assert len(driver.calls) == 9 and driver.lifecycle == ["start", "release"] * 4
+    assert len(driver.calls) == 10 and driver.lifecycle == ["start", "release"] * 4
     assert sum("AS readable" in sql for sql, _ in driver.calls) == 1
+    assert sum("AS storage_present" in sql for sql, _ in driver.calls) == 1
     assert all(task is asyncio.current_task() for task in driver.tasks) and driver.is_in_transaction()
 
 

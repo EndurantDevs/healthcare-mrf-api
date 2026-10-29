@@ -228,19 +228,20 @@ def receipt(found):
     )
 
 
-async def _require_no_references(session, schema, identity):
+async def _require_no_references(session, identity):
     from api.ptg2_serving import PTG2_SCHEMA
+    from process.ptg_parts.source_snapshot_control import _TransactionExecutor
     from process.ptg_parts.source_snapshot_references import load_snapshot_reference_rows
 
     async def load_reference_rows(
-        _schema, snapshot_id, *, table, selected_fields, reference_field="snapshot_id", order_fields=None
+        reference_schema, snapshot_id, *, table, selected_fields, reference_field="snapshot_id", order_fields=None
     ):
         """Read exact source-reference rows inside the held lifecycle fence."""
         return (
             (
                 await session.execute(
                     text(
-                        f"SELECT {selected_fields} FROM {schema}.{native._quoted(table)} "
+                        f"SELECT {selected_fields} FROM {native._quoted(reference_schema)}.{native._quoted(table)} "
                         f"WHERE {native._quoted(reference_field)}=:snapshot_id ORDER BY {order_fields or selected_fields}"
                     ),
                     {"snapshot_id": snapshot_id},
@@ -250,7 +251,9 @@ async def _require_no_references(session, schema, identity):
             .all()
         )
 
-    references = await load_snapshot_reference_rows(PTG2_SCHEMA, identity["snapshot_id"], load_reference_rows)
+    references = await load_snapshot_reference_rows(
+        PTG2_SCHEMA, identity["snapshot_id"], load_reference_rows, _TransactionExecutor(session)
+    )
     expected = _pin(identity)
     for kind, reference_rows in references.items():
         if kind == "pin":
@@ -304,7 +307,7 @@ async def retire_unreferenced(session, identity):
         {"snapshot_id": identity["snapshot_id"]},
     )
 
-    expected = await _require_no_references(session, schema, identity)
+    expected = await _require_no_references(session, identity)
     ownership = found[0]
     # A concurrent reader already holds ACCESS SHARE on the family; NOWAIT makes
     # this retirement roll back without detaching its view or pin under that reader.

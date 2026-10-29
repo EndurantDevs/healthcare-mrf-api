@@ -237,18 +237,21 @@ def receipt(found):
 async def _unreferenced_source_schema(session, identity):
     from api.ptg2_serving import PTG2_SCHEMA
     from api.ptg_membership_contract import CONTRACT as MEMBERSHIP_CONTRACT
+    from process.ptg_parts.source_snapshot_control import _TransactionExecutor
     from process.ptg_parts.source_snapshot_references import load_snapshot_reference_rows
 
     source_schema = native._quoted(PTG2_SCHEMA)
     await source_pins(session, identity)
 
-    async def load(_schema, snapshot_id, *, table, selected_fields, reference_field="snapshot_id", order_fields=None):
+    async def load(
+        reference_schema, snapshot_id, *, table, selected_fields, reference_field="snapshot_id", order_fields=None
+    ):
         """Read one ordered source-reference family within the locked snapshot."""
         return (
             (
                 await session.execute(
                     text(
-                        f"SELECT {selected_fields} FROM {source_schema}.{native._quoted(table)} WHERE {native._quoted(reference_field)}=:snapshot ORDER BY {order_fields or selected_fields}"
+                        f"SELECT {selected_fields} FROM {native._quoted(reference_schema)}.{native._quoted(table)} WHERE {native._quoted(reference_field)}=:snapshot ORDER BY {order_fields or selected_fields}"
                     ),
                     {"snapshot": snapshot_id},
                 )
@@ -262,7 +265,9 @@ async def _unreferenced_source_schema(session, identity):
             text(f"SELECT snapshot_id FROM {source_schema}.ptg2_snapshot WHERE snapshot_id=:snapshot_id FOR UPDATE"),
             {"snapshot_id": pin["snapshot_id"]},
         )
-        references = await load_snapshot_reference_rows(PTG2_SCHEMA, pin["snapshot_id"], load)
+        references = await load_snapshot_reference_rows(
+            PTG2_SCHEMA, pin["snapshot_id"], load, _TransactionExecutor(session)
+        )
         # Other derived families retain their own source data, not this family.
         references["pin"] = [
             reference_row

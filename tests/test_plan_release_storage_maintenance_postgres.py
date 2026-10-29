@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import asyncpg
 import pytest
+from sqlalchemy import text
 
 from process.plan_release_storage_custody import require_plan_release_storage_custody
 from process.ptg_parts import source_snapshot_control
@@ -95,14 +96,28 @@ async def test_source_controls_see_both_pin_stores(monkeypatch):
     async with storage_case(provisioned=True) as case:
         await prepare_maintenance_actor(case)
         reader = await case.connect(case.reader)
+        admin = await case.connect()
+        header = case.relation("plan_release_serving_revision")
+        for manifest_type in ("json", "jsonb"):
+            await admin.execute(
+                f"ALTER TABLE {header} ALTER COLUMN source_manifest TYPE {manifest_type} "
+                f"USING source_manifest::{manifest_type}"
+            )
+            async with maintenance_session(case) as session:
 
-        async def all_rows(statement, **parameters):
-            return await reader.fetch(statement.replace(":snapshot_id", "$1"), parameters["snapshot_id"])
+                async def all_rows(statement, **parameters):
+                    return list(await session.execute(text(statement), parameters))
 
-        monkeypatch.setattr(source_snapshot_control, "db", SimpleNamespace(all=all_rows))
-        refs = await source_snapshot_control._current_references(case.schema, "old-snapshot")
-        assert refs["plan_release_pins"] == ["plan_release_serving_revision:" + OLD_REVISION] * 2
-        assert len(refs["plan_release_bindings"]) == 1000
+                monkeypatch.setattr(source_snapshot_control, "db", SimpleNamespace(all=all_rows))
+                refs = await source_snapshot_control._current_references(case.schema, "old-snapshot")
+                assert refs["plan_release_pins"] == ["plan_release_serving_revision:" + OLD_REVISION] * 2
+                assert len(refs["plan_release_bindings"]) == 1000
+                await admin.execute(
+                    f'UPDATE {header} SET source_manifest=\'{{"binding_storage":"source-plan-release-bindings-v1"}}\''
+                )
+                with pytest.raises(RuntimeError, match="Claimed Source release binding storage is missing"):
+                    await source_snapshot_control._current_references(case.schema, "old-snapshot")
+            await admin.execute(f"UPDATE {header} SET source_manifest='{{}}'")
         query = "SELECT " + _pin_reference_count_sql('"' + case.schema + '"')
         assert await reader.fetchval(query.replace(":snapshot_id", "$1"), "old-snapshot") == 2
 

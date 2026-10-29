@@ -140,6 +140,8 @@ class _Session:
     async def execute(self, statement, params):
         sql = str(statement)
         self.calls.append((sql, params))
+        if "AS storage_present" in sql:
+            return []
         if "AS readable" in sql:
             return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
         if "to_regclass" in sql:

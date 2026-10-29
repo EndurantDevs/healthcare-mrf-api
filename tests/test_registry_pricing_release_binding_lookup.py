@@ -4,6 +4,7 @@
 import asyncio
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
@@ -69,6 +70,8 @@ class Driver:
     async def fetch(self, sql, *parameters):
         self.calls.append((sql, parameters))
         self.tasks.append(asyncio.current_task())
+        if "AS storage_present" in sql:
+            return []
         if self.failure:
             raise self.failure
         if "AS readable" in sql:
@@ -135,7 +138,7 @@ async def test_bulk_phase_reuses_one_driver_and_keeps_pricing_unknown(retained_e
     driver = Driver([_binding_row(), _binding_row(plan_release_id=second_id)])
     result = await append(driver)
     assert len(exports) == 1 and exports[0][0] is driver
-    assert len(driver.calls) == 3 and driver.calls[2][1][0] == [PLAN_RELEASE_ID, second_id]
+    assert len(driver.calls) == 4 and driver.calls[3][1][0] == [PLAN_RELEASE_ID, second_id]
     assert all(task is asyncio.current_task() for task in driver.tasks)
     assert driver.lifecycle == ["start", "release"] and driver.is_in_transaction()
     assert {key: result[key] for key in REPORT if key != "provenance"} == {
@@ -306,7 +309,7 @@ async def test_release_metadata_query_count_is_fixed(retained_export, release_co
     result = await lookup.append_pricing_binding_metadata(
         driver, report_by_field, object(), control_schema="sample_control", max_report_bytes=16 * 1024 * 1024
     )
-    assert len(exports) == 1 and len(driver.calls) == 3
+    assert len(exports) == 1 and len(driver.calls) == 4
     assert len(result["provenance"]["pricing_binding_metadata"]["release_metadata"]) == release_count
 
 
@@ -381,3 +384,270 @@ async def test_optional_export_refusal_is_narrow_and_keeps_directory(monkeypatch
             await append(driver)
         assert caught.value is failure
     assert driver.calls == driver.lifecycle == []
+
+
+@pytest.mark.asyncio
+async def test_bulk_source_legacy_and_retired_metadata_keep_separate_closed_routes(retained_export, monkeypatch):
+    import json
+
+    from tests.test_plan_release_source_bindings import header
+
+    monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "sample_registry")
+    legacy_id = "hprelease_" + "4" * 26
+    retired_id = "hprelease_" + "5" * 26
+    requests, _ = retained_export
+    requests[0]["pricing_refs"].extend(
+        {**REFERENCE, "plan_release_id": identity} for identity in (legacy_id, retired_id)
+    )
+    custody = AsyncMock()
+    monkeypatch.setattr(lookup, "require_source_binding_custody_fetch", custody)
+
+    class MixedDriver(Driver):
+        async def fetch(self, sql, *parameters):
+            if "AS storage_present" in sql:
+                self.calls.append((sql, parameters))
+                return [
+                    header(),
+                    header(plan_release_id=legacy_id, storage_present=False),
+                    header(plan_release_id=retired_id, current_header_count=0),
+                ]
+            return await super().fetch(sql, *parameters)
+
+        async def fetchrow(self, sql, *parameters):
+            self.calls.append((sql, parameters))
+            rows = [row for row in self.rows if row["plan_release_id"] in parameters[0]]
+            return {"bounded": True, "rows_json": json.dumps(rows)}
+
+    driver = MixedDriver(
+        [_binding_row(plan_release_id=identity) for identity in (PLAN_RELEASE_ID, legacy_id, retired_id)]
+    )
+    metadata_report = await append(driver)
+    phases = [(sql, params) for sql, params in driver.calls if "bindings AS MATERIALIZED" in sql]
+    assert len(phases) == 2
+    assert [parameters[0] for _, parameters in phases] == [[PLAN_RELEASE_ID], [legacy_id]]
+    legacy_sql = next(sql for sql, params in phases if params[0] == [legacy_id])
+    source_sql = next(sql for sql, params in phases if params[0] == [PLAN_RELEASE_ID])
+    assert "plan_release_snapshot_binding" in legacy_sql
+    assert "plan_release_snapshot_binding" not in source_sql
+    assert "plan_release_snapshot_pin" not in source_sql
+    assert "hp_plan_release_binding" in source_sql
+    custody.assert_awaited_once()
+    metadata = metadata_report["provenance"]["pricing_binding_metadata"]["release_metadata"]
+    assert metadata[PLAN_RELEASE_ID] is not None and metadata[legacy_id] is not None
+    assert metadata[retired_id] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_marker", [False, True])
+async def test_bulk_retired_source_release_never_queries_legacy_bindings(
+    retained_export, monkeypatch, malformed_marker
+):
+    from tests.test_plan_release_source_bindings import header
+
+    custody = AsyncMock()
+    monkeypatch.setattr(lookup, "require_source_binding_custody_fetch", custody)
+
+    class RetiredDriver(Driver):
+        async def fetch(self, sql, *parameters):
+            if "AS storage_present" in sql:
+                self.calls.append((sql, parameters))
+                retired = header(current_header_count=0)
+                if malformed_marker:
+                    retired["binding_storage"] = "unknown-storage"
+                return [retired]
+            return await super().fetch(sql, *parameters)
+
+    driver = RetiredDriver()
+    if malformed_marker:
+        with pytest.raises(ValueError, match="binding_storage_invalid"):
+            await append(driver)
+    else:
+        result = await append(driver)
+        provenance = result["provenance"]["pricing_binding_metadata"]
+        assert provenance["release_metadata"][PLAN_RELEASE_ID] is None
+        assert provenance["networks"][0]["pricing_refs"][0]["binding_metadata_match"] is False
+    custody.assert_not_awaited()
+    assert all("bindings AS MATERIALIZED" not in sql for sql, _ in driver.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source_custody", "source_rows", "legacy_rows"])
+@pytest.mark.parametrize("error_type", [asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError])
+async def test_missing_claimed_storage_refuses_while_legacy_remains_optional(
+    retained_export, monkeypatch, stage, error_type
+):
+    from tests.test_plan_release_source_bindings import header
+
+    monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "sample_registry")
+    failure = error_type("synthetic")
+    custody = AsyncMock(side_effect=failure if stage == "source_custody" else None)
+    monkeypatch.setattr(lookup, "require_source_binding_custody_fetch", custody)
+
+    class MissingStorageDriver(Driver):
+        async def fetch(self, sql, *parameters):
+            if "AS storage_present" in sql:
+                self.calls.append((sql, parameters))
+                return [header(storage_present=stage != "legacy_rows")]
+            return await super().fetch(sql, *parameters)
+
+        async def fetchrow(self, sql, *parameters):
+            raise failure
+
+    driver = MissingStorageDriver()
+    if stage == "legacy_rows":
+        assert (await append(driver))["targets"] == REPORT["targets"]
+        custody.assert_not_awaited()
+    else:
+        with pytest.raises(ValueError, match="plan_release_source_binding_storage_missing") as caught:
+            await append(driver)
+        assert caught.value.__cause__ is failure
+        custody.assert_awaited_once()
+    assert driver.lifecycle == ["start", "rollback"] and driver.is_in_transaction()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_storage", ["legacy", "source", "both"])
+@pytest.mark.parametrize("error_type", [asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError])
+async def test_mixed_storage_errors_preserve_the_canonical_and_optional_legacy_boundary(
+    retained_export, monkeypatch, failed_storage, error_type
+):
+    import json
+
+    from tests.test_plan_release_source_bindings import header
+
+    monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "sample_registry")
+    legacy_id = "hprelease_" + "4" * 26
+    requests, _ = retained_export
+    requests[0]["pricing_refs"].append({**REFERENCE, "plan_release_id": legacy_id})
+    custody = AsyncMock()
+    monkeypatch.setattr(lookup, "require_source_binding_custody_fetch", custody)
+    failure = error_type("synthetic")
+    queried_storage_names = []
+
+    class MixedStorageDriver(Driver):
+        async def fetch(self, sql, *parameters):
+            if "AS storage_present" in sql:
+                self.calls.append((sql, parameters))
+                return [header(), header(plan_release_id=legacy_id, storage_present=False)]
+            return await super().fetch(sql, *parameters)
+
+        async def fetchrow(self, sql, *parameters):
+            self.calls.append((sql, parameters))
+            storage = "source" if parameters[0] == [PLAN_RELEASE_ID] else "legacy"
+            queried_storage_names.append(storage)
+            if failed_storage in (storage, "both"):
+                raise failure
+            rows = [row for row in self.rows if row["plan_release_id"] in parameters[0]]
+            return {"bounded": True, "rows_json": json.dumps(rows)}
+
+    driver = MixedStorageDriver([_binding_row(), _binding_row(plan_release_id=legacy_id)])
+    if failed_storage == "legacy":
+        metadata_report = await append(driver)
+        assert metadata_report["targets"] == REPORT["targets"]
+        metadata = metadata_report["provenance"]["pricing_binding_metadata"]["release_metadata"]
+        assert metadata == {PLAN_RELEASE_ID: None, legacy_id: None}
+        assert queried_storage_names == ["source", "legacy"]
+    else:
+        with pytest.raises(ValueError, match="^plan_release_source_binding_storage_missing$") as caught:
+            await append(driver)
+        assert caught.value.__cause__ is failure
+        assert queried_storage_names == ["source"]
+    custody.assert_awaited_once()
+    assert driver.lifecycle == ["start", "rollback"] and driver.is_in_transaction()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ("not_text", "metadata_invalid"),
+        ("over_budget", "metadata_invalid"),
+        ("not_list", "metadata_invalid"),
+        ("unexpected_release", "identity_invalid"),
+        ("wrong_revision", "identity_invalid"),
+        ("wrong_digest", "identity_invalid"),
+        ("missing_rows", "incomplete"),
+    ],
+)
+async def test_malformed_canonical_metadata_rolls_back_without_optional_recovery(
+    retained_export, monkeypatch, change, reason
+):
+    import json
+
+    from tests.test_plan_release_source_bindings import header
+
+    monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "sample_registry")
+    custody = AsyncMock()
+    monkeypatch.setattr(lookup, "require_source_binding_custody_fetch", custody)
+    binding_rows = [_binding_row()]
+    if change == "unexpected_release":
+        binding_rows[0]["plan_release_id"] = "hprelease_" + "9" * 26
+    elif change == "wrong_revision":
+        binding_rows[0]["serving_revision_id"] = "hpserve_" + "9" * 26
+    elif change == "wrong_digest":
+        binding_rows[0]["binding_set_digest"] = "9" * 64
+    elif change == "missing_rows":
+        binding_rows = []
+    encoded = json.dumps(binding_rows)
+    if change == "not_text":
+        encoded = None
+    elif change == "over_budget":
+        encoded = " " * (16 * 1024 * 1024 + 1)
+    elif change == "not_list":
+        encoded = "{}"
+
+    class MalformedDriver(Driver):
+        async def fetch(self, sql, *parameters):
+            if "AS storage_present" in sql:
+                self.calls.append((sql, parameters))
+                return [header()]
+            return await super().fetch(sql, *parameters)
+
+        async def fetchrow(self, sql, *parameters):
+            self.calls.append((sql, parameters))
+            return {"bounded": True, "rows_json": encoded}
+
+    driver = MalformedDriver()
+    with pytest.raises(ValueError, match=reason):
+        await append(driver)
+    custody.assert_awaited_once()
+    assert driver.lifecycle == ["start", "rollback"] and driver.is_in_transaction()
+
+
+@pytest.mark.asyncio
+async def test_combined_storage_budget_does_not_return_a_partial_binding_set(retained_export, monkeypatch):
+    import json
+
+    from tests.test_plan_release_source_bindings import header
+
+    monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "sample_registry")
+    legacy_id = "hprelease_" + "4" * 26
+    binding_rows = [_binding_row(), _binding_row(plan_release_id=legacy_id)]
+    maximum = max(len(json.dumps([binding_row]).encode()) for binding_row in binding_rows) + 1
+    custody = AsyncMock()
+    monkeypatch.setattr(lookup, "require_source_binding_custody_fetch", custody)
+    driver = Driver(binding_rows)
+    phases = []
+
+    async def fetchrow(sql, identities, owner_type, limit):
+        phases.append(identities)
+        encoded = json.dumps(
+            [binding_row for binding_row in binding_rows if binding_row["plan_release_id"] in identities]
+        )
+        assert len(encoded.encode()) <= limit == maximum
+        return {"bounded": True, "rows_json": encoded}
+
+    driver.fetchrow = fetchrow
+    assert (
+        await lookup._fetch_admitted_binding_rows(
+            driver,
+            [PLAN_RELEASE_ID, legacy_id],
+            maximum,
+            lookup.storage_admissions([header(), header(plan_release_id=legacy_id, storage_present=False)]),
+            retained=True,
+            has_projection=False,
+        )
+        is None
+    )
+    assert phases == [[PLAN_RELEASE_ID], [legacy_id]]
+    custody.assert_awaited_once()

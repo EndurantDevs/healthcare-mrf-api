@@ -40,7 +40,8 @@ async def test_actual_managed_resolver_never_physically_probes_denied_or_allowed
     assert selection is not None and len(selection.bindings) == 2
     assert selection.binding_set_digest == "a" * 64 and selection._validated_serving_tables == ()
     readiness.assert_not_awaited()
-    assert len(session.calls) == 3
+    assert len(session.calls) == 4
+    assert "AS storage_present" in session.calls[1][0]
     assert "AS readable" in session.calls[0][0]
 
 

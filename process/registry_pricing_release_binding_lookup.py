@@ -16,6 +16,8 @@ from api.plan_release_serving import (
     _selection_from_rows,
     normalize_plan_release_id,
 )
+from api.plan_release_source_binding_custody import require_source_binding_custody_fetch
+from api.plan_release_source_bindings import _HEADER_SQL, SourceBindingAdmission, storage_admissions
 from process.network_approved_catalog_evidence import (
     MAX_NETWORKS,
     ApprovedNetworkCatalogEvidenceResourceLimit,
@@ -61,29 +63,84 @@ async def _fetch_release_binding_rows(connection, release_ids, max_report_bytes)
     required_names = {f"{PTG2_SCHEMA}.{name}" for name in _REQUIRED_RELATIONS}
     projection_name = pricing_projection_relation(PTG2_SCHEMA)
     availability_rows = await connection.fetch(_AVAILABILITY_SQL, sorted(required_names | {projection_name}))
-    available_names = {row["relation_name"] for row in availability_rows if row["available"] is True}
+    available_names = {
+        binding_row["relation_name"] for binding_row in availability_rows if binding_row["available"] is True
+    }
     if not required_names <= available_names:
         return None
-    binding_sql = plan_release_binding_set_sql(
-        PTG2_SCHEMA,
-        include_pricing_projection=projection_name in available_names,
-        retained=await is_retained_binding_read(connection.fetch, PTG2_SCHEMA),
-    )
-    page = await connection.fetchrow(
-        _BOUNDED_METADATA_SQL.format(binding_sql=binding_sql),
-        list(release_ids),
-        PLAN_RELEASE_PIN_OWNER_TYPE,
+    retained = await is_retained_binding_read(connection.fetch, PTG2_SCHEMA)
+    header_sql = _HEADER_SQL.format(schema=PTG2_SCHEMA).replace(":release_ids", "$1")
+    admissions = storage_admissions(await connection.fetch(header_sql, list(release_ids)))
+    return await _fetch_admitted_binding_rows(
+        connection,
+        release_ids,
         max_report_bytes,
+        admissions,
+        retained=retained,
+        has_projection=projection_name in available_names,
     )
-    if page["bounded"] is not True:
-        return None
-    encoded_rows = page["rows_json"]
-    if type(encoded_rows) is not str or len(encoded_rows.encode()) > max_report_bytes:
-        raise ValueError("registry_pricing_binding_metadata_invalid")
-    binding_rows = json.loads(encoded_rows)
-    if type(binding_rows) is not list:
-        raise ValueError("registry_pricing_binding_metadata_invalid")
+
+
+async def _fetch_admitted_binding_rows(
+    connection, release_ids, max_report_bytes, admissions, *, retained, has_projection
+):
+    source_ids = [identity for identity in admissions if isinstance(admissions[identity], SourceBindingAdmission)]
+    legacy_ids = [identity for identity in release_ids if admissions.get(identity) is None]
+    try:
+        for identity in source_ids:
+            await require_source_binding_custody_fetch(connection.fetch, PTG2_SCHEMA, admissions[identity])
+    except _OPTIONAL_STORAGE_ERRORS as error:
+        raise ValueError("plan_release_source_binding_storage_missing") from error
+    binding_rows = []
+    for identities, source_bindings in ((source_ids, True), (legacy_ids, False)):
+        if not identities:
+            continue
+        binding_sql = plan_release_binding_set_sql(
+            PTG2_SCHEMA,
+            include_pricing_projection=has_projection,
+            retained=retained and not source_bindings,
+            source_bindings=source_bindings,
+        )
+        try:
+            page = await connection.fetchrow(
+                _BOUNDED_METADATA_SQL.format(binding_sql=binding_sql),
+                list(identities),
+                PLAN_RELEASE_PIN_OWNER_TYPE,
+                max_report_bytes,
+            )
+        except _OPTIONAL_STORAGE_ERRORS as error:
+            if source_bindings:
+                raise ValueError("plan_release_source_binding_storage_missing") from error
+            raise
+        if page["bounded"] is not True:
+            return None
+        encoded_rows = page["rows_json"]
+        if type(encoded_rows) is not str or len(encoded_rows.encode()) > max_report_bytes:
+            raise ValueError("registry_pricing_binding_metadata_invalid")
+        phase_binding_rows = json.loads(encoded_rows)
+        if type(phase_binding_rows) is not list:
+            raise ValueError("registry_pricing_binding_metadata_invalid")
+        if source_bindings:
+            _validate_source_binding_rows(phase_binding_rows, identities, admissions)
+        binding_rows.extend(phase_binding_rows)
+        if len(json.dumps(binding_rows).encode()) > max_report_bytes:
+            return None
     return binding_rows
+
+
+def _validate_source_binding_rows(rows, identities, admissions):
+    count_by_release_id = {identity: 0 for identity in identities}
+    for binding_row in rows:
+        identity = binding_row["plan_release_id"]
+        admission = admissions.get(identity)
+        if not isinstance(admission, SourceBindingAdmission) or (
+            binding_row["serving_revision_id"] != admission.serving_revision_id
+            or binding_row["binding_set_digest"] != admission.binding_set_digest
+        ):
+            raise ValueError("registry_pricing_binding_identity_invalid")
+        count_by_release_id[identity] += 1
+    if any(count_by_release_id[identity] != admissions[identity].expected_binding_count for identity in identities):
+        raise ValueError("plan_release_source_binding_incomplete")
 
 
 async def _optional_release_binding_rows(connection, release_ids, max_report_bytes):
