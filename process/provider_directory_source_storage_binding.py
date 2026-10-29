@@ -207,7 +207,7 @@ _PRIVATE_LAYOUT_SQL = """SELECT c.oid::bigint,c.relname,n.nspname,
 
 async def _isolated_roles(connection, policy, migration_role, namespace_owner_role, publication):
     from process.plan_release_storage_catalog import ROLE_SQL
-    from process.plan_release_storage_custody import storage_roles
+    from process.plan_release_storage_custody import _require_storage_roles, storage_profile
 
     _require(not policy.control_runtime_roles, "private_control_reader_forbidden")
     _require(type(publication) is dict and set(publication) == {"owner_role", "publisher_role"}, "publication_required")
@@ -223,8 +223,10 @@ async def _isolated_roles(connection, policy, migration_role, namespace_owner_ro
     for name in names:
         storage_identifier(name)
     _require(len(set(names)) == len(names), "role_overlap")
-    await storage_roles(connection, policy.schema, **policy.role_arguments())
+    await connection.execute("SET LOCAL search_path=pg_catalog,pg_temp")
+    source_names = storage_profile(**policy.role_arguments())
     role_rows = await connection.fetch(ROLE_SQL, list(names), policy.owner_role, policy.publisher_role, policy.schema)
+    _require_storage_roles([role for role in role_rows if role["rolname"] in source_names], **policy.role_arguments())
     roles_by_name = {role["rolname"]: dict(role) for role in role_rows}
     _require(
         set(roles_by_name) == set(names) and not any(role["elevated"] for role in role_rows), "role_authority_changed"
@@ -233,8 +235,23 @@ async def _isolated_roles(connection, policy, migration_role, namespace_owner_ro
     return roles_by_name
 
 
+_ISOLATED_DELEGATION_SQL = """SELECT
+ (SELECT coalesce(jsonb_agg(jsonb_build_array(member::bigint,inherit_option,set_option,admin_option)
+  ORDER BY member),'[]'::jsonb) FROM pg_auth_members WHERE roleid=$1) AS edges,
+ NOT EXISTS(SELECT FROM pg_auth_members WHERE member=ANY(ARRAY[$1::oid,$2::oid])
+  AND NOT(member=$2::oid AND roleid=$1::oid)) AS forward_only,
+ NOT EXISTS(SELECT FROM pg_roles WHERE NOT rolsuper AND oid<>ALL($3::oid[])
+  AND (pg_has_role(oid,$1::oid,'SET') OR pg_has_role(oid,$1::oid,'USAGE'))) AS owner_closed,
+ NOT EXISTS(SELECT FROM unnest($4::oid[]) actor(oid),unnest($5::oid[]) owner(oid)
+  WHERE pg_has_role(actor.oid,owner.oid,'SET') OR pg_has_role(actor.oid,owner.oid,'USAGE')) AS publication_closed,
+ pg_has_role($6::oid,$7::oid,'USAGE') AND pg_has_role($6::oid,$7::oid,'SET')
+  AND has_schema_privilege($7::oid,$8::name,'CREATE') AS publication_available"""
+
+
 async def _isolated_delegation(connection, policy, roles_by_name, migration_role, namespace_owner_role, publication):
     """Require the one-way native handoff without giving Source actors a reverse path."""
+    from process.provider_directory_generic_source_storage import _json
+
     protected_oids = [roles_by_name[name]["oid"] for name in (namespace_owner_role, publication["owner_role"])]
     _require(
         not any(roles_by_name[name]["rolcanlogin"] for name in (namespace_owner_role, publication["owner_role"])),
@@ -250,58 +267,25 @@ async def _isolated_delegation(connection, policy, roles_by_name, migration_role
             (publication["publisher_role"], True),
         )
     )
-    edges = await connection.fetch(
-        "SELECT member::bigint,inherit_option,set_option,admin_option FROM pg_auth_members WHERE roleid=$1 ORDER BY member",
+    delegation = await connection.fetchrow(
+        _ISOLATED_DELEGATION_SQL,
         owner_oid,
+        roles_by_name[policy.publisher_role]["oid"],
+        [owner_oid, *(entry[0] for entry in expected)],
+        [roles_by_name[name]["oid"] for name in (policy.owner_role, policy.publisher_role, *policy.runtime_roles)],
+        protected_oids,
+        roles_by_name[publication["publisher_role"]]["oid"],
+        roles_by_name[publication["owner_role"]]["oid"],
+        policy.schema,
     )
-    _require([tuple(edge) for edge in edges] == expected, "source_delegation_changed")
     _require(
-        await connection.fetchval(
-            "SELECT NOT EXISTS(SELECT FROM pg_auth_members WHERE member=ANY($1::oid[]) "
-            "AND NOT(member=$2::oid AND roleid=$3::oid))",
-            [owner_oid, roles_by_name[policy.publisher_role]["oid"]],
-            roles_by_name[policy.publisher_role]["oid"],
-            owner_oid,
-        ),
+        [tuple(edge) for edge in _json(delegation["edges"])] == expected,
         "source_delegation_changed",
     )
-    allowed_oids = [owner_oid, *(entry[0] for entry in expected)]
-    _require(
-        await connection.fetchval(
-            "SELECT NOT EXISTS(SELECT FROM pg_roles WHERE NOT rolsuper AND oid<>ALL($2::oid[]) "
-            "AND (pg_has_role(oid,$1::oid,'SET') OR pg_has_role(oid,$1::oid,'USAGE')))",
-            owner_oid,
-            allowed_oids,
-        ),
-        "source_delegation_changed",
-    )
-    await _isolated_publication_authority(connection, policy, roles_by_name, protected_oids, publication)
-
-
-async def _isolated_publication_authority(connection, policy, roles_by_name, protected_oids, publication):
-    """Keep protected publication custody beyond every ordinary Source principal."""
-    ordinary_oids = [
-        roles_by_name[name]["oid"] for name in (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
-    ]
-    _require(
-        await connection.fetchval(
-            "SELECT NOT EXISTS(SELECT FROM unnest($1::oid[]) actor(oid),unnest($2::oid[]) owner(oid) "
-            "WHERE pg_has_role(actor.oid,owner.oid,'SET') OR pg_has_role(actor.oid,owner.oid,'USAGE'))",
-            ordinary_oids,
-            protected_oids,
-        ),
-        "publication_reverse_delegation",
-    )
-    _require(
-        await connection.fetchval(
-            "SELECT pg_has_role($1::oid,$2::oid,'USAGE') AND pg_has_role($1::oid,$2::oid,'SET') "
-            "AND has_schema_privilege($2::oid,$3::name,'CREATE')",
-            roles_by_name[publication["publisher_role"]]["oid"],
-            roles_by_name[publication["owner_role"]]["oid"],
-            policy.schema,
-        ),
-        "publication_custody_unavailable",
-    )
+    _require(delegation["forward_only"], "source_delegation_changed")
+    _require(delegation["owner_closed"], "source_delegation_changed")
+    _require(delegation["publication_closed"], "publication_reverse_delegation")
+    _require(delegation["publication_available"], "publication_custody_unavailable")
 
 
 def _isolated_layout_shape(row, *, template):
@@ -330,13 +314,112 @@ def _isolated_layout_shape(row, *, template):
     )
 
 
-async def _isolated_application_checks(connection, catalog_schema, catalog_oid):
-    from process.provider_directory_generic_source_provision import _ISOLATED_APPLICATION_CHECKS, _ISOLATED_TEMPLATE_SQL
-    from process.provider_directory_generic_source_storage import HEADER, _json
+_ADMISSION_RIGHTS = {
+    "provider_directory_source": ("source_id", None),
+    "provider_directory_api_endpoint": ("endpoint_id", None),
+    "import_run": (
+        "run_id",
+        ["run_id", "retry_of_run_id", "engine", "node_id", "importer", "status", "finished_at", "params"],
+    ),
+}
+_ADMISSION_RIGHTS_SQL = """SELECT relation.oid,
+ NOT pg_has_role($3::oid,relation.relowner::oid,'SET')
+ AND NOT pg_has_role($3::oid,relation.relowner::oid,'USAGE')
+ AND has_schema_privilege($3::oid,$2::name,'USAGE') AND NOT has_schema_privilege($3::oid,$2::name,'CREATE')
+ AND NOT has_table_privilege($3::oid,relation.oid::oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+ AND NOT has_any_column_privilege($3::oid,relation.oid::oid,'INSERT,REFERENCES')
+ AND NOT has_table_privilege($4::oid,relation.oid::oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+ AND NOT has_any_column_privilege($4::oid,relation.oid::oid,'INSERT,UPDATE,REFERENCES')
+ AND EXISTS(SELECT FROM pg_attribute WHERE attrelid=relation.oid AND attname=rights.key AND NOT attisdropped)
+ AND NOT EXISTS(SELECT FROM pg_attribute a WHERE a.attrelid=relation.oid AND a.attnum>0 AND NOT a.attisdropped
+  AND (has_column_privilege($3::oid,relation.oid::oid,a.attnum,'UPDATE')<>(a.attname=rights.key)
+  OR has_column_privilege($3::oid,relation.oid::oid,a.attnum,'SELECT')<>(rights.selected IS NULL OR a.attname=ANY(rights.selected))
+  OR has_column_privilege($3::oid,relation.oid::oid,a.attnum,'SELECT WITH GRANT OPTION,UPDATE WITH GRANT OPTION'))) AS closed
+ FROM catalog relation JOIN jsonb_to_recordset($8::jsonb) rights(root text,key text,selected text[])
+ ON relation.relname=rights.root WHERE relation.scope='admission'"""
 
-    rows = await connection.fetch(_ISOLATED_TEMPLATE_SQL, catalog_oid, [HEADER])
+
+def _isolated_catalog_sql():
+    """Evaluate existing catalog contracts together, without retaining observations."""
+    from process.plan_release_storage_catalog import CATALOG_SQL
+    from process.provider_directory_generic_source_provision import _FHIR_PHYSICAL_SQL, _ISOLATED_TEMPLATE_SQL
+
+    catalog = CATALOG_SQL.replace("$3::oid[]", "ARRAY[]::oid[]").replace("$2::oid", "$3::oid")
+    catalog = catalog.replace("$1::text[]", "relation_group.names")
+    template = _ISOLATED_TEMPLATE_SQL.replace("$2::text[]", "template_group.names")
+    template = template.replace("$1::oid", "template_group.namespace_oid")
+    physical = _FHIR_PHYSICAL_SQL.replace("$1::oid[]", "ARRAY(SELECT oid::oid FROM catalog)")
+    layouts = _PRIVATE_LAYOUT_SQL.replace("$2::text[]", "$6::text[]")
+    layouts = layouts.replace("$1::text[]", "ARRAY[$2::text,$1::text]")
+    return f"""WITH relation_groups(scope,names) AS (
+ SELECT 'private',array_agg(quote_ident($1::text)||'.'||quote_ident(root) ORDER BY ordinal)
+ FROM unnest($6::text[]) WITH ORDINALITY roots(root,ordinal)
+ UNION ALL SELECT 'admission',array_agg(c.oid::text ORDER BY c.relname)
+ FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE n.nspname=$2 AND c.relname=ANY(ARRAY(SELECT root FROM jsonb_to_recordset($8::jsonb) rights(root text)))
+ ), catalog AS MATERIALIZED (
+ SELECT relation_group.scope,evidence.* FROM relation_groups relation_group CROSS JOIN LATERAL ({catalog}) evidence
+ ), template_groups(scope,namespace_oid,names) AS (
+ SELECT 'private',to_regnamespace($1)::oid,$6::text[]
+ UNION ALL SELECT 'catalog',to_regnamespace($2)::oid,ARRAY[($6::text[])[1]]
+ ), templates AS (
+ SELECT template_group.scope,evidence.* FROM template_groups template_group CROSS JOIN LATERAL ({template}) evidence
+ ), physical AS ({physical}), layouts AS ({layouts}), admission_rights AS ({_ADMISSION_RIGHTS_SQL})
+ SELECT (SELECT coalesce(jsonb_agg(catalog ORDER BY scope,oid),'[]'::jsonb) FROM catalog) AS catalog,
+ (SELECT coalesce(jsonb_agg(templates ORDER BY scope,relname),'[]'::jsonb) FROM templates) AS templates,
+ (SELECT coalesce(jsonb_agg(physical ORDER BY oid),'[]'::jsonb) FROM physical) AS physical,
+ (SELECT coalesce(jsonb_agg(layouts ORDER BY nspname,relname),'[]'::jsonb) FROM layouts) AS layouts,
+ (SELECT coalesce(jsonb_agg(admission_rights ORDER BY oid),'[]'::jsonb) FROM admission_rights) AS admission_rights,
+ quote_ident($2::text)||'.' AS catalog_prefix,{_isolated_native_checks_sql()}"""
+
+
+def _isolated_native_checks_sql():
+    from process.provider_directory_generic_source_provision import _ISOLATED_DEPENDENCIES_SQL
+    from process.provider_directory_generic_source_storage import _PRIVATE_READERS_CLOSED_SQL
+    from process.provider_directory_source_checkpoint_catalog import _NATIVE_SQL
+
+    private_oids = "ARRAY(SELECT oid::oid FROM catalog WHERE scope='private')"
+    readers = _PRIVATE_READERS_CLOSED_SQL.replace("$2::oid[]", "$5::oid[]").replace("$1::oid[]", private_oids)
+    dependencies = _ISOLATED_DEPENDENCIES_SQL.replace("$2::oid[]", "ARRAY[]::oid[]")
+    dependencies = dependencies.replace("$1::oid[]", private_oids)
+    checkpoint = _NATIVE_SQL.replace("$1::oid", "relation.oid::oid")
+    return f"""({readers}) AS readers_closed,({dependencies}) AS dependencies_closed,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object('oid',relation.oid,'supported',({checkpoint})) ORDER BY relation.oid),
+ '[]'::jsonb) FROM catalog relation WHERE scope='private' AND relname=ANY($7::text[])) AS checkpoints"""
+
+
+async def _isolated_catalog_rows(connection, policy, catalog_schema, roles_by_name):
+    from process.provider_directory_generic_source_provision import ISOLATED_FHIR_ROOTS
+    from process.provider_directory_generic_source_storage import _json
+    from process.provider_directory_source_checkpoint_catalog import CHECKPOINT_LAYOUTS
+
+    evidence_by_field = dict(
+        await connection.fetchrow(
+            _isolated_catalog_sql(),
+            policy.schema,
+            catalog_schema,
+            roles_by_name[policy.owner_role]["oid"],
+            roles_by_name[policy.publisher_role]["oid"],
+            [roles_by_name[name]["oid"] for name in policy.runtime_roles],
+            list(ISOLATED_FHIR_ROOTS),
+            list(CHECKPOINT_LAYOUTS),
+            json.dumps(
+                [dict(root=root, key=key, selected=selected) for root, (key, selected) in _ADMISSION_RIGHTS.items()]
+            ),
+        )
+    )
+    for name in ("catalog", "templates", "physical", "layouts", "admission_rights", "checkpoints"):
+        evidence_by_field[name] = _json(evidence_by_field[name])
+    return evidence_by_field
+
+
+def _isolated_application_checks(evidence):
+    from process.provider_directory_generic_source_provision import _ISOLATED_APPLICATION_CHECKS
+    from process.provider_directory_generic_source_storage import _json
+
+    rows = [relation for relation in evidence["templates"] if relation["scope"] == "catalog"]
     _require(len(rows) == 1 and rows[0]["supported"], "header_template_changed")
-    prefix = await connection.fetchval("SELECT quote_ident($1::text)||'.'", catalog_schema)
+    prefix = evidence["catalog_prefix"]
     checks_by_name = {check["name"]: check for check in _json(rows[0]["checks"]) or []}
     required_checks_by_name = {}
     for name, (function, digest) in _ISOLATED_APPLICATION_CHECKS.items():
@@ -350,10 +433,10 @@ async def _isolated_application_checks(connection, catalog_schema, catalog_oid):
     return required_checks_by_name
 
 
-async def _require_isolated_relation_layouts(connection, policy, roles_by_name, relation_rows):
+def _require_isolated_relation_layouts(policy, roles_by_name, relation_rows, checkpoints):
     """Check private relation owners, native layouts and checkpoint contracts."""
     from process.provider_directory_generic_source_storage import _table_proof
-    from process.provider_directory_source_checkpoint_catalog import _NATIVE_SQL, CHECKPOINT_LAYOUTS, _require_layout
+    from process.provider_directory_source_checkpoint_catalog import CHECKPOINT_LAYOUTS, _require_layout
     from process.provider_directory_source_proof_control import PROOF_ROOT, _require_proof_layout
 
     for relation in relation_rows:
@@ -366,45 +449,39 @@ async def _require_isolated_relation_layouts(connection, policy, roles_by_name, 
             _require_proof_layout(relation, isolated=True)
         if relation["relname"] in CHECKPOINT_LAYOUTS:
             _require_layout(relation, policy.schema, isolated=True)
-            _require(await connection.fetchval(_NATIVE_SQL, relation["oid"]), "checkpoint_native_contract_changed")
+            _require(checkpoints.get(relation["oid"]), "checkpoint_native_contract_changed")
 
 
-async def _isolated_inventory(connection, policy, catalog_schema, roles_by_name):
+def _isolated_inventory(policy, catalog_schema, roles_by_name, evidence):
     """Verify and return the physical inventory for one isolated source schema."""
-    from db.plan_release_storage import storage_relation
-    from process.plan_release_storage_catalog import CATALOG_SQL
     from process.provider_directory_generic_source_provision import (
-        _ISOLATED_DEPENDENCIES_SQL,
-        _ISOLATED_TEMPLATE_SQL,
         ISOLATED_FHIR_ROOTS,
         _fhir_catalog_row,
-        _fhir_physical_inventory,
+        _fhir_physical_rows,
     )
-    from process.provider_directory_generic_source_storage import require_private_source_readers_closed
+    from process.provider_directory_generic_source_storage import _require as require_storage
 
     roots = list(ISOLATED_FHIR_ROOTS)
-    relation_rows = await connection.fetch(
-        CATALOG_SQL,
-        [storage_relation(policy.schema, root) for root in roots],
-        roles_by_name[policy.owner_role]["oid"],
-        [],
-    )
+    relation_rows = [
+        {key: field_value for key, field_value in relation.items() if key != "scope"}
+        for relation in evidence["catalog"]
+        if relation["scope"] == "private"
+    ]
     _require(
         len(relation_rows) == len(roots) and {relation["relname"] for relation in relation_rows} == set(roots),
         "storage_missing",
     )
-    await _require_isolated_relation_layouts(connection, policy, roles_by_name, relation_rows)
-    relation_oids = [relation["oid"] for relation in relation_rows]
-    await require_private_source_readers_closed(
-        connection, relation_oids, [roles_by_name[name]["oid"] for name in policy.runtime_roles]
+    _require_isolated_relation_layouts(
+        policy, roles_by_name, relation_rows, {entry["oid"]: entry["supported"] for entry in evidence["checkpoints"]}
     )
-    _require(await connection.fetchval(_ISOLATED_DEPENDENCIES_SQL, relation_oids, []), "storage_dependency_changed")
-    native = await connection.fetch(
-        _ISOLATED_TEMPLATE_SQL, await connection.fetchval("SELECT to_regnamespace($1)::oid", policy.schema), roots
+    require_storage(evidence["readers_closed"] is True, "private_reader_access")
+    _require(evidence["dependencies_closed"], "storage_dependency_changed")
+    native_rows = [relation for relation in evidence["templates"] if relation["scope"] == "private"]
+    _require(
+        len(native_rows) == len(roots) and all(relation["supported"] for relation in native_rows),
+        "storage_native_changed",
     )
-    _require(len(native) == len(roots) and all(relation["supported"] for relation in native), "storage_native_changed")
-    layouts = await connection.fetch(_PRIVATE_LAYOUT_SQL, [catalog_schema, policy.schema], roots)
-    layout_by_key = {(relation["nspname"], relation["relname"]): relation for relation in layouts}
+    layout_by_key = {(relation["nspname"], relation["relname"]): relation for relation in evidence["layouts"]}
     _require(len(layout_by_key) == 2 * len(roots), "template_missing")
     for root in roots:
         _require(
@@ -412,7 +489,10 @@ async def _isolated_inventory(connection, policy, catalog_schema, roles_by_name)
             == _isolated_layout_shape(layout_by_key[catalog_schema, root], template=True),
             "template_layout_changed",
         )
-    physical = await _fhir_physical_inventory(connection, [dict(relation) for relation in relation_rows])
+    relation_oids = {relation["oid"] for relation in relation_rows}
+    physical = _fhir_physical_rows(
+        relation_rows, [relation for relation in evidence["physical"] if relation["oid"] in relation_oids]
+    )
     return {
         relation["relname"]: {
             **_fhir_catalog_row(relation),
@@ -441,41 +521,20 @@ async def _isolated_access_closure(connection, inventory_by_name, roles_by_name,
     )
 
 
-async def _isolated_admission_rows(connection, catalog_schema, owner_oid):
-    """Read the exact admission roots by native OID without canonical schema access."""
-    from process.plan_release_storage_catalog import CATALOG_SQL
+def _isolated_admission_rights(catalog_schema, evidence):
+    from process.provider_directory_generic_source_provision import _fhir_catalog_row, _fhir_physical_rows
 
-    named_relations = await connection.fetch(
-        "SELECT c.oid::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) ORDER BY c.relname",
-        catalog_schema,
-        sorted(_CATALOG_ROOTS),
-    )
-    relation_rows = await connection.fetch(
-        CATALOG_SQL, [str(relation["oid"]) for relation in named_relations], owner_oid, []
-    )
+    relation_rows = [
+        {key: value for key, value in relation.items() if key != "scope"}
+        for relation in evidence["catalog"]
+        if relation["scope"] == "admission"
+    ]
     _require(
         len(relation_rows) == 3 and {relation["relname"] for relation in relation_rows} == _CATALOG_ROOTS,
         "admission_missing",
     )
-    return relation_rows
-
-
-async def _isolated_admission_rights(connection, catalog_schema, roles_by_name, policy):
-    from process.provider_directory_generic_source_provision import _fhir_catalog_row, _fhir_physical_inventory
-
-    owner = roles_by_name[policy.owner_role]["oid"]
-    relation_rows = await _isolated_admission_rows(connection, catalog_schema, owner)
-    rights_by_root = {
-        "provider_directory_source": ("source_id", None),
-        "provider_directory_api_endpoint": ("endpoint_id", None),
-        "import_run": (
-            "run_id",
-            ["run_id", "retry_of_run_id", "engine", "node_id", "importer", "status", "finished_at", "params"],
-        ),
-    }
+    closed_by_oid = {relation["oid"]: relation["closed"] for relation in evidence["admission_rights"]}
     for relation in relation_rows:
-        key, selected = rights_by_root[relation["relname"]]
         _require(
             relation["nspname"] == catalog_schema
             and relation["relkind"] == "r"
@@ -484,37 +543,36 @@ async def _isolated_admission_rights(connection, catalog_schema, roles_by_name, 
             and not relation["relforcerowsecurity"],
             "admission_layout_changed",
         )
-        _require(
-            await connection.fetchval(
-                "SELECT NOT pg_has_role($1::oid,$2::oid,'SET') AND NOT pg_has_role($1::oid,$2::oid,'USAGE') "
-                "AND has_schema_privilege($1::oid,$4::name,'USAGE') AND NOT has_schema_privilege($1::oid,$4::name,'CREATE') "
-                "AND NOT has_table_privilege($1::oid,$3::oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
-                "AND NOT has_any_column_privilege($1::oid,$3::oid,'INSERT,REFERENCES') "
-                "AND NOT has_table_privilege($7::oid,$3::oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
-                "AND NOT has_any_column_privilege($7::oid,$3::oid,'INSERT,UPDATE,REFERENCES') "
-                "AND EXISTS(SELECT FROM pg_attribute WHERE attrelid=$3::oid AND attname=$5 AND NOT attisdropped) "
-                "AND NOT EXISTS(SELECT FROM pg_attribute a WHERE a.attrelid=$3::oid AND a.attnum>0 AND NOT a.attisdropped "
-                "AND (has_column_privilege($1::oid,$3::oid,a.attnum,'UPDATE')<>(a.attname=$5) "
-                "OR has_column_privilege($1::oid,$3::oid,a.attnum,'SELECT')<>($6::text[] IS NULL OR a.attname=ANY($6)) "
-                "OR has_column_privilege($1::oid,$3::oid,a.attnum,'SELECT WITH GRANT OPTION,UPDATE WITH GRANT OPTION')))",
-                owner,
-                relation["relowner"],
-                relation["oid"],
-                catalog_schema,
-                key,
-                selected,
-                roles_by_name[policy.publisher_role]["oid"],
-            ),
-            "admission_authority_changed",
-        )
-    physical_rows = await _fhir_physical_inventory(connection, [dict(relation) for relation in relation_rows])
+        _require(closed_by_oid.get(relation["oid"]), "admission_authority_changed")
+    relation_oids = {relation["oid"] for relation in relation_rows}
+    physical_rows = _fhir_physical_rows(
+        relation_rows, [relation for relation in evidence["physical"] if relation["oid"] in relation_oids]
+    )
     return {relation["relname"]: _fhir_catalog_row(relation) for relation in physical_rows}
 
 
-async def _isolated_metadata_rows(connection, catalog_schema, runtime_roles):
-    """Resolve fixed callable identities without granting Publisher canonical schema access."""
-    from db.plan_release_storage import storage_relation
+def _isolated_metadata_sql():
     from process.provider_directory_cms_callable_custody import _FUNCTION_SQL
+
+    functions = _FUNCTION_SQL.replace("$1::text[]", "ARRAY(SELECT oid::text FROM named_functions)")
+    functions = functions.replace("$2", "$1").replace("$3::text[]", "$2::text[]").replace("$4::text[]", "$3::text[]")
+    return f"""WITH named_functions AS MATERIALIZED (
+ SELECT p.oid,p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+ WHERE n.nspname=$1 AND p.proname=ANY($2::text[])
+ ), functions AS ({functions})
+ SELECT functions.*,named_functions.proname,
+ NOT EXISTS(SELECT FROM unnest($4::oid[]) actor(oid) WHERE
+ pg_has_role(actor.oid,(definition->>'proowner')::oid,'SET')
+ OR pg_has_role(actor.oid,(definition->>'proowner')::oid,'USAGE'))
+ AND NOT EXISTS(SELECT FROM unnest($4::oid[]) actor(oid)
+ WHERE has_function_privilege(actor.oid,(definition->>'oid')::oid,'EXECUTE')) AS authority_closed
+ FROM functions JOIN named_functions ON named_functions.oid=functions.signature::oid
+ ORDER BY named_functions.oid"""
+
+
+async def _isolated_metadata_rows(connection, catalog_schema, runtime_roles, private_oids):
+    """Resolve fixed callables and private rights in the same native snapshot."""
+    from db.plan_release_storage import storage_relation
     from process.provider_directory_source_control_privileges import METADATA_FUNCTIONS
 
     signatures_by_name = {
@@ -523,28 +581,21 @@ async def _isolated_metadata_rows(connection, catalog_schema, runtime_roles):
         + signature.split("(", 1)[1]
         for signature in METADATA_FUNCTIONS
     }
-    named_functions = await connection.fetch(
-        "SELECT p.oid::bigint,p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
-        "WHERE n.nspname=$1 AND p.proname=ANY($2::text[]) ORDER BY p.oid",
-        catalog_schema,
-        list(signatures_by_name),
-    )
-    _require(len(named_functions) == len(signatures_by_name), "metadata_missing")
-    signatures_by_oid = {str(function["oid"]): signatures_by_name[function["proname"]] for function in named_functions}
     function_rows = await connection.fetch(
-        _FUNCTION_SQL,
-        list(signatures_by_oid),
-        catalog_schema,
-        list(signatures_by_name),
-        list(runtime_roles),
+        _isolated_metadata_sql(), catalog_schema, list(signatures_by_name), list(runtime_roles), private_oids
     )
     _require(
         len(function_rows) == len(signatures_by_name)
-        and {function["signature"] for function in function_rows} == set(signatures_by_oid)
-        and set(signatures_by_oid.values()) == set(signatures_by_name.values()),
+        and {function["proname"] for function in function_rows} == set(signatures_by_name),
         "metadata_missing",
     )
-    return [dict(function, signature=signatures_by_oid[function["signature"]]) for function in function_rows]
+    return [
+        dict(
+            {key: value for key, value in function.items() if key != "proname"},
+            signature=signatures_by_name[function["proname"]],
+        )
+        for function in function_rows
+    ]
 
 
 async def _isolated_metadata_custody(connection, catalog_schema, catalog_oid, roles_by_name, policy):
@@ -552,10 +603,11 @@ async def _isolated_metadata_custody(connection, catalog_schema, catalog_oid, ro
     from process.provider_directory_cms_callable_custody import _decoded
     from process.provider_directory_source_callable_custody import _CONTRACTS, _TYPE_OIDS, _require_definition
 
-    function_rows = await _isolated_metadata_rows(connection, catalog_schema, policy.runtime_roles)
+    private_oids = [roles_by_name[name]["oid"] for name in (policy.owner_role, policy.publisher_role)]
+    function_rows = await _isolated_metadata_rows(connection, catalog_schema, policy.runtime_roles, private_oids)
     functions_by_signature = {}
     for function in function_rows:
-        function_by_field = dict(function)
+        function_by_field = {key: value for key, value in function.items() if key != "authority_closed"}
         for key in ("definition", "acl", "access"):
             function_by_field[key] = _decoded(function_by_field[key])
         signature = function["signature"].split(".", 1)[1].replace('"', "").replace("character varying", "varchar")
@@ -567,24 +619,10 @@ async def _isolated_metadata_custody(connection, catalog_schema, catalog_oid, ro
             _TYPE_OIDS,
             storage_identifier(catalog_schema),
         )
-        function_owner = int(function_by_field["definition"]["proowner"])
         ordinary_oids = [
             roles_by_name[name]["oid"] for name in (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
         ]
-        private_oids = [roles_by_name[name]["oid"] for name in (policy.owner_role, policy.publisher_role)]
-        _require(
-            await connection.fetchval(
-                "SELECT NOT EXISTS(SELECT FROM unnest($1::oid[]) actor(oid) WHERE "
-                "pg_has_role(actor.oid,$2::oid,'SET') OR pg_has_role(actor.oid,$2::oid,'USAGE')) "
-                "AND NOT EXISTS(SELECT FROM unnest($3::oid[]) actor(oid) "
-                "WHERE has_function_privilege(actor.oid,$4::oid,'EXECUTE'))",
-                private_oids,
-                function_owner,
-                private_oids,
-                int(function_by_field["definition"]["oid"]),
-            ),
-            "metadata_authority_changed",
-        )
+        _require(function["authority_closed"], "metadata_authority_changed")
         # Existing runtime rights stay pinned; only private principals must lack canonical authority.
         function_by_field["access"] = [access for access in function_by_field["access"] if access[0] in ordinary_oids]
         functions_by_signature[signature] = function_by_field
@@ -638,16 +676,15 @@ async def capture_isolated_source_storage_custody(
         coordinates is not None and coordinates["namespace_owner_oid"] == roles_by_name[namespace_owner_role]["oid"],
         "storage_identity_changed",
     )
+    evidence = await _isolated_catalog_rows(connection, policy, catalog_schema, roles_by_name)
     custody_by_field = dict(
         version=1,
         coordinates=dict(catalog_schema=catalog_schema, storage_schema=policy.schema, **dict(coordinates)),
         roles=roles_by_name,
-        inventory=await _isolated_inventory(connection, policy, catalog_schema, roles_by_name),
-        application_checks=await _isolated_application_checks(
-            connection, catalog_schema, coordinates["catalog_schema_oid"]
-        ),
+        inventory=_isolated_inventory(policy, catalog_schema, roles_by_name, evidence),
+        application_checks=_isolated_application_checks(evidence),
         canonical_authority=dict(
-            admission=await _isolated_admission_rights(connection, catalog_schema, roles_by_name, policy),
+            admission=_isolated_admission_rights(catalog_schema, evidence),
             metadata=await _isolated_metadata_custody(
                 connection, catalog_schema, coordinates["catalog_schema_oid"], roles_by_name, policy
             ),

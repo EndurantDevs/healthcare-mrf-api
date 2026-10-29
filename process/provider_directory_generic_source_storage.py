@@ -481,12 +481,17 @@ async def _capture(connection, policy, names, *, private=True):
     return proof_by_name
 
 
+_PRIVATE_READERS_CLOSED_SQL = (
+    "SELECT NOT EXISTS(SELECT FROM unnest($1::oid[]) relations(oid),unnest($2::oid[]) readers(oid) "
+    "WHERE has_table_privilege(readers.oid,relations.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
+    "OR has_any_column_privilege(readers.oid,relations.oid,'SELECT,INSERT,UPDATE,REFERENCES'))"
+)
+
+
 async def require_private_source_readers_closed(connection, relation_oids, reader_oids):
     """Private loading storage grants no direct or inherited runtime access."""
     closed = await connection.fetchval(
-        "SELECT NOT EXISTS(SELECT FROM unnest($1::oid[]) relations(oid),unnest($2::oid[]) readers(oid) "
-        "WHERE has_table_privilege(readers.oid,relations.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
-        "OR has_any_column_privilege(readers.oid,relations.oid,'SELECT,INSERT,UPDATE,REFERENCES'))",
+        _PRIVATE_READERS_CLOSED_SQL,
         list(relation_oids),
         list(reader_oids),
     )

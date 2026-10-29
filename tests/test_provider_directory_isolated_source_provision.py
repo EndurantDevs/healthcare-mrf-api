@@ -427,10 +427,11 @@ async def test_native_isolated_inventory_rechecks_provisioned_storage(native_boo
         await _provision(case)
         roles_by_name = {
             name: {"oid": await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", name)}
-            for name in (case.policy.owner_role, *case.policy.runtime_roles)
+            for name in (case.policy.owner_role, case.policy.publisher_role, *case.policy.runtime_roles)
         }
+        evidence = await binding._isolated_catalog_rows(connection, case.policy, "catalog", roles_by_name)
         with pytest.raises(GenericCandidateError, match="checkpoint_layout_changed"):
-            await binding._isolated_inventory(connection, case.policy, "catalog", roles_by_name)
+            binding._isolated_inventory(case.policy, "catalog", roles_by_name, evidence)
 
 
 async def _assert_migrated_isolated_custody(driver, storage_policy, role_names_by_kind):
@@ -441,14 +442,19 @@ async def _assert_migrated_isolated_custody(driver, storage_policy, role_names_b
         name: {"oid": await driver.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", name)}
         for name in (storage_policy.owner_role, storage_policy.publisher_role, *storage_policy.runtime_roles)
     }
-    inventory = await binding._isolated_inventory(driver, storage_policy, "mrf", roles_by_name)
+    evidence = await binding._isolated_catalog_rows(driver, storage_policy, "mrf", roles_by_name)
+    inventory = binding._isolated_inventory(storage_policy, "mrf", roles_by_name, evidence)
     assert set(inventory) == set(provision.ISOLATED_FHIR_ROOTS)
-    catalog_oid = await driver.fetchval("SELECT 'mrf'::regnamespace::oid")
-    checks = await binding._isolated_application_checks(driver, "mrf", catalog_oid)
+    checks = binding._isolated_application_checks(evidence)
     assert set(checks) == set(provision._ISOLATED_APPLICATION_CHECKS)
-    admission = await binding._isolated_admission_rows(driver, "mrf", roles_by_name[storage_policy.owner_role]["oid"])
-    assert {relation["relname"] for relation in admission} == binding._CATALOG_ROOTS
-    metadata = await binding._isolated_metadata_rows(driver, "mrf", storage_policy.runtime_roles)
+    admission_rows = [relation for relation in evidence["catalog"] if relation["scope"] == "admission"]
+    assert {relation["relname"] for relation in admission_rows} == binding._CATALOG_ROOTS
+    metadata = await binding._isolated_metadata_rows(
+        driver,
+        "mrf",
+        storage_policy.runtime_roles,
+        [roles_by_name[name]["oid"] for name in (storage_policy.owner_role, storage_policy.publisher_role)],
+    )
     assert metadata
     task, publisher_identity = await binding._require_source_storage_publisher(driver, storage_policy, None)
     assert task is not None and publisher_identity["administrator"]
