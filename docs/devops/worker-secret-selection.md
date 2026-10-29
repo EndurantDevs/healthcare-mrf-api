@@ -48,6 +48,14 @@ activation checks. Qualify both paths and the independent API reader with
 real roles before enabling these references. Secret selection is not proof
 of publisher readiness, a passing audit or successful activation.
 
+## Discovery worker image
+
+Set the optional `HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE` to an immutable
+`repository@sha256:digest` image reference for `mrf-source-discovery` Kubernetes
+workers. An unset or blank value uses `HLTHPRT_WORKER_JOB_IMAGE`. Authorized
+source-worker launch images retain priority. Other importers continue to use
+their configured images.
+
 ## Protected source-profile maintenance
 
 Set `HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE` to an independently managed,

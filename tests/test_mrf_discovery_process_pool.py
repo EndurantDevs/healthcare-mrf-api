@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import threading
+import time
+from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 
@@ -15,16 +22,42 @@ from process.mrf_source_discovery import (
     DiscoverySourceProcessPool,
     SourceBatchSummary,
     SourceProcessResult,
+    _consume_bounded_crawl_targets,
+    _consume_completed_crawl_tasks,
     _discovery_http_connection_limit,
     _discovery_http_per_host_limit,
     _discovery_process_http_limits,
     _discovery_process_worker_count,
     _discovery_target_concurrency,
-    _consume_bounded_crawl_targets,
-    _consume_completed_crawl_tasks,
     _execute_discovery_source_batch,
     _process_discovery_source_record,
 )
+
+
+def _process_pool_test_options():
+    return DiscoverySourceProcessingOptions(
+        test_mode=True,
+        check_urls=False,
+        crawl=False,
+        observation_run_id="run_process_test",
+        max_toc_bytes=1024,
+        crawl_target_limit=None,
+    )
+
+
+def _simulate_source_process(source_record, _processing_options):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    Path(source_record["started_path"]).write_text(str(os.getpid()))
+    if source_record["action"] == "exit":
+        os._exit(7)
+    while True:
+        time.sleep(1)
+
+
+async def _wait_for_process_start(path):
+    async with asyncio.timeout(30):
+        while not path.exists():
+            await asyncio.sleep(0.01)
 
 
 async def _execute_all_source_callbacks(**batch_options):
@@ -190,9 +223,7 @@ class _SharedSessionBatchProbe:
         return SourceProcessResult()
 
     async def execute_batch(self, **option_by_name):
-        self.observed_executor_concurrency_list.append(
-            option_by_name["concurrency"]
-        )
+        self.observed_executor_concurrency_list.append(option_by_name["concurrency"])
         return await _execute_all_source_callbacks(**option_by_name)
 
 
@@ -229,10 +260,7 @@ async def test_async_batch_reuses_session_and_forwards_source_concurrency(monkey
         probe.shared_session,
         probe.shared_session,
     ]
-    assert len({
-        id(semaphore)
-        for semaphore in probe.observed_target_semaphore_list
-    }) == 1
+    assert len({id(semaphore) for semaphore in probe.observed_target_semaphore_list}) == 1
     assert probe.observed_target_semaphore_list[0]._value == 34
     assert probe.observed_session_option_list == [
         {
@@ -329,14 +357,7 @@ async def test_spawned_process_pool_returns_source_result():
     try:
         source_result = await process_pool.process_source(
             {"source_id": "source_process_test"},
-            DiscoverySourceProcessingOptions(
-                test_mode=True,
-                check_urls=False,
-                crawl=False,
-                observation_run_id="run_process_test",
-                max_toc_bytes=1024,
-                crawl_target_limit=None,
-            ),
+            _process_pool_test_options(),
         )
     except BaseException:
         await process_pool.terminate()
@@ -347,6 +368,97 @@ async def test_spawned_process_pool_returns_source_result():
     assert source_result.plans_discovered == 0
     assert source_result.files_discovered == 0
     assert source_result.bytes_streamed == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notify_exit", [True, False])
+async def test_abrupt_process_exit_drains_surviving_writers_before_failure(monkeypatch, tmp_path, notify_exit):
+    monkeypatch.setattr(discovery, "_run_discovery_source_process", _simulate_source_process)
+    process_pool = DiscoverySourceProcessPool(2)
+    if not notify_exit:
+        submit = process_pool._process_pool.submit
+
+        def submit_without_notification(*arguments):
+            submit(*arguments)
+            return Future()
+
+        monkeypatch.setattr(process_pool._process_pool, "submit", submit_without_notification)
+    waiting_source = asyncio.create_task(
+        process_pool.process_source(
+            {"action": "wait", "started_path": str(tmp_path / "waiting")}, _process_pool_test_options()
+        )
+    )
+    source_tasks = [waiting_source]
+    try:
+        await _wait_for_process_start(tmp_path / "waiting")
+        source_tasks.append(
+            asyncio.create_task(
+                process_pool.process_source(
+                    {"action": "exit", "started_path": str(tmp_path / "exiting")}, _process_pool_test_options()
+                )
+            )
+        )
+        source_outcomes = await asyncio.wait_for(asyncio.gather(*source_tasks, return_exceptions=True), 30)
+        assert all(isinstance(outcome, BrokenProcessPool) for outcome in source_outcomes)
+        assert all(process.exitcode is not None for process in process_pool._processes_by_pid.values())
+        with pytest.raises(RuntimeError, match="process pool is closed"):
+            await process_pool.process_source(
+                {"action": "wait", "started_path": str(tmp_path / "forbidden")}, _process_pool_test_options()
+            )
+        assert not (tmp_path / "forbidden").exists()
+    finally:
+        await process_pool.terminate()
+        await asyncio.gather(*source_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_and_concurrent_shutdown_wait_for_one_drain(monkeypatch, tmp_path):
+    monkeypatch.setattr(discovery, "_run_discovery_source_process", _simulate_source_process)
+    process_pool = DiscoverySourceProcessPool(2)
+    join_started, release_join = threading.Event(), threading.Event()
+    original_join = process_pool._join_processes
+
+    def delayed_join(cancel_futures):
+        join_started.set()
+        release_join.wait(30)
+        original_join(cancel_futures)
+
+    monkeypatch.setattr(process_pool, "_join_processes", delayed_join)
+    source_tasks = [
+        asyncio.create_task(
+            process_pool.process_source(
+                {"action": "wait", "started_path": str(tmp_path / str(index))}, _process_pool_test_options()
+            )
+        )
+        for index in range(2)
+    ]
+    shutdown_tasks = []
+    try:
+        await asyncio.gather(*(_wait_for_process_start(tmp_path / str(index)) for index in range(2)))
+        shutdown_tasks = [asyncio.create_task(process_pool.close())]
+        async with asyncio.timeout(30):
+            while not join_started.is_set():
+                await asyncio.sleep(0.01)
+        for source_task in source_tasks:
+            source_task.cancel()
+        shutdown_tasks.append(asyncio.create_task(process_pool.terminate()))
+        await asyncio.sleep(0)
+        for _ in range(2):
+            for task in source_tasks + shutdown_tasks[:1]:
+                task.cancel()
+            await asyncio.sleep(0)
+        assert all(not task.done() for task in source_tasks + shutdown_tasks)
+        release_join.set()
+        source_outcomes = await asyncio.wait_for(
+            asyncio.gather(*source_tasks, *shutdown_tasks, return_exceptions=True), 30
+        )
+        assert all(isinstance(outcome, asyncio.CancelledError) for outcome in source_outcomes[:3])
+        assert source_outcomes[3] is None
+        assert all(process.exitcode is not None for process in process_pool._processes_by_pid.values())
+    finally:
+        release_join.set()
+        await process_pool.terminate()
+        await asyncio.gather(*source_tasks, *shutdown_tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio
