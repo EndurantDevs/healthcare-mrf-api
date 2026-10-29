@@ -428,6 +428,9 @@ paths:
           headers:
             X-Network-Generation:
               $ref: '#/components/headers/RegistryNetworkGeneration'
+            X-Network-Legacy-Checksums:
+              description: Exact signed checksum subset, present only after its pinned mapping and provider-office filter were enforced.
+              schema: {type: string, minLength: 1, maxLength: 600}
             Cache-Control:
               $ref: '#/components/headers/CustomImportReadCacheControl'
           content:
@@ -467,6 +470,9 @@ paths:
           headers:
             X-Network-Generation:
               $ref: '#/components/headers/RegistryNetworkGeneration'
+            X-Network-Legacy-Checksums:
+              description: Exact signed checksum subset, present only after its pinned mapping and provider-office filter were enforced.
+              schema: {type: string, minLength: 1, maxLength: 600}
             Cache-Control:
               $ref: '#/components/headers/CustomImportReadCacheControl'
           content:
@@ -544,6 +550,9 @@ paths:
               description: Present only when signed network_binding is supplied and verified.
               schema:
                 $ref: '#/components/schemas/RegistryNetworkCatalogGeneration'
+            X-Network-Legacy-Checksums:
+              description: Exact signed checksum subset, present only after its pinned mapping and provider-office filter were enforced.
+              schema: {type: string, minLength: 1, maxLength: 600}
           content:
             application/json:
               schema:
@@ -11691,6 +11700,13 @@ components:
           uniqueItems: true
           description: Sorted positive canonical IDs, exactly equal to selector.values.
           items: {type: integer, minimum: 1, maximum: 2147483647}
+        legacy_checksums:
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          description: Optional signed, sorted legacy checksum subset. Its approved mapping must exactly match network_ids in the pinned generation; provider-office reads retain this original subset.
+          items: {type: integer, minimum: -2147483648, maximum: 2147483647}
         query_sha256:
           type: string
           pattern: '^[0-9a-f]{64}$'

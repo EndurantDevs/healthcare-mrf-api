@@ -139,6 +139,57 @@ async def test_unselected_or_initial_head_never_composes(monkeypatch, selected, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["complete", "refused", "cancel"])
+async def test_ptg_attempt_prepares_independent_addresses_before_fresh_composition(monkeypatch, outcome):
+    actual, connection, settings = await recipe(), Connection(), config()
+    approved = SimpleNamespace(approved_revision=7, generation_id="a" * 64)
+    pin = SimpleNamespace(generation_id=3, manifest_sha256="b" * 64, schema_name="retained_addresses")
+    copy_target = SimpleNamespace(candidate_id=str(UUID(int=8)))
+    events, observed = [], {}
+
+    async def prepare(**options):
+        events.append("prepare")
+        observed.update(options)
+        assert options["approved_revision"] == 7 and options["source_manifest"] is pin
+        assert options["expected_head"] == 3
+        assert options["address_sources"].replacement_source_recipes == (actual,)
+        if outcome != "complete":
+            raise asyncio.CancelledError if outcome == "cancel" else ValueError("address_refused")
+        return options["address_sources"]
+
+    async def compose(_runtime, _connection, **options):
+        events.append("compose")
+        assert options["address_sources"] is observed["address_sources"]
+        assert options["request_id"] == observed["request_id"] and options["source_manifest"] is pin
+        return copy_target, "addresses"
+
+    monkeypatch.setattr(consumer, "_replacement_selection", AsyncMock(return_value=(7, approved, pin, (actual,))))
+    monkeypatch.setattr(RegistryPublicationPTGRuntime, "compose", compose)
+    ready = AsyncMock()
+    monkeypatch.setattr(consumer, "prepare_network_candidate", ready)
+    monkeypatch.setattr(consumer, "_notice", AsyncMock(return_value=actual))
+    monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock(return_value=approved))
+    monkeypatch.setattr(consumer, "require_selected_ptg_office_recipes", AsyncMock())
+    published = AsyncMock()
+    monkeypatch.setattr(consumer, "publish_network_candidate", published)
+    connection.execute = AsyncMock()
+    settings = replace(settings, prepare_address_sources=prepare)
+    event_by_name = {"event_id": str(UUID(int=6)), "header": {}}
+    operation = consumer._attempt(connection, None, STORE, "office_reader", IDENTITY, event_by_name, actual, settings)
+    if outcome == "complete":
+        assert await operation == {"state": "completed"}
+        assert events == ["prepare", "compose"]
+        ready.assert_awaited_once()
+        published.assert_awaited_once()
+    else:
+        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else ValueError):
+            await operation
+        assert events == ["prepare"]
+        ready.assert_not_awaited()
+        published.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_bounded_head_conflict_retries_and_unlocks(monkeypatch):
     actual = await recipe()
     monkeypatch.setattr(consumer, "_canonical_session", AsyncMock())
@@ -388,7 +439,11 @@ async def _prepared_ptg_attempt(monkeypatch, changed, sealing):
     compose = AsyncMock(return_value=(copy_target, address))
     runtime = SimpleNamespace(compose=compose)
     cfg = SimpleNamespace(
-        control_schema="office_control", composition_runtime=runtime, writer_roles={}, seal_candidate=None
+        control_schema="office_control",
+        composition_runtime=runtime,
+        writer_roles={},
+        seal_candidate=None,
+        prepare_address_sources=None,
     )
     prepare, publish = AsyncMock(), AsyncMock()
     monkeypatch.setattr(consumer, "prepare_network_candidate", prepare)
@@ -472,16 +527,21 @@ async def test_positive_attempt_uses_existing_pipeline_and_rechecks_source_befor
 def test_ptg_custody_callback_is_runtime_only_and_hidden():
     callback = AsyncMock()
     assert replace(config(), seal_candidate=callback).seal_candidate is callback
+    assert replace(config(), prepare_address_sources=callback).prepare_address_sources is callback
     assert "AsyncMock" not in repr(replace(config(), seal_candidate=callback))
+    assert "AsyncMock" not in repr(replace(config(), prepare_address_sources=callback))
     with pytest.raises(ValueError):
         replace(config(), seal_candidate={})
+    with pytest.raises(ValueError):
+        replace(config(), prepare_address_sources={})
 
 
-def test_ptg_worker_json_cannot_select_custody_callback():
+@pytest.mark.parametrize("name", ["seal_candidate", "prepare_address_sources"])
+def test_ptg_worker_json_cannot_select_custody_callback(name):
     from process.registry_ptg_source_worker import parse_registry_ptg_source_worker_config
     from tests.test_registry_ptg_source_worker import configuration
 
     value = configuration()
-    value["consumer"]["seal_candidate"] = {}
+    value["consumer"][name] = {}
     with pytest.raises(ValueError):
         parse_registry_ptg_source_worker_config(json.dumps(value))

@@ -58,9 +58,14 @@ class RegistryPTGSourceConsumerConfig:
     operation_seconds: int = 300
     composition_runtime: RegistryPublicationPTGRuntime | None = field(default=None, repr=False)
     seal_candidate: Callable[[MembershipCopyTarget], Awaitable[None]] | None = field(default=None, repr=False)
+    prepare_address_sources: Callable[..., Awaitable[RegistryCompositionAddressSources]] | None = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self):
         if self.seal_candidate is not None and not callable(self.seal_candidate):
+            _invalid()
+        if self.prepare_address_sources is not None and not callable(self.prepare_address_sources):
             _invalid()
         for value in (self.control_schema, self.execution_role, self.owner_role):
             _identifier(value)
@@ -281,21 +286,20 @@ async def _seal_source_checkpoint(connection, copy_target, checkpoint, config, n
     return checkpoint
 
 
-async def _attempt(connection, pool, store, reader_role, identity, event, recipe, config):
-    """Prepare and seal the selected replacement before atomic reauthorization and publication."""
-    namespace = _identifier(config.control_schema)
-    selection = await _replacement_selection(connection, store, recipe, config)
-    if type(selection) is dict:
-        return selection
-    revision, approved, pin, replacement = selection
-    attempt = uuid5(
-        UUID(event["event_id"]),
-        _json((pin.manifest_sha256, approved.generation_id, canonical_registry_source_recipes(replacement))),
-    )
+async def _prepare_source_candidate(connection, config, attempt, revision, pin, replacement):
+    """Commit independently prepared addresses before opening the execution snapshot."""
     address_sources = RegistryCompositionAddressSources(
         PinnedAddressSource(pin.schema_name, "entity_address_unified", pin.manifest_sha256),
         replacement_source_recipes=replacement,
     )
+    if config.prepare_address_sources is not None:
+        address_sources = await config.prepare_address_sources(
+            request_id=attempt,
+            approved_revision=revision,
+            source_manifest=pin,
+            expected_head=pin.generation_id,
+            address_sources=address_sources,
+        )
     copy_target, addresses = await config.composition_runtime.compose(
         connection,
         request_id=attempt,
@@ -309,6 +313,21 @@ async def _attempt(connection, pool, store, reader_role, identity, event, recipe
     await prepare_network_candidate(
         connection, copy_target, addresses, **config.writer_roles, control_schema=config.control_schema
     )
+    return copy_target
+
+
+async def _attempt(connection, pool, store, reader_role, identity, event, recipe, config):
+    """Prepare and seal the selected replacement before atomic reauthorization and publication."""
+    namespace = _identifier(config.control_schema)
+    selection = await _replacement_selection(connection, store, recipe, config)
+    if type(selection) is dict:
+        return selection
+    revision, approved, pin, replacement = selection
+    attempt = uuid5(
+        UUID(event["event_id"]),
+        _json((pin.manifest_sha256, approved.generation_id, canonical_registry_source_recipes(replacement))),
+    )
+    copy_target = await _prepare_source_candidate(connection, config, attempt, revision, pin, replacement)
     checkpoint = (
         f"UPDATE {namespace}.network_membership_candidate "
         "SET validation_json=validation_json||jsonb_build_object($1::text,$2::jsonb) WHERE candidate_id=$3",

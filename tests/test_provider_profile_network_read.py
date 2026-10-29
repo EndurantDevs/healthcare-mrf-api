@@ -248,3 +248,61 @@ async def test_directory_profile_disables_jit_once_before_scoped_aggregation(mon
         assert await reader._directory_profile(session, object(), manifest(), "1000000491", query, (), "mrf") is None
     assert statements.count("SET LOCAL jit = off") == 1
     assert sum(sql.startswith("WITH projection AS MATERIALIZED") for sql in statements) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("optional,retained_capture", [(True, True), (False, True), (True, False)])
+async def test_generic_profile_omits_only_optional_authenticated_retained_enrichment(
+    monkeypatch, optional, retained_capture
+):
+    from api.network_address_scope import network_address_read_scope
+    from tests.test_network_fhir_retained_capture import pin, retained
+
+    source = pin(retained())
+    if not retained_capture:
+        source = replace(source, retained_capture=None)
+    recipes = AsyncMock(return_value=[SimpleNamespace(source_pin=source)])
+    observed = AsyncMock(return_value={})
+    monkeypatch.setattr(reader, "resolve_retained_registry_source_recipes", recipes)
+    monkeypatch.setattr(provider, "_fetch_provider_directory_profile_map", observed)
+    session = SimpleNamespace(connection=AsyncMock())
+    session.connection.return_value.get_raw_connection = AsyncMock(
+        return_value=SimpleNamespace(driver_connection=object())
+    )
+    with network_address_read_scope(address_manifest(), (42,)):
+        if optional and retained_capture:
+            assert await reader.read_detail_directory_profile(session, 1000000491, include_evidence=False) is None
+        elif optional:
+            with pytest.raises(reader.ServiceUnavailable):
+                await reader.read_detail_directory_profile(session, 1000000491, include_evidence=False)
+        else:
+            with pytest.raises(DirectoryReadError):
+                await reader.read_address_scoped_directory_profile(session, 1000000491, include_evidence=False)
+    recipes.assert_awaited_once()
+    if retained_capture:
+        observed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["mixed", "recipe"])
+async def test_optional_profile_preserves_other_proof_failures(monkeypatch, failure):
+    from api.network_address_scope import network_address_read_scope
+    from tests.test_network_fhir_retained_capture import pin, retained
+    from tests.test_provider_profile_network_facts import scope
+
+    resolve = AsyncMock(
+        return_value=[SimpleNamespace(source_pin=pin(retained())), SimpleNamespace(source_pin=scope().source_pin)]
+    )
+    if failure == "recipe":
+        resolve.side_effect = RegistrySourceRecipeError("registry_source_recipes_unavailable")
+    monkeypatch.setattr(reader, "resolve_retained_registry_source_recipes", resolve)
+    observed = AsyncMock(return_value={})
+    monkeypatch.setattr(provider, "_fetch_provider_directory_profile_map", observed)
+    session = SimpleNamespace(connection=AsyncMock())
+    session.connection.return_value.get_raw_connection = AsyncMock(
+        return_value=SimpleNamespace(driver_connection=object())
+    )
+    with network_address_read_scope(address_manifest(), (42,)), pytest.raises(reader.ServiceUnavailable):
+        await reader.read_detail_directory_profile(session, 1000000491, include_evidence=False)
+    if failure == "recipe":
+        observed.assert_not_awaited()

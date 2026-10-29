@@ -298,8 +298,8 @@ async def test_composer_passes_full_resolved_recipes_and_same_office_authority(m
     artifact = _artifact()
     prepare = AsyncMock(return_value=artifact)
     monkeypatch.setattr(candidate, "prepare_recipe_address_source", prepare)
-    source = SimpleNamespace(base_source=artifact.base_source, npi_source=None, introduced_source_recipes=())
-    approved = SimpleNamespace(approved_revision=4, generation_id="a" * 64)
+    source = candidate.RegistryCompositionAddressSources(artifact.base_source)
+    approved = SimpleNamespace(approved_revision=4, generation_id="a" * 64, total_rows=1)
     writer_by_role = {
         "owner_role": "owner_fixture",
         "loader_roles": ("loader_fixture",),

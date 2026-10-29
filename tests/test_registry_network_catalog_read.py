@@ -41,8 +41,11 @@ class BatchConnection:
             "projected_locations": 1,
             "orphan_bindings": 0,
             "candidate_readiness": {"address_rows": 1},
+            "serving_readiness": {"index_definition_sha256": "d" * 64},
         }
-        self.parity = {"address_rows": 1, "changed_arrays": 0}
+        self.index_digest = "d" * 64
+        self.native_ready = True
+        self.search_path = "sample_path"
         self.page = {"total": 1, "bounded": True, "rows_json": json.dumps([network_document()])}
         self.autocomplete = {"plan_count": 1, "bounded": True, "plans_json": json.dumps([autocomplete_document()])}
         self.legacy_batch = {"complete": True, "network_ids": [7]}
@@ -53,12 +56,10 @@ class BatchConnection:
 
     async def fetchrow(self, sql, *parameters):
         self.calls.append((sql, parameters))
-        if "current_setting" in sql:
+        if "transaction_isolation" in sql:
             return {"isolation": self.isolation, "read_only": self.read_only}
         if "validation_json::text" in sql:
             return {"validation_json": json.dumps(self.report)}
-        if "AS changed_arrays" in sql:
-            return self.parity
         if "AS plan_count" in sql:
             return self.autocomplete
         if "AS complete" in sql:
@@ -67,6 +68,14 @@ class BatchConnection:
             return self.legacy
         assert "registry_approved_record" in sql
         return self.page
+
+    async def execute(self, sql, *parameters):
+        self.calls.append((sql, parameters))
+
+    async def fetchval(self, sql, *parameters):
+        self.calls.append((sql, parameters))
+        assert sql == "SELECT current_setting('search_path')"
+        return self.search_path
 
 
 @pytest.fixture
@@ -94,18 +103,19 @@ def batch_boundary(monkeypatch):
         pinned_revisions.append(approved_revision)
         return SimpleNamespace(generation_id="a" * 64)
 
-    async def accounting(_connection, *relations):
-        assert _connection is connection
-        assert relations == (
-            '"candidate_sample".network_membership',
-            '"candidate_sample".provider_location_binding',
-            '"candidate_sample".entity_address_unified',
-        )
-        return {"membership_rows": 2, "distinct_memberships": 2, "projected_locations": 1, "orphan_bindings": 0}
+    async def readiness(_connection, schema_name):
+        assert _connection is connection and schema_name == manifest.schema_name
+        if not connection.native_ready:
+            raise ValueError("native canonical index not ready")
+
+    async def index_digest(_connection, schema_name, _plan):
+        assert _connection is connection and schema_name == manifest.schema_name
+        return connection.index_digest
 
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", resolve)
     monkeypatch.setattr(catalog, "pin_retained_approved_membership_source", retained)
-    monkeypatch.setattr(catalog, "_membership_accounting", accounting)
+    monkeypatch.setattr(catalog, "_catalog_readiness", readiness)
+    monkeypatch.setattr(catalog, "_index_digest", index_digest)
     return connection, manifest, pinned_revisions
 
 
@@ -234,18 +244,18 @@ async def test_caller_owned_pinned_read_only_transaction_required(batch_boundary
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["membership", "arrays", "address", "source"])
-async def test_directory_requires_exact_complete_accounting(batch_boundary, failure):
+@pytest.mark.parametrize("failure", ["report", "digest", "native", "source"])
+async def test_directory_requires_retained_proof_and_current_native_readiness(batch_boundary, failure):
     connection, manifest, _ = batch_boundary
-    if failure == "membership":
-        connection.report["membership_rows"] = 1
-    elif failure == "arrays":
-        connection.parity["changed_arrays"] = 1
-    elif failure == "address":
-        connection.parity["address_rows"] = 2
+    if failure == "report":
+        connection.report.pop("serving_readiness")
+    elif failure == "digest":
+        connection.index_digest = "e" * 64
+    elif failure == "native":
+        connection.native_ready = False
     else:
         manifest.source_generations["custom_membership"] = "c" * 64
-    with pytest.raises(catalog.RegistryNetworkCatalogError, match="directory_unavailable|source_changed"):
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="unavailable|source_changed"):
         await catalog.read_registry_network_catalog(
             connection, catalog.RegistryNetworkCatalogQuery(), excluded_network_ids=(), control_schema="sample_control"
         )
@@ -333,6 +343,94 @@ def test_nested_company_and_binding_metadata_is_closed():
     changed["source_bindings"][0]["source_scope"]["extra"] = "value"
     with pytest.raises(catalog.RegistryNetworkCatalogError):
         catalog._network_document(changed)
+
+
+def retained_binding_document():
+    """Keep retained capture evidence distinct from legacy aliases."""
+    return {
+        "namespace": "source_binding",
+        "binding_id": "33333333-3333-4333-8333-333333333333",
+        "revision": 1,
+        "source_system": "fhir",
+        "source_id": "source",
+        "dataset_schema": "sample_source",
+        "dataset_id": "dataset",
+        "producer_id": "registry-retained-normalized-fhir-v1",
+        "edition_id": "capture-one",
+        "source_key": "network-one",
+        "source_scope": {"organization_id": "network-one", "capture_sha256": "a" * 64},
+        "evidence_id": "reviewed-evidence",
+        "evidence_sha256": "b" * 64,
+    }
+
+
+@pytest.mark.asyncio
+async def test_retained_capture_catalog_response_preserves_exact_source_and_generation(batch_boundary):
+    """Accept only the producer-bound capture shape through the ordinary pinned reader."""
+    connection, manifest, revisions = batch_boundary
+    binding = retained_binding_document()
+    document = network_document() | {"source_bindings": [binding]}
+    connection.page["rows_json"] = json.dumps([document])
+    coordinates = RegistryNetworkSourceCoordinates(
+        *[
+            binding[key]
+            for key in ("source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id")
+        ]
+    )
+    page = await catalog.read_registry_network_catalog(
+        connection,
+        catalog.RegistryNetworkCatalogQuery(source=coordinates, generation_id=manifest.generation_id),
+        excluded_network_ids=(2,),
+        control_schema="sample_control",
+    )
+    assert page["items"] == (document,) and page["generation"] == "9" and revisions == [4]
+    assert connection.calls[-1][1][4] == coordinates.sql_parameters
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"producer_id": "different-producer"},
+        {"source_system": "ptg"},
+        {"source_scope": {"organization_id": "network-one", "capture_sha256": "A" * 64}},
+        {"source_scope": {"organization_id": "network-one", "capture_sha256": "a" * 63}},
+        {"source_scope": {"organization_id": "network-one", "capture_sha256": None}},
+        {"source_scope": {"organization_id": "network_one", "capture_sha256": "a" * 64}},
+        {"source_scope": {"organization_id": "network-one"}},
+        {
+            "source_scope": {
+                "organization_id": "network-one",
+                "capture_sha256": "a" * 64,
+                "legacy_uuid": "11111111-1111-4111-8111-111111111111",
+            }
+        },
+    ],
+)
+def test_retained_capture_catalog_refuses_forged_producer_hash_or_mixed_scope(changes):
+    """Do not widen arbitrary FHIR metadata or the legacy UUID namespace."""
+    document = network_document() | {"source_bindings": [retained_binding_document() | changes]}
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        catalog._network_document(document)
+
+
+def test_retained_capture_scope_never_satisfies_a_legacy_uuid_selector():
+    """A registry capture digest cannot create an original-source UUID alias."""
+    binding = retained_binding_document()
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="document_invalid"):
+        catalog._source_scope("fhir", binding["source_scope"])
+    coordinates = replace(source_coordinates("fhir"), producer_id=binding["producer_id"])
+    identifier = "11111111-1111-4111-8111-111111111111"
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="request_invalid"):
+        catalog.RegistryNetworkCatalogLegacySelector(
+            coordinates, "legacy_fhir_uuid", identifier, json.dumps(binding["source_scope"]).encode()
+        )
+    legacy_scope_by_field = {"organization_id": "network-one", "legacy_uuid": identifier, "alias_scope": "original"}
+    assert (
+        catalog.RegistryNetworkCatalogLegacySelector(
+            coordinates, "legacy_fhir_uuid", identifier, json.dumps(legacy_scope_by_field).encode()
+        ).value
+        == identifier
+    )
 
 
 @pytest.mark.asyncio
@@ -598,11 +696,11 @@ async def test_verified_seal_keeps_approved_map_pin_without_fact_rescan(batch_bo
     connection, manifest, revisions = batch_boundary
     manifest = _sealed_manifest(manifest, "c" * 64)
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", AsyncMock(return_value=manifest))
-    accounting = AsyncMock(side_effect=AssertionError("sealed facts must not be rescanned"))
-    monkeypatch.setattr(catalog, "_membership_accounting", accounting)
+    readiness = AsyncMock(side_effect=AssertionError("sealed facts must not be rescanned"))
+    monkeypatch.setattr(catalog, "_verified_directory", readiness)
     assert await catalog._pin(connection, 9, "sample_control") is manifest
     assert revisions == [4]
-    accounting.assert_not_awaited()
+    readiness.assert_not_awaited()
     assert len(connection.calls) == 1 and "current_setting" in connection.calls[0][0]
 
 
@@ -630,11 +728,11 @@ async def test_malformed_seal_marker_is_terminal_not_a_legacy_scan(batch_boundar
         "resolve_network_serving_manifest",
         AsyncMock(return_value=_sealed_manifest(manifest, marker)),
     )
-    accounting = AsyncMock()
-    monkeypatch.setattr(catalog, "_membership_accounting", accounting)
+    readiness = AsyncMock()
+    monkeypatch.setattr(catalog, "_verified_directory", readiness)
     with pytest.raises(catalog.RegistryNetworkCatalogError):
         await catalog._pin(connection, 9, "sample_control")
-    accounting.assert_not_awaited()
+    readiness.assert_not_awaited()
 
 
 def test_all_four_company_roles_roundtrip_without_requiring_a_group():
@@ -651,3 +749,26 @@ def test_all_four_company_roles_roundtrip_without_requiring_a_group():
         catalog._company_document(company_by_field | {"roles": [*company_by_field["roles"], "benefits_administrator"]})
     with pytest.raises(catalog.RegistryNetworkCatalogError):
         catalog._company_document(company_by_field | {"roles": ["unknown"]})
+
+
+@pytest.mark.asyncio
+async def test_unsealed_pin_uses_catalog_proof_without_fact_scans_and_restores_path(batch_boundary):
+    connection, manifest, _ = batch_boundary
+    assert await catalog._pin(connection, 9, "sample_control") is manifest
+    statements = [sql for sql, _ in connection.calls]
+    assert any(sql.startswith('LOCK TABLE "candidate_sample".network_membership,') for sql in statements)
+    assert "SET LOCAL search_path TO pg_catalog,public" in statements
+    assert connection.calls[-1] == ("SELECT set_config('search_path',$1,true)", ("sample_path",))
+    assert all("count(*)" not in sql and "JOIN" not in sql for sql in statements)
+
+
+@pytest.mark.asyncio
+async def test_native_pin_identity_change_under_relation_locks_refuses(batch_boundary, monkeypatch):
+    connection, manifest, _ = batch_boundary
+    monkeypatch.setattr(
+        catalog,
+        "resolve_network_serving_manifest",
+        AsyncMock(side_effect=[manifest, replace(manifest, address_table_oid=456)]),
+    )
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
+        await catalog._pin(connection, 9, "sample_control")

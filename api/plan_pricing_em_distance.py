@@ -384,6 +384,7 @@ async def _progressive_page_rows(
         "allowed_binding_ordinals",
         "code_index",
         "_canonical_network_ids",
+        "_legacy_network_checksums",
         "_network_excluded_ids",
         "_network_approved_revision",
     }:

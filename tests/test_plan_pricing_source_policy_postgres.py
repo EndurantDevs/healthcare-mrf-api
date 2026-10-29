@@ -209,7 +209,8 @@ async def _admitted_reader(fixture):
         finally:
             await asyncio.sleep(0)
             driver.remove_query_logger(queries.append)
-    assert sum("binding_matches AS MATERIALIZED" in query.query for query in queries) == 1
+    assert not any("binding_matches AS MATERIALIZED" in query.query for query in queries)
+    assert sum("to_jsonb(candidate)::text AS candidate_json" in query.query for query in queries) == 2
     assert sum("validation_json::text AS validation_json" in query.query for query in queries) == 1
     assert sum(query.query.startswith("WITH source_rows AS MATERIALIZED") for query in queries) == 3
     assert not held.writer_statements and not held.database.has_reader_session()
