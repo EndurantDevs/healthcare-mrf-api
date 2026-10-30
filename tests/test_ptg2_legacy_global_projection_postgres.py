@@ -14,18 +14,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database
 from process.ptg_parts import ptg2_legacy_global_projection_queue as projection
-from process.ptg_parts import ptg2_lifecycle_lock as lifecycle
 from tests.test_ptg_wave_recovery_storage_postgres import (
     _dsn,
     _load_migration,
     _quote,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = ROOT / "alembic" / "versions" / (
-    "20260810160000_ptg2_legacy_global_projection_queue.py"
-)
+MIGRATION_PATH = ROOT / "alembic" / "versions" / ("20260810160000_ptg2_legacy_global_projection_queue.py")
 
 
 def _database():
@@ -73,25 +69,17 @@ async def _create_schema(engine, schema: str) -> None:
         for statement in statements:
             await connection.execute(text(statement))
         await connection.execute(
-            text(
-                f"INSERT INTO {schema}.ptg2_current_snapshot "
-                "VALUES ('current', NULL, NULL, now())"
-            )
+            text(f"INSERT INTO {schema}.ptg2_current_snapshot VALUES ('current', NULL, NULL, now())")
         )
 
 
 async def _publish_source(sessions, schema_name: str, schema: str, ordinal: int):
     source_key = f"source-{ordinal}"
     snapshot_id = f"snapshot-{ordinal}"
-    published_at = datetime.datetime(2026, 8, 10, tzinfo=datetime.UTC) + (
-        datetime.timedelta(seconds=ordinal)
-    )
+    published_at = datetime.datetime(2026, 8, 10, tzinfo=datetime.UTC) + (datetime.timedelta(seconds=ordinal))
     async with sessions.begin() as session:
         await session.execute(
-            text(
-                f"INSERT INTO {schema}.ptg2_snapshot VALUES "
-                "(:snapshot_id, 'published', :published_at)"
-            ),
+            text(f"INSERT INTO {schema}.ptg2_snapshot VALUES (:snapshot_id, 'published', :published_at)"),
             {"snapshot_id": snapshot_id, "published_at": published_at},
         )
         await session.execute(
@@ -128,9 +116,7 @@ async def _publish_source(sessions, schema_name: str, schema: str, ordinal: int)
 async def _drain_all() -> projection.PTG2LegacyGlobalProjectionDrain:
     claimed = reconciled = deferred = lease_lost = 0
     while True:
-        result = await projection.drain_legacy_global_projection_queue(
-            max_requests=8
-        )
+        result = await projection.drain_legacy_global_projection_queue(max_requests=8)
         claimed += result.claimed
         reconciled += result.reconciled
         deferred += result.deferred
@@ -154,26 +140,14 @@ async def _assert_source_commits_while_singleton_locked(
 
     holder = sessions()
     holder_transaction = await holder.begin()
-    await holder.execute(
-        text(
-            f"UPDATE {schema}.ptg2_current_snapshot SET updated_at = now() "
-            "WHERE slot = 'current'"
-        )
-    )
+    await holder.execute(text(f"UPDATE {schema}.ptg2_current_snapshot SET updated_at = now() WHERE slot = 'current'"))
     started = time.monotonic()
     await asyncio.wait_for(
-        asyncio.gather(
-            *(
-                _publish_source(sessions, schema_name, schema, ordinal)
-                for ordinal in range(24)
-            )
-        ),
+        asyncio.gather(*(_publish_source(sessions, schema_name, schema, ordinal) for ordinal in range(24))),
         timeout=2,
     )
     assert time.monotonic() - started < 2
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_current_source_snapshot"
-    ) == 24
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_current_source_snapshot") == 24
     blocked = await asyncio.gather(
         *(
             projection.drain_legacy_global_projection_queue(
@@ -183,9 +157,7 @@ async def _assert_source_commits_while_singleton_locked(
             for ordinal in range(24)
         )
     )
-    assert sum(
-        projection_result.deferred for projection_result in blocked
-    ) == 24
+    assert sum(projection_result.deferred for projection_result in blocked) == 24
     await holder_transaction.rollback()
     await holder.close()
 
@@ -199,31 +171,21 @@ async def _assert_generation_race_replays(
     """Leave a newer dirty generation ready when an older lease finishes."""
 
     async with sessions.begin() as session:
-        await projection.mark_legacy_global_projection_dirty(
-            session, schema_name=schema_name, source_key="source-0"
-        )
+        await projection.mark_legacy_global_projection_dirty(session, schema_name=schema_name, source_key="source-0")
     claim = await projection._claim_projection(source_key="source-0")
     assert claim is not None
     async with sessions.begin() as session:
-        await projection.mark_legacy_global_projection_dirty(
-            session, schema_name=schema_name, source_key="source-0"
-        )
+        await projection.mark_legacy_global_projection_dirty(session, schema_name=schema_name, source_key="source-0")
     assert await projection._is_authoritative_projection_applied()
-    assert await projection._is_projection_finish_committed(
-        claim, reconciled=True
-    )
+    assert await projection._is_projection_finish_committed(claim, reconciled=True)
     generation_rows = await local_db.all(
         f"SELECT requested_generation, applied_generation "
         f"FROM {schema}.ptg2_legacy_global_pointer_projection_queue "
         "WHERE source_key = 'source-0'"
     )
-    assert [
-        tuple(generation_row) for generation_row in generation_rows
-    ] == [(3, 2)]
+    assert [tuple(generation_row) for generation_row in generation_rows] == [(3, 2)]
     assert (
-        await projection.drain_legacy_global_projection_queue(
-            max_requests=1, source_key="source-0"
-        )
+        await projection.drain_legacy_global_projection_queue(max_requests=1, source_key="source-0")
     ).reconciled == 1
 
 
@@ -236,9 +198,7 @@ async def _assert_expired_claim_replays(
     """Replay an applied projection whose lease expired before its finish CAS."""
 
     async with sessions.begin() as session:
-        await projection.mark_legacy_global_projection_dirty(
-            session, schema_name=schema_name, source_key="source-1"
-        )
+        await projection.mark_legacy_global_projection_dirty(session, schema_name=schema_name, source_key="source-1")
     crash_claim = await projection._claim_projection(source_key="source-1")
     assert crash_claim is not None
     assert await projection._is_authoritative_projection_applied()
@@ -250,13 +210,9 @@ async def _assert_expired_claim_replays(
                 "WHERE source_key = 'source-1'"
             )
         )
-    crash_replay = await projection.drain_legacy_global_projection_queue(
-        max_requests=1, source_key="source-1"
-    )
+    crash_replay = await projection.drain_legacy_global_projection_queue(max_requests=1, source_key="source-1")
     assert crash_replay.reconciled == 1
-    assert not await projection._is_projection_finish_committed(
-        crash_claim, reconciled=True
-    )
+    assert not await projection._is_projection_finish_committed(crash_claim, reconciled=True)
 
 
 async def _assert_allowed_only_source_is_excluded(
@@ -269,10 +225,7 @@ async def _assert_allowed_only_source_is_excluded(
 
     async with sessions.begin() as session:
         await session.execute(
-            text(
-                f"INSERT INTO {schema}.ptg2_snapshot VALUES "
-                "('allowed-only', 'published', '2026-08-11T00:00:00Z')"
-            )
+            text(f"INSERT INTO {schema}.ptg2_snapshot VALUES ('allowed-only', 'published', '2026-08-11T00:00:00Z')")
         )
         await session.execute(
             text(
@@ -284,14 +237,12 @@ async def _assert_allowed_only_source_is_excluded(
         await projection.mark_legacy_global_projection_dirty(
             session, schema_name=schema_name, source_key="allowed-source"
         )
-    allowed_replay = await projection.drain_legacy_global_projection_queue(
-        max_requests=1, source_key="allowed-source"
-    )
+    allowed_replay = await projection.drain_legacy_global_projection_queue(max_requests=1, source_key="allowed-source")
     assert allowed_replay.reconciled == 1
-    assert await local_db.scalar(
-        f"SELECT snapshot_id FROM {schema}.ptg2_current_snapshot "
-        "WHERE slot = 'current'"
-    ) == "snapshot-23"
+    assert (
+        await local_db.scalar(f"SELECT snapshot_id FROM {schema}.ptg2_current_snapshot WHERE slot = 'current'")
+        == "snapshot-23"
+    )
 
 
 @pytest.mark.asyncio
@@ -303,7 +254,6 @@ async def test_held_singleton_never_gates_sources_and_queue_replays(monkeypatch)
     engine, local_db, sessions = _database()
     monkeypatch.setattr(projection, "db", local_db)
     monkeypatch.setattr(projection, "resolve_ptg2_schema", lambda: schema_name)
-    monkeypatch.setattr(lifecycle, "db", local_db)
     monkeypatch.setattr(projection, "_RETRY_SECONDS", 0)
     await _create_schema(engine, schema)
 
@@ -316,10 +266,10 @@ async def test_held_singleton_never_gates_sources_and_queue_replays(monkeypatch)
 
     replay = await _drain_all()
     assert replay.reconciled == 24
-    assert await local_db.scalar(
-        f"SELECT snapshot_id FROM {schema}.ptg2_current_snapshot "
-        "WHERE slot = 'current'"
-    ) == "snapshot-23"
+    assert (
+        await local_db.scalar(f"SELECT snapshot_id FROM {schema}.ptg2_current_snapshot WHERE slot = 'current'")
+        == "snapshot-23"
+    )
 
     await _assert_generation_race_replays(
         sessions,

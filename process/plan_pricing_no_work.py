@@ -2,10 +2,10 @@
 """Raw native control witnesses for the settled managed pricing lineage."""
 
 from db.migration_expression_adoption import _normalized_expression
-from db.models import ImportRun
 from db.plan_release_storage import plan_release_schema, storage_relation
 from process.plan_pricing_admission import _dispatches, require
 from process.plan_pricing_control import DELIVERY_FIELD, require_pricing_replay
+from process.plan_pricing_control_catalog import NATIVE_RUN_COLUMNS
 from process.plan_release_storage_custody import _document
 
 CONTRACT = "managed-pricing-no-work-v1"
@@ -45,7 +45,7 @@ async def require_native_control_shape(connection):
         relation,
     )
     require(
-        [native_column["attname"] for native_column in columns] == list(ImportRun.__table__.columns.keys()),
+        [native_column["attname"] for native_column in columns] == list(NATIVE_RUN_COLUMNS),
         "native_run_columns_changed",
     )
     require(

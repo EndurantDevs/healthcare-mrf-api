@@ -12,8 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database
 from process.ptg_parts import ptg2_lifecycle_lock as lifecycle
-from process.ptg_parts import source_pointers
-from process.ptg_parts import table_setup
+from process.ptg_parts import source_pointers, table_setup
 from tests.test_ptg_wave_recovery_storage_postgres import _dsn, _quote
 
 
@@ -36,12 +35,7 @@ async def _create_source_event_schema(engine, schema: str) -> None:
     async with engine.begin() as connection:
         await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         await connection.execute(text(f"CREATE SCHEMA {schema}"))
-        await connection.execute(
-            text(
-                f"CREATE TABLE {schema}.source_events "
-                "(source_no integer PRIMARY KEY)"
-            )
-        )
+        await connection.execute(text(f"CREATE TABLE {schema}.source_events (source_no integer PRIMARY KEY)"))
 
 
 async def _publish_source_event(sessions, schema: str, source_no: int) -> None:
@@ -53,10 +47,7 @@ async def _publish_source_event(sessions, schema: str, source_no: int) -> None:
             statement_timeout="3s",
         )
         await session.execute(
-            text(
-                f"INSERT INTO {schema}.source_events (source_no) "
-                "VALUES (:source_no)"
-            ),
+            text(f"INSERT INTO {schema}.source_events (source_no) VALUES (:source_no)"),
             {"source_no": source_no},
         )
 
@@ -90,9 +81,7 @@ async def _cancel_source_zero_waiters(sessions, engine) -> None:
                 statement_timeout="5s",
             )
 
-    blocked_tasks = [
-        asyncio.create_task(wait_on_source_zero()) for _ in range(4)
-    ]
+    blocked_tasks = [asyncio.create_task(wait_on_source_zero()) for _ in range(4)]
     await asyncio.sleep(0.1)
     for task in blocked_tasks:
         task.cancel()
@@ -106,7 +95,6 @@ async def test_source_zero_does_not_block_peers_and_gc_waits(monkeypatch):
     schema_name = "ptg_lifecycle_source_local_hol"
     schema = _quote(schema_name)
     engine, local_db, sessions = _database()
-    monkeypatch.setattr(lifecycle, "db", local_db)
     await _create_source_event_schema(engine, schema)
 
     holder = sessions()
@@ -119,18 +107,10 @@ async def test_source_zero_does_not_block_peers_and_gc_waits(monkeypatch):
     )
 
     await asyncio.wait_for(
-        asyncio.gather(
-            *(
-                _publish_source_event(sessions, schema, source_no)
-                for source_no in range(1, 24)
-            )
-        ),
+        asyncio.gather(*(_publish_source_event(sessions, schema, source_no) for source_no in range(1, 24))),
         timeout=3,
     )
-    assert (
-        await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.source_events")
-        == 23
-    )
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.source_events") == 23
 
     gc_task = await _start_waiting_global_gc(sessions)
     await _cancel_source_zero_waiters(sessions, engine)
@@ -160,10 +140,7 @@ async def _create_global_projection_schema(engine, schema: str) -> None:
                 "slot text PRIMARY KEY, snapshot_id text, "
                 "previous_snapshot_id text, updated_at timestamptz)"
             ),
-            (
-                f"CREATE TABLE {schema}.source_publication "
-                "(source_no integer PRIMARY KEY, snapshot_id text NOT NULL)"
-            ),
+            (f"CREATE TABLE {schema}.source_publication (source_no integer PRIMARY KEY, snapshot_id text NOT NULL)"),
             (
                 f"INSERT INTO {schema}.ptg2_snapshot "
                 "(snapshot_id, status, published_at) "
@@ -191,18 +168,13 @@ async def _publish_source_and_project(
             source_key=f"publication_source_{source_no}",
         )
         await session.execute(
-            text(
-                f"INSERT INTO {schema}.source_publication "
-                "(source_no, snapshot_id) VALUES (:source_no, :snapshot_id)"
-            ),
+            text(f"INSERT INTO {schema}.source_publication (source_no, snapshot_id) VALUES (:source_no, :snapshot_id)"),
             {"source_no": source_no, "snapshot_id": f"snapshot_{source_no}"},
         )
     return await source_pointers._attempt_global_snapshot_pointer_reconciliation(
         schema_name=schema_name,
         snapshot_id=f"snapshot_{source_no}",
-        updated_at=source_pointers.datetime.datetime.now(
-            source_pointers.datetime.UTC
-        ),
+        updated_at=source_pointers.datetime.datetime.now(source_pointers.datetime.UTC),
     )
 
 
@@ -212,18 +184,12 @@ async def test_held_legacy_singleton_does_not_gate_24_source_commits(monkeypatch
     schema_name = "ptg_lifecycle_global_projection_hol"
     schema = _quote(schema_name)
     engine, local_db, sessions = _database()
-    monkeypatch.setattr(lifecycle, "db", local_db)
     monkeypatch.setattr(source_pointers, "db", local_db)
     await _create_global_projection_schema(engine, schema)
 
     holder = sessions()
     holder_transaction = await holder.begin()
-    await holder.execute(
-        text(
-            f"UPDATE {schema}.ptg2_current_snapshot "
-            "SET updated_at = now() WHERE slot = 'current'"
-        )
-    )
+    await holder.execute(text(f"UPDATE {schema}.ptg2_current_snapshot SET updated_at = now() WHERE slot = 'current'"))
 
     started = time.monotonic()
     statuses = await asyncio.wait_for(
@@ -243,10 +209,7 @@ async def test_held_legacy_singleton_does_not_gate_24_source_commits(monkeypatch
     elapsed = time.monotonic() - started
     assert statuses == ["deferred"] * 24
     assert elapsed < 2
-    assert (
-        await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.source_publication")
-        == 24
-    )
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.source_publication") == 24
 
     await holder_transaction.rollback()
     await holder.close()
@@ -295,7 +258,6 @@ def _patch_runtime_schema_probe_models(
         "PTG2_LEGACY_GLOBAL_PROJECTION_QUEUE_TABLE",
         "ptg2_probe",
     )
-    monkeypatch.setattr(lifecycle, "db", local_db)
 
 
 async def _assert_bounded_schema_probes(statements: list[str]) -> None:
@@ -307,10 +269,7 @@ async def _assert_bounded_schema_probes(statements: list[str]) -> None:
         timeout=3,
     )
     assert all(probe_result is None for probe_result in probe_results), probe_results
-    assert not any(
-        statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))
-        for statement in statements
-    )
+    assert not any(statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP ")) for statement in statements)
 
 
 async def _assert_missing_schema_probe(statements: list[str]) -> None:
@@ -323,14 +282,10 @@ async def _assert_missing_schema_probe(statements: list[str]) -> None:
     )
     assert all(
         isinstance(probe_result, table_setup.PTG2RuntimeSchemaUnavailable)
-        and "missing migration-owned capabilities: table:ptg2_probe"
-        in str(probe_result)
+        and "missing migration-owned capabilities: table:ptg2_probe" in str(probe_result)
         for probe_result in missing_results
     ), missing_results
-    assert not any(
-        statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP "))
-        for statement in statements
-    )
+    assert not any(statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP ")) for statement in statements)
 
 
 @pytest.mark.asyncio
@@ -348,15 +303,11 @@ async def test_runtime_schema_probe_never_runs_ddl_or_hangs_on_relation_lock(
     async with engine.begin() as connection:
         await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         await connection.execute(text(f"CREATE SCHEMA {schema}"))
-        await connection.execute(
-            text(f"CREATE TABLE {schema}.ptg2_probe (probe_id integer PRIMARY KEY)")
-        )
+        await connection.execute(text(f"CREATE TABLE {schema}.ptg2_probe (probe_id integer PRIMARY KEY)"))
 
     holder = sessions()
     holder_transaction = await holder.begin()
-    await holder.execute(
-        text(f"LOCK TABLE {schema}.ptg2_probe IN ACCESS EXCLUSIVE MODE")
-    )
+    await holder.execute(text(f"LOCK TABLE {schema}.ptg2_probe IN ACCESS EXCLUSIVE MODE"))
 
     original_execute = local_db.session_factory.class_.execute
 

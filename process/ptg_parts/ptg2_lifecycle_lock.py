@@ -6,9 +6,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any
 
-from db.connection import db
-from process.ptg_parts.snapshot_tables import _normalize_source_key
+from sqlalchemy import text
 
+from process.ptg_parts.snapshot_tables import _normalize_source_key
 
 PTG2_SOURCE_POINTER_GC_LOCK_KEY = "ptg2_source_pointer_gc_v1"
 PTG2_SOURCE_LIFECYCLE_LOCK_NAMESPACE = "ptg2_source_lifecycle_v2"
@@ -93,7 +93,7 @@ async def configure_ptg2_lifecycle_transaction(
 
     await _execute_lifecycle_statement(
         session,
-        db.text(
+        text(
             "SELECT set_config('lock_timeout', :lock_timeout, true), "
             "set_config('statement_timeout', :statement_timeout, true)"
         ),
@@ -124,31 +124,18 @@ async def acquire_ptg2_source_lifecycle_lock(
         )
         await _execute_lifecycle_statement(
             session,
-            db.text(
-                "SELECT pg_advisory_xact_lock_shared("
-                "hashtext(:gc_lock_key))"
-            ),
+            text("SELECT pg_advisory_xact_lock_shared(hashtext(:gc_lock_key))"),
             {"gc_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY},
         )
         await _execute_lifecycle_statement(
             session,
-            db.text(
-                "SELECT pg_advisory_xact_lock("
-                "hashtextextended(:source_lock_key, 0))"
-            ),
-            {
-                "source_lock_key": (
-                    f"{PTG2_SOURCE_LIFECYCLE_LOCK_NAMESPACE}:"
-                    f"{normalized_source_key}"
-                )
-            },
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:source_lock_key, 0))"),
+            {"source_lock_key": (f"{PTG2_SOURCE_LIFECYCLE_LOCK_NAMESPACE}:{normalized_source_key}")},
         )
     except Exception as exc:
         if not is_retryable_lifecycle_database_error(exc):
             raise
-        raise PTG2LifecycleLockDeferred(
-            f"PTG lifecycle fence is busy for {normalized_source_key}; retry"
-        ) from exc
+        raise PTG2LifecycleLockDeferred(f"PTG lifecycle fence is busy for {normalized_source_key}; retry") from exc
     return normalized_source_key
 
 
@@ -168,18 +155,13 @@ async def acquire_ptg2_lifecycle_lock(
         )
         await _execute_lifecycle_statement(
             session,
-            db.text(
-                "SELECT pg_advisory_xact_lock("
-                "hashtext(:gc_lock_key))"
-            ),
+            text("SELECT pg_advisory_xact_lock(hashtext(:gc_lock_key))"),
             {"gc_lock_key": PTG2_SOURCE_POINTER_GC_LOCK_KEY},
         )
     except Exception as exc:
         if not is_retryable_lifecycle_database_error(exc):
             raise
-        raise PTG2LifecycleLockDeferred(
-            "PTG global garbage-collection fence is busy; retry"
-        ) from exc
+        raise PTG2LifecycleLockDeferred("PTG global garbage-collection fence is busy; retry") from exc
 
 
 __all__ = [
