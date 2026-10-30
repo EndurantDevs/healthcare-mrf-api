@@ -3619,6 +3619,7 @@ def test_source_row_from_seed_overrides_humana_stale_oauth_label():
         "InsurancePlan",
         "Location",
         "Organization",
+        "OrganizationAffiliation",
         "Practitioner",
         "PractitionerRole",
     ]
@@ -3628,9 +3629,12 @@ def test_source_row_from_seed_overrides_humana_stale_oauth_label():
         "api_base": "https://fhir.humana.com/api/provider-directory",
     }
     assert importer._resource_start_url(source_row, "InsurancePlan", page_count=100) == (
-        f"{importer.HUMANA_PROVIDER_DIRECTORY_BASE}/InsurancePlan?_count=100"
+        f"{importer.HUMANA_PROVIDER_DIRECTORY_BASE}/InsurancePlan?_total=none&_count=100"
     )
-    assert importer._resource_start_url(source_row, "OrganizationAffiliation", page_count=100) is None
+    assert importer._resource_start_url(source_row, "OrganizationAffiliation", page_count=100) == (
+        f"{importer.HUMANA_PROVIDER_DIRECTORY_BASE}/OrganizationAffiliation?_total=none&_count=100"
+    )
+    assert importer._resource_start_url(source_row, "HealthcareService", page_count=100) is None
     assert importer._resource_start_url(source_row, "Endpoint", page_count=100) is None
 
 
@@ -9253,6 +9257,18 @@ def test_amerihealth_provider_api_uses_state_nonempty_core():
     ("api_base", "org_name", "expected_resources"),
     [
         (
+            importer.HUMANA_PROVIDER_DIRECTORY_BASE,
+            "Humana",
+            (
+                "InsurancePlan",
+                "Location",
+                "Organization",
+                "OrganizationAffiliation",
+                "Practitioner",
+                "PractitionerRole",
+            ),
+        ),
+        (
             importer.MICHIGAN_PROVIDER_DIRECTORY_BASE,
             "Blue Cross Blue Shield of Michigan",
             tuple(sorted(importer.MICHIGAN_SUPPORTED_RESOURCES)),
@@ -9879,7 +9895,7 @@ async def test_probe_sources_persists_resolved_api_base_for_repaired_catalog_url
                 None,
                 10,
             )
-        if url == "https://fhir.humana.com/api/Practitioner?_count=1":
+        if url == "https://fhir.humana.com/api/Practitioner?_total=none&_count=1":
             return 200, {"resourceType": "Bundle", "entry": []}, None, 5
         return 400, {"resourceType": "OperationOutcome"}, None, 5
 
@@ -25889,6 +25905,137 @@ def test_http_403_restart_requires_humana_continuation_token(request_url):
         resume_state=resume_state,
         has_restart_attempted=False,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("continuation_status", [200, 503])
+async def test_humana_affiliation_cursor_preserves_progress(monkeypatch, unit_checkpoint_catalog, continuation_status):
+    """Follow exact affiliation cursors and retain the prefix after refusal."""
+    source_record = importer._source_row_from_seed({"api_base": importer.HUMANA_PROVIDER_DIRECTORY_BASE})
+    _, checkpoint_context = _humana_checkpoint_values()
+    source_record["source_id"] = checkpoint_context.source_ids[0]
+    start_url = importer._resource_start_url(source_record, "OrganizationAffiliation", page_count=100)
+    assert start_url == f"{importer.HUMANA_PROVIDER_DIRECTORY_BASE}/OrganizationAffiliation?_total=none&_count=100"
+    next_url = f"{start_url}&_continuationToken=opaque%2Bcursor%2F"
+    bundles = [_humana_affiliation_bundle(resource_id) for resource_id in ("affiliation-one", "affiliation-two")]
+    bundles[0]["link"] = [{"relation": "next", "url": next_url}]
+    fetch_source_json = AsyncMock(side_effect=[(200, bundles[0], None, 1), (continuation_status, bundles[1], None, 1)])
+    save_checkpoint = AsyncMock()
+    reset_checkpoint = AsyncMock()
+    write_resource_rows = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        AsyncMock(
+            return_value=importer.PaginationResumeState(start_url, 0, 0, ()),
+        ),
+    )
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(importer, "_reset_pagination_checkpoint", reset_checkpoint)
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_record,
+        "OrganizationAffiliation",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id=checkpoint_context.owner_run_id,
+        row_batch_handler=write_resource_rows,
+        row_batch_size=1,
+        retain_rows=False,
+        pagination_checkpoint=checkpoint_context,
+    )
+
+    assert fetch_result.complete is (continuation_status == 200)
+    assert fetch_result.error == (None if continuation_status == 200 else "http_503")
+    assert [request_call.args[1] for request_call in fetch_source_json.await_args_list] == [start_url, next_url]
+    assert save_checkpoint.await_args_list[0].kwargs["next_url"] == next_url
+    assert save_checkpoint.await_args_list[-1].kwargs["next_url"] == (None if continuation_status == 200 else next_url)
+    assert save_checkpoint.await_args_list[-1].kwargs["rows_processed"] == (2 if continuation_status == 200 else 1)
+    affiliation_row = write_resource_rows.await_args_list[0].args[1][0]
+    assert affiliation_row["organization_ref"] == "Organization/provider"
+    assert affiliation_row["network_refs"] == ["Organization/network"]
+    assert affiliation_row["location_refs"] == ["Location/office"]
+    reset_checkpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_humana_affiliation_retry_keeps_checkpoint(monkeypatch, unit_checkpoint_catalog):
+    """Resume a six-resource acquisition without refetching its retained prefix."""
+    source_record = importer._source_row_from_seed({"api_base": importer.HUMANA_PROVIDER_DIRECTORY_BASE})
+    root_context = importer._pagination_checkpoint_context(
+        source_record,
+        [source_record["source_id"]],
+        run_id="run_original",
+        retry_of_run_id=None,
+    )
+    assert root_context is not None
+    retry_context = dataclasses.replace(
+        root_context,
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        dataset_id="dataset_humana",
+        lineage_verified=True,
+    )
+    start_url = importer._resource_start_url(source_record, "OrganizationAffiliation", page_count=100)
+    next_url = f"{start_url}&_continuationToken=opaque%2Bcursor%2F"
+    resume_state = importer.PaginationResumeState(
+        next_url=next_url,
+        pages_processed=1,
+        rows_processed=1,
+        recent_url_hashes=(hashlib.sha256(start_url.encode()).hexdigest(),),
+        resumed=True,
+    )
+    load_checkpoint = AsyncMock(return_value=resume_state)
+    save_checkpoint = AsyncMock()
+    reset_checkpoint = AsyncMock()
+    fetch_source_json = AsyncMock(return_value=(200, _humana_affiliation_bundle("affiliation-two"), None, 1))
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", load_checkpoint)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(importer, "_reset_pagination_checkpoint", reset_checkpoint)
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_record,
+        "OrganizationAffiliation",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id=retry_context.owner_run_id,
+        row_batch_handler=AsyncMock(return_value=1),
+        row_batch_size=1,
+        retain_rows=False,
+        pagination_checkpoint=retry_context,
+    )
+
+    load_checkpoint.assert_awaited_once_with(retry_context, "OrganizationAffiliation", start_url)
+    fetch_source_json.assert_awaited_once_with(source_record, next_url, timeout=3)
+    assert fetch_result.complete is True and fetch_result.error is None
+    assert fetch_result.rows_fetched == 2 and fetch_result.rows_written == 1
+    assert save_checkpoint.await_args.kwargs["rows_processed"] == 2
+    assert save_checkpoint.await_args.kwargs["next_url"] is None
+    reset_checkpoint.assert_not_awaited()
+
+
+def _humana_affiliation_bundle(resource_id):
+    return {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": [
+            {
+                "resource": {
+                    "resourceType": "OrganizationAffiliation",
+                    "id": resource_id,
+                    "organization": {"reference": "Organization/provider"},
+                    "network": [{"reference": "Organization/network"}],
+                    "location": [{"reference": "Location/office"}],
+                }
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio

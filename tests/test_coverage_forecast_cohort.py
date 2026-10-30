@@ -105,7 +105,7 @@ def test_complete_cohort_retains_all_sidecars_and_accepts_only_the_union(cohort_
 
     _, directory, _ = cohort_input
     bytes_by_name = {path.name: path.read_bytes() for path in directory.iterdir()}
-    assert len(bytes_by_name) == 63
+    assert len(bytes_by_name) == 64
     assert _verify(cohort_input) == [directory / artifacts.POSTGRES_COVERAGE_NAME]
     assert bytes_by_name == {path.name: path.read_bytes() for path in directory.iterdir()}
     for path in (cohort_template / "originals").glob("*.json"):

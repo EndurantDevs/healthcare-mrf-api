@@ -444,6 +444,52 @@ def test_cli_writes_shard_provenance_without_rust_versions(tmp_path: Path, monke
     assert shard_calls == [(tmp_path, "main", "0", Path("main.coverage"), BASE_SHA, Path("main.provenance.json"))]
 
 
+@pytest.mark.parametrize(("shard", "exit_code"), [("cms-successor", 0), ("cms-successor-2", 2)])
+def test_cli_writes_only_the_declared_cms_shard_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shard: str, exit_code: int
+) -> None:
+    """The native CMS producer writes a real receipt without accepting another shard."""
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(artifacts, "resolve_forecast_base", lambda *_: (BASE_SHA, HEAD_SHA))
+    (tmp_path / artifacts.BASELINE_NAME).write_text(json.dumps(_artifact_baseline()), encoding="utf-8")
+    coverage_path = tmp_path / f".coverage.postgres.{shard}"
+    _write_coverage_data(tmp_path, coverage_path)
+    receipt_path = tmp_path / f".coverage-provenance.postgres.{shard}.json"
+
+    assert (
+        forecast.run_coverage_forecast_cli(
+            [
+                "write-shard-provenance",
+                "--base",
+                BASE_SHA,
+                "--kind",
+                "postgres",
+                "--shard",
+                shard,
+                "--coverage",
+                str(coverage_path),
+                "--output",
+                str(receipt_path),
+            ]
+        )
+        == exit_code
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if exit_code:
+        assert "unsupported coverage shard" in receipt["error"]
+        assert "coverage_sha256" not in receipt
+        return
+    assert (receipt["kind"], receipt["shard"], receipt["base_sha"], receipt["head_sha"]) == (
+        "postgres",
+        shard,
+        BASE_SHA,
+        HEAD_SHA,
+    )
+    assert receipt["coverage_file"] == coverage_path.name
+    assert receipt["coverage_sha256"] == artifacts._sha256_file(coverage_path)
+
+
 def test_cli_writes_rust_provenance_with_actual_producer_versions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -514,6 +560,7 @@ def test_python_forecast_combines_only_the_bound_coverage_files(tmp_path: Path) 
             ".coverage.postgres.directory-address",
             ".coverage.postgres.profile-storage",
             ".coverage.postgres.profile-publication",
+            ".coverage.postgres.cms-successor",
         ],
     }
 

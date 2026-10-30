@@ -17,7 +17,7 @@ from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_types import CandidateRunnerError, LeaseAuthorityLost
 from process.custom_import.storage_layout import SNAPSHOT_MODELS, snapshot_models
-from tests.test_custom_import_build_graph import _request
+from tests.test_custom_import_build_graph import _registry, _request
 from tests.test_custom_import_build_output import _generation
 
 
@@ -52,7 +52,7 @@ def test_five_publication_queries_keep_exact_shape_order_and_models(monkeypatch,
     )
     request = _request()
     arguments = (
-        (None, request, None, 7, _generation(request), ())
+        (None, request, _registry(request.definition), 7, _generation(request), ())
         if name in {"_family_material", "_scalar_material"}
         else (None, request, 7, _generation(request), ())
     )
