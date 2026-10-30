@@ -11837,10 +11837,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
                 "The selected release is not ready for exact state-scan serving.",
             )
         return _ptg_json_response(request, state_scan_payload)
-    if plan_release_id and _is_broad_office_visit_cpt(
-        ptg_code_system,
-        code,
-    ):
+    if plan_release_id and npi is None and _is_broad_office_visit_cpt(ptg_code_system, code):
         if _em_distance_request_code_index(args) is not None and em_distance_retry_option(args, pagination) is not None:
             release_selection = await resolve_plan_release_serving(
                 session,
