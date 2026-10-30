@@ -22,6 +22,7 @@ from process.provider_directory_profile_selection_contract import (
     PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
     PROFILE_SELECTION_LINEAGE_AUTHORITY,
     ProviderDirectoryProfileSelectionDrift,
+    ProviderDirectoryProfileSelectionError,
     _clean_text,
     _required_hash,
     _required_text,
@@ -450,13 +451,22 @@ def _computed_desired_selection_from_rows(
     node_id: str,
     source_rows: list[Mapping[str, Any]],
     dataset_rows: list[Mapping[str, Any]],
-    desired_dataset_row: Mapping[str, Any],
+    desired_dataset_row: Mapping[str, Any] | None,
     desired_selection: Mapping[str, Any],
     include_input_proof: bool = True,
 ) -> _ComputedProfileSelection:
-    """Replace only CMS in the full current vector using an exact desired tuple."""
+    """Keep the current vector or replace only its exact desired CMS tuple."""
     desired_selection = _validated_desired_selection(desired_selection)
     desired = desired_selection["desired_cms_dataset"]
+    if desired is None:
+        computed = _computed_selection_from_rows(
+            catalog_map,
+            node_id=node_id,
+            source_rows=source_rows,
+            dataset_rows=dataset_rows,
+            include_input_proof=include_input_proof,
+        )
+        return _with_desired_selection(computed, desired_selection)
     incumbent = _cms_incumbent_pair(dataset_rows, desired["endpoint_id"])
     if incumbent != desired_selection["expected_cms_incumbent"]:
         raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_incumbent_changed")
@@ -474,21 +484,11 @@ def _computed_desired_selection_from_rows(
     selection_records = _selection_records(
         source_groups, dataset_by_group, source_by_id, desired, include_input_proof=include_input_proof
     )
-    identity = _selection_identity(str(catalog_map["catalog_digest"]), node_id, selection_records)
-    identity.update(
-        {
-            "contract_id": PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
-            **desired_selection,
-            "selection_fingerprint": desired_selection_fingerprint(
-                node_id, str(catalog_map["catalog_digest"]), selection_records.request_projection, desired_selection
-            ),
-            "profile_input_digest": stable_hash(
-                {"current_input_digest": identity["profile_input_digest"], **desired_selection},
-                domain="provider_directory_profile_input.v2",
-            ),
-        }
+    computed = _ComputedProfileSelection(
+        tuple(selection_records.request_projection),
+        _selection_identity(str(catalog_map["catalog_digest"]), node_id, selection_records),
     )
-    return _ComputedProfileSelection(tuple(selection_records.request_projection), identity)
+    return _with_desired_selection(computed, desired_selection)
 
 
 async def _compute_desired_selection(
@@ -499,9 +499,15 @@ async def _compute_desired_selection(
     desired_selection: Mapping[str, Any],
     exact_readiness: bool = True,
 ) -> _ComputedProfileSelection:
+    desired_selection = _validated_desired_selection(desired_selection)
+    desired = desired_selection["desired_cms_dataset"]
+    if desired is None:
+        computed = await _compute_current_selection(
+            catalog_map, node_id=node_id, lock_selection=lock_selection, exact_readiness=exact_readiness
+        )
+        return _with_desired_selection(computed, desired_selection)
     if lock_selection:
         await _lock_profile_selection_tables()
-    desired = desired_selection["desired_cms_dataset"]
     desired_dataset_row = await db.first(
         f"SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "
         "status, is_current, resource_count, validated_at, published_at, superseded_at, publication_metadata_json "
@@ -528,3 +534,30 @@ async def _compute_desired_selection(
         desired_selection=desired_selection,
         include_input_proof=exact_readiness,
     )
+
+
+def _with_desired_selection(
+    computed: _ComputedProfileSelection, desired_selection: Mapping[str, Any]
+) -> _ComputedProfileSelection:
+    """Sign the explicit evaluation date without changing the selected inputs."""
+    desired_selection = _validated_desired_selection(desired_selection)
+    identity_by_field = dict(computed.identity_payload)
+    if identity_by_field["operation"] != "publish":
+        raise ProviderDirectoryProfileSelectionError("Profile selection dated publish requires current datasets")
+    identity_by_field.update(
+        {
+            "contract_id": PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
+            **desired_selection,
+            "selection_fingerprint": desired_selection_fingerprint(
+                identity_by_field["node_id"],
+                identity_by_field["catalog_digest"],
+                computed.request_projection,
+                desired_selection,
+            ),
+            "profile_input_digest": stable_hash(
+                {"current_input_digest": identity_by_field["profile_input_digest"], **desired_selection},
+                domain="provider_directory_profile_input.v2",
+            ),
+        }
+    )
+    return _ComputedProfileSelection(computed.request_projection, identity_by_field)

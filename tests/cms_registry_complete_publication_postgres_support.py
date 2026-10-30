@@ -1027,6 +1027,9 @@ def sign_native_receipt(guard, receipt, timing, *, reservation):
     """Enroll actual database, geometry and runtime values with the synthetic key."""
     binding = receipt.get("database_binding", receipt["capacity_geometry"])
     required = receipt["required_reservation_bytes_by_storage_class"]
+    storage_by_class = {
+        volume["volume_class"]: volume for volume in guard["control_plane_request"]["storage_observation"]["volumes"]
+    }
 
     def mutate(body):
         body.update(
@@ -1055,6 +1058,7 @@ def sign_native_receipt(guard, receipt, timing, *, reservation):
         for tablespace in body["tablespaces"]:
             tablespace.update(tablespace_oid=binding["tablespace_oid"], tablespace_name=binding["tablespace_name"])
         for volume in body["volumes"]:
+            volume.update(storage_by_class[volume["volume_class"]])
             volume["reserved_bytes"] = required[volume["volume_class"]]
 
     return _signed_envelope(body_mutator=mutate)

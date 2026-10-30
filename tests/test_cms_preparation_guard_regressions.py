@@ -1220,6 +1220,7 @@ async def test_prepared_native_publication_requires_unconsumed_stage_and_result_
         required_names=[],
         context={},
         native_receipt=None,
+        affected_patch=None,
     )
     with pytest.raises(RuntimeError, match="already committed|requires native result authority"):
         await candidate.publish_prepared_entity_address_generation(prepared)

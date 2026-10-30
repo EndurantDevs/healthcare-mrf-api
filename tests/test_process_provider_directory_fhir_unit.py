@@ -6886,38 +6886,57 @@ def test_provider_directory_refresh_preset_rejects_unknown_value():
 
 @pytest.mark.asyncio
 async def test_delete_stale_provider_directory_source_catalog_prunes_dependent_rows(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
     status_mock = AsyncMock(return_value=1)
+    deletable = AsyncMock(return_value=["source_stale"])
+    monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "status", status_mock)
+    monkeypatch.setattr(importer, "_catalog_deletable_source_ids", deletable)
 
     cleanup = await importer._delete_stale_provider_directory_source_catalog(["source_b", "source_a", "source_a", ""])
 
     assert cleanup["deleted"]["provider_directory_source"] == 1
     assert cleanup["protected_source_ids_missing"] == []
+    deletable.assert_awaited_once_with(["source_a", "source_b"])
     assert status_mock.await_count == len(importer.SOURCE_CATALOG_STALE_TABLE_MODELS) + 1
     for call in status_mock.await_args_list:
-        assert call.kwargs["source_ids"] == ["source_a", "source_b"]
-        assert "NOT (source_id = ANY(CAST(:source_ids AS varchar[])))" in call.args[0]
+        assert call.kwargs["source_ids"] == ["source_stale"]
+        assert "WHERE source_id = ANY(CAST(:source_ids AS varchar[]))" in call.args[0]
     assert '"mrf"."provider_directory_source"' in status_mock.await_args_list[-1].args[0]
 
 
 @pytest.mark.asyncio
 async def test_source_catalog_cleanup_retains_manifest_pinned_hap_alias(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def transaction():
+        yield
+
     pinned_source_id = "pdfhir_eee751f2c17d5c473daf3060"
     sibling_source_id = "pdfhir_f9d6f8a84714e7c298323833"
     all_mock = AsyncMock(return_value=[{"source_id": pinned_source_id}])
     status_mock = AsyncMock(return_value=0)
+    deletable = AsyncMock(return_value=[])
+    monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(importer.db, "all", all_mock)
     monkeypatch.setattr(importer.db, "status", status_mock)
+    monkeypatch.setattr(importer, "_catalog_deletable_source_ids", deletable)
 
     cleanup = await importer._delete_stale_provider_directory_source_catalog(
-        [sibling_source_id],
-        protected_source_ids=[pinned_source_id],
+        [sibling_source_id], protected_source_ids=[pinned_source_id]
     )
 
     assert cleanup == {"deleted": {}, "protected_source_ids_missing": []}
+    all_mock.assert_awaited_once()
     assert all_mock.await_args.kwargs["source_ids"] == [pinned_source_id]
-    for call in status_mock.await_args_list:
-        assert call.kwargs["source_ids"] == [pinned_source_id, sibling_source_id]
+    deletable.assert_awaited_once_with([pinned_source_id, sibling_source_id])
+    status_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -15547,14 +15566,15 @@ def _write_supplemental_catalog_fixtures(tmp_path):
 
 
 def _assert_supplemental_catalog_metrics(metrics) -> None:
-    assert metrics["sources_seeded"] == 16
-    assert metrics["supplemental_catalog_sources_considered"] == 15
+    assert metrics["sources_seeded"] == 17
+    assert metrics["supplemental_catalog_sources_considered"] == 16
     catalog_metrics = metrics["supplemental_catalogs"]["catalogs"]
     assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 8
     assert catalog_metrics["amerihealth_caritas"]["rows"] == 1
     assert catalog_metrics["contra_costa"]["rows"] == 1
     assert catalog_metrics["cms_sma_endpoint_directory"]["rows"] == 0
     assert catalog_metrics["health_partners_plans"]["rows"] == 1
+    assert catalog_metrics["christus_health_plan"]["rows"] == 1
     assert catalog_metrics["aetna_provider_directorydata"]["rows"] == 1
     assert catalog_metrics["provider_directory_blockers"]["rows"] == 3
 

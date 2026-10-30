@@ -28,10 +28,7 @@ async def test_filter_capabilities_use_cache_and_schema_results(monkeypatch):
         "_filter_cache_get",
         lambda: cached_capability_map,
     )
-    assert (
-        await npi_module._resolve_npi_filter_capabilities()
-        is cached_capability_map
-    )
+    assert await npi_module._resolve_npi_filter_capabilities() is cached_capability_map
 
     monkeypatch.setattr(npi_module, "_filter_cache_get", lambda: None)
     monkeypatch.setattr(npi_module, "_model_table_columns", lambda _model: set())
@@ -39,11 +36,7 @@ async def test_filter_capabilities_use_cache_and_schema_results(monkeypatch):
     monkeypatch.setattr(
         npi_module,
         "_execute_stmt",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                all=lambda: [("procedures_array",)]
-            )
-        ),
+        AsyncMock(return_value=SimpleNamespace(all=lambda: [("procedures_array",)])),
     )
     monkeypatch.setattr(
         npi_module,
@@ -112,9 +105,7 @@ async def test_taxonomy_codes_use_cache_and_request_session(monkeypatch):
     cache = npi_module._CLASSIFICATION_TAXONOMY_CODES_CACHE
     cache.clear()
     cache["hospital"] = (time.time(), ["282N00000X"])
-    assert await npi_module._get_taxonomy_codes_for_classification(
-        "Hospital"
-    ) == ["282N00000X"]
+    assert await npi_module._get_taxonomy_codes_for_classification("Hospital") == ["282N00000X"]
 
     cache.clear()
     session = SimpleNamespace(
@@ -146,13 +137,13 @@ async def test_evidence_fetchers_open_a_session(monkeypatch):
 
     assert (
         await npi_module._fetch_provider_directory_role_evidence_map(
-            [("source", "role")]
+            [("source", "role")], source_datasets=(("source", "dataset-source"),)
         )
         == {}
     )
     assert (
         await npi_module._fetch_provider_directory_affiliation_evidence_map(
-            [("source", "affiliation")]
+            [("source", "affiliation")], source_datasets=(("source", "dataset-source"),)
         )
         == {}
     )
@@ -174,9 +165,7 @@ def test_role_evidence_mapping_handles_role_without_metadata_and_network(
     monkeypatch.setattr(
         npi_module,
         "_append_provider_directory_network_evidence",
-        lambda mapping, evidence, _keys: evidence["networks"].append(
-            {"resource_id": mapping["resource_id"]}
-        ),
+        lambda mapping, evidence, _keys: evidence["networks"].append({"resource_id": mapping["resource_id"]}),
     )
     evidence_rows = [
         {
@@ -195,9 +184,7 @@ def test_role_evidence_mapping_handles_role_without_metadata_and_network(
         },
     ]
 
-    evidence = npi_module._map_provider_directory_role_evidence(evidence_rows)[
-        ("source", "role")
-    ]
+    evidence = npi_module._map_provider_directory_role_evidence(evidence_rows)[("source", "role")]
 
     assert evidence["practitioner_role"] == {"resource_id": "role"}
     assert evidence["networks"] == [{"resource_id": "network"}]
@@ -246,6 +233,13 @@ def test_affiliation_fields_include_plan_network_and_single_metadata(
 async def test_attach_source_details_handles_missing_nonmapping_and_success(
     monkeypatch,
 ):
+    from api import provider_directory_evidence_lineage
+
+    monkeypatch.setattr(
+        provider_directory_evidence_lineage,
+        "resolve_address_evidence",
+        AsyncMock(return_value=({"source": ("endpoint-source", "https://example.test/fhir")}, (), ())),
+    )
     monkeypatch.setattr(
         npi_module,
         "_provider_directory_source_ids_from_addresses",
@@ -257,7 +251,8 @@ async def test_attach_source_details_handles_missing_nonmapping_and_success(
         "_fetch_provider_directory_source_detail_map",
         detail_fetch,
     )
-    await npi_module._attach_provider_directory_source_details([{}])
+    with pytest.raises(RuntimeError, match="provider_directory_evidence_source_alias_unavailable"):
+        await npi_module._attach_provider_directory_source_details([{}])
 
     monkeypatch.setattr(
         npi_module,
@@ -285,13 +280,9 @@ async def test_attach_source_details_handles_missing_nonmapping_and_success(
         lambda *_args: [{"source_id": "source"}],
     )
     address_map = {}
-    await npi_module._attach_provider_directory_source_details(
-        [object(), address_map]
-    )
+    await npi_module._attach_provider_directory_source_details([object(), address_map])
 
-    assert address_map[npi_module.PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] == [
-        {"source_id": "source"}
-    ]
+    assert address_map[npi_module.PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY] == [{"source_id": "source"}]
 
 
 def test_role_detail_aliases_accepting_patients(monkeypatch):
@@ -330,8 +321,6 @@ def test_role_detail_aliases_accepting_patients(monkeypatch):
 
 def test_fhir_url_identity_brackets_ipv6_host():
     assert (
-        npi_module._provider_directory_fhir_url_identity(
-            "HTTPS://[2001:db8::1]/path?secret=value"
-        )
+        npi_module._provider_directory_fhir_url_identity("HTTPS://[2001:db8::1]/path?secret=value")
         == "https://[2001:db8::1]/path"
     )

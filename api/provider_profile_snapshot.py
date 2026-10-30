@@ -130,7 +130,7 @@ async def _snapshot_relation_oids(session, schema, table_names):
     return {f"{schema}.{name}": oid for name, oid in result.all()}
 
 
-async def _lock_serving_relations(session, schema, *, include_detail):
+async def _lock_serving_relations(session, schema, *, include_detail, fresh_snapshot=False):
     """Use the shared lexical lock order and reject a stale repeatable-read catalog."""
     table_names = tuple(
         sorted(
@@ -151,9 +151,23 @@ async def _lock_serving_relations(session, schema, *, include_detail):
     )
     relation_oids = await _snapshot_relation_oids(session, schema, table_names)
     installed_names = [name for name in table_names if relation_oids[f"{schema}.{name}"] is not None]
+    if fresh_snapshot:
+        await session.rollback()
+        await _read_timeouts(session)
+        await session.execute(text("SET LOCAL lock_timeout = '5s'"))
     if installed_names:
         qualified_names = ", ".join(f'"{schema}"."{name}"' for name in installed_names)
-        await session.execute(text(f"LOCK TABLE {qualified_names} IN ACCESS SHARE MODE"))
+        try:
+            await session.execute(text(f"LOCK TABLE {qualified_names} IN ACCESS SHARE MODE"))
+        except DBAPIError as error:
+            if fresh_snapshot and postgres_sqlstate(error) == "42P01":
+                raise _SnapshotSetupChanged("Provider data changed during read setup.") from error
+            raise
+    if fresh_snapshot:
+        await session.execute(text("SET LOCAL lock_timeout = '250ms'"))
+        relation_oids = await _snapshot_relation_oids(session, schema, table_names)
+        if installed_names != [name for name in table_names if relation_oids[f"{schema}.{name}"] is not None]:
+            raise _SnapshotSetupChanged("Provider data changed during read setup.")
     if await _relation_oids(session, schema, table_names) != relation_oids:
         raise _SnapshotSetupChanged("Provider data changed during the read; retry the request.")
     return relation_oids
@@ -235,9 +249,24 @@ async def provider_profile_read_snapshot(database, schema, *, include_detail=Fal
     max_attempts = 1 if database.has_reader_session() or database._transaction_binding() is not None else 3
     for attempt in range(1, max_attempts + 1):
         has_yielded = False
+        prelocked_by_ref = {}
+
+        async def setup(session):
+            """Capture only this owned setup's freshly locked relation inventory."""
+            await _read_timeouts(session)
+            prelocked_by_ref.update(
+                await _lock_serving_relations(session, schema, include_detail=include_detail, fresh_snapshot=True)
+            )
+
+        options = {"snapshot_setup": setup} if max_attempts > 1 else {}
         try:
-            async with database.reader_session() as session:
-                async with _read_snapshot_scope(session, schema, include_detail=include_detail):
+            async with database.reader_session(**options) as session:
+                async with _read_snapshot_scope(
+                    session,
+                    schema,
+                    include_detail=include_detail,
+                    prelocked=prelocked_by_ref if options else None,
+                ):
                     has_yielded = True
                     yield session
             return
@@ -245,19 +274,18 @@ async def provider_profile_read_snapshot(database, schema, *, include_detail=Fal
             if has_yielded or attempt == max_attempts:
                 raise
         except DBAPIError as error:
-            if not has_yielded and attempt < max_attempts and postgres_sqlstate(error) == "55P03":
-                continue
             raise ServiceUnavailable("Provider data is temporarily unavailable.") from error
 
 
 @asynccontextmanager
-async def _read_snapshot_scope(session, schema, *, include_detail):
+async def _read_snapshot_scope(session, schema, *, include_detail, prelocked=None):
     """Finish setup before yielding; loader failures never replay a response."""
     if not session.info.get("api_reader_verified"):
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-    await session.execute(text("SET LOCAL lock_timeout = '250ms'"))
-    await session.execute(text("SET LOCAL statement_timeout = '5s'"))
-    relation_oids = await _lock_serving_relations(session, schema, include_detail=include_detail)
+    if prelocked is None:
+        await _read_timeouts(session)
+        prelocked = await _lock_serving_relations(session, schema, include_detail=include_detail)
+    relation_oids = prelocked
     requires_cms_receipt = await _requires_cms_receipt(session, schema, relation_oids)
     authorities_by_family = await _read_native_authorities(
         session,
@@ -277,3 +305,9 @@ async def _read_snapshot_scope(session, schema, *, include_detail):
         _SNAPSHOT.reset(token)
         session.info.pop("provider_profile_native_authorities", None)
         session.info.pop("provider_profile_cms_serving_receipt", None)
+
+
+async def _read_timeouts(session):
+    """Use the existing bounded Reader statement and lock limits on each owned transaction."""
+    await session.execute(text("SET LOCAL lock_timeout = '250ms'"))
+    await session.execute(text("SET LOCAL statement_timeout = '5s'"))

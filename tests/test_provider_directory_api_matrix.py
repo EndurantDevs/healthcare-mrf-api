@@ -44,9 +44,7 @@ def _build_provenance_entry(**field_overrides) -> dict:
     return provenance_entry_dict
 
 
-def _build_detail_response(
-    *, endpoint_id: str = "endpoint-1", detail_geo_present: bool = True
-) -> dict:
+def _build_detail_response(*, endpoint_id: str = "endpoint-1", detail_geo_present: bool = True) -> dict:
     source_provenance_dict = _build_provenance_entry(endpoint_id=endpoint_id)
     fact_evidence_dict = {
         **source_provenance_dict,
@@ -67,11 +65,7 @@ def _build_detail_response(
                 "provider_directory_profile": {"sources": [source_provenance_dict]},
                 "provider_directory_profile_evidence": {
                     "sources": [source_provenance_dict],
-                    "facts": {
-                        "accepting_patients": {
-                            "items": [{"evidence": [fact_evidence_dict]}]
-                        }
-                    },
+                    "facts": {"accepting_patients": {"items": [{"evidence": [fact_evidence_dict]}]}},
                 },
             }
         }
@@ -200,9 +194,7 @@ def test_matrix_accepts_detail_geo_without_candidate():
 
     checks = result["verification_matrix"][0]
     assert result["status"] == "pass"
-    assert {checks[code]["state"] for code in ("A", "P", "F", "V")} == {
-        "pass"
-    }
+    assert {checks[code]["state"] for code in ("A", "P", "F", "V")} == {"pass"}
     assert checks["G"] == {
         "state": "pass",
         "geo_match_candidates": {"status_code": 200, "latency_ms": 1.0},
@@ -263,18 +255,25 @@ def test_matrix_fails_all_http_checks_when_latency_exceeds_slo():
 
 def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contracts():
     root = Path(__file__).resolve().parents[1]
-    manifest = json.loads(
-        (root / "specs/provider_directory_endpoint_acquisition_manifest.json").read_text()
-    )
+    manifest = json.loads((root / "specs/provider_directory_endpoint_acquisition_manifest.json").read_text())
     profile_spec = matrix.load_matrix_source_spec()
     selections = matrix.resolve_matrix_source_selection(manifest, profile_spec)
 
-    assert len(profile_spec["source_ids"]) == 28
-    assert len(selections) == 26
+    assert len(profile_spec["source_ids"]) == 29
+    assert len(selections) == 27
     assert selections[0].source_id == "cms-npd"
-    michigan = next(
-        selection for selection in selections if selection.entry_id == "michigan"
+    christus = next(selection for selection in selections if selection.entry_id == "christus-health-plan")
+    assert christus.resource_profile == "A7"
+    assert christus.resources == (
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
     )
+    michigan = next(selection for selection in selections if selection.entry_id == "michigan")
     assert michigan.resource_profile == "M5"
     assert michigan.resources == (
         "Location",
@@ -292,11 +291,7 @@ def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contract
         "PractitionerRole",
     )
     assert "OrganizationAffiliation" not in alohr.resources
-    uhc = next(
-        selection
-        for selection in selections
-        if selection.entry_id == "uhc-provider-files"
-    )
+    uhc = next(selection for selection in selections if selection.entry_id == "uhc-provider-files")
     assert uhc.resource_profile == "A6"
     assert uhc.resources == (
         "InsurancePlan",

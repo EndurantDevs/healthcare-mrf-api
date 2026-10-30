@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_capacity_attestation as lease
 from process import provider_directory_profile_capacity_runtime as runtime
 from process import provider_directory_profile_selection_contract as selection
@@ -19,12 +20,12 @@ from process.provider_directory_profile_capacity_trust import (
     CAPACITY_TRUST_MAX_DOCUMENT_BYTES,
     CAPACITY_TRUST_MAX_KEYS,
 )
+from tests.provider_directory_profile_capacity_signing_guard_test_support import (
+    synthetic_profile_task,
+)
 from tests.provider_directory_profile_capacity_trust_fixtures import (
     PUBLIC_KEY_HEX,
     capacity_trust,
-)
-from tests.provider_directory_profile_capacity_signing_guard_test_support import (
-    synthetic_profile_task,
 )
 from tests.test_provider_directory_profile_capacity_attestation import (
     VALIDATION_TIME,
@@ -166,6 +167,18 @@ def test_execution_v2_golden_freezes_neutral_cross_repository_envelope(
         verified.attestation_id
         == task_map["provider_directory_profile_capacity_attestation"]["lease"]["attestation_id"]
     )
+
+
+def test_neutral_execution_golden_is_independent_of_live_profile_sources(monkeypatch):
+    """Adding or removing live sources cannot rewrite an existing signed fixture."""
+    fixture_task = json.loads(EXECUTION_V2_FIXTURE.read_text(encoding="utf-8"))
+    for source_ids in ((), ("synthetic_unrelated_profile_source",)):
+        monkeypatch.setattr(
+            profile_artifact,
+            "configured_profile_source_ids",
+            lambda values=source_ids: values,
+        )
+        assert synthetic_profile_task(_signed_envelope()) == fixture_task
 
 
 @pytest.mark.parametrize(

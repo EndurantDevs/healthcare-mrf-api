@@ -239,10 +239,7 @@ async def test_evidence_fetchers_short_circuit_empty_and_missing_tables(
     monkeypatch,
 ):
     assert await npi_module._fetch_provider_directory_role_evidence_map([]) == {}
-    assert (
-        await npi_module._fetch_provider_directory_affiliation_evidence_map([])
-        == {}
-    )
+    assert await npi_module._fetch_provider_directory_affiliation_evidence_map([]) == {}
 
     monkeypatch.setattr(
         npi_module,
@@ -254,6 +251,7 @@ async def test_evidence_fetchers_short_circuit_empty_and_missing_tables(
         await npi_module._fetch_provider_directory_role_evidence_map(
             [("source", "role")],
             session=session,
+            source_datasets=(("source", "dataset-source"),),
         )
         == {}
     )
@@ -261,6 +259,7 @@ async def test_evidence_fetchers_short_circuit_empty_and_missing_tables(
         await npi_module._fetch_provider_directory_affiliation_evidence_map(
             [("source", "affiliation")],
             session=session,
+            source_datasets=(("source", "dataset-source"),),
         )
         == {}
     )
@@ -277,10 +276,7 @@ async def test_source_detail_fetch_short_circuits_empty_and_unavailable(
         "_is_table_available",
         AsyncMock(return_value=False),
     )
-    assert (
-        await npi_module._fetch_provider_directory_source_detail_map(["source"])
-        == {}
-    )
+    assert await npi_module._fetch_provider_directory_source_detail_map(["source"]) == {}
 
 
 @pytest.mark.asyncio

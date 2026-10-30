@@ -186,6 +186,12 @@ def _role_graph():
     )
 
 
+_RECEIPT_CHECK_ROWS = [
+    {"definition": check, "key_default": custody.guards._LEGACY_KEY_DEFAULT}
+    for check in sorted(custody.guards._RECEIPT_CHECKS)
+]
+
+
 @pytest.fixture
 def catalog(monkeypatch):
     policy = GenericSourcePolicy(
@@ -211,11 +217,13 @@ def catalog(monkeypatch):
         _execute_function(sql, functions, events)
 
     async def fetch(sql, *_):
+        if sql == custody.guards._RECEIPT_CHECKS_SQL.replace(":schema", "$1"):
+            return deepcopy(_RECEIPT_CHECK_ROWS)
         return deepcopy(relations if sql == custody._RELATION_SQL else functions)
 
     async def fetchrow(sql):
         if sql.startswith("WITH rows"):
-            return dict(count=1, bytes=42, sha256="a" * 64)
+            return dict(count=1, bytes=42, sha256="a" * 64, **({"largest_bytes": 42} if "largest_bytes" in sql else {}))
         return dict(session="native_admin", current="native_admin", backend=7, xid="9", native_admin=True)
 
     async def fetchval(sql, *arguments):
@@ -544,11 +552,12 @@ async def test_data_bound_refuses_before_any_function_transfer(catalog, bound):
     fetchrow = catalog.driver.fetchrow.side_effect
 
     async def bounded(sql):
-        return (
-            dict(zip(("count", "bytes", "sha256"), bound, strict=True))
-            if sql.startswith("WITH rows")
-            else await fetchrow(sql)
-        )
+        if sql.startswith("WITH rows"):
+            observed_by_field = dict(zip(("count", "bytes", "sha256"), bound, strict=True))
+            if "largest_bytes" in sql:
+                observed_by_field["largest_bytes"] = bound[1]
+            return observed_by_field
+        return await fetchrow(sql)
 
     catalog.driver.fetchrow.side_effect = bounded
     with pytest.raises(ValueError, match="rows_unbounded"):

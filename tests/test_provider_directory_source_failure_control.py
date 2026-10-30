@@ -31,7 +31,7 @@ def case(monkeypatch):
     candidate, directory, header = _case()
     directory.db = object()
     directory._json_default = lambda value: value.isoformat()
-    directory.IMMUTABLE_ENDPOINT_DATASET_STATUSES = ("validated", "published", "superseded")
+    directory.IMMUTABLE_ENDPOINT_DATASET_STATUSES = ("validated", "published", "superseded", "publication_acknowledged")
     connection = SimpleNamespace(
         fetchrow=AsyncMock(return_value=header),
         fetchval=AsyncMock(return_value=3),
@@ -109,7 +109,9 @@ async def test_failure_diagnostics_keep_the_existing_metadata_encoder(case):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["absent", "endpoint", "root", "current", "validated", "published"])
+@pytest.mark.parametrize(
+    "change", ["absent", "endpoint", "root", "current", "validated", "published", "publication_acknowledged"]
+)
 async def test_historical_noop_cannot_count_or_change_an_immutable_or_other_candidate(case, change):
     match change:
         case "absent":

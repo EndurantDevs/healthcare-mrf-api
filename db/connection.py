@@ -582,6 +582,8 @@ class Database:
         route, _, parameter = path.rstrip("/").rpartition("/")
         if route == "/api/v1/npi/id" and parameter != "batch":
             return False  # Detail owns a bounded Reader that closes before geocoding.
+        if parameter == "profile" and route.rpartition("/")[0] == "/api/v1/npi/id":
+            return False  # Profile owns snapshot setup before its first loader.
         roots = ("/api/v1/pricing", "/api/v1/codes", "/api/v1/npi")
         return (
             path in roots
@@ -607,11 +609,20 @@ class Database:
 
     @asynccontextmanager
     async def reader_session(
-        self, *, independent: bool = False, temporary_setup=None, prepare_plan_workspace: bool = False
+        self,
+        *,
+        independent: bool = False,
+        temporary_setup=None,
+        prepare_plan_workspace: bool = False,
+        snapshot_setup=None,
     ) -> AsyncIterator[AsyncSession]:
         """Own a genuine Reader transaction, or reuse this task's exact Reader."""
         if temporary_setup is not None and not callable(temporary_setup):
             raise TypeError("Reader temporary setup must be an async callable")
+        if snapshot_setup is not None and not callable(snapshot_setup):
+            raise TypeError("Reader snapshot setup must be an async callable")
+        if snapshot_setup is not None and (temporary_setup is not None or prepare_plan_workspace):
+            raise RuntimeError("Reader preparation modes require separate ownership")
         if prepare_plan_workspace and not independent:
             raise RuntimeError("Plan Reader workspace requires independent ownership")
         if temporary_setup is not None and prepare_plan_workspace:
@@ -625,6 +636,8 @@ class Database:
         ):
             if temporary_setup is not None:
                 raise RuntimeError("Temporary setup requires a fresh Reader session")
+            if snapshot_setup is not None:
+                raise RuntimeError("Snapshot setup requires a fresh Reader session")
             yield binding.session
             return
         if self._transaction_binding() is not None:
@@ -648,16 +661,21 @@ class Database:
                 scope,
                 temporary_setup=temporary_setup is not None,
                 prepare_plan_workspace=prepare_plan_workspace,
+                snapshot_setup=snapshot_setup,
             ) as session:
                 yield session
 
     @asynccontextmanager
-    async def _verified_reader_session(self, reader, scope, *, temporary_setup, prepare_plan_workspace):
+    async def _verified_reader_session(
+        self, reader, scope, *, temporary_setup, prepare_plan_workspace, snapshot_setup=None
+    ):
         """Verify login and prepared modes while owning binding cleanup and cancellation."""
-        prepared = temporary_setup or prepare_plan_workspace
+        prepared = temporary_setup or prepare_plan_workspace or snapshot_setup is not None
         async with scope as session:
             reader_context_token = None
             try:
+                if snapshot_setup is not None:
+                    await snapshot_setup(session)
                 identity_result = await session.execute(
                     sa_text(
                         "SELECT session_user, current_user, "
@@ -916,6 +934,24 @@ class Database:
                     await invalidate_task
                 raise
 
+    def _request_reader_scope(self, request):
+        """Let ordinary nearby-provider setup own locks before claims share its snapshot."""
+        if request.path.rstrip("/") == "/api/v1/npi/near":
+            from sanic.exceptions import SanicException
+
+            from api.network_address_scope import _request_selector, current_network_address_scope
+
+            try:
+                is_ordinary = current_network_address_scope() is None and _request_selector(request, None) is None
+            except SanicException:
+                is_ordinary = False  # The existing endpoint owns selector errors and response headers.
+            if is_ordinary:
+                from api.endpoint.npi import _runtime_db_schema
+                from api.provider_profile_snapshot import provider_profile_read_snapshot
+
+                return provider_profile_read_snapshot(self, _runtime_db_schema(), include_detail=True)
+        return self.reader_session()
+
     def init_app(self, app) -> None:
         """Register database lifecycle and request-session hooks on an app."""
         if _ASYNC_IMPORT_ERROR is not None:
@@ -941,7 +977,7 @@ class Database:
                 self.is_api_reader_enabled() and self._is_pinned_read_path(request.path)
             ) or request.path.rstrip("/") == "/control/v1/plan-pricing/code-projection"
             if is_pinned_reader:
-                scope = self.reader_session()
+                scope = self._request_reader_scope(request)
                 session = await scope.__aenter__()
                 request.ctx._sa_reader_scope = scope
             else:
