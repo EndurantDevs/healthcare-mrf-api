@@ -688,6 +688,7 @@ async def test_retry_import_run_merges_provider_directory_retry_params_into_chil
             "retry_params": {
                 "retry_of_run_id": "run_parent",
                 "provider_directory_pagination_root_run_id": "run_root",
+                "allow_retained_pagination_reset": False,
             },
         },
     )
@@ -702,6 +703,7 @@ async def test_retry_import_run_merges_provider_directory_retry_params_into_chil
                 "resource_limit": 100,
                 "retry_of_run_id": "run_parent",
                 "provider_directory_pagination_root_run_id": "run_root",
+                "allow_retained_pagination_reset": False,
             },
             "triggered_by": "api",
             "idempotency_key": "retry_provider_directory",
@@ -712,6 +714,23 @@ async def test_retry_import_run_merges_provider_directory_retry_params_into_chil
             "retry_of_run_id": "run_parent",
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, 0, 1, "false", "true"])
+async def test_provider_directory_api_rejects_nonboolean_retained_reset_control(monkeypatch, value):
+    monkeypatch.setattr(control_imports, "importer_names", lambda: {"provider-directory-fhir"})
+    with pytest.raises(ValueError, match="allow_retained_pagination_reset_invalid"):
+        await control_imports.create_import_run(
+            {"importer": "provider-directory-fhir", "params": {"allow_retained_pagination_reset": value}}
+        )
+
+
+def test_provider_directory_retry_cannot_reenable_retained_reset():
+    parent_run_map = {"importer": "provider-directory-fhir", "params": {"allow_retained_pagination_reset": False}}
+    assert control_imports._retry_child_params(parent_run_map, "parent", {})["allow_retained_pagination_reset"] is False
+    with pytest.raises(ValueError, match="retained_pagination_reset_cannot_be_enabled"):
+        control_imports._retry_child_params(parent_run_map, "parent", {"allow_retained_pagination_reset": True})
 
 
 @pytest.mark.asyncio
@@ -2773,12 +2792,16 @@ class _BlockingProviderEnqueue:
         }
 
 
-def _provider_retry_request(run_id):
-    return {
+def _provider_retry_request(run_id, lineage="outer"):
+    request_payload_map = {
         "run_id": run_id,
         "importer": "provider-directory-fhir",
-        "retry_of_run_id": "run_parent",
     }
+    if lineage in {"outer", "both"}:
+        request_payload_map["retry_of_run_id"] = "run_parent"
+    if lineage in {"nested", "both"}:
+        request_payload_map["params"] = {"retry_of_run_id": "run_parent"}
+    return request_payload_map
 
 
 def _install_provider_admission_stubs(monkeypatch, active_runs, *, idempotency_run=None):
@@ -3270,7 +3293,8 @@ async def test_create_import_run_replays_provider_directory_idempotency_key(monk
 
 
 @pytest.mark.asyncio
-async def test_create_import_run_replays_terminal_provider_directory_retry_child(monkeypatch):
+@pytest.mark.parametrize("lineage", ["outer", "nested", "both"])
+async def test_create_import_run_replays_terminal_provider_directory_retry_child(monkeypatch, lineage):
     terminal_child_map = {
         "run_id": "run_child",
         "status": "failed",
@@ -3290,14 +3314,9 @@ async def test_create_import_run_replays_terminal_provider_directory_retry_child
     monkeypatch.setattr(control_imports, "_active_importer_runs", fail_active_lookup)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
-    replayed_run, created = await create_import_run(
-        {
-            "run_id": "run_second_child",
-            "importer": "provider-directory-fhir",
-            "retry_of_run_id": "run_parent",
-            "idempotency_key": "new-idempotency-key",
-        }
-    )
+    request_payload_map = _provider_retry_request("run_second_child", lineage)
+    request_payload_map["idempotency_key"] = "new-idempotency-key"
+    replayed_run, created = await create_import_run(request_payload_map)
 
     assert created is False
     assert replayed_run == terminal_child_map
@@ -3308,7 +3327,10 @@ async def test_create_import_run_replays_terminal_provider_directory_retry_child
 
 
 @pytest.mark.asyncio
-async def test_concurrent_provider_directory_retries_converge_on_one_child(monkeypatch):
+@pytest.mark.parametrize(
+    "first_lineage,second_lineage", [("outer", "outer"), ("nested", "nested"), ("nested", "outer"), ("outer", "nested")]
+)
+async def test_concurrent_provider_directory_retries_converge_on_one_child(monkeypatch, first_lineage, second_lineage):
     """Serialize concurrent admissions and return the first direct child."""
     database = _ConcurrentProviderAdmissionDb()
     enqueue = _BlockingProviderEnqueue()
@@ -3324,15 +3346,16 @@ async def test_concurrent_provider_directory_retries_converge_on_one_child(monke
     async def no_active_runs(_connection, _importer):
         return []
 
+    database.query_rows = [{"run_id": "run_parent", "importer": "provider-directory-fhir", "params": {}}]
     monkeypatch.setattr(control_imports, "db", database)
     monkeypatch.setattr(control_imports, "_provider_directory_retry_child", retry_child)
     monkeypatch.setattr(control_imports, "_active_idempotency_run", no_idempotency_run)
     monkeypatch.setattr(control_imports, "_active_importer_runs", no_active_runs)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
 
-    first_task = asyncio.create_task(create_import_run(_provider_retry_request("run_child_one")))
+    first_task = asyncio.create_task(create_import_run(_provider_retry_request("run_child_one", first_lineage)))
     await enqueue.started.wait()
-    second_result = await create_import_run(_provider_retry_request("run_child_two"))
+    second_result = await create_import_run(_provider_retry_request("run_child_two", second_lineage))
     enqueue.finish.set()
     first_result = await first_task
 
@@ -3341,6 +3364,204 @@ async def test_concurrent_provider_directory_retries_converge_on_one_child(monke
     assert first_result[0]["run_id"] == second_result[0]["run_id"] == "run_child_one"
     assert enqueue.calls == ["run_child_one"]
     assert [event[0] for event in database.events].count("status") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lineage", ["nested", "both"])
+async def test_provider_retry_normalizes_parent_without_changing_source_scope(monkeypatch, lineage):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    database.query_rows = [
+        {"run_id": run_id, "importer": "provider-directory-fhir", "params": {"allow_retained_pagination_reset": False}}
+        for run_id in ("run_parent", "run_root")
+    ]
+    retry_child = AsyncMock(return_value=None)
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", retry_child)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    request_payload_map = _provider_retry_request("run_child", lineage)
+    params_by_name = {
+        "retry_of_run_id": " run_parent ",
+        "provider_directory_pagination_root_run_id": "run_root",
+        "allow_retained_pagination_reset": False,
+        "source_ids": ["source_alias_a", "source_alias_b"],
+        "provider_directory_endpoint_scope": "https://directory.example.test/fhir",
+    }
+    request_payload_map["params"] = params_by_name
+    original_request = json.loads(json.dumps(request_payload_map))
+    created_run, created = await create_import_run(request_payload_map)
+    assert created is True
+    assert request_payload_map == original_request
+    assert created_run["retry_of_run_id"] == "run_parent"
+    retry_child.assert_awaited_once_with(database, "run_parent")
+    queued_run = enqueue.await_args.args[0]
+    assert queued_run["retry_of_run_id"] == "run_parent"
+    assert queued_run["params"] == params_by_name
+    inserted = next(event[1].compile().params for event in database.events if event[0] == "status")
+    assert inserted["retry_of_run_id"] == "run_parent"
+    assert inserted["params"] == params_by_name
+    adapter = control_imports._SINGLE_JOB_ADAPTERS["provider-directory-fhir"]
+    assert control_imports._adapter_payload(adapter, queued_run, queued_run["params"])["task"] == {
+        "test_mode": False,
+        **params_by_name,
+        "retry_of_run_id": "run_parent",
+    }
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_rejects_conflicting_parents_before_replay(monkeypatch):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    replayed_run_map = {
+        "run_id": "run_existing",
+        "importer": "provider-directory-fhir",
+        "retry_of_run_id": "run_parent",
+    }
+    retry_child = AsyncMock(return_value=replayed_run_map)
+    idempotency_run = AsyncMock(return_value=replayed_run_map)
+    enqueue = AsyncMock()
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", retry_child)
+    monkeypatch.setattr(control_imports, "_active_idempotency_run", idempotency_run)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    with pytest.raises(ValueError, match="retry_parent_changed"):
+        await create_import_run(
+            {
+                "importer": "provider-directory-fhir",
+                "retry_of_run_id": "run_parent",
+                "params": {"retry_of_run_id": "run_other"},
+                "idempotency_key": "existing-key",
+            }
+        )
+    assert database.events == []
+    retry_child.assert_not_awaited()
+    idempotency_run.assert_not_awaited()
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["openaddresses", "mrf-source-discovery"])
+async def test_nested_retry_normalization_is_limited_to_provider_directory(monkeypatch, importer):
+    _install_provider_admission_stubs(monkeypatch, [])
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", AsyncMock(return_value=None))
+    monkeypatch.setattr(control_imports, "_has_isolated_pricing_admission", AsyncMock(return_value=False))
+    admission = AsyncMock(return_value=None)
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_admit_import_row", admission)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    run, created = await create_import_run({"importer": importer, "params": {"retry_of_run_id": "run_parent"}})
+    assert created is True
+    assert run["retry_of_run_id"] is None
+    assert admission.await_args.args[1]["retry_of_run_id"] is None
+    assert enqueue.await_args.args[0]["params"] == {"retry_of_run_id": "run_parent"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_policy", [None, True, False])
+@pytest.mark.parametrize("lineage", ["outer", "nested", "root"])
+async def test_direct_provider_retry_preserves_retained_reset_policy(monkeypatch, child_policy, lineage):
+    """Reject widening before insert/enqueue; queue the explicit false policy unchanged."""
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    database.query_rows = [
+        {
+            "run_id": "run_parent",
+            "importer": "provider-directory-fhir",
+            "params": {"allow_retained_pagination_reset": False},
+        }
+    ]
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", AsyncMock(return_value=None))
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    params_by_name = {} if child_policy is None else {"allow_retained_pagination_reset": child_policy}
+    request_payload_map = {"importer": "provider-directory-fhir", "params": params_by_name}
+    if lineage == "outer":
+        request_payload_map["retry_of_run_id"] = "run_parent"
+    else:
+        params_by_name["retry_of_run_id" if lineage == "nested" else "provider_directory_pagination_root_run_id"] = (
+            "run_parent"
+        )
+    if child_policy is not False:
+        with pytest.raises(ValueError, match="retained_pagination_reset_cannot_be_enabled"):
+            await create_import_run(request_payload_map)
+        assert not any(event[0] in {"status", "execute"} for event in database.events)
+        enqueue.assert_not_awaited()
+        return
+    created_run, created = await create_import_run(request_payload_map)
+    assert created is True
+    assert created_run["params"]["allow_retained_pagination_reset"] is False
+    assert enqueue.await_args.args[0]["params"]["allow_retained_pagination_reset"] is False
+    inserted = next(event[1].compile().params for event in database.events if event[0] == "status")
+    assert inserted["params"]["allow_retained_pagination_reset"] is False
+    lookup = next(event[1].compile().params for event in database.events if event[0] == "all")
+    assert lookup["importer_1"] == "provider-directory-fhir"
+    assert set(lookup["run_id_1"]) == {"run_parent"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing", "wrong-importer", "conflicting-parent", "root-no-reset", "self-root"])
+async def test_direct_provider_retry_rejects_unverified_or_restrictive_ancestors(monkeypatch, damage):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    parent_run_map = {"run_id": "run_parent", "importer": "provider-directory-fhir", "params": {}}
+    root_run_map = {"run_id": "run_root", "importer": "provider-directory-fhir", "params": {}}
+    params_by_name = {"retry_of_run_id": "run_parent", "provider_directory_pagination_root_run_id": "run_root"}
+    database.query_rows = [parent_run_map, root_run_map]
+    expected = "retry_ancestor_unavailable"
+    if damage == "missing":
+        database.query_rows = [parent_run_map]
+    elif damage == "wrong-importer":
+        root_run_map["importer"] = "npi"
+        database.query_rows = [parent_run_map]
+    elif damage == "conflicting-parent":
+        params_by_name["retry_of_run_id"] = "run_other"
+        expected = "retry_parent_changed"
+    elif damage == "self-root":
+        params_by_name["provider_directory_pagination_root_run_id"] = "run_child"
+        database.query_rows = [parent_run_map]
+    else:
+        root_run_map["params"]["allow_retained_pagination_reset"] = False
+        expected = "retained_pagination_reset_cannot_be_enabled"
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", AsyncMock(return_value=None))
+    enqueue = AsyncMock()
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    with pytest.raises(ValueError, match=expected):
+        await create_import_run(
+            {
+                "run_id": "run_child",
+                "importer": "provider-directory-fhir",
+                "retry_of_run_id": "run_parent",
+                "params": params_by_name,
+            }
+        )
+    assert not any(event[0] in {"status", "execute"} for event in database.events)
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_provider_retry_keeps_legacy_permissive_policy(monkeypatch):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    database.query_rows = [{"run_id": "run_parent", "importer": "provider-directory-fhir", "params": {}}]
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", AsyncMock(return_value=None))
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    run, created = await create_import_run({"importer": "provider-directory-fhir", "retry_of_run_id": "run_parent"})
+    assert created is True
+    assert "allow_retained_pagination_reset" not in run["params"]
+    assert "allow_retained_pagination_reset" not in enqueue.await_args.args[0]["params"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_provider_run_accepts_its_explicit_pagination_root(monkeypatch):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    run, created = await create_import_run(
+        {
+            "run_id": "run_fresh",
+            "importer": "provider-directory-fhir",
+            "params": {"provider_directory_pagination_root_run_id": "run_fresh"},
+        }
+    )
+    assert created is True
+    assert run["params"]["provider_directory_pagination_root_run_id"] == "run_fresh"
+    assert not any(event[0] == "all" for event in database.events)
+    enqueue.assert_awaited_once()
 
 
 @pytest.mark.asyncio

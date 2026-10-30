@@ -79,6 +79,11 @@ from process.plan_pricing_control import (
 from process.plan_pricing_control_transaction import pricing_admission_transaction
 from process.provider_directory_fhir_census_contract import (
     ProviderDirectoryFHIRAcquisitionStrategy,
+    is_retained_pagination_reset_allowed,
+    require_retained_pagination_reset_policy,
+    retained_pagination_ancestor_ids,
+    retained_pagination_retry_params,
+    retained_pagination_retry_parent,
 )
 from process.provider_directory_profile_selection import (
     ProviderDirectoryProfileSelectionError,
@@ -2720,6 +2725,20 @@ async def _provider_directory_retry_child(connection: Any, retry_of_run_id: str)
     return _normalize_connection_run(child_rows[0]) if child_rows else None
 
 
+async def _require_provider_directory_retained_reset_policy(connection: Any, import_row: dict[str, Any]) -> None:
+    """Keep direct retry creation from weakening a retained ancestor's policy."""
+    ancestors = retained_pagination_ancestor_ids(import_row)
+    if not ancestors:
+        return
+    rows = await connection.all(
+        select(ImportRun.__table__)
+        .where(ImportRun.importer == "provider-directory-fhir")
+        .where(ImportRun.run_id.in_(ancestors))
+    )
+    retained_runs = [_normalize_connection_run(row) for row in rows]
+    require_retained_pagination_reset_policy(import_row["params"], ancestors, retained_runs)
+
+
 async def _active_importer_runs(connection: Any, importer: str) -> list[dict[str, Any]]:
     statement = (
         select(ImportRun.__table__)
@@ -3191,6 +3210,7 @@ async def _admit_provider_directory_run(import_row: dict[str, Any]) -> dict[str,
             )
             if active_run:
                 return active_run
+        await _require_provider_directory_retained_reset_policy(connection, import_row)
         active_runs = await _active_importer_runs(connection, "provider-directory-fhir")
         blocking_run = _provider_directory_blocking_run(import_row["params"], active_runs)
         if blocking_run:
@@ -3486,6 +3506,8 @@ async def create_import_run(
         if importer == "provider-directory-fhir"
         else raw_params_by_name
     )
+    if importer == "provider-directory-fhir":
+        is_retained_pagination_reset_allowed(effective_params_by_name)
     if importer == "npi" and any(
         bool(effective_params_by_name.get(parameter_name)) for parameter_name in ("test", "test_mode")
     ):
@@ -3544,6 +3566,8 @@ async def create_import_run(
         **request_payload_map,
         "params": normalized_params_by_name,
     }
+    if importer == "provider-directory-fhir":
+        request_payload_map["retry_of_run_id"] = retained_pagination_retry_parent(request_payload_map)
     source_file_import_id = (
         source_file_import_id_from_payload(
             request_payload_map,
@@ -4929,14 +4953,7 @@ def _retry_child_params(
             str(current_run_map.get("importer") or ""),
             child_params_by_name,
         )
-    root_run_id = str(
-        current_params_by_name.get("provider_directory_pagination_root_run_id")
-        or retry_params_by_name.get("provider_directory_pagination_root_run_id")
-        or run_id
-    ).strip()
-    child_params_by_name["retry_of_run_id"] = run_id
-    child_params_by_name["provider_directory_pagination_root_run_id"] = root_run_id
-    return child_params_by_name
+    return retained_pagination_retry_params(current_params_by_name, run_id, child_params_by_name)
 
 
 def _has_ptg_full_rebuild_control(params_by_name: dict[str, Any]) -> bool:

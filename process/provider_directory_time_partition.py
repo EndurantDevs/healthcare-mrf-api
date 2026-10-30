@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from process import provider_directory_time_partition_primitives as _primitives
+from process.provider_directory_fetch_types import PartitionFetchState
 from process.provider_directory_time_partition_primitives import (
     PartitionPlanError,
     fingerprint_resource,
@@ -531,3 +532,9 @@ class PartitionPlan:
             count=fields["count"],
             passes=passes_by_number,
         )
+
+
+async def mark_partition_page_fetched(state: PartitionFetchState) -> None:
+    """Account for a fetched page under the existing partition state lock."""
+    async with state.state_lock:
+        state.page_count += 1

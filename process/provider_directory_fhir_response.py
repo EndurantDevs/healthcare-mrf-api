@@ -12,6 +12,36 @@ SOURCE_HTTP_REQUEST_SLOTS: contextvars.ContextVar[dict | None] = contextvars.Con
 )
 
 
+class AdaptiveRequestSlots:
+    """Drain active requests before admitting work at a reduced endpoint limit."""
+
+    def __init__(self, capacity):
+        self.limit = capacity
+        self.active = 0
+        self.condition = asyncio.Condition()
+
+    async def __aenter__(self):
+        async with self.condition:
+            await self.condition.wait_for(lambda: self.active < self.limit)
+            self.active += 1
+        return self
+
+    async def __aexit__(self, *_exc):
+        async with self.condition:
+            self.active -= 1
+            self.condition.notify_all()
+
+    def reduce(self):
+        """Retain a lower allowance until this import's transport closes."""
+        self.limit = max(1, self.limit // 2)
+
+
+def _response_limits_concurrency(response):
+    """Reduce load for throttling, unavailable upstreams and transport timeouts."""
+    status, _payload, error, _elapsed = response
+    return status in {429, 503, 504} or bool(error and any(word in error.lower() for word in ("timeout", "timed out")))
+
+
 def is_empty_search_set(
     status_code: int | None,
     fhir_payload: dict[str, Any] | None,
@@ -71,15 +101,27 @@ async def fetch_paced_source_response(directory, source_record, url, *, timeout)
         if slot_map is None:
             slot_map, slot_key = pacing_state, "request_slots"
         if slot_key not in slot_map:
-            slot_map[slot_key] = asyncio.Semaphore(max(1, capacity))
+            slot_map[slot_key] = AdaptiveRequestSlots(max(1, capacity))
         request_slots = slot_map[slot_key]
-    async with request_slots, total_slots:
-        await directory._pace_source_request(source_record)
-        response = await directory._fetch_source_json_unpaced(source_record, url, timeout=timeout)
-        if response[0] == 429 and pacing_state is not None:
-            delay = directory._source_retry_after_seconds(response[1])
-            if delay is not None:
-                pacing_state["retry_after_monotonic"] = max(
-                    pacing_state.get("retry_after_monotonic", 0.0), directory.time.monotonic() + delay
-                )
-        return response
+    while True:
+        async with request_slots, total_slots:
+            await directory._pace_source_request(source_record)
+            if isinstance(request_slots, AdaptiveRequestSlots) and request_slots.active > request_slots.limit:
+                continue
+            response = await directory._fetch_source_json_unpaced(source_record, url, timeout=timeout)
+            if isinstance(request_slots, AdaptiveRequestSlots) and _response_limits_concurrency(response):
+                previous_limit = request_slots.limit
+                request_slots.reduce()
+                if request_slots.limit != previous_limit:
+                    directory.LOGGER.info(
+                        "Provider Directory request concurrency reduced: previous=%s effective=%s",
+                        previous_limit,
+                        request_slots.limit,
+                    )
+            if response[0] in {429, 503, 504} and pacing_state is not None:
+                delay = directory._source_retry_after_seconds(response[1])
+                if delay is not None:
+                    pacing_state["retry_after_monotonic"] = max(
+                        pacing_state.get("retry_after_monotonic", 0.0), directory.time.monotonic() + delay
+                    )
+            return response

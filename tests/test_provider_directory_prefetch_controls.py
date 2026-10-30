@@ -51,7 +51,7 @@ def _configure_neutral_parallel_source(source_record, cap):
         (3, 2, False, 4, 2),
         (3, 3, False, 4, 3),
         (3, 3, False, 3, 1),
-        (3, 3, True, 2, 2),
+        (3, 3, True, 2, 3),
         (2, 2, True, 2, 2),
     ],
 )
@@ -69,7 +69,7 @@ def test_configured_resource_scans_respect_source_and_connection_caps(
         assert importer._effective_resource_scan_concurrency(source_record, options) == expected
 
 
-@pytest.mark.parametrize("cap", [0, -1, 4, True, 2.0, "invalid", [], {}])
+@pytest.mark.parametrize("cap", [0, -1, 9, True, 2.0, "invalid", [], {}])
 def test_source_resource_cap_rejects_invalid_metadata(cap):
     """Malformed source policy must not silently select a parallel default."""
     source_record = _configure_neutral_parallel_source(_parallel_resource_source(), cap)
@@ -670,6 +670,8 @@ async def test_sources_sharing_host_recheck_cooldown_after_shared_slot_wait(thro
             await asyncio.sleep(0)
             release.set()
             assert (await asyncio.wait_for(tasks[1], 2))[0] == 429
+            assert not tasks[2].done()
+            release_blocker.set()
             assert (await asyncio.wait_for(tasks[2], 2))[0] == 200
             assert (
                 starts_by_path["/sibling"]

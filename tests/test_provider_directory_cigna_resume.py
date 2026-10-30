@@ -39,6 +39,7 @@ def resumed_cursor():
         {"request_url": f"{directory.CIGNA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"},
         {"request_url": "https://directory.example.test/fhir/Practitioner?_getpages=unusable"},
         {"is_current_version_census": True},
+        {"allow_retained_pagination_reset": False},
     ],
 )
 def test_outcome_restart_keeps_existing_replay_and_source_fences(resumed_cursor, overrides):
@@ -96,6 +97,94 @@ async def test_unusable_resumed_cursor_reenumerates_once_and_still_requires_comp
     assert result.rows_written == (2 if recovers else 1)
     assert result.next_url_remaining is not recovers
     assert result.error == (None if recovers else directory.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("unit_source_factory")
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("after_page", [False, True])
+@pytest.mark.parametrize("status", [200, 400, 404, 410, 503])
+async def test_retained_prefix_is_preserved_when_cursor_replay_is_disabled(
+    monkeypatch, request, prefetch, after_page, status
+):
+    if after_page:
+        request.getfixturevalue("unit_checkpoint_catalog")
+    scan = _RestPageHarness(monkeypatch, pages=3, prefetch=prefetch)
+    scan.checkpoint_context = replace(scan.checkpoint_context, allow_retained_pagination_reset=False)
+    scan.resume_state = directory.PaginationResumeState(scan.urls[1], 10, 1000, (), resumed=True)
+    failed_index = 2 if after_page else 1
+    failure = _outcome_response(scan) if status == 200 else (status, None, None, 5)
+    scan.responses[scan.urls[failed_index]] = failure
+    reset = AsyncMock()
+    monkeypatch.setattr(directory, "_reset_pagination_checkpoint", reset)
+
+    result = await scan.run()
+
+    reset.assert_not_awaited()
+    assert scan.requests == scan.urls[1 : failed_index + 1]
+    assert not result.complete and result.next_url_remaining
+    assert result.error == (directory.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR if status == 200 else f"http_{status}")
+    assert result.rows_fetched == 1000 + int(after_page)
+    assert result.pages_fetched == 10 + int(after_page)
+    assert len(scan.write_attempts) == len(scan.checkpoints) == int(after_page)
+    if after_page:
+        assert scan.checkpoints[-1]["next_url"] == scan.urls[failed_index]
+        assert scan.checkpoints[-1]["rows_processed"] == 1001
+    assert result.page_prefetch_consumed == int(prefetch and after_page)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("unit_source_factory", "unit_checkpoint_catalog")
+@pytest.mark.parametrize("prefetch", [False, True])
+async def test_disabling_replay_keeps_successful_retained_resume(monkeypatch, prefetch):
+    scan = _RestPageHarness(monkeypatch, pages=3, prefetch=prefetch)
+    scan.checkpoint_context = replace(scan.checkpoint_context, allow_retained_pagination_reset=False)
+    scan.resume_state = directory.PaginationResumeState(scan.urls[1], 10, 1000, (), resumed=True)
+    reset = AsyncMock()
+    monkeypatch.setattr(directory, "_reset_pagination_checkpoint", reset)
+
+    result = await scan.run()
+
+    assert result.complete and result.rows_fetched == 1002
+    assert scan.requests == scan.urls[1:]
+    assert scan.checkpoints[-1]["next_url"] is None
+    reset.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "false", "true"])
+def test_retained_reset_control_is_strict_before_execution(value):
+    with pytest.raises(ValueError, match="allow_retained_pagination_reset_invalid"):
+        directory.current_version_census_request(
+            {"allow_retained_pagination_reset": value}, allowed_resources=directory.DEFAULT_RESOURCES
+        )
+    with pytest.raises(ValueError, match="allow_retained_pagination_reset_invalid"):
+        directory.PaginationCheckpointContext(
+            "https://directory.example.test/fhir",
+            "scope",
+            ("source",),
+            "run",
+            "run",
+            allow_retained_pagination_reset=value,
+        )
+
+
+@pytest.mark.asyncio
+async def test_resource_group_carries_no_reset_control_into_checkpoint_context(monkeypatch):
+    scan = _RestPageHarness(monkeypatch, prefetch=False)
+    prepare = AsyncMock(return_value=None)
+    monkeypatch.setattr(directory, "_prepare_endpoint_dataset_candidate", prepare)
+    records, candidate = await directory._prepare_resource_import_source_group(
+        [scan.source],
+        ["Practitioner"],
+        run_id="retry",
+        retry_of_run_id="parent",
+        pagination_root_run_id="root",
+        is_checkpointing_enabled=True,
+        allow_retained_pagination_reset=False,
+    )
+    assert candidate is None
+    assert records[0]["_pagination_checkpoint_context"].allow_retained_pagination_reset is False
+    assert prepare.await_args.kwargs["checkpoint_context"].allow_retained_pagination_reset is False
 
 
 @pytest.mark.asyncio

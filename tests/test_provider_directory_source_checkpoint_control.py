@@ -190,7 +190,7 @@ async def test_private_pagination_fence_requires_live_parent_and_matching_root(c
             await control.fence_checkpoint_dataset_parents(publisher, ["dataset"], ["root"])
     publisher.connection.fetch.assert_awaited_once()
     query, datasets, roots = publisher.connection.fetch.await_args.args
-    assert query.endswith('ORDER BY dataset_id COLLATE "C" FOR SHARE')
+    assert query.endswith('ORDER BY dataset_id COLLATE "C" FOR KEY SHARE')
     assert datasets == ["dataset"] and roots == ["root"]
 
 

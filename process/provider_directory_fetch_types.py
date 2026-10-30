@@ -111,8 +111,11 @@ class PaginationCheckpointContext:
     dataset_id: str | None = None
     lineage_verified: bool = False
     restart_expired_current_census_slice: bool = True
+    allow_retained_pagination_reset: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.allow_retained_pagination_reset) is not bool:
+            raise ValueError("provider_directory_allow_retained_pagination_reset_invalid")
         if not self.acquisition_root_run_id.strip():
             raise ValueError("provider_directory_pagination_root_missing")
 
@@ -214,7 +217,7 @@ class LastUpdatedPartitionFetchOptions:
     window_concurrency: int = 1
 
 
-MAX_RESOURCE_SCAN_CONCURRENCY = 3
+MAX_RESOURCE_SCAN_CONCURRENCY = 8
 
 
 def validated_resource_scan_concurrency(raw_value: Any) -> int:
