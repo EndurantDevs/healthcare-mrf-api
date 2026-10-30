@@ -34,12 +34,9 @@ from process.provider_directory_fhir_subset_identity import (
     SERVER_ISSUED_SUBSET_STRATEGY_VERSION,
     SERVER_ISSUED_SUBSET_TRAVERSAL_VERSION,
 )
-CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY = (
-    "smile-opaque-logical-offset-v2"
-)
-CURRENT_VERSION_CENSUS_STRATEGY_VERSION = (
-    "provider-directory-fhir-cutoff-bounded-current-version-census-v1"
-)
+
+CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY = "smile-opaque-logical-offset-v2"
+CURRENT_VERSION_CENSUS_STRATEGY_VERSION = "provider-directory-fhir-cutoff-bounded-current-version-census-v1"
 _CURRENT_VERSION_CENSUS_BOOLEAN_TASK_FIELDS = frozenset(
     {
         "bulk_export",
@@ -116,9 +113,7 @@ class ProviderDirectoryFHIRAcquisitionStrategy(str, Enum):
     """Supported top-level FHIR acquisition strategies."""
 
     CONFIGURED = "configured"
-    CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS = (
-        "cutoff-bounded-current-version-census"
-    )
+    CUTOFF_BOUNDED_CURRENT_VERSION_CENSUS = "cutoff-bounded-current-version-census"
     SERVER_ISSUED_TRAVERSAL_SUBSET = "server-issued-traversal-subset"
 
 
@@ -154,9 +149,7 @@ def _raw_vector(value: Any, *, field_name: str) -> list[Any]:
                 raise ValueError(f"{field_name}_invalid_json") from exc
             return decoded
         return stripped.split(",")
-    if isinstance(value, Sequence) and not isinstance(
-        value, (bytes, bytearray)
-    ):
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
         return list(value)
     raise ValueError(f"{field_name}_must_be_sequence")
 
@@ -183,9 +176,7 @@ def _strict_text_vector(
     if allowed_values is not None:
         unknown_values = sorted(set(normalized_values) - allowed_values)
         if unknown_values:
-            raise ValueError(
-                f"{field_name}_unsupported:{','.join(unknown_values)}"
-            )
+            raise ValueError(f"{field_name}_unsupported:{','.join(unknown_values)}")
     return tuple(normalized_values)
 
 
@@ -196,9 +187,7 @@ def _source_id_vector(task: Mapping[str, Any]) -> tuple[str, ...]:
         if task.get(field_name) not in (None, "", [], ())
     ]
     if len(populated_aliases) > 1:
-        raise ValueError(
-            "provider_directory_current_version_census_source_id_aliases_conflict"
-        )
+        raise ValueError("provider_directory_current_version_census_source_id_aliases_conflict")
     if not populated_aliases:
         return ()
     return _strict_text_vector(
@@ -212,28 +201,18 @@ def _canonical_cutoff(value: Any, *, now: datetime.datetime | None = None) -> st
     if raw_cutoff is None:
         raise ValueError("provider_directory_current_version_census_cutoff_required")
     try:
-        parsed_cutoff = datetime.datetime.fromisoformat(
-            raw_cutoff.replace("Z", "+00:00")
-        )
+        parsed_cutoff = datetime.datetime.fromisoformat(raw_cutoff.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise ValueError(
-            "provider_directory_current_version_census_cutoff_invalid"
-        ) from exc
+        raise ValueError("provider_directory_current_version_census_cutoff_invalid") from exc
     if parsed_cutoff.tzinfo is None or parsed_cutoff.utcoffset() is None:
-        raise ValueError(
-            "provider_directory_current_version_census_cutoff_timezone_required"
-        )
+        raise ValueError("provider_directory_current_version_census_cutoff_timezone_required")
     normalized_cutoff = parsed_cutoff.astimezone(datetime.UTC)
     current_time = now or datetime.datetime.now(datetime.UTC)
     if current_time.tzinfo is None or current_time.utcoffset() is None:
         raise ValueError("provider_directory_current_version_census_now_timezone_required")
     if normalized_cutoff > current_time.astimezone(datetime.UTC):
-        raise ValueError(
-            "provider_directory_current_version_census_cutoff_cannot_be_future"
-        )
-    return normalized_cutoff.isoformat(timespec="microseconds").replace(
-        "+00:00", "Z"
-    )
+        raise ValueError("provider_directory_current_version_census_cutoff_cannot_be_future")
+    return normalized_cutoff.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -253,25 +232,72 @@ def _validate_current_version_census_task_types(
 ) -> None:
     has_invalid_task_field = bool(
         any(
-            task.get(field_name) is not None
-            and type(task.get(field_name)) is not bool
+            task.get(field_name) is not None and type(task.get(field_name)) is not bool
             for field_name in _CURRENT_VERSION_CENSUS_BOOLEAN_TASK_FIELDS
         )
         or any(
-            task.get(field_name) is not None
-            and type(task.get(field_name)) is not int
+            task.get(field_name) is not None and type(task.get(field_name)) is not int
             for field_name in _CURRENT_VERSION_CENSUS_INTEGER_TASK_FIELDS
         )
         or any(
-            task.get(field_name) is not None
-            and type(task.get(field_name)) is not str
+            task.get(field_name) is not None and type(task.get(field_name)) is not str
             for field_name in _CURRENT_VERSION_CENSUS_TEXT_TASK_FIELDS
         )
     )
     if has_invalid_task_field:
-        raise ValueError(
-            "provider_directory_current_version_census_task_type_invalid"
-        )
+        raise ValueError("provider_directory_current_version_census_task_type_invalid")
+
+
+def is_retained_pagination_reset_allowed(task: Mapping[str, Any]) -> bool:
+    """Require an explicit boolean before changing retained acquisition behavior."""
+    is_allowed = task.get("allow_retained_pagination_reset", True)
+    if type(is_allowed) is not bool:
+        raise ValueError("provider_directory_allow_retained_pagination_reset_invalid")
+    return is_allowed
+
+
+def retained_pagination_retry_parent(run: Mapping[str, Any]) -> str | None:
+    """Resolve one canonical parent without accepting conflicting references."""
+    parent = str(run.get("retry_of_run_id") or "").strip()
+    nested_parent = str(run["params"].get("retry_of_run_id") or "").strip()
+    if parent and nested_parent and parent != nested_parent:
+        raise ValueError("provider_directory_retry_parent_changed")
+    return parent or nested_parent or None
+
+
+def retained_pagination_ancestor_ids(run: Mapping[str, Any]) -> set[str]:
+    """Resolve the retained references while allowing an explicit fresh root."""
+    parent = retained_pagination_retry_parent(run)
+    root = str(run["params"].get("provider_directory_pagination_root_run_id") or "").strip()
+    if not parent and root == run["run_id"]:
+        return set()
+    return {run_id for run_id in (parent, root) if run_id}
+
+
+def require_retained_pagination_reset_policy(
+    params: Mapping[str, Any], ancestors: set[str], retained_runs: Sequence[Mapping[str, Any]]
+) -> None:
+    """Require every retained reference and preserve its no-reset setting."""
+    if {run["run_id"] for run in retained_runs} != ancestors:
+        raise ValueError("provider_directory_retry_ancestor_unavailable")
+    retained_reset_values = [is_retained_pagination_reset_allowed(run.get("params") or {}) for run in retained_runs]
+    if is_retained_pagination_reset_allowed(params) and not all(retained_reset_values):
+        raise ValueError("provider_directory_retained_pagination_reset_cannot_be_enabled")
+
+
+def retained_pagination_retry_params(
+    current_params: Mapping[str, Any], run_id: str, child_params: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Bind merged retry parameters to their parent and retained reset policy."""
+    if not is_retained_pagination_reset_allowed(current_params) and is_retained_pagination_reset_allowed(child_params):
+        raise ValueError("provider_directory_retained_pagination_reset_cannot_be_enabled")
+    is_retained_pagination_reset_allowed(child_params)
+    root_run_id = str(
+        current_params.get("provider_directory_pagination_root_run_id")
+        or child_params.get("provider_directory_pagination_root_run_id")
+        or run_id
+    ).strip()
+    return {**child_params, "retry_of_run_id": run_id, "provider_directory_pagination_root_run_id": root_run_id}
 
 
 def current_version_census_request(
@@ -282,31 +308,22 @@ def current_version_census_request(
 ) -> CurrentVersionCensusRequest | None:
     """Parse manual acquisition identity and reject ambiguous fields."""
 
-    strategy = _strategy_from_value(
-        task.get("provider_directory_acquisition_strategy")
-    )
+    is_retained_pagination_reset_allowed(task)
+    strategy = _strategy_from_value(task.get("provider_directory_acquisition_strategy"))
     raw_cutoff = task.get("provider_directory_census_cutoff")
     if strategy is ProviderDirectoryFHIRAcquisitionStrategy.CONFIGURED:
         if raw_cutoff not in (None, ""):
-            raise ValueError(
-                "provider_directory_current_version_census_cutoff_without_strategy"
-            )
+            raise ValueError("provider_directory_current_version_census_cutoff_without_strategy")
         return None
     _validate_current_version_census_task_types(task)
     if task.get("import_resources") is not True:
-        raise ValueError(
-            "provider_directory_current_version_census_import_resources_required"
-        )
+        raise ValueError("provider_directory_current_version_census_import_resources_required")
     source_ids = _source_id_vector(task)
     if len(source_ids) != 1:
-        raise ValueError(
-            "provider_directory_current_version_census_exactly_one_source_required"
-        )
+        raise ValueError("provider_directory_current_version_census_exactly_one_source_required")
     raw_resources = task.get("resources")
     if raw_resources in (None, ""):
-        raise ValueError(
-            "provider_directory_current_version_census_resources_required"
-        )
+        raise ValueError("provider_directory_current_version_census_resources_required")
     resources = _strict_text_vector(
         raw_resources,
         field_name="provider_directory_current_version_census_resources",
@@ -363,8 +380,10 @@ def _validate_current_version_census_runtime_types(
 ) -> None:
     """Reject JSON type lookalikes before evaluating runtime values."""
     boolean_controls = (
-        runtime.checkpointing_enabled, runtime.full_refresh,
-        runtime.probe, runtime.seed_only,
+        runtime.checkpointing_enabled,
+        runtime.full_refresh,
+        runtime.probe,
+        runtime.seed_only,
         runtime.test_mode,
         runtime.dataset_rehydrate_only,
         runtime.dataset_followup_only,
@@ -385,7 +404,8 @@ def _validate_current_version_census_runtime_types(
         runtime.include_auth_required,
     )
     integer_controls = (
-        runtime.resource_limit, runtime.page_limit,
+        runtime.resource_limit,
+        runtime.page_limit,
         runtime.stream_batch_size,
         runtime.source_concurrency,
         runtime.resource_scan_concurrency,
@@ -395,16 +415,12 @@ def _validate_current_version_census_runtime_types(
     )
     has_invalid_remote_inputs = bool(
         type(runtime.remote_catalog_inputs) is not tuple
-        or any(
-            type(field_name) is not str or not field_name
-            for field_name in runtime.remote_catalog_inputs
-        )
+        or any(type(field_name) is not str or not field_name for field_name in runtime.remote_catalog_inputs)
     )
     has_invalid_local_supplemental_inputs = bool(
         type(runtime.local_supplemental_catalog_inputs) is not tuple
         or any(
-            type(field_name) is not str or not field_name
-            for field_name in runtime.local_supplemental_catalog_inputs
+            type(field_name) is not str or not field_name for field_name in runtime.local_supplemental_catalog_inputs
         )
     )
     if (
@@ -413,9 +429,7 @@ def _validate_current_version_census_runtime_types(
         or has_invalid_remote_inputs
         or has_invalid_local_supplemental_inputs
     ):
-        raise ValueError(
-            "provider_directory_current_version_census_runtime_type_invalid"
-        )
+        raise ValueError("provider_directory_current_version_census_runtime_type_invalid")
 
 
 def validate_current_version_census_runtime(
@@ -436,9 +450,7 @@ def validate_current_version_census_runtime(
         "source_concurrency": runtime.source_concurrency != 1,
         "resource_scan_concurrency": runtime.resource_scan_concurrency != 1,
         "linked_resource_limit": runtime.linked_resource_limit != 0,
-        "linked_resource_deadline_seconds": (
-            runtime.linked_resource_deadline_seconds != 0
-        ),
+        "linked_resource_deadline_seconds": (runtime.linked_resource_deadline_seconds != 0),
         "resource_deadline_seconds": runtime.resource_deadline_seconds != 0,
         "probe": not runtime.probe,
         "seed_only": runtime.seed_only,
@@ -451,29 +463,40 @@ def validate_current_version_census_runtime(
         "local_seed_catalog": not runtime.local_seed_catalog,
         "local_retest_catalog": runtime.local_retest_catalog,
         "supplemental_catalogs": runtime.supplemental_catalogs,
-        "local_supplemental_catalog_inputs": bool(
-            runtime.local_supplemental_catalog_inputs
-        ),
+        "local_supplemental_catalog_inputs": bool(runtime.local_supplemental_catalog_inputs),
         "remote_catalog_inputs": bool(runtime.remote_catalog_inputs),
         "bulk_export": runtime.bulk_export,
         "stale_cleanup": runtime.stale_cleanup,
         "publication": runtime.publication_requested,
-        "defer_typed_materialization": (
-            not runtime.defer_typed_materialization
-        ),
+        "defer_typed_materialization": (not runtime.defer_typed_materialization),
         "bounded_source_selection": runtime.bounded_source_selection,
         "endpoint_scope": runtime.endpoint_scope_configured,
         "credential_config": runtime.credential_configured,
         "open_only": not runtime.open_only,
         "include_auth_required": runtime.include_auth_required,
     }
-    failures = sorted(
-        name
-        for name, is_invalid in invalid_control_by_name.items()
-        if is_invalid
-    )
+    failures = sorted(name for name, is_invalid in invalid_control_by_name.items() if is_invalid)
     if failures:
-        raise ValueError(
-            "provider_directory_current_version_census_runtime_invalid:"
-            + ",".join(failures)
-        )
+        raise ValueError("provider_directory_current_version_census_runtime_invalid:" + ",".join(failures))
+
+
+def can_restart_terminal_census_checkpoint(
+    directory,
+    checkpoint: dict[str, Any],
+    context,
+) -> bool:
+    """Allow one direct retry to replace a terminally drifted resource slice."""
+
+    completeness = directory._json_object(checkpoint.get("completeness_json"))
+    return bool(
+        context.allow_retained_pagination_reset
+        and context.retry_of_run_id
+        and context.lineage_verified
+        and context.dataset_id
+        and directory._has_matching_pagination_checkpoint_identity(checkpoint, context)
+        and checkpoint.get("state") == directory.PAGINATION_CHECKPOINT_ACTIVE
+        and not directory._clean_text(checkpoint.get("next_url"))
+        and int(checkpoint.get("pages_processed") or 0) > 0
+        and int(checkpoint.get("rows_processed") or 0) > 0
+        and completeness.get("failure") == "census_drift"
+    )

@@ -300,7 +300,7 @@ def test_command_wrapper_preserves_public_reflection_contract():
         **options.__annotations__,
         "return": "dict[str, Any]",
     }
-    assert len(command_signature.parameters) == 63
+    assert len(command_signature.parameters) == 64
     assert "provider_directory_serving_operation" not in command_signature.parameters
     assert "provider_directory_serving_generation" not in command_signature.parameters
     assert "resource_scan_concurrency" in command_signature.parameters
@@ -16700,6 +16700,7 @@ async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejecti
         {
             **_checkpoint_retry_task(requested_source_id),
             "restart_expired_current_census_slice": False,
+            "allow_retained_pagination_reset": False,
         },
     )
 
@@ -16710,6 +16711,8 @@ async def test_checkpoint_retry_keeps_exact_source_after_transient_probe_rejecti
     assert import_resources.await_args.kwargs["require_complete_resources"] is True
     assert import_resources.await_args.kwargs["restart_expired_current_census_slice"] is False
     assert metrics["restart_expired_current_census_slice"] is False
+    assert import_resources.await_args.kwargs["allow_retained_pagination_reset"] is False
+    assert metrics["allow_retained_pagination_reset"] is False
 
 
 @pytest.mark.asyncio
@@ -22746,6 +22749,7 @@ def _cigna_checkpoint_context(
     root_run_id: str | None = None,
     is_lineage_verified: bool | None = None,
     dataset_id: str | None = None,
+    allow_retained_pagination_reset: bool = True,
 ):
     if root_run_id is None:
         root_run_id = retry_of_run_id or owner_run_id
@@ -22760,6 +22764,7 @@ def _cigna_checkpoint_context(
         acquisition_root_run_id=root_run_id,
         dataset_id=dataset_id,
         lineage_verified=is_lineage_verified,
+        allow_retained_pagination_reset=allow_retained_pagination_reset,
     )
 
 
@@ -24320,8 +24325,9 @@ def _unit_restart_storage(monkeypatch, restart_connection):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("allow_reset", [False, True])
 async def test_empty_checkpoint_restarts_after_page_size_change(
-    monkeypatch, unit_source_factory, unit_checkpoint_catalog
+    monkeypatch, unit_source_factory, unit_checkpoint_catalog, allow_reset
 ):
     old_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=75"
     new_start_url = f"{importer.CIGNA_PROVIDER_DIRECTORY_BASE}/Location?_count=100"
@@ -24356,6 +24362,7 @@ async def test_empty_checkpoint_restarts_after_page_size_change(
             "run_direct_parent",
             root_run_id="run_original",
             dataset_id="dataset_a",
+            allow_retained_pagination_reset=allow_reset,
         ),
         "Location",
         new_start_url,
@@ -26526,7 +26533,7 @@ def test_resource_scan_concurrency_checks_parallel_transport_shape(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("raw_value", (0, 4, "invalid", True, 2.0, 2.9, None))
+@pytest.mark.parametrize("raw_value", (0, 9, "invalid", True, 2.0, 2.9, None))
 def test_resource_scan_concurrency_rejects_invalid_values(raw_value):
     with pytest.raises(
         ValueError,
