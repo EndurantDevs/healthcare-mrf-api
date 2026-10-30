@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-
 fhir = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -97,27 +96,36 @@ def _alohr_import_state(**overrides):
 
 def test_alohr_stream_bounds_and_locator_identity():
     page_limited = fhir.AlohrGraphQLStreamState("locator", 1, 0, [], set())
-    assert fhir._can_fetch_alohr_graphql_stream(
-        page_limited,
-        _alohr_options(page_limit=1),
-    ) is False
+    assert (
+        fhir._can_fetch_alohr_graphql_stream(
+            page_limited,
+            _alohr_options(page_limit=1),
+        )
+        is False
+    )
     assert page_limited.is_page_limit_reached is True
 
     row_limited = fhir.AlohrGraphQLStreamState("locator", 0, 2, [], set())
-    assert fhir._can_fetch_alohr_graphql_stream(
-        row_limited,
-        _alohr_options(per_resource_limit=2),
-    ) is False
+    assert (
+        fhir._can_fetch_alohr_graphql_stream(
+            row_limited,
+            _alohr_options(per_resource_limit=2),
+        )
+        is False
+    )
     assert row_limited.is_row_limit_reached is True
 
     unbounded = fhir.AlohrGraphQLStreamState("locator", 0, 0, [], set())
-    items = [{"id": "a"}, {"id": "b"}]
-    assert fhir._bounded_alohr_graphql_items(
-        items,
-        None,
-        unbounded,
-        _alohr_options(),
-    ) is items
+    provider_items = [{"id": "a"}, {"id": "b"}]
+    assert (
+        fhir._bounded_alohr_graphql_items(
+            provider_items,
+            None,
+            unbounded,
+            _alohr_options(),
+        )
+        is provider_items
+    )
 
 
 @pytest.mark.asyncio
@@ -139,11 +147,14 @@ async def test_alohr_stream_rejects_replayed_and_failed_pages(monkeypatch):
         [],
         {locator_hash},
     )
-    assert await fhir._can_advance_alohr_graphql_stream_page(
-        _alohr_import_state(),
-        spec,
-        replayed,
-    ) is False
+    assert (
+        await fhir._can_advance_alohr_graphql_stream_page(
+            _alohr_import_state(),
+            spec,
+            replayed,
+        )
+        is False
+    )
     assert replayed.error == "pagination_cursor_repeated"
 
     fresh = fhir.AlohrGraphQLStreamState(locator, 0, 0, [], set())
@@ -152,11 +163,14 @@ async def test_alohr_stream_rejects_replayed_and_failed_pages(monkeypatch):
         "_fetch_alohr_graphql_page",
         AsyncMock(return_value=([], None, "offline")),
     )
-    assert await fhir._can_advance_alohr_graphql_stream_page(
-        _alohr_import_state(),
-        spec,
-        fresh,
-    ) is False
+    assert (
+        await fhir._can_advance_alohr_graphql_stream_page(
+            _alohr_import_state(),
+            spec,
+            fresh,
+        )
+        is False
+    )
     assert fresh.error == "offline"
 
 
@@ -182,9 +196,7 @@ async def test_alohr_stale_cleanup_handles_every_source_state(monkeypatch):
         diagnostics_by_resource={"Organization": {"complete": True}},
     )
     await fhir._finalize_alohr_stale_rows(seen_state)
-    assert seen_state.stale_ready_source_ids_by_resource == {
-        "Organization": ["source-a"]
-    }
+    assert seen_state.stale_ready_source_ids_by_resource == {"Organization": ["source-a"]}
 
 
 def test_address_overlay_scope_and_retention_identity_boundaries():
@@ -194,32 +206,42 @@ def test_address_overlay_scope_and_retention_identity_boundaries():
 
     current = fhir._address_overlay_stage_table_name("current")
     other = fhir._address_overlay_stage_table_name("other")
-    owner_token = other.rsplit("_", 1)[-1][
-        : fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_TOKEN_LENGTH
-    ]
+    owner_token = other.rsplit("_", 1)[-1][: fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_OWNER_TOKEN_LENGTH]
     assert fhir._address_overlay_stage_retention_status(None, current, {}) == "rejected"
     assert fhir._address_overlay_stage_retention_status(current, current, {}) == "current_stage_retained"
     assert fhir._address_overlay_stage_retention_status(other, current, {}) == "unowned_stage_retained"
-    assert fhir._address_overlay_stage_retention_status(
-        other,
-        current,
-        {owner_token: [("running", False)]},
-    ) == "active_stage_retained"
-    assert fhir._address_overlay_stage_retention_status(
-        other,
-        current,
-        {owner_token: [("failed", False)]},
-    ) == "recent_stage_retained"
-    assert fhir._address_overlay_stage_retention_status(
-        other,
-        current,
-        {owner_token: [("failed", True), ("failed", True)]},
-    ) == "ambiguous_owner_retained"
-    assert fhir._address_overlay_stage_retention_status(
-        other,
-        current,
-        {owner_token: [("failed", True)]},
-    ) is None
+    assert (
+        fhir._address_overlay_stage_retention_status(
+            other,
+            current,
+            {owner_token: [("running", False)]},
+        )
+        == "active_stage_retained"
+    )
+    assert (
+        fhir._address_overlay_stage_retention_status(
+            other,
+            current,
+            {owner_token: [("failed", False)]},
+        )
+        == "recent_stage_retained"
+    )
+    assert (
+        fhir._address_overlay_stage_retention_status(
+            other,
+            current,
+            {owner_token: [("failed", True), ("failed", True)]},
+        )
+        == "ambiguous_owner_retained"
+    )
+    assert (
+        fhir._address_overlay_stage_retention_status(
+            other,
+            current,
+            {owner_token: [("failed", True)]},
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -323,9 +345,7 @@ def test_catalog_parsers_dedupe_replayed_source_identity(tmp_path):
     ]
     deduped = fhir._dedupe_source_rows(source_rows)
     assert deduped == [source_rows[0]]
-    assert source_rows[0]["metadata_json"][
-        "provider_directory_merged_overrides"
-    ] == ["retest"]
+    assert source_rows[0]["metadata_json"]["provider_directory_merged_overrides"] == ["retest"]
 
     catalog_path = tmp_path / "contra-costa.html"
     catalog_path.write_text(
@@ -334,20 +354,18 @@ def test_catalog_parsers_dedupe_replayed_source_identity(tmp_path):
         "Provider Directory API Base URL</a>",
         encoding="utf-8",
     )
-    seed_rows, metrics = fhir._seed_rows_from_contra_costa_catalog(
-        catalog_path=str(catalog_path)
-    )
+    seed_rows, metrics = fhir._seed_rows_from_contra_costa_catalog(catalog_path=str(catalog_path))
     assert len(seed_rows) == 1
     assert metrics.get("fallback") is None
 
 
 @pytest.mark.asyncio
 async def test_source_request_pacing_and_candidate_exhaustion(monkeypatch):
-    source_by_field = {
-        "_provider_directory_last_request_monotonic": fhir.time.monotonic()
-    }
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(fhir, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    source_by_field = {"_provider_directory_last_request_monotonic": clock.now}
     monkeypatch.setattr(fhir, "_source_request_interval_seconds", lambda *_args: 1.0)
-    sleep = AsyncMock()
+    sleep = AsyncMock(side_effect=lambda seconds: setattr(clock, "now", clock.now + seconds))
     monkeypatch.setattr(fhir.asyncio, "sleep", sleep)
     await fhir._pace_source_request(source_by_field)
     sleep.assert_awaited_once()
@@ -376,12 +394,15 @@ def test_molina_quota_duration_and_bulk_flag_defaults():
     payload = {
         "message": "Out of call volume quota; replenished in 00:01:02",
     }
-    assert fhir._molina_quota_retry_not_before(
-        source_by_field,
-        403,
-        payload,
-        now_utc=now,
-    ) == "2026-07-22T00:02:02Z"
+    assert (
+        fhir._molina_quota_retry_not_before(
+            source_by_field,
+            403,
+            payload,
+            now_utc=now,
+        )
+        == "2026-07-22T00:02:02Z"
+    )
     assert fhir._is_bulk_export_enabled(None) is False
 
 
@@ -496,5 +517,3 @@ def test_partition_checkpoint_and_preflight_contracts_fail_closed():
         fhir.ProviderDirectoryOrganization,
         durable,
     ).error.endswith("durable_checkpoint_context_required")
-
-

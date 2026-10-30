@@ -1410,25 +1410,40 @@ the request's setting, which may still enable the qualified pilot.
 No schema or checkpoint-format change is involved, so the existing durable
 checkpoint resumes on the sequential path.
 
-Resource-cursor concurrency is a separate default-off pilot. Set
+Resource-cursor concurrency is opt-in. Set
 `HLTHPRT_PROVIDER_DIRECTORY_RESOURCE_SCAN_CONCURRENCY=2` (or pass
-`resource_scan_concurrency=2`) to overlap independent resource collections for
-the exact pilot allowlist; accepted values are `1` through `3`. The importer
-falls back to `1` unless the scan is anonymous, keepalive-backed, unbounded,
-streaming, checkpointed, deferred-materialization acquisition with one source
-worker, one start URL per resource, sufficient database pool capacity, and no
-partition, linked-resource, reverse-lookup, effective Bulk, or stale-cleanup
-path. A schedule-level Bulk request does not disable this REST pilot when
-source-level selection has already rejected Bulk as ineligible; any source that
-can actually enter Bulk remains serial. The foundation collections may overlap,
-while the dependency-sensitive role collection remains a serial tail. Each
-resource retains its own durable cursor, so a retry skips completed collections
-and resumes only incomplete ones. This does not fan out pages within an opaque
-cursor or scan archive rows in parallel. Progress and persisted resource
-diagnostics report requested and effective resource-scan concurrency so a
-fail-closed fallback to `1` remains visible.
-Rollback is immediate: set the value back to `1` and restart the worker; durable
-checkpoint identities and formats are unchanged.
+`resource_scan_concurrency=2`). Accepted values are `1` through `3`; the default
+request value remains `1`. Optional source metadata
+`provider_directory_resource_scan_concurrency` may lower the requested cap.
+The effective value is limited to two writers for isolated Source storage;
+ordinary storage requires one spare database connection. No new source
+enrollment or catalog edit is required to use the existing request option.
+
+The importer falls back to `1` unless the scan is anonymous, keepalive-backed,
+unbounded, streaming, checkpointed and deferred-materialization acquisition
+with one source worker and one start URL per resource. Linked-resource,
+reverse-lookup, effective Bulk, stale-cleanup and reviewed census paths keep
+existing serial behavior. A rejected source-level Bulk selection can still use
+parallel REST acquisition. Dependency-ready collections start largest first,
+using the previous published snapshot's resource counts as estimates. Unknown
+sizes keep their existing relative order; the role collection remains a serial
+tail. Counts influence scheduling only, never completion or validation.
+
+Each collection retains its own sequential server-issued cursor. For sources
+already qualified for complete last-updated partitions, up to two independent
+window downloads may overlap within the same request budget. One writer commits
+window results and checkpoints; a second proof pass follows the first committed
+pass. Completed windows survive retries, and failed or uncommitted downloads
+can be fetched again. This cannot renew an expired opaque cursor or establish
+coverage for a source that lacks a verified partition contract.
+
+Retries, prefetch and windows share the endpoint request allowance, including
+shared rate-limit cooldown. Independent source groups retain their separate
+allowance within the run's bounded total. Existing worker admission controls
+still govern concurrent imports. Progress records requested/effective resource
+concurrency. Set the value back to `1` for subsequent workers to restore serial
+acquisition; do not restart active imports just to change this setting.
+Checkpoint identities and formats remain unchanged.
 
 If resource rows were imported before canonical resource storage was enabled,
 populate the canonical resource and source-edge tables from existing

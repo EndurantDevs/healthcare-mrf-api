@@ -195,3 +195,39 @@ class PartitionChainRequest:
     state: PartitionFetchState
     request_url: str
     fetch_options: PartitionFetchOptions
+
+
+@dataclass(frozen=True)
+class LastUpdatedPartitionFetchOptions:
+    per_resource_limit: int
+    page_limit: int
+    timeout: int
+    run_id: str | None
+    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
+    row_batch_size: int
+    retain_rows: bool
+    cancel_ctx: dict[str, Any] | None
+    cancel_task: dict[str, Any] | None
+    deadline_seconds: int
+    pagination_checkpoint: PaginationCheckpointContext | None
+    deferred_materialization: bool = False
+    window_concurrency: int = 1
+
+
+MAX_RESOURCE_SCAN_CONCURRENCY = 3
+
+
+def validated_resource_scan_concurrency(raw_value: Any) -> int:
+    """Return a bounded resource-cursor concurrency or reject bad input."""
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, str)):
+        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
+    raw_text = str(raw_value).strip()
+    if not raw_text.isdecimal():
+        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
+    try:
+        concurrency = int(raw_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("provider_directory_resource_scan_concurrency_invalid") from exc
+    if not 1 <= concurrency <= MAX_RESOURCE_SCAN_CONCURRENCY:
+        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
+    return concurrency

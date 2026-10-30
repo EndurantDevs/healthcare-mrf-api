@@ -1,11 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Pure planning and verification for ceiling-limited FHIR time partitions."""
+"""Planning, bounded downloads and verification for FHIR time partitions."""
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
+from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Mapping
@@ -42,6 +45,7 @@ class CountObservation:
     kind: CountKind
     count: int | None = None
     detail: str | None = None
+
     def __post_init__(self) -> None:
         if not isinstance(self.kind, CountKind):
             raise PartitionPlanError("count observation kind is invalid")
@@ -98,6 +102,57 @@ class TimeWindow:
         if self.start >= self.end:
             raise PartitionPlanError("a window must have start < end")
 
+
+async def run_partition_passes[FetchResult, FailureResult](
+    plan: PartitionPlan,
+    fetch_window: Callable[[TimeWindow], Awaitable[FetchResult]],
+    persist_pass: Callable[[tuple[TimeWindow, int], FetchResult], Awaitable[FailureResult | None]],
+    *,
+    concurrency: int = 1,
+) -> FailureResult | None:
+    """Overlap downloads while one caller commits each window's ordered passes."""
+
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency not in (1, 2):
+        raise PartitionPlanError("partition concurrency must be 1 or 2")
+    if plan.status not in (PlanStatus.ACQUIRING, PlanStatus.SUCCEEDED):
+        raise PartitionPlanError("partition downloads require a counted, active plan")
+    windows = deque(
+        sorted(
+            (window for window in plan.leaf_windows() if len(window.passes) < 2),
+            key=lambda window: window.count or 0,
+            reverse=True,
+        )
+    )
+    passes_by_task: dict[asyncio.Task[FetchResult], tuple[TimeWindow, int]] = {}
+    try:
+        while windows or passes_by_task:
+            while windows and len(passes_by_task) < concurrency:
+                window = windows.popleft()
+                pass_number = next(number for number in (1, 2) if number not in window.passes)
+                fetch_task = asyncio.create_task(fetch_window(window), name="provider-directory-partition-window")
+                passes_by_task[fetch_task] = (window, pass_number)
+            settled_tasks, _ = await asyncio.wait(passes_by_task, return_when=asyncio.FIRST_COMPLETED)
+            for fetch_task in tuple(passes_by_task):
+                if fetch_task not in settled_tasks:
+                    continue
+                settled_tasks.remove(fetch_task)
+                window, pass_number = passes_by_task.pop(fetch_task)
+                failure = await persist_pass((window, pass_number), fetch_task.result())
+                if failure is not None:
+                    return failure
+                if pass_number not in window.passes:
+                    raise PartitionPlanError("partition pass was not committed")
+                if pass_number == 1:
+                    windows.appendleft(window)
+        return None
+    finally:
+        for fetch_task in passes_by_task:
+            if not fetch_task.done():
+                fetch_task.cancel()
+        if passes_by_task:
+            await asyncio.gather(*passes_by_task, return_exceptions=True)
+
+
 @dataclass(frozen=True)
 class PartitionConfig:
     ceiling: int
@@ -117,13 +172,9 @@ class PartitionConfig:
         if self.boundary_precision <= datetime.timedelta(0):
             raise PartitionPlanError("boundary_precision must be positive")
         minimum_width_microseconds = _primitives.timedelta_microseconds(self.minimum_width)
-        boundary_precision_microseconds = _primitives.timedelta_microseconds(
-            self.boundary_precision
-        )
+        boundary_precision_microseconds = _primitives.timedelta_microseconds(self.boundary_precision)
         if minimum_width_microseconds % boundary_precision_microseconds:
-            raise PartitionPlanError(
-                "minimum_width must be an exact multiple of boundary_precision"
-            )
+            raise PartitionPlanError("minimum_width must be an exact multiple of boundary_precision")
         normalized_paths = tuple(sorted(set(self.volatile_metadata_paths)))
         for path in normalized_paths:
             _primitives.decode_json_pointer(path)
@@ -283,12 +334,8 @@ class PartitionPlan:
             "version": 2,
             "config": {
                 "ceiling": self.config.ceiling,
-                "minimum_width_microseconds": _primitives.timedelta_microseconds(
-                    self.config.minimum_width
-                ),
-                "boundary_precision_microseconds": _primitives.timedelta_microseconds(
-                    self.config.boundary_precision
-                ),
+                "minimum_width_microseconds": _primitives.timedelta_microseconds(self.config.minimum_width),
+                "boundary_precision_microseconds": _primitives.timedelta_microseconds(self.config.boundary_precision),
                 "volatile_metadata_paths": list(self.config.volatile_metadata_paths),
             },
             "windows": windows_list,
@@ -310,15 +357,10 @@ class PartitionPlan:
                 ceiling=config_fields["ceiling"],
                 minimum_width=datetime.timedelta(microseconds=config_fields["minimum_width_microseconds"]),
                 volatile_metadata_paths=tuple(config_fields["volatile_metadata_paths"]),
-                boundary_precision=datetime.timedelta(
-                    microseconds=config_fields["boundary_precision_microseconds"]
-                ),
+                boundary_precision=datetime.timedelta(microseconds=config_fields["boundary_precision_microseconds"]),
             )
             window_fields_list = checkpoint["windows"]
-            windows_by_id = {
-                fields["window_id"]: cls._window_from_dict(fields)
-                for fields in window_fields_list
-            }
+            windows_by_id = {fields["window_id"]: cls._window_from_dict(fields) for fields in window_fields_list}
             if len(windows_by_id) != len(window_fields_list):
                 raise PartitionPlanError("checkpoint contains duplicate window IDs")
             failure_fields = checkpoint.get("failure")
@@ -348,16 +390,10 @@ class PartitionPlan:
                 window.window_id,
             )
             return
-        duration_microseconds = _primitives.timedelta_microseconds(
-            window.end - window.start
-        )
-        boundary_microseconds = _primitives.timedelta_microseconds(
-            self.config.boundary_precision
-        )
+        duration_microseconds = _primitives.timedelta_microseconds(window.end - window.start)
+        boundary_microseconds = _primitives.timedelta_microseconds(self.config.boundary_precision)
         midpoint_units = (duration_microseconds // boundary_microseconds) // 2
-        midpoint = window.start + datetime.timedelta(
-            microseconds=midpoint_units * boundary_microseconds
-        )
+        midpoint = window.start + datetime.timedelta(microseconds=midpoint_units * boundary_microseconds)
         left = TimeWindow(f"{window.window_id}.0", window.start, midpoint)
         right = TimeWindow(f"{window.window_id}.1", midpoint, window.end)
         window.state = WindowState.SPLIT
@@ -423,9 +459,7 @@ class PartitionPlan:
                 window.end,
                 self.config.boundary_precision,
             ):
-                raise PartitionPlanError(
-                    "checkpoint window is not aligned to boundary_precision"
-                )
+                raise PartitionPlanError("checkpoint window is not aligned to boundary_precision")
             pass_numbers = set(window.passes)
             if not pass_numbers.issubset({1, 2}) or (2 in pass_numbers and 1 not in pass_numbers):
                 raise PartitionPlanError("checkpoint contains an invalid pass sequence")
@@ -487,8 +521,7 @@ class PartitionPlan:
     @staticmethod
     def _window_from_dict(fields: Mapping[str, Any]) -> TimeWindow:
         passes_by_number = {
-            int(pass_number): WindowPass(dict(fingerprints))
-            for pass_number, fingerprints in fields["passes"].items()
+            int(pass_number): WindowPass(dict(fingerprints)) for pass_number, fingerprints in fields["passes"].items()
         }
         return TimeWindow(
             window_id=fields["window_id"],

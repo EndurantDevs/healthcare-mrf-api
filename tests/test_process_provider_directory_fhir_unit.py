@@ -8535,24 +8535,16 @@ async def test_hap_source_request_pacing_serializes_anonymous_calls(monkeypatch)
     source_lookup = {
         "source_id": "hap",
         "api_base": importer.HAP_PROVIDER_DIRECTORY_BASE,
-        "_provider_directory_last_request_monotonic": importer.time.monotonic() - 10.0,
+        "_provider_directory_last_request_monotonic": 90.0,
     }
     sleep_mock = AsyncMock()
     monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
-    monkeypatch.setattr(
-        importer,
-        "_fetch_json",
-        AsyncMock(return_value=(200, {"resourceType": "Bundle"}, None, 1)),
-    )
-
+    monkeypatch.setattr(importer, "time", Mock(monotonic=Mock(side_effect=[100.0, 110.0, 110.0])))
+    monkeypatch.setattr(importer, "_fetch_json", AsyncMock(return_value=(200, {"resourceType": "Bundle"}, None, 1)))
     await importer._fetch_source_json_once(
-        source_lookup,
-        f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1",
-        timeout=3,
+        source_lookup, f"{importer.HAP_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=1", timeout=3
     )
-
-    sleep_mock.assert_awaited_once()
-    assert 9.0 <= sleep_mock.await_args.args[0] <= 10.0
+    sleep_mock.assert_awaited_once_with(10.0)
 
 
 @pytest.mark.asyncio
@@ -26482,6 +26474,7 @@ def _patch_parallel_resource_flow(
 ):
     """Patch candidate ownership while retaining the real resource-wave runner."""
     source_record = _parallel_resource_source()
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
 
     @contextlib.asynccontextmanager
     async def fake_guard(_context):

@@ -34,9 +34,7 @@ async def test_source_http_session_reuses_anonymous_connections_and_redirects(
 
     async def page(request: web.Request) -> web.Response:
         record_request(request)
-        return web.json_response(
-            {"resourceType": "Bundle", "type": "searchset", "entry": []}
-        )
+        return web.json_response({"resourceType": "Bundle", "type": "searchset", "entry": []})
 
     async def redirect(request: web.Request) -> web.Response:
         record_request(request)
@@ -70,10 +68,7 @@ async def test_source_http_session_reuses_anonymous_connections_and_redirects(
 
     assert len(transports) == 22
     assert all(transport is transports[0] for transport in transports)
-    assert all(
-        headers.get("Accept-Encoding") == "identity"
-        for headers in observed_headers
-    )
+    assert all(headers.get("Accept-Encoding") == "identity" for headers in observed_headers)
     assert all("Cookie" not in headers for headers in observed_headers)
     assert importer._SOURCE_HTTP_SESSION.get() is None
 
@@ -216,9 +211,7 @@ async def test_source_http_session_retains_slow_error_status_and_retry_after(
 @pytest.mark.asyncio
 async def test_source_http_session_keeps_credentialed_fetches_on_urllib(monkeypatch):
     monkeypatch.setenv(importer.SOURCE_HTTP_KEEPALIVE_ENV, "true")
-    fetch_json_sync = Mock(
-        return_value=(200, {"resourceType": "Bundle"}, None, 1)
-    )
+    fetch_json_sync = Mock(return_value=(200, {"resourceType": "Bundle"}, None, 1))
     monkeypatch.setattr(importer, "_fetch_json_sync", fetch_json_sync)
 
     async with importer._source_http_session_scope():
@@ -241,9 +234,7 @@ async def test_source_http_session_keeps_credentialed_fetches_on_urllib(monkeypa
 @pytest.mark.asyncio
 async def test_source_http_session_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv(importer.SOURCE_HTTP_KEEPALIVE_ENV, raising=False)
-    fetch_json_sync = Mock(
-        return_value=(200, {"resourceType": "Bundle"}, None, 1)
-    )
+    fetch_json_sync = Mock(return_value=(200, {"resourceType": "Bundle"}, None, 1))
     monkeypatch.setattr(importer, "_fetch_json_sync", fetch_json_sync)
 
     async with importer._source_http_session_scope():
@@ -265,9 +256,7 @@ async def test_resource_import_wrapper_sets_and_clears_source_session(monkeypatc
         assert source_records == [{"source_id": "source_a"}]
         assert import_options == {"page_count": 100}
         assert importer._SOURCE_HTTP_SESSION.get() is not None
-        child_session = await asyncio.create_task(
-            asyncio.sleep(0, result=importer._SOURCE_HTTP_SESSION.get())
-        )
+        child_session = await asyncio.create_task(asyncio.sleep(0, result=importer._SOURCE_HTTP_SESSION.get()))
         assert child_session is importer._SOURCE_HTTP_SESSION.get()
         return {"Practitioner": 2}
 
@@ -289,9 +278,9 @@ async def test_source_http_session_closes_on_error_and_cancellation(monkeypatch)
     create_session = importer._source_http_client_session
 
     def capture_session(
-        *, require_verified_tls: bool = False
+        **options,
     ) -> aiohttp.ClientSession:
-        session = create_session(require_verified_tls=require_verified_tls)
+        session = create_session(**options)
         created_sessions.append(session)
         return session
 

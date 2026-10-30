@@ -40,7 +40,9 @@ async def prepare_job_tables(directory, ctx, profile_execution, *, overlay_follo
     if profile_execution is not None and not source.is_source_storage_required():
         for model in (*directory.SOURCE_MODELS, *directory.CANONICAL_RESOURCE_MODELS):
             columns = ",".join(directory._q(str(column.name)) for column in model.__table__.columns)
-            await directory.db.all(f"SELECT {columns} FROM {directory._qt(directory._schema(), model.__tablename__)} LIMIT 0")
+            await directory.db.all(
+                f"SELECT {columns} FROM {directory._qt(directory._schema(), model.__tablename__)} LIMIT 0"
+            )
         # These reads never mark acquisition preflight complete.
         return
     await directory._ensure_provider_directory_tables()
@@ -54,23 +56,38 @@ def ordinary_overlay_followup(directory, task):
     markers_by_field = {
         name: task.get(_FOLLOWUP_PREFIX + name) for name in (*_FOLLOWUP_IDENTITIES, "version", "stage", "attempt")
     }
-    flags_by_name = {"publish_artifacts_only": True, "publish_corroboration": False, "probe": False, "import_resources": False}
+    flags_by_name = {
+        "publish_artifacts_only": True,
+        "publish_corroboration": False,
+        "probe": False,
+        "import_resources": False,
+    }
     expected_fields = {*flags_by_name, "publish_artifacts_targets", "source_ids"} | {
         _FOLLOWUP_PREFIX + name for name in markers_by_field
     }
     require_output(
         set(task) - {"test_mode", "run_id"} == expected_fields
         and task.get("test_mode", False) is False
-        and ("run_id" not in task or type(task["run_id"]) is str and bool(task["run_id"])
-             and task["run_id"] == task["run_id"].strip())
+        and (
+            "run_id" not in task
+            or type(task["run_id"]) is str
+            and bool(task["run_id"])
+            and task["run_id"] == task["run_id"].strip()
+        )
         and all(task.get(name) is enabled for name, enabled in flags_by_name.items())
         and task.get("publish_artifacts_targets") == "address_overlay"
-        and all(type(markers_by_field[name]) is str and bool(markers_by_field[name])
-                and markers_by_field[name] == markers_by_field[name].strip() for name in _FOLLOWUP_IDENTITIES)
+        and all(
+            type(markers_by_field[name]) is str
+            and bool(markers_by_field[name])
+            and markers_by_field[name] == markers_by_field[name].strip()
+            for name in _FOLLOWUP_IDENTITIES
+        )
         and len(markers_by_field["dataset_hash"]) == 64
         and set(markers_by_field["dataset_hash"]) <= set("0123456789abcdef")
-        and type(markers_by_field["version"]) is int and markers_by_field["version"] == 1
-        and type(markers_by_field["attempt"]) is int and markers_by_field["attempt"] > 0
+        and type(markers_by_field["version"]) is int
+        and markers_by_field["version"] == 1
+        and type(markers_by_field["attempt"]) is int
+        and markers_by_field["attempt"] > 0
         and task.get("source_ids") == [markers_by_field["source_id"]]
         and markers_by_field["source_id"] not in {"cms-npd", directory.UHC_RETAINED_SOURCE_ID}
         and not directory.is_uhc_flex_profile_source(markers_by_field["source_id"]),
@@ -87,11 +104,21 @@ def require_overlay_followup_fence(directory, fence, metrics):
         raise directory.ProviderDirectoryArtifactBuildStale("provider_directory_overlay_followup_selection_changed")
     dataset = fence.datasets[0]
     expected_by_field = {name: metrics.get(_FOLLOWUP_PREFIX + name) for name in _FOLLOWUP_IDENTITIES}
-    actual_by_field = dict(source_id=dataset.source_id, endpoint_id=dataset.endpoint_id, dataset_id=dataset.dataset_id,
-                           dataset_hash=dataset.dataset_hash, parent_run_id=dataset.evidence_run_id)
+    actual_by_field = dict(
+        source_id=dataset.source_id,
+        endpoint_id=dataset.endpoint_id,
+        dataset_id=dataset.dataset_id,
+        dataset_hash=dataset.dataset_hash,
+        parent_run_id=dataset.evidence_run_id,
+    )
     if (
-        actual_by_field != expected_by_field or dataset.status != "published" or dataset.is_current is not True
-        or any((alias.serving_endpoint_id or alias.endpoint_id) != alias.endpoint_id for alias in fence.locked_alias_datasets)
+        actual_by_field != expected_by_field
+        or dataset.status != "published"
+        or dataset.is_current is not True
+        or any(
+            (alias.serving_endpoint_id or alias.endpoint_id) != alias.endpoint_id
+            for alias in fence.locked_alias_datasets
+        )
     ):
         raise directory.ProviderDirectoryArtifactBuildStale("provider_directory_overlay_followup_selection_changed")
 
@@ -178,7 +205,17 @@ async def import_resources_with_source_session(directory, source_records, rest_p
     token = directory._REST_PAGE_PREFETCH_OVERRIDE.set(rest_page_prefetch)
     try:
         with source_publication_request(directory, source_records, source_only):
-            async with directory._source_http_session_scope(force=force_session, require_verified_tls=force_session):
+            async with directory._source_http_session_scope(
+                force=force_session,
+                require_verified_tls=force_session,
+                request_concurrency=max(
+                    directory._validated_resource_scan_concurrency(options.get("resource_scan_concurrency", 1)),
+                    min(100, max(1, options.get("linked_resource_concurrency", 5)))
+                    if options.get("linked_resource_limit", 0) > 0
+                    else 1,
+                ),
+                source_concurrency=max(1, min(len(source_records), options.get("source_concurrency", 1))),
+            ):
                 return await directory._import_resources(source_records, **options)
     finally:
         directory._REST_PAGE_PREFETCH_OVERRIDE.reset(token)
@@ -365,8 +402,10 @@ async def _prepare_model(directory, admission, model, name, created_by_relation)
             if admission.factory is None:
                 statement = directory._provider_directory_artifact_resource_select_sql(model, schema)
                 params_by_name = dict(
-                    source_ids=[dataset.source_id], dataset_ids=[dataset.dataset_id],
-                    evidence_run_ids=[dataset.evidence_run_id], resource_type=directory.RESOURCE_TYPES_BY_MODEL[model],
+                    source_ids=[dataset.source_id],
+                    dataset_ids=[dataset.dataset_id],
+                    evidence_run_ids=[dataset.evidence_run_id],
+                    resource_type=directory.RESOURCE_TYPES_BY_MODEL[model],
                 )
             else:
                 statement, params_by_name = typed_input_projection(
@@ -514,7 +553,9 @@ def _publication_admission(directory, fence, request, resource_types):
     _require_published_overlay(directory, fence, request)
     factory = source._FACTORY.get()
     if is_ordinary_followup:
-        require_output(request.metrics.get(recovery.GENERATION_PARAM) is None, "rest_artifact_recovery_admission_required")
+        require_output(
+            request.metrics.get(recovery.GENERATION_PARAM) is None, "rest_artifact_recovery_admission_required"
+        )
         require_overlay_followup_fence(directory, fence, request.metrics)
     else:
         require_output(callable(getattr(factory, "artifact_fence", None)), "rest_artifact_fence_required")
@@ -548,7 +589,8 @@ async def publication_scope(directory, fence, request, resource_types):
         try:
             actor = await directory.db.first("SELECT session_user::text,current_user::text")
             require_output(
-                tuple(actor) == ((factory.policy.control_runtime_roles[0],) * 2 if factory is not None else (actor[0],) * 2),
+                tuple(actor)
+                == ((factory.policy.control_runtime_roles[0],) * 2 if factory is not None else (actor[0],) * 2),
                 "rest_artifact_ordinary_actor_required",
             )
             projection = await _prepare(directory, admission, relation_by_table, created_by_relation)

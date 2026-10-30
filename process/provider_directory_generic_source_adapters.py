@@ -356,3 +356,53 @@ async def completed_source_scope(directory, candidate):
         await complete_generic_source_candidate(directory.db, directory, candidate)
         async with generic_source_relation_scope(directory.db, directory, candidate) as state:
             yield state
+
+
+async def current_endpoint_dataset_record(directory, endpoint_id, *, exclude_dataset_id):
+    """Read the incumbent header through the established ordinary catalog route."""
+    from process.provider_directory_generic_source_policy import _FACTORY
+
+    factory = _FACTORY.get()
+    binding = getattr(factory, "storage_binding", None)
+    if binding is None:
+        relation = directory._qt(directory._schema(), directory.ProviderDirectoryEndpointDataset.__tablename__)
+    else:
+        factory._require_current_policy()
+        if directory._schema() != binding.catalog_schema or directory.db._transaction_binding() is not None:
+            raise RuntimeError("provider_directory_predecessor_catalog_reader_required")
+        # The private header contains candidates, not the incumbent serving generation.
+        relation = storage_relation(binding.catalog_schema, directory.ProviderDirectoryEndpointDataset.__tablename__)
+    predecessor = await directory.db.first(
+        f"""
+        SELECT dataset_id, status,
+               publication_metadata_json -> 'source_summary_v1' -> 'resource_counts' AS resource_counts
+          FROM {relation}
+         WHERE endpoint_id = :endpoint_id
+           AND is_current = true
+           AND dataset_id <> :exclude_dataset_id
+         LIMIT 1;
+        """,
+        endpoint_id=endpoint_id,
+        exclude_dataset_id=exclude_dataset_id,
+    )
+    if binding is not None:
+        factory._require_current_policy()
+    return directory._pagination_checkpoint_row_mapping(predecessor)
+
+
+async def resource_scan_estimates(directory, source_record):
+    """Use published header counts only as estimates for download ordering."""
+    endpoint_id = directory._clean_text(source_record.get("_endpoint_id"))
+    if endpoint_id is None:
+        return {}
+    header_by_field = await current_endpoint_dataset_record(
+        directory, endpoint_id, exclude_dataset_id=source_record.get("_endpoint_dataset_id") or ""
+    )
+    if header_by_field.get("status") != directory.ENDPOINT_DATASET_PUBLISHED:
+        return {}
+    count_by_resource = directory._json_object(header_by_field.get("resource_counts"))
+    return {
+        resource: count
+        for resource, count in count_by_resource.items()
+        if resource in directory.DEFAULT_RESOURCES and type(count) is int and count >= 0
+    }
