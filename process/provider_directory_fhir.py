@@ -159,6 +159,8 @@ from process.provider_directory_endpoint_admission import (
     _admit_provider_directory_endpoint_components,
 )
 from process.provider_directory_fetch_types import (
+    MAX_RESOURCE_SCAN_CONCURRENCY,
+    LastUpdatedPartitionFetchOptions,
     PaginationCheckpointContext,
     PaginationResumeState,
     PartitionChainRequest,
@@ -171,6 +173,9 @@ from process.provider_directory_fetch_types import (
     RestPagePrefetchEligibility,
     RestPagePrefetchState,
     RestPaginationCooldownResult,
+)
+from process.provider_directory_fetch_types import (
+    validated_resource_scan_concurrency as _validated_resource_scan_concurrency,
 )
 from process.provider_directory_fhir_census_binding import (
     CurrentVersionCensusContract,
@@ -221,11 +226,15 @@ from process.provider_directory_fhir_census_execution import (
 from process.provider_directory_fhir_manual_catalog import (
     reviewed_manual_census_seed_rows,
 )
+from process.provider_directory_fhir_response import SOURCE_HTTP_REQUEST_SLOTS
 from process.provider_directory_fhir_response import (
     has_operation_outcome_error as _has_operation_outcome_error,
 )
 from process.provider_directory_fhir_response import (
     is_access_denied_outcome as _is_access_denied_outcome,
+)
+from process.provider_directory_fhir_response import (
+    is_empty_search_set as _is_empty_fhir_search_set,
 )
 from process.provider_directory_fhir_root_policy import (
     POLICY_PENDING_STATUS as PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
@@ -439,6 +448,7 @@ from process.provider_directory_time_partition import (
     WindowPass,
     fingerprint_resource,
     parse_utc_instant,
+    run_partition_passes,
 )
 from process.provider_directory_validated_publication_contract import (
     AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY,
@@ -1154,6 +1164,7 @@ AETNA_MEDICAID_SUPPORTED_RESOURCES = tuple(
 AETNA_MEDICAID_TARGETED_QUERY_REQUIRED_ERROR = "aetna_medicaid_targeted_query_required_npi_or_name_and_location"
 AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR = "aetna_resource_search_returned_operation_outcome"
 RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR = "provider_directory_resource_search_returned_operation_outcome"
+CIGNA_AMBIGUOUS_EMPTY_CONTINUATION_ERROR = "provider_directory_ambiguous_empty_continuation"
 CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
 CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
@@ -1418,7 +1429,6 @@ SOURCE_HTTP_PAGE_PREFETCH_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH"
 SOURCE_HTTP_DETERMINISTIC_PAGE_PREFETCH_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC"
 SOURCE_HTTP_SUBSET_PAGE_PREFETCH_ENV = "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_SERVER_ISSUED_SUBSET"
 SOURCE_RESOURCE_SCAN_CONCURRENCY_ENV = "HLTHPRT_PROVIDER_DIRECTORY_RESOURCE_SCAN_CONCURRENCY"
-MAX_RESOURCE_SCAN_CONCURRENCY = 3
 SOURCE_HTTP_KEEPALIVE_SECONDS = 60.0
 SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS = 300
 SOURCE_TRANSIENT_HTTP_STATUSES = frozenset({423, 429, 500, 502, 503, 504})
@@ -1817,22 +1827,6 @@ class LastUpdatedPartitionResume:
     census: LastUpdatedCompletenessCensus = field(default_factory=LastUpdatedCompletenessCensus)
     pages_processed: int = 0
     rows_processed: int = 0
-
-
-@dataclass(frozen=True)
-class LastUpdatedPartitionFetchOptions:
-    per_resource_limit: int
-    page_limit: int
-    timeout: int
-    run_id: str | None
-    row_batch_handler: Callable[[type, list[dict[str, Any]]], Awaitable[int]] | None
-    row_batch_size: int
-    retain_rows: bool
-    cancel_ctx: dict[str, Any] | None
-    cancel_task: dict[str, Any] | None
-    deadline_seconds: int
-    pagination_checkpoint: PaginationCheckpointContext | None
-    deferred_materialization: bool = False
 
 
 @dataclass(frozen=True)
@@ -40745,10 +40739,18 @@ def _is_source_http_keepalive_enabled() -> bool:
 def _source_http_client_session(
     *,
     require_verified_tls: bool = False,
+    request_concurrency: int = 100,
+    source_concurrency: int = 1,
 ) -> aiohttp.ClientSession:
     """Create an anonymous REST client without adding cookies or compression."""
+    if type(request_concurrency) is not int or not 1 <= request_concurrency <= 100:
+        raise ValueError("provider_directory_request_concurrency_invalid")
+    if type(source_concurrency) is not int or source_concurrency < 1:
+        raise ValueError("provider_directory_source_concurrency_invalid")
     connector = aiohttp.TCPConnector(
         ssl=_ssl_context(require_verified=require_verified_tls),
+        limit=min(100, source_concurrency * request_concurrency),
+        limit_per_host=request_concurrency,
         keepalive_timeout=SOURCE_HTTP_KEEPALIVE_SECONDS,
         ttl_dns_cache=300,
     )
@@ -40773,16 +40775,24 @@ async def _source_http_session_scope(
     *,
     force: bool = False,
     require_verified_tls: bool = False,
+    request_concurrency: int = 100,
+    source_concurrency: int = 1,
 ) -> AsyncIterator[None]:
     """Reuse anonymous REST connections for one resource-import run."""
     if not force and not _is_source_http_keepalive_enabled():
         yield
         return
-    async with _source_http_client_session(require_verified_tls=require_verified_tls) as session:
+    async with _source_http_client_session(
+        require_verified_tls=require_verified_tls,
+        request_concurrency=request_concurrency,
+        source_concurrency=source_concurrency,
+    ) as session:
         session_token = _SOURCE_HTTP_SESSION.set(session)
+        slots_token = SOURCE_HTTP_REQUEST_SLOTS.set({})
         try:
             yield
         finally:
+            SOURCE_HTTP_REQUEST_SLOTS.reset(slots_token)
             _SOURCE_HTTP_SESSION.reset(session_token)
 
 
@@ -41117,6 +41127,7 @@ def _is_transient_source_fetch_failure(
         return fetch_error not in {
             AETNA_RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR,
             RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR,
+            CIGNA_AMBIGUOUS_EMPTY_CONTINUATION_ERROR,
             SOURCE_QUOTA_EXHAUSTED_ERROR,
         }
     return status_code in SOURCE_TRANSIENT_HTTP_STATUSES
@@ -41159,7 +41170,7 @@ def _resource_search_payload_error(
     status_code: int | None,
     fhir_payload: dict[str, Any] | None,
 ) -> str | None:
-    """Fail closed when a successful collection search only reports an outcome."""
+    """Reject errored or ambiguous successful collection responses."""
     aetna_error = _aetna_resource_search_payload_error(
         source_record,
         request_url,
@@ -41178,6 +41189,15 @@ def _resource_search_payload_error(
         return RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
     if not _is_bundle_payload(fhir_payload):
         return None
+    if (
+        _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+        == CIGNA_PROVIDER_DIRECTORY_BASE
+        and _has_fhir_continuation_query(request_url)
+        and _is_empty_fhir_search_set(status_code, fhir_payload, None)
+        and type(fhir_payload.get("total")) is int
+        and fhir_payload["total"] == 0
+    ):
+        return CIGNA_AMBIGUOUS_EMPTY_CONTINUATION_ERROR
     entry_resources = [entry["resource"] for entry in _bundle_entries(fhir_payload)]
     outcome_resources = [resource for resource in entry_resources if resource.get("resourceType") == "OperationOutcome"]
     if outcome_resources and (
@@ -41233,21 +41253,6 @@ def _cigna_empty_collection_retry_delays(
     return CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS
 
 
-def _is_empty_fhir_search_set(
-    status_code: int | None,
-    fhir_payload: dict[str, Any] | None,
-    fetch_error: str | None,
-) -> bool:
-    return bool(
-        status_code == 200
-        and fetch_error is None
-        and isinstance(fhir_payload, dict)
-        and fhir_payload.get("resourceType") == "Bundle"
-        and fhir_payload.get("type") == "searchset"
-        and not (fhir_payload.get("entry") or [])
-    )
-
-
 def _source_fetch_candidate_urls(url: str) -> list[str]:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -41290,18 +41295,22 @@ def _source_request_interval_seconds(source_record: dict[str, Any]) -> float:
 
 async def _pace_source_request(source_record: dict[str, Any]) -> None:
     interval_seconds = _source_request_interval_seconds(source_record)
-    if interval_seconds <= 0:
+    pacing_state = source_record.get("_provider_directory_request_pacing_state", source_record)
+    if interval_seconds <= 0 and not pacing_state.get("retry_after_monotonic"):
         return
-    pacing_lock = source_record.get("_provider_directory_request_pacing_lock")
+    pacing_lock = pacing_state.get("_provider_directory_request_pacing_lock")
     if pacing_lock is None:
         pacing_lock = asyncio.Lock()
-        source_record["_provider_directory_request_pacing_lock"] = pacing_lock
+        pacing_state["_provider_directory_request_pacing_lock"] = pacing_lock
     async with pacing_lock:
-        last_started_at = float(source_record.get("_provider_directory_last_request_monotonic") or 0.0)
-        wait_seconds = max(0.0, last_started_at + interval_seconds - time.monotonic())
-        if wait_seconds > 0:
+        last_started_at = float(pacing_state.get("_provider_directory_last_request_monotonic") or 0.0)
+        while True:
+            next_request_at = max(last_started_at + interval_seconds, pacing_state.get("retry_after_monotonic", 0.0))
+            wait_seconds = next_request_at - time.monotonic()
+            if wait_seconds <= 0:
+                break
             await asyncio.sleep(wait_seconds)
-        source_record["_provider_directory_last_request_monotonic"] = time.monotonic()
+        pacing_state["_provider_directory_last_request_monotonic"] = time.monotonic()
 
 
 def _source_retry_after_seconds(
@@ -41438,7 +41447,14 @@ def _molina_quota_retry_not_before(
     )
 
 
-async def _fetch_source_json_once(
+async def _fetch_source_json_once(source_record, url, *, timeout):
+    """Hold a source request slot through pacing, response and throttle accounting."""
+    from process.provider_directory_fhir_response import fetch_paced_source_response
+
+    return await fetch_paced_source_response(sys.modules[__name__], source_record, url, timeout=timeout)
+
+
+async def _fetch_source_json_unpaced(
     source_record: dict[str, Any],
     url: str,
     *,
@@ -41458,7 +41474,6 @@ async def _fetch_source_json_once(
             allow_redirects=False,
             preserve_url_bytes=True,
         )
-    await _pace_source_request(source_record)
     pinned_session = _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.get()
     if pinned_session is not None:
         return await _fetch_json_with_source_session(
@@ -52282,27 +52297,21 @@ def _partition_pass_failure(
     )
 
 
-async def _fetch_partition_pass(
+async def _persist_fetched_partition_pass(
     source_record: dict[str, Any],
     resource_type: str,
     model: type,
     config: LastUpdatedPartitionConfig,
     state: LastUpdatedPartitionState,
     fetch_options: LastUpdatedPartitionFetchOptions,
-    window: TimeWindow,
-    pass_number: int,
+    window_pass: tuple[TimeWindow, int],
+    fetched_window: tuple[str, LastUpdatedWindowFetch],
 ) -> ResourceFetchResult | None:
-    """Fetch and atomically persist one twin-pass partition proof."""
+    """Atomically persist a fetched pass without concurrent plan mutations."""
+    window, pass_number = window_pass
+    request_url, window_fetch = fetched_window
     if pass_number == 2:
         await _restore_pass_one_proof(state, resource_type, window)
-    request_url, window_fetch = await _fetch_partition_window_for_pass(
-        source_record,
-        resource_type,
-        config,
-        state,
-        fetch_options,
-        window,
-    )
     if _is_partition_window_fetch_retryable(window_fetch):
         return await _partition_window_retry_result(
             model,
@@ -52348,23 +52357,13 @@ async def _fetch_partition_plan_passes(
     state: LastUpdatedPartitionState,
     fetch_options: LastUpdatedPartitionFetchOptions,
 ) -> ResourceFetchResult | None:
-    for window in state.plan.leaf_windows():
-        for pass_number in (1, 2):
-            if pass_number in window.passes:
-                continue
-            failure = await _fetch_partition_pass(
-                source_record,
-                resource_type,
-                model,
-                config,
-                state,
-                fetch_options,
-                window,
-                pass_number,
-            )
-            if failure is not None:
-                return failure
-    return None
+    """Bound window downloads while retaining one durable checkpoint writer."""
+    return await run_partition_passes(
+        state.plan,
+        partial(_fetch_partition_window_for_pass, source_record, resource_type, config, state, fetch_options),
+        partial(_persist_fetched_partition_pass, source_record, resource_type, model, config, state, fetch_options),
+        concurrency=fetch_options.window_concurrency,
+    )
 
 
 async def _observe_partition_post_census(
@@ -53481,6 +53480,9 @@ async def _fetch_resource_rows(
                     deadline_seconds=deadline_seconds,
                     pagination_checkpoint=pagination_checkpoint,
                     deferred_materialization=deferred_materialization,
+                    window_concurrency=_partition_window_concurrency(
+                        source_record, _resource_start_url(source_record, resource_type, page_count=page_count) or ""
+                    ),
                 ),
             )
         if partition_config_error != "resource_not_opted_in":
@@ -57733,22 +57735,6 @@ def _source_resource_fetch_order(
     return foundational_resources + practitioner_role_resources
 
 
-def _validated_resource_scan_concurrency(raw_value: Any) -> int:
-    """Return a bounded resource-cursor concurrency or reject bad input."""
-    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, str)):
-        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
-    raw_text = str(raw_value).strip()
-    if not raw_text.isdecimal():
-        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
-    try:
-        concurrency = int(raw_text)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("provider_directory_resource_scan_concurrency_invalid") from exc
-    if not 1 <= concurrency <= MAX_RESOURCE_SCAN_CONCURRENCY:
-        raise ValueError("provider_directory_resource_scan_concurrency_invalid")
-    return concurrency
-
-
 def _resource_scan_foundation_types(
     source_record: dict[str, Any],
     resource_types: tuple[str, ...],
@@ -57825,8 +57811,12 @@ def _effective_resource_scan_concurrency(
     source_record: dict[str, Any],
     options: ResourceScanConcurrencyOptions,
 ) -> int:
-    """Fail closed unless one Cigna group has independent durable cursors."""
-    requested = _validated_resource_scan_concurrency(options.requested_concurrency)
+    """Admit only configured sources with independent durable cursors."""
+    requested = min(
+        _validated_resource_scan_concurrency(options.requested_concurrency),
+        _source_resource_scan_concurrency(source_record),
+        2 if is_source_storage_required() else MAX_RESOURCE_SCAN_CONCURRENCY,
+    )
     source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     checkpoint_context = source_record.get("_pagination_checkpoint_context")
     foundation_types = _resource_scan_foundation_types(
@@ -57835,7 +57825,7 @@ def _effective_resource_scan_concurrency(
     )
     is_safe_shape = bool(
         requested > 1
-        and source_api_base == CIGNA_PROVIDER_DIRECTORY_BASE
+        and current_version_census_contract(source_record) is None
         and _has_bound_resource_scan_checkpoint(
             source_record,
             checkpoint_context,
@@ -57861,7 +57851,7 @@ def _effective_resource_scan_concurrency(
             source_record,
             list(options.resource_types),
         )
-        and _provider_directory_database_pool_capacity() >= requested + 1
+        and (is_source_storage_required() or _provider_directory_database_pool_capacity() >= requested + 1)
         and _has_parallel_resource_transport(
             source_record,
             foundation_types,
@@ -57876,6 +57866,20 @@ def _effective_resource_scan_concurrency(
     except RuntimeError:
         return 1
     return min(requested, len(foundation_types))
+
+
+def _source_resource_scan_concurrency(source_record: dict[str, Any]) -> int:
+    """Apply an optional lower source cap to the explicit request concurrency."""
+    configured = _source_metadata(source_record).get("provider_directory_resource_scan_concurrency")
+    return MAX_RESOURCE_SCAN_CONCURRENCY if configured is None else _validated_resource_scan_concurrency(configured)
+
+
+def _partition_window_concurrency(source_record: dict[str, Any], request_url: str) -> int:
+    """Share the bounded run transport without enabling credentialed windows."""
+    session = _rest_page_prefetch_session(source_record, request_url)
+    if session is None or session.connector is None:
+        return 1
+    return max(1, min(2, session.connector.limit_per_host, _source_resource_scan_concurrency(source_record)))
 
 
 def _is_bool_or_default(value: Any, default: bool) -> bool:
@@ -59185,33 +59189,12 @@ async def _current_endpoint_dataset_id(
     exclude_dataset_id: str,
 ) -> str | None:
     """Read the serving predecessor through the ordinary catalog credentials."""
-    from process.provider_directory_generic_source_policy import _FACTORY
+    from process.provider_directory_generic_source_adapters import current_endpoint_dataset_record
 
-    factory = _FACTORY.get()
-    binding = getattr(factory, "storage_binding", None)
-    if binding is None:
-        relation = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
-    else:
-        factory._require_current_policy()
-        if _schema() != binding.catalog_schema or db._transaction_binding() is not None:
-            raise RuntimeError("provider_directory_predecessor_catalog_reader_required")
-        # The private header contains candidates, not the incumbent serving generation.
-        relation = storage_relation(binding.catalog_schema, ProviderDirectoryEndpointDataset.__tablename__)
-    predecessor = await db.first(
-        f"""
-        SELECT dataset_id
-          FROM {relation}
-         WHERE endpoint_id = :endpoint_id
-           AND is_current = true
-           AND dataset_id <> :exclude_dataset_id
-         LIMIT 1;
-        """,
-        endpoint_id=endpoint_id,
-        exclude_dataset_id=exclude_dataset_id,
+    predecessor = await current_endpoint_dataset_record(
+        sys.modules[__name__], endpoint_id, exclude_dataset_id=exclude_dataset_id
     )
-    if binding is not None:
-        factory._require_current_policy()
-    return _clean_text(_pagination_checkpoint_row_mapping(predecessor).get("dataset_id"))
+    return _clean_text(predecessor.get("dataset_id"))
 
 
 async def _assert_locked_endpoint_candidate(
@@ -67836,6 +67819,7 @@ class ResourceGroupScanRunner:
         requested_resource_types: list[str],
     ) -> ResourceFetchResult | None:
         """Run a foundation wave and retain the serial role-tail outcome."""
+        self.source_record.setdefault("_provider_directory_request_pacing_state", {})
         ordered_resource_types = tuple(
             _source_resource_fetch_order(
                 self.source_record,
@@ -67845,8 +67829,15 @@ class ResourceGroupScanRunner:
         concurrency = self._effective_concurrency(ordered_resource_types)
         self.effective_concurrency = concurrency
         if concurrency > 1:
+            from process.provider_directory_generic_source_adapters import resource_scan_estimates
+
+            resource_count_by_type = await resource_scan_estimates(sys.modules[__name__], self.source_record)
             foundation_types = tuple(
-                resource_type for resource_type in ordered_resource_types if resource_type != "PractitionerRole"
+                sorted(
+                    (resource_type for resource_type in ordered_resource_types if resource_type != "PractitionerRole"),
+                    key=lambda resource: resource_count_by_type.get(resource, -1),
+                    reverse=True,
+                )
             )
             await self.activate(
                 foundation_types,
