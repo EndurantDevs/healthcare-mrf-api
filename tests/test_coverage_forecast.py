@@ -34,7 +34,9 @@ def test_workflow_postgres_producers_match_forecast_contract() -> None:
     workflow_path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     producers = workflow["jobs"]["address-canonical-db-tests"]["strategy"]["matrix"]["include"]
-    assert tuple(producer["shard"] for producer in producers) == artifacts.SHARD_SPEC_BY_KIND["postgres"]["shards"]
+    # The workflow lists lanes longest-first; the forecast only needs the exact lane set.
+    assert len(producers) == len(artifacts.SHARD_SPEC_BY_KIND["postgres"]["shards"])
+    assert {producer["shard"] for producer in producers} == set(artifacts.SHARD_SPEC_BY_KIND["postgres"]["shards"])
     for shard in (
         "registry-48",
         "registry--1",
