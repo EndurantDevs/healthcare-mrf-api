@@ -258,6 +258,78 @@ def test_openapi_routes_match_code():
         )
 
 
+def _contract_literal(path, name):
+    """Read protocol constants without importing database runtime dependencies."""
+    tree = ast.parse(Path(path).read_text())
+    return next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    )
+
+
+def test_registry_refresh_schemas_preserve_closed_service_contracts():
+    schemas = load_openapi_document(OPENAPI_PATH)["components"]["schemas"]
+    contract_path = "process/registry_membership_refresh_contract.py"
+    command = schemas["RegistryMembershipRefreshCommand"]
+    assert set(command["required"]) == set(command["properties"]) == _contract_literal(contract_path, "COMMAND_FIELDS")
+    envelope = schemas["RegistryMembershipRefreshEnvelope"]
+    assert set(envelope["required"]) == set(envelope["properties"]) == {"actor", "command"}
+    actor = envelope["properties"]["actor"]
+    assert set(actor["required"]) == set(actor["properties"]) == {"kind", "service_id"}
+    for name, value in _contract_literal(contract_path, "SERVICE_ACTOR").items():
+        assert actor["properties"][name]["enum"] == [value]
+    scope = schemas["RegistryRefreshEnrolledScope"]
+    assert (
+        set(scope["required"])
+        == set(scope["properties"])
+        == _contract_literal("process/registry_refresh_anchor_contract.py", "SCOPE_FIELDS")
+    )
+    for schema in (command, envelope, actor, scope):
+        assert schema["additionalProperties"] is False
+    for name in ("accepted_sources", "enrolled_scopes"):
+        assert command["properties"][name]["allOf"][1] == {"minItems": 1}
+    observation = schemas["RegistryMembershipRefreshInputs"]
+    assert set(observation["required"]) == set(observation["properties"])
+    assert observation["additionalProperties"] is False
+    for name in ("ready_address_generation", "published_inputs_digest", "refresh_request"):
+        assert observation["properties"][name]["nullable"] is True
+
+
+def test_registry_refresh_routes_require_control_auth_and_exact_transport():
+    paths = load_openapi_document(OPENAPI_PATH)["paths"]
+    for path, method, request_schema, response_schema in (
+        (
+            "/registry/manage/approved-refresh-anchors",
+            "post",
+            "RegistryRefreshAnchorRequest",
+            "RegistryRefreshAnchorReceipt",
+        ),
+        ("/registry/publication/membership-refresh/inputs", "get", None, "RegistryMembershipRefreshInputs"),
+        (
+            "/registry/publication/refresh-memberships",
+            "post",
+            "RegistryMembershipRefreshEnvelope",
+            "RegistryMembershipRefreshQueueReceipt",
+        ),
+    ):
+        operation = paths[path][method]
+        assert operation["security"] == [{"RegistryControlBearer": []}, {"RegistryControlHeader": []}]
+        assert not operation.get("parameters")
+        assert set(operation["responses"]) == {"200", "400", "403", "409", "503"}
+        assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/" + response_schema
+        }
+        if request_schema is None:
+            assert "requestBody" not in operation
+        else:
+            assert operation["requestBody"]["required"] is True
+            assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/" + request_schema
+            }
+
+
 def test_custom_import_extension_read_openapi_contract():
     spec = load_openapi_document(OPENAPI_PATH)
     operation = spec["paths"]["/extensions/custom-import/search"]["post"]

@@ -298,8 +298,7 @@ async def test_office_bound_and_fixed_bulk_query_count(catalog_db):
                 queries.clear()
                 await _bounded_office_page(fixture, scope, count)
                 await asyncio.sleep(0)
-                assert len(queries) == 5
-                assert sum("network_candidate_custody" in query.query for query in queries) == 1
+                _assert_fixed_guarded_queries(queries)
     finally:
         fixture.connection.remove_query_logger(queries.append)
 
@@ -311,6 +310,37 @@ async def _bounded_office_page(fixture, scope, count):
         return
     page = await read_network_provider_page(fixture.connection, scope, control_schema=fixture.control_schema)
     assert max(len(provider["locations"]) for provider in page["providers"]) == 100 and page["total_count"] == 2
+
+
+def _assert_fixed_guarded_queries(logged_queries):
+    """Pin constant metadata/data/identity reads, including first-use driver codec discovery."""
+    application_prefixes = (
+        "SELECT current_setting('transaction_isolation')",
+        "SELECT to_jsonb(candidate)::text AS candidate_json",
+        "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')",
+        "SELECT to_regclass($1)::oid",
+        "SELECT seal_sha256,receipt_json::text AS receipt_json",
+        "WITH selected_addresses AS NOT MATERIALIZED",
+        "WITH expected AS MATERIALIZED",
+    )
+    codec_prefixes = (
+        "SELECT current_setting('jit') AS cur, set_config('jit', 'off', false) AS new",
+        "WITH RECURSIVE typeinfo_tree(",
+        "SELECT set_config('jit', $1, false)",
+    )
+    application_queries, codec_queries = [], []
+    for query in logged_queries:
+        statement = " ".join(query.query.split())
+        (codec_queries if statement.startswith(codec_prefixes) else application_queries).append(statement)
+    assert len(application_queries) == len(application_prefixes) == 7
+    assert all(
+        statement.startswith(prefix)
+        for statement, prefix in zip(application_queries, application_prefixes, strict=True)
+    )
+    assert len(codec_queries) in (0, 3) and len(logged_queries) in (7, 10)
+    assert all(statement.startswith(prefix) for statement, prefix in zip(codec_queries, codec_prefixes))
+    assert all(query.query.lstrip().startswith(("SELECT", "WITH")) for query in logged_queries)
+    assert sum("network_candidate_custody" in query.query for query in logged_queries) == 1
 
 
 async def test_draft_edits_and_new_head_preserve_retained_approved_identity(manual_read_db):
@@ -354,10 +384,7 @@ async def test_five_native_reads_and_reader_cannot_modify_candidate(manual_read_
                 )
                 assert result["total_count"] == 1
                 await asyncio.sleep(0)
-                assert len(statements) == 5 and all(
-                    query.query.lstrip().startswith(("SELECT", "WITH")) for query in statements
-                )
-                assert sum("network_candidate_custody" in query.query for query in statements) == 1
+                _assert_fixed_guarded_queries(statements)
     finally:
         fixture.connection.remove_query_logger(statements.append)
     async with fixture.connection.transaction():
@@ -436,25 +463,41 @@ async def test_unselected_duplicate_binding_does_not_affect_selected_offices(man
     fixture = manual_read_db
     before = await _read(fixture)
     namespace = '"' + fixture.source.schema_name + '"'
-    transaction = fixture.connection.transaction(isolation="repeatable_read")
-    await transaction.start()
+    aliases = (uuid4(), uuid4())
+    has_committed_aliases = False
     try:
-        copied = await fixture.connection.fetchval(
-            f"""WITH unselected AS (SELECT * FROM {namespace}.entity_address_unified
+        async with fixture.connection.transaction():
+            copied = await fixture.connection.fetchval(
+                f"""WITH unselected AS (SELECT * FROM {namespace}.entity_address_unified
               WHERE NOT (canonical_network_ids && ARRAY[$3::integer]) LIMIT 1),
               added AS (INSERT INTO {namespace}.provider_location_binding
               SELECT address.entity_type,address.entity_id,identity,address.location_key,address.entity_type,
                 address.entity_id FROM unselected address CROSS JOIN unnest(ARRAY[$1::uuid,$2::uuid]) identity
               RETURNING location_id)
               SELECT count(*) FROM added""",
-            uuid4(),
-            uuid4(),
-            fixture.seed.network["record_id"],
-        )
+                *aliases,
+                fixture.seed.network["record_id"],
+            )
+        has_committed_aliases = True
         assert copied == 2
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            assert (
+                await fixture.connection.fetchval(
+                    f"SELECT count(*) FROM {namespace}.provider_location_binding WHERE location_id=ANY($1::uuid[])",
+                    aliases,
+                )
+                == 2
+            )
         assert await _read(fixture, role=False) == before
     finally:
-        await transaction.rollback()
+        if has_committed_aliases:
+            async with fixture.connection.transaction():
+                removed = await fixture.connection.fetchval(
+                    f"WITH removed AS (DELETE FROM {namespace}.provider_location_binding "
+                    "WHERE location_id=ANY($1::uuid[]) RETURNING location_id) SELECT count(*) FROM removed",
+                    aliases,
+                )
+                assert removed == 2
     assert await _read(fixture) == before
 
 

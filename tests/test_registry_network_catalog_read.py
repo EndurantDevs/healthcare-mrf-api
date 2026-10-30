@@ -364,6 +364,69 @@ def retained_binding_document():
     }
 
 
+def product_binding_document(network_id=7):
+    return retained_binding_document() | {
+        "source_key": "InsurancePlan/plan-one",
+        "source_scope": {"insurance_plan_id": "plan-one", "capture_sha256": "a" * 64, "product_network_id": network_id},
+    }
+
+
+def test_product_binding_requires_its_enclosing_network():
+    binding = product_binding_document()
+    document = network_document() | {"network_id": 7, "source_bindings": [binding]}
+    assert catalog.catalog_network_document(document) == document
+    assert catalog.catalog_binding_document(binding, network_id=7) is None
+    for enclosing in (None, 8, True, "7"):
+        with pytest.raises(catalog.RegistryNetworkCatalogError, match="document_invalid"):
+            catalog.catalog_binding_document(binding, network_id=enclosing)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"producer_id": "other-producer"},
+        {"source_id": "cms-npd"},
+        {"source_key": "plan-one"},
+        {"source_key": "Organization/plan-one"},
+        {"source_key": "InsurancePlan/plan-two"},
+        {"source_scope": {"insurance_plan_id": "plan_one", "capture_sha256": "a" * 64, "product_network_id": 7}},
+        {"source_scope": {"insurance_plan_id": "plan-one", "capture_sha256": "A" * 64, "product_network_id": 7}},
+        {"source_scope": {"insurance_plan_id": "plan-one", "capture_sha256": "a" * 64, "product_network_id": True}},
+        {"source_scope": {"insurance_plan_id": "plan-one", "capture_sha256": "a" * 64, "product_network_id": 0}},
+        {
+            "source_scope": {
+                "insurance_plan_id": "plan-one",
+                "capture_sha256": "a" * 64,
+                "product_network_id": 2147483648,
+            }
+        },
+        {
+            "source_scope": {
+                "insurance_plan_id": "plan-one",
+                "capture_sha256": "a" * 64,
+                "product_network_id": 7,
+                "organization_id": "anchor",
+            }
+        },
+    ],
+)
+def test_product_binding_refuses_changed_scope_or_coordinates(changes):
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        catalog.catalog_binding_document(product_binding_document() | changes, network_id=7)
+
+
+def test_product_scope_never_becomes_a_legacy_selector():
+    binding = product_binding_document()
+    coordinates = replace(source_coordinates("fhir"), producer_id=binding["producer_id"])
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        catalog.RegistryNetworkCatalogLegacySelector(
+            coordinates,
+            "legacy_fhir_uuid",
+            "11111111-1111-4111-8111-111111111111",
+            json.dumps(binding["source_scope"]).encode(),
+        )
+
+
 @pytest.mark.asyncio
 async def test_retained_capture_catalog_response_preserves_exact_source_and_generation(batch_boundary):
     """Accept only the producer-bound capture shape through the ordinary pinned reader."""

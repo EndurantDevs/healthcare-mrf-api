@@ -9,6 +9,7 @@ from sqlalchemy import text
 from api.provider_directory_cms_network_scope import CMSNetworkScope, _mapped_networks
 from api.provider_directory_entities_contract import DirectoryReadError
 from api.provider_profile_network_facts import _query as _plan_query
+from api.provider_profile_network_facts import execute_cms_profile_read
 from api.provider_profile_scoped_resources import project_scoped_profile_resources
 from process.network_address_projection import _identifier
 from process.network_fhir_membership_source import _require_pinned_source
@@ -173,12 +174,12 @@ async def read_cms_profile_resources(session, scope: CMSNetworkScope, npi: str):
         or await driver.fetchval("SHOW transaction_read_only") != "on"
     ):
         raise ValueError("profile_resource_transaction_invalid")
-    await _require_pinned_source(driver, scope.source_pin)
+    await _require_pinned_source(driver, scope.source_pin, api_read=True)
     parameters_by_name = {
         **scope.parameters_by_name,
         "minimal_role": list(_MINIMAL_ROLE),
         "resource_max_rows": MAX_ROWS,
         "resource_max_bytes": MAX_BYTES,
     }
-    document = (await session.execute(text(_query(scope)), parameters_by_name)).scalar_one()
+    document = (await execute_cms_profile_read(session, scope, text(_query(scope)), parameters_by_name)).scalar_one()
     return _decode(document, npi)

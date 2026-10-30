@@ -34,7 +34,8 @@ class _OrdinalSession:
         self.ordinals = ordinals
         self.candidate_scopes = []
 
-    async def execute(self, statement):
+    async def execute(self, statement, parameters=None):
+        assert parameters in (None, {})
         compiled = statement.compile()
         assert "LIMIT" not in str(compiled)
         self.candidate_scopes.append(compiled.params["billing_candidate_npis"])

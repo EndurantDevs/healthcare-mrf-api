@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read
 from api.plan_pricing_projection_contract import SCHEMA, PlanPricingProjectionUnavailable
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
@@ -164,14 +165,12 @@ async def is_em_distance_projection_ready(
     if scope is not None:
         from api.plan_pricing_em_attribution import resolve_em_attribution
         from api.provider_service_source_policy import admitted_plan_release_bindings
-        from process.network_em_provider_inputs import resolve_em_provider_inputs
+        from process.network_em_provider_inputs import resolve_em_provider_inputs_in_session
 
         try:
             await admitted_plan_release_bindings(session, selection)
-            await resolve_em_attribution(session, selection)
-            connection = await session.connection()
-            driver = (await connection.get_raw_connection()).driver_connection
-            await resolve_em_provider_inputs(driver, scope.manifest)
+            await resolve_em_attribution(session, selection, api_read=True)
+            await resolve_em_provider_inputs_in_session(session, scope.manifest)
         except PlanPricingProjectionUnavailable:
             return False
         return True
@@ -367,6 +366,32 @@ def _projection_response(
     return annotate_plan_release_response(response_by_field, selection) or response_by_field
 
 
+def _validate_page_parameters(extra_parameters):
+    """Permit only the pinned physical inputs and existing managed-page options."""
+    allowed_parameters = {
+        "allowed_binding_ordinals",
+        "code_index",
+        "_canonical_network_ids",
+        "_legacy_network_checksums",
+        "_network_excluded_ids",
+        "_network_approved_revision",
+    }
+    if extra_parameters and any(key.startswith("_compact_") for key in extra_parameters):
+        from api.network_address_scope import current_network_address_scope, scoped_address_parameters
+        from api.network_compact_address import compact_address_parameters
+
+        scope = current_network_address_scope()
+        if scope is None or scope.manifest.compact_layout is None:
+            raise ValueError("E&M page parameters cannot replace the bounded request")
+        reserved = compact_address_parameters(scope.manifest.compact_layout)
+        scoped_address_parameters(
+            {key: value for key, value in extra_parameters.items() if key.startswith("_compact_")}
+        )
+        allowed_parameters.update(reserved)
+    if extra_parameters and set(extra_parameters) - allowed_parameters:
+        raise ValueError("E&M page parameters cannot replace the bounded request")
+
+
 async def _progressive_page_rows(
     session: Any,
     selection: PlanReleaseServingSelection,
@@ -379,20 +404,12 @@ async def _progressive_page_rows(
     extra_parameters: Mapping[str, Any] | None = None,
 ) -> tuple[list[Mapping[str, Any]], bool, bool, int] | None:
     """Read only enough nearest locations to prove the requested page."""
-
-    if extra_parameters and set(extra_parameters) - {
-        "allowed_binding_ordinals",
-        "code_index",
-        "_canonical_network_ids",
-        "_legacy_network_checksums",
-        "_network_excluded_ids",
-        "_network_approved_revision",
-    }:
-        raise ValueError("E&M page parameters cannot replace the bounded request")
+    _validate_page_parameters(extra_parameters)
     zip5, latitude, longitude = location
     candidate_limit = max(_INITIAL_LOCATION_WINDOW, (int(pagination.offset) + int(pagination.limit) + 1) * 4)
     while True:
-        page_result = await session.execute(
+        page_result = await execute_network_read(
+            session,
             text(_PAGE_SQL if page_sql is None else page_sql),
             {
                 "serving_revision_id": selection.serving_revision_id,

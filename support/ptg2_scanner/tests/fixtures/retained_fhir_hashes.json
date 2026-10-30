@@ -1,0 +1,190 @@
+[
+  {
+    "contract": "transport_bound_v1",
+    "expected_hash": "30ed05e26dd7c222a993bc13a122d2f71c96c20ef99d1d40344d6a972bc2e671",
+    "kind": "Location",
+    "payload": {
+      "fhir_meta": {
+        "lastUpdated": "2026-01-01",
+        "versionId": "2"
+      },
+      "name": "Caf\u00e9 \ud83d\ude00\u007f\u0000",
+      "nested": [
+        null,
+        true,
+        {
+          "a": "\u00e9",
+          "z": -2
+        }
+      ],
+      "number": 100000000000000000000001,
+      "resource_id": "item-1",
+      "resource_url": "https://example.test/resource",
+      "source_id": "source-a"
+    }
+  },
+  {
+    "contract": "transport_neutral_v2",
+    "expected_hash": "6395c4c72449fde1cc5fff9f0be175f44b63ebcd011fc7daa40d61a8a78db252",
+    "kind": "Location",
+    "payload": {
+      "fhir_meta": {
+        "lastUpdated": "2026-01-01",
+        "versionId": "2"
+      },
+      "name": "Caf\u00e9 \ud83d\ude00\u007f\u0000",
+      "nested": [
+        null,
+        true,
+        {
+          "a": "\u00e9",
+          "z": -2
+        }
+      ],
+      "number": 100000000000000000000001,
+      "resource_id": "item-1",
+      "resource_url": "https://example.test/resource",
+      "source_id": "source-a"
+    }
+  },
+  {
+    "contract": "semantic_content_v3",
+    "expected_hash": "35c38d535ae0b31e704a0a791e4573fc73639a89b553f4442272c58ce966e0a7",
+    "kind": "Location",
+    "payload": {
+      "fhir_meta": {
+        "lastUpdated": "2026-01-01",
+        "versionId": "2"
+      },
+      "name": "Caf\u00e9 \ud83d\ude00\u007f\u0000",
+      "nested": [
+        null,
+        true,
+        {
+          "a": "\u00e9",
+          "z": -2
+        }
+      ],
+      "number": 100000000000000000000001,
+      "resource_id": "item-1",
+      "resource_url": "https://example.test/resource",
+      "source_id": "source-a"
+    }
+  },
+  {
+    "contract": "semantic_content_v4",
+    "expected_hash": "35c38d535ae0b31e704a0a791e4573fc73639a89b553f4442272c58ce966e0a7",
+    "kind": "Location",
+    "payload": {
+      "fhir_meta": {
+        "lastUpdated": "2026-01-01",
+        "versionId": "2"
+      },
+      "name": "Caf\u00e9 \ud83d\ude00\u007f\u0000",
+      "nested": [
+        null,
+        true,
+        {
+          "a": "\u00e9",
+          "z": -2
+        }
+      ],
+      "number": 100000000000000000000001,
+      "resource_id": "item-1",
+      "resource_url": "https://example.test/resource",
+      "source_id": "source-a"
+    }
+  },
+  {
+    "contract": "semantic_content_v3",
+    "expected_hash": "8c6f673cac2042da236b34adb86305dad80298a060aa81bd6e776d914b0addfc",
+    "kind": "Practitioner",
+    "payload": {
+      "family_name": "Able",
+      "fhir_meta": {
+        "lastUpdated": "2026-01-02"
+      },
+      "full_name": "Ann Able",
+      "given_names": [
+        "Ann"
+      ],
+      "names": [
+        {
+          "family": "Able",
+          "given": [
+            "Ann"
+          ],
+          "text": "Ann Able"
+        },
+        {
+          "family": "\u00c9clair",
+          "given": [
+            "Zo\u00eb"
+          ],
+          "text": null
+        }
+      ],
+      "resource_id": "item-1",
+      "resource_url": "https://example.test/one",
+      "source_id": "source-a"
+    }
+  },
+  {
+    "contract": "semantic_content_v4",
+    "expected_hash": "8c6f673cac2042da236b34adb86305dad80298a060aa81bd6e776d914b0addfc",
+    "kind": "Practitioner",
+    "payload": {
+      "family_name": "Able",
+      "fhir_meta": {
+        "lastUpdated": "2026-01-02"
+      },
+      "full_name": "Ann Able",
+      "given_names": [
+        "Ann"
+      ],
+      "names": [
+        {
+          "family": "Able",
+          "given": [
+            "Ann"
+          ],
+          "text": "Ann Able"
+        },
+        {
+          "family": "\u00c9clair",
+          "given": [
+            "Zo\u00eb"
+          ],
+          "text": null
+        }
+      ],
+      "resource_id": "item-1",
+      "resource_url": "https://example.test/one",
+      "source_id": "source-a"
+    }
+  },
+  {
+    "contract": "semantic_content_v4",
+    "expected_hash": "f26ddbd1f755112e104f9b5d603c53a5d65d58225c8b6bc7d552ec91ccee2d1d",
+    "kind": "Organization",
+    "payload": {
+      "aliases": [
+        "EXAMPLE",
+        "Example",
+        "Old label"
+      ],
+      "fhir_meta": {
+        "lastUpdated": "2026-01-02"
+      },
+      "name": "example",
+      "name_variants": [
+        "example",
+        "Example",
+        "EXAMPLE"
+      ],
+      "resource_id": "item-1",
+      "resource_url": "https://example.test/org",
+      "source_id": "source-a"
+    }
+  }
+]

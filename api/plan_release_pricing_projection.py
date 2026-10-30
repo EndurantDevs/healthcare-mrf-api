@@ -64,12 +64,12 @@ SELECT revision.serving_revision_id,
        ) AS logical_scope_present,
        EXISTS (
            SELECT 1
-             FROM {schema}.ptg2_snapshot_pin pin
+             FROM {old_pin_relation} pin
             WHERE pin.owner_type = {pin_owner_parameter}
               AND pin.owner_id = revision.serving_revision_id
               AND pin.snapshot_id = binding.snapshot_id
        ){native_pin_sql} AS is_pinned
-  FROM {schema}.plan_release_serving_revision revision
+  FROM {revision_relation} revision
   JOIN {binding_relation} binding
     ON binding.serving_revision_id = revision.serving_revision_id
   LEFT JOIN {schema}.ptg2_snapshot snapshot
@@ -128,6 +128,8 @@ def _plan_release_serving_sql(
     )
     return _PLAN_RELEASE_SERVING_SQL_TEMPLATE.format(
         schema=schema,
+        revision_relation=("ONLY " if retained else "") + f"{schema}.plan_release_serving_revision",
+        old_pin_relation=("ONLY " if retained else "") + f"{schema}.ptg2_snapshot_pin",
         binding_relation=(
             canonical_binding_relation(schema)
             if source_bindings

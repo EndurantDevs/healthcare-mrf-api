@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Retained NPI cache, address selection, and enrichment query contracts."""
 
+import asyncio
 import json
 from collections import OrderedDict
 from copy import deepcopy
@@ -9,7 +10,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
-from sanic.exceptions import InvalidUsage
+from sanic.exceptions import InvalidUsage, ServiceUnavailable
 from sqlalchemy import column, select, table
 
 from api import provider_list_sql
@@ -903,7 +904,7 @@ async def test_canonical_all_binds_count_and_late_hydration_on_pinned_session(mo
 
     connection = SimpleNamespace(all=query)
     proxy = Mock(return_value=connection)
-    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", proxy)
+    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", proxy)
     monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned query"))))
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
@@ -1071,3 +1072,118 @@ async def test_classification_counts_keep_optional_predicates(monkeypatch, uses_
         assert "c.premise_key = CAST(:address_site_key AS uuid)" in statement_sql
     else:
         assert "regexp_replace(COALESCE(c.telephone_number" in statement_sql
+
+
+@pytest.mark.parametrize("has_session", [False, True])
+async def test_canonical_statement_requires_the_original_request_reader(monkeypatch, has_session):
+    from api import network_read_execution
+    from db import connection
+    from db.models import EntityAddressUnified
+    from tests.test_network_optional_sql_recovery import _Session
+    from tests.test_network_read_execution import _manifest
+
+    session = _Session()
+    selected = Mock(return_value=session) if has_session else Mock(side_effect=RuntimeError("no reader bound"))
+    monkeypatch.setattr(connection, "current_session", selected)
+    verify = AsyncMock()
+    monkeypatch.setattr(network_read_execution, "verify_consumed_network_relations", verify)
+    unpinned = AsyncMock(side_effect=AssertionError("canonical query escaped its request reader"))
+    monkeypatch.setattr(npi_module, "db", SimpleNamespace(execute=unpinned))
+    statement = select(EntityAddressUnified.__table__.c.npi)
+    with network_address_read_scope(_manifest(), (42,)):
+        if has_session:
+            assert await npi_module._execute_stmt(statement) is session.result
+        else:
+            with pytest.raises(ServiceUnavailable, match="Reader is unavailable") as caught:
+                await npi_module._execute_stmt(statement)
+            assert isinstance(caught.value.__cause__, RuntimeError)
+    selected.assert_called_once_with()
+    unpinned.assert_not_awaited()
+    assert verify.await_count == int(has_session)
+
+
+@pytest.mark.parametrize("write_option", ["force_address_update", "sync_geocode"])
+async def test_canonical_detail_cannot_mutate_geocode_even_with_debug(monkeypatch, write_option):
+    from tests.test_network_read_execution import _manifest
+
+    lookup = AsyncMock(side_effect=AssertionError("write request reached storage"))
+    monkeypatch.setattr(npi_module, "_execute_stmt", lookup)
+    request = SimpleNamespace(args={write_option: "1", "debug": "1"}, app=SimpleNamespace())
+    with network_address_read_scope(_manifest(), (42,)), pytest.raises(InvalidUsage, match="cannot update"):
+        await npi_module.read_npi_detail(request, "1000000004")
+    lookup.assert_not_awaited()
+
+
+@pytest.mark.parametrize("limit", ["invalid", "1.5", "all", "0", "-1", "6"])
+async def test_network_detail_premise_paging_rejects_unbounded_or_invalid_limits(monkeypatch, limit):
+    from tests.test_network_read_execution import _manifest
+
+    lookup = AsyncMock(side_effect=AssertionError("invalid page reached storage"))
+    monkeypatch.setattr(npi_module, "_execute_stmt", lookup)
+    request = SimpleNamespace(args={"address_grouping": "premise", "address_limit": limit}, app=SimpleNamespace())
+    with network_address_read_scope(_manifest(), (42,)), pytest.raises(InvalidUsage, match="between 1 and 5"):
+        await npi_module.read_npi_detail(request, "1000000004")
+    lookup.assert_not_awaited()
+
+
+async def test_count_cache_refuses_identity_failure_instead_of_unpinned_fallback(monkeypatch):
+    monkeypatch.setattr(npi_module, "_npi_canonical_publication_identity", AsyncMock(return_value="sealed"))
+    original = ServiceUnavailable("canonical relation changed")
+    query = AsyncMock(side_effect=original)
+    monkeypatch.setattr(npi_module, "_execute_stmt", query)
+    with pytest.raises(ServiceUnavailable) as caught:
+        await npi_module._npi_count_cache_identity(npi_module.EntityAddressUnified)
+    assert caught.value is original
+    query.assert_awaited_once()
+
+
+async def test_count_cache_has_no_identity_for_non_address_models(monkeypatch):
+    monkeypatch.setattr(npi_module, "_npi_canonical_publication_identity", AsyncMock(return_value="sealed"))
+    query = AsyncMock(side_effect=AssertionError("unsupported count model reached catalog"))
+    monkeypatch.setattr(npi_module, "_execute_stmt", query)
+    assert await npi_module._npi_count_cache_identity(npi_module.NPIData) is None
+    query.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", [asyncio.TimeoutError, ServiceUnavailable])
+async def test_canonical_provider_count_timeout_differs_from_identity_refusal(monkeypatch, failure):
+    from tests.test_network_read_execution import _manifest
+    from tests.test_npi_network_geo_query_contract import _guarded_query_session
+
+    statements = []
+    original = failure("count failed")
+
+    async def query(statement, **parameters):
+        sql = str(statement)
+        statements.append(sql)
+        assert parameters["_canonical_network_ids"] == [42]
+        if len(statements) == 1:
+            assert "COUNT(" in sql
+            if failure is asyncio.TimeoutError:
+                await asyncio.sleep(1)
+            raise original
+        return []
+
+    session = _guarded_query_session(query)
+    monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned read"))))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
+    monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
+    monkeypatch.setattr(npi_module, "_apply_location_statuses", AsyncMock())
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(npi_module, "_NPI_ALL_TOTAL_TIMEOUT_SECONDS", 0.01)
+    request = SimpleNamespace(
+        args={"limit": "1", "phone": "2025550101", "include_total": "1"},
+        app=SimpleNamespace(),
+        ctx=SimpleNamespace(sa_session=session),
+    )
+    with network_address_read_scope(_manifest(), (42,)):
+        if failure is ServiceUnavailable:
+            with pytest.raises(ServiceUnavailable) as caught:
+                await npi_module.list_providers(request)
+            assert caught.value is original
+            assert len(statements) == 1
+        else:
+            document = json.loads((await npi_module.list_providers(request)).body)
+            assert document["total_source"] == "estimated_timeout_floor"
+            assert document["total"] == 0 and document["rows"] == []
+            assert len(statements) == 2

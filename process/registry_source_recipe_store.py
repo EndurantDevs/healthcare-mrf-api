@@ -213,8 +213,24 @@ def _decode_recipe(document):
 
 
 def _decode_fhir_pin(document):
-    """Decode the unchanged legacy pin or the complete retained CMS custody pin."""
-    all_names = {field.name for field in fields(PinnedFHIRMembershipSource)}
+    """Decode closed flat source pins and at most one independently retained successor."""
+    if type(document) is not dict:
+        raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    values_by_name = dict(document)
+    successor = values_by_name.pop("retained_successor", None)
+    if "retained_successor" in document:
+        if type(successor) is not dict or "retained_successor" in successor:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        successor = _decode_flat_fhir_pin(successor)
+    return PinnedFHIRMembershipSource(**_decode_flat_fhir_pin_values(values_by_name), retained_successor=successor)
+
+
+def _decode_flat_fhir_pin(document):
+    return PinnedFHIRMembershipSource(**_decode_flat_fhir_pin_values(document))
+
+
+def _decode_flat_fhir_pin_values(document):
+    all_names = {field.name for field in fields(PinnedFHIRMembershipSource)} - {"retained_successor"}
     custody_names = all_names - {"retained_epoch", "retained_capture"}
     legacy_names = {name for name in custody_names if not name.startswith("custody_")}
     epoch_names = legacy_names | {"retained_epoch"}
@@ -236,7 +252,7 @@ def _decode_fhir_pin(document):
         if type(document["retained_capture"]) is not dict:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         values_by_name["retained_capture"] = validate_capture(document["retained_capture"])
-    return PinnedFHIRMembershipSource(**values_by_name)
+    return values_by_name
 
 
 def _recipe_document(recipe):
@@ -444,25 +460,82 @@ def verify_registry_source_recipes(candidate: Mapping) -> tuple[RegistrySourceMe
         raise RegistrySourceRecipeError("registry_source_recipes_invalid") from None
 
 
-async def resolve_retained_registry_source_recipes(connection, pinned_manifest, *, control_schema=None):
-    """Recheck exact retained manifest and native writer closure without any writes."""
+def _decode_source_inventory_recipes(entries):
+    """Decode already folded singleton entries without applying the legacy whole-array cap."""
+    return tuple(decode_registry_source_recipes("[" + entry.recipe_json + "]")[0] for entry in entries)
+
+
+def _source_inventory_recipe_digest(recipes):
+    """Preserve the legacy SHA state over exact array bytes without materializing a large array."""
+    from process.registry_source_inventory_preparation import SourceInventoryPreparation
+
+    preparation = SourceInventoryPreparation(recipes)
+    digest = hashlib.sha256(b"[")
+    for index, recipe in enumerate(preparation.recipes):
+        if index:
+            digest.update(b",")
+        digest.update(canonical_registry_source_recipes((recipe,))[1:-1].encode())
+    digest.update(b"]")
+    if digest.hexdigest() != preparation.recipe_root.recipes_sha256:
+        raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    return digest
+
+
+async def _retained_inventory_recipes(connection, candidate, control_schema, *, api_read=False):
+    from db.registry_source_inventory_schema import INVENTORY_TABLE
+    from process.network_candidate_custody import verify_network_candidate_custody
+    from process.network_membership_copy import MembershipCopyTarget
+    from process.registry_source_inventory_store import _load_locked_source_inventory
+
+    target = MembershipCopyTarget(
+        *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
+    )
+    if type(api_read) is not bool:
+        raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
+    if api_read:
+        from process.registry_source_inventory_store import load_source_inventory_for_api
+
+        _, entries = await load_source_inventory_for_api(connection, target, candidate, control_schema=control_schema)
+        return _decode_source_inventory_recipes(entries)
+    custody = await verify_network_candidate_custody(connection, target, control_schema=control_schema, required=True)
+    _, entries = await _load_locked_source_inventory(
+        connection,
+        target,
+        candidate,
+        expected_table_oid=custody["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE],
+        control_schema=control_schema,
+    )
+    return _decode_source_inventory_recipes(entries)
+
+
+async def resolve_retained_registry_source_recipes(connection, pinned_manifest, *, control_schema=None, api_read=False):
+    """Recheck exact retained manifest and native writer closure without any writes.
+
+    Trusted API callers explicitly select RR/RO metadata and consumed-read checks;
+    producer and maintenance defaults retain their original locking verification.
+    """
     try:
         if (
-            type(pinned_manifest) is not PinnedNetworkServingManifest
+            type(api_read) is not bool
+            or type(pinned_manifest) is not PinnedNetworkServingManifest
             or not connection.is_in_transaction()
             or await connection.fetchval("SHOW transaction_isolation") not in {"repeatable read", "serializable"}
         ):
+            raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
+        if api_read and await connection.fetchval("SHOW transaction_read_only") != "on":
             raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
         current = await resolve_network_serving_manifest(
             connection,
             generation_id=pinned_manifest.generation_id,
             control_schema=control_schema,
+            **({"api_read": True} if api_read else {}),
         )
         if current != pinned_manifest:
             raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
         namespace = _control_namespace(control_schema)
         candidate = await connection.fetchrow(
-            f"""SELECT CASE WHEN octet_length(source_recipes_json::text)<=$2
+            f"""SELECT dataset_id,schema_id,producer_id,candidate_id,schema_name,state,
+              CASE WHEN octet_length(source_recipes_json::text)<=$2
               THEN source_recipes_json::text END AS source_recipes_json,source_generations::text
               FROM {namespace}.network_membership_candidate WHERE candidate_id=$1 AND state='published'""",
             UUID(pinned_manifest.candidate_id),
@@ -470,6 +543,20 @@ async def resolve_retained_registry_source_recipes(connection, pinned_manifest, 
         )
         if candidate is None:
             raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
-        return verify_registry_source_recipes(dict(candidate))
+        candidate_by_field = dict(candidate)
+        from process.registry_source_inventory_reference import verify_source_recipe_metadata
+
+        if verify_source_recipe_metadata(candidate_by_field).inventory is None:
+            return verify_registry_source_recipes(candidate_by_field)
+        if (
+            str(candidate_by_field["candidate_id"]) != current.candidate_id
+            or candidate_by_field["schema_name"] != current.schema_name
+            or candidate_by_field["state"] != "published"
+            or _decode_document(candidate_by_field["source_generations"]) != current.source_generations
+        ):
+            raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
+        return await _retained_inventory_recipes(
+            connection, candidate_by_field, namespace[1:-1], **({"api_read": True} if api_read else {})
+        )
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, asyncpg.PostgresError) as error:
         raise RegistrySourceRecipeError("registry_source_recipes_unavailable") from error

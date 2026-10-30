@@ -3,6 +3,8 @@
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from alembic.config import Config
@@ -25,6 +27,17 @@ def _migration(revision=REVISION):
     migration = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(migration)
     return migration
+
+
+def _assert_source_inventory_migration_head(script):
+    """Require the inventory head and its refresh and catalog predecessors."""
+    assert script.get_heads() == ["20261029010000_registry_source_inventory"]
+    assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
+        "20261028020000_registry_membership_refresh"
+    )
+    assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (
+        "20261028010000_registry_fhir_catalog"
+    )
 
 
 def test_additive_group_assertion_migration_matches_frozen_model_and_index():
@@ -90,7 +103,7 @@ def test_group_migration_extends_only_the_actual_current_receipt_head():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261025020000_company_affiliation_join"]
+    _assert_source_inventory_migration_head(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"
@@ -230,7 +243,9 @@ def test_affiliation_branch_preserves_pending_directory_migrations_and_matches_c
     script = ScriptDirectory.from_config(config)
     base = "20261023220000_merge_directory_pricing_controls"
     assert [step.revision.revision for step in script._upgrade_revs(branch, base)] == [branch]
-    assert set(step.revision.revision for step in script._upgrade_revs("head", base)) == {
+    assert set(
+        step.revision.revision for step in script._upgrade_revs("20261025020000_company_affiliation_join", base)
+    ) == {
         branch,
         "20261024050000_provider_directory_first_retirement_owner_lineage",
         "20261023100000_provider_directory_serving_recovery",
@@ -296,5 +311,25 @@ def test_native_fixture_head_checks_preserve_history_without_database_work():
     from tests.test_provider_directory_profile_capacity_adoption_postgres import _assert_registry_migration_lineage
 
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert _assert_registry_migration_lineage() == {"20261025020000_company_affiliation_join"}
+    assert _assert_registry_migration_lineage() == {"20261029010000_registry_source_inventory"}
     assert _assert_address_migration_chain(script) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [None, "before-affiliation"])
+async def test_assertion_fixture_keeps_named_affiliation_boundary(monkeypatch, tmp_path, phase):
+    from tests import test_company_registry_assertions_postgres as assertions
+
+    prepared = AsyncMock(return_value=object())
+    monkeypatch.setattr(assertions, "_guarded_url", lambda: None)
+    monkeypatch.setattr(assertions, "_registration", lambda path: (path / "receipt.json", {}))
+    monkeypatch.setattr(assertions, "_prepare_database", prepared)
+    monkeypatch.setattr(assertions, "_cleanup_database", AsyncMock())
+    fixture = assertions.assertion_db.__wrapped__(tmp_path, monkeypatch, SimpleNamespace(param=phase))
+    try:
+        assert await anext(fixture) is prepared.return_value
+        migrations = prepared.await_args.args[-1]
+        assert migrations[-1] == "20261028010000_registry_fhir_catalog.py"
+        assert (assertions._AFFILIATION_MIGRATION in migrations) == (phase is None)
+    finally:
+        await fixture.aclose()

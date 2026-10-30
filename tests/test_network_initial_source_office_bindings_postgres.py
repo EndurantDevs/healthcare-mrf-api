@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib
 import json
+from contextlib import AsyncExitStack
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -388,7 +389,9 @@ async def test_fixed_bulk_query_count_native_batch_and_hash_receipt(office_db):
             runtime_roles=(fixture.reader,),
             control_schema=fixture.control,
         )
-        assert counted.statements == 18
+        # Native address authority and shared-origin transaction checks stay
+        # constant for one row and the complete bounded source page.
+        assert counted.statements == 21
         assert receipt["office_count"] == min(fixture.batch.source_rows, 2)
         assert len(receipt["selected_offices_sha256"]) == 64
 
@@ -675,6 +678,16 @@ async def initial_cms_db(cms_full_office_source, reviewed_cms_source, custom_db)
     yield fixture
 
 
+@pytest.fixture
+async def initial_cms_publication_db(initial_cms_db):
+    """Seal source contributions through the existing independently authenticated custodian."""
+    from tests.source_contribution_custody_postgres_support import install_source_contribution_custody
+
+    async with AsyncExitStack() as stack:
+        await install_source_contribution_custody(initial_cms_db, initial_cms_db.reviewed_cms[0][2], stack)
+        yield initial_cms_db
+
+
 async def _cms_initial_arguments(fixture):
     from process.network_approved_membership_source import pin_approved_membership_source
     from process.registry_candidate_composition import RegistryCompositionAddressSources
@@ -700,11 +713,11 @@ async def _cms_initial_arguments(fixture):
             npi_source=PinnedAddressSource(fixture.source_schema, "npi", "same-npi-base"),
             initial_source_recipes=(RegistrySourceMembershipRecipe(source_fixture[2], coordinates),),
         ),
-        "writer_roles": {
-            "owner_role": fixture.roles["owner"],
-            "loader_roles": (),
-            "reader_roles": (fixture.roles["reader"],),
-        },
+        "writer_roles": getattr(
+            fixture,
+            "writer_roles",
+            {"owner_role": fixture.roles["owner"], "loader_roles": (), "reader_roles": (fixture.roles["reader"],)},
+        ),
         "control_schema": fixture.control_schema,
     }
 
@@ -731,14 +744,14 @@ async def _assert_cms_native_read(fixture, manifest, network_id):
 
 
 @pytest.mark.parametrize("cms_full_office_source", ["npi", "provider_directory"], indirect=True)
-async def test_initial_cms_exact_office_manual_publish_and_replay(initial_cms_db):
+async def test_initial_cms_exact_office_manual_publish_and_replay(initial_cms_publication_db):
     from process.network_membership_pipeline import prepare_and_publish_network_candidate
     from process.network_serving_read import resolve_network_serving_manifest
     from process.registry_candidate_composition import compose_registry_membership_candidate
     from process.registry_initial_source_composition import verify_initial_source_office_receipt
     from tests.test_registry_candidate_composition_postgres import _remove_candidates
 
-    fixture = initial_cms_db
+    fixture = initial_cms_publication_db
     seed, arguments = await _cms_initial_arguments(fixture)
     copy_targets = []
     try:
@@ -763,6 +776,7 @@ async def test_initial_cms_exact_office_manual_publish_and_replay(initial_cms_db
             addresses,
             **arguments["writer_roles"],
             control_schema=fixture.control_schema,
+            seal_candidate=fixture.seal_candidate,
         )
         async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
             manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
@@ -862,9 +876,10 @@ async def _damage_cms_office(fixture, monkeypatch, damage):
             if not injection_receipts:
                 injection_receipts.append(
                     await connection.execute(f"""INSERT INTO "{copy_target.schema_name}".provider_location_binding
-                  SELECT provider_system,provider_id,gen_random_uuid(),location_key,entity_type,entity_id
+                  SELECT provider_system,'1000000004',gen_random_uuid(),location_key,entity_type,'1000000004'
                   FROM "{copy_target.schema_name}".provider_location_binding WHERE provider_system='npi' LIMIT 1""")
                 )
+                assert injection_receipts[-1] == "INSERT 0 1"
 
         monkeypatch.setattr(cms_offices, "_copy_bindings", duplicate_binding)
     else:
@@ -1178,13 +1193,15 @@ async def _assert_cms_match_pages(fixture, connection, recipes, approved, damage
         pin_cms_office_address_source,
         prepare_cms_office_matches,
     )
+    from process.registry_source_office_errors import SourceOfficeNotReady
 
     pages = initial._fhir_office_pages(connection, recipes, approved, fixture.control_schema, None)
-    expected = (
-        InitialCMSOfficeBindingError
-        if damage in {"duplicate_custom_key", "missing", "tamper", "child_task"}
-        else asyncio.CancelledError
-    )
+    expected = {
+        "missing": SourceOfficeNotReady,
+        "duplicate_custom_key": InitialCMSOfficeBindingError,
+        "tamper": InitialCMSOfficeBindingError,
+        "child_task": InitialCMSOfficeBindingError,
+    }.get(damage, asyncio.CancelledError)
     try:
         async with prepare_cms_office_matches(
             connection, fixture.base, (fixture.roles["reader"],), pages, control_schema=fixture.control_schema
@@ -1214,8 +1231,10 @@ async def _assert_cms_match_pages(fixture, connection, recipes, approved, damage
             assert seen >= 2 and office_count == 2
             if damage == "cancel":
                 raise asyncio.CancelledError
-    except expected:
+    except expected as error:
         assert damage is not None
+        if damage == "missing":
+            assert type(error) is SourceOfficeNotReady and str(error) == "registry_source_office_not_ready"
     else:
         assert damage is None
     assert connection.complete_matches == 1

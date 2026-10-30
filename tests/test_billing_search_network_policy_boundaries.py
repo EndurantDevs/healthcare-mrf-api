@@ -13,6 +13,7 @@ from api import ptg2_serving as native
 from api.network_address_scope import network_address_read_scope
 from api.ptg2_billing_search_contract import BillingSearchServingUnavailableError
 from tests.billing_search_service_support import selection
+from tests.network_read_execution_support import with_read_identity_receipts
 from tests.ptg2_billing_geo_reader_support import NPI_A, NPI_B, _location_row
 from tests.ptg2_serving_coverage_paydown_support import FakeResult, FakeSession
 from tests.test_billing_search_network_policy import _scope
@@ -101,7 +102,7 @@ async def test_retained_location_and_lineage_keep_only_the_admitting_source(monk
     execute = AsyncMock(return_value=rows)
     monkeypatch.setattr(native, "_membership_location_query", AsyncMock(return_value=context))
     monkeypatch.setattr(native, "_execute_membership_location_sql", execute)
-    session = FakeSession([FakeResult([_lineage_row(NPI_A, 1), _lineage_row(NPI_B, 2)])])
+    session = with_read_identity_receipts(FakeSession([FakeResult([_lineage_row(NPI_A, 1), _lineage_row(NPI_B, 2)])]))
     with _scope(exclusions=(19,)) as manifest:
         actual = await policy.load_managed_billing_location_rows(session, object(), {}, (NPI_A, NPI_B))
     assert [entry["npi"] for entry in actual] == [NPI_A]

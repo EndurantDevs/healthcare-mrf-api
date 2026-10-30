@@ -14,10 +14,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from db.models import NPIData
 from process import registry_candidate_composition as composition
+from process import registry_fhir_serving_preservation as preservation
 from process import registry_membership_composition_stage as command_stages
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_candidate_custody import seal_network_candidate_custody
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_legacy_membership_source import PinnedACAMembershipSource
 from process.network_membership_candidate_lifecycle import (
@@ -43,7 +45,19 @@ from process.registry_initial_source_composition import (
     validate_initial_source_office_receipt,
     verify_initial_source_office_receipt,
 )
-from process.registry_record_store import RegistryRecordCommand, _history_result, apply_registry_record_command
+from process.registry_publication_queue import (
+    SOURCE_ROLLBACK_PROVENANCE,
+    _retained_operation_record,
+    claim_registry_publication_request,
+    enqueue_registry_source_rollback_preview,
+    enqueue_registry_source_rollback_publication,
+)
+from process.registry_record_store import (
+    RegistryActor,
+    RegistryRecordCommand,
+    _history_result,
+    apply_registry_record_command,
+)
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.test_network_custom_address_source_postgres import (
     _draft,
@@ -53,6 +67,8 @@ from tests.test_network_custom_address_source_postgres import (
     restricted_artifact_db,
     restricted_bootstrap_artifact_db,
 )
+from tests.test_network_fhir_membership_source_postgres import fhir_source as fhir_source
+from tests.test_network_fhir_membership_source_postgres import reviewed_fhir_source as reviewed_fhir_source
 from tests.test_network_initial_source_office_bindings_postgres import (
     _archive,
     _cleanup_offices,
@@ -62,6 +78,7 @@ from tests.test_network_initial_source_office_bindings_postgres import (
 from tests.test_network_legacy_membership_source_postgres import _aca_binding, _write_aca_bindings
 from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _create
+from tests.test_registry_fhir_serving_preservation import receipt
 
 pytestmark = pytest.mark.asyncio
 
@@ -95,7 +112,10 @@ async def test_retained_address_label_binds_digest_receipt_and_original_pin(gene
     approved = SimpleNamespace(approved_revision=1, generation_id="approved-one")
     summary = _office_receipt((recipe,), approved, artifact.address_source, 0, 0, "b" * 64)
     generations_by_source = {}
-    composition._bind_prepared_generations(generations_by_source, approved, artifact, None)
+    assert (
+        composition._bind_prepared_generations(generations_by_source, approved, artifact, None, source_stage=None)
+        is None
+    )
     assert _validated_sources({"source_generations": generations_by_source}) == generations_by_source
     assert (
         generations_by_source["unified_address"] == summary["address_generation_sha256"] == artifact.generation_sha256
@@ -104,6 +124,15 @@ async def test_retained_address_label_binds_digest_receipt_and_original_pin(gene
         assert "retained_unified_address" not in generations_by_source
     else:
         assert generations_by_source["retained_unified_address"] == address_pin.generation_id
+
+
+async def test_inventory_without_source_stage_refuses_before_binding_generations():
+    generations_by_source = {"existing": "unchanged"}
+    with pytest.raises(composition.RegistryCompositionError, match="registry_composition_source_stage_required"):
+        composition._bind_prepared_generations(
+            generations_by_source, object(), object(), None, source_stage=None, inventory=object()
+        )
+    assert generations_by_source == {"existing": "unchanged"}
 
 
 def _roles(fixture):
@@ -751,12 +780,81 @@ async def test_initial_aca_omissions_are_explicit_and_preserve_manual(initial_co
 
 async def _publish_composition_target(fixture, copy_target, address_source):
     """Use the actual protected preparation and atomic publication pipeline."""
-    await prepare_and_publish_network_candidate(
+    candidate = await _initial_candidate(fixture, copy_target)
+    source_operation = json.loads(candidate["validation_json"]).get(SOURCE_ROLLBACK_PROVENANCE)
+    if source_operation is not None:
+        return await _publish_reviewed_source_rollback(fixture, copy_target, source_operation)
+    return await prepare_and_publish_network_candidate(
         fixture.connection,
         copy_target,
         address_source,
         **_roles(fixture),
         control_schema=fixture.control_schema,
+    )
+
+
+async def _seal_composition_target(fixture, copy_target, runtime_roles):
+    async def authorize(connection, supplied):
+        assert connection is fixture.connection and supplied == copy_target
+        return await connection.fetchval("SELECT current_user=session_user")
+
+    return await seal_network_candidate_custody(
+        fixture.connection,
+        copy_target,
+        control_schema=fixture.control_schema,
+        runtime_roles=runtime_roles,
+        authorize=authorize,
+    )
+
+
+async def _publish_reviewed_source_rollback(fixture, copy_target, source_operation):
+    from process.registry_publication_execution import (
+        complete_queued_registry_source_rollback_preview,
+        complete_queued_registry_source_rollback_publication,
+    )
+    from tests.test_registry_publication_execution_postgres import _reactivation_authority
+
+    connection, schema = fixture.connection, fixture.control_schema
+    request_id = UUID(source_operation["request_id"])
+    request = await connection.fetchrow(
+        f'SELECT * FROM "{schema}".registry_publication_request WHERE request_id=$1', request_id
+    )
+    _command, actor = _retained_operation_record(request, "prepare_source_rollback")
+    preview = await complete_queued_registry_source_rollback_preview(
+        connection,
+        request_id,
+        request["lease_id"],
+        authorize=_reactivation_authority([]),
+        writer_roles=_roles(fixture),
+        control_schema=schema,
+    )
+    assert preview["candidate_id"] == copy_target.candidate_id
+    async with connection.transaction():
+        queued = await enqueue_registry_source_rollback_publication(
+            connection,
+            {
+                "operation": "publish_source_rollback",
+                "preview_request_id": str(request_id),
+                "candidate_sha256": preview["candidate_sha256"],
+                "expected_serving_generation": source_operation["expected_head"],
+                "expected_approved_revision": source_operation["approved_revision"],
+                "reason": "Publish reviewed retained source",
+                "idempotency_key": uuid4().hex,
+            },
+            actor,
+            session_token_sha256="a" * 64,
+            control_schema=schema,
+        )
+        lease = await claim_registry_publication_request(
+            connection, operation_family="publication", request_id=UUID(queued["request_id"]), control_schema=schema
+        )
+    return await complete_queued_registry_source_rollback_publication(
+        connection,
+        lease["request_id"],
+        lease["lease_id"],
+        authorize=_reactivation_authority([]),
+        writer_roles=_roles(fixture),
+        control_schema=schema,
     )
 
 
@@ -942,7 +1040,9 @@ async def test_initial_admitted_recipe_recomposes_from_retained_manifest(initial
         )
         copy_targets.append(second_target)
         candidate = await _initial_candidate(fixture, second_target)
-        assert verify_initial_source_office_receipt(candidate) is None
+        summary = verify_initial_source_office_receipt(candidate)
+        assert (summary["recipe_count"], summary["office_rows"], summary["page_count"]) == (1, 2, 1)
+        assert summary["approved_revision"] == seed.revision
         assert (
             candidate["source_recipes_json"] == (await _initial_candidate(fixture, first_target))["source_recipes_json"]
         )
@@ -1095,7 +1195,7 @@ async def rollback_composition(initial_composition, replacement_aca_source):
     try:
         seed, first, second = await _rollback_source_versions(fixture, replacement_aca_source, copy_targets, requests)
         revision = await _approve_rollback_manual_office(fixture, seed)
-        request_id = uuid4()
+        request_id = await _reviewed_source_rollback_request(fixture, first, revision, second.generation_id)
         requests.append(request_id)
         async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
             approved = await pin_approved_membership_source(
@@ -1125,6 +1225,34 @@ async def rollback_composition(initial_composition, replacement_aca_source):
     finally:
         for request_id in requests:
             await _remove_candidates(fixture, copy_targets, request_id)
+
+
+async def _reviewed_source_rollback_request(fixture, source_manifest, revision, expected_head):
+    command_by_name = {
+        "operation": "prepare_source_rollback",
+        "target_generation": source_manifest.generation_id,
+        "expected_serving_generation": expected_head,
+        "expected_approved_revision": revision,
+        "reason": "Review retained source edition",
+        "idempotency_key": uuid4().hex,
+    }
+    async with fixture.connection.transaction():
+        queued = await enqueue_registry_source_rollback_preview(
+            fixture.connection,
+            command_by_name,
+            RegistryActor("platform_admin", uuid4(), "system"),
+            session_token_sha256="a" * 64,
+            control_schema=fixture.control_schema,
+        )
+        request_id = UUID(queued["request_id"])
+        lease = await claim_registry_publication_request(
+            fixture.connection,
+            operation_family="publication",
+            request_id=request_id,
+            control_schema=fixture.control_schema,
+        )
+    assert lease["request_id"] == request_id and lease["state"] == "running"
+    return request_id
 
 
 async def _rollback_members(connection, manifest):
@@ -1199,6 +1327,10 @@ async def test_selected_old_aca_source_keeps_latest_manual_and_pinned_readers(ro
                 candidate["source_recipes_json"]
                 == (await _initial_candidate(fixture, history.copy_targets[0]))["source_recipes_json"]
             )
+            assert await compose_registry_membership_candidate(fixture.connection, **history.arguments_by_name) == (
+                copy_target,
+                addresses,
+            )
             await _publish_composition_target(fixture, copy_target, addresses)
             assert await resolve_network_serving_manifest(reader, control_schema=fixture.control_schema) == pinned
             assert await _rollback_members(reader, pinned) == before
@@ -1208,10 +1340,6 @@ async def test_selected_old_aca_source_keeps_latest_manual_and_pinned_readers(ro
             assert current.generation_id > history.second.generation_id > history.first.generation_id
             assert current.approved_custom_revision == history.revision
             await _assert_rollback_source_and_manual(history, current)
-        assert await compose_registry_membership_candidate(fixture.connection, **history.arguments_by_name) == (
-            copy_target,
-            addresses,
-        )
     finally:
         await reader.close()
 
@@ -1261,13 +1389,27 @@ async def test_source_rollback_interruption_resumes_exact_batches(rollback_compo
 
 @pytest.mark.parametrize("drift", ["head", "approval"])
 async def test_source_rollback_rechecks_publication_head_and_latest_approval(rollback_composition, drift):
-    from process.network_membership_publication import NetworkPublicationError
+    """Reviewed rollback refuses stale head or approval pins before publication."""
+    from process.registry_approval_store import RegistryApprovalConflict
 
     history = rollback_composition
     fixture = history.fixture
     arguments_by_name = dict(history.arguments_by_name)
     if drift == "head":
         arguments_by_name["expected_head"] = history.first.generation_id
+        with pytest.raises(ValueError, match="registry_source_rollback_operation_conflict"):
+            await compose_registry_membership_candidate(fixture.connection, **arguments_by_name)
+        assert not await fixture.connection.fetchval(
+            f'SELECT EXISTS(SELECT FROM "{fixture.control_schema}".network_membership_candidate WHERE dataset_id=$1)',
+            uuid5(arguments_by_name["request_id"], "dataset"),
+        )
+        assert (
+            await fixture.connection.fetchval(
+                f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
+            )
+            == history.second.generation_id
+        )
+        return
     copy_target, addresses = await compose_registry_membership_candidate(fixture.connection, **arguments_by_name)
     history.copy_targets.append(copy_target)
     if drift == "approval":
@@ -1278,8 +1420,7 @@ async def test_source_rollback_rechecks_publication_head_and_latest_approval(rol
             await _command(fixture.connection, fixture.control_schema, draft),
             history.seed.actor,
         )
-    expected_error = "Expected serving head changed" if drift == "head" else "Approved custom revision changed"
-    with pytest.raises(NetworkPublicationError, match=expected_error):
+    with pytest.raises(RegistryApprovalConflict, match="registry_source_rollback_revision_conflict"):
         await _publish_composition_target(fixture, copy_target, addresses)
     assert (
         await fixture.connection.fetchval(
@@ -1291,32 +1432,41 @@ async def test_source_rollback_rechecks_publication_head_and_latest_approval(rol
         f'SELECT EXISTS(SELECT 1 FROM "{fixture.control_schema}".network_serving_manifest WHERE candidate_id=$1)',
         UUID(copy_target.candidate_id),
     )
-    if drift == "approval":
-        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
-            approved = await pin_approved_membership_source(
-                fixture.connection,
-                approved_revision=approval["approved_revision"],
-                control_schema=fixture.control_schema,
-            )
-        fixture.composition_ids.append(uuid5(arguments_by_name["request_id"], "address:" + approved.generation_id))
-        retry_arguments_by_name = {
-            **arguments_by_name,
-            "approved_revision": approved.approved_revision,
-        }
-        retry_target, retry_addresses = await compose_registry_membership_candidate(
-            fixture.connection, **retry_arguments_by_name
+    await _retry_source_rollback_after_approval(history, copy_target, approval["approved_revision"])
+
+
+async def _retry_source_rollback_after_approval(history, copy_target, revision):
+    """Recompose the newly reviewed approval without changing retained source facts."""
+    fixture = history.fixture
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        approved = await pin_approved_membership_source(
+            fixture.connection,
+            approved_revision=revision,
+            control_schema=fixture.control_schema,
         )
-        history.copy_targets.append(retry_target)
-        assert retry_target != copy_target
-        assert (await _initial_candidate(fixture, retry_target))["source_recipes_json"] == (
-            await _initial_candidate(fixture, history.copy_targets[0])
-        )["source_recipes_json"]
-        await _publish_composition_target(fixture, retry_target, retry_addresses)
-        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
-            current = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
-            assert current.approved_custom_revision == approved.approved_revision > history.revision
-            latest_history = SimpleNamespace(**{**vars(history), "revision": approved.approved_revision})
-            await _assert_rollback_source_and_manual(latest_history, current)
+    retry_request = await _reviewed_source_rollback_request(
+        fixture, history.first, approved.approved_revision, history.second.generation_id
+    )
+    fixture.composition_ids.append(uuid5(retry_request, "address:" + approved.generation_id))
+    retry_arguments_by_name = {
+        **history.arguments_by_name,
+        "request_id": retry_request,
+        "approved_revision": approved.approved_revision,
+    }
+    retry_target, retry_addresses = await compose_registry_membership_candidate(
+        fixture.connection, **retry_arguments_by_name
+    )
+    history.copy_targets.append(retry_target)
+    assert retry_target != copy_target
+    assert (await _initial_candidate(fixture, retry_target))["source_recipes_json"] == (
+        await _initial_candidate(fixture, history.copy_targets[0])
+    )["source_recipes_json"]
+    await _publish_composition_target(fixture, retry_target, retry_addresses)
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        current = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
+        assert current.approved_custom_revision == approved.approved_revision > history.revision
+        latest_history = SimpleNamespace(**{**vars(history), "revision": approved.approved_revision})
+        await _assert_rollback_source_and_manual(latest_history, current)
 
 
 async def _approved_roundtrip_organization(fixture):
@@ -1425,7 +1575,7 @@ async def test_source_roundtrip_keeps_approved_organization_override_exact_membe
     try:
         seed, first, second = await _rollback_source_versions(fixture, replacement_aca_source, copy_targets, requests)
         revision = await _approve_rollback_manual_office(fixture, seed)
-        request_id = uuid4()
+        request_id = await _reviewed_source_rollback_request(fixture, first, revision, second.generation_id)
         requests.append(request_id)
         async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
             approved = await pin_approved_membership_source(
@@ -1515,7 +1665,11 @@ async def _approve_composition_intent(fixture, actor, command):
 
 async def _compose_intent_candidate(context, revision, source_manifest, head, recipes=()):
     fixture, copy_targets, requests, network_id = context
-    request = uuid4()
+    request = (
+        await _reviewed_source_rollback_request(fixture, source_manifest, revision, head)
+        if source_manifest.generation_id != head
+        else uuid4()
+    )
     requests.append(request)
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         approved = await pin_approved_membership_source(
@@ -1854,3 +2008,126 @@ async def test_command_stage_native_accounting_materialization_and_exact_cleanup
             await fixture.connection.execute(f'DROP TABLE pg_temp."{source_stage.table_name}"')
     finally:
         await _remove_candidates(fixture, [copy_target], request_id)
+
+
+async def test_reviewed_subjects_require_exact_endpoint_coordinates(reviewed_fhir_source):
+    source_fixture, _, networks, _, coordinates, approved = reviewed_fhir_source
+    connection, schema, _, _ = source_fixture
+    family_coordinates = tuple(coordinates.sql_parameters[index] for index in (0, 1, 2, 4))
+    second = replace(coordinates, dataset_id="other-endpoint-edition")
+    async with connection.transaction(isolation="repeatable_read"):
+        await connection.execute(
+            "CREATE TEMP TABLE subject_inventory(side text,slot text,family jsonb,coordinates jsonb) ON COMMIT DROP"
+        )
+        await connection.execute(
+            "CREATE TEMP TABLE selected_subjects(network_id integer,slot text,organization_id text,supported boolean) ON COMMIT DROP"
+        )
+        for slot, edition in (("endpoint-a", coordinates), ("endpoint-b", second)):
+            await connection.execute(
+                "INSERT INTO subject_inventory VALUES('previous',$1,$2::jsonb,$3::jsonb)",
+                slot,
+                json.dumps(family_coordinates),
+                json.dumps(edition.sql_parameters),
+            )
+        await preservation._subjects(
+            connection,
+            "pg_temp.subject_inventory",
+            '"' + schema + '"',
+            approved.approved_revision,
+            "pg_temp.selected_subjects",
+            "previous",
+            historical=True,
+        )
+        assert [tuple(subject) for subject in await connection.fetch("SELECT * FROM selected_subjects")] == [
+            (int(networks[0]["record_id"]), "endpoint-a", "network-one", True)
+        ]
+        # An orphan edition cannot be assigned to either same-family endpoint.
+        await connection.execute("TRUNCATE selected_subjects")
+        await connection.execute(
+            "UPDATE subject_inventory SET coordinates=jsonb_set(coordinates,'{3}','\"later-edition\"')"
+        )
+        await preservation._subjects(
+            connection,
+            "pg_temp.subject_inventory",
+            '"' + schema + '"',
+            approved.approved_revision,
+            "pg_temp.selected_subjects",
+            "previous",
+            historical=True,
+        )
+        assert await connection.fetchval("SELECT bool_and(slot IS NULL) FROM selected_subjects")
+        await _require_unknown_endpoint_refusal(
+            connection, schema, approved.approved_revision, int(networks[0]["record_id"])
+        )
+
+
+async def _require_unknown_endpoint_refusal(connection, schema, revision, network_id):
+    """An unresolved active continuation must refuse before disappearance filtering can omit it."""
+    await connection.execute("CREATE TEMP TABLE original_subjects(LIKE selected_subjects) ON COMMIT DROP")
+    await connection.execute("CREATE TEMP TABLE current_subjects(LIKE selected_subjects) ON COMMIT DROP")
+    await connection.execute(
+        "CREATE TEMP TABLE identity_coverage(side text,slot text,organization_id text,payload_hash text) ON COMMIT DROP"
+    )
+    await connection.execute("CREATE TEMP TABLE prior_raw(network_id integer) ON COMMIT DROP")
+    await connection.execute("INSERT INTO prior_raw VALUES($1)", network_id)
+    await connection.execute("INSERT INTO original_subjects VALUES($1,'endpoint-a','network-one',true)", network_id)
+    await connection.execute("INSERT INTO identity_coverage VALUES('current','endpoint-b','network-one',$1)", "a" * 64)
+    relations = (
+        "pg_temp.subject_inventory",
+        "pg_temp.identity_coverage",
+        "pg_temp.original_subjects",
+        "pg_temp.current_subjects",
+        "pg_temp.selected_subjects",
+        "pg_temp.missing_networks",
+    )
+    previous = (
+        '"' + schema + '"',
+        "pg_temp.prior_raw",
+        "pg_temp.prior_raw",
+        "SELECT 0 AS network_id WHERE false",
+        "SELECT network_id FROM pg_temp.prior_raw WHERE false",
+    )
+    with pytest.raises(preservation.FHIRServingPreservationError, match="identity_ambiguous"):
+        await preservation._select_missing_networks(connection, relations, previous, revision, schema)
+
+
+@pytest.mark.parametrize("change", ["first_line", "entity_id", "canonical_network_ids"])
+async def test_address_carry_refuses_version_conflict_without_changes(serving_schema, change):
+    connection = serving_schema[0]
+    async with connection.transaction(isolation="repeatable_read"):
+        await connection.execute("""CREATE TEMP TABLE old_addresses(location_key text PRIMARY KEY,
+          entity_type text,entity_id text,first_line text,canonical_network_ids integer[]) ON COMMIT DROP""")
+        await connection.execute(
+            "CREATE TEMP TABLE entity_address_unified(LIKE old_addresses INCLUDING ALL) ON COMMIT DROP"
+        )
+        await connection.execute("""CREATE TEMP TABLE old_bindings(provider_system text,provider_id text,
+          location_id uuid,location_key text,entity_type text,entity_id text,
+          PRIMARY KEY(provider_system,provider_id,location_id)) ON COMMIT DROP""")
+        await connection.execute(
+            "CREATE TEMP TABLE provider_location_binding(LIKE old_bindings INCLUDING ALL) ON COMMIT DROP"
+        )
+        await connection.execute(
+            "INSERT INTO old_addresses VALUES($1,'npi','1000000491','Example Street',ARRAY[1])", "a" * 64
+        )
+        await connection.execute(
+            "INSERT INTO old_bindings VALUES('npi','1000000491',$1,$2,'npi','1000000491')", UUID(int=1), "a" * 64
+        )
+        await connection.execute("INSERT INTO entity_address_unified SELECT * FROM old_addresses")
+        await connection.execute("INSERT INTO provider_location_binding SELECT * FROM old_bindings")
+        substitutions_by_field = {
+            "first_line": "first_line='Changed Street'",
+            "entity_id": "entity_id='1000000004'",
+            "canonical_network_ids": "canonical_network_ids=ARRAY[2]",
+        }
+        await connection.execute("UPDATE entity_address_unified SET " + substitutions_by_field[change])
+        before = await connection.fetchval("SELECT to_jsonb(address)::text FROM entity_address_unified address")
+        proof = receipt() | {"carried_rows": 1, "binding_rows": 1, "address_rows": 1}
+        selected = preservation.FHIRServingPreservation(
+            None, "unused", "unused", "SELECT * FROM pg_temp.old_bindings", "SELECT * FROM pg_temp.old_addresses", proof
+        )
+        if change == "canonical_network_ids":
+            assert await preservation.carry_fhir_preservation_addresses(connection, selected, "pg_temp", writing=True)
+        else:
+            with pytest.raises(preservation.FHIRServingPreservationError, match="address_version_conflict"):
+                await preservation.carry_fhir_preservation_addresses(connection, selected, "pg_temp", writing=True)
+        assert await connection.fetchval("SELECT to_jsonb(address)::text FROM entity_address_unified address") == before

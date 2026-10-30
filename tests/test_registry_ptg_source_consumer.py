@@ -166,7 +166,7 @@ async def test_ptg_attempt_prepares_independent_addresses_before_fresh_compositi
     monkeypatch.setattr(consumer, "_replacement_selection", AsyncMock(return_value=(7, approved, pin, (actual,))))
     monkeypatch.setattr(RegistryPublicationPTGRuntime, "compose", compose)
     ready = AsyncMock()
-    monkeypatch.setattr(consumer, "prepare_network_candidate", ready)
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", ready)
     monkeypatch.setattr(consumer, "_notice", AsyncMock(return_value=actual))
     monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock(return_value=approved))
     monkeypatch.setattr(consumer, "require_selected_ptg_office_recipes", AsyncMock())
@@ -446,7 +446,7 @@ async def _prepared_ptg_attempt(monkeypatch, changed, sealing):
         prepare_address_sources=None,
     )
     prepare, publish = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(consumer, "prepare_network_candidate", prepare)
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
     monkeypatch.setattr(consumer, "publish_network_candidate", publish)
     monkeypatch.setattr(consumer, "_notice", AsyncMock(return_value=old if changed else selected))
     connection, phase_state, writes = _ptg_attempt_checkpoint(monkeypatch, copy_target, approved, sealing, cfg)

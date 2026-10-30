@@ -9,7 +9,11 @@ from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
-from process.registry_company_approval_fence import _source_engine
+from process.registry_company_approval_fence import (
+    _source_engine,
+    registry_company_approval_transaction,
+    require_registry_company_approval_fence,
+)
 from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
 from process.registry_source_observation_store import _namespace
@@ -153,3 +157,39 @@ class RegistryPublicationPTGRuntime:
             "address_sources": replace(address_sources, office_scope_store=self.store, office_read_budget=read_budget),
         }
         return await compose_registry_membership_candidate(self.sessions, **composition_by_name)
+
+    async def prepare(self, connection, copy_target, address_source, *, writer_roles, control_schema):
+        """Keep native office authority on the actual preparation backend and snapshot."""
+        from process.network_membership_pipeline import (
+            _close_raw_phase,
+            _compact_selection,
+            _inspect_candidate,
+            _prepare_phase_snapshot,
+            prepare_network_candidate,
+        )
+
+        if connection.is_in_transaction() or (self.store.control_schema or control_schema) != control_schema:
+            raise ValueError("registry_publication_ptg_runtime_invalid")
+        await self._same_execution_database(connection, control_schema)
+        candidate = await _inspect_candidate(connection, copy_target, control_schema)
+        if not _compact_selection(candidate, None):
+            return await prepare_network_candidate(
+                connection, copy_target, address_source, **writer_roles, control_schema=control_schema
+            )
+        if candidate["state"] == "published":
+            return candidate
+        await _close_raw_phase(connection, copy_target, writer_roles, control_schema)
+        async with registry_company_approval_transaction(self.sessions, control_schema=control_schema) as session:
+            await require_registry_company_approval_fence(session, control_schema)
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
+            budget = RegistryPTGGraphReadBudget(**dict(zip(_LIMIT_FIELDS, self._limits, strict=True)))
+            await _prepare_phase_snapshot(
+                driver,
+                copy_target,
+                address_source,
+                writer_roles,
+                control_schema,
+                compact=True,
+                office_authority=(session, self.store, budget),
+            )
+        return await _inspect_candidate(connection, copy_target, control_schema)

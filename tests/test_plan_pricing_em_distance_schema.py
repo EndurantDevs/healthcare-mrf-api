@@ -52,7 +52,13 @@ def _assert_registry_migration_chain():
     alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
     script = ScriptDirectory.from_config(alembic_config)
-    assert script.get_heads() == ["20261025020000_company_affiliation_join"]
+    assert script.get_heads() == ["20261029010000_registry_source_inventory"]
+    assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
+        "20261028020000_registry_membership_refresh"
+    )
+    assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (
+        "20261028010000_registry_fhir_catalog"
+    )
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"

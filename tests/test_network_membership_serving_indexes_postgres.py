@@ -2,6 +2,7 @@
 """Native complete serving profile on the model's synthetic unified address source."""
 
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import replace
@@ -15,7 +16,12 @@ from sqlalchemy.schema import CreateColumn
 from db.models import EntityAddressUnified
 from process.entity_address_unified import _post_publish_index_plan
 from process.network_membership_candidate_indexes import prepare_network_candidate_indexes
-from process.network_membership_serving_indexes import NetworkServingIndexesError, prepare_network_serving_indexes
+from process.network_membership_serving_indexes import (
+    NetworkServingIndexesError,
+    _index_digest,
+    _serving_plan,
+    prepare_network_serving_indexes,
+)
 from tests.test_network_address_projection_postgres import projection_db
 from tests.test_network_membership_candidate_indexes_postgres import _project_validated
 from tests.test_network_membership_validation_postgres import validation_db
@@ -139,7 +145,7 @@ async def test_complete_profile_and_native_replay(serving_indexes_db):
         await asyncio.sleep(0)
         print({"serving_build_roundtrips": len(logged_queries)})
         build_count = len(logged_queries)
-        assert build_count == 49
+        assert build_count == 52
         assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
     indexes = await _indexes(fixture)
     plan, _ = _post_publish_index_plan(f'"{fixture.copy_target.schema_name}"', "serving", build_concurrently=False)
@@ -162,7 +168,7 @@ async def test_complete_profile_and_native_replay(serving_indexes_db):
         assert await _prepare(fixture) == readiness
         await asyncio.sleep(0)
         print({"serving_replay_roundtrips": len(logged_queries), "build_roundtrips": build_count})
-        assert len(logged_queries) == 21
+        assert len(logged_queries) == 24
         assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
         _assert_only_parity_temporary_ddl(logged_queries)
     assert await _state(fixture) == state and await _indexes(fixture) == indexes
@@ -360,7 +366,7 @@ async def test_large_candidate_uses_bounded_parity_statements(serving_indexes_db
         logged_queries.clear()
         await _prepare(fixture)
         await asyncio.sleep(0)
-        assert len(logged_queries) == 57
+        assert len(logged_queries) == 60
         assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
         assert len([entry for entry in logged_queries if "WITH source AS (" in entry.query]) == 5
     assert (
@@ -435,6 +441,8 @@ async def test_invalid_native_index_replay_rejected(serving_indexes_db):
 @pytest.mark.asyncio
 async def test_search_path_is_restored_and_replay_digest_stable(serving_indexes_db):
     fixture = serving_indexes_db
+    schema = fixture.copy_target.schema_name
+    index_plan = _serving_plan(schema)
     original_search_path = await fixture.connection.fetchval("SHOW search_path")
     try:
         await fixture.connection.execute(
@@ -444,15 +452,42 @@ async def test_search_path_is_restored_and_replay_digest_stable(serving_indexes_
         async with fixture.connection.transaction():
             readiness = await _prepare(fixture)
             assert await fixture.connection.fetchval("SHOW search_path") == caller_search_path
+            assert await _index_digest(fixture.connection, schema, index_plan) == readiness["index_definition_sha256"]
+            assert await fixture.connection.fetchval("SHOW search_path") == caller_search_path
         await fixture.connection.execute(
             "SELECT set_config('search_path',$1,false)", '"' + fixture.copy_target.schema_name + '",pg_catalog,public'
         )
         alternate_search_path = await fixture.connection.fetchval("SHOW search_path")
         async with fixture.connection.transaction():
+            assert await _index_digest(fixture.connection, schema, index_plan) == readiness["index_definition_sha256"]
             assert await _prepare(fixture) == readiness
             assert await fixture.connection.fetchval("SHOW search_path") == alternate_search_path
             with pytest.raises(NetworkServingIndexesError, match="ownership scope"):
                 await _prepare(fixture, copy_target=replace(fixture.copy_target, producer_id=str(uuid4())))
             assert await fixture.connection.fetchval("SHOW search_path") == alternate_search_path
+        await fixture.connection.execute("SELECT set_config('search_path','pg_catalog',false)")
+        async with fixture.connection.transaction():
+            ambient = await fixture.connection.fetch(
+                "SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid=to_regclass($1)",
+                f'"{schema}".entity_address_unified',
+            )
+            ambient_digest = hashlib.sha256(
+                json.dumps(
+                    sorted(definition_record[0] for definition_record in ambient),
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            assert ambient_digest != readiness["index_definition_sha256"]
+            assert await _index_digest(fixture.connection, schema, index_plan) == readiness["index_definition_sha256"]
+            assert await fixture.connection.fetchval("SHOW search_path") == "pg_catalog"
+        await fixture.connection.execute(
+            f'ALTER INDEX "{fixture.copy_target.schema_name}".entity_address_unified_idx_npi SET (fillfactor=75)'
+        )
+        async with fixture.connection.transaction():
+            assert await _index_digest(fixture.connection, schema, index_plan) != readiness["index_definition_sha256"]
+            with pytest.raises(NetworkServingIndexesError, match="native index definitions changed"):
+                await _prepare(fixture)
+            assert await fixture.connection.fetchval("SHOW search_path") == "pg_catalog"
     finally:
         await fixture.connection.execute("SELECT set_config('search_path',$1,false)", original_search_path)

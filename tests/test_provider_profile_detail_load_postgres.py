@@ -62,7 +62,7 @@ class _Measurements:
 
     def install(self, monkeypatch):
         read_snapshot = npi_api.provider_profile_read_snapshot
-        lock_relations = snapshot._lock_serving_relations
+        inventory_relations = snapshot._inventory_serving_relations
         prelock = native._lock_cms_doctors_publication
         apply_stage = native._apply_cms_doctors_stage
 
@@ -82,14 +82,14 @@ class _Measurements:
                 if sample_by_field is not None:
                     sample_by_field["transaction_ms"] = round((perf_counter() - started) * 1000, 3)
 
-        async def measured_locks(*args, **kwargs):
+        async def measured_inventory(*args, **kwargs):
             started = perf_counter()
-            result = await lock_relations(*args, **kwargs)
+            result = await inventory_relations(*args, **kwargs)
             sample_by_field = self.request.get()
             if sample_by_field is not None:
-                assert len(result) == 57 and all(result.values())
+                assert len(result) == 59 and all(result.values())
                 sample_by_field["relations"] = len(result)
-                sample_by_field["lock_ms"] = round((perf_counter() - started) * 1000, 3)
+                sample_by_field["inventory_ms"] = round((perf_counter() - started) * 1000, 3)
             return result
 
         async def measured_prelock(*args, **kwargs):
@@ -112,7 +112,7 @@ class _Measurements:
             return result
 
         monkeypatch.setattr(npi_api, "provider_profile_read_snapshot", measured_snapshot)
-        monkeypatch.setattr(snapshot, "_lock_serving_relations", measured_locks)
+        monkeypatch.setattr(snapshot, "_inventory_serving_relations", measured_inventory)
         monkeypatch.setattr(native, "_lock_cms_doctors_publication", measured_prelock)
         monkeypatch.setattr(native, "_apply_cms_doctors_stage", measured_apply)
 
@@ -261,15 +261,19 @@ def _write_receipt(tmp_path, fixture, measurements, before, publication_by_field
         "cache_enabled": cache_enabled,
         "reader_count": 3,
         "cadence": "continuous; no sleeps or quiet windows",
-        "relation_count": 57,
+        "relation_count": 59,
         "before_authority": asdict(before),
         "npi_identity": fixture.npi_identity,
         "publication": publication_by_field,
         "attempts": measurements.attempts,
         "requests": measurements.requests,
         "latency_ms": _distribution([sample_by_field["latency_ms"] for sample_by_field in measurements.requests]),
-        "snapshot_lock_ms": _distribution(
-            [sample_by_field["lock_ms"] for sample_by_field in measurements.requests if "lock_ms" in sample_by_field]
+        "snapshot_inventory_ms": _distribution(
+            [
+                sample_by_field["inventory_ms"]
+                for sample_by_field in measurements.requests
+                if "inventory_ms" in sample_by_field
+            ]
         ),
         "snapshot_transaction_ms": _distribution(
             [sample_by_field["transaction_ms"] for sample_by_field in measurements.requests]
@@ -282,7 +286,7 @@ def _write_receipt(tmp_path, fixture, measurements, before, publication_by_field
 def _assert_publication(measurements, publication_by_field, before, after, stages):
     """Require a committed new native OID family and coherent successful reads on both sides."""
     assert all(
-        not sample_by_field.get("error") and sample_by_field.get("relations") == 57
+        not sample_by_field.get("error") and sample_by_field.get("relations") == 59
         for sample_by_field in measurements.requests
     )
     assert "error" not in publication_by_field, publication_by_field

@@ -292,6 +292,8 @@ def test_worker_registry_exposes_shared_and_finish_workers():
     assert by_importer["claims-procedures"]["worker_class"] == "process.ClaimsPricing"
     assert by_importer["entity-address-unified"]["worker_class"] == "process.EntityAddressUnified"
     assert by_importer["provider-directory-fhir"]["worker_class"] == "process.ProviderDirectoryFHIR"
+    assert by_importer["registry-fhir-catalog-sync"]["worker_class"] == "process.RegistryFHIRCatalogSync"
+    assert by_importer["registry-publication-worker"]["worker_class"] == "process.PTGCandidateAudit"
     assert by_importer["florida-mqa-profile"]["worker_class"] == "process.FloridaMQAProfile"
     assert by_importer["ms-drg"]["worker_class"] == "process.MSDRG"
     assert by_importer["terminology-synonyms"]["worker_class"] == "process.TerminologySynonyms"

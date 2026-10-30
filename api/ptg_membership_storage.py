@@ -3,15 +3,20 @@
 
 import base64
 import re
+from contextlib import asynccontextmanager, nullcontext
 from uuid import UUID
 
+from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read, install_network_read_inventory, network_read_name_inventory
 from api.ptg_membership_contract import CONTRACT, SPEC, digest
 from process import reference_family_archive as native
 from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
+from process.network_compact_layout import CompactAddressRelation
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
+from process.registry_ptg_published_provisioning import LOCK_COLUMN
 
 
 def attachment_name(identity):
@@ -21,6 +26,134 @@ def attachment_name(identity):
 
 def _attachment_for_digest(key):
     return "pm_" + base64.b32encode(bytes.fromhex(key)).decode("ascii").lower().rstrip("=")
+
+
+async def _api_read_snapshot(session):
+    """Use only the existing native read-only snapshot, never another connection."""
+    try:
+        transaction = session.get_transaction()
+        if session.in_transaction() is not True or transaction is None:
+            raise ValueError
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        backend_pid = driver.get_server_pid()
+        if driver.is_in_transaction() is not True or type(backend_pid) is not int or not 0 < backend_pid <= 2147483647:
+            raise ValueError
+        modes = (
+            await execute_network_read(
+                session,
+                text("SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"),
+            )
+        ).one()
+        if driver.get_server_pid() != backend_pid or driver.is_in_transaction() is not True:
+            raise ValueError
+        if session.get_transaction() is not transaction or tuple(modes) not in (
+            ("repeatable read", "on"),
+            ("serializable", "on"),
+        ):
+            raise ValueError
+    except Exception as error:
+        raise PTG2ManifestArtifactError("capability API read snapshot is unavailable") from error
+    return driver, transaction, backend_pid
+
+
+async def _read_metadata(session, statement, *, api_read=False):
+    if api_read:
+        return await execute_network_read(session, statement)
+    return await session.execute(statement)
+
+
+async def _require_api_continuity(session, driver, transaction, backend_pid):
+    """Refuse a changed transaction or backend before capability metadata escapes."""
+    try:
+        actual_driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        if (
+            session.in_transaction() is not True
+            or session.get_transaction() is not transaction
+            or actual_driver is not driver
+            or driver.get_server_pid() != backend_pid
+            or driver.is_in_transaction() is not True
+        ):
+            raise ValueError
+    except Exception as error:
+        raise ServiceUnavailable("capability read transaction changed") from error
+
+
+@asynccontextmanager
+async def _api_storage_read(session, ownership, driver, transaction, backend_pid):
+    """Guard authenticated immutable heaps; attachment views are metadata only."""
+    try:
+        relations = tuple(
+            CompactAddressRelation(ownership.schema_name, name, oid) for name, oid in ownership.relation_oids
+        )
+        relations = (*relations, await _api_source_pin_relation(session))
+        await _require_api_continuity(session, driver, transaction, backend_pid)
+        with network_read_name_inventory(driver, relations):
+            yield
+            await _require_api_continuity(session, driver, transaction, backend_pid)
+            await install_network_read_inventory(session, relations, only_relations=relations)
+            await _require_api_continuity(session, driver, transaction, backend_pid)
+    except ServiceUnavailable as error:
+        raise PTG2ManifestArtifactError("capability API storage identity changed") from error
+
+
+async def _api_source_pin_relation(session):
+    """Pin current retention control metadata; this establishes no Source custody."""
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    catalog = (
+        (
+            await execute_network_read(
+                session,
+                text("""SELECT d.oid::bigint AS database_oid,
+      n.oid::bigint AS schema_oid,c.oid::bigint AS table_oid,c.relkind::text,c.relpersistence::text,
+      c.relrowsecurity,c.relforcerowsecurity,c.relispartition,
+      c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap') AS heap,
+      EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
+      EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) AS rules,
+      current_user=session_user AND NOT(r.rolsuper OR r.rolcreatedb OR r.rolcreaterole
+        OR r.rolreplication OR r.rolbypassrls) AND NOT pg_catalog.pg_has_role(r.oid,c.relowner,'SET')
+        AND NOT pg_catalog.has_schema_privilege(r.oid,n.oid,'CREATE')
+        AND pg_catalog.has_table_privilege(r.oid,c.oid,'SELECT')
+        AND NOT pg_catalog.has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+        AND NOT pg_catalog.has_any_column_privilege(r.oid,c.oid,'INSERT,REFERENCES') AS ordinary_reader,
+      ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a WHERE a.attrelid=c.oid
+        AND a.attnum>0 AND NOT a.attisdropped AND pg_catalog.has_column_privilege(r.oid,c.oid,a.attnum,'UPDATE')
+        ORDER BY a.attname) AS column_updates,
+      EXISTS(SELECT FROM pg_catalog.pg_attribute a WHERE a.attrelid=c.oid AND a.attname=:lock_column
+        AND NOT a.attisdropped AND a.attnotnull AND a.atttypid='pg_catalog.int2'::regtype
+        AND EXISTS(SELECT FROM pg_catalog.pg_constraint k WHERE k.conrelid=c.oid AND k.contype='c'
+          AND k.convalidated AND k.conenforced AND k.conkey=ARRAY[a.attnum]::smallint[]
+          AND pg_catalog.regexp_replace(pg_catalog.pg_get_expr(k.conbin,k.conrelid),'[()\\s]','','g')=:lock_expression))
+        AS immutable_read_lock
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+      JOIN pg_catalog.pg_roles r ON r.rolname=current_user CROSS JOIN pg_catalog.pg_database d
+      WHERE n.nspname=:schema AND c.relname='ptg2_snapshot_pin' AND d.datname=current_database()"""),
+                {"schema": PTG2_SCHEMA, "lock_column": LOCK_COLUMN, "lock_expression": LOCK_COLUMN + "=0"},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if (
+        catalog is None
+        or any(
+            type(catalog[field]) is not int or not 0 < catalog[field] < 2**32
+            for field in ("database_oid", "schema_oid", "table_oid")
+        )
+        or catalog["relkind"] != "r"
+        or catalog["relpersistence"] != "p"
+        or catalog["heap"] is not True
+        or catalog["ordinary_reader"] is not True
+        or type(catalog["column_updates"]) is not list
+        or catalog["column_updates"] not in ([], [LOCK_COLUMN])
+        or (catalog["column_updates"] and catalog["immutable_read_lock"] is not True)
+        or any(
+            catalog[field]
+            for field in ("relrowsecurity", "relforcerowsecurity", "relispartition", "inherited", "rules")
+        )
+    ):
+        raise PTG2ManifestArtifactError("capability source retention control binding is unavailable")
+    return CompactAddressRelation(PTG2_SCHEMA, "ptg2_snapshot_pin", catalog["table_oid"])
 
 
 async def protected_owner(session):
@@ -77,6 +210,26 @@ async def source_pin(session, identity, *, create=False):
     return params
 
 
+async def _api_source_pin(session, identity):
+    """Read the exact retention predicate inside the authenticated API scope."""
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    pin = _pin(identity)
+    present = (
+        await execute_network_read(
+            session,
+            text(
+                f"SELECT EXISTS(SELECT 1 FROM ONLY {native._quoted(PTG2_SCHEMA)}.ptg2_snapshot_pin "
+                "WHERE owner_type=:owner_type AND owner_id=:owner_id AND snapshot_id=:snapshot_id)"
+            ),
+            pin,
+        )
+    ).scalar_one()
+    if present is not True:
+        raise PTG2ManifestArtifactError("membership index source retention pin is missing")
+    return pin
+
+
 async def _active_view(session, identity, owner):
     name = attachment_name(identity)
     row = (
@@ -97,7 +250,7 @@ async def _active_view(session, identity, owner):
     return view_oid
 
 
-async def _attachment_storage(session, view_oid, owner):
+async def _attachment_storage(session, view_oid, owner, *, api_read=False):
     dependencies = (
         await session.execute(
             text(
@@ -120,7 +273,10 @@ async def _attachment_storage(session, view_oid, owner):
         dataset = UUID(schema[len(prefix) :])
     except ValueError as error:
         raise PTG2ManifestArtifactError("membership index namespace differs") from error
-    await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
+    if api_read is True:
+        await _api_read_snapshot(session)
+    else:
+        await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
     ownership = await native.capture_model_family_stage_ownership(session, SPEC, dataset)
     if ownership.schema_oid != schema_oid or set(ownership.relation_oids) != {
         (dependency[3], int(dependency[0])) for dependency in dependencies
@@ -130,11 +286,15 @@ async def _attachment_storage(session, view_oid, owner):
     return ownership
 
 
-async def _sealed_header(session, schema, identity):
+async def _sealed_header(session, schema, identity, *, api_read=False):
     header = (
         (
-            await session.execute(
-                text(f'SELECT identity,content_digest,counts FROM "{schema}".ptg_membership_manifest WHERE singleton=1')
+            await _read_metadata(
+                session,
+                text(
+                    f'SELECT identity,content_digest,counts FROM {"ONLY " if api_read else ""}"{schema}".ptg_membership_manifest WHERE singleton=1'
+                ),
+                api_read=api_read,
             )
         )
         .mappings()
@@ -143,12 +303,14 @@ async def _sealed_header(session, schema, identity):
     if header["identity"] != identity or re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
         raise PTG2ManifestArtifactError("membership index sealed identity differs")
     coverage_rows = [
-        dict(row)
-        for row in (
-            await session.execute(
+        dict(coverage_row)
+        for coverage_row in (
+            await _read_metadata(
+                session,
                 text(
-                    f'SELECT code_key,occurrence_count,set_count,set_digest FROM "{schema}".ptg_membership_code_coverage ORDER BY code_key'
-                )
+                    f'SELECT code_key,occurrence_count,set_count,set_digest FROM {"ONLY " if api_read else ""}"{schema}".ptg_membership_code_coverage ORDER BY code_key'
+                ),
+                api_read=api_read,
             )
         ).mappings()
     ]
@@ -157,17 +319,23 @@ async def _sealed_header(session, schema, identity):
     return dict(header)
 
 
-async def locate(session, identity):
+async def locate(session, identity, *, api_read=False):
     """Only a protected native view authorizes an active index; comments do not."""
+    if type(api_read) is not bool:
+        raise PTG2ManifestArtifactError("capability API read mode is invalid")
+    driver, transaction, backend_pid = await _api_read_snapshot(session) if api_read else (None, None, None)
     owner = await protected_owner(session)
     if owner is None:
         return None
     view_oid = await _active_view(session, identity, owner)
     if view_oid is None:
         return None
-    ownership = await _attachment_storage(session, view_oid, owner)
-    header = await _sealed_header(session, ownership.schema_name, identity)
-    pin = await source_pin(session, identity)
+    ownership = await _attachment_storage(session, view_oid, owner, **({"api_read": True} if api_read else {}))
+    async with _api_storage_read(session, ownership, driver, transaction, backend_pid) if api_read else nullcontext():
+        header = await _sealed_header(
+            session, ownership.schema_name, identity, **({"api_read": True} if api_read else {})
+        )
+        pin = await (_api_source_pin if api_read else source_pin)(session, identity)
     return ownership, header, owner, view_oid, pin
 
 

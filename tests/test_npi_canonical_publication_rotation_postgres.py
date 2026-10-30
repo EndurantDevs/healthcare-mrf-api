@@ -12,12 +12,15 @@ from typing import NamedTuple
 
 import asyncpg
 import pytest
+from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api import provider_profile_snapshot as snapshot
+from api.network_read_execution import execute_network_read
 from db.connection import Database
 from process.entity_address_cutover_contract import _ServingRelationLockTimeout
+from process.network_read_identity import NetworkReadIdentityError
 from process.npi_canonical_publication import (
     NpiCanonicalPublicationError,
     NpiCanonicalPublicationInput,
@@ -198,6 +201,18 @@ async def _drain_task(task: asyncio.Task | None) -> None:
     if not task.done():
         task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+async def _wait_for_reader(reader, entered):
+    """Surface reader setup failures instead of hiding them behind an event timeout."""
+    waiter = asyncio.create_task(entered.wait())
+    try:
+        completed, _ = await asyncio.wait((reader, waiter), timeout=3, return_when=asyncio.FIRST_COMPLETED)
+        if reader in completed:
+            await reader
+        assert waiter in completed, "Reader did not enter its serving snapshot"
+    finally:
+        await _drain_task(waiter)
 
 
 async def _assert_committed_rotation(
@@ -497,7 +512,10 @@ async def _read_npi_snapshot(fixture, *, entered=None, release=None):
     ) as session:
         oids = tuple(snapshot._SNAPSHOT.get()[f"{fixture.schema}.{name}"] for name in CANONICAL_TABLES)
         counts = tuple(
-            [await session.scalar(text(f'SELECT count(*) FROM "{fixture.schema}".{name}')) for name in CANONICAL_TABLES]
+            [
+                (await execute_network_read(session, text(f'SELECT count(*) FROM "{fixture.schema}".{name}'))).scalar()
+                for name in CANONICAL_TABLES
+            ]
         )
         if entered is not None:
             entered.set()
@@ -528,10 +546,19 @@ async def test_npi_rotation_completes_with_continuous_snapshot_readers(tmp_path,
         tasks = []
 
         async def read():
-            after_count = 0
+            after_count = refused_count = 0
             while after_count < 3:
-                after_count += finished.is_set()
-                observed_states.append(await _read_npi_snapshot(fixture))
+                is_after_publication = finished.is_set()
+                try:
+                    observed = await _read_npi_snapshot(fixture)
+                except ServiceUnavailable as error:
+                    if not isinstance(error.__cause__, NetworkReadIdentityError):
+                        raise
+                    refused_count += 1
+                    assert refused_count <= 3
+                    continue
+                observed_states.append(observed)
+                after_count += is_after_publication
                 entered.set()
 
         try:
@@ -580,7 +607,7 @@ async def test_npi_rotation_preserves_late_readers(tmp_path, monkeypatch):
             setup = await _prepare_rotation(connection, schema, tmp_path)
             await grant_profile_reader(fixture.database, schema, setup.stage_table_by_live.values())
             reader = asyncio.create_task(_read_npi_snapshot(fixture, entered=entered, release=release))
-            await asyncio.wait_for(entered.wait(), 3)
+            await _wait_for_reader(reader, entered)
             publisher = asyncio.create_task(_publish_reader_rotation(connection, schema, setup))
             pending = await pending_publisher_locks(fixture, publisher)
             assert await _read_npi_snapshot(fixture) == setup.old_state and pending

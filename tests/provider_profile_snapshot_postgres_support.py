@@ -55,6 +55,56 @@ async def grant_profile_reader(database, schema, table_names):
                 await connection.execute(text(f'GRANT SELECT ON "{schema}"."{name}" TO "{role}"'))
 
 
+async def create_directory_partitions(database, schema, *, populated=True, partition_kind="single"):
+    """Exercise directory topology using actual models under fixture administration."""
+    from db.models import (
+        ProviderDirectoryDatasetAffiliationOrganization,
+        ProviderDirectoryDatasetInsurancePlan,
+        ProviderDirectoryDatasetNetworkPlan,
+        ProviderDirectoryDatasetResource,
+    )
+
+    partition_bound = {
+        "single": "FOR VALUES IN ('fixture')",
+        "history": "FOR VALUES IN ('fixture', 'retained')",
+        "default": "DEFAULT",
+    }[partition_kind]
+    rows_by_model = (
+        (
+            ProviderDirectoryDatasetResource,
+            dict(
+                resource_type="PractitionerRole",
+                resource_id="role",
+                payload_hash="a" * 64,
+                payload_json={"resource_id": "role"},
+            ),
+        ),
+        (
+            ProviderDirectoryDatasetInsurancePlan,
+            dict(resource_id="plan", payload_hash="b" * 64, payload_json={"resource_id": "plan"}),
+        ),
+        (ProviderDirectoryDatasetNetworkPlan, dict(network_resource_id="network", insurance_plan_resource_id="plan")),
+        (
+            ProviderDirectoryDatasetAffiliationOrganization,
+            dict(participating_organization_resource_id="organization", affiliation_resource_id="affiliation"),
+        ),
+    )
+    async with database.engine.begin() as connection:
+        for model, row_by_field in rows_by_model:
+            table = model.__table__.to_metadata(MetaData(), schema=schema)
+            table.dialect_options["postgresql"]["partition_by"] = "LIST (dataset_id)"
+            await connection.run_sync(lambda sync, table=table: table.create(sync, checkfirst=False))
+            if populated:
+                await connection.execute(
+                    text(
+                        f'CREATE TABLE "{schema}"."{table.name}_leaf" PARTITION OF "{schema}"."{table.name}" '
+                        + partition_bound
+                    )
+                )
+                await connection.execute(table.insert(), dict(dataset_id="fixture", **row_by_field))
+    await grant_profile_reader(database, schema, snapshot._DIRECTORY_PARTITION_ROOTS)
+
+
 async def _cleanup_profile_reader(database, schema, role):
     """Close the Reader before revoking its exact schema grants, including renamed heaps."""
     reader = database._reader_database

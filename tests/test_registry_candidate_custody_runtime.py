@@ -459,8 +459,16 @@ def _custody_pool_creator(config, case):
 
 
 def _custody_finalizer(config, case):
-    async def finalize(connection, actual, *, control_schema, runtime_roles, authorize, pre_enrolled_only=False):
-        assert connection is case.custodian and actual is case.copy_target and not case.custodian.active
+    async def finalize(
+        connection, actual, *, control_schema, runtime_roles, authorize, pre_enrolled_only=False, **office
+    ):
+        if config.ptg is not None:
+            assert connection.driver is case.custodian and case.custodian.active
+            assert office == {"office_store": config.ptg.store, "office_read_budget": config.ptg.read_budget}
+            connection = connection.driver
+        else:
+            assert not case.custodian.active and not office
+        assert connection is case.custodian and actual is case.copy_target
         assert case.execution_pool.active and case.custody_pool.active
         assert pre_enrolled_only is case.pre_enrolled_only
         assert control_schema == config.consumer.control_schema
@@ -490,7 +498,7 @@ def _custody_verifier(config, case):
     async def verify(connection, actual, *, control_schema, required):
         assert connection is case.custodian and actual is case.copy_target and case.custodian.active
         assert control_schema == config.consumer.control_schema and required is True
-        assert case.events[-2:] == ["finalize", "verify begin"]
+        assert case.events[-2:] == ["custody release" if config.ptg is not None else "finalize", "verify begin"]
         case.events.append("verify")
         if case.outcome == "verify failure":
             raise RuntimeError("custody_verify_failed")
@@ -504,6 +512,7 @@ def _custody_verifier(config, case):
 
 
 def _runtime_custody_case(monkeypatch, config, outcome, protected_store_owner):
+    """Build real runtime callbacks around isolated native custody and preserve exact cleanup."""
     events = []
     identity_by_name = dict(
         database_name="example",
@@ -557,6 +566,7 @@ def _runtime_custody_case(monkeypatch, config, outcome, protected_store_owner):
         AsyncMock(side_effect=_custody_verifier(config, case)),
     )
     monkeypatch.setattr(foundation, "seal_network_candidate_custody", finalizer)
+    _install_custody_company_fence(monkeypatch, config, case, finalizer)
     monkeypatch.setattr(foundation, "verify_network_candidate_custody", verifier)
     completions = []
 
@@ -612,7 +622,8 @@ async def _exercise_runtime_custody_callback(
         assert not completions
         assert verifier.await_count == int(outcome in {"verify failure", "verify cancel", "mismatch"})
         assert finalizer.await_count == int(outcome != "entry")
-    assert create_pool.await_count == execution_pool.checkouts == custody_pool.checkouts == 1
+    assert create_pool.await_count == int(config.ptg is None)
+    assert execution_pool.checkouts == custody_pool.checkouts == 1
     assert execution.identity_reads == 1 and custody_pool.closes == 1
     assert events.index("custody created") < events.index("custody acquire") < events.index("custody close")
     assert events.index("q reach") < events.index("custody created")
@@ -631,11 +642,14 @@ async def test_runtime_callback_uses_one_distinct_connection_and_checks_exact_fi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("parser,factory", (WORKERS[0], WORKERS[2]))
 @pytest.mark.parametrize(
     "outcome", ("entry", "seal failure", "seal cancel", "verify failure", "verify cancel", "mismatch", "identity")
 )
-async def test_runtime_callback_failures_cancel_completion_and_close_registered_pool(monkeypatch, outcome):
-    await _exercise_runtime_custody_callback(monkeypatch, WORKERS[0][0], WORKERS[0][1], outcome)
+async def test_runtime_callback_failures_cancel_completion_and_close_registered_pool(
+    monkeypatch, parser, factory, outcome
+):
+    await _exercise_runtime_custody_callback(monkeypatch, parser, factory, outcome)
 
 
 @pytest.mark.asyncio
@@ -718,3 +732,54 @@ async def test_runtime_identity_refuses_changed_native_owner_or_original_login(d
     assert "owner.oid=ledger.relowner" in sql
     for privilege in ("MEMBER", "USAGE", "SET"):
         assert f"pg_has_role(current_user,n.nspowner,'{privilege}')" in sql
+
+
+def _install_custody_company_fence(monkeypatch, config, case, finalizer):
+    """Use the same independent custodian pool for the company-fenced test sessions."""
+    custodian, custody_pool, events = case.custodian, case.custody_pool, case.events
+    if config.ptg is not None:
+        from process import registry_company_approval_fence as fence
+
+        class Session:
+            driver = custodian
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def begin(self):
+                return custodian.transaction(isolation="repeatable_read", readonly=True)
+
+            async def connection(self, **options):
+                return self
+
+            async def execute(self, statement):
+                assert str(statement) == "SET TRANSACTION READ ONLY"
+
+            async def get_raw_connection(self):
+                return SimpleNamespace(driver_connection=custodian)
+
+        sessions = Session
+
+        def owned_sessions(actual, stack, url, *, backend_verifier=None):
+            assert backend_verifier is None
+            assert actual is config and url == config.custody_url and url != config.execution_url
+            events.append("custody created")
+            stack.push_async_callback(custody_pool.close)
+            return sessions
+
+        @asynccontextmanager
+        async def transaction(actual, *, control_schema):
+            assert actual is sessions and control_schema == config.consumer.control_schema
+            async with custody_pool.acquire(timeout=config.sql_limits.connect_timeout_seconds):
+                custodian.active = True
+                try:
+                    yield Session()
+                finally:
+                    custodian.active = False
+
+        monkeypatch.setattr(publication, "_worker_sessions", owned_sessions)
+        monkeypatch.setattr(fence, "registry_company_approval_transaction", transaction)
+        monkeypatch.setattr(foundation, "seal_network_candidate_custody_in_session", finalizer)

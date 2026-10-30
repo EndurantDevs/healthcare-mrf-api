@@ -95,6 +95,7 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
     ("get", "/registry/serving/providers"): {
         "network_ids",
         "network_generation",
+        "membership_level",
         "limit",
         "offset",
         "location_id",

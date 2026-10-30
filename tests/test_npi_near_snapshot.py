@@ -95,7 +95,7 @@ def near_snapshot(monkeypatch):
             raise RuntimeError("read unavailable")
 
     @asynccontextmanager
-    async def snapshot(_database, _schema, *, include_detail=False):
+    async def snapshot(_database, _schema, *, include_detail=True):
         assert include_detail and not state.active
         state.entered += 1
         state.active = True
@@ -118,6 +118,7 @@ def near_snapshot(monkeypatch):
         return encode(*args, **kwargs)
 
     monkeypatch.setattr(npi, "provider_profile_read_snapshot", snapshot)
+    monkeypatch.setattr(npi, "provider_geo_read_snapshot", snapshot)
     _install_near_connection(monkeypatch, check, state)
     _install_filter_readers(monkeypatch, check)
     monkeypatch.setattr(npi, "_project_provider_network_metadata", metadata)

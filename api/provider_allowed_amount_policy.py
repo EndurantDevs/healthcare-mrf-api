@@ -153,10 +153,9 @@ async def allowed_office_inputs(session):
     scope = current_network_address_scope()
     if scope is None:
         return None
-    from process.network_em_provider_inputs import resolve_em_provider_inputs
+    from process.network_em_provider_inputs import resolve_em_provider_inputs_in_session
 
-    driver = (await (await session.connection()).get_raw_connection()).driver_connection
-    return await resolve_em_provider_inputs(driver, scope.manifest)
+    return await resolve_em_provider_inputs_in_session(session, scope.manifest)
 
 
 def allowed_address_relation(schema):
@@ -172,9 +171,10 @@ def allowed_policy_parameters(parameters):
 def allowed_geo_joins(inputs, schema):
     """Join held postal and polygon references for this office."""
     from api import ptg2_geo_policy as geo
+    from process.network_em_provider_inputs import em_provider_geo_reads_sql
 
     bindings = inputs.geo_bindings(schema)
-    return (
+    joins = (
         geo.provider_address_identity_reference_joins_sql(
             "addr",
             schema_name=schema,
@@ -187,14 +187,22 @@ def allowed_geo_joins(inputs, schema):
             "addr", zcta_alias="allowed_zcta_ref", schema_name=schema, dependency_bindings=bindings
         )
     )
+    return em_provider_geo_reads_sql(joins, inputs, schema)
 
 
 def allowed_geo_evidence(inputs, schema):
     """Classify this exact office against held provider evidence."""
     from api.ptg2_geo_projection import legacy_evidence_source_id_sql
+    from process.network_em_provider_inputs import em_provider_geo_reads_sql
 
     scope = current_network_address_scope()
-    return f"({legacy_evidence_source_id_sql('addr', schema_name=schema, dependency_bindings=inputs.geo_bindings(schema), unified_schema_name=scope.manifest.schema_name)})<>0"
+    evidence = legacy_evidence_source_id_sql(
+        "addr",
+        schema_name=schema,
+        dependency_bindings=inputs.geo_bindings(schema),
+        unified_schema_name=scope.manifest.schema_name,
+    )
+    return f"({em_provider_geo_reads_sql(evidence, inputs, schema)})<>0"
 
 
 def allowed_spatial_predicate(inputs, schema, zip_predicate, radius_predicates):

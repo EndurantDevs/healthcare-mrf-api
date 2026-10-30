@@ -136,23 +136,28 @@ async def test_provider_digest_enters_identity_before_candidate_creation_and_rec
     address_sources = _sources(_inputs())
     receipt_by_field = {"receipt_sha256": "a" * 64}
     approved = SimpleNamespace(approved_revision=2, generation_id="b" * 64, total_rows=0)
-    artifact = SimpleNamespace(generation_sha256="c" * 64, address_source=address_sources.base_source)
-    source_stage = RegistrySourceRecipeStage("source_stage", 0, 0, "e" * 64)
+    artifact = SimpleNamespace(generation_sha256="c" * 64, address_source=address_sources.base_source, runtime_roles=())
+    source_stage = composition.RegistrySourceRecipeStage("registry_source_page_" + UUID(int=3).hex, 0, 0, "e" * 64)
     command_stage = object()
     calls = []
     monkeypatch.setattr(composition, "_preparation_driver", AsyncMock(return_value=(connection, None)))
     monkeypatch.setattr(composition, "_em_provider_receipt", AsyncMock(return_value=receipt_by_field))
     monkeypatch.setattr(composition, "pin_approved_membership_source", AsyncMock(return_value=approved))
+    monkeypatch.setattr(composition, "resolve_registered_source_inventory", AsyncMock(return_value=None))
+    monkeypatch.setattr(composition, "resolve_registered_office_summary_revision", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        composition, "_composition_sources_with_reads", AsyncMock(return_value=({}, 0, (), source_stage))
+        composition,
+        "_prepare_composition_sources_for_format",
+        AsyncMock(return_value=(({}, 0, (), source_stage), None)),
     )
     monkeypatch.setattr(
         composition, "_composition_retention", AsyncMock(return_value=(command_stage, {"effective_rows": 0}))
     )
     monkeypatch.setattr(composition, "registry_source_retention_sha256", lambda _receipt: "d" * 64)
-    monkeypatch.setattr(composition, "_composition_artifact_with_reads", AsyncMock(return_value=(artifact, None)))
+    monkeypatch.setattr(composition, "_composition_artifact", AsyncMock(return_value=(artifact, None)))
     monkeypatch.setattr(composition, "_bindings", AsyncMock())
     monkeypatch.setattr(composition, "_record_source_receipts", AsyncMock())
+    monkeypatch.setattr(composition, "require_registered_composition_target", AsyncMock())
 
     async def create(_connection, target, **kwargs):
         assert kwargs["source_generations"]["em_provider_inputs"] == receipt_by_field["receipt_sha256"]
@@ -188,13 +193,15 @@ async def test_closed_candidate_checks_both_receipts_without_recording(monkeypat
     )
     record = AsyncMock()
     monkeypatch.setattr(composition, "record_em_provider_inputs", record)
+    monkeypatch.setattr(composition, "require_registered_composition_target", AsyncMock())
     call = composition._composition_candidate(
         object(),
+        UUID(int=2),
         object(),
         {},
         2,
         0,
-        ({"effective_rows": 0}, (), provider_receipt_by_field, initial_summary_by_field),
+        ({"effective_rows": 0}, (), provider_receipt_by_field, initial_summary_by_field, None),
         "registry",
     )
     if changed:

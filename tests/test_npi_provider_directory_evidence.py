@@ -6,9 +6,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
-
 from api.endpoint import npi as npi_module
+from tests.provider_profile_snapshot_test_support import (
+    stub_provider_profile_snapshot as stub_provider_profile_snapshot,
+)
 
 
 @pytest.fixture
@@ -29,9 +30,7 @@ def provider_directory_fixture():
             "long": -87.6232,
             "checksum": 100,
             "address_sources": ["provider_directory_fhir"],
-            "source_record_ids": [
-                f"provider_directory_fhir:practitioner_role:{source_id}:{role_id}:location-400"
-            ],
+            "source_record_ids": [f"provider_directory_fhir:practitioner_role:{source_id}:{role_id}:location-400"],
         },
         "source_detail_map": {
             source_id: {
@@ -158,6 +157,8 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "FROM direct_plans AS direct_plan" in sql
     assert "direct_plan.resource_id = insurance_plan.resource_id" in sql
     assert "BOOL_OR(role_network.plan_provenance = 'network-derived')" in sql
+
+
 def test_role_plan_cap_prioritizes_direct_plans_and_reports_both_bounds():
     sql = npi_module._provider_directory_role_evidence_sql("mrf", has_catalog=True)
     cap = npi_module.MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE
@@ -205,12 +206,8 @@ def test_incomplete_catalog_keeps_direct_evidence_with_unknown_total():
         ),
     ]
 
-    role_evidence = npi_module._map_provider_directory_role_evidence(evidence_rows)[
-        ("pdfhir_aetna", "role-100")
-    ]
-    assert [entry["resource_id"] for entry in role_evidence["insurance_plans"]] == [
-        "direct-plan"
-    ]
+    role_evidence = npi_module._map_provider_directory_role_evidence(evidence_rows)[("pdfhir_aetna", "role-100")]
+    assert [entry["resource_id"] for entry in role_evidence["insurance_plans"]] == ["direct-plan"]
     assert "provenance" not in role_evidence["insurance_plans"][0]
     assert [entry["resource_id"] for entry in role_evidence["networks"]] == ["network-1"]
     assert role_evidence["insurance_plan_metadata"] == {
@@ -242,9 +239,7 @@ def test_mapper_preserves_cap_and_global_truncation_metadata():
         ),
     ]
 
-    role_evidence = npi_module._map_provider_directory_role_evidence(evidence_rows)[
-        ("pdfhir_aetna", "role-100")
-    ]
+    role_evidence = npi_module._map_provider_directory_role_evidence(evidence_rows)[("pdfhir_aetna", "role-100")]
     assert role_evidence["insurance_plan_metadata"] == {
         "returned": 1,
         "total": 1000,
@@ -282,9 +277,9 @@ def test_high_cardinality_mapping_is_linear_and_stable(monkeypatch):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("JSON dedup used")),
     )
 
-    plans = npi_module._map_provider_directory_role_evidence(evidence_rows)[
-        ("pdfhir_aetna", "role-100")
-    ]["insurance_plans"]
+    plans = npi_module._map_provider_directory_role_evidence(evidence_rows)[("pdfhir_aetna", "role-100")][
+        "insurance_plans"
+    ]
     assert len(plans) == 3000
     assert (plans[0]["resource_id"], plans[-1]["resource_id"]) == (
         "plan-0000",
@@ -306,21 +301,21 @@ async def test_role_evidence_disables_jit_once_per_request_session():
 
 @pytest.mark.asyncio
 async def test_missing_affiliation_and_catalog_tables_keep_direct_path():
-    evidence_session = _EvidenceSession({
-        "provider_directory_organization_affiliation",
-        "provider_directory_network_catalog",
-        "provider_directory_dataset_network_plan",
-        "provider_directory_dataset_affiliation_organization",
-    })
+    evidence_session = _EvidenceSession(
+        {
+            "provider_directory_organization_affiliation",
+            "provider_directory_network_catalog",
+            "provider_directory_dataset_network_plan",
+            "provider_directory_dataset_affiliation_organization",
+        }
+    )
 
     evidence_map = await npi_module._fetch_provider_directory_role_evidence_map(
         [("pdfhir_example", "role-100")],
         session=evidence_session,
     )
 
-    query_sql = next(
-        statement for statement in evidence_session.statements if "requested_roles AS" in statement
-    )
+    query_sql = next(statement for statement in evidence_session.statements if "requested_roles AS" in statement)
     assert evidence_map == {}
     assert "provider_directory_organization_affiliation AS affiliation" not in query_sql
     assert "provider_directory_network_catalog" not in query_sql
@@ -345,11 +340,7 @@ async def test_same_source_roles_are_isolated_to_exact_addresses(monkeypatch):
     source_id = "pdfhir_aetna"
     role_keys = [(source_id, "role-a"), (source_id, "role-b")]
     addresses = [
-        {
-            "source_record_ids": [
-                f"provider_directory_fhir:practitioner_role:{source_id}:{role_id}:location-1"
-            ]
-        }
+        {"source_record_ids": [f"provider_directory_fhir:practitioner_role:{source_id}:{role_id}:location-1"]}
         for _source_id, role_id in role_keys
     ]
     detail_by_id = {
@@ -389,9 +380,7 @@ async def test_same_source_roles_are_isolated_to_exact_addresses(monkeypatch):
     for address, role_key in zip(addresses, role_keys):
         evidence = address["provider_directory_sources"][0]
         assert evidence["practitioner_role_ids"] == [role_key[1]]
-        assert [entry["resource_id"] for entry in evidence["insurance_plans"]] == [
-            f"plan-{role_key[1]}"
-        ]
+        assert [entry["resource_id"] for entry in evidence["insurance_plans"]] == [f"plan-{role_key[1]}"]
 
 
 def test_overlapping_multi_role_plans_keep_role_keyed_metadata():
@@ -424,8 +413,7 @@ def test_overlapping_multi_role_plans_keep_role_keyed_metadata():
     assert evidence["insurance_plans"] == [shared_plan_map]
     assert "insurance_plan_metadata" not in evidence
     assert [
-        (entry["practitioner_role_id"], entry["total"])
-        for entry in evidence["insurance_plan_metadata_by_role"]
+        (entry["practitioner_role_id"], entry["total"]) for entry in evidence["insurance_plan_metadata_by_role"]
     ] == [("role-a", 1), ("role-b", 1)]
 
 
@@ -440,9 +428,14 @@ def _patch_detail_endpoint(monkeypatch, fixture, role_evidence_mock):
         }
 
     replacement_map = {
+        "_npi_canonical_publication_identity": AsyncMock(
+            side_effect=RuntimeError("Synthetic cache identity is unavailable")
+        ),
         "_build_npi_details": fake_build,
         "_fetch_npi_location_candidates": AsyncMock(return_value=[]),
         "_fetch_npi_address_rows": AsyncMock(return_value=[]),
+        "_fetch_provider_directory_profile_map": AsyncMock(return_value={}),
+        "_fetch_location_status_by_record_id": AsyncMock(return_value={}),
         "_fetch_provider_directory_address_overlay": AsyncMock(return_value=[]),
         "_fetch_provider_directory_source_detail_map": AsyncMock(return_value=fixture["source_detail_map"]),
         "_fetch_provider_directory_role_evidence_map": role_evidence_mock,
@@ -494,9 +487,7 @@ async def test_include_sources_is_compact_and_skips_roles(monkeypatch, provider_
 
     fetch_roles.assert_not_awaited()
     assert evidence["source_ids"] == [fixture["role_key"][0]]
-    assert [entry["source_id"] for entry in evidence["catalog_aliases"]] == [
-        fixture["role_key"][0]
-    ]
+    assert [entry["source_id"] for entry in evidence["catalog_aliases"]] == [fixture["role_key"][0]]
     assert "insurance_plans" not in evidence
     assert "networks" not in evidence
     assert "practitioner_role_ids" not in evidence

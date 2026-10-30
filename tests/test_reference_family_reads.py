@@ -358,6 +358,8 @@ async def test_request_entrypoint_binds_pinning_only_to_real_pricing_consumers(m
         await callbacks["request"](request)
         assert request.ctx.sa_session is session
         assert pin.await_count == int(is_claims_read)
+        if is_claims_read:
+            pin.assert_awaited_once_with(session, api_read=True)
     finally:
         await callbacks["response"](request, SimpleNamespace(status=200))
     session.close.assert_awaited_once()

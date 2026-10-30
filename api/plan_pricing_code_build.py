@@ -3,12 +3,19 @@
 
 import hashlib
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass
 from uuid import uuid4
 
 from sqlalchemy import text
 
+from api.network_read_execution import (
+    _SESSION_INVENTORY_KEY,
+    _installed_read_inventory,
+    _original_read_driver,
+    execute_network_read,
+    install_network_read_inventory,
+)
 from api.plan_pricing_code_contract import (
     SPEC,
     capability_identity,
@@ -20,6 +27,9 @@ from api.plan_pricing_code_contract import (
 )
 from api.plan_pricing_code_storage import locate, lock_identity, receipt, seal
 from api.plan_pricing_projection_contract import (
+    PROVIDER_RELATIONS,
+    SCHEMA,
+    PlanPricingProjectionUnavailable,
     canonical_json,
     lock_provider_generation,
     projection_code_identity,
@@ -45,7 +55,7 @@ from api.plan_pricing_projection_v3_provider_cells import _materialize_provider_
 from api.plan_pricing_projection_v3_types import _BuildState
 from api.plan_pricing_projection_v3_work import _record_code_work, _stage_code_work, _WorkLimits
 from api.plan_pricing_projection_v4_occurrence import rate_occurrence_rows
-from api.ptg2_code_scope import load_sealed_code_rows
+from api.ptg2_code_scope import _SOURCE_READ_BRAND, load_sealed_code_rows
 from api.ptg2_db_sidecars import _preflight_price_membership_aliases_from_db
 from api.ptg_membership_source import source_identity
 from api.ptg_membership_storage import locate as locate_membership
@@ -59,11 +69,229 @@ from db.models.plan_pricing_code_projection import (
 )
 from process import reference_family_archive as native
 from process.live_progress import enqueue_live_progress
+from process.network_compact_layout import CompactAddressRelation
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 MAX_CODE_MEMBER_CELL_WORK_ROWS: int | None = 32_768
 MAX_CODE_FACTOR_JOIN_WORK_ROWS: int | None = 16_384
 CODE_PROVIDER_READ_BATCH_SIZE = 100
+
+_API_SOURCE_NAMES = (
+    "ptg2_snapshot",
+    "ptg2_v3_snapshot_binding",
+    "ptg2_v3_snapshot_layout",
+    "ptg2_v3_snapshot_scope",
+    "ptg2_v3_snapshot_plan_scope",
+    "ptg2_v3_candidate_audit_attestation",
+    "ptg2_v3_snapshot_source",
+    "ptg2_v4_snapshot_map_root",
+    "ptg2_v4_relation_manifest",
+    "ptg2_v4_snapshot_map_pack",
+    "ptg2_v3_block",
+    "ptg2_v3_snapshot_block",
+    "ptg2_v4_npi_scope",
+    "ptg2_v3_code",
+    "ptg2_v3_provider_set",
+    "ptg2_v3_provider_group",
+    "ptg2_v4_finalizer_map_root",
+    "ptg2_v4_finalizer_map_pack",
+    "ptg2_v4_finalizer_map_target",
+    "ptg2_snapshot_pin",
+)
+
+
+class _CodeAPISetup:
+    """Keep setup decoding behind guards on the original session; caches stay private."""
+
+    _source_read_brand = _SOURCE_READ_BRAND
+
+    def __init__(self, session, source_relations=None):
+        self._session, self.info = session, dict(session.info)
+        self._source_relations = source_relations or {}
+
+    @property
+    def original_read_session(self):
+        """Expose the exact original session for native proof inventory installation."""
+        return self._session
+
+    def source_relation(self, schema_name, table_name):
+        """Read only captured plain heaps; partition routing requires separate authority."""
+        key = schema_name, table_name
+        relation = self._source_relations.get(key)
+        if relation is not None and relation[1:] == ("r", False):
+            return "ONLY " + native._quoted(schema_name) + "." + native._quoted(table_name)
+        raise PlanPricingProjectionUnavailable("Source physical read routing is unavailable")
+
+    async def execute(self, statement, parameters=None):
+        """Verify buffered setup results before a decoder can inspect them."""
+        if _installed_read_inventory(self._session) is None:
+            raise PlanPricingProjectionUnavailable("code pricing API inventory is unavailable")
+        return await execute_network_read(self._session, statement, parameters)
+
+    async def scalar(self, statement, parameters=None):
+        """Decode a scalar after the original session's read guard."""
+        return (await self.execute(statement, parameters)).scalar()
+
+    def in_transaction(self):
+        """Expose the actual caller's transaction state."""
+        return self._session.in_transaction()
+
+    def get_transaction(self):
+        """Keep native helpers bound to the original transaction object."""
+        return self._session.get_transaction()
+
+    async def connection(self):
+        """Borrow the original connection without opening another session."""
+        return await self._session.connection()
+
+
+async def _api_input_inventory(session, driver, *, allow_legacy=False):
+    """Pin the complete fixed-name input census without granting Source authority."""
+    from api import ptg2_geo_projection as geo
+    from api.ptg2_tables import PTG2_SCHEMA, PTG2_V4_GRAPH_DIAGNOSTIC_TABLE
+
+    required_names = {(SCHEMA, name) for name in PROVIDER_RELATIONS}
+    required_names.update((schema or SCHEMA, name) for schema, name in geo._PROJECTION_DEPENDENCIES)
+    source_names = {*_API_SOURCE_NAMES, PTG2_V4_GRAPH_DIAGNOSTIC_TABLE}
+    names = tuple(sorted(required_names | {(PTG2_SCHEMA, name) for name in source_names}))
+    transaction, backend_pid = session.get_transaction(), driver.get_server_pid()
+    catalog = await driver.fetch(
+        "SELECT expected.schema_name,expected.table_name,c.oid::pg_catalog.int8,c.relkind::pg_catalog.text,"
+        "EXISTS(SELECT FROM pg_catalog.pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid) AS inherited,"
+        "pg_catalog.has_schema_privilege(current_user,n.oid,'USAGE') AND pg_catalog.has_table_privilege(current_user,c.oid,'SELECT') AS readable "
+        "FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]),pg_catalog.unnest($2::pg_catalog.text[])) expected(schema_name,table_name) "
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.nspname=expected.schema_name "
+        "LEFT JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=expected.table_name "
+        "ORDER BY expected.schema_name,expected.table_name",
+        [schema for schema, _ in names],
+        [name for _, name in names],
+    )
+    await _same_api_input_session(session, driver, backend_pid, transaction)
+    if tuple((catalog_row["schema_name"], catalog_row["table_name"]) for catalog_row in catalog) != names:
+        raise PlanPricingProjectionUnavailable("code pricing API input inventory differs")
+    relations, absent_names = [], []
+    for catalog_row in catalog:
+        name = catalog_row["schema_name"], catalog_row["table_name"]
+        if name in required_names and (
+            catalog_row["oid"] is None or catalog_row["relkind"] != "r" or catalog_row["readable"] is not True
+        ):
+            _unqualified_api_read("code pricing API provider inputs are unavailable", allow_legacy)
+        if catalog_row["oid"] is None:
+            absent_names.append(name)
+        else:
+            if catalog_row["relkind"] not in {"r", "p"}:
+                _unqualified_api_read("code pricing API Source inputs are unavailable", allow_legacy)
+            relations.append(CompactAddressRelation(*name, catalog_row["oid"]))
+    plain_names = {
+        (catalog_row["schema_name"], catalog_row["table_name"])
+        for catalog_row in catalog
+        if catalog_row["relkind"] == "r" and catalog_row["inherited"] is False
+    }
+    await install_network_read_inventory(
+        session,
+        tuple(relations),
+        absent_names=tuple(absent_names),
+        only_relations=tuple(
+            relation for relation in relations if (relation.schema_name, relation.table_name) in plain_names
+        ),
+    )
+    return {
+        (catalog_row["schema_name"], catalog_row["table_name"]): (
+            catalog_row["oid"],
+            catalog_row["relkind"],
+            catalog_row["inherited"],
+        )
+        for catalog_row in catalog
+        if catalog_row["oid"] is not None
+    }
+
+
+async def _same_api_input_session(session, driver, backend_pid, transaction):
+    current_driver, current_pid = await _original_read_driver(session)
+    if (
+        current_driver is not driver
+        or current_pid != backend_pid
+        or session.get_transaction() is not transaction
+        or driver.is_in_transaction() is not True
+    ):
+        raise PlanPricingProjectionUnavailable("code pricing API read transaction changed")
+
+
+async def _has_local_api_sources(reader, selection):
+    """Identify the separate local SourceReader before its view deparsers or locks."""
+    from api.ptg2_tables import PTG2_SCHEMA, local_physical_binding_declared_sql
+
+    snapshot_relation = reader.source_relation(PTG2_SCHEMA, "ptg2_snapshot")
+    binding_relation = reader.source_relation(PTG2_SCHEMA, "ptg2_v3_snapshot_binding")
+    layout_relation = reader.source_relation(PTG2_SCHEMA, "ptg2_v3_snapshot_layout")
+    sql = text(
+        "SELECT coalesce(pg_catalog.bool_or(" + local_physical_binding_declared_sql("snapshot", "layout") + "),false) "
+        f"FROM {snapshot_relation} snapshot LEFT JOIN {binding_relation} binding "
+        "ON binding.snapshot_id=snapshot.snapshot_id "
+        f"LEFT JOIN {layout_relation} layout ON layout.snapshot_key=binding.snapshot_key "
+        "WHERE snapshot.snapshot_id=:snapshot_id"
+    )
+    for snapshot_id in sorted({binding.snapshot_id for binding in selection.bindings if binding.role == "in_network"}):
+        if await reader.scalar(sql, {"snapshot_id": snapshot_id}) is not False:
+            return True
+    return False
+
+
+class _LegacyCodeReadRequired(Exception):
+    """Keep admitted routes whose physical reader has not been independently replaced."""
+
+
+def _unqualified_api_read(reason, allow_legacy):
+    if allow_legacy:
+        raise _LegacyCodeReadRequired(reason)
+    raise PlanPricingProjectionUnavailable(reason)
+
+
+async def can_read_code_api(session, selection):
+    """Select metadata-eligible ZIP routing; full Source custody remains mandatory."""
+    if not callable(getattr(session, "get_transaction", None)):
+        return False
+    previous_info_by_name = dict(session.info)
+    try:
+        async with _api_input_reader(session, selection, allow_legacy=True):
+            return True
+    except _LegacyCodeReadRequired:
+        return False
+    finally:
+        _restore_api_inventory(session, previous_info_by_name)
+
+
+def _restore_api_inventory(session, previous_info_by_name):
+    if _SESSION_INVENTORY_KEY in previous_info_by_name:
+        session.info[_SESSION_INVENTORY_KEY] = previous_info_by_name[_SESSION_INVENTORY_KEY]
+    else:
+        session.info.pop(_SESSION_INVENTORY_KEY, None)
+
+
+@asynccontextmanager
+async def _api_input_reader(session, selection, *, allow_legacy=False):
+    transaction = session.get_transaction()
+    driver, backend_pid = await _original_read_driver(session)
+    modes = await driver.fetchrow(
+        "SELECT pg_catalog.current_setting('transaction_isolation'),pg_catalog.current_setting('transaction_read_only')"
+    )
+    await _same_api_input_session(session, driver, backend_pid, transaction)
+    if modes is None or tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
+        _unqualified_api_read("code pricing API requires a read-only repeatable-read snapshot", allow_legacy)
+    previous_info_by_name = dict(session.info)
+    try:
+        source_relations = await _api_input_inventory(session, driver, allow_legacy=allow_legacy)
+        await _same_api_input_session(session, driver, backend_pid, transaction)
+        if any(kind != "r" or inherited for _, kind, inherited in source_relations.values()):
+            _unqualified_api_read("Source physical read routing is unavailable", allow_legacy)
+        reader = _CodeAPISetup(session, source_relations)
+        if await _has_local_api_sources(reader, selection):
+            _unqualified_api_read("selected source is unavailable for code pricing API reads", allow_legacy)
+        yield reader
+        await _same_api_input_session(session, driver, backend_pid, transaction)
+    except BaseException:
+        _restore_api_inventory(session, previous_info_by_name)
+        raise
 
 
 @dataclass
@@ -117,7 +345,63 @@ class CodeProjectionMembershipNotReady(ValueError):
     """A missing preparation dependency is different from corrupt ready storage."""
 
 
-async def resolve_inputs(session, selection, code_identity, *, scope=None):
+async def resolve_inputs(session, selection, code_identity, *, scope=None, api_read=False):
+    """Keep producer defaults; API setup authenticates through its original guarded session."""
+    if type(api_read) is not bool:
+        raise ValueError("code pricing API mode is invalid")
+    if api_read:
+        async with _api_input_reader(session, selection) as reader:
+            return await _resolve_inputs(reader, selection, code_identity, scope=scope, api_read=True)
+    return await _resolve_inputs(session, selection, code_identity, scope=scope)
+
+
+async def _resolve_code_input(session, binding, code_identity, ordinal_by_read_identity, *, api_read):
+    """Authenticate one complete source and membership before assigning its physical alias."""
+    params = asdict(binding)
+    params["ordinal"], params["market_type"] = binding.binding_ordinal, binding.plan_market_type
+    options = {"api_read": True} if api_read else {}
+    tables, read_identity = await binding_source(session, params, **options)
+    _, _, identity = await source_identity(
+        session, binding.source_key, binding.snapshot_id, *code_identity, tables=tables, **options
+    )
+    found = await locate_membership(
+        session._session if api_read else session, identity, **({"api_read": True} if api_read else {})
+    )
+    if found is None:
+        raise CodeProjectionMembershipNotReady("code projection requires ready complete source/procedure membership")
+    code_rows = await load_sealed_code_rows(
+        session,
+        tables,
+        {
+            "plan_id": binding.plan_id,
+            "plan_market_type": binding.plan_market_type,
+            "code_system": code_identity[0],
+            "code": code_identity[1],
+        },
+    )
+    if (
+        len(code_rows) > MAX_CODE_OCCURRENCES
+        or sum(int(code_row["rate_count"]) for code_row in code_rows) > MAX_CODE_OCCURRENCES
+    ):
+        raise ValueError("code projection occurrence count exceeds its bound")
+    representative = ordinal_by_read_identity.setdefault(read_identity, binding.binding_ordinal)
+    coverage = source_coverage(
+        binding.binding_ordinal,
+        identity,
+        code_rows,
+        membership_receipt(found),
+        materialized_binding_ordinal=representative,
+        read_identity_digest=sealed_read_digest(read_identity),
+    )
+    physical_input = (
+        (BindingProjection(params, tables, {code_identity: code_rows}, len(code_rows)), found)
+        if representative == binding.binding_ordinal
+        else None
+    )
+    return coverage, physical_input
+
+
+async def _resolve_inputs(session, selection, code_identity, *, scope=None, api_read=False):
     """Authenticate every logical binding and its complete protected code membership."""
     inputs, source_coverages = [], []
     bindings = tuple(binding for binding in selection.bindings if binding.role == "in_network")
@@ -125,46 +409,12 @@ async def resolve_inputs(session, selection, code_identity, *, scope=None):
         raise ValueError("code projection binding count exceeds its bound")
     ordinal_by_read_identity = {}
     for binding in bindings:
-        params = asdict(binding)
-        params["ordinal"] = binding.binding_ordinal
-        params["market_type"] = binding.plan_market_type
-        tables, read_identity = await binding_source(session, params)
-        _, _, identity = await source_identity(
-            session, binding.source_key, binding.snapshot_id, *code_identity, tables=tables
+        coverage, physical_input = await _resolve_code_input(
+            session, binding, code_identity, ordinal_by_read_identity, api_read=api_read
         )
-        found = await locate_membership(session, identity)
-        if found is None:
-            raise CodeProjectionMembershipNotReady(
-                "code projection requires ready complete source/procedure membership"
-            )
-        code_rows = await load_sealed_code_rows(
-            session,
-            tables,
-            {
-                "plan_id": binding.plan_id,
-                "plan_market_type": binding.plan_market_type,
-                "code_system": code_identity[0],
-                "code": code_identity[1],
-            },
-        )
-        if (
-            len(code_rows) > MAX_CODE_OCCURRENCES
-            or sum(int(code_row["rate_count"]) for code_row in code_rows) > MAX_CODE_OCCURRENCES
-        ):
-            raise ValueError("code projection occurrence count exceeds its bound")
-        representative = ordinal_by_read_identity.setdefault(read_identity, binding.binding_ordinal)
-        source_coverages.append(
-            source_coverage(
-                binding.binding_ordinal,
-                identity,
-                code_rows,
-                membership_receipt(found),
-                materialized_binding_ordinal=representative,
-                read_identity_digest=sealed_read_digest(read_identity),
-            )
-        )
-        if representative == binding.binding_ordinal:
-            inputs.append((BindingProjection(params, tables, {code_identity: code_rows}, len(code_rows)), found))
+        source_coverages.append(coverage)
+        if physical_input is not None:
+            inputs.append(physical_input)
     if (
         sum(
             code_row["rate_count"]
@@ -184,9 +434,14 @@ async def _resolve_capability_identity(session, selection, code_identity, source
     if scope is not None:
         from api.plan_pricing_projection_read import geo_cells
 
-        cells = await geo_cells(session, scope, result_type="rate_aggregates")
+        cells = await geo_cells(
+            session,
+            scope,
+            result_type="rate_aggregates",
+            **({"api_read": True} if type(session) is _CodeAPISetup else {}),
+        )
         scope_by_field = {**scope, "geo_cells": sorted(set(cells))}
-    signature = await provider_signature(session)
+    signature = await provider_signature(session, **({"api_read": True} if type(session) is _CodeAPISetup else {}))
     return capability_identity(selection, code_identity, signature, source_coverages, scope=scope_by_field)
 
 

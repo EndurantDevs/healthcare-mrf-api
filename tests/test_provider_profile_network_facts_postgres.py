@@ -1,26 +1,18 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Profile facts from real committed CMS custody and a published canonical head."""
 
-import hashlib
+import asyncio
 import json
-from contextlib import aclosing
-from uuid import UUID, uuid4, uuid5
+from contextlib import AsyncExitStack, aclosing
+from uuid import uuid4, uuid5
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.provider_profile_network_facts import read_cms_profile_plan_inputs
-from process import provider_directory_cms_npd as cms
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
-from process.network_fhir_membership_source import read_fhir_membership_batch
-from process.network_membership_candidate_lifecycle import (
-    admit_network_membership_batch,
-    create_network_candidate,
-    seal_network_candidate,
-)
-from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
@@ -28,10 +20,10 @@ from process.registry_candidate_composition import (
     compose_registry_membership_candidate,
 )
 from process.registry_record_store import RegistryRecordCommand
-from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests import cms_npd_admission_postgres_support as support
 from tests import test_network_cms_registry_source_pair_postgres as pairs
 from tests.cms_registry_recipe_postgres_support import _reviewed_cms_binding
+from tests.source_contribution_custody_postgres_support import install_source_contribution_custody
 from tests.test_network_custom_address_source_postgres import custom_db
 from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_provider_directory_cms_resource_batch_postgres import cms_resource_template as cms_resource_template
@@ -46,79 +38,27 @@ from tests.test_registry_retained_site_adoption_postgres import _source_addresse
 pytestmark = pytest.mark.asyncio
 
 
-async def _publish_profile_recipe(fixture, reviewed_source, copy_targets, *, public_contacts=False):
-    """Retain the actual reviewed office and its raw recipe in a serving manifest."""
-    source_fixture, _, _, _, coordinates, approved = reviewed_source
-    connection, schema, source_pin, sites = source_fixture
-    source_table = await _profile_addresses(fixture, public_contacts=public_contacts)
-    identity = uuid4()
-    copy_target = MembershipCopyTarget(
-        *(str(uuid4()) for _ in range(3)), str(identity), "network_candidate_" + identity.hex
-    )
-    copy_targets.append(copy_target)
-    async with connection.transaction(isolation="repeatable_read"):
-        batch = await read_fhir_membership_batch(
-            connection,
-            source_pin,
-            registry_schema=schema,
-            approved_source=approved,
-            binding_coordinates=coordinates,
-            approved_only=True,
-        )
-        await create_network_candidate(
-            connection,
-            copy_target,
-            source_generations={
-                "unified_address": fixture.base.generation_id,
-                "fhir": batch.generation_id,
-                "custom_membership": approved.generation_id,
-            },
-            source_recipes=(RegistrySourceMembershipRecipe(source_pin, coordinates),),
-            approved_custom_revision=approved.approved_revision,
-            expected_head=0,
-            expected_rows=batch.membership_rows,
-            control_schema=schema,
-        )
-        await connection.execute(f'''CREATE TABLE "{copy_target.schema_name}".provider_location_binding(
-          provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,
-          location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,
-          PRIMARY KEY(provider_system,provider_id,location_id))''')
-        for index, site in enumerate(sites):
-            await connection.execute(
-                f'''INSERT INTO "{copy_target.schema_name}".provider_location_binding
-                SELECT 'npi',entity_id,$1,location_key,entity_type,entity_id FROM {source_table}
-                ORDER BY location_key LIMIT 1 OFFSET $2''',
-                site,
-                index,
-            )
-        await admit_network_membership_batch(
-            connection,
-            copy_target,
-            batch_id=uuid4(),
-            input_bytes=batch.input_bytes,
-            expected_input_sha256=hashlib.sha256(batch.input_bytes).hexdigest(),
-            control_schema=schema,
-        )
-        await seal_network_candidate(connection, copy_target, control_schema=schema)
-    await prepare_and_publish_network_candidate(
-        connection, copy_target, fixture.base, **_roles(fixture), control_schema=schema
-    )
-    async with connection.transaction(isolation="repeatable_read", readonly=True):
-        return await resolve_network_serving_manifest(connection, control_schema=schema)
-
-
 async def _profile_addresses(fixture, *, public_contacts=False):
     """Use two complete native addresses for the source's two distinct offices."""
     connection = fixture.connection
     _, source_table = await _source_addresses(fixture, 2, "npi")
     await connection.execute(f"UPDATE {source_table} SET entity_id='1000000491',npi=1000000491")
     await connection.execute(f'UPDATE "{fixture.source_schema}".npi SET npi=1000000491')
+    await connection.execute(
+        f"UPDATE {source_table} SET first_line='123 Example Street',"
+        "second_line=CASE WHEN location_key=$1 THEN NULL ELSE 'Suite 3' END,"
+        "city_name='Sample City',state_name='CA',postal_code='90210',country_code='US',"
+        "type='practice',inferred_npi=NULL",
+        "a" * 64,
+    )
     if public_contacts:
         await _public_address_contacts(connection, source_table)
+    else:
+        await _profile_address_identity(connection, source_table)
     return source_table
 
 
-async def _public_address_contacts(connection, source_table):
+async def _profile_address_identity(connection, source_table):
     """Prepare native identity/precision before publication; mask-zero base facts stay public."""
     import ptg2_address_canon
 
@@ -139,39 +79,50 @@ async def _public_address_contacts(connection, source_table):
     ]
     await connection.execute(
         f"""UPDATE {source_table} address SET address_key=prepared.address_key,premise_key=prepared.premise_key,
-          address_precision=prepared.precision,telephone_number='555-0100',phone_number='5550100'
+          address_precision=prepared.precision
         FROM jsonb_to_recordset($1::jsonb) AS prepared(location_key text,address_key uuid,premise_key uuid,precision text)
         WHERE address.location_key=prepared.location_key""",
         json.dumps(rows),
     )
 
 
-async def _compose_profile_manifest(fixture, manifest, approved, copy_targets):
+async def _public_address_contacts(connection, source_table):
+    """Prepare the native office identity and its synthetic public phone."""
+    await _profile_address_identity(connection, source_table)
+    await connection.execute(f"UPDATE {source_table} SET telephone_number='555-0100',phone_number='5550100'")
+
+
+async def _compose_profile_manifest(fixture, manifest, approved, copy_targets, *, initial_recipe=None):
     """Compose and publish exact retained source rows through the real registry pipeline."""
-    await fixture.connection.execute(
+    connection = getattr(fixture, "execution_connection", fixture.connection)
+    await connection.execute(
         "SET TimeZone='UTC'; SET DateStyle='ISO, YMD'; SET IntervalStyle='iso_8601'; SET extra_float_digits=3; SET bytea_output='hex'"
     )
     request_id = uuid4()
     fixture.composition_ids.append(uuid5(request_id, "address:" + approved.generation_id))
     composed, addresses = await compose_registry_membership_candidate(
-        fixture.connection,
+        connection,
         request_id=request_id,
         approved_revision=approved.approved_revision,
-        expected_head=manifest.generation_id,
+        expected_head=0 if manifest is None else manifest.generation_id,
         address_sources=RegistryCompositionAddressSources(
-            PinnedAddressSource(manifest.schema_name, "entity_address_unified", manifest.manifest_sha256)
+            fixture.base
+            if manifest is None
+            else PinnedAddressSource(manifest.schema_name, "entity_address_unified", manifest.manifest_sha256),
+            initial_source_recipes=() if initial_recipe is None else (initial_recipe,),
         ),
-        writer_roles=_roles(fixture),
+        writer_roles=getattr(fixture, "writer_roles", _roles(fixture)),
         source_manifest=manifest,
         control_schema=fixture.control_schema,
     )
     copy_targets.append(composed)
     await prepare_and_publish_network_candidate(
-        fixture.connection,
+        connection,
         composed,
         addresses,
-        **_roles(fixture),
+        **getattr(fixture, "writer_roles", _roles(fixture)),
         control_schema=fixture.control_schema,
+        seal_candidate=getattr(fixture, "seal_candidate", None),
     )
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
@@ -228,7 +179,7 @@ async def _remove_profile_office(fixture, manifest, network_id, sites, actor, co
     return await _compose_profile_manifest(fixture, manifest, latest_approved, copy_targets), revision
 
 
-async def _prepare_profile_source(fixture, pair, copy_targets, *, public_contacts=False):
+async def _prepare_profile_source(fixture, pair, copy_targets, stack, *, public_contacts=False):
     """Review the source binding and publish the exact source/effective office inputs."""
     pin = pair.recipe.source_pin
     actor, networks, binding, approved = await _reviewed_cms_binding(
@@ -241,16 +192,10 @@ async def _prepare_profile_source(fixture, pair, copy_targets, *, public_contact
         )
         for resource in ("site-1", "site-2")
     ]
-    reviewed = (
-        (fixture.connection, fixture.control_schema, pin, sites),
-        actor,
-        networks,
-        binding,
-        pair.recipe.binding_coordinates,
-        approved,
-    )
-    manifest = await _publish_profile_recipe(fixture, reviewed, copy_targets, public_contacts=public_contacts)
-    manifest = await _compose_profile_manifest(fixture, manifest, approved, copy_targets)
+    await _profile_addresses(fixture, public_contacts=public_contacts)
+    await _grant_profile_reader(fixture)
+    await install_source_contribution_custody(fixture, pin, stack)
+    manifest = await _compose_profile_manifest(fixture, None, approved, copy_targets, initial_recipe=pair.recipe)
     source_manifest = manifest
     manifest, revision = await _remove_profile_office(
         fixture, manifest, networks[0]["record_id"], sites, actor, copy_targets
@@ -293,6 +238,14 @@ async def published_profile_source(monkeypatch, tmp_path, request):
     def resources(revision):
         rows = source_resources(revision)
         rows["OrganizationAffiliation"][0]["active"] = False
+        for ordinal, location in enumerate(rows["Location"]):
+            location["address"] = {
+                "line": ["123 Example Street"] + (["Suite 3"] if ordinal else []),
+                "city": "Sample City",
+                "state": "CA",
+                "postalCode": "90210",
+                "country": "US",
+            }
         return rows
 
     monkeypatch.setattr(support, "_resource_rows", resources)
@@ -311,21 +264,19 @@ async def published_profile_source(monkeypatch, tmp_path, request):
         )
         async with aclosing(serving_schema.__wrapped__()) as registry:
             native_registry = await anext(registry)
-            async with aclosing(custom_db.__wrapped__(native_registry)) as custom:
+            async with aclosing(custom_db.__wrapped__(native_registry)) as custom, AsyncExitStack() as stack:
                 fixture = await anext(custom)
+                stack.push_async_callback(_remove_profile_pairs, fixture, capture_id)
+                stack.push_async_callback(_remove_candidates, fixture, copy_targets, uuid4())
                 for extension in ("intarray", "btree_gin", "postgis"):
                     await fixture.connection.execute(f'CREATE EXTENSION IF NOT EXISTS "{extension}"')
-                try:
-                    pair = await pairs._capture_bounded_pair(
-                        database, proof, capture_id, (fixture.roles["owner"], fixture.roles["reader"])
-                    )
-                    manifest, network, sites = await _prepare_profile_source(
-                        fixture, pair, copy_targets, public_contacts=getattr(request, "param", False) is True
-                    )
-                    yield database, fixture, pair, manifest, network, sites
-                finally:
-                    await _remove_candidates(fixture, copy_targets, uuid4())
-                    await _remove_profile_pairs(fixture, capture_id)
+                pair = await pairs._capture_bounded_pair(
+                    database, proof, capture_id, (fixture.roles["owner"], fixture.roles["reader"])
+                )
+                manifest, network, sites = await _prepare_profile_source(
+                    fixture, pair, copy_targets, stack, public_contacts=getattr(request, "param", False) is True
+                )
+                yield database, fixture, pair, manifest, network, sites
 
 
 async def _read(fixture, manifest, **options):
@@ -336,9 +287,18 @@ async def _read(fixture, manifest, **options):
         assert not await session.scalar(
             text("SELECT pg_has_role(current_user,:owner,'SET')"), {"owner": fixture.roles["owner"]}
         )
-        return await read_cms_profile_plan_inputs(
-            session, manifest, "1000000491", excluded_network_ids=options.pop("excluded_network_ids", ()), **options
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        statements = []
+        with driver.query_logger(statements.append):
+            result = await read_cms_profile_plan_inputs(
+                session, manifest, "1000000491", excluded_network_ids=options.pop("excluded_network_ids", ()), **options
+            )
+            await asyncio.sleep(0)
+        assert not any(
+            statement.query.lstrip().upper().startswith("LOCK TABLE") or "pg_advisory" in statement.query.lower()
+            for statement in statements
         )
+        return result
 
 
 async def test_native_profile_exact_office_and_default_exclusion(published_profile_source):

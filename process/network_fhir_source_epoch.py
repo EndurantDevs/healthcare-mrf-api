@@ -191,6 +191,7 @@ def _origin(source_pin):
         type(source_pin) is not PinnedFHIRMembershipSource
         or source_pin.source_id != "cms-npd"
         or source_pin.custody_owner_role is not None
+        or source_pin.retained_successor is not None
     ):
         _fail()
     return tuple(getattr(source_pin, name) for name in _ORIGIN_FIELDS)
@@ -618,17 +619,33 @@ async def _catalog_relations(connection, schema):
         return relations
 
 
-async def _catalog(connection, schema, owner_role, runtime_roles):
+async def _require_api_metadata_read(connection, api_read, *, verify_content=False):
+    """Require a genuine read-only snapshot without weakening requested content admission."""
+    if type(api_read) is not bool or api_read and verify_content is not False:
+        _fail()
+    if api_read:
+        if not connection.is_in_transaction():
+            _fail()
+        modes = await connection.fetchrow(
+            "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+        )
+        if tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
+            _fail()
+
+
+async def _catalog(connection, schema, owner_role, runtime_roles, *, api_read=False):
     """Require trigger-free heaps, exact local OIDs and SELECT-only native capabilities."""
+    await _require_api_metadata_read(connection, api_read)
     owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", owner_role)
     if not _protected_owner(owner):
         _fail()
     namespace = _identifier(schema)
-    await connection.execute(
-        "LOCK TABLE "
-        + ",".join(namespace + "." + _identifier(name) for name in _TABLES)
-        + " IN ACCESS SHARE MODE NOWAIT"
-    )
+    if not api_read:
+        await connection.execute(
+            "LOCK TABLE "
+            + ",".join(namespace + "." + _identifier(name) for name in _TABLES)
+            + " IN ACCESS SHARE MODE NOWAIT"
+        )
     relations = await _catalog_relations(connection, schema)
     if tuple(relation_record["relname"] for relation_record in relations) != tuple(sorted(_TABLES)) or any(
         relation_record["relkind"] != b"r"
@@ -1058,10 +1075,11 @@ def _receipt_comment(epoch):
     return "cms-fhir-epoch-v1:" + json.dumps(epoch.as_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, *, verify_content=True):
+async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, *, verify_content=True, api_read=False):
     """Revalidate immutable physical custody without consulting a later origin edition."""
     if type(verify_content) is not bool:
         _fail()
+    await _require_api_metadata_read(connection, api_read, verify_content=verify_content)
     epoch = validate_retained_cms_fhir_source_epoch(epoch)
     if epoch.origin_coordinates != _origin(source_pin):
         _fail()
@@ -1071,7 +1089,13 @@ async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, 
 
     await require_registry_epoch_transaction(connection, source_pin, epoch)
     try:
-        observed = await _catalog(connection, epoch.schema_name, epoch.owner_role, epoch.runtime_roles)
+        observed = await _catalog(
+            connection,
+            epoch.schema_name,
+            epoch.owner_role,
+            epoch.runtime_roles,
+            **({"api_read": True} if api_read else {}),
+        )
         if (
             observed != (epoch.schema_oid, epoch.relation_oids, epoch.catalog_sha256)
             or await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", epoch.schema_oid)

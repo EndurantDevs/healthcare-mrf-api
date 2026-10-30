@@ -4,7 +4,7 @@
 import asyncio
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import asyncpg
 import pytest
@@ -13,6 +13,7 @@ from api import plan_release_pricing_projection as projection
 from process import registry_pricing_release_binding_lookup as lookup
 from process import registry_required_target_coverage as coverage
 from process.network_approved_catalog_evidence import ApprovedNetworkCatalogEvidenceRecord
+from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_plan_release_serving import PLAN_RELEASE_ID, _binding_row
 
 REFERENCE = {
@@ -228,12 +229,15 @@ async def test_additive_absence_and_report_budget_preserve_directory(retained_ex
 @pytest.mark.asyncio
 async def test_actual_report_body_consumes_the_metadata_phase_once(monkeypatch):
     driver = Driver()
-    manifest = SimpleNamespace(
+    manifest = PinnedNetworkServingManifest(
         approved_custom_revision=4,
         source_generations={},
         schema_name="sample_serving",
         generation_id=1,
         candidate_id="00000000-0000-0000-0000-000000000001",
+        schema_revision=1,
+        manifest_sha256="b" * 64,
+        address_table_oid=1,
     )
 
     async def fetchrow(sql, *parameters):
@@ -255,6 +259,7 @@ async def test_actual_report_body_consumes_the_metadata_phase_once(monkeypatch):
         return {}
 
     calls = []
+    recipes = Mock()
 
     async def consumed(connection, report, approved, **options):
         calls.append((connection, report, options))
@@ -265,22 +270,28 @@ async def test_actual_report_body_consumes_the_metadata_phase_once(monkeypatch):
     monkeypatch.setattr(coverage, "pin_retained_approved_membership_source", pin)
     monkeypatch.setattr(coverage, "_read_review_bundle", bundle)
     monkeypatch.setattr(coverage, "_verify_ledger", lambda *args: {})
-    monkeypatch.setattr(coverage, "verify_registry_source_recipes", lambda *args: None)
+    monkeypatch.setattr(coverage, "verify_source_recipe_metadata", recipes)
     monkeypatch.setattr(coverage, "_native", lambda *args: {})
     monkeypatch.setattr(coverage, "_coverage_report", lambda *args: REPORT)
     monkeypatch.setattr(coverage, "append_pricing_binding_metadata", consumed)
     assert await coverage._read(driver, coverage.UUID(manifest.candidate_id), None, "sample_control") is REPORT
+    recipes.assert_called_once_with(
+        {"candidate_id": coverage.UUID(manifest.candidate_id), "manifest_status": "current"}
+    )
     assert len(calls) == 1 and calls[0][0] is driver and calls[0][1] is REPORT
 
 
-def test_native_set_query_preserves_all_original_singleton_predicates():
+@pytest.mark.parametrize("retained", (False, True))
+def test_native_set_query_preserves_all_original_singleton_predicates(retained):
     for has_projection in (False, True):
-        bulk_sql = projection.plan_release_binding_set_sql("synthetic", include_pricing_projection=has_projection)
+        bulk_sql = projection.plan_release_binding_set_sql(
+            "synthetic", include_pricing_projection=has_projection, retained=retained
+        )
         restored_sql = bulk_sql.replace(
             "revision.plan_release_id = ANY($1::text[])", "revision.plan_release_id = :plan_release_id"
         ).replace("$2", ":pin_owner_type")
         assert restored_sql == projection.plan_release_serving_sql(
-            "synthetic", include_pricing_projection=has_projection
+            "synthetic", include_pricing_projection=has_projection, retained=retained
         )
         assert "ptg2_current" not in bulk_sql and "LIMIT" not in bulk_sql
 

@@ -12,6 +12,7 @@ from api.network_address_scope import (
     scoped_address_parameters,
     scoped_address_relation_sql,
 )
+from api.network_read_execution import execute_network_read
 from api.plan_release_serving import PlanReleaseServingSelection
 from api.provider_service_source_policy import admitted_plan_release_bindings
 from api.ptg2_billing_search_contract import serving_unavailable
@@ -104,7 +105,8 @@ async def _retained_lineage(session, native, location_rows):
     from api.plan_pricing_projection_contract import address_provenance_sql
 
     query = address_provenance_sql(template.replace(marker, retained), native.PTG2_SCHEMA)
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text(query),
         {
             "location_keys": [request[0] for request in requests],

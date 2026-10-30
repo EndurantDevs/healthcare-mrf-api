@@ -7,6 +7,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
+from string import Template
 from typing import Any
 
 from sqlalchemy import text
@@ -76,7 +77,7 @@ def local_physical_binding_declared_sql(snapshot_alias: str, layout_alias: str) 
     )"""
 
 
-_PUBLISHED_SNAPSHOT_SQL = f"""
+_PUBLISHED_SNAPSHOT_TEMPLATE = f"""
             SELECT layout.layout_manifest->'serving_index'
                        AS layout_serving_index,
                    {local_physical_binding_declared_sql("snapshot", "layout")}
@@ -106,14 +107,14 @@ _PUBLISHED_SNAPSHOT_SQL = f"""
                    pg_backend_pid() > 0 AS backend_session_active,
                    txid_current_snapshot() IS NOT NULL
                        AS transaction_snapshot_observed
-              FROM __PTG2_SCHEMA__.ptg2_snapshot snapshot
-              JOIN __PTG2_SCHEMA__.ptg2_v3_snapshot_binding binding
+              FROM $ptg2_snapshot snapshot
+              JOIN $ptg2_v3_snapshot_binding binding
                 ON binding.snapshot_id = snapshot.snapshot_id
-              JOIN __PTG2_SCHEMA__.ptg2_v3_snapshot_layout layout
+              JOIN $ptg2_v3_snapshot_layout layout
                 ON layout.snapshot_key = binding.snapshot_key
-              JOIN __PTG2_SCHEMA__.ptg2_v3_snapshot_scope snapshot_scope
+              JOIN $ptg2_v3_snapshot_scope snapshot_scope
                 ON snapshot_scope.snapshot_id = snapshot.snapshot_id
-              JOIN __PTG2_SCHEMA__.ptg2_v3_candidate_audit_attestation attestation
+              JOIN $ptg2_v3_candidate_audit_attestation attestation
                 ON attestation.snapshot_id = snapshot.snapshot_id
                AND attestation.snapshot_key = binding.snapshot_key
                AND attestation.coverage_scope_id
@@ -141,7 +142,7 @@ _PUBLISHED_SNAPSHOT_SQL = f"""
                              )
                              ORDER BY source.source_key
                          ) AS source_identity_rows
-                    FROM __PTG2_SCHEMA__.ptg2_v3_snapshot_source source
+                    FROM $ptg2_v3_snapshot_source source
                    WHERE source.snapshot_id = snapshot.snapshot_id
               ) source_summary
              WHERE snapshot.snapshot_id = :snapshot_id
@@ -157,6 +158,31 @@ _PUBLISHED_SNAPSHOT_SQL = f"""
                    = snapshot_scope.plan_market_type
              LIMIT 1
         """
+
+_PUBLISHED_SOURCE_RELATIONS = (
+    "ptg2_snapshot",
+    "ptg2_v3_snapshot_binding",
+    "ptg2_v3_snapshot_layout",
+    "ptg2_v3_snapshot_scope",
+    "ptg2_v3_candidate_audit_attestation",
+    "ptg2_v3_snapshot_source",
+)
+_PUBLISHED_SNAPSHOT_SQL = Template(_PUBLISHED_SNAPSHOT_TEMPLATE).substitute(
+    {name: "__PTG2_SCHEMA__." + name for name in _PUBLISHED_SOURCE_RELATIONS}
+)
+
+
+def _published_source_read_sql(session, schema_name):
+    """Bind only fixed published query inputs to independently verified physical reads."""
+    from api.ptg2_code_scope import source_read_relation
+
+    return Template(_PUBLISHED_SNAPSHOT_TEMPLATE).substitute(
+        {
+            name: source_read_relation(session, schema_name, name, default=schema_name + "." + name)
+            for name in _PUBLISHED_SOURCE_RELATIONS
+        }
+    )
+
 
 PTG2_V3_ARCH_VERSION = "postgres_binary_v3"
 PTG2_V3_STORAGE_TYPE = "ptg2_shared_blocks_v3"
@@ -939,7 +965,12 @@ def _strict_v3_manifest_fields(
     )
 
 
-def _v4_provider_graph_root_sql(schema_name):
+def _v4_provider_graph_root_sql(schema_name, *, source_relations=None):
+    relations_by_role = source_relations or {
+        "root": f"{schema_name}.ptg2_v4_snapshot_map_root",
+        "layout": f"{schema_name}.ptg2_v3_snapshot_layout",
+        "diagnostic": f"{schema_name}.{PTG2_V4_GRAPH_DIAGNOSTIC_TABLE}",
+    }
     persisted_columns = ", ".join(
         (
             f"diagnostic.{field_name}"
@@ -954,10 +985,10 @@ def _v4_provider_graph_root_sql(schema_name):
                    root.projection_id_scope,
                    encode(root.map_digest, 'hex') AS map_digest,
                    {persisted_columns}
-              FROM {schema_name}.ptg2_v4_snapshot_map_root AS root
-              JOIN {schema_name}.ptg2_v3_snapshot_layout AS layout
+              FROM {relations_by_role["root"]} AS root
+              JOIN {relations_by_role["layout"]} AS layout
                 ON layout.snapshot_key = root.snapshot_key
-              JOIN {schema_name}.{PTG2_V4_GRAPH_DIAGNOSTIC_TABLE}
+              JOIN {relations_by_role["diagnostic"]}
                     AS diagnostic
                 ON diagnostic.snapshot_key = root.snapshot_key
              WHERE root.snapshot_key = :snapshot_key
@@ -974,8 +1005,20 @@ async def _load_v4_provider_graph_root(
     physical_binding=None,
 ) -> dict[str, Any]:
     schema_name = PTG2_SCHEMA if physical_binding is None else physical_binding.schema_name
+    options_by_name = {}
+    from api.ptg2_code_scope import is_source_api_reader, source_read_relation
+
+    if is_source_api_reader(session):
+        options_by_name["source_relations"] = {
+            role: source_read_relation(session, schema_name, name, default=f"{schema_name}.{name}")
+            for role, name in (
+                ("root", "ptg2_v4_snapshot_map_root"),
+                ("layout", "ptg2_v3_snapshot_layout"),
+                ("diagnostic", PTG2_V4_GRAPH_DIAGNOSTIC_TABLE),
+            )
+        }
     root_query_result = await session.execute(
-        text(_v4_provider_graph_root_sql(schema_name)),
+        text(_v4_provider_graph_root_sql(schema_name, **options_by_name)),
         {
             "snapshot_key": int(snapshot_key),
             "storage_generation": PTG2_V4_SHARED_GENERATION,
@@ -1158,8 +1201,17 @@ async def snapshot_serving_tables(
     *,
     candidate_audit_access: PTG2CandidateAuditAccess | None = None,
     include_billing_tax_identity_source: bool = False,
+    api_read: bool = False,
 ) -> PTG2ServingTables:
     """Load one published snapshot through its sealed shared-layout binding."""
+    from api.ptg2_code_scope import is_source_api_reader
+
+    if (
+        type(api_read) is not bool
+        or api_read
+        and (candidate_audit_access is not None or not is_source_api_reader(session))
+    ):
+        raise PTG2ManifestArtifactError("PTG Source API read mode is invalid")
 
     query_params_by_name: dict[str, Any] = {
         "snapshot_id": str(snapshot_id),
@@ -1261,7 +1313,11 @@ async def snapshot_serving_tables(
         """
     else:
         query_params_by_name["attestation_contracts"] = list(PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS)
-        query_sql = _PUBLISHED_SNAPSHOT_SQL.replace("__PTG2_SCHEMA__", PTG2_SCHEMA)
+        query_sql = (
+            _published_source_read_sql(session, PTG2_SCHEMA)
+            if api_read
+            else _PUBLISHED_SNAPSHOT_SQL.replace("__PTG2_SCHEMA__", PTG2_SCHEMA)
+        )
     snapshot_query = await session.execute(
         text(query_sql),
         query_params_by_name,
@@ -1283,6 +1339,7 @@ async def snapshot_serving_tables(
                 str(snapshot_id),
                 dict(row_fields),
                 is_prepared=candidate_audit_access is not None,
+                **({"api_read": True} if api_read else {}),
             )
         except PTG2PhysicalBindingError as error:
             raise PTG2ManifestArtifactError("PTG snapshot-local physical binding is not available") from error

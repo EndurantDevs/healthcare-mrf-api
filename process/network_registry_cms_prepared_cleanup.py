@@ -80,7 +80,14 @@ def _closed(document, model):
 
 def _request(document):
     request_by_field = dict(_closed(document, RegistryCMSRetentionRequest))
-    pin_by_field = dict(_closed(request_by_field.pop("source_pin"), PinnedFHIRMembershipSource))
+    pin_document = request_by_field.pop("source_pin")
+    pin_fields = {entry.name for entry in fields(PinnedFHIRMembershipSource)} - {
+        "retained_successor",
+        "retained_capture",
+    }
+    if type(pin_document) is not dict or set(pin_document) != pin_fields:
+        _invalid()
+    pin_by_field = dict(pin_document)
     if type(pin_by_field["custody_runtime_roles"]) is not list or pin_by_field["retained_epoch"] is not None:
         _invalid()
     pin_by_field["custody_runtime_roles"] = tuple(pin_by_field["custody_runtime_roles"])

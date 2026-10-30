@@ -6,11 +6,11 @@ from urllib.parse import parse_qs
 
 import asyncpg
 from sanic import Blueprint, response
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.control_auth import require_registry_auth
 from api.network_address_scope import network_address_read_scope
+from api.network_provider_only_read import read_network_provider_only_page
 from api.network_provider_read import (
     NetworkOfficeSelection,
     NetworkProviderNotFound,
@@ -23,6 +23,7 @@ from api.network_provider_read import (
 from api.network_provider_read import (
     _selector as validate_provider_identity,
 )
+from api.network_serving_read_context import network_serving_read_context
 from process.network_serving_read import (
     NetworkServingReadUnavailable,
     parse_canonical_network_ids,
@@ -52,7 +53,15 @@ def _parameters(request, *, is_detail):
     """Validate the complete unique selector boundary before database access."""
     if request.body or len(request.query_string.encode("utf-8")) > 2048:
         raise ValueError("network_provider_request_invalid")
-    allowed_names = {"network_ids", "network_generation", "location_id", "lat", "long", "radius_miles"}
+    allowed_names = {
+        "network_ids",
+        "network_generation",
+        "location_id",
+        "lat",
+        "long",
+        "radius_miles",
+        "membership_level",
+    }
     if not is_detail:
         allowed_names.update(("limit", "offset"))
     query_by_name = parse_qs(
@@ -63,6 +72,15 @@ def _parameters(request, *, is_detail):
         or "network_ids" not in query_by_name
         or any(len(query_values) != 1 for query_values in query_by_name.values())
     ):
+        raise ValueError("network_provider_request_invalid")
+    membership_level = query_by_name.get("membership_level", ["office"])[0]
+    if membership_level not in {"office", "provider"} or (
+        membership_level == "provider"
+        and (is_detail or set(query_by_name) & {"location_id", "lat", "long", "radius_miles"})
+    ):
+        raise ValueError("network_provider_request_invalid")
+    network_ids = parse_canonical_network_ids(query_by_name["network_ids"][0])
+    if membership_level == "provider" and len(network_ids) > 50:
         raise ValueError("network_provider_request_invalid")
     access_scope_sha256 = request.headers.get("X-Network-Access-Scope")
     if access_scope_sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", access_scope_sha256) is None:
@@ -79,7 +97,8 @@ def _parameters(request, *, is_detail):
         office_filters_by_name["location_id"] = query_by_name["location_id"][0]
     office_selection(**office_filters_by_name)
     return {
-        "network_ids": parse_canonical_network_ids(query_by_name["network_ids"][0]),
+        "network_ids": network_ids,
+        "membership_level": membership_level,
         "generation_id": generation_id,
         "limit": _decimal(query_by_name.get("limit", ["50"])[0], 1, 100),
         "offset": _decimal(query_by_name.get("offset", ["0"])[0], 0, 1_000_000),
@@ -98,6 +117,20 @@ def _error(status, generation_id=None):
     return response.json({"error": {"code": code_by_status[status]}}, status=status, headers=headers)
 
 
+async def _read_provider_page(connection, scope, parameters_by_name):
+    if parameters_by_name["membership_level"] == "provider":
+        return await read_network_provider_only_page(
+            connection, scope, limit=parameters_by_name["limit"], offset=parameters_by_name["offset"]
+        )
+    return await read_network_provider_page(
+        connection,
+        scope,
+        limit=parameters_by_name["limit"],
+        offset=parameters_by_name["offset"],
+        office_filters=NetworkOfficeSelection(**parameters_by_name["office_filters"]),
+    )
+
+
 async def _provider_response(request, *, provider_system=None, provider_id=None):
     """Pin and read one complete result in a request-owned read-only transaction."""
     require_registry_auth(request)
@@ -110,12 +143,10 @@ async def _provider_response(request, *, provider_system=None, provider_id=None)
         return _error(400)
     try:
         session = request.ctx.sa_session
-        async with session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            await session.execute(text("SET LOCAL lock_timeout='1s'"))
-            connection = await session.connection()
-            driver = (await connection.get_raw_connection()).driver_connection
-            manifest = await resolve_network_serving_manifest(driver, generation_id=parameters_by_name["generation_id"])
+        async with network_serving_read_context(session) as driver:
+            manifest = await resolve_network_serving_manifest(
+                driver, generation_id=parameters_by_name["generation_id"], api_read=True
+            )
             with network_address_read_scope(
                 manifest,
                 parameters_by_name["network_ids"],
@@ -130,13 +161,7 @@ async def _provider_response(request, *, provider_system=None, provider_id=None)
                         office_filters=NetworkOfficeSelection(**parameters_by_name["office_filters"]),
                     )
                 else:
-                    provider_document = await read_network_provider_page(
-                        driver,
-                        scope,
-                        limit=parameters_by_name["limit"],
-                        offset=parameters_by_name["offset"],
-                        office_filters=NetworkOfficeSelection(**parameters_by_name["office_filters"]),
-                    )
+                    provider_document = await _read_provider_page(driver, scope, parameters_by_name)
         return response.json(
             provider_document, headers=_HEADERS | {"X-Network-Generation": str(manifest.generation_id)}
         )

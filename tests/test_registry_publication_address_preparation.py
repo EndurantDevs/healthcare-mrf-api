@@ -199,6 +199,9 @@ async def test_custodian_callback_preserves_complete_census(monkeypatch, outcome
 
     identity = AsyncMock(side_effect=[identity_by_name, {} if outcome == "identity" else identity_by_name])
     reach = AsyncMock(side_effect=[None, ValueError("role_reach_changed") if outcome == "roles" else None])
+    from process import registry_composition_resume as resume
+
+    monkeypatch.setattr(resume, "resolve_registered_compact_format", AsyncMock(return_value=None))
     monkeypatch.setattr(worker, "_custody_identity", identity)
     monkeypatch.setattr(custody, "_q_reach_closed", reach)
     monkeypatch.setattr(composition, "prepare_registry_composition_address_artifact", prepare)
@@ -212,19 +215,7 @@ async def test_custodian_callback_preserves_complete_census(monkeypatch, outcome
         expected_head=0,
         address_sources=address_sources,
     )
-    if outcome in {"materialize", "retained"}:
-        prepared_sources = await operation
-        assert connection.committed and not connection.active
-        assert (
-            prepared_sources is address_sources
-            if outcome == "retained"
-            else prepared_sources.prepared_address_artifact is artifact
-        )
-        assert identity.await_count == reach.await_count == 2
-    else:
-        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else ValueError):
-            await operation
-        assert not connection.committed and not connection.active
+    await _assert_preparation_outcome(operation, connection, address_sources, artifact, identity, reach, outcome)
 
 
 @pytest.mark.parametrize("role_count", [0, 33, 128, 129])
@@ -390,3 +381,20 @@ async def test_rollback_preparation_rejects_unknown_or_noncallable_callbacks(cal
             writer_roles={},
             **callbacks,
         )
+
+
+async def _assert_preparation_outcome(operation, connection, address_sources, artifact, identity, reach, outcome):
+    """Check every success, retained-only, failure and cancellation outcome after the callback."""
+    if outcome in {"materialize", "retained"}:
+        prepared_sources = await operation
+        assert connection.committed and not connection.active
+        assert (
+            prepared_sources is address_sources
+            if outcome == "retained"
+            else prepared_sources.prepared_address_artifact is artifact
+        )
+        assert identity.await_count == reach.await_count == 2
+    else:
+        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else ValueError):
+            await operation
+        assert not connection.committed and not connection.active

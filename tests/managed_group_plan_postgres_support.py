@@ -167,7 +167,7 @@ async def test_managed_group_handler_real_source_policy_and_retained_offices(sou
     assert document["providers"]["total"] == 1
     assert [provider["npi"] for provider in document["providers"]["items"]] == [npi]
     addresses = document["providers"]["items"][0]["addresses"]
-    assert len(addresses) == 2 and {address["second_line"] for address in addresses} == {None, "Suite 1"}
+    assert len(addresses) == 2 and {address["second_line"] for address in addresses} == {None, "Suite 3"}
     assert document["providers"]["next_cursor"] == str(npi)
     _, all_sources = await app.asgi_client.post("/group", json={"excluded": []})
     assert all_sources.status == 200 and all_sources.json["providers"]["total"] == 1

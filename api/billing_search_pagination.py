@@ -331,13 +331,100 @@ async def _locked_address_relation_oids(session) -> tuple[int, int]:
     return relation_oids[0], relation_oids[1]
 
 
-async def capture_billing_search_generation_pin(
+async def _api_address_relation_oids(session) -> tuple[int, int]:
+    """Inventory the exact live address pair without conferring Source authority."""
+    from api.network_read_execution import _original_read_driver, install_network_read_inventory
+    from process.network_compact_layout import CompactAddressRelation
+
+    try:
+        address_relations = _quoted_address_relations()
+        schema = address_relations[0][0].split(".", 1)[0]
+        driver, backend_pid = await _original_read_driver(session)
+        transaction = session.get_transaction()
+        if transaction is None or driver.is_in_transaction() is not True:
+            raise _invalid_generation()
+        modes = await driver.fetchrow(
+            "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+        )
+        if modes is None or tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
+            raise _invalid_generation()
+        catalog_result = await session.execute(
+            text(
+                "SELECT c.relname::text,c.oid::bigint FROM pg_catalog.pg_class c "
+                "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname=:schema AND c.relname=ANY(CAST(:names AS text[])) AND c.relkind='r' "
+                "AND c.relpersistence IN ('p','u') AND NOT c.relispartition "
+                "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits i "
+                "WHERE i.inhrelid=c.oid OR i.inhparent=c.oid)"
+            ),
+            {"schema": schema, "names": list(_ADDRESS_TABLES)},
+        )
+        catalog_rows = catalog_result.all()
+        oid_by_name = dict(catalog_rows)
+        if (
+            len(catalog_rows) != 2
+            or set(oid_by_name) != set(_ADDRESS_TABLES)
+            or any(type(oid) is not int or oid <= 0 for oid in oid_by_name.values())
+        ):
+            raise _invalid_generation()
+        current_driver, current_pid = await _original_read_driver(session)
+        if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
+            raise _invalid_generation()
+        relations = tuple(CompactAddressRelation(schema, name, oid_by_name[name]) for name in _ADDRESS_TABLES)
+        await install_network_read_inventory(session, relations)
+        current_driver, current_pid = await _original_read_driver(session)
+        if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
+            raise _invalid_generation()
+        return oid_by_name["entity_address_unified"], oid_by_name["entity_address_evidence"]
+    except PTG2ManifestArtifactError:
+        raise
+    except Exception as error:
+        raise _invalid_generation() from error
+
+
+async def _capture_billing_search_api_generation_pin(
     session,
     selection: PlanReleaseServingSelection,
     *,
     contributing_bindings=None,
 ) -> BillingSearchGenerationPin:
+    """Keep the original cursor bytes while installing a physical API read inventory."""
+
+    snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection, contributing_bindings=contributing_bindings)
+    address_relation_oid, address_evidence_relation_oid = await _api_address_relation_oids(session)
+    generation_bundle_sha256 = _framed_sha256(
+        _GENERATION_BUNDLE_DOMAIN,
+        _canonical_json_bytes(
+            {
+                "address_relation_oid": address_relation_oid,
+                "address_evidence_relation_oid": address_evidence_relation_oid,
+                "address_selection_contract": BILLING_ADDRESS_SELECTION_CONTRACT,
+                "snapshot_set_sha256": snapshot_set_sha256,
+            }
+        ),
+    )
+    return BillingSearchGenerationPin(
+        snapshot_set_sha256=snapshot_set_sha256,
+        generation_bundle_sha256=generation_bundle_sha256,
+        address_relation_oid=address_relation_oid,
+        address_evidence_relation_oid=address_evidence_relation_oid,
+    )
+
+
+async def capture_billing_search_generation_pin(
+    session,
+    selection: PlanReleaseServingSelection,
+    *,
+    contributing_bindings=None,
+    api_read=False,
+) -> BillingSearchGenerationPin:
     """Lock the address relation and capture the complete serving generation."""
+    if type(api_read) is not bool:
+        raise _invalid_generation()
+    if api_read:
+        return await _capture_billing_search_api_generation_pin(
+            session, selection, contributing_bindings=contributing_bindings
+        )
 
     snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection, contributing_bindings=contributing_bindings)
     address_relation_oid, address_evidence_relation_oid = await _locked_address_relation_oids(session)

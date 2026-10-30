@@ -148,19 +148,35 @@ async def _build_serving_indexes(connection, schema_name, index_plan):
         await connection.execute(statement)
 
 
+async def _serving_index_records(connection, schema_name):
+    """Deparse the same complete index catalog independently of caller lookup settings."""
+    previous_path = await connection.fetchval("SELECT current_setting('search_path')")
+    await connection.execute("SET LOCAL search_path TO pg_catalog,public")
+    try:
+        index_records = await connection.fetch(
+            """
+            SELECT index_relation.oid AS index_oid,index_relation.relname,index_record.indrelid,
+                projected.oid AS table_oid,index_record.indisvalid,index_record.indisready,index_record.indislive,
+                pg_get_indexdef(index_relation.oid) AS index_definition
+            FROM pg_class projected JOIN pg_namespace namespace ON namespace.oid=projected.relnamespace
+            JOIN pg_index index_record ON index_record.indrelid=projected.oid
+            JOIN pg_class index_relation ON index_relation.oid=index_record.indexrelid
+            WHERE namespace.nspname=$1 AND projected.relname='entity_address_unified'
+        """,
+            schema_name,
+        )
+    except BaseException as failure:
+        try:
+            await connection.execute("SELECT set_config('search_path',$1,true)", previous_path)
+        except BaseException:
+            raise failure from None
+        raise
+    await connection.execute("SELECT set_config('search_path',$1,true)", previous_path)
+    return index_records
+
+
 async def _index_digest(connection, schema_name, index_plan):
-    index_records = await connection.fetch(
-        """
-        SELECT index_relation.oid AS index_oid,index_relation.relname,index_record.indrelid,
-            projected.oid AS table_oid,index_record.indisvalid,index_record.indisready,index_record.indislive,
-            pg_get_indexdef(index_relation.oid) AS index_definition
-        FROM pg_class projected JOIN pg_namespace namespace ON namespace.oid=projected.relnamespace
-        JOIN pg_index index_record ON index_record.indrelid=projected.oid
-        JOIN pg_class index_relation ON index_relation.oid=index_record.indexrelid
-        WHERE namespace.nspname=$1 AND projected.relname='entity_address_unified'
-    """,
-        schema_name,
-    )
+    index_records = await _serving_index_records(connection, schema_name)
     actual_by_name = {record["relname"]: record for record in index_records}
     if not all(index_name in actual_by_name for index_name, _ in index_plan) or any(
         record["indrelid"] != record["table_oid"]

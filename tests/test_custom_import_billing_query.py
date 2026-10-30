@@ -334,7 +334,7 @@ async def test_invalid_native_candidate_scope_fails_before_sql(candidates):
 )
 async def test_invalid_composed_ordinals_cannot_produce_an_order_proof(require_match, ordinals):
     candidates = (candidate(), candidate(binding_ordinal=1))
-    session = Mock(execute=AsyncMock(return_value=Mock()))
+    session = Mock(info={}, execute=AsyncMock(return_value=Mock()))
     session.execute.return_value.scalars.return_value.all.return_value = ordinals
 
     with pytest.raises(BillingSearchServingUnavailableError):
@@ -349,7 +349,7 @@ async def test_invalid_composed_ordinals_cannot_produce_an_order_proof(require_m
 async def test_composed_order_proof_retains_complete_native_identities(require_match, ordinals):
     candidates = (candidate(), candidate(binding_ordinal=1))
     context = _context(require_match=require_match)
-    session = Mock(execute=AsyncMock(return_value=Mock()))
+    session = Mock(info={}, execute=AsyncMock(return_value=Mock()))
     session.execute.return_value.scalars.return_value.all.return_value = ordinals
 
     ordered, proof = await composition.compose_billing_candidates(

@@ -33,6 +33,7 @@ def _empty_page(**changes):
 
 def _replay(monkeypatch, pages, *, source_rows=1):
     """Provide reader-contract outputs while keeping the replay guards real."""
+    monkeypatch.setattr(composition, "fhir_physical_source", lambda source: source)
     pin = SimpleNamespace(
         retained_capture=SimpleNamespace(origin=SimpleNamespace(resource_counts=(("PractitionerRole", source_rows),)))
     )

@@ -406,12 +406,19 @@ def _catalog_digest(catalog):
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-async def _verify(connection, receipt, identity_json):
+async def _verify(connection, receipt, identity_json, *, api_read=False):
+    if type(api_read) is not bool:
+        raise ValueError("attribution read mode is invalid")
+    if api_read:
+        from process.network_address_artifact import _require_api_read_context
+
+        await _require_api_read_context(connection, True)
     _validate_receipt(receipt)
     if receipt.identity_json != identity_json:
         raise ValueError("attribution full recipe differs")
     relation = receipt.rates_relation
-    await connection.execute(f"LOCK TABLE {relation} IN ACCESS SHARE MODE")
+    if not api_read:
+        await connection.execute(f"LOCK TABLE {relation} IN ACCESS SHARE MODE")
     namespace = await _namespace(connection, receipt.schema_name)
     if namespace is None or _decode(namespace["receipt"]) != receipt:
         raise ValueError("attribution protected publication differs")
@@ -595,8 +602,56 @@ async def prepare_em_attribution_in_session(
         raise PlanPricingProjectionUnavailable("E&M attribution preparation is unavailable") from None
 
 
-async def resolve_em_attribution(session, selection):
+async def _resolve_em_attribution_api(session, selection):
+    """Verify unchanged release/custody proof and bind subsequent rates reads to this session."""
+    from api.network_read_execution import _original_read_driver, install_network_read_inventory
+    from process.network_address_artifact import _require_api_read_context
+    from process.network_compact_layout import CompactAddressRelation
+
+    try:
+        identity = _identity(selection)
+        transaction = session.get_transaction()
+        if transaction is None:
+            raise ValueError("attribution read transaction is unavailable")
+        connection, backend_pid = await _original_read_driver(session)
+        if session.get_transaction() is not transaction:
+            raise ValueError("attribution read transaction changed")
+        await _require_api_read_context(connection, True)
+        current = await builder._selected_release(session, selection.plan_release_id, selection.serving_revision_id)
+        if _identity(current) != identity:
+            raise ValueError("attribution selection is stale or filtered")
+        namespace = await _namespace(connection, identity[2])
+        if namespace is None:
+            raise ValueError("attribution publication is absent")
+        receipt = await _verify(connection, _decode(namespace["receipt"]), identity[0], api_read=True)
+        current_driver, current_pid = await _original_read_driver(session)
+        if (
+            current_driver is not connection
+            or current_pid != backend_pid
+            or session.get_transaction() is not transaction
+        ):
+            raise ValueError("attribution read transaction changed")
+        await install_network_read_inventory(
+            session, (CompactAddressRelation(receipt.schema_name, "rates", receipt.table_oid),)
+        )
+        current_driver, current_pid = await _original_read_driver(session)
+        if (
+            current_driver is not connection
+            or current_pid != backend_pid
+            or session.get_transaction() is not transaction
+        ):
+            raise ValueError("attribution read transaction changed")
+        return receipt
+    except Exception:
+        raise PlanPricingProjectionUnavailable("E&M attribution is unavailable") from None
+
+
+async def resolve_em_attribution(session, selection, *, api_read=False):
     """Verify the full current release recipe and immutable custody without rescanning rates."""
+    if type(api_read) is not bool:
+        raise PlanPricingProjectionUnavailable("E&M attribution is unavailable")
+    if api_read:
+        return await _resolve_em_attribution_api(session, selection)
     try:
         identity = _identity(selection)
         connection = await _driver(session)

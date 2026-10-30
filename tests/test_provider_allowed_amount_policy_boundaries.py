@@ -82,12 +82,12 @@ async def test_office_inputs_pin_exact_manifest_and_propagate_dependency_failure
     )
     inputs = object()
     resolver = AsyncMock(return_value=inputs)
-    monkeypatch.setattr(network_em_provider_inputs, "resolve_em_provider_inputs", resolver)
+    monkeypatch.setattr(network_em_provider_inputs, "resolve_em_provider_inputs_in_session", resolver)
     assert await allowed.allowed_office_inputs(session) is None
     session.connection.assert_not_awaited()
     with held_scope() as manifest:
         assert await allowed.allowed_office_inputs(session) is inputs
-        resolver.assert_awaited_once_with(driver, manifest)
+        resolver.assert_awaited_once_with(session, manifest)
         resolver.side_effect = PlanPricingProjectionUnavailable("held dependency changed")
         with pytest.raises(PlanPricingProjectionUnavailable, match="dependency"):
             await allowed.allowed_office_inputs(session)
@@ -160,6 +160,9 @@ def test_zip_only_office_survives_missing_polygon_reference(predicate):
           INSERT INTO held_inputs.geo_zip_lookup VALUES('00002','IL','Illinois');
           INSERT INTO held_inputs.tiger_zip_state VALUES('00002','IL');""")
         joins = allowed.allowed_geo_joins(HeldInputs(), "mrf")
+        assert 'JOIN ONLY "held_inputs"."tiger_zcta5"' in joins
+        # SQLite has no inheritance; execute the remaining geographic policy unchanged.
+        joins = joins.replace("JOIN ONLY ", "JOIN ")
         assert connection.execute(f"""SELECT addr.zip5,allowed_zcta_ref.zcta5ce
           FROM (SELECT '00002' AS zip5,'IL' AS state_name,'IL' AS state_code,NULL AS lat,NULL AS long) addr
           {joins} WHERE {predicate}""").fetchall() == [("00002", None)]

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from api import reference_family_reads
 from db.connection import current_session
 from tests.test_api_reader_sessions import ReaderSession, reader_database
 from tests.test_db_connection import _FakeSession
@@ -41,6 +42,7 @@ async def test_cold_request_reader_replacement_uses_existing_cleanup_lifecycle(m
     await callbacks["request"](request)
     assert current_session() is ordinary
     assert await database.bind_request_reader(request) is reader
+    reference_family_reads.pin_claims_reader.assert_awaited_once_with(reader, api_read=True)
     assert ordinary.closed and not ordinary.committed and not ordinary.rolled_back
     assert request.ctx.sa_session is reader and database.has_reader_session()
     assert await database.bind_request_reader(request) is reader

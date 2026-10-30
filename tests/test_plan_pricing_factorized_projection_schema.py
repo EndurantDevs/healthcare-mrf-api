@@ -104,9 +104,23 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
     assert "CHECK (contract_version = 'plan_pricing_card_v2')" in sql
 
 
+def _assert_current_registry_head(script):
+    """Keep the complete catalog refresh and inventory revision chain explicit."""
+    assert script.get_heads() == ["20261029010000_registry_source_inventory"]
+    assert (
+        script.get_revision("20261029010000_registry_source_inventory").down_revision
+        == "20261028020000_registry_membership_refresh"
+    )
+    assert (
+        script.get_revision("20261028020000_registry_membership_refresh").down_revision
+        == "20261028010000_registry_fhir_catalog"
+    )
+
+
 def test_factorized_projection_precedes_the_unique_repository_head() -> None:
+    """Preserve factorized pricing ancestry through the current unique registry head."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["20261025020000_company_affiliation_join"]
+    _assert_current_registry_head(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"

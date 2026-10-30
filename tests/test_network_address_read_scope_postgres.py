@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 from sanic import Sanic, response
+from sanic.compat import Header
 from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import MetaData, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -24,14 +25,16 @@ from api.network_address_scope import (
     scoped_address_relation_sql,
     scoped_address_statement,
 )
+from api.network_read_execution import execute_network_read
 from api.provider_geo_sql import nearby_row_tiebreaker
 from api.provider_list_sql import _is_unified_address_table, _provider_list_connection, _provider_list_parameters
 from db.models import EntityAddressUnified, Issuer, NPIData, NPIDataTaxonomy, NPIDataTaxonomyGroup, PlanNetworkTierRaw
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_network_address_projection_postgres import projection_db
-from tests.test_network_membership_publication_postgres import _candidate_writer_roles, _publish
-from tests.test_network_membership_serving_indexes_postgres import _prepare, serving_indexes_db
+from tests.test_network_custom_address_source_postgres import custom_db as custom_db
+from tests.test_network_membership_serving_indexes_postgres import serving_indexes_db
 from tests.test_network_membership_validation_postgres import validation_db
+from tests.test_network_provider_routes_postgres import provider_app as provider_app
 from tests.test_network_serving_schema_postgres import serving_schema
 
 
@@ -145,6 +148,69 @@ async def test_count_page_and_existing_hydration_keep_exact_location(serving_ind
             assert scoped_address_cache_key("legacy:42") != first_key
 
 
+async def _attached_scope_keys(session, manifest, selector, *, inherited=False, typed=False):
+    options = (
+        {"excluded_network_ids": (), "access_scope_sha256": "a" * 64}
+        if selector == "default"
+        else {"legacy_checksums": (42,)}
+        if selector == "legacy"
+        else {}
+    )
+    with network_address_read_scope(manifest, None if selector == "default" else (42,), **options):
+        if typed:
+            statement = scoped_address_statement(select(EntityAddressUnified.location_key))
+        else:
+            relation = scoped_address_relation_sql("mrf.entity_address_unified")
+            if inherited:
+                relation = relation.replace("FROM ONLY ", "FROM ").replace("JOIN ONLY ", "JOIN ")
+            statement = text(f"SELECT location_key FROM {relation} addresses")
+        result = await execute_network_read(session, statement, scoped_address_parameters({}))
+        return sorted(result.scalars().all())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["selected", "default", "legacy"])
+async def test_scope_readers_exclude_children_after_native_pin(default_address_db, default_scope_reader, selector):
+    fixture = default_address_db
+    engine, role = default_scope_reader
+    manifest = replace(await _manifest(fixture), approved_custom_revision=8)
+    parent = f'"{manifest.schema_name}".entity_address_unified'
+    child = f'"{fixture.control_schema}".unsealed_address_child'
+    ghost_key = "e" * 64
+    await fixture.connection.execute(f"CREATE TABLE {child} (LIKE {parent} INCLUDING CONSTRAINTS)")
+    try:
+        await fixture.connection.execute(
+            f"INSERT INTO {child} SELECT (jsonb_populate_record(NULL::{parent},to_jsonb(row)||$1::jsonb)).* "
+            f"FROM ONLY {parent} row LIMIT 1",
+            json.dumps(
+                {
+                    "location_key": ghost_key,
+                    "row_origin": "base",
+                    "canonical_network_ids": [42],
+                    "plans_network_array": [42],
+                }
+            ),
+        )
+        async with async_sessionmaker(engine)() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            baseline = await _attached_scope_keys(session, manifest, selector)
+        async with async_sessionmaker(engine)() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            assert (await session.execute(text("SELECT session_user,current_user"))).one() == (role, role)
+            assert (
+                await session.scalar(text("SELECT to_regclass(:name)::oid::bigint"), {"name": parent})
+                == manifest.address_table_oid
+            )
+            await fixture.connection.execute(f"ALTER TABLE {child} INHERIT {parent}")
+            assert await _attached_scope_keys(session, manifest, selector, inherited=True) == sorted(
+                [*baseline, ghost_key]
+            )
+            for typed in (False, True):
+                assert await _attached_scope_keys(session, manifest, selector, typed=typed) == baseline
+    finally:
+        await fixture.connection.execute(f"DROP TABLE {child}")
+
+
 async def test_all_phone_classification_counts_use_retained_offices(serving_indexes_db, serving_schema, monkeypatch):
     """The actual list count branch needs only selected retained phone rows."""
     manifest = await _manifest(serving_indexes_db)
@@ -163,6 +229,7 @@ async def test_all_phone_classification_counts_use_retained_offices(serving_inde
         lambda conditions: f'(SELECT * FROM "{schema}".phone_test_taxonomy WHERE {conditions}) AS q',
     )
     async with async_sessionmaker(engine)() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         request = SimpleNamespace(
             args={"count_only": "1", "format": "all", "phone": "2125550100", "primary_only": "0"},
             app=SimpleNamespace(),
@@ -177,7 +244,7 @@ async def test_all_phone_classification_counts_use_retained_offices(serving_inde
 def _canonical_read_app(engine, invoked_generations):
     """Register request sessions and actual shared hydration for native HTTP proof."""
     app = Sanic("canonical_network_read_" + uuid4().hex)
-    sessions = async_sessionmaker(engine)
+    sessions = async_sessionmaker(engine.execution_options(isolation_level="REPEATABLE READ", postgresql_readonly=True))
 
     @app.middleware("request")
     async def open_session(request):
@@ -195,7 +262,7 @@ def _canonical_read_app(engine, invoked_generations):
         """Run actual shared NPI hydration under the registered scope wrapper."""
         invoked_generations.append(current_network_address_scope().manifest.generation_id)
         addresses_by_npi = await npi._fetch_npi_location_candidates_map(
-            [1111111111, 2222222222, 3333333333],
+            [1000000004, 1000000491],
             session=request.ctx.sa_session,
         )
         return response.json(
@@ -209,6 +276,7 @@ def _canonical_read_app(engine, invoked_generations):
         raise NotFound("Provider has no location in this network.")
 
     @app.get("/provider/<provider_npi>")
+    @canonical_network_read
     async def read_provider(request, provider_npi):
         """Exercise the real provider detail guard before any mutable enrichment."""
         return await npi.get_npi(request, provider_npi)
@@ -235,56 +303,75 @@ async def _assert_rejected_selectors(app, headers_by_name, invoked_generations):
         assert rejected.status == 400 and invoked_generations == []
 
 
+@pytest.fixture
+async def protected_provider_app(provider_app):
+    """Protect the fixture's fixed control identities and restore their exact owners and grants."""
+    from tests.test_network_canonical_cutover_postgres import _nearby_control_identity
+
+    fixture = provider_app.fixture
+    connection, schema = fixture.connection, fixture.control_schema
+    namespace, tables = await _nearby_control_identity(connection, schema)
+    try:
+        async with connection.transaction():
+            await connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO "{fixture.roles["owner"]}"')
+            for table in tables:
+                await connection.execute(
+                    f'ALTER TABLE "{schema}"."{table["relname"]}" OWNER TO "{fixture.roles["owner"]}"'
+                )
+        yield provider_app
+    finally:
+        async with connection.transaction():
+            for table in tables:
+                await connection.execute(f'ALTER TABLE "{schema}"."{table["relname"]}" OWNER TO {namespace["owner"]}')
+            await connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO {namespace["owner"]}')
+        assert await _nearby_control_identity(connection, schema) == (namespace, tables)
+
+
 @pytest.mark.asyncio
-async def test_registered_http_wrapper_uses_verified_manifest_and_no_fallback(
-    serving_indexes_db, serving_schema, monkeypatch
-):
+async def test_registered_http_wrapper_uses_verified_manifest_and_no_fallback(protected_provider_app, monkeypatch):
     """Require real frozen publication for every authenticated HTTP address read."""
-    fixture = serving_indexes_db
-    _, _, engine = serving_schema
+    fixture = protected_provider_app.fixture
+    network_id = protected_provider_app.source_network_id
+    generation_id = await fixture.connection.fetchval(
+        f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
+    )
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-read-token")
-    async with fixture.connection.transaction():
-        await _prepare(fixture)
-    async with _candidate_writer_roles(fixture):
-        async with fixture.connection.transaction():
-            manifest = await _publish(fixture)
-        invoked_generations = []
-        app = _canonical_read_app(engine, invoked_generations)
-        headers_by_name = {"Authorization": "Bearer synthetic-network-read-token"}
-        await _assert_rejected_selectors(app, headers_by_name, invoked_generations)
-        _, invalid_access = await app.asgi_client.get(
-            "/addresses?network_ids=42",
-            headers={**headers_by_name, "X-Network-Access-Scope": "invalid"},
+    invoked_generations = []
+    app = _canonical_read_app(protected_provider_app.engine, invoked_generations)
+    headers_by_name = {"Authorization": "Bearer synthetic-network-read-token"}
+    await _assert_rejected_selectors(app, headers_by_name, invoked_generations)
+    _, invalid_access = await app.asgi_client.get(
+        f"/addresses?network_ids={network_id}",
+        headers={**headers_by_name, "X-Network-Access-Scope": "invalid"},
+    )
+    assert invalid_access.status == 400 and invoked_generations == []
+    _, member = await app.asgi_client.get(f"/addresses?network_ids={network_id}", headers=headers_by_name)
+    assert member.status == 200 and member.json == {"locations": ["a" * 64]}
+    assert member.headers["X-Network-Generation"] == str(generation_id)
+    assert member.headers["Cache-Control"] == "private, no-store"
+    _, missing_provider = await app.asgi_client.get(f"/absent?network_ids={network_id}", headers=headers_by_name)
+    assert missing_provider.status == 404
+    assert missing_provider.headers["X-Network-Generation"] == str(generation_id)
+    assert missing_provider.headers["Cache-Control"] == "private, no-store"
+    for update_flag in ("sync_geocode", "force_address_update"):
+        _, update_rejected = await app.asgi_client.get(
+            f"/provider/1000000004?network_ids={network_id}&{update_flag}=true", headers=headers_by_name
         )
-        assert invalid_access.status == 400 and invoked_generations == []
-        _, member = await app.asgi_client.get("/addresses?network_ids=42", headers=headers_by_name)
-        assert member.status == 200 and member.json == {"locations": ["a" * 64]}
-        assert member.headers["X-Network-Generation"] == str(manifest["generation_id"])
-        assert member.headers["Cache-Control"] == "private, no-store"
-        _, missing_provider = await app.asgi_client.get("/absent?network_ids=42", headers=headers_by_name)
-        assert missing_provider.status == 404
-        assert missing_provider.headers["X-Network-Generation"] == str(manifest["generation_id"])
-        assert missing_provider.headers["Cache-Control"] == "private, no-store"
-        for update_flag in ("sync_geocode", "force_address_update"):
-            _, update_rejected = await app.asgi_client.get(
-                "/provider/1111111111?network_ids=42&" + update_flag + "=true", headers=headers_by_name
-            )
-            assert update_rejected.status == 400
-            assert update_rejected.headers["X-Network-Generation"] == str(manifest["generation_id"])
-        _, absent = await app.asgi_client.get("/addresses?network_ids=99", headers=headers_by_name)
-        assert absent.status == 200 and absent.json == {"locations": []}
-        _, retained = await app.asgi_client.get(
-            f"/addresses?network_ids=42&network_generation={manifest['generation_id']}",
-            headers=headers_by_name,
-        )
-        assert retained.status == 200 and retained.json == member.json
-        await fixture.connection.execute(
-            f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false WHERE generation_id=$1',
-            manifest["generation_id"],
-        )
-        _, unavailable = await app.asgi_client.get("/addresses?network_ids=42", headers=headers_by_name)
-        assert unavailable.status == 503 and len(invoked_generations) == 3
-        assert current_network_address_scope() is None
+        assert update_rejected.status == 400
+        assert update_rejected.headers["X-Network-Generation"] == str(generation_id)
+    _, absent = await app.asgi_client.get("/addresses?network_ids=2147483647", headers=headers_by_name)
+    assert absent.status == 200 and absent.json == {"locations": []}
+    _, retained = await app.asgi_client.get(
+        f"/addresses?network_ids={network_id}&network_generation={generation_id}", headers=headers_by_name
+    )
+    assert retained.status == 200 and retained.json == member.json
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false WHERE generation_id=$1',
+        generation_id,
+    )
+    _, unavailable = await app.asgi_client.get(f"/addresses?network_ids={network_id}", headers=headers_by_name)
+    assert unavailable.status == 503 and len(invoked_generations) == 3
+    assert current_network_address_scope() is None
 
 
 @pytest.mark.asyncio
@@ -322,6 +409,7 @@ async def test_native_batch_candidates_exclude_provider_wide_overlay(serving_ind
 
     monkeypatch.setattr(npi, "_fetch_provider_directory_address_overlay_map", reject_overlay)
     async with async_sessionmaker(engine)() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         with network_address_read_scope(manifest, (42,)):
             ranked = await npi._rank_npi_batch_addresses([1111111111, 2222222222], session=session)
             assert len(ranked[1111111111]) == 1 and ranked[2222222222] == []
@@ -343,6 +431,7 @@ async def test_empty_scope_result_never_relaxes_to_checksum_or_other_office(serv
     manifest = await _manifest(fixture)
     _, _, engine = serving_schema
     async with async_sessionmaker(engine)() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         with network_address_read_scope(manifest, (99,)):
             assert await npi._fetch_npi_location_candidates_map([1111111111, 3333333333], session=session) == {}
             assert await npi._fetch_npi_address_rows_map([1111111111, 3333333333], session=session) == {}
@@ -766,9 +855,10 @@ def test_default_scope_requires_closed_policy_and_keeps_nested_selected_identity
             scoped_address_relation_sql("mrf.entity_address_unified"),
             scoped_address_cache_key("detail"),
         )
+        assert selected_sql.startswith("(/* network-read:")
         assert (
-            selected_sql
-            == '(SELECT * FROM "network_candidate_00000000000000000000000000000001".entity_address_unified WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))'
+            selected_sql.split(" */ ", 1)[1]
+            == 'SELECT * FROM ONLY "network_candidate_00000000000000000000000000000001".entity_address_unified WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))'
         )
         with network_address_read_scope(manifest, None, excluded_network_ids=(88,), access_scope_sha256="a" * 64):
             assert current_network_address_scope().network_ids is None
@@ -1006,6 +1096,9 @@ class _ScopedReportSession:
         self.session = session
         self.schema = schema
 
+    def __getattr__(self, name):
+        return getattr(self.session, name)
+
     async def execute(self, statement, parameters=None):
         import re
 
@@ -1121,15 +1214,16 @@ def _legacy_header_mapping_records(ambiguous):
         ("42", "42", True),
     ],
 )
-async def test_native_legacy_header_mapping_must_equal_authorized_ids(
+async def test_native_legacy_header_mapping_component_scope(
     serving_indexes_db, serving_schema, monkeypatch, checksums, ids, denied
 ):
-    """Resolve original aliases using actual pinned-revision SQL before reading any office."""
-    from sanic.compat import Header
-    from sanic.exceptions import Forbidden
-
+    """Native mapping/consumption only; the existing manifest double supplies no Source authority."""
     from api.network_address_scope import _pin_network_scope
     from process import network_serving_read
+    from process.network_address_projection import _identifier
+    from process.network_compact_layout import CompactAddressRelation
+    from process.network_read_identity import verify_consumed_network_relations
+    from process.registry_network_catalog_read import _LEGACY_BATCH_SQL
 
     fixture = serving_indexes_db
     manifest = replace(await _manifest(fixture), approved_custom_revision=4)
@@ -1145,6 +1239,7 @@ async def test_native_legacy_header_mapping_must_equal_authorized_ids(
             json.dumps(document),
         )
     async with async_sessionmaker(engine)() as session, session.begin():
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         request = SimpleNamespace(
             headers=Header(
                 {
@@ -1155,11 +1250,26 @@ async def test_native_legacy_header_mapping_must_equal_authorized_ids(
             ),
             ctx=SimpleNamespace(sa_session=session),
         )
-        arguments_by_name = {"network_ids": ids, "network_generation": "1"}
-        if denied:
-            with pytest.raises(Forbidden):
-                await _pin_network_scope(request, arguments_by_name)
-        else:
-            actual_manifest, network_ids, _, actual_checksums = await _pin_network_scope(request, arguments_by_name)
-            assert actual_manifest is manifest and network_ids == (42,)
-            assert actual_checksums == tuple(map(int, checksums.split(",")))
+        transaction = session.get_transaction()
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        backend_pid = driver.get_server_pid()
+        actual_manifest, network_ids, _, actual_checksums = await _pin_network_scope(
+            request, {"network_ids": ids, "network_generation": "1"}
+        )
+        assert actual_manifest is manifest and network_ids == tuple(map(int, ids.split(",")))
+        assert actual_checksums == tuple(map(int, checksums.split(",")))
+        oid = await driver.fetchval("SELECT to_regclass($1)::oid::bigint", schema + ".registry_approved_record")
+        mapping = await driver.fetchrow(
+            _LEGACY_BATCH_SQL.format(control="ONLY " + _identifier(schema)),
+            manifest.approved_custom_revision,
+            tuple(map(str, actual_checksums)),
+            "checksum_network",
+            (),
+        )
+        await verify_consumed_network_relations(
+            driver, (CompactAddressRelation(schema, "registry_approved_record", oid),), expected_backend_pid=backend_pid
+        )
+        assert session.get_transaction() is transaction
+        assert (await (await session.connection()).get_raw_connection()).driver_connection is driver
+        assert (mapping["complete"] is True and mapping["network_ids"] == list(network_ids)) is (not denied)
+        assert current_network_address_scope() is None

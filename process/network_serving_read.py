@@ -57,6 +57,21 @@ class PinnedNetworkServingManifest:
     manifest_sha256: str
     address_table_oid: int
 
+    @property
+    def compact_layout(self):
+        """Keep verified physical routing outside the public manifest wire format."""
+        return getattr(self, "_compact_layout", None)
+
+    @property
+    def candidate_relation_pins(self):
+        """Verified candidate data identities, outside the public manifest wire format."""
+        return getattr(self, "_candidate_relation_pins", ())
+
+    @property
+    def custody_control(self):
+        """Independent control identity for API snapshot checks; metadata is not payload authority."""
+        return getattr(self, "_custody_control", None)
+
 
 def parse_canonical_network_ids(value: str) -> tuple[int, ...]:
     """Parse the explicit network_ids selector, independently of legacy checksums."""
@@ -148,18 +163,35 @@ def _verified_writer_closure(candidate, catalog):
 
 
 def _pinned_manifest(entry, *, custody=None):
+    """Authenticate the retained manifest and bind its protected physical dependencies."""
     candidate = json.loads(entry["candidate_json"])
     manifest = json.loads(entry["manifest_json"])
     readiness = _publication_readiness(candidate)
     retained = _retained_manifest(manifest, readiness, replayed=True)
     if retained["schema_name"] != "network_candidate_" + UUID(retained["candidate_id"]).hex:
         raise NetworkServingReadUnavailable("Network serving schema identity differs")
+    from process.network_compact_readiness import is_compact_candidate
+
+    is_compact = is_compact_candidate(candidate)
+    if is_compact and (custody is None or custody.get("compact_layout") is None):
+        raise NetworkServingReadUnavailable("Compact network dependencies lack protected custody")
+    from process.registry_source_contribution_store import verify_registry_source_contributions
+    from process.registry_source_inventory_reference import source_inventory_heaps
+
+    if custody is None and (
+        source_inventory_heaps(candidate) or verify_registry_source_contributions(candidate) is not None
+    ):
+        raise NetworkServingReadUnavailable("Source contribution dependencies lack protected custody")
     if custody is None:
         address_table_oid = _verified_writer_closure(candidate, json.loads(entry["catalog_json"]))
     else:
         if custody["receipt"]["index_definition_sha256"] != readiness[2]["index_definition_sha256"]:
             raise NetworkServingReadUnavailable("Sealed native index definitions differ from validation")
-        address_table_oid = custody["receipt"]["closure"]["relation_oids"]["entity_address_unified"]
+        address_table_oid = (
+            custody["compact_layout"].base.table_oid
+            if is_compact
+            else custody["receipt"]["closure"]["relation_oids"]["entity_address_unified"]
+        )
     pinned = PinnedNetworkServingManifest(
         **{
             field: retained[field]
@@ -175,18 +207,40 @@ def _pinned_manifest(entry, *, custody=None):
         },
         address_table_oid=address_table_oid,
     )
-    if custody is not None:
-        # Keep custody proof outside serialized retained/public manifest contracts.
-        object.__setattr__(pinned, "_custody_seal_sha256", custody["seal_sha256"])
+    _attach_manifest_custody(pinned, custody, readiness, is_compact)
     return pinned
 
 
-async def resolve_network_serving_manifest(connection, *, generation_id: int | None = None, control_schema=None):
+def _attach_manifest_custody(pinned, custody, readiness, is_compact):
+    from process.network_compact_layout import CompactAddressRelation
+
+    physical_closure = custody["receipt"]["closure"] if custody is not None else readiness[3]
+    object.__setattr__(
+        pinned,
+        "_candidate_relation_pins",
+        tuple(
+            CompactAddressRelation(pinned.schema_name, name, oid)
+            for name, oid in sorted(physical_closure["relation_oids"].items())
+        ),
+    )
+    if custody is not None:
+        # Keep custody proof outside serialized retained/public manifest contracts.
+        object.__setattr__(pinned, "_custody_seal_sha256", custody["seal_sha256"])
+        object.__setattr__(pinned, "_custody_control", dict(custody["receipt"]["control"]))
+    if is_compact:
+        object.__setattr__(pinned, "_compact_layout", custody["compact_layout"])
+
+
+async def resolve_network_serving_manifest(
+    connection, *, generation_id: int | None = None, control_schema=None, api_read=False
+):
     """Pin the current or retained manifest and verify its physical custody.
 
     The caller owns the transaction and uses this same identity for every query
     in the request. An unavailable canonical generation never selects legacy data.
     """
+    if type(api_read) is not bool:
+        raise NetworkServingReadUnavailable("Network read verification mode is invalid")
     if generation_id is not None and (type(generation_id) is not int or not 0 < generation_id <= 9223372036854775807):
         raise NetworkServingReadUnavailable("Network serving generation is invalid")
     if not connection.is_in_transaction():
@@ -197,7 +251,9 @@ async def resolve_network_serving_manifest(connection, *, generation_id: int | N
         if entry is None:
             raise NetworkServingReadUnavailable("Network serving manifest is unavailable")
         candidate = json.loads(entry["candidate_json"])
-        custody = await _candidate_custody(connection, candidate, namespace[1:-1])
+        custody = await _candidate_custody(
+            connection, candidate, namespace[1:-1], **({"api_read": True} if api_read else {})
+        )
         return _pinned_manifest(entry, custody=custody)
     except (ValueError, TypeError, KeyError, asyncpg.PostgresError) as error:
         if isinstance(error, NetworkServingReadUnavailable):

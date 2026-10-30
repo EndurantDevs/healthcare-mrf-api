@@ -290,8 +290,14 @@ async def _admit(admission, selection, *, excluded=(_EXCLUDED,)):
             await asyncio.sleep(0)
             driver.remove_query_logger(queries.append)
     assert not any("binding_matches AS MATERIALIZED" in query.query for query in queries)
-    assert sum("to_jsonb(candidate)::text AS candidate_json" in query.query for query in queries) == 2
-    assert sum("validation_json::text AS validation_json" in query.query for query in queries) == 1
+    candidate_queries = [query for query in queries if "to_jsonb(candidate)::text AS candidate_json" in query.query]
+    assert len(candidate_queries) == 1
+    assert candidate_queries[0].args == (admission.manifest.generation_id, False)
+    assert candidate_queries[0].exception is None
+    assert not any("validation_json::text AS validation_json" in query.query for query in queries)
+    seals = [query for query in queries if "SELECT seal_sha256,receipt_json::text AS receipt_json" in query.query]
+    assert len(seals) == 1 and seals[0].exception is None
+    assert tuple(map(str, seals[0].args)) == (admission.manifest.candidate_id,)
     batches = [query for query in queries if query.query.startswith("WITH source_rows AS MATERIALIZED")]
     assert len(batches) == 3 and all(query.exception is None for query in batches)
     assert batches[1].args[1] == batches[2].args[1] == admission.manifest.approved_custom_revision

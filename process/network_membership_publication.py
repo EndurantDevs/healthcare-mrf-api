@@ -22,13 +22,13 @@ class NetworkPublicationError(ValueError):
 
 
 def _publication_readiness(candidate):
-    from process.registry_source_recipe_store import RegistrySourceRecipeError, verify_registry_source_recipes
+    from process.registry_source_inventory_reference import verify_source_recipe_metadata
 
     try:
-        verify_registry_source_recipes({**candidate, "source_recipes_json": candidate.get("source_recipes_json", [])})
-    except RegistrySourceRecipeError:
+        verify_source_recipe_metadata({**candidate, "source_recipes_json": candidate.get("source_recipes_json", [])})
+    except ValueError:
         raise NetworkPublicationError("Candidate source recipes differ from their retained digest") from None
-    report = _json_object(candidate["validation_json"])
+    report = _json_object(candidate.get("validation_json"))
     if type(report) is not dict or type(report.get("address_source")) is not dict:
         raise NetworkPublicationError("Candidate lacks a pinned validation report")
     address_source = PinnedAddressSource(**report["address_source"])
@@ -38,8 +38,13 @@ def _publication_readiness(candidate):
     report = _validated_replay(candidate, scope_report)
     if scope_report["source_generations"].get("unified_address") != address_source.generation_id:
         raise NetworkPublicationError("Candidate source generation differs from validation")
-    canonical_readiness = _ready_replay(candidate, report, scope_report)
     _complete_accounting(report)
+    from process.network_compact_readiness import compact_readiness, is_compact_candidate
+
+    if is_compact_candidate(candidate):
+        canonical, serving = compact_readiness(candidate, report, scope_report)
+        return scope_report, canonical, serving, _publication_writer_closure(candidate, report)
+    canonical_readiness = _ready_replay(candidate, report, scope_report)
     serving_readiness = report.get("serving_readiness")
     if (
         type(serving_readiness) is not dict
@@ -54,6 +59,12 @@ def _publication_readiness(candidate):
     ):
         raise NetworkPublicationError("Candidate lacks matching full serving readiness")
     return scope_report, canonical_readiness, serving_readiness, _publication_writer_closure(candidate, report)
+
+
+publication_candidate_readiness = _publication_readiness
+
+
+_publication_readiness = publication_candidate_readiness
 
 
 def _publication_writer_closure(candidate, report):
@@ -87,11 +98,23 @@ def _publication_writer_closure(candidate, report):
     )
     if any(closure[role_group] != expected for role_group, expected in roles_by_group.items()):
         raise NetworkPublicationError("Candidate writer roles differ from their canonical receipt")
-    required_heaps = {"network_membership", "provider_location_binding", "entity_address_unified"}
+    from process.network_compact_readiness import compact_serving_heaps, is_compact_candidate
+
+    required_heaps = {"network_membership", "provider_location_binding"}
+    required_heaps.update(
+        compact_serving_heaps(candidate) if is_compact_candidate(candidate) else {"entity_address_unified"}
+    )
     if retention is not None:
         required_heaps.add(SOURCE_TABLE)
+    from process.registry_source_contribution_store import CONTRIBUTION_TABLE, verify_registry_source_contributions
+
+    if verify_registry_source_contributions(candidate) is not None:
+        required_heaps.add(CONTRIBUTION_TABLE)
+    from process.registry_source_inventory_reference import source_inventory_heaps
+
+    required_heaps.update(source_inventory_heaps(candidate))
     if type(closure.get("relation_oids")) is not dict or set(closure["relation_oids"]) != required_heaps:
-        raise NetworkPublicationError("Candidate writer closure lacks the projected address heap")
+        raise NetworkPublicationError("Candidate writer closure differs from its serving storage")
     return closure
 
 
@@ -176,7 +199,8 @@ def _retained_manifest(manifest, readiness, *, replayed):
     }
 
 
-async def _lock_publication_controls(connection, namespace):
+async def lock_publication_controls(connection, namespace):
+    """Lock revision and serving singletons in publication order and return their current generations."""
     revision_control = await connection.fetchrow(
         f"SELECT approved_revision FROM {namespace}.registry_revision_control WHERE id=1 FOR UPDATE"
     )
@@ -186,6 +210,9 @@ async def _lock_publication_controls(connection, namespace):
     if revision_control is None or serving_control is None:
         raise NetworkPublicationError("Publication singleton controls are missing")
     return revision_control["approved_revision"], serving_control["generation_id"] or 0
+
+
+_lock_publication_controls = lock_publication_controls
 
 
 async def _insert_manifest(connection, namespace, candidate, readiness):
@@ -225,30 +252,43 @@ async def _verify_provider_custody(connection, candidate, closure):
     return await verify_candidate_em_provider_inputs(connection, candidate, runtime_roles=runtime_roles)
 
 
-async def _candidate_custody(connection, candidate, control_schema):
+async def _candidate_custody(connection, candidate, control_schema, *, api_read=False):
+    from process.registry_source_inventory_reference import source_inventory_heaps
+
     target = MembershipCopyTarget(
         *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
     )
-    return await verify_network_candidate_custody(connection, target, control_schema=control_schema, required=False)
+    if type(api_read) is not bool:
+        raise NetworkPublicationError("Candidate read verification mode is invalid")
+    verifier = verify_network_candidate_custody
+    if api_read:
+        from process.network_candidate_custody import verify_network_candidate_read_metadata
+
+        verifier = verify_network_candidate_read_metadata
+    custody = await verifier(
+        connection, target, control_schema=control_schema, required=bool(source_inventory_heaps(candidate))
+    )
+    from process.network_compact_readiness import is_compact_candidate
+
+    if custody is not None and is_compact_candidate(candidate):
+        from process.network_compact_dependencies import verify_compact_dependencies
+
+        layout = await verify_compact_dependencies(
+            connection, candidate, control_schema=control_schema, **({"api_read": True} if api_read else {})
+        )
+        return {**custody, "compact_layout": layout}
+    return custody
 
 
-async def _publish_candidate(connection, copy_target, namespace):
+async def _publish_candidate(connection, copy_target, namespace, source_rollback_authority=None):
+    """Publish only the locked ready candidate with exact custody and rollback authority."""
     approved_revision, current_head = await _lock_publication_controls(connection, namespace)
     candidate = await _locked_candidate(connection, copy_target, namespace)
     if candidate["state"] not in {"ready", "published"}:
         raise NetworkPublicationError("Candidate must be fully ready before publication")
     readiness = _publication_readiness(candidate)
     closure = readiness[3]
-    custody = await _candidate_custody(connection, candidate, namespace[1:-1])
-    if custody is None:
-        await verify_network_candidate_writer_closure(
-            connection,
-            copy_target,
-            owner_role=closure["owner_role"],
-            loader_roles=tuple(closure["loader_roles"]),
-            reader_roles=tuple(closure["reader_roles"]),
-            control_schema=namespace[1:-1],
-        )
+    custody = await _require_publication_custody(connection, copy_target, candidate, namespace, closure)
     await _verify_provider_custody(connection, candidate, closure)
     manifest = await connection.fetchrow(
         f"SELECT * FROM {namespace}.network_serving_manifest WHERE candidate_id=$1", UUID(copy_target.candidate_id)
@@ -263,10 +303,58 @@ async def _publish_candidate(connection, copy_target, namespace):
         raise NetworkPublicationError("Approved custom revision changed before publication")
     if current_head != candidate["expected_head"]:
         raise NetworkPublicationError("Expected serving head changed before publication")
+    from process.network_serving_read import resolve_network_serving_manifest
+    from process.registry_fhir_serving_preservation import fhir_preservation_obligation
+
+    generations = _json_object(candidate["source_generations"])
+    report = _json_object(candidate["validation_json"])
+    is_historical_source = (
+        report.get("registry_fhir_serving_preservation", {}).get("operation") == "source_rollback"
+        or "registry_source_rollback" in report
+    )
+    if current_head and generations.get("retained_network_source") is not None:
+        current = await resolve_network_serving_manifest(
+            connection, generation_id=current_head, control_schema=namespace[1:-1]
+        )
+        is_historical_source = is_historical_source or generations["retained_network_source"] != current.manifest_sha256
+    reviewed_source = None
+    if is_historical_source or source_rollback_authority is not None:
+        from process.registry_publication_execution import require_registry_source_rollback_publication_authority
+
+        reviewed_source = await require_registry_source_rollback_publication_authority(
+            connection, source_rollback_authority, copy_target, candidate, control_schema=namespace[1:-1]
+        )
+    predecessor = await fhir_preservation_obligation(
+        connection, candidate, control_schema=namespace[1:-1], reviewed_source_manifest=reviewed_source
+    )
+    if predecessor is not None and custody is None:
+        raise NetworkPublicationError("FHIR serving preservation requires independent candidate custody")
     return await _insert_manifest(connection, namespace, candidate, readiness)
 
 
-async def publish_network_candidate(connection, copy_target, *, control_schema=None):
+async def _require_publication_custody(connection, copy_target, candidate, namespace, closure):
+    custody = await _candidate_custody(connection, candidate, namespace[1:-1])
+    if custody is None:
+        from process.network_compact_readiness import is_compact_candidate
+
+        if is_compact_candidate(candidate):
+            raise NetworkPublicationError("Compact publication requires independent physical custody")
+        from process.registry_source_contribution_store import verify_registry_source_contributions
+
+        if verify_registry_source_contributions(candidate) is not None:
+            raise NetworkPublicationError("Source contributions require independent physical custody")
+        await verify_network_candidate_writer_closure(
+            connection,
+            copy_target,
+            owner_role=closure["owner_role"],
+            loader_roles=tuple(closure["loader_roles"]),
+            reader_roles=tuple(closure["reader_roles"]),
+            control_schema=namespace[1:-1],
+        )
+    return custody
+
+
+async def publish_network_candidate(connection, copy_target, *, control_schema=None, source_rollback_authority=None):
     """Atomically publish trusted readiness, or replay its retained manifest.
 
     Caller owns commit/rollback. Protected custody or legacy native writer
@@ -279,7 +367,7 @@ async def publish_network_candidate(connection, copy_target, *, control_schema=N
     try:
         namespace = _identifier(control_schema if control_schema is not None else registry_schema())
         async with connection.transaction():
-            return await _publish_candidate(connection, copy_target, namespace)
+            return await _publish_candidate(connection, copy_target, namespace, source_rollback_authority)
     except (ValueError, TypeError) as error:
         if isinstance(error, NetworkPublicationError):
             raise

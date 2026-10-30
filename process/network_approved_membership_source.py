@@ -12,6 +12,7 @@ from uuid import UUID, uuid5
 
 import asyncpg
 
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_candidate_lifecycle import (
     _control_namespace,
     _locked_candidate,
@@ -25,6 +26,7 @@ from process.network_membership_copy import (
     _encode,
     partition_network_membership_commands,
 )
+from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
@@ -260,7 +262,21 @@ async def read_approved_membership_commands(
     )
 
 
-async def _scope(connection, approved_revision, namespace, *, retained=False, legacy=False):
+async def _verify_approved_consumption(connection, namespace, read_identity):
+    if read_identity is None:
+        return
+    if (
+        type(read_identity) is not tuple
+        or len(read_identity) != 2
+        or type(read_identity[0]) is not CompactAddressRelation
+        or read_identity[0].schema_name != namespace[1:-1]
+        or read_identity[0].table_name != "registry_approved_record"
+    ):
+        raise ApprovedMembershipSourceError("Approved source read identity is invalid")
+    await verify_consumed_network_relations(connection, (read_identity[0],), expected_backend_pid=read_identity[1])
+
+
+async def _scope(connection, approved_revision, namespace, *, retained=False, legacy=False, read_identity=None):
     _counter(approved_revision)
     if not connection.is_in_transaction():
         raise ApprovedMembershipSourceError("Approved source requires a caller-owned repeatable-read transaction")
@@ -274,7 +290,8 @@ async def _scope(connection, approved_revision, namespace, *, retained=False, le
             MAX_INPUT_BYTES,
             namespace[1:-1],
         )
-    except asyncpg.PostgresError as error:
+        await _verify_approved_consumption(connection, namespace, read_identity)
+    except (asyncpg.PostgresError, NetworkReadIdentityError) as error:
         raise ApprovedMembershipSourceError("Approved source prerequisites are unavailable") from error
     if scope is None or scope["approved_revision"] != approved_revision:
         raise ApprovedMembershipSourceError("Approved source revision no longer matches the control pin")
@@ -294,9 +311,57 @@ async def pin_approved_membership_source(connection, *, approved_revision, contr
     return await _scope(connection, approved_revision, _control_namespace(control_schema))
 
 
-async def pin_retained_approved_membership_source(connection, *, approved_revision, control_schema=None):
+async def pin_retained_approved_membership_source(
+    connection, *, approved_revision, control_schema=None, read_identity=None
+):
     """Fingerprint the exact approved revision retained by a verified serving manifest."""
-    return await _scope(connection, approved_revision, _control_namespace(control_schema), retained=True)
+    return await _scope(
+        connection,
+        approved_revision,
+        _control_namespace(control_schema),
+        retained=True,
+        **({"read_identity": read_identity} if read_identity is not None else {}),
+    )
+
+
+async def pin_api_retained_approved_membership_source(connection, manifest, *, control_schema=None):
+    """Authenticate an approved snapshot and its current physical race pin on this API backend.
+
+    Re-resolve the manifest instead of trusting DTO/private JSON fields. This pin
+    is not a historical seal; Source readers still require their independent seal.
+    """
+    from process.network_candidate_custody import read_network_control_relation_pins
+    from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
+
+    try:
+        if type(manifest) is not PinnedNetworkServingManifest:
+            raise ApprovedMembershipSourceError("Approved API manifest is unavailable")
+        current = await resolve_network_serving_manifest(
+            connection, generation_id=manifest.generation_id, control_schema=control_schema, api_read=True
+        )
+        if current != manifest:
+            raise ApprovedMembershipSourceError("Approved API manifest differs")
+        namespace = _control_namespace(control_schema)
+        control = current.custody_control
+        if control is not None and type(control) is not dict:
+            raise ApprovedMembershipSourceError("Approved API control metadata differs")
+        (relation,) = await read_network_control_relation_pins(
+            connection,
+            ("registry_approved_record",),
+            control_schema=namespace[1:-1],
+            expected_candidate_table_oid=None if control is None else control["candidate_table_oid"],
+        )
+        pid = connection.get_server_pid()
+        approved = await _scope(
+            connection, current.approved_custom_revision, namespace, retained=True, read_identity=(relation, pid)
+        )
+        if approved.generation_id != current.source_generations.get("custom_membership"):
+            raise ApprovedMembershipSourceError("Approved API source generation differs")
+        return approved, relation
+    except (asyncpg.PostgresError, ValueError, TypeError, KeyError) as error:
+        if isinstance(error, ApprovedMembershipSourceError):
+            raise
+        raise ApprovedMembershipSourceError("Approved API source is unavailable") from error
 
 
 async def _read_batch(connection, source, offset, limit, namespace):

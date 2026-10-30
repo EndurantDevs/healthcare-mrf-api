@@ -264,7 +264,7 @@ def test_expensive_native_publication_cases_use_distinct_shards() -> None:
 
 @pytest.mark.parametrize("shard_count", (32, 48))
 def test_registry_shards_isolate_long_publications_and_preserve_every_case(shard_count) -> None:
-    """Long proofs keep their process budget without sharing it with ordinary cases."""
+    """Keep reserved proofs apart while moving only the anchor's ordinary collisions."""
     heavy_nodeids = list(SHARDER.EXCLUSIVE_REGISTRY_TEST_SHARDS)
     ordinary_nodeids = [
         *(node + "[variant]" for node in heavy_nodeids),
@@ -280,14 +280,78 @@ def test_registry_shards_isolate_long_publications_and_preserve_every_case(shard
         "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[legacy]",
         "tests/test_registry_execution_catalog_postgres.py::test_retained_fhir_capture_is_certified_only_with_complete_native_custody[modern]",
     ]
-    assert shards[:21] == [[node] for node in heavy_nodeids]
-    assert all(shards)
+    for index, node in enumerate(heavy_nodeids):
+        assert node in shards[index]
+        if shard_count == 32 or index not in (1, 6, 10, 16):
+            assert shards[index] == [node]
+    if shard_count == 48:
+        assert shards[21] == []
+    assert all(shard for index, shard in enumerate(shards) if shard_count != 48 or index != 21)
     assert sorted(node for shard in shards for node in shard) == sorted(nodeids)
     assert all(shard == sorted(shard) for shard in shards)
     for node in ordinary_nodeids:
         digest = int.from_bytes(hashlib.sha256(node.encode()).digest(), byteorder="big")
-        assert SHARDER.shard_index_for_nodeid(node, shard_count) == 21 + digest % (shard_count - 21)
+        expected = 21 + digest % (shard_count - 21)
+        if shard_count == 48 and expected == 21:
+            module_digest = int.from_bytes(hashlib.sha256(node.split("::", 1)[0].encode()).digest(), byteorder="big")
+            expected = (1, 6, 10, 16)[module_digest % 4]
+        assert SHARDER.shard_index_for_nodeid(node, shard_count) == expected
     assert SHARDER.TEST_PROCESS_TIMEOUT_SECONDS == "295s"
+
+
+@pytest.mark.parametrize("shard_count", (1, 2, 4, 6, 8, 16, 32, 48))
+def test_new_cms_anchor_moves_only_its_exact_forty_eight_shard_case(shard_count) -> None:
+    anchor = (
+        "tests/test_registry_cms_refresh_anchors_postgres.py"
+        "::test_cms_anchor_uses_genuine_accepted_notification_and_original_native_evidence"
+    )
+    nodeids = [
+        anchor,
+        anchor + "[variant]",
+        anchor.replace("tests/", "other/", 1),
+        anchor.replace("::test_", "::TestAnchor::test_"),
+        *(f"tests/test_unrelated.py::test_case[{index}]" for index in range(5000)),
+    ]
+    shards = [
+        SHARDER.select_nodeids(nodeids, shard_count=shard_count, shard_index=index) for index in range(shard_count)
+    ]
+    assert sorted(node for shard in shards for node in shard) == sorted(nodeids)
+    assert len(SHARDER.EXCLUSIVE_REGISTRY_TEST_SHARDS) == 21
+    if shard_count == 48:
+        assert shards[21] == [anchor]
+    for node in nodeids:
+        digest = int.from_bytes(hashlib.sha256(node.encode()).digest(), byteorder="big")
+        original = 21 + digest % (shard_count - 21) if shard_count in (32, 48) else digest % shard_count
+        expected = original
+        if shard_count == 48:
+            if node == anchor:
+                expected = 21
+            elif original == 21:
+                module_digest = int.from_bytes(
+                    hashlib.sha256(node.split("::", 1)[0].encode()).digest(), byteorder="big"
+                )
+                expected = (1, 6, 10, 16)[module_digest % 4]
+        assert SHARDER.shard_index_for_nodeid(node, shard_count) == expected
+    assert SHARDER.TEST_PROCESS_TIMEOUT_SECONDS == "295s"
+
+
+def test_anchor_collisions_keep_module_fixtures_together() -> None:
+    """Fixed natural collisions exercise every destination without splitting a module."""
+    destination_by_nodeid = {
+        "tests/test_gamma.py::test_case[10]": 1,
+        "tests/test_gamma.py::test_case[77]": 1,
+        "tests/test_epsilon.py::test_case[32]": 6,
+        "tests/test_epsilon.py::test_case[34]": 6,
+        "tests/test_alpha.py::test_case[23]": 10,
+        "tests/test_alpha.py::test_case[69]": 10,
+        "tests/test_group_0.py::test_case[7]": 16,
+        "tests/test_group_0.py::test_case[39]": 16,
+    }
+    for node, destination in destination_by_nodeid.items():
+        digest = int.from_bytes(hashlib.sha256(node.encode()).digest(), byteorder="big")
+        assert 21 + digest % 27 == 21
+        assert SHARDER.shard_index_for_nodeid(node, 48) == destination
+        assert SHARDER.shard_index_for_nodeid(node, 32) == 21 + digest % 11
 
 
 def _main_cost_moves() -> dict[str, tuple[int, int]]:

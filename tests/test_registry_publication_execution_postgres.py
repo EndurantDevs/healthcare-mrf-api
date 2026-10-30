@@ -72,6 +72,7 @@ from tests.test_registry_candidate_composition_postgres import (
     _initial_arguments,
     _publish_composition_target,
     _remove_candidates,
+    _reviewed_source_rollback_request,
     _roles,
     _rollback_members,
     _rollback_reader,
@@ -1295,7 +1296,7 @@ async def test_source_publication_explicit_review_commits_head_audit_and_preserv
             before = await _rollback_members(reader, pin)
             calls = []
             result_by_name = await _complete_source_publication(source_publication, _reactivation_authority(calls))
-            assert len(calls) == 3 and all(call["command"] == command for call in calls)
+            assert len(calls) == 4 and all(call["command"] == command for call in calls)
             assert result_by_name["candidate_id"] == preview["candidate_id"]
             assert result_by_name["candidate_sha256"] == preview["candidate_sha256"]
             assert result_by_name["previous_generation_id"] == history.second.generation_id
@@ -1446,7 +1447,9 @@ async def test_source_publication_refuses_changed_review_pins_and_closure(source
 async def test_source_publication_competing_native_head_preserves_reviewed_ready_candidate(source_publication):
     history, _command, _actor, _queued, _lease, preview = source_publication
     fixture = history.fixture
-    request_id = uuid4()
+    request_id = await _reviewed_source_rollback_request(
+        fixture, history.first, history.revision, history.second.generation_id
+    )
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         approved = await pin_approved_membership_source(
             fixture.connection, approved_revision=history.revision, control_schema=fixture.control_schema
@@ -1456,13 +1459,7 @@ async def test_source_publication_competing_native_head_preserves_reviewed_ready
         fixture.connection, **{**history.arguments_by_name, "request_id": request_id}
     )
     try:
-        await execution.prepare_network_candidate(
-            fixture.connection, competing_target, addresses, **_roles(fixture), control_schema=fixture.control_schema
-        )
-        async with fixture.connection.transaction():
-            competing_manifest = await execution.publish_network_candidate(
-                fixture.connection, competing_target, control_schema=fixture.control_schema
-            )
+        competing_manifest = await _publish_composition_target(fixture, competing_target, addresses)
         with pytest.raises(RegistryApprovalConflict, match="registry_source_rollback_revision_conflict"):
             await _complete_source_publication(source_publication, _reactivation_authority([]))
         assert (

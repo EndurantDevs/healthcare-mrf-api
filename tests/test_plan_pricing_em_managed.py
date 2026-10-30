@@ -12,9 +12,13 @@ from api import network_address_scope as address_scope
 from api import plan_pricing_em_distance as distance
 from api import plan_pricing_em_managed as managed
 from api import ptg2_serving
+from api.network_read_execution import NetworkReadStatements, install_network_read_inventory
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from api.plan_release_serving import PlanReleaseServingSelection, PlanReleaseSnapshotBinding
 from api.ptg2_serving import PTG2LocationScopeError
+from process import network_em_provider_inputs as input_contract
+from process.network_compact_layout import CompactAddressRelation
+from tests.network_read_execution_support import with_read_identity_receipts
 
 
 @pytest.fixture
@@ -30,11 +34,17 @@ def held(monkeypatch):
         "hpserve_example", "hprelease_example", "hpplan_example", None, "2026-08", "published", "a" * 64, bindings
     )
     scope = SimpleNamespace(
-        manifest=SimpleNamespace(schema_name="network_candidate_example", approved_custom_revision=17),
+        manifest=SimpleNamespace(
+            schema_name="network_candidate_example",
+            approved_custom_revision=17,
+            compact_layout=None,
+            address_table_oid=99,
+        ),
         network_ids=None,
         legacy_checksums=None,
         excluded_network_ids=(7,),
         address_predicate_sql=address_scope._default_address_predicate(),
+        read_statements=NetworkReadStatements(["a" * 64, None, (7,), "b" * 64]),
     )
     inputs = _retained_inputs()
     state = SimpleNamespace(
@@ -66,14 +76,22 @@ def _mock_authority_resolvers(state, monkeypatch):
         state.events.append("admission")
         return state.admitted
 
-    async def artifact(_session, actual):
-        assert actual is state.selection
+    async def artifact(actual_session, actual, *, api_read=False):
+        assert actual_session is state.session and actual is state.selection and api_read is True
         state.events.append("artifact")
+        await install_network_read_inventory(actual_session, (CompactAddressRelation("held_rates", "rate", 100),))
         return SimpleNamespace(rates_relation='"held_rates"."rate"')
 
-    async def resolve_inputs(_driver, manifest):
-        assert manifest is state.scope.manifest
+    async def resolve_inputs(actual_session, manifest):
+        assert actual_session is state.session and manifest is state.scope.manifest
         state.events.append("inputs")
+        await install_network_read_inventory(
+            actual_session,
+            tuple(
+                CompactAddressRelation(item.schema_name, item.table_name, item.relation_oid)
+                for item in state.inputs.relations
+            ),
+        )
         return state.inputs
 
     state.session = _reader_session(state)
@@ -81,12 +99,13 @@ def _mock_authority_resolvers(state, monkeypatch):
     attribution.ATTRIBUTION_CONTRACT = "example_attribution_v1"
     attribution.resolve_em_attribution = AsyncMock(side_effect=artifact)
     provider_inputs = ModuleType("process.network_em_provider_inputs")
-    provider_inputs.resolve_em_provider_inputs = AsyncMock(side_effect=resolve_inputs)
+    provider_inputs.resolve_em_provider_inputs_in_session = AsyncMock(side_effect=resolve_inputs)
+    provider_inputs.em_provider_geo_reads_sql = input_contract.em_provider_geo_reads_sql
     monkeypatch.setitem(sys.modules, attribution.__name__, attribution)
     monkeypatch.setitem(sys.modules, provider_inputs.__name__, provider_inputs)
     monkeypatch.setattr(managed, "admitted_plan_release_bindings", AsyncMock(side_effect=admit))
     state.attribution = attribution.resolve_em_attribution
-    state.resolve_inputs = provider_inputs.resolve_em_provider_inputs
+    state.resolve_inputs = provider_inputs.resolve_em_provider_inputs_in_session
 
 
 def _retained_inputs():
@@ -101,18 +120,14 @@ def _retained_inputs():
         "tiger.zcta5",
         "tiger.zip_state",
     )
-    relations_by_role = {role: f'"held_example"."{role.replace(".", "_")}"' for role in roles}
-    geo_by_relation = {
-        role if role.startswith("tiger.") else f"{managed.SCHEMA}.{role}": {
-            "schema_name": "held_example",
-            "table_name": role.replace(".", "_"),
-            "relation_oid": index + 1,
-            "relfilenode": index + 20,
-        }
-        for index, role in enumerate(roles)
-        if role not in {"npi", "npi_taxonomy", "nucc_taxonomy"}
-    }
-    return SimpleNamespace(relation=relations_by_role.__getitem__, geo_bindings=lambda _schema: geo_by_relation)
+    return input_contract.EMProviderInputs(
+        tuple(
+            input_contract.EMProviderInputRelation(
+                role, "held_example", role.replace(".", "_"), "example_generation", index + 1, index + 20
+            )
+            for index, role in enumerate(roles)
+        )
+    )
 
 
 def _reader_session(state):
@@ -153,13 +168,14 @@ def _reader_session(state):
         return state.envelope_mutation({"count": len(rows), "bytes": len(encoded), "rows_json": encoded})
 
     state.driver = SimpleNamespace(fetchrow=AsyncMock(side_effect=fetchrow))
-    return SimpleNamespace(
-        execute=AsyncMock(side_effect=execute),
-        connection=AsyncMock(
-            return_value=SimpleNamespace(
-                get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=state.driver))
-            )
+    transaction = object()
+    return with_read_identity_receipts(
+        SimpleNamespace(
+            execute=AsyncMock(side_effect=execute),
+            get_transaction=lambda: transaction,
+            info={},
         ),
+        driver=state.driver,
     )
 
 
@@ -300,7 +316,7 @@ async def test_managed_window_grows_to_the_existing_cap_without_fallback(held):
 async def test_completion_rejects_more_than_101_provider_identities(held):
     rows = [{"npi": index} for index in range(102)]
     with pytest.raises(PlanPricingProjectionUnavailable, match="page bound"):
-        await managed._complete_page(held.driver, held.inputs, "rate", rows, (3,), 3)
+        await managed._complete_page(held.session, held.inputs, "rate", rows, (3,), 3)
     held.driver.fetchrow.assert_not_awaited()
 
 

@@ -25,6 +25,7 @@ from process.network_fhir_retained_capture_contract import PRODUCER as RETAINED_
 from process.network_fhir_retained_capture_contract import is_sha256
 from process.network_membership_candidate_indexes import _catalog_readiness
 from process.network_membership_serving_indexes import _index_digest, _serving_plan
+from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 
@@ -40,13 +41,18 @@ class RegistryNetworkCatalogError(ValueError):
     """The request, retained proof or approved metadata is unavailable."""
 
 
-def _integer(number, maximum, *, minimum=1):
+def catalog_integer(number, maximum, *, minimum=1):
+    """Require an actual integer within the inclusive request bounds."""
     if type(number) is not int or not minimum <= number <= maximum:
         raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
     return number
 
 
-def _text(text, maximum):
+_integer = catalog_integer
+
+
+def catalog_text(text, maximum):
+    """Require bounded, trimmed UTF-8 request text without control characters."""
     if (
         type(text) is not str
         or not text
@@ -62,7 +68,11 @@ def _text(text, maximum):
     return text
 
 
-def _uuid(identifier):
+_text = catalog_text
+
+
+def catalog_uuid(identifier):
+    """Require a nonzero UUID encoded in its canonical string form."""
     try:
         parsed = UUID(identifier) if type(identifier) is str else None
     except ValueError:
@@ -70,6 +80,9 @@ def _uuid(identifier):
     if parsed is None or not parsed.int or str(parsed) != identifier:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     return identifier
+
+
+_uuid = catalog_uuid
 
 
 def _retained_fhir_scope(scope, producer_id):
@@ -83,11 +96,26 @@ def _retained_fhir_scope(scope, producer_id):
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
 
 
+def _retained_product_scope(scope, producer_id):
+    if (
+        producer_id != RETAINED_FHIR_PRODUCER
+        or type(scope["insurance_plan_id"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", scope["insurance_plan_id"]) is None
+        or not is_sha256(scope["capture_sha256"])
+        or type(scope["product_network_id"]) is not int
+        or not 1 <= scope["product_network_id"] <= 2147483647
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+
+
 def _source_scope(system, scope, *, producer_id=None):
     if type(scope) is not dict:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     if system == "fhir" and set(scope) == {"organization_id", "capture_sha256"}:
         _retained_fhir_scope(scope, producer_id)
+        return scope
+    if system == "fhir" and set(scope) == {"insurance_plan_id", "capture_sha256", "product_network_id"}:
+        _retained_product_scope(scope, producer_id)
         return scope
     if system == "ptg" and "review_type" in scope:
         from process.registry_published_plan_binding_refs import (
@@ -102,11 +130,7 @@ def _source_scope(system, scope, *, producer_id=None):
     if system == "ptg" and set(scope) == {"cohort_id", "company_key", "snapshot_id"}:
         for key, entry in scope.items():
             _text(entry, 512 if key == "company_key" else 128)
-    elif system == "fhir" and set(scope) == {
-        "organization_id",
-        "legacy_uuid",
-        "alias_scope",
-    }:
+    elif system == "fhir" and set(scope) == {"organization_id", "legacy_uuid", "alias_scope"}:
         if (
             type(scope["organization_id"]) is not str
             or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", scope["organization_id"]) is None
@@ -143,7 +167,8 @@ def _source_scope(system, scope, *, producer_id=None):
     return scope
 
 
-def _exclusions(network_ids):
+def catalog_exclusions(network_ids):
+    """Require bounded, strictly increasing positive network identifiers."""
     if type(network_ids) is not tuple or len(network_ids) > MAX_EXCLUSIONS:
         raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
     previous = 0
@@ -153,6 +178,9 @@ def _exclusions(network_ids):
             raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
         previous = network_id
     return network_ids
+
+
+_exclusions = catalog_exclusions
 
 
 @dataclass(frozen=True)
@@ -182,7 +210,8 @@ class RegistryNetworkCatalogQuery:
             raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
 
 
-def _closed_json(encoded, maximum):
+def catalog_closed_json(encoded, maximum):
+    """Decode bounded JSON while rejecting duplicate keys and nonfinite constants."""
     if type(encoded) is not bytes or len(encoded) > maximum:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
 
@@ -201,6 +230,9 @@ def _closed_json(encoded, maximum):
         return json.loads(encoded, object_pairs_hook=_object_pairs, parse_constant=_invalid_constant)
     except ValueError, UnicodeError:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid") from None
+
+
+_closed_json = catalog_closed_json
 
 
 @dataclass(frozen=True)
@@ -338,7 +370,7 @@ WITH approved AS MATERIALIZED (
       JOIN {candidate}.provider_location_binding location
         ON (location.provider_system,location.provider_id,location.location_id)=
           (membership.provider_system,membership.provider_id,membership.location_id)
-      JOIN {candidate}.entity_address_unified address
+      JOIN {addresses} address
         ON (address.location_key,address.entity_type,address.entity_id)=
           (location.location_key,location.entity_type,location.entity_id)
       WHERE membership.network_id=page.network_id),
@@ -370,7 +402,40 @@ _ORGANIZATION_SQL = _BASE_SQL.replace(
 )
 
 
-async def _pin(connection, generation_id, control_schema):
+def catalog_directory_relation(manifest, *, first_parameter):
+    """Render addresses and consumed pins from an already authenticated catalog manifest."""
+    if manifest.compact_layout is None:
+        return _identifier(manifest.schema_name) + ".entity_address_unified", (), ()
+    from api.network_compact_address import compact_address_native_sql, compact_address_read_relations
+    from process.network_compact_layout import CompactAddressRelation
+
+    pins = manifest.candidate_relation_pins
+    if type(pins) is not tuple or any(type(pin) is not CompactAddressRelation for pin in pins):
+        raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
+    relations = []
+    for name in ("network_membership", "provider_location_binding"):
+        matches = [pin for pin in pins if pin.schema_name == manifest.schema_name and pin.table_name == name]
+        if len(matches) != 1:
+            raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
+        relations.append(matches[0])
+    # The enclosing EXISTS proves this network's exact office membership.
+    addresses, parameters = compact_address_native_sql(
+        manifest.compact_layout, first_parameter=first_parameter, visible_membership_sql="TRUE"
+    )
+    return addresses, parameters, tuple(relations) + compact_address_read_relations(manifest.compact_layout)
+
+
+async def catalog_directory_fetchrow(connection, sql, parameters, relations):
+    """Guard consumed compact relations on the page's original backend before exposing its result."""
+    backend_pid = connection.get_server_pid() if relations else None
+    entry = await connection.fetchrow(sql, *parameters)
+    if relations:
+        await verify_consumed_network_relations(connection, relations, expected_backend_pid=backend_pid)
+    return entry
+
+
+async def catalog_pin(connection, generation_id, control_schema):
+    """Pin a verified catalog generation and approved membership in the caller-owned read-only snapshot."""
     if not connection.is_in_transaction():
         raise RegistryNetworkCatalogError("registry_network_catalog_transaction_required")
     transaction = await connection.fetchrow(
@@ -434,6 +499,9 @@ async def _verified_directory(connection, manifest, control_schema):
     return manifest
 
 
+_pin = catalog_pin
+
+
 @asynccontextmanager
 async def registry_catalog_read_snapshot(connection, generation_id, control_schema):
     """Reuse only a manifest verified on this connection in the active read scope."""
@@ -486,7 +554,8 @@ def _company_document(company):
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
 
 
-def _binding_document(binding):
+def catalog_binding_document(binding, *, network_id=None):
+    """Validate closed coordinates and evidence, requiring the enclosing target for a product scope."""
     coordinates = {"source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id"}
     fields = coordinates | {
         "namespace",
@@ -507,9 +576,21 @@ def _binding_document(binding):
     if type(binding["evidence_sha256"]) is not str or re.fullmatch(r"[0-9a-f]{64}", binding["evidence_sha256"]) is None:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     _source_scope(binding["source_system"], binding["source_scope"], producer_id=binding["producer_id"])
+    scope = binding["source_scope"]
+    if "insurance_plan_id" in scope and (
+        binding["source_id"] == "cms-npd"
+        or binding["source_key"] != "InsurancePlan/" + scope["insurance_plan_id"]
+        or type(network_id) is not int
+        or scope["product_network_id"] != network_id
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
 
 
-def _network_document(document):
+_binding_document = catalog_binding_document
+
+
+def catalog_network_document(document):
+    """Validate the closed network response and its nested companies and source bindings."""
     fields = {
         "network_id",
         "display_name",
@@ -547,11 +628,14 @@ def _network_document(document):
     for company in document["companies"]:
         _company_document(company)
     for binding in document["source_bindings"]:
-        _binding_document(binding)
+        _binding_document(binding, network_id=document["network_id"])
     for entries, identity in ((document["companies"], "company_id"), (document["source_bindings"], "binding_id")):
         if len({entry[identity] for entry in entries}) != len(entries):
             raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     return document
+
+
+_network_document = catalog_network_document
 
 
 async def _page(connection, manifest, query, exclusions, control_schema, network_ids=None, organization_policy=None):
@@ -572,8 +656,14 @@ async def _page(connection, manifest, query, exclusions, control_schema, network
     )
     if organization_policy is not None:
         parameters += (organization_policy.excluded_company_ids, organization_policy.excluded_group_ids)
-    entry = await connection.fetchrow(
-        sql.format(control=_identifier(control_schema), candidate=_identifier(manifest.schema_name)), *parameters
+    addresses, address_parameters, relations = catalog_directory_relation(manifest, first_parameter=len(parameters) + 1)
+    entry = await catalog_directory_fetchrow(
+        connection,
+        sql.format(
+            control=_identifier(control_schema), candidate=_identifier(manifest.schema_name), addresses=addresses
+        ),
+        parameters + address_parameters,
+        relations,
     )
     if entry is None or entry["bounded"] is not True:
         raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
@@ -623,7 +713,7 @@ async def read_registry_network_catalog(
         return await _page(
             connection, manifest, query, exclusions, control_schema, organization_policy=organization_policy
         )
-    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
@@ -646,7 +736,7 @@ async def read_registry_network_catalog_detail(
         if page["total"] != 1 or len(page["items"]) != 1 or page["items"][0]["network_id"] != network_id:
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         return page
-    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
@@ -695,7 +785,7 @@ async def resolve_registry_network_catalog_legacy(
         if page["total"] != 1 or page["items"][0]["network_id"] != network_id:
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         return page
-    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
@@ -772,7 +862,7 @@ async def _resolve_legacy_batch(
         ):
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         return page
-    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error

@@ -116,8 +116,10 @@ def test_sql_renders_each_bundle_before_deduplication_counts_and_caps():
     for forbidden in ("INSERT INTO", "UPDATE ", "CREATE ", "ON CONFLICT", ";"):
         assert forbidden not in sql
     for schema, table in _arguments()["row_type_refs"].values():
-        assert f'NULL::"{schema}"."{table}"' in sql
-        assert f'FROM "{schema}"."{table}"' not in sql
+        assert f'"{schema}"."{table}"' not in sql
+    assert "jsonb_populate_record" not in sql
+    assert sql.count("CROSS JOIN LATERAL jsonb_to_record(") == 12
+    assert '"fhir_meta" JSON' in sql and '"resource_id" VARCHAR(256)' in sql
     assert "office-a" not in sql
 
 

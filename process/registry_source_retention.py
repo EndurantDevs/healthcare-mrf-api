@@ -112,10 +112,14 @@ def _stage_relation(stage, receipt):
     return f'pg_temp."{stage.table_name}"'
 
 
-def _stage_projection(stage_relation):
+def registry_source_stage_projection(stage_relation):
+    """Return the closed five-column projection of a caller-validated native page stage."""
     return f"""SELECT member.* FROM {stage_relation} page CROSS JOIN LATERAL
       jsonb_to_record(page.input_json::jsonb) AS member(network_id integer,provider_system text,
         provider_id text,location_id uuid,evidence_id text)"""
+
+
+_stage_projection = registry_source_stage_projection
 
 
 async def retain_registry_source_memberships(connection, copy_target, stage, *, control_schema=None):
@@ -170,7 +174,7 @@ async def verify_registry_source_retention_rows(connection, copy_target, candida
     if candidate["state"] == "open" and source_stage is None:
         raise RegistrySourceRetentionError("registry_source_retention_stage_required")
     try:
-        await connection.execute(f"LOCK TABLE {source_relation} IN SHARE MODE")
+        await _require_source_retention_lock(connection, source_relation)
         if await connection.fetchval(f"SELECT count(*) FROM {source_relation}") != receipt["source_rows"]:
             raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
         if source_stage is not None:
@@ -184,3 +188,16 @@ async def verify_registry_source_retention_rows(connection, copy_target, candida
     except asyncpg.PostgresError as error:
         raise RegistrySourceRetentionError("registry_source_retention_source_invalid") from error
     return receipt
+
+
+async def _require_source_retention_lock(connection, source_relation):
+    # The independent custodian already holds an exact exclusive lock under its owner capability.
+    held = await connection.fetchval(
+        "SELECT EXISTS(SELECT FROM pg_catalog.pg_locks WHERE locktype='relation' "
+        "AND pid=pg_catalog.pg_backend_pid() AND relation=to_regclass($1) AND granted "
+        "AND mode=ANY($2::text[]))",
+        source_relation,
+        ["ShareLock", "ShareRowExclusiveLock", "ExclusiveLock", "AccessExclusiveLock"],
+    )
+    if held is not True:
+        await connection.execute(f"LOCK TABLE {source_relation} IN SHARE MODE")

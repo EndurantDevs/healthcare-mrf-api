@@ -29,6 +29,7 @@ HEAD = "20261024050000_provider_directory_first_retirement_owner_lineage"
 SERVING_RECOVERY = "20261023100000_provider_directory_serving_recovery"
 COMPANY_AFFILIATION = "20261025010000_company_affiliation_states"
 COMPANY_JOIN = "20261025020000_company_affiliation_join"
+CATALOG_HEAD = "20261028010000_registry_fhir_catalog"
 INDEX = "import_run_code_pricing_idempotency_idx"
 
 
@@ -42,7 +43,12 @@ def _config(connection=None):
 
 def test_directory_pricing_join_preserves_exact_parents_without_database_work():
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == [COMPANY_JOIN]
+    assert scripts.get_heads() == ["20261029010000_registry_source_inventory"]
+    assert scripts.get_revision("20261029010000_registry_source_inventory").down_revision == (
+        "20261028020000_registry_membership_refresh"
+    )
+    assert scripts.get_revision("20261028020000_registry_membership_refresh").down_revision == CATALOG_HEAD
+    assert scripts.get_revision(CATALOG_HEAD).down_revision == COMPANY_JOIN
     assert scripts.get_revision(COMPANY_JOIN).down_revision == (SERVING_RECOVERY, COMPANY_AFFILIATION)
     assert scripts.get_revision(COMPANY_AFFILIATION).down_revision == JOIN
     assert scripts.get_revision(SERVING_RECOVERY).down_revision == HEAD
@@ -173,7 +179,7 @@ async def test_directory_pricing_join_preserves_native_controls_rows_and_outer_t
 )
 def test_company_join_preserves_each_installed_branch(installed, expected):
     scripts = ScriptDirectory.from_config(_config())
-    assert [step.revision.revision for step in scripts._upgrade_revs("head", installed)] == expected
+    assert [step.revision.revision for step in scripts._upgrade_revs(COMPANY_JOIN, installed)] == expected
     assert [step.revision.revision for step in scripts._upgrade_revs(COMPANY_AFFILIATION, JOIN)] == [
         COMPANY_AFFILIATION
     ]

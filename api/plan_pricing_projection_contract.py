@@ -258,15 +258,16 @@ def normalized_bindings(bindings: Any) -> list[dict[str, Any]]:
     return normalized_bindings_list
 
 
-def _provider_signature_sql(*, candidate_inputs=None) -> str:
+def _provider_signature_sql(*, candidate_inputs=None, api_read=False) -> str:
+    state_relation = ("ONLY " if api_read else "") + table("entity_address_geo_assurance_state")
     geo_identity = f"""COALESCE((
         SELECT jsonb_build_object(
             'version', active_geo_assurance_version,
             'table_oid', active_table_oid,
             'signature', active_relation_signature
-        ) FROM {table("entity_address_geo_assurance_state")} WHERE singleton
+        ) FROM {state_relation} WHERE singleton
     ), '{{}}'::jsonb)"""
-    geo_ready = geo_projection.projection_state_available_sql(SCHEMA)
+    geo_ready = geo_projection.projection_state_available_sql(SCHEMA, **({"api_read": True} if api_read else {}))
     if candidate_inputs is not None:
         geo_identity, geo_ready = "CAST(:candidate_geo AS jsonb)", "TRUE"
     return f"""
@@ -332,8 +333,12 @@ def _validated_provider_signature(signature_text: Any) -> str:
     return hashlib.sha256(canonical_json(signature_by_relation).encode("utf-8")).hexdigest()
 
 
-async def provider_signature(session: Any, *, candidate_inputs=None) -> str:
+async def provider_signature(session: Any, *, candidate_inputs=None, api_read=False) -> str:
     """Bind a candidate to the atomically published provider relations."""
+    from api.ptg2_code_scope import is_source_api_reader
+
+    if type(api_read) is not bool or api_read and (candidate_inputs is not None or not is_source_api_reader(session)):
+        raise ValueError("pricing projection API provider inputs are invalid")
 
     parameters_by_name = {
         "npi_relation": f"{SCHEMA}.npi",
@@ -350,7 +355,7 @@ async def provider_signature(session: Any, *, candidate_inputs=None) -> str:
         }
         parameters_by_name["candidate_geo"] = canonical_json(geo_identity)
     signature_result = await session.execute(
-        text(_provider_signature_sql(candidate_inputs=candidate_inputs)),
+        text(_provider_signature_sql(candidate_inputs=candidate_inputs, **({"api_read": True} if api_read else {}))),
         parameters_by_name,
     )
     return _validated_provider_signature(signature_result.scalar_one())
