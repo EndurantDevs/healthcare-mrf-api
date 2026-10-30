@@ -410,6 +410,7 @@ def test_public_test_matrices_preserve_independent_database_shards():
             assert set(job["strategy"]) == {"max-parallel", "fail-fast", "matrix"}
             assert job["strategy"]["max-parallel"] == 48
             assert job["strategy"]["fail-fast"] is False
+            assert set(job["strategy"]["matrix"]) == {"include"}
             assert sorted(job["strategy"]["matrix"]["include"], key=lambda row: row["shard"]) == sorted(
                 rows, key=lambda row: row["shard"]
             )
