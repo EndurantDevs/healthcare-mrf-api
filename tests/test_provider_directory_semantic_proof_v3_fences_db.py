@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -13,8 +14,11 @@ from sqlalchemy import text
 from db.models import ProviderDirectoryPractitioner
 from process import provider_directory_generic_source_storage as source_storage
 from process import provider_directory_output_snapshot_stage as output_stage
-from process.provider_directory_generic_source_completion import complete_generic_source_candidate
-from process.provider_directory_generic_source_policy import source_transaction
+from process.provider_directory_generic_source_completion import (
+    _observed_divergence,
+    complete_generic_source_candidate,
+)
+from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
@@ -56,6 +60,62 @@ async def _input_sequence(database, schema, dataset_id):
         relation = f"{schema}.{binding['tables']['resource_input']['name']}"
         sequence = await database.scalar("SELECT pg_get_serial_sequence(:relation,'batch_ordinal')", relation=relation)
     return binding, sequence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["identical", "payload", "provenance"])
+async def test_postgres_json_observations_preserve_completion_divergence(monkeypatch, change):
+    """Compare duplicate JSON observations while retaining the semantic union decision."""
+    async with _semantic_database(monkeypatch) as (database, schema):
+        dataset_id = "dataset-semantic-json-comparison"
+        await _insert_parent(database, schema, dataset_id)
+        await _write_page(dataset_id, _observation("Alex Example", page_number=2 if change == "provenance" else 1))
+        await _write_page(
+            dataset_id,
+            _observation(
+                "Avery Sample" if change == "payload" else "Alex Example",
+                page_number=1,
+            ),
+        )
+        binding, _ = await _input_sequence(database, schema, dataset_id)
+        relation = importer._unscoped_qt(schema, binding["tables"]["resource_input"]["name"])
+        async with source_transaction(database):
+            connection = bound_publisher().connection
+            # The legacy fixture uses jsonb; retain the deployed json input type in this mirror.
+            await connection.execute(
+                "CREATE TEMP TABLE json_observations ON COMMIT DROP AS "
+                "SELECT resource_type,resource_id,payload_hash,payload_json::json AS payload_json,"
+                f"acquired_resource_sha256,batch_ordinal,row_ordinal FROM {relation}"
+            )
+            comparison_by_field = {
+                **binding,
+                "tables": {"resource_input": {"name": "json_observations"}},
+            }
+            assert await connection.fetchval(
+                "SELECT atttypid='json'::regtype FROM pg_attribute "
+                "WHERE attrelid=to_regclass($1) AND attname='payload_json'",
+                "pg_temp.json_observations",
+            )
+            assert await connection.fetchval(f"SELECT count(*) FROM {relation}") == 2
+            assert await connection.fetchval(f"SELECT count(DISTINCT payload_hash) FROM {relation}") == (
+                2 if change == "payload" else 1
+            )
+            assert await _observed_divergence(
+                connection, SimpleNamespace(schema="pg_temp"), comparison_by_field, "resource_input"
+            ) is (change != "identical")
+            completed = await complete_generic_source_candidate(
+                database, importer, database.semantic_candidates[dataset_id]
+            )
+            assert completed["phase"] == "prepared"
+            reduced = importer._unscoped_qt(schema, completed["tables"][source_storage.RESOURCE]["name"])
+            assert await connection.fetchval(f"SELECT count(*) FROM {reduced}") == 1
+            payload_by_field = source_storage._json(await connection.fetchval(f"SELECT payload_json FROM {reduced}"))
+            assert {name["text"] for name in payload_by_field["names"]} == (
+                {"Alex Example", "Avery Sample"} if change == "payload" else {"Alex Example"}
+            )
+            if change == "provenance":
+                assert payload_by_field["fhir_fetch_url"] == f"{CANONICAL_BASE}/Practitioner?page=2"
+                assert payload_by_field["fhir_meta"]["lastUpdated"] == "2026-08-09T12:00:02Z"
 
 
 @pytest.mark.asyncio
