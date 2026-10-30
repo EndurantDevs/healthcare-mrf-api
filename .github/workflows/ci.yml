@@ -705,192 +705,193 @@ jobs:
       artifact_profile_storage: ${{ steps.coverage-output.outputs.artifact_profile_storage }}
       artifact_profile_publication: ${{ steps.coverage-output.outputs.artifact_profile_publication }}
     strategy:
+      max-parallel: 48
       fail-fast: false
       matrix:
         include:
+        - shard: registry-28
+          label: Database tests (registry 29)
+          output: artifact_registry_28
+        - shard: registry-19
+          label: Database tests (registry 20)
+          output: artifact_registry_19
+        - shard: registry-37
+          label: Database tests (registry 38)
+          output: artifact_registry_37
+        - shard: registry-31
+          label: Database tests (registry 32)
+          output: artifact_registry_31
+        - shard: registry-46
+          label: Database tests (registry 47)
+          output: artifact_registry_46
         - shard: core-services
           label: Database tests (services)
           output: artifact_core_services
-        - shard: core-services-2
-          label: Database tests (services 2)
-          output: artifact_core_services_2
+        - shard: registry-35
+          label: Database tests (registry 36)
+          output: artifact_registry_35
+        - shard: registry-11
+          label: Database tests (registry 12)
+          output: artifact_registry_11
+        - shard: profile-publication
+          label: Database tests (profile publication)
+          output: artifact_profile_publication
         - shard: core-imports
           label: Database tests (imports)
           output: artifact_core_imports
-        - shard: core-imports-2
-          label: Database tests (imports 2)
-          output: artifact_core_imports_2
-        - shard: core-snapshots
-          label: Database tests (snapshot imports)
-          output: artifact_core_snapshots
-        - shard: core-snapshots-2
-          label: Database tests (snapshot imports 2)
-          output: artifact_core_snapshots_2
-        - shard: core-ptg
-          label: Database tests (PTG)
-          output: artifact_core_ptg
-        - shard: registry-0
-          label: Database tests (registry 1)
-          output: artifact_registry_0
-        - shard: registry-1
-          label: Database tests (registry 2)
-          output: artifact_registry_1
-        - shard: registry-2
-          label: Database tests (registry 3)
-          output: artifact_registry_2
-        - shard: registry-3
-          label: Database tests (registry 4)
-          output: artifact_registry_3
+        - shard: registry-39
+          label: Database tests (registry 40)
+          output: artifact_registry_39
+        - shard: registry-41
+          label: Database tests (registry 42)
+          output: artifact_registry_41
+        - shard: directory-source-2
+          label: Database tests (directory source 2)
+          output: artifact_directory_source_2
+        - shard: registry-20
+          label: Database tests (registry 21)
+          output: artifact_registry_20
         - shard: registry-4
           label: Database tests (registry 5)
           output: artifact_registry_4
-        - shard: registry-5
-          label: Database tests (registry 6)
-          output: artifact_registry_5
+        - shard: core-snapshots-2
+          label: Database tests (snapshot imports 2)
+          output: artifact_core_snapshots_2
+        - shard: registry-14
+          label: Database tests (registry 15)
+          output: artifact_registry_14
+        - shard: registry-13
+          label: Database tests (registry 14)
+          output: artifact_registry_13
+        - shard: registry-32
+          label: Database tests (registry 33)
+          output: artifact_registry_32
+        - shard: core-ptg
+          label: Database tests (PTG)
+          output: artifact_core_ptg
+        - shard: registry-10
+          label: Database tests (registry 11)
+          output: artifact_registry_10
+        - shard: directory-address
+          label: Database tests (directory address)
+          output: artifact_directory_address
+        - shard: directory-source
+          label: Database tests (directory source)
+          output: artifact_directory_source
+        - shard: core-services-2
+          label: Database tests (services 2)
+          output: artifact_core_services_2
+        - shard: registry-40
+          label: Database tests (registry 41)
+          output: artifact_registry_40
+        - shard: registry-27
+          label: Database tests (registry 28)
+          output: artifact_registry_27
+        - shard: registry-9
+          label: Database tests (registry 10)
+          output: artifact_registry_9
+        - shard: registry-45
+          label: Database tests (registry 46)
+          output: artifact_registry_45
+        - shard: core-imports-2
+          label: Database tests (imports 2)
+          output: artifact_core_imports_2
         - shard: registry-6
           label: Database tests (registry 7)
           output: artifact_registry_6
+        - shard: registry-22
+          label: Database tests (registry 23)
+          output: artifact_registry_22
+        - shard: registry-26
+          label: Database tests (registry 27)
+          output: artifact_registry_26
+        - shard: registry-0
+          label: Database tests (registry 1)
+          output: artifact_registry_0
+        - shard: registry-36
+          label: Database tests (registry 37)
+          output: artifact_registry_36
+        - shard: registry-3
+          label: Database tests (registry 4)
+          output: artifact_registry_3
+        - shard: registry-43
+          label: Database tests (registry 44)
+          output: artifact_registry_43
+        - shard: registry-42
+          label: Database tests (registry 43)
+          output: artifact_registry_42
+        - shard: registry-38
+          label: Database tests (registry 39)
+          output: artifact_registry_38
+        - shard: registry-44
+          label: Database tests (registry 45)
+          output: artifact_registry_44
+        - shard: registry-5
+          label: Database tests (registry 6)
+          output: artifact_registry_5
+        - shard: profile-storage
+          label: Database tests (profile storage)
+          output: artifact_profile_storage
+        - shard: registry-29
+          label: Database tests (registry 30)
+          output: artifact_registry_29
+        - shard: directory-storage
+          label: Database tests (directory storage)
+          output: artifact_directory_storage
+        - shard: registry-21
+          label: Database tests (registry 22)
+          output: artifact_registry_21
+        - shard: registry-16
+          label: Database tests (registry 17)
+          output: artifact_registry_16
+        - shard: registry-34
+          label: Database tests (registry 35)
+          output: artifact_registry_34
+        - shard: registry-15
+          label: Database tests (registry 16)
+          output: artifact_registry_15
+        - shard: registry-23
+          label: Database tests (registry 24)
+          output: artifact_registry_23
+        - shard: registry-30
+          label: Database tests (registry 31)
+          output: artifact_registry_30
+        - shard: registry-2
+          label: Database tests (registry 3)
+          output: artifact_registry_2
+        - shard: registry-17
+          label: Database tests (registry 18)
+          output: artifact_registry_17
+        - shard: registry-24
+          label: Database tests (registry 25)
+          output: artifact_registry_24
+        - shard: registry-33
+          label: Database tests (registry 34)
+          output: artifact_registry_33
+        - shard: registry-12
+          label: Database tests (registry 13)
+          output: artifact_registry_12
+        - shard: registry-18
+          label: Database tests (registry 19)
+          output: artifact_registry_18
         - shard: registry-7
           label: Database tests (registry 8)
           output: artifact_registry_7
         - shard: registry-8
           label: Database tests (registry 9)
           output: artifact_registry_8
-        - shard: registry-9
-          label: Database tests (registry 10)
-          output: artifact_registry_9
-        - shard: registry-10
-          label: Database tests (registry 11)
-          output: artifact_registry_10
-        - shard: registry-11
-          label: Database tests (registry 12)
-          output: artifact_registry_11
-        - shard: registry-12
-          label: Database tests (registry 13)
-          output: artifact_registry_12
-        - shard: registry-13
-          label: Database tests (registry 14)
-          output: artifact_registry_13
-        - shard: registry-14
-          label: Database tests (registry 15)
-          output: artifact_registry_14
-        - shard: registry-15
-          label: Database tests (registry 16)
-          output: artifact_registry_15
-        - shard: registry-16
-          label: Database tests (registry 17)
-          output: artifact_registry_16
-        - shard: registry-17
-          label: Database tests (registry 18)
-          output: artifact_registry_17
-        - shard: registry-18
-          label: Database tests (registry 19)
-          output: artifact_registry_18
-        - shard: registry-19
-          label: Database tests (registry 20)
-          output: artifact_registry_19
-        - shard: registry-20
-          label: Database tests (registry 21)
-          output: artifact_registry_20
-        - shard: registry-21
-          label: Database tests (registry 22)
-          output: artifact_registry_21
-        - shard: registry-22
-          label: Database tests (registry 23)
-          output: artifact_registry_22
-        - shard: registry-23
-          label: Database tests (registry 24)
-          output: artifact_registry_23
-        - shard: registry-24
-          label: Database tests (registry 25)
-          output: artifact_registry_24
-        - shard: registry-25
-          label: Database tests (registry 26)
-          output: artifact_registry_25
-        - shard: registry-26
-          label: Database tests (registry 27)
-          output: artifact_registry_26
-        - shard: registry-27
-          label: Database tests (registry 28)
-          output: artifact_registry_27
-        - shard: registry-28
-          label: Database tests (registry 29)
-          output: artifact_registry_28
-        - shard: registry-29
-          label: Database tests (registry 30)
-          output: artifact_registry_29
-        - shard: registry-30
-          label: Database tests (registry 31)
-          output: artifact_registry_30
-        - shard: registry-31
-          label: Database tests (registry 32)
-          output: artifact_registry_31
-        - shard: registry-32
-          label: Database tests (registry 33)
-          output: artifact_registry_32
-        - shard: registry-33
-          label: Database tests (registry 34)
-          output: artifact_registry_33
-        - shard: registry-34
-          label: Database tests (registry 35)
-          output: artifact_registry_34
-        - shard: registry-35
-          label: Database tests (registry 36)
-          output: artifact_registry_35
-        - shard: registry-36
-          label: Database tests (registry 37)
-          output: artifact_registry_36
-        - shard: registry-37
-          label: Database tests (registry 38)
-          output: artifact_registry_37
-        - shard: registry-38
-          label: Database tests (registry 39)
-          output: artifact_registry_38
-        - shard: registry-39
-          label: Database tests (registry 40)
-          output: artifact_registry_39
-        - shard: registry-40
-          label: Database tests (registry 41)
-          output: artifact_registry_40
-        - shard: registry-41
-          label: Database tests (registry 42)
-          output: artifact_registry_41
-        - shard: registry-42
-          label: Database tests (registry 43)
-          output: artifact_registry_42
-        - shard: registry-43
-          label: Database tests (registry 44)
-          output: artifact_registry_43
-        - shard: registry-44
-          label: Database tests (registry 45)
-          output: artifact_registry_44
-        - shard: registry-45
-          label: Database tests (registry 46)
-          output: artifact_registry_45
-        - shard: registry-46
-          label: Database tests (registry 47)
-          output: artifact_registry_46
         - shard: registry-47
           label: Database tests (registry 48)
           output: artifact_registry_47
-        - shard: directory-source
-          label: Database tests (directory source)
-          output: artifact_directory_source
-        - shard: directory-source-2
-          label: Database tests (directory source 2)
-          output: artifact_directory_source_2
-        - shard: directory-storage
-          label: Database tests (directory storage)
-          output: artifact_directory_storage
-        - shard: directory-address
-          label: Database tests (directory address)
-          output: artifact_directory_address
-        - shard: profile-storage
-          label: Database tests (profile storage)
-          output: artifact_profile_storage
-        - shard: profile-publication
-          label: Database tests (profile publication)
-          output: artifact_profile_publication
+        - shard: registry-1
+          label: Database tests (registry 2)
+          output: artifact_registry_1
+        - shard: registry-25
+          label: Database tests (registry 26)
+          output: artifact_registry_25
+        - shard: core-snapshots
+          label: Database tests (snapshot imports)
+          output: artifact_core_snapshots
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   measurement:
