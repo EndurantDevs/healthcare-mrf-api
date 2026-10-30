@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from unittest.mock import AsyncMock
 
 import pytest
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -98,17 +98,10 @@ def _patch_group_import(monkeypatch):
     return finalized_dataset_ids, cleared_dataset_ids, mark_failed
 
 
-@pytest.mark.asyncio
-async def test_resumable_group_does_not_suppress_complete_sibling(monkeypatch):
-    """Finalize a complete group while a concurrent sibling retains a cursor."""
-
-    finalized_dataset_ids, cleared_dataset_ids, mark_failed = (
-        _patch_group_import(monkeypatch)
-    )
-    resume_required_entries: set[str] = set()
-
-    counts = await importer._import_resources(
-        [_source_by_field("source-a"), _source_by_field("source-b")],
+async def _run_source_groups(source_ids, concurrency, resume_required_entries):
+    """Run real group scheduling with only acquisition and database I/O replaced."""
+    return await importer._import_resources(
+        [_source_by_field(source_id) for source_id in source_ids],
         resources=["Location"],
         per_resource_limit=0,
         page_limit=0,
@@ -116,12 +109,70 @@ async def test_resumable_group_does_not_suppress_complete_sibling(monkeypatch):
         timeout=3,
         run_id="run-current",
         stream_batch_size=1,
-        source_concurrency=2,
+        source_concurrency=concurrency,
         is_pagination_checkpointing_enabled=True,
         pagination_resume_required=resume_required_entries,
     )
 
+
+@pytest.mark.asyncio
+async def test_resumable_group_does_not_suppress_complete_sibling(monkeypatch):
+    """Finalize a complete group while a concurrent sibling retains a cursor."""
+
+    finalized_dataset_ids, cleared_dataset_ids, mark_failed = _patch_group_import(monkeypatch)
+    resume_required_entries: set[str] = set()
+    counts = await _run_source_groups(["source-a", "source-b"], 2, resume_required_entries)
+
     assert counts == {"Location": 2}
     assert resume_required_entries == {"source-a:Location"}
     assert finalized_dataset_ids == cleared_dataset_ids == ["dataset-source-b"]
+    mark_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency", [2, 10])
+async def test_ten_source_groups_finish_healthy_siblings_while_one_cursor_waits(monkeypatch, concurrency):
+    """Preserve scheduling limits without making healthy endpoints wait for a retry."""
+    finalized_ids, cleared_ids, mark_failed = _patch_group_import(monkeypatch)
+    source_ids = [f"source-{index}" for index in range(10)]
+    resume_entries = set()
+    release_slow = asyncio.Event()
+    healthy_finished = asyncio.Event()
+    counts_by_state = {"active": 0, "maximum": 0}
+    original_finalize = importer._finalize_endpoint_dataset_candidate
+
+    async def fetch(source, _resource_type, **_options):
+        counts_by_state["active"] += 1
+        counts_by_state["maximum"] = max(counts_by_state["maximum"], counts_by_state["active"])
+        try:
+            if source["source_id"] == "source-0":
+                await release_slow.wait()
+            else:
+                await asyncio.sleep(0)
+            return _fetch_result(complete=source["source_id"] != "source-0")
+        finally:
+            counts_by_state["active"] -= 1
+
+    async def finalize(candidate, diagnostics):
+        result = await original_finalize(candidate, diagnostics)
+        if len(finalized_ids) == 9:
+            healthy_finished.set()
+        return result
+
+    monkeypatch.setattr(importer, "_fetch_resource_rows", fetch)
+    monkeypatch.setattr(importer, "_finalize_endpoint_dataset_candidate", finalize)
+    task = asyncio.create_task(_run_source_groups(source_ids, concurrency, resume_entries))
+    try:
+        await asyncio.wait_for(healthy_finished.wait(), 2)
+        assert not task.done()
+        assert set(finalized_ids) == {f"dataset-source-{index}" for index in range(1, 10)}
+        release_slow.set()
+        assert await asyncio.wait_for(task, 2) == {"Location": 10}
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert counts_by_state == {"active": 0, "maximum": concurrency}
+    assert resume_entries == {"source-0:Location"}
+    assert cleared_ids == finalized_ids
     mark_failed.assert_not_awaited()
