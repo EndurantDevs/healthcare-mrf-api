@@ -294,6 +294,7 @@ async def test_role_evidence_disables_jit_once_per_request_session():
         await npi_module._fetch_provider_directory_role_evidence_map(
             [("pdfhir_example", "role-100")],
             session=evidence_session,
+            source_datasets=(("pdfhir_example", "dataset-example"),),
         )
     assert evidence_session.statements.count("SET LOCAL jit = off") == 1
     assert sum("requested_roles AS" in statement for statement in evidence_session.statements) == 2
@@ -313,12 +314,14 @@ async def test_missing_affiliation_and_catalog_tables_keep_direct_path():
     evidence_map = await npi_module._fetch_provider_directory_role_evidence_map(
         [("pdfhir_example", "role-100")],
         session=evidence_session,
+        source_datasets=(("pdfhir_example", "dataset-example"),),
     )
 
     query_sql = next(statement for statement in evidence_session.statements if "requested_roles AS" in statement)
     assert evidence_map == {}
     assert "provider_directory_organization_affiliation AS affiliation" not in query_sql
-    assert "provider_directory_network_catalog" not in query_sql
+    assert "mrf.provider_directory_network_catalog" not in query_sql
+    assert "pinned_network_catalog AS NOT MATERIALIZED" in query_sql
     assert "FROM direct_plans AS direct_plan" in query_sql
     assert evidence_session.requested_table_names == [
         "provider_directory_source",
@@ -363,6 +366,12 @@ async def test_same_source_roles_are_isolated_to_exact_addresses(monkeypatch):
         }
         for role_key in role_keys
     }
+    from api import provider_directory_evidence_lineage
+
+    source_datasets = ((source_id, "dataset-addresses"),)
+    binding_by_source = {source_id: ("pd_endpoint_aetna", "https://example.test/fhir")}
+    resolve_lineage = AsyncMock(return_value=(binding_by_source, source_datasets, ()))
+    monkeypatch.setattr(provider_directory_evidence_lineage, "resolve_address_evidence", resolve_lineage)
     fetch_roles = AsyncMock(return_value=role_evidence_map)
     monkeypatch.setattr(
         npi_module,
@@ -376,7 +385,10 @@ async def test_same_source_roles_are_isolated_to_exact_addresses(monkeypatch):
         include_role_evidence=True,
     )
 
-    fetch_roles.assert_awaited_once_with(role_keys, session=None)
+    fetch_roles.assert_awaited_once_with(role_keys, session=None, source_datasets=source_datasets)
+    resolve_lineage.assert_awaited_once_with(
+        npi_module, addresses, profile_generation_id=None, include_role_evidence=True, phone_digits=None, session=None
+    )
     for address, role_key in zip(addresses, role_keys):
         evidence = address["provider_directory_sources"][0]
         assert evidence["practitioner_role_ids"] == [role_key[1]]
@@ -427,6 +439,23 @@ def _patch_detail_endpoint(monkeypatch, fixture, role_evidence_mock):
             "do_business_as": [],
         }
 
+    from api import provider_directory_evidence_lineage
+
+    source_datasets = ((fixture["role_key"][0], "dataset-example"),)
+    monkeypatch.setattr(
+        provider_directory_evidence_lineage,
+        "resolve_address_evidence",
+        AsyncMock(
+            return_value=(
+                {
+                    source_id: (details["endpoint_id"], details["canonical_api_base"])
+                    for source_id, details in fixture["source_detail_map"].items()
+                },
+                source_datasets,
+                (),
+            )
+        ),
+    )
     replacement_map = {
         "_npi_canonical_publication_identity": AsyncMock(
             side_effect=RuntimeError("Synthetic cache identity is unavailable")
@@ -466,7 +495,9 @@ async def test_include_evidence_runs_full_role_resolution(monkeypatch, provider_
     )
     evidence = json.loads(response.body)["address_list"][0]["provider_directory_sources"][0]
 
-    fetch_roles.assert_awaited_once_with([fixture["role_key"]], session=None)
+    fetch_roles.assert_awaited_once_with(
+        [fixture["role_key"]], session=None, source_datasets=((fixture["role_key"][0], "dataset-example"),)
+    )
     assert evidence["source_ids"] == [fixture["role_key"][0]]
     assert evidence["practitioner_role_ids"] == [fixture["role_key"][1]]
     assert evidence["insurance_plans"][0]["identifier"] == "H1234-001"

@@ -251,6 +251,7 @@ async def test_network_catalog_small_edges(monkeypatch):
 
 
 def test_supplemental_catalog_failures_are_reported(monkeypatch):
+    monkeypatch.setattr(importer.public_directory_seeds, "christus_seed_rows", Mock(return_value=[]))
     failure = Mock(side_effect=RuntimeError("offline fixture"))
     for name in (
         "_seed_rows_from_amerihealth_caritas_catalog",

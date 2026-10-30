@@ -316,8 +316,9 @@ async def _admit_source_worker_launches(worker_payload, admitted_run):
             return _failed_worker_admission(worker_payload, "CMS registry worker admission is unavailable")
         if worker_payload.cms_registry_launch is None:
             try:
-                worker_payload.fhir_source_launch = provider_directory_source_worker.admit_fhir_source_worker_launch(
-                    admitted_run
+                ordinary = await provider_directory_source_worker.is_ordinary_serving_job(admitted_run)
+                worker_payload.fhir_source_launch = (
+                    None if ordinary else provider_directory_source_worker.admit_fhir_source_worker_launch(admitted_run)
                 )
                 worker_payload.ordinary_fhir_overlay_job = (
                     worker_payload.admitted_job

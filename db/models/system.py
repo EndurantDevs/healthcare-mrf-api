@@ -2835,7 +2835,7 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
             name="pd_profile_capacity_consumption_run_purpose_key",
         ),
         CheckConstraint(
-            "admission_purpose IN ('profile','cms_nonprofile')",
+            "admission_purpose IN ('profile','cms_nonprofile','serving_nonprofile','serving_inverse')",
             name="pd_profile_capacity_consumption_purpose_check",
         ),
         CheckConstraint(

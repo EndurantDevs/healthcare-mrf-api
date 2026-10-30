@@ -124,7 +124,16 @@ async def test_isolated_proof_control_rejects_foreign_keys_and_changed_native_cu
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "status", ["acquiring", "validated", "published", "failed", "acquisition_abandoned", "acquisition_retired"]
+    "status",
+    [
+        "acquiring",
+        "validated",
+        "published",
+        "failed",
+        "acquisition_abandoned",
+        "acquisition_retired",
+        "publication_acknowledged",
+    ],
 )
 async def test_whole_batch_delete_checks_exact_parent_and_terminal_immutability(status):
     _, _, parent = _case()
@@ -133,7 +142,7 @@ async def test_whole_batch_delete_checks_exact_parent_and_terminal_immutability(
         connection=SimpleNamespace(fetchrow=AsyncMock(return_value=parent)),
         policy=SimpleNamespace(schema="source_schema"),
     )
-    if status in {"acquisition_abandoned", "acquisition_retired"}:
+    if status in {"acquisition_abandoned", "acquisition_retired", "publication_acknowledged"}:
         with pytest.raises(GenericCandidateError, match="proof_parent_immutable"):
             await control.lock_proof_parent(publisher, "dataset", acquiring=False)
     else:

@@ -62,7 +62,7 @@ class _Measurements:
 
     def install(self, monkeypatch):
         read_snapshot = npi_api.provider_profile_read_snapshot
-        inventory_relations = snapshot._inventory_serving_relations
+        inventory_relations = snapshot._inventory_relation_names
         prelock = native._lock_cms_doctors_publication
         apply_stage = native._apply_cms_doctors_stage
 
@@ -112,7 +112,7 @@ class _Measurements:
             return result
 
         monkeypatch.setattr(npi_api, "provider_profile_read_snapshot", measured_snapshot)
-        monkeypatch.setattr(snapshot, "_inventory_serving_relations", measured_inventory)
+        monkeypatch.setattr(snapshot, "_inventory_relation_names", measured_inventory)
         monkeypatch.setattr(native, "_lock_cms_doctors_publication", measured_prelock)
         monkeypatch.setattr(native, "_apply_cms_doctors_stage", measured_apply)
 
@@ -195,6 +195,19 @@ async def test_detail_nppes_reuse_refuses_missing_enrollment(missing):
         async with nppes.existing_nppes_component(component):
             pytest.fail("incomplete enrollment cannot expose a component")
     assert nppes._COMPONENT.get() is None
+
+
+async def test_detail_fixture_grants_retained_endpoint_read_without_writer_rights():
+    """The retained raw-resource query needs its exact canonical endpoint metadata."""
+    connection = SimpleNamespace(execute=AsyncMock())
+    component = SimpleNamespace(
+        policy=SimpleNamespace(schema="synthetic", owner_role="synthetic_owner", runtime_roles=()),
+        reader="synthetic_reader",
+    )
+    await detail_support._grant_detail_reads(connection, component, {}, {})
+    assert [str(call.args[0]) for call in connection.execute.await_args_list] == [
+        'GRANT SELECT ON TABLE "synthetic".provider_directory_api_endpoint TO "synthetic_reader"'
+    ]
 
 
 @pytest.mark.asyncio

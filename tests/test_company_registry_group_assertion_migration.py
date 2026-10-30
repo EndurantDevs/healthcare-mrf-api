@@ -30,13 +30,16 @@ def _migration(revision=REVISION):
 
 
 def _assert_source_inventory_migration_head(script):
-    """Require the inventory head and its refresh and catalog predecessors."""
-    assert script.get_heads() == ["20261029010000_registry_source_inventory"]
+    """Require the current head while preserving the inventory predecessors."""
+    assert script.get_heads() == ["20261031030000_profile_initial_inverse_guard"]
     assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
     )
     assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (
         "20261028010000_registry_fhir_catalog"
+    )
+    assert script.get_revision("20261028010000_registry_fhir_catalog").down_revision == (
+        "20261025020000_company_affiliation_join"
     )
 
 
@@ -311,7 +314,7 @@ def test_native_fixture_head_checks_preserve_history_without_database_work():
     from tests.test_provider_directory_profile_capacity_adoption_postgres import _assert_registry_migration_lineage
 
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert _assert_registry_migration_lineage() == {"20261029010000_registry_source_inventory"}
+    assert _assert_registry_migration_lineage() == {"20261031030000_profile_initial_inverse_guard"}
     assert _assert_address_migration_chain(script) is None
 
 

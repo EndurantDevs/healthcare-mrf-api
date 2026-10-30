@@ -696,6 +696,11 @@ _POSTGRES_PHONE_PROVIDER_TABLE_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE mrf.provider_directory_api_endpoint (
+        endpoint_id varchar(64) PRIMARY KEY, canonical_api_base text NOT NULL
+    )
+    """,
+    """
     CREATE TABLE mrf.provider_directory_source (
         source_id varchar, endpoint_id varchar
     )
@@ -704,7 +709,8 @@ _POSTGRES_PHONE_PROVIDER_TABLE_STATEMENTS = (
     CREATE TABLE mrf.provider_directory_endpoint_dataset (
         dataset_id varchar, endpoint_id varchar, acquisition_root_run_id varchar,
         import_run_id varchar, is_current boolean, status varchar,
-        published_at timestamptz, superseded_at timestamptz
+        published_at timestamptz, superseded_at timestamptz,
+        publication_metadata_json jsonb, publication_metadata_summary_json jsonb
     )
     """,
     """
@@ -764,10 +770,16 @@ _POSTGRES_PHONE_PROVIDER_SEED_STATEMENTS = (
         current_date, 'Overlay Provider'
     )
     """,
+    """
+    INSERT INTO mrf.provider_directory_api_endpoint VALUES (
+        'endpoint-a', 'https://directory.example.test/fhir'
+    )
+    """,
     "INSERT INTO mrf.provider_directory_source VALUES ('source-a', 'endpoint-a')",
     """
     INSERT INTO mrf.provider_directory_endpoint_dataset VALUES (
-        'dataset-a', 'endpoint-a', 'run-a', NULL, true, 'published', now(), NULL
+        'dataset-a', 'endpoint-a', 'run-a', NULL, true, 'published', now(), NULL,
+        NULL, '{"source_ids":["source-a"]}'::jsonb
     )
     """,
     """

@@ -19,16 +19,20 @@ from tests import test_address_numeric_grid_alias_db as numeric
 from tests import test_entity_address_snapshot_destination as fixture
 from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
 from tests.test_entity_address_alias_guard_postgres import _admin_url, _owned_guard_database
-from tests.test_provider_directory_profile_capacity_adoption_postgres import _upgrade_disposable_schema_to_head
+from tests.test_provider_directory_profile_capacity_adoption_postgres import (
+    _assert_ordinary_serving_migration_tail,
+    _upgrade_disposable_schema_to_head,
+)
 
 _SCHEMA = "migrated_address"
-_HEAD = "20261029010000_registry_source_inventory"
+_HEAD = "20261031030000_profile_initial_inverse_guard"
 _ROLE_SCHEMA_REVISION = "20261019030000_provider_directory_role_schema"
 
 
 def _assert_address_migration_chain(script):
     """Keep the exact accepted migration head and predecessor assertions."""
     _assert_source_inventory_migration_head(script)
+    _assert_ordinary_serving_migration_tail(script)
     assert script.get_revision(_ROLE_SCHEMA_REVISION).down_revision == "20261019020000_registry_continuation_join"
     assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
         "20261019010000_registry_raw_object_join",

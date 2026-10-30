@@ -15,8 +15,28 @@ from process import provider_directory_profile_initial_contract as contract
 from process import provider_directory_profile_selection as selection
 from tests import test_provider_directory_profile_initial_migration as fixture
 from tests.provider_directory_profile_capacity_signing_guard_test_support import synthetic_profile_execution
-from tests.test_provider_directory_profile_initial_cutover_postgres import _cutover_fixture, _seed_legacy_snapshot, fhir
+from tests.test_provider_directory_profile_initial_cutover_postgres import (
+    _bind_fixture_geometry,
+    _cutover_fixture,
+    _seed_legacy_snapshot,
+    fhir,
+)
 from tests.test_provider_directory_profile_initial_migration import _SCHEMA, _database
+
+
+async def _reader_target_inputs(database, engine, consumed, preflight, geometry, projection):
+    """Freeze the legacy baseline before the component's immutable authority rows are seeded."""
+    async with database.transaction():
+        await _seed_legacy_snapshot(database, _SCHEMA, "legacy", selection, synthetic_profile_execution)
+        initial_targets = await initial.capture_targets(fhir, _SCHEMA)
+    geometry, _layout, projection, _hash, _raw = await _bind_fixture_geometry(
+        consumed,
+        preflight,
+        {"capacity_geometry": fhir.profile_capacity.capacity_geometry_payload(geometry)},
+        _SCHEMA,
+        initial_targets,
+    )
+    return consumed, preflight, geometry, projection, {"initial_targets": initial_targets}
 
 
 async def _reader_fixture(engine, monkeypatch):
@@ -30,14 +50,9 @@ async def _reader_fixture(engine, monkeypatch):
         return values
 
     monkeypatch.setattr(fixture, "_publication_values", page_funded_values)
-    database, cutover, stages = await _cutover_fixture(engine, monkeypatch)
+    database, cutover, stages = await _cutover_fixture(engine, monkeypatch, _reader_target_inputs)
     build = cutover["build"]
     async with database.transaction():
-        await database.status(
-            f'ALTER TABLE "{_SCHEMA}".import_run ADD COLUMN importer text, '
-            "ADD COLUMN finished_at timestamptz, ADD COLUMN metrics jsonb"
-        )
-        await _seed_legacy_snapshot(database, _SCHEMA, "legacy", selection, synthetic_profile_execution)
         await database.status(
             f'''INSERT INTO "{_SCHEMA}".initial_profile_stage
             SELECT npi,profile_json,evidence_json,source_ids,endpoint_ids,dataset_ids,source_count,
@@ -48,10 +63,8 @@ async def _reader_fixture(engine, monkeypatch):
             f'INSERT INTO "{_SCHEMA}".initial_evidence_stage SELECT * FROM "{_SCHEMA}".provider_directory_profile_evidence'
         )
         await database.status(f'CREATE TABLE "{_SCHEMA}".callback_marker (marker integer)')
-        initial_targets = await initial.capture_targets(fhir, _SCHEMA)
     admission = replace(
         cutover["admission"],
-        admitted_identity=SimpleNamespace(initial_targets=initial_targets),
         initial_wal_lsn=await database.scalar("SELECT pg_current_wal_insert_lsn()::text"),
     )
     # The existing fixture seeds authority and ready checkpoints, without runtime admission.

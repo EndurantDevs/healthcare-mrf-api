@@ -68,7 +68,7 @@ def _selection(day="2026-09-29", *, current=False):
 async def _metadata(database, engine):
     schema = fixture._SCHEMA
     async with engine.begin() as connection:
-        # Replace only this fixture's empty three-column run stub before authority is seeded.
+        # Replace only this fixture's temporary run stub before authority is seeded.
         await connection.execute(text(f'DROP TABLE "{schema}".import_run'))
         await connection.run_sync(lambda sync: _delta_metadata(sync, schema))
         for sql in _capacity_guard_statements(schema):
@@ -124,7 +124,9 @@ async def _authority(database, engine, consumed, preflight, geometry, projection
         database, schema, geometry, execution, projection
     )
     accepted = datetime.now(timezone.utc).replace(microsecond=0)
-    envelope, receipt = signed_initial_envelope(geometry, database_identity, target_snapshot, execution, accepted)
+    envelope, receipt = signed_initial_envelope(
+        geometry, database_identity, target_snapshot.payload, execution, accepted
+    )
     trust = capacity_trust_from_envelope(envelope)
     verified, consumed_by_field = _consume_replay_authority(
         envelope, trust, accepted, geometry, consumed_by_field, preflight, receipt
@@ -151,6 +153,7 @@ async def _authority(database, engine, consumed, preflight, geometry, projection
             },
             "verified_lease": verified,
             "database_identity": database_identity,
+            "initial_targets": target_snapshot,
             "execution": replace(execution, capacity_attestation=envelope),
             "trust": trust,
         },
@@ -411,7 +414,8 @@ def _consume_replay_authority(envelope, trust, accepted, geometry, consumed_by_f
 
 async def _bind_replay_geometry(database, schema, geometry, execution, projection):
     """Bind canonical selected vectors and observed target layouts before signing fixture authority."""
-    initial_targets = contract.InitialTargets(geometry.evidence_target_oid, geometry.profile_target_oid, {})
+    async with database.transaction():
+        initial_targets = await initial.capture_targets(fhir, schema)
     database_identity = await fhir._provider_directory_profile_capacity_database_identity(schema, initial_targets)
     geometry = replace(
         geometry,
@@ -422,8 +426,6 @@ async def _bind_replay_geometry(database, schema, geometry, execution, projectio
         },
     )
     layout = await initial.receipt_layout(fhir, schema)
-    async with database.transaction():
-        target_snapshot = (await initial.capture_targets(fhir, schema)).payload
     source_pairs = (("cms-npd", "dataset"),)
     contexts = (
         (
@@ -452,11 +454,11 @@ async def _bind_replay_geometry(database, schema, geometry, execution, projectio
         desired_source_vector_hash=fhir._provider_directory_profile_source_vector_hash(source_pairs),
         desired_context_vector_hash=fhir._provider_directory_profile_source_context_vector_hash(contexts),
         sql_contract_digest=fhir._provider_directory_profile_sql_contract_digest(),
-        initial_target_state_sha256=contract.target_state_sha256(target_snapshot),
+        initial_target_state_sha256=contract.target_state_sha256(initial_targets.payload),
         initial_receipt_storage_fingerprint=layout.exact_fingerprint,
     )
     projection = replace(projection, capacity_geometry_hash=capacity.capacity_geometry_hash(geometry))
-    return database_identity, geometry, source_pairs, contexts, target_snapshot, projection
+    return database_identity, geometry, source_pairs, contexts, initial_targets, projection
 
 
 async def _commit_replay_successor(

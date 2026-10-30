@@ -28,20 +28,14 @@ def _phone_membership_fixture() -> dict[str, object]:
         "phone_number": "4195550198",
         "member_npi": 1003968710,
         "member_address_key": "47ab23c8-74f7-41eb-8ffb-e8b9f6214594",
-        "member_record_id": (
-            "provider_directory_fhir:organization_address:"
-            f"{source_id}:shared-resource:0"
-        ),
+        "member_record_id": (f"provider_directory_fhir:organization_address:{source_id}:shared-resource:0"),
         "nonmember_npi": 1003968728,
         "nonmember_address_key": "b231f8d5-9af7-40b6-81c5-95a69eb52311",
-        "nonmember_record_id": (
-            "provider_directory_fhir:practitioner_role_address:"
-            f"{source_id}:shared-resource:0"
-        ),
+        "nonmember_record_id": (f"provider_directory_fhir:practitioner_role_address:{source_id}:shared-resource:0"),
     }
 
 
-def _phone_candidate_membership_sql() -> str:
+def _phone_candidate_membership_sql(schema: str = "mrf") -> str:
     empty_address_relation = """(
         SELECT NULL::bigint AS npi, NULL::bigint AS inferred_npi,
                NULL::uuid AS address_key, NULL::integer AS source_count,
@@ -60,7 +54,7 @@ def _phone_candidate_membership_sql() -> str:
           FROM phone_candidate_rows
          WHERE provider_directory_matched
       ORDER BY provider_npi
-    """
+    """.replace("mrf.", f"{schema}.")
 
 
 def test_phone_candidate_membership_sql_uses_provider_list_ctes():
@@ -104,9 +98,10 @@ async def _insert_current_dataset(session, schema: str, fixture: dict) -> None:
     await session.execute(
         text(
             f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
-            "(dataset_id, endpoint_id, import_run_id, status, is_current, "
-            "resource_count) VALUES "
-            "(:dataset_id, :endpoint_id, :run_id, 'acquiring', false, 1)"
+            "(dataset_id, endpoint_id, import_run_id, acquisition_root_run_id, status, is_current, "
+            "resource_count, publication_metadata_json) VALUES "
+            "(:dataset_id, :endpoint_id, :run_id, :run_id, 'acquiring', false, 1, "
+            "jsonb_build_object('source_ids', jsonb_build_array(CAST(:source_id AS text))))"
         ),
         fixture,
     )
@@ -170,7 +165,7 @@ async def _insert_overlay_rows(session, schema: str, fixture: dict) -> None:
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_phone_candidates_require_exact_current_dataset_membership():
-    """A matching current run cannot admit a nonmember resource overlay."""
+    """Retained Overlay membership survives a newer Source pointer without admitting nonmembers."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
     fixture = _phone_membership_fixture()
@@ -182,12 +177,10 @@ async def test_phone_candidates_require_exact_current_dataset_membership():
             await _insert_current_dataset(session, schema, fixture)
             await _insert_overlay_rows(session, schema, fixture)
             candidate_result = await session.execute(
-                text(_phone_candidate_membership_sql()),
+                text(_phone_candidate_membership_sql(schema)),
                 {"phone_digits": fixture["phone_number"]},
             )
-            candidate_rows = [
-                dict(candidate._mapping) for candidate in candidate_result.all()
-            ]
+            candidate_rows = [dict(candidate._mapping) for candidate in candidate_result.all()]
 
             assert candidate_rows == [
                 {
@@ -196,5 +189,36 @@ async def test_phone_candidates_require_exact_current_dataset_membership():
                     "source_record_id": fixture["member_record_id"],
                 }
             ]
+            await session.execute(
+                text(
+                    f"UPDATE {schema}.provider_directory_endpoint_dataset "
+                    "SET status='superseded',is_current=false,superseded_at=transaction_timestamp() "
+                    "WHERE dataset_id=:dataset_id"
+                ),
+                fixture,
+            )
+            await _insert_current_dataset(
+                session,
+                schema,
+                {
+                    **fixture,
+                    "dataset_id": fixture["dataset_id"] + "_replacement",
+                    "run_id": fixture["run_id"] + "_replacement",
+                },
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        f"SELECT dataset_id FROM {schema}.provider_directory_endpoint_dataset "
+                        "WHERE endpoint_id=:endpoint_id AND is_current IS TRUE"
+                    ),
+                    fixture,
+                )
+                == fixture["dataset_id"] + "_replacement"
+            )
+            retained = await session.execute(
+                text(_phone_candidate_membership_sql(schema)), {"phone_digits": fixture["phone_number"]}
+            )
+            assert [dict(candidate._mapping) for candidate in retained.all()] == candidate_rows
         finally:
             await fixture_savepoint.rollback()

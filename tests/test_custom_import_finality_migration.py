@@ -95,9 +95,6 @@ _SEALED_APPEND_UPGRADE_TAIL = (
     "20261024050000_provider_directory_first_retirement_owner_lineage",
     "20261023100000_provider_directory_serving_recovery",
     "20261025020000_company_affiliation_join",
-    "20261028010000_registry_fhir_catalog",
-    "20261028020000_registry_membership_refresh",
-    "20261029010000_registry_source_inventory",
 )
 
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
@@ -274,7 +271,7 @@ def _assert_custom_import_manual_acceptance_lineage(script):
 
 def _assert_finality_migration_chain(script):
     """Keep the exact accepted migration head and predecessor assertions."""
-    assert script.get_heads() == ["20261029010000_registry_source_inventory"]
+    assert script.get_heads() == ["20261031030000_profile_initial_inverse_guard"]
     assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
     )
@@ -327,7 +324,10 @@ def test_sealed_append_plans_extend_the_single_installed_migration_head():
     revision = _plans_migration().revision
     _assert_finality_migration_chain(script)
     assert tuple(
-        step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
+        step.revision.revision
+        for step in script._upgrade_revs(
+            "20261025020000_company_affiliation_join", "20261001110000_profile_initial_publication"
+        )
     ) == (revision, *_SEALED_APPEND_UPGRADE_TAIL)
 
 

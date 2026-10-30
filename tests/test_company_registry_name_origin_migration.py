@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261029010000_registry_source_inventory"
+CURRENT_HEAD = "20261031030000_profile_initial_inverse_guard"
 _ORIGIN_UPGRADE_REVISIONS = [
     REVISION,
     "20261013010000_registry_custom_history_events",
@@ -61,9 +61,6 @@ _ORIGIN_UPGRADE_REVISIONS = [
     "20261024050000_provider_directory_first_retirement_owner_lineage",
     "20261023100000_provider_directory_serving_recovery",
     "20261025020000_company_affiliation_join",
-    "20261028010000_registry_fhir_catalog",
-    "20261028020000_registry_membership_refresh",
-    CURRENT_HEAD,
 ]
 
 
@@ -235,4 +232,6 @@ def test_origin_migration_extends_the_sole_existing_head():
     assert script.get_revision(history).down_revision == REVISION
     assert script.get_revision(REVISION).down_revision == PREDECESSOR
     assert script.get_revision(PREDECESSOR).down_revision == "20261010030000_registry_source_admission_receipt"
-    assert [step.revision.revision for step in script._upgrade_revs("head", PREDECESSOR)] == _ORIGIN_UPGRADE_REVISIONS
+    assert [
+        step.revision.revision for step in script._upgrade_revs("20261025020000_company_affiliation_join", PREDECESSOR)
+    ] == _ORIGIN_UPGRADE_REVISIONS

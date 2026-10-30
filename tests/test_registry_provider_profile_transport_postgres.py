@@ -107,11 +107,15 @@ def _reader_settings(fixture, role, password):
     }
 
 
-def _observe_reader_transactions(reader, fixture, statements, transactions):
-    """Observe real principal, connection and transaction identity without changing reads."""
+def _observe_reader_transactions(database, fixture, statements, transactions):
+    """Probe only verified reads; setup probes would establish a snapshot before its locks."""
+    setup_statements = []
 
-    @event.listens_for(reader.engine.sync_engine, "after_cursor_execute")
+    @event.listens_for(database._reader_database.engine.sync_engine, "after_cursor_execute")
     def record_reader(connection, cursor, statement, parameters, context, executemany):
+        if not database.has_reader_session():
+            setup_statements.append(statement)
+            return
         probe = connection.connection.cursor()
         try:
             probe.execute(
@@ -126,6 +130,8 @@ def _observe_reader_transactions(reader, fixture, statements, transactions):
             transactions.append(identity_values[7])
         finally:
             probe.close()
+
+    return setup_statements
 
 
 @pytest.fixture
@@ -148,9 +154,9 @@ async def profile_transport(published_profile_source, monkeypatch):
         monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.control_schema)
         for module in (provider, provider_profile, provider_profile_cms, provider_profile_states):
             monkeypatch.setattr(module, "db", database)
-        reader = await database._connect_reader()
+        await database._connect_reader()
 
-        _observe_reader_transactions(reader, fixture, statements, transactions)
+        setup_statements = _observe_reader_transactions(database, fixture, statements, transactions)
 
         @event.listens_for(fixture.engine.sync_engine, "before_cursor_execute")
         def record_writer(connection, cursor, statement, parameters, context, executemany):
@@ -169,6 +175,7 @@ async def profile_transport(published_profile_source, monkeypatch):
             sites=sites,
             role=role,
             statements=statements,
+            setup_statements=setup_statements,
             writer_statements=writer_statements,
             transactions=transactions,
         )
@@ -243,7 +250,7 @@ async def test_native_profile_post_exact_office_default_denial_and_policy_genera
         identity[:4] == (context.role, context.role, "on", "repeatable read") for _, identity in context.statements
     )
     assert all(identity[5:] == (False, False) for _, identity in context.statements)
-    assert "LOCK" in {command for command, _ in context.statements}
+    assert any(statement.startswith("LOCK TABLE ") for statement in context.setup_statements)
     assert len({identity[4] for _, identity in context.statements}) == 1
 
 
@@ -254,7 +261,7 @@ async def test_native_profile_auth_and_closed_query_refuse_before_reader(profile
     assert (await _post(context, v2_envelope({"npi": _NPI, "network_ids": [context.network]}))).status == 400
     assert (await _post(context, document | {"access_scope_sha256": "0" * 64})).status == 400
     assert (await _post(context, envelope({"npi": _NPI}))).status == 400
-    assert not context.statements
+    assert not context.statements and not context.setup_statements
 
 
 _DETAIL_PATH = "/api/v1/registry/serving/providers/detail"
@@ -336,7 +343,7 @@ async def test_native_detail_known_zero_office_missing_identity_and_auth_before_
     assert (await _post(context, document, headers={"Authorization": "Bearer wrong"}, path=_DETAIL_PATH)).status == 403
     assert (await _post(context, document | {"access_scope_sha256": "0" * 64}, path=_DETAIL_PATH)).status == 400
     assert (await _post(context, envelope({"npi": _NPI}), path=_DETAIL_PATH)).status == 400
-    assert not context.statements
+    assert not context.statements and not context.setup_statements
     known = await _post(context, v2_envelope({"npi": "1000000005"}), path=_DETAIL_PATH)
     assert known.status == 200, known.json
     assert known.json["data"]["npi"]["address_list"] == []
@@ -375,6 +382,7 @@ async def test_native_detail_known_zero_office_missing_identity_and_auth_before_
                     "manifest_sha256": context.manifest.manifest_sha256,
                 },
                 "reader_transactions": context.statements,
+                "reader_setup_statements": context.setup_statements,
             }
         )
     )
@@ -567,13 +575,14 @@ async def _source_post(held, document, *, status=200, headers=None):
     from api.network_address_scope import current_network_address_scope
 
     calls, statements = len(held.calls), len(held.statements)
+    setup_start = len(held.setup_statements)
     reply = await _post(held, document, headers=headers, path=_SOURCE_PATH)
     assert reply.status == status, reply.json
     assert current_network_address_scope() is None
     assert all(request.ctx.sa_session is held.prior for request in held.requests)
     observed = held.statements[statements:]
     if status == 403:
-        assert not observed and not held.calls[calls:]
+        assert not observed and not held.calls[calls:] and not held.setup_statements[setup_start:]
     else:
         assert held.calls[calls:] == ["pin", "custody"]
         identities = [identity for _statement, identity in observed]

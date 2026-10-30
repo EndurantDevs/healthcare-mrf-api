@@ -34,7 +34,7 @@ def test_current_dataset_readiness_is_scoped_to_requested_source_endpoints():
         npi_module._provider_directory_affiliation_evidence_sql("mrf", has_catalog=True),
     ):
         counts, metadata = sql.split("), current_dataset_metadata AS MATERIALIZED (", 1)
-        metadata, datasets = metadata.split("), current_datasets AS MATERIALIZED (", 1)
+        metadata, datasets = metadata.split("current_datasets AS MATERIALIZED (", 1)
         datasets, _resources = datasets.split("), current_resources AS NOT MATERIALIZED (", 1)
         assert "GROUP BY dataset.endpoint_id" in counts
         assert "HAVING COUNT(*) = 1" in counts
@@ -100,7 +100,7 @@ def test_role_sql_without_relations_is_legacy_only():
 
 @pytest.mark.parametrize("affiliation", [False, True])
 @pytest.mark.parametrize("available_indexes", [0, 1, 2])
-async def test_readiness_index_path_requires_both_capabilities(affiliation, available_indexes):
+async def test_retained_readiness_uses_exact_header_despite_current_indexes(affiliation, available_indexes):
     statements = []
 
     class EvidenceResult:
@@ -128,10 +128,19 @@ async def test_readiness_index_path_requires_both_capabilities(affiliation, avai
         if affiliation
         else npi_module._fetch_provider_directory_role_evidence_map
     )
-    assert await fetch([("source", "resource")], session=EvidenceSession()) == {}
+    assert (
+        await fetch(
+            [("source", "resource")], session=EvidenceSession(), source_datasets=(("source", "dataset-source"),)
+        )
+        == {}
+    )
     sql = statements[-1]
     metadata = sql.split("current_dataset_metadata AS MATERIALIZED (", 1)[1].split(
-        "), current_datasets AS MATERIALIZED (", 1
+        "current_datasets AS MATERIALIZED (", 1
     )[0]
-    assert ("publication_metadata_json" not in metadata) is (available_indexes == 2)
-    assert ("AS ready WHERE ready.dataset_id = dataset.dataset_id" in sql) is (available_indexes == 2)
+    assert metadata.count("-> 'dataset_network_plan' AS dataset_network_plan_metadata") == 1
+    assert metadata.count("-> 'dataset_affiliation_organization' AS dataset_affiliation_organization_metadata") == 1
+    assert "AS ready WHERE ready.dataset_id = dataset.dataset_id" not in sql
+    assert "requested_dataset_scope AS MATERIALIZED" in sql
+    assert "dataset.dataset_network_plan_metadata ->> 'complete'" in sql
+    assert "dataset.dataset_affiliation_organization_metadata ->> 'complete'" in sql

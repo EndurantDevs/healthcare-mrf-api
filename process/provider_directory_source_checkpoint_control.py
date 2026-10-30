@@ -140,7 +140,10 @@ def _assert_bulk_identity(rows, identity_by_field):
 def _require_checkpoint_parents(parents, dataset_ids, identity_by_field):
     """Preserve terminal guards and explicitly check private parent relationships."""
     _require(
-        all(parent["status"] not in {"acquisition_abandoned", "acquisition_retired"} for parent in parents),
+        all(
+            parent["status"] not in {"acquisition_abandoned", "acquisition_retired", "publication_acknowledged"}
+            for parent in parents
+        ),
         "checkpoint_parent_abandoned",
     )
     _require(set(dataset_ids) <= {parent["dataset_id"] for parent in parents}, "checkpoint_parent_missing")
@@ -153,7 +156,7 @@ def _require_checkpoint_parents(parents, dataset_ids, identity_by_field):
 
 
 async def fence_checkpoint_dataset_parents(publisher, dataset_ids, root_run_ids):
-    """Keep mutable private checkpoints attached to an existing live root."""
+    """Fence the live root before checkpoint work can update its candidate header."""
     dataset_ids = _coordinates(dataset_ids, 96)
     root_run_ids = _coordinates(root_run_ids, 64)
     _require(len(dataset_ids) == len(root_run_ids) == 1, "checkpoint_coordinates_conflict")

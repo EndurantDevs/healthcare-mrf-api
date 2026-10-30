@@ -347,15 +347,30 @@ def _assert_custom_import_manual_acceptance_lineage(script):
     )
 
 
+def _assert_ordinary_serving_migration_tail(script):
+    """Preserve the inventory and ordinary serving successors of the historical joined head."""
+    assert [
+        step.revision.revision for step in script._upgrade_revs("head", "20261025020000_company_affiliation_join")
+    ] == [
+        "20261028010000_registry_fhir_catalog",
+        "20261028020000_registry_membership_refresh",
+        "20261029010000_registry_source_inventory",
+        "20261030010000_ordinary_address_capacity",
+        "20261031010000_profile_initial_reactivation",
+        "20261031020000_serving_inverse_capacity",
+        "20261031030000_profile_initial_inverse_guard",
+    ]
+
+
 def _assert_registry_migration_lineage():
     """Require the current joined head and every protected registry parent edge."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     expected_heads = set(script.get_heads())
     _assert_source_inventory_migration_head(script)
+    _assert_ordinary_serving_migration_tail(script)
     _assert_custom_import_manual_acceptance_lineage(script)
-    assert (
-        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
-        == "20261019020000_registry_continuation_join"
+    assert script.get_revision("20261019030000_provider_directory_role_schema").down_revision == (
+        "20261019020000_registry_continuation_join"
     )
     assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
         "20261019010000_registry_raw_object_join",

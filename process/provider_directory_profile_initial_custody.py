@@ -38,13 +38,15 @@ def _require(condition, code):
         raise ValueError("profile_initial_callable_" + code)
 
 
-def _specifications(schema, composite_oid):
+def _specifications(schema, composite_oid, *, receipt_version=1):
     bodies = (
         guards.IMMUTABLE_BODY,
         guards.IMMUTABLE_BODY,
         guards._receipt_insert_body(schema),
         guards._serving_insert_body(schema),
-        guards._receipt_matches_sql(schema),
+        guards._receipt_matches_sql(schema)
+        if receipt_version == 1
+        else guards._reactivated_receipt_matches_sql(schema),
     )
     return {
         name: dict(
@@ -135,10 +137,45 @@ async def _capture_relations(connection, schema):
     return relation_by_name
 
 
+async def _receipt_catalog_version(connection, schema):
+    checks = await connection.fetch(guards._RECEIPT_CHECKS_SQL.replace(":schema", "$1"), schema)
+    try:
+        defaults = {entry["key_default"] for entry in checks}
+        return guards.receipt_catalog_version(
+            [entry["definition"] for entry in checks], next(iter(defaults)) if len(defaults) == 1 else None
+        )
+    except RuntimeError:
+        raise ValueError("profile_initial_callable_receipt_catalog_changed") from None
+
+
+async def _capture_receipt_rows(connection, schema):
+    """Hash immutable history in the database without transporting or accumulating its payloads."""
+    statement = """WITH rows AS MATERIALIZED (
+        SELECT build_id,to_jsonb(r) AS body,row_number() OVER (ORDER BY build_id) AS ordinal FROM __RELATION__ r),
+        sized AS (SELECT count(*)::bigint AS count,COALESCE(sum(octet_length(body::text)),0)::bigint AS bytes,
+          COALESCE(max(octet_length(body::text)),0)::bigint AS largest_bytes,
+          COALESCE(jsonb_agg(body) FILTER (WHERE ordinal=1),'[]'::jsonb) AS first_payload,
+          string_agg(encode(sha256(convert_to(body::text,'UTF8')),'hex'),'' ORDER BY build_id) AS hashes FROM rows)
+        SELECT count,bytes,largest_bytes,CASE WHEN largest_bytes<=16777216 THEN
+          encode(sha256(convert_to(CASE WHEN count<=1 THEN first_payload::text ELSE
+            'provider-directory-profile-initial-history.v1:'||hashes END,'UTF8')),'hex') END AS sha256 FROM sized"""
+    observed_by_field = dict(
+        await connection.fetchrow(statement.replace("__RELATION__", storage_relation(schema, _RELATIONS[0])))
+    )
+    _require(
+        observed_by_field.pop("largest_bytes") <= 16_777_216 and observed_by_field["sha256"] is not None,
+        "rows_unbounded",
+    )
+    return observed_by_field
+
+
 async def _capture_rows(connection, schema):
     data_by_name = {}
     for name in _RELATIONS:
-        # The native singleton contracts admit at most one row; never transport its payload.
+        if name == _RELATIONS[0]:
+            data_by_name[name] = await _capture_receipt_rows(connection, schema)
+            continue
+        # The serving head stays a native singleton; never transport its payload.
         statement = """WITH rows AS MATERIALIZED (SELECT to_jsonb(r) AS body FROM __RELATION__ r LIMIT 2),
             sized AS (SELECT count(*)::integer AS count,COALESCE(sum(octet_length(body::text)),0)::bigint AS bytes,
             COALESCE(jsonb_agg(body),'[]'::jsonb) AS payload FROM rows)
@@ -242,7 +279,8 @@ async def capture_initial_callable_custody(connection, policy, *, legacy=False):
     relations = await _capture_relations(connection, policy.schema)
     composite_oid = int(relations[_RELATIONS[0]]["composite"]["oid"])
     namespace = int(relations[_RELATIONS[0]]["relation"]["relnamespace"])
-    specifications = _specifications(policy.schema, composite_oid)
+    receipt_version = await _receipt_catalog_version(connection, policy.schema)
+    specifications = _specifications(policy.schema, composite_oid, receipt_version=receipt_version)
     function_rows = await connection.fetch(
         _FUNCTION_SQL,
         list(_signatures(policy.schema)),
@@ -262,6 +300,9 @@ async def capture_initial_callable_custody(connection, policy, *, legacy=False):
             for key in function_row.keys()
         }
         name = function_by_field["definition"]["proname"]
+        if name == "pd_profile_initial_serving_insert":
+            body = guards.validated_serving_guard_body(policy.schema, function_by_field["definition"]["prosrc"])
+            specifications[name]["body"] = " " + body + " "
         _require_definition(function_by_field, specifications[name], namespace)
         _role_rows(function_by_field["access"], role_ids, 6)
         _require_function_access(function_by_field, owner, role_by_name, policy, legacy)

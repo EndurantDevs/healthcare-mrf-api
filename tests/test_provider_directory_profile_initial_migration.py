@@ -123,6 +123,28 @@ def test_migration_sql_is_frozen_against_runtime_changes(monkeypatch, schema):
     assert after.getvalue() == before.getvalue()
 
 
+def _capacity_ledger():
+    """Keep this historical fixture independent of later model purposes."""
+    ledger = ProviderDirectoryProfileCapacityLeaseConsumption.__table__.to_metadata(sa.MetaData(), schema=_SCHEMA)
+    purpose = next(item for item in ledger.constraints if item.name == "pd_profile_capacity_consumption_purpose_check")
+    purpose.sqltext = sa.text("admission_purpose IN ('profile','cms_nonprofile','serving_nonprofile')")
+    return ledger
+
+
+def test_historical_ledger_does_not_mutate_current_model():
+    model = ProviderDirectoryProfileCapacityLeaseConsumption.__table__
+    before_by_name = {
+        item.name: str(item.sqltext) for item in model.constraints if isinstance(item, sa.CheckConstraint)
+    }
+    ledger = _capacity_ledger()
+    assert ledger is not model
+    assert {
+        item.name: str(item.sqltext) for item in model.constraints if isinstance(item, sa.CheckConstraint)
+    } == before_by_name
+    purpose = next(item for item in ledger.constraints if item.name == "pd_profile_capacity_consumption_purpose_check")
+    assert str(purpose.sqltext) == "admission_purpose IN ('profile','cms_nonprofile','serving_nonprofile')"
+
+
 def _bootstrap(connection):
     with Operations.context(MigrationContext.configure(connection)):
         op = Operations(MigrationContext.configure(connection))
@@ -131,8 +153,7 @@ def _bootstrap(connection):
         checkpoint.upgrade()
         delta._add_checkpoint_columns(_SCHEMA)
         delta._create_serving_generation_table(_SCHEMA)
-        ledger = ProviderDirectoryProfileCapacityLeaseConsumption.__table__.to_metadata(sa.MetaData(), schema=_SCHEMA)
-        ledger.create(connection)
+        _capacity_ledger().create(connection)
         migration._ORIGINAL._create_table(_SCHEMA)
         migration._ORIGINAL._create_guards(_SCHEMA)
         _migration("20260930120000_cms_native_input_revision.py").upgrade()

@@ -24,6 +24,20 @@ _JOURNAL_CHECKS = {
 }
 
 
+async def recovered_initial_targets(directory, schema):
+    """Read only a complete current inverse and its authentic original initial targets."""
+    from process.provider_directory_common_initial_witness import recovered_initial_targets as read_targets
+
+    return await read_targets(directory, schema)
+
+
+async def assert_initial_common_receipt(directory, schema, build_id, generation_id, publication_xid):
+    """Bind the genuine initial receipt to its immutable complete common publication."""
+    from process.provider_directory_common_initial_witness import assert_initial_common_receipt as assert_receipt
+
+    return await assert_receipt(directory, schema, build_id, generation_id, publication_xid)
+
+
 def canonical_generation(value):
     """Accept only one canonical, non-nil opaque generation identifier."""
     try:
@@ -55,6 +69,14 @@ def publication_descriptor(task, descriptor):
 
 def is_recovery_request(importer, params):
     """Keep recovery outside acquisition, Profile and caller-selected object paths."""
+    from process import provider_directory_serving_inverse_capacity_contract as inverse
+
+    if inverse.EVENT_FIELD in params or inverse.EXECUTION_FIELD in params:
+        from process.provider_directory_serving_inverse_capacity import task_execution
+
+        receipts.require(importer == "provider-directory-fhir", "request_invalid")
+        task_execution(dict(params))
+        return True
     if OPERATION_PARAM not in params:
         if GENERATION_PARAM in params:
             canonical_generation(params[GENERATION_PARAM])
@@ -86,6 +108,23 @@ def is_recovery_request(importer, params):
     )
     canonical_generation(params.get(GENERATION_PARAM))
     return True
+
+
+def validated_recovery_retry_params(importer, current_params_by_name, retry_params_by_name, run_id):
+    """Keep recovery retries on their validated operation and fresh inverse authority."""
+    is_recovery_request(str(importer or ""), current_params_by_name)
+    from process.provider_directory_serving_inverse_capacity_contract import EXECUTION_FIELD
+
+    if EXECUTION_FIELD in current_params_by_name:
+        from process.provider_directory_serving_inverse_capacity import validated_inverse_retry_params
+
+        return validated_inverse_retry_params(current_params_by_name, retry_params_by_name, run_id)
+    if any(
+        key not in current_params_by_name or override_value != current_params_by_name[key]
+        for key, override_value in retry_params_by_name.items()
+    ):
+        raise ValueError("provider_directory_serving_recovery_retry_scope_changed")
+    return dict(current_params_by_name)
 
 
 async def _journal(database, schema):
@@ -131,6 +170,10 @@ async def _journal(database, schema):
 
 def _document(document_by_field, phase, generation, source_id):
     document_by_field = decoded(document_by_field)
+    from process import provider_directory_common_serving_journal as common
+
+    if type(document_by_field) is dict and common.is_common(document_by_field.get("preparation")):
+        return common.documents.document(document_by_field, phase, generation, source_id)
     receipts.require(
         type(document_by_field) is dict
         and set(document_by_field)
@@ -216,6 +259,15 @@ async def _load_history(database, schema, generation, *, for_update=False):
         document = _document(event["document"], phase, generation, event["source_id"])
         receipts.require(document["journal"] == native, "journal_catalog_changed")
         events_by_phase[phase] = {"document": document, "sha256": event["document_sha256"]}
+    from process import provider_directory_common_serving_journal as common
+
+    if any(common.is_common(event["document"].get("preparation")) for event in events_by_phase.values()):
+        events_by_phase = common.validate_history(events_by_phase)
+        if "recovered" in events_by_phase:
+            from process.provider_directory_common_serving_recovery import validate_consumed_inverse
+
+            await validate_consumed_inverse(database, schema, events_by_phase)
+        return events_by_phase
     for phase, prior in (
         ("published", "overlay"),
         ("recovered", "published" if "published" in events_by_phase else "overlay"),
@@ -240,28 +292,44 @@ async def _load_history(database, schema, generation, *, for_update=False):
 
 
 async def _append(database, schema, generation, phase, publication_pin, before, after, *, preparation=None):
+    """Append through the existing version-one native journal boundary."""
+    await _append_document(
+        database,
+        schema,
+        dict(
+            generation=generation,
+            phase=phase,
+            source=publication_pin,
+            before=before,
+            after=after,
+            preparation={} if preparation is None else preparation,
+        ),
+    )
+
+
+async def _append_document(database, schema, event_by_field):
+    """Fill native writer/catalog/predecessor facts on the actual journal owner."""
     native = await _journal(database, schema)
+    generation, phase = event_by_field["generation"], event_by_field["phase"]
     history = await _load_history(database, schema, generation, for_update=True)
     receipts.require(phase not in history, "phase_already_recorded")
+    from process import provider_directory_common_serving_journal as common
+
+    fields = {"generation", "phase", "source", "before", "after", "preparation"}
+    receipts.require(set(event_by_field) in (fields, fields | {"inverse"}), "journal_fields_changed")
+    preparation = event_by_field["preparation"]
+    if "inverse" in event_by_field:
+        receipts.require(common.is_common(preparation) and phase == "recovered", "inverse_scope_invalid")
     predecessor = None
-    if phase != "overlay":
+    if common.is_common(preparation):
+        predecessor = common.append_predecessor(history, phase, preparation)
+    elif phase != "overlay":
         previous = "published" if phase == "recovered" and "published" in history else "overlay"
         receipts.require(previous in history, "journal_history_changed")
         predecessor = history[previous]["sha256"]
     _session, driver, actor = await receipts.ordinary(database)
-    document_by_field = dict(
-        version=1,
-        generation=generation,
-        phase=phase,
-        source=publication_pin,
-        before=before,
-        after=after,
-        writer=actor,
-        predecessor=predecessor,
-        journal=native,
-        preparation={} if preparation is None else preparation,
-    )
-    _document(document_by_field, phase, generation, publication_pin["source_id"])
+    document_by_field = dict(version=1, **event_by_field, writer=actor, predecessor=predecessor, journal=native)
+    _document(document_by_field, phase, generation, event_by_field["source"]["source_id"])
     table = receipts.qualified(schema, receipts.JOURNAL)
     await driver.execute(
         f"INSERT INTO {table}(generation,phase,source_id,document,document_sha256) "
@@ -269,7 +337,7 @@ async def _append(database, schema, generation, phase, publication_pin, before, 
         "FROM (SELECT $4::jsonb AS value) document",
         UUID(generation),
         phase,
-        publication_pin["source_id"],
+        event_by_field["source"]["source_id"],
         encoded(document_by_field),
     )
 
@@ -386,6 +454,9 @@ async def before_overlay(directory):
 
 async def retain_overlay(directory, stage):
     """Preserve every ordinary overlay's reads and retain only admitted predecessors."""
+    from process.provider_directory_ordinary_initial_retention import retain_initial_stage
+
+    await retain_initial_stage(directory, stage)
     from process import provider_directory_generic_source_artifacts as artifacts
     from process import provider_directory_generic_source_policy as source
     from process import provider_directory_output_snapshot_custody as outputs
@@ -920,6 +991,12 @@ async def maybe_recover(directory, ctx, task):
     """Dispatch the fixed recovery action in a clean ordinary context only."""
     if not is_recovery_request("provider-directory-fhir", task):
         return None
+    from process import provider_directory_serving_inverse_capacity_contract as inverse
+
+    if inverse.EXECUTION_FIELD in task:
+        from process.provider_directory_common_serving_recovery import maybe_recover_common
+
+        return await maybe_recover_common(directory, ctx, task)
     receipts.require(directory.db._transaction_binding() is None, "ordinary_binding_required")
     await directory.ensure_database(bool(ctx.get("context", {}).get("test_mode")))
     result = await asyncio.create_task(_recover(directory, task), context=contextvars.Context())

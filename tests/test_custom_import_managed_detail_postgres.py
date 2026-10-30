@@ -48,6 +48,7 @@ async def managed_import_transport(profile_transport, monkeypatch):
         install_signed_routes(context, monkeypatch)
         context.writer_statements.clear()
         context.statements.clear()
+        context.setup_statements.clear()
         context.transactions.clear()
         yield SimpleNamespace(context=context, case=case, target=target, external_target=external_target)
 
@@ -201,6 +202,7 @@ async def test_signed_managed_detail_invalid_expired_and_wrong_target_refuse_bef
     for headers in (invalid, expired, wrong):
         reply = await _managed_post(fixture, request_by_field, headers=headers)
         assert reply.status == 404 and "managed_detail" not in reply.json
+    assert not fixture.context.setup_statements
     assert not fixture.context.statements
 
 
@@ -469,6 +471,7 @@ async def signed_collection_transport(signed_collection_coordinates, managed_imp
 
     context.writer_statements.clear()
     context.statements.clear()
+    context.setup_statements.clear()
     context.transactions.clear()
     yield observed
 
@@ -524,6 +527,7 @@ async def _signed_collection_post(case, kind, document, *, invalid_signature=Fal
     if invalid_signature:
         headers[transport.CUSTOM_IMPORT_READ_SIGNATURE_HEADER] = permits._encoded(b"x" * 32)
     context.statements.clear()
+    context.setup_statements.clear()
     context.transactions.clear()
     case.pins.clear()
     case.custody.clear()
@@ -589,6 +593,7 @@ async def test_signed_collection_http_same_reader_policy_and_imports(signed_coll
         case, kind, _signed_collection_document(case, kind, "default", True), invalid_signature=True
     )
     assert invalid.status == 404 and "managed_collection" not in invalid.json
+    assert not case.fixture.context.setup_statements
     assert not case.fixture.context.statements and not case.pins and not case.custody and not case.import_reads
     for policy in ("default", "selected", "excluded"):
         for include_filter in (True, False):
@@ -778,6 +783,7 @@ async def _service_http_post(case, document, *, signed, invalid=False, headers=N
         headers[transport.CUSTOM_IMPORT_READ_SIGNATURE_HEADER] = permits._encoded(b"x" * 32)
     for collection in (
         context.statements,
+        context.setup_statements,
         context.transactions,
         case.pins,
         case.custody,
@@ -864,6 +870,7 @@ async def test_native_service_collection_preserves_addressless_claims_under_defa
     malformed = _service_policy(case, _service_native_args(), excluded=True)
     malformed["query"]["native_query"]["billing_entity_ref"] = "forbidden"
     rejected = await _service_http_post(case, malformed, signed=False)
+    assert not case.fixture.context.setup_statements
     assert rejected.status == 400 and not case.fixture.context.statements and not case.pins
     unauthenticated = await _service_http_post(
         case,
@@ -871,6 +878,7 @@ async def test_native_service_collection_preserves_addressless_claims_under_defa
         signed=False,
         headers={"Authorization": "Bearer invalid-control"},
     )
+    assert not case.fixture.context.setup_statements
     assert unauthenticated.status == 403 and not case.fixture.context.statements and not case.pins
 
 
@@ -903,6 +911,7 @@ async def test_signed_service_http_reader_policy_claims_and_native_complement(se
         signed=True,
         invalid=True,
     )
+    assert not case.fixture.context.setup_statements
     assert invalid.status == 404 and not case.fixture.context.statements and not case.pins and not case.import_reads
     await _assert_service_optional_metric_refusal(case)
     await _assert_service_empty_required_page(case)
@@ -928,4 +937,5 @@ async def test_signed_service_http_reader_policy_claims_and_native_complement(se
     malformed = _service_signed_document(case, require_match=True, include_filter=True, excluded=True)
     malformed["managed_collection"]["query"]["selector"] = {"namespace": "canonical", "values": []}
     rejected = await _service_http_post(case, malformed, signed=True)
+    assert not case.fixture.context.setup_statements
     assert rejected.status == 400 and not case.fixture.context.statements and not case.pins and not case.import_reads

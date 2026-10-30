@@ -53,3 +53,24 @@ def test_stage_and_live_index_plans_resolve_exact_public_extensions(name, elemen
         assert f"USING {index['using']} ({', '.join(elements)})" in statement
         if index.get("where"):
             assert statement.endswith(f" WHERE {index['where']};")
+
+
+@pytest.mark.parametrize("model", [address.EntityAddressProcedureBridge, address.EntityAddressMedicationBridge])
+@pytest.mark.parametrize("option", [None, "false"])
+def test_prepared_support_builds_the_complete_validated_index_set(monkeypatch, model, option):
+    from tests.test_entity_address_candidate_preparation_postgres import _inputs
+
+    if option is None:
+        monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES", raising=False)
+    else:
+        monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES", option)
+    index = next(entry for entry in model.__my_additional_indexes__ if entry["name"] == "code_location")
+    assert not address._is_stage_index_enabled(model, index)
+    token = address.candidate_preparation._PREPARATION.set(_inputs())
+    try:
+        statements_by_name = dict(address._stage_index_statements(model, "index_schema", [index], {}))
+        assert "code_location" in statements_by_name
+        assert "CREATE INDEX" in statements_by_name["code_location"]
+    finally:
+        address.candidate_preparation._PREPARATION.reset(token)
+    assert not address._is_stage_index_enabled(model, index)

@@ -169,12 +169,27 @@ def _admitted_preparation(admission, native_input_hash):
     return scope
 
 
-def assert_full_recipe(ctx, task) -> None:
+def assert_full_recipe(ctx, task, scope=None) -> None:
     """Reject branches whose reused or partial scratch is outside this owned full build."""
     native = _native()
     context = ctx.get("context") or {}
+    from process.provider_directory_serving_capacity_plan import OrdinaryServingAdmissionPlan
+
+    is_ordinary = scope is not None and type(scope.admission.plan) is OrdinaryServingAdmissionPlan
+    expected_mode = native.ENTITY_ADDRESS_REFRESH_MODE_FULL
+    if is_ordinary:
+        from process.provider_directory_ordinary_address_admission import require_capture
+
+        capture = require_capture(_fhir(), scope.admission.plan, scope.admission.captured_inputs)
+        if (
+            not capture.address_task
+            or native.db is not capture.database
+            or task != {**capture.address_task, "publish": True, "skip_publish": False}
+        ):
+            raise RuntimeError("entity-address preparation differs from its captured recipe")
+        expected_mode = native.ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
     if (
-        native._entity_address_refresh_mode(task) != native.ENTITY_ADDRESS_REFRESH_MODE_FULL
+        native._entity_address_refresh_mode(task) != expected_mode
         or bool(task.get("test_mode", context.get("test_mode", False)))
         or any(context.get(name) for name in ("stage_prepared", "support_stage_prepared", "support_stage_populated"))
         or any(task.get(name) not in (None, "", 0) for name in ("limit_per_source", "source_limit"))
@@ -184,11 +199,14 @@ def assert_full_recipe(ctx, task) -> None:
         or native._is_task_or_env_enabled(
             task, "reuse_raw_stage", "HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_RAW_STAGE", False
         )
-        or native._is_task_or_env_enabled(
-            task,
-            "serving_only_refresh",
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY",
-            native.DEFAULT_SERVING_ONLY_REFRESH,
+        or (
+            not is_ordinary
+            and native._is_task_or_env_enabled(
+                task,
+                "serving_only_refresh",
+                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SERVING_ONLY",
+                native.DEFAULT_SERVING_ONLY_REFRESH,
+            )
         )
     ):
         raise RuntimeError("entity-address admitted preparation requires a full fresh build")
@@ -196,6 +214,22 @@ def assert_full_recipe(ctx, task) -> None:
 
 def _fhir():
     return importlib.import_module("process.provider_directory_fhir")
+
+
+def inference_enabled(test_mode):
+    """Preserve the existing option and refuse ordinary scope drift at its actual use."""
+    name = "HLTHPRT_ENTITY_ADDRESS_UNIFIED_" + ("TEST_" if test_mode else "") + "ENABLE_INFERENCE"
+    is_enabled = str(os.getenv(name, "false")).strip().lower() in {"1", "true", "yes", "on"}
+    scope = _ADMISSION.get()
+    from process.provider_directory_serving_capacity_plan import OrdinaryServingAdmissionPlan
+
+    if scope is not None and type(scope.admission.plan) is OrdinaryServingAdmissionPlan:
+        from process.provider_directory_ordinary_address_admission import require_capture
+
+        capture = require_capture(_fhir(), scope.admission.plan, scope.admission.captured_inputs)
+        if test_mode or is_enabled is not capture.affected_scope["inference_enabled"]:
+            raise RuntimeError("entity-address preparation inference differs from its captured recipe")
+    return is_enabled
 
 
 async def check_owned_storage() -> None:

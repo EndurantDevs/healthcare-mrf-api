@@ -5,7 +5,7 @@ import asyncio
 import copy
 import importlib
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -502,7 +502,7 @@ async def test_preparation_keeps_short_sql_timeout_after_hash(monkeypatch):
     monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(session, object(), {})))
     monkeypatch.setattr(receipts, "catalog", AsyncMock(return_value={receipts.ROOTS[0]: native_receipt()["native"]}))
     monkeypatch.setattr(contract, "preserve_transaction_sql_settings", preserve)
-    monkeypatch.setattr(snapshot, "_normalize_receipt_session", AsyncMock())
+    monkeypatch.setattr(receipts, "normalized_receipt_scope", lambda *_args: nullcontext())
     monkeypatch.setattr(snapshot, "_row_identity", row_identity)
     assert await receipts.relation(database, "serving", receipts.ROOTS[0]) == native_receipt()
     assert events == ["save", "hash", "restore"]
@@ -792,6 +792,14 @@ async def test_narrow_metadata_writer_locks_require_existing_authority(monkeypat
             "provider_directory_cms_serving_receipt",
         ):
             assert f'LOCK TABLE "serving"."{table}" IN SHARE MODE NOWAIT' in statements
+        for table, predicate in (
+            ("address_alias_state_v1", "singleton"),
+            ("reference_family_result_generation", "importer_id='cms-doctors'"),
+            ("provider_directory_profile_serving_generation", "singleton_key='global'"),
+        ):
+            read = f'SELECT 1 FROM "serving"."{table}" WHERE {predicate}'
+            assert statements.index(f'LOCK TABLE "serving"."{table}" IN SHARE MODE NOWAIT') < statements.index(read)
+            assert not any(statement.startswith(read + " FOR ") for statement in statements)
     for table in (
         "entity_address_result_generation",
         "address_alias_artifact_state_v1",

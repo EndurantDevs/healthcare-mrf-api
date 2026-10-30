@@ -36,6 +36,8 @@ from db.models import (
     db,
 )
 from db.models.entity_address_unified import ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES
+from process import entity_address_affected_patch as affected_patch
+from process import entity_address_affected_support as affected_support
 from process import entity_address_candidate_preparation as candidate_preparation
 from process import entity_address_preparation_admission as preparation_admission
 from process import entity_address_result_generation as result_generation
@@ -1019,6 +1021,8 @@ def _post_publish_index_plan(
 
 
 def _is_stage_index_enabled(stage_cls, index: dict) -> bool:
+    if candidate_preparation.current() is not None:
+        return True
     if _is_support_code_location_index(stage_cls, index):
         return _is_env_enabled(
             "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES",
@@ -2359,17 +2363,9 @@ async def _ensure_entity_address_unified_live_columns(
 
 
 async def _is_support_bridge_reuse_available(db_schema: str, *, build_network_bridge: bool) -> bool:
-    bridge_models: list[type] = [
-        EntityAddressPlanBridge,
-        EntityAddressProcedureBridge,
-        EntityAddressMedicationBridge,
-    ]
-    if build_network_bridge:
-        bridge_models.append(EntityAddressNetworkBridge)
-    for model in bridge_models:
-        if not await _has_table(db_schema, model.__main_table__):
-            return False
-    return True
+    return await affected_support.is_bridge_reuse_available(
+        importlib.import_module(__name__), db_schema, build_network_bridge
+    )
 
 
 def _promote_facility_npi_candidates_sql(db_schema: str) -> str:
@@ -2407,6 +2403,7 @@ def _promote_facility_npi_candidates_sql(db_schema: str) -> str:
         NOW()::timestamp AS updated_at
       FROM {db_schema}.facility_anchor_npi_candidate AS c
      WHERE c.review_status = 'approved'
+       AND c.candidate_status <> 'inactive'
        AND c.candidate_npi IS NOT NULL
        AND c.facility_anchor_id IS NOT NULL
     ON CONFLICT (facility_anchor_id, npi) DO UPDATE
@@ -2828,6 +2825,9 @@ def _provider_directory_live_source_filter_sql(
     *,
     source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> str:
+    captured_filter = affected_patch.source_filter_sql(importlib.import_module(__name__), alias)
+    if captured_filter is not None:
+        return captured_filter
     if not source_ids:
         return ""
     selected_source_ids = _string_array_literal(list(source_ids))
@@ -4238,13 +4238,7 @@ def _entity_address_evidence_group_match_sql(group_alias: str, row_alias: str) -
 
 
 def _entity_address_row_npi_expr(row_alias: str) -> str:
-    return (
-        f"COALESCE({row_alias}.npi, CASE\n"
-        f"            WHEN {row_alias}.entity_type = 'npi' AND {row_alias}.entity_id ~ '^[0-9]+$'\n"
-        f"                THEN {row_alias}.entity_id::bigint\n"
-        f"            ELSE NULL::bigint\n"
-        f"        END)"
-    )
+    return affected_patch.row_npi_sql(row_alias)
 
 
 def _partial_affected_group_table(stage_table: str) -> str:
@@ -4256,6 +4250,8 @@ def _affected_live_location_table(stage_table: str) -> str:
 
 
 def _is_provider_directory_source_select(db_schema: str, source_select: str) -> bool:
+    if affected_patch.is_active() and "desired_dataset_pins(" in source_select and "current_overlay" in source_select:
+        return True
     return (
         f"FROM {db_schema}.provider_directory_practitioner_role AS role" in source_select
         or f"FROM {db_schema}.provider_directory_organization_affiliation AS affiliation" in source_select
@@ -4266,32 +4262,7 @@ def _is_provider_directory_source_select(db_schema: str, source_select: str) -> 
 
 
 def _provider_directory_current_group_select_sql(source_select: str) -> str:
-    return f"""
-    SELECT DISTINCT
-        src.entity_type::varchar AS entity_type,
-        src.entity_id::varchar AS entity_id,
-        CASE
-            WHEN src.entity_type = 'npi' AND src.entity_id ~ '^[0-9]+$'
-                THEN src.entity_id::bigint
-            ELSE NULL::bigint
-        END AS entity_npi,
-        src.address_key::uuid AS address_key,
-        {_street_soft_norm_expr("src.first_line")}::varchar AS street_key,
-        {_alnum_norm_expr("src.city_name")}::varchar AS city_key,
-        {_state_norm_expr("src.state_name")}::varchar AS state_key,
-        {_zip5_norm_expr("src.postal_code")}::varchar AS zip_key,
-        {_state_norm_expr("src.country_code")}::varchar AS country_key
-      FROM (
-            {source_select.strip()}
-      ) AS src
-     WHERE src.entity_type IS NOT NULL
-       AND src.entity_id IS NOT NULL
-       AND (
-            src.address_key IS NOT NULL
-         OR NULLIF(TRIM(src.first_line), '') IS NOT NULL
-         OR NULLIF(TRIM(src.city_name), '') IS NOT NULL
-       )
-    """
+    return affected_patch.current_group_select_sql(importlib.import_module(__name__), source_select)
 
 
 def _prepare_partial_affected_groups_sql(
@@ -4319,16 +4290,17 @@ def _prepare_partial_affected_groups_sql(
         "live",
         source_ids=source_ids,
     )
+    npi_expression = (
+        _entity_address_row_npi_expr("live")
+        if affected_patch.is_active()
+        else "CASE WHEN live.entity_type = 'npi' AND live.entity_id ~ '^[0-9]+$' THEN live.entity_id::bigint ELSE NULL::bigint END"
+    )
     return f"""
     CREATE UNLOGGED TABLE {db_schema}.{group_table} AS
     SELECT DISTINCT
         live.entity_type::varchar AS entity_type,
         live.entity_id::varchar AS entity_id,
-        CASE
-            WHEN live.entity_type = 'npi' AND live.entity_id ~ '^[0-9]+$'
-                THEN live.entity_id::bigint
-            ELSE NULL::bigint
-        END AS entity_npi,
+        {npi_expression} AS entity_npi,
         live.address_key::uuid AS address_key,
         {_street_soft_norm_expr("live.first_line")}::varchar AS street_key,
         {_alnum_norm_expr("live.city_name")}::varchar AS city_key,
@@ -4426,6 +4398,10 @@ def _affected_group_source_select_sql(db_schema: str, source_select: str, group_
 
 
 def _affected_npi_source_select_sql(db_schema: str, source_select: str, group_table: str) -> str:
+    if affected_patch.is_active():
+        return affected_patch.affected_source_select_sql(
+            importlib.import_module(__name__), db_schema, source_select, group_table
+        )
     source_select = _prefilter_npi_source_select_sql(db_schema, source_select, group_table)
     return f"""
     SELECT src.*
@@ -4622,15 +4598,10 @@ def _prepare_affected_live_locations_sql(
     """
 
 
-def _index_affected_live_locations_sql(
-    db_schema: str,
-    affected_location_table: str,
-) -> str:
-    index_name = _archived_identifier(f"{affected_location_table}_idx_location", "")
-    return f"""
-    CREATE UNIQUE INDEX {index_name}
-        ON {db_schema}.{affected_location_table} (location_key);
-    """
+def _index_affected_live_locations_sql(db_schema: str, affected_location_table: str) -> str:
+    return affected_patch.index_location_scope_sql(
+        importlib.import_module(__name__), db_schema, affected_location_table
+    )
 
 
 def _copy_unaffected_rows_by_location_sql(
@@ -8073,15 +8044,7 @@ def _copy_unaffected_bridge_rows_sql(
 
 
 def _support_patch_models(*, build_network_bridge: bool) -> list[type]:
-    models: list[type] = [
-        EntityAddressEvidence,
-        EntityAddressPlanBridge,
-        EntityAddressProcedureBridge,
-        EntityAddressMedicationBridge,
-    ]
-    if build_network_bridge:
-        models.insert(2, EntityAddressNetworkBridge)
-    return models
+    return affected_support.legacy_patch_models(importlib.import_module(__name__), build_network_bridge)
 
 
 def _model_column_names(model: type) -> list[str]:
@@ -8299,7 +8262,7 @@ _EVIDENCE_FROM_STAGE_SQL = """
         retired_at
     )
     SELECT
-        ROW_NUMBER() OVER ()::bigint AS evidence_id,
+        {evidence_id_sql} AS evidence_id,
         t.location_key,
         t.address_key,
         t.premise_key,
@@ -8339,10 +8302,18 @@ def _evidence_from_stage_sql(
     source_run_id: str,
     node_id: str | None,
     affected_group_table: str | None = None,
+    evidence_id_floor: int = 0,
 ) -> str:
     """Build provenance-evidence SQL from unified staged locations."""
+    if type(evidence_id_floor) is not int or not 0 <= evidence_id_floor < 2**63:
+        raise ValueError("entity_address_evidence_id_floor_invalid")
     affected_filter = _affected_stage_row_filter_sql(db_schema, affected_group_table)
     return _EVIDENCE_FROM_STAGE_SQL.format(
+        evidence_id_sql=(
+            f"({evidence_id_floor} + ROW_NUMBER() OVER ())::bigint"
+            if evidence_id_floor
+            else "ROW_NUMBER() OVER ()::bigint"
+        ),
         db_schema=db_schema,
         evidence_stage_table=evidence_stage_table,
         stage_table=stage_table,
@@ -9405,23 +9376,7 @@ def _facility_anchor_npi_candidate_sql(
 
 
 def _support_stage_evidence_sql(context: _SupportStageContext) -> str:
-    plan = context.plan
-    if plan.raw_table:
-        return _evidence_from_raw_sql(
-            context.db_schema,
-            context.stage_table_map[EntityAddressEvidence],
-            plan.raw_table,
-            source_run_id=plan.source_run_id,
-            node_id=plan.node_id,
-        )
-    return _evidence_from_stage_sql(
-        context.db_schema,
-        context.stage_table_map[EntityAddressEvidence],
-        context.stage_table,
-        source_run_id=plan.source_run_id,
-        node_id=plan.node_id,
-        affected_group_table=(plan.affected_group_table if context.is_partial_support_patch else None),
-    )
+    return affected_support.legacy_evidence_sql(importlib.import_module(__name__), context)
 
 
 def _support_bridge_specs(context: _SupportStageContext) -> list[_SupportBridgeSpec]:
@@ -11995,24 +11950,33 @@ async def process_entity_address_unified_data(ctx, task=None):
         affected_group_table = _partial_affected_group_table(stage_table)
         context["partial_provider_directory_affected_group_table"] = affected_group_table
         context["partial_affected_group_table"] = affected_group_table
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
-        await _run_sql_phase(
-            _prepare_partial_affected_groups_sql(
+        if affected_patch.is_active():
+            await preparation_admission.create_stage_sql(
                 db_schema,
                 affected_group_table,
-                source_selects,
-                source_ids=provider_directory_source_ids,
-            ),
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified preparing affected Provider Directory groups",
-            unit="tables",
-            done=0,
-            total=1,
-            message="preparing affected Provider Directory evidence groups",
-            emit_start=True,
-            emit_done=True,
-        )
+                _prepare_partial_affected_groups_sql(
+                    db_schema, affected_group_table, source_selects, source_ids=provider_directory_source_ids
+                ),
+            )
+        else:
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
+            await _run_sql_phase(
+                _prepare_partial_affected_groups_sql(
+                    db_schema,
+                    affected_group_table,
+                    source_selects,
+                    source_ids=provider_directory_source_ids,
+                ),
+                context=context,
+                run_id=run_id,
+                phase="entity-address-unified preparing affected Provider Directory groups",
+                unit="tables",
+                done=0,
+                total=1,
+                message="preparing affected Provider Directory evidence groups",
+                emit_start=True,
+                emit_done=True,
+            )
         await _run_sql_phase(
             _index_partial_affected_groups_sql(db_schema, affected_group_table),
             context=context,
@@ -12116,7 +12080,7 @@ async def process_entity_address_unified_data(ctx, task=None):
     if not source_selects:
         raise RuntimeError("No source tables are available for entity_address_unified materialization.")
 
-    if serving_only_refresh:
+    if serving_only_refresh and not affected_patch.is_active():
         support_stage_class_map = {}
         ctx["context"]["support_stage_prepared"] = False
         ctx["context"]["support_stage_indexes_prepared"] = True
@@ -12652,13 +12616,7 @@ async def process_entity_address_unified_data(ctx, task=None):
                 message="sources materialized",
             )
 
-    should_enable_inference = str(
-        os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_INFERENCE", "false")
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    if test_mode:
-        should_enable_inference = str(
-            os.getenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_TEST_ENABLE_INFERENCE", "false")
-        ).strip().lower() in {"1", "true", "yes", "on"}
+    should_enable_inference = preparation_admission.inference_enabled(test_mode)
 
     if (
         should_enable_inference
@@ -12667,62 +12625,67 @@ async def process_entity_address_unified_data(ctx, task=None):
         and available_relation_map.get("npi_taxonomy", False)
         and available_relation_map.get("nucc_taxonomy", False)
     ):
-        include_facility_override = False
-        if available_relation_map.get("facility_anchor_npi_override", False):
-            include_facility_override = bool(
-                await preparation_admission.read_scalar(
-                    db,
-                    f"""
-                    SELECT EXISTS (
-                        SELECT 1
-                          FROM {db_schema}.facility_anchor_npi_override
-                         WHERE npi IS NOT NULL
-                           AND LOWER(COALESCE(status, '')) = 'approved'
-                         LIMIT 1
-                    );
-                    """,
+        async with affected_support.inference_inputs(db_schema):
+            include_facility_override = False
+            if available_relation_map.get("facility_anchor_npi_override", False):
+                include_facility_override = bool(
+                    await preparation_admission.read_scalar(
+                        db,
+                        f"""
+                        SELECT EXISTS (
+                            SELECT 1
+                              FROM {db_schema}.facility_anchor_npi_override
+                             WHERE npi IS NOT NULL
+                               AND LOWER(COALESCE(status, '')) = 'approved'
+                             LIMIT 1
+                        );
+                        """,
+                    )
                 )
+            context["facility_anchor_npi_override_inference_enabled"] = include_facility_override
+            include_npi_other_identifier = available_relation_map.get(
+                "npi_other_identifier", False
+            ) and _is_env_enabled(
+                "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPI_OTHER_IDENTIFIER_INFERENCE",
+                False,
             )
-        context["facility_anchor_npi_override_inference_enabled"] = include_facility_override
-        include_npi_other_identifier = available_relation_map.get("npi_other_identifier", False) and _is_env_enabled(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPI_OTHER_IDENTIFIER_INFERENCE",
-            False,
-        )
-        context["facility_anchor_npi_other_identifier_inference_enabled"] = include_npi_other_identifier
-        await _prepare_inference_stage_indexes(db_schema, stage_table, context=context)
-        await _run_sql_phase(
-            _inference_sql(
-                db_schema,
-                stage_table,
-                inference_options_by_name={
-                    "include_hospital_enrollment": available_relation_map.get("provider_enrollment_hospital", False),
-                    "include_fqhc_enrollment": available_relation_map.get("provider_enrollment_fqhc", False),
-                    "include_facility_override": include_facility_override,
-                    "include_npi_other_identifier": include_npi_other_identifier,
-                    "include_name_fallback": _is_env_enabled(
-                        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE",
-                        False,
-                    ),
-                    "include_nppes_name_inference": _is_env_enabled(
-                        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_NAME_INFERENCE",
-                        False,
-                    ),
-                    "include_nppes_broad_inference": _is_env_enabled(
-                        "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_BROAD_INFERENCE",
-                        False,
-                    ),
-                },
-            ),
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified inferring NPIs",
-            unit="run",
-            done=0,
-            total=1,
-            message="inferring facility-anchor NPIs",
-            emit_start=True,
-            emit_done=True,
-        )
+            context["facility_anchor_npi_other_identifier_inference_enabled"] = include_npi_other_identifier
+            await _prepare_inference_stage_indexes(db_schema, stage_table, context=context)
+            await _run_sql_phase(
+                _inference_sql(
+                    db_schema,
+                    stage_table,
+                    inference_options_by_name={
+                        "include_hospital_enrollment": available_relation_map.get(
+                            "provider_enrollment_hospital", False
+                        ),
+                        "include_fqhc_enrollment": available_relation_map.get("provider_enrollment_fqhc", False),
+                        "include_facility_override": include_facility_override,
+                        "include_npi_other_identifier": include_npi_other_identifier,
+                        "include_name_fallback": _is_env_enabled(
+                            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NAME_FALLBACK_INFERENCE",
+                            False,
+                        ),
+                        "include_nppes_name_inference": _is_env_enabled(
+                            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_NAME_INFERENCE",
+                            False,
+                        ),
+                        "include_nppes_broad_inference": _is_env_enabled(
+                            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_ENABLE_NPPES_BROAD_INFERENCE",
+                            False,
+                        ),
+                    },
+                ),
+                context=context,
+                run_id=run_id,
+                phase="entity-address-unified inferring NPIs",
+                unit="run",
+                done=0,
+                total=1,
+                message="inferring facility-anchor NPIs",
+                emit_start=True,
+                emit_done=True,
+            )
 
     if include_inline_source_evidence:
         context["source_evidence_inlined"] = True
@@ -12952,7 +12915,17 @@ async def process_entity_address_unified_data(ctx, task=None):
 
     node_id = str(os.getenv("HLTHPRT_IMPORT_NODE_ID") or "").strip() or None
     cached_support_counts = context.get("support_counts")
-    if serving_only_refresh:
+    if serving_only_refresh and affected_patch.is_active():
+        support_counts_by_kind = await affected_support.populate(
+            importlib.import_module(__name__),
+            db_schema,
+            stage_table,
+            support_stage_class_map,
+            available_relation_map,
+            context,
+            import_date,
+        )
+    elif serving_only_refresh:
         support_counts_by_kind = {}
         context["support_stage_populated"] = False
         context["support_stage_skipped"] = True
@@ -13034,7 +13007,15 @@ async def process_entity_address_unified_data(ctx, task=None):
                 message=f"compacted {compacted_rows:,} hot rows",
             )
 
-    if is_partial_provider_directory_refresh and context.get("partial_provider_directory_replacement_publish"):
+    if affected_patch.is_active():
+        await affected_patch.prepare_location_scope(
+            importlib.import_module(__name__), db_schema, stage_table, affected_group_table, context
+        )
+    if (
+        is_partial_provider_directory_refresh
+        and context.get("partial_provider_directory_replacement_publish")
+        and not affected_patch.is_active()
+    ):
         if not affected_group_table or not await _has_table(db_schema, affected_group_table):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
@@ -13228,7 +13209,7 @@ async def process_entity_address_unified_data(ctx, task=None):
     if (
         not ctx["context"].get("support_stage_indexes_prepared")
         and not context.get("partial_support_patch_publish")
-        and not serving_only_refresh
+        and (not serving_only_refresh or affected_patch.is_active())
     ):
         await _create_support_stage_indexes(
             support_stage_class_map,
@@ -13336,7 +13317,9 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
                 )
     stage_cls = make_class(EntityAddressUnified, import_date)
     serving_only_refresh = bool(context.get("serving_only_refresh"))
-    support_stage_class_map = {} if serving_only_refresh else _support_stage_classes(import_date)
+    support_stage_class_map = (
+        {} if serving_only_refresh and not affected_patch.is_active() else _support_stage_classes(import_date)
+    )
     affected_group_table = str(
         context.get("partial_affected_group_table")
         or context.get("partial_provider_directory_affected_group_table")
@@ -13365,7 +13348,11 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             "entity-address-unified provider-directory-partial refresh must publish "
             "through replacement-stage table swap; live support patch publishing is disabled."
         )
-    if is_partial_provider_directory_refresh and context.get("partial_provider_directory_replacement_publish"):
+    if (
+        is_partial_provider_directory_refresh
+        and context.get("partial_provider_directory_replacement_publish")
+        and not affected_patch.is_active()
+    ):
         if not coordinate_scope_table or not await _has_table(db_schema, coordinate_scope_table):
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial replacement publish requires "
@@ -13452,8 +13439,11 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         print_time_info(context.get("start"))
         return
 
+    context["merged_result_rows"] = await affected_patch.merged_row_count(
+        importlib.import_module(__name__), db_schema, stage_cls.__tablename__, context, previous_rows
+    )
     _validate_publish_row_count(
-        stage_rows=stage_rows,
+        stage_rows=context["merged_result_rows"],
         previous_rows=previous_rows,
         test_mode=bool(context.get("test_mode")),
         min_rows_required=min_rows_required,
@@ -13558,7 +13548,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         run_id=run_id,
         stage_rows=stage_rows,
         **geo_dependency_options_dict,
-        **({"record_candidate": False} if protected_publication else {}),
+        **({"record_candidate": False} if protected_publication or affected_patch.is_active() else {}),
     )
     compaction_started = time.monotonic()
     context["geo_assurance_compaction"] = await _compact_geo_assurance_stage(
@@ -13585,7 +13575,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         )
     await _create_stage_indexes(stage_cls, db_schema, context=context)
     context["stage_indexes_prepared"] = True
-    if coordinate_scope_table:
+    if coordinate_scope_table and not affected_patch.is_active():
         await _run_sql_phase(
             f"DROP TABLE IF EXISTS {db_schema}.{coordinate_scope_table};",
             context=context,

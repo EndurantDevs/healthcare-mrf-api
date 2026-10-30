@@ -5,12 +5,13 @@ import types
 from unittest.mock import AsyncMock
 
 import pytest
-
-from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
 import sanic.exceptions
 
 from api.endpoint import npi as npi_module
 from api.endpoint.npi import npi_index_status
+from tests.provider_profile_snapshot_test_support import (
+    stub_provider_profile_snapshot as stub_provider_profile_snapshot,
+)
 
 
 @pytest.fixture
@@ -19,10 +20,7 @@ def uhc_provider_directory_alias_fixture():
     canonical_api_base = "https://public.providerexpress.com/providerdirectory"
     source_ids = [f"pdfhir_uhc_{alias_number:02d}" for alias_number in range(31)]
     source_record_ids = [
-        (
-            "provider_directory_fhir:practitioner_role:"
-            f"{source_id}:role-{alias_number:02d}:location-{alias_number:02d}"
-        )
+        (f"provider_directory_fhir:practitioner_role:{source_id}:role-{alias_number:02d}:location-{alias_number:02d}")
         for alias_number, source_id in enumerate(source_ids)
     ]
     source_detail_map = {
@@ -54,9 +52,7 @@ async def test_npi_index(monkeypatch):
 
     monkeypatch.setattr("api.endpoint.npi._compute_npi_counts", fake_counts)
 
-    request = types.SimpleNamespace(
-        app=types.SimpleNamespace(config={"RELEASE": "test", "ENVIRONMENT": "test"})
-    )
+    request = types.SimpleNamespace(app=types.SimpleNamespace(config={"RELEASE": "test", "ENVIRONMENT": "test"}))
 
     response = await npi_index_status(request)
     response_payload = json.loads(response.body)
@@ -214,9 +210,24 @@ async def test_provider_directory_sources_collapse_uhc_aliases(
     alias_fixture = uhc_provider_directory_alias_fixture
     stable_source_record_ids = list(alias_fixture["source_record_ids"])
     provider_address_map = {
+        "npi": 1000000000,
+        "address_key": "00000000-0000-0000-0000-000000000001",
         "source_record_ids": list(stable_source_record_ids),
         "plans_network_array": [],
     }
+    lineage_rows = [
+        {
+            "source_id": source_id,
+            "resource_type": "PractitionerRole",
+            "resource_id": f"role-{alias_number:02d}",
+            "dataset_id": "retained-alias-dataset",
+            "endpoint_id": alias_fixture["endpoint_id"],
+            "canonical_api_base": alias_fixture["canonical_api_base"],
+        }
+        for alias_number, source_id in enumerate(alias_fixture["source_ids"])
+    ]
+    fetch_lineage = AsyncMock(return_value=types.SimpleNamespace(all=lambda: lineage_rows))
+    monkeypatch.setattr(npi_module, "_execute_stmt", fetch_lineage)
     fetch_source_details = AsyncMock(return_value=alias_fixture["source_detail_map"])
     monkeypatch.setattr(
         npi_module,
@@ -227,6 +238,14 @@ async def test_provider_directory_sources_collapse_uhc_aliases(
     await npi_module._attach_provider_directory_source_details([provider_address_map])
 
     fetch_source_details.assert_awaited_once_with(alias_fixture["source_ids"], session=None)
+    assert fetch_lineage.await_count == 1
+    assert fetch_lineage.await_args.kwargs["params"] == {
+        "source_record_ids": sorted(stable_source_record_ids),
+        "npis": [provider_address_map["npi"]] * len(stable_source_record_ids),
+        "address_keys": [provider_address_map["address_key"]] * len(stable_source_record_ids),
+        "phone_numbers": [None] * len(stable_source_record_ids),
+    }
+    assert "dataset.run_id = overlay.last_seen_run_id" in str(fetch_lineage.await_args.args[0])
     assert provider_address_map["source_record_ids"] == stable_source_record_ids
     assert provider_address_map["plans_network_array"] == []
     endpoint_sources = provider_address_map["provider_directory_sources"]
@@ -234,9 +253,7 @@ async def test_provider_directory_sources_collapse_uhc_aliases(
     endpoint_provenance = endpoint_sources[0]
     assert endpoint_provenance["endpoint_id"] == alias_fixture["endpoint_id"]
     assert endpoint_provenance["catalog_aliases_verified"] is False
-    assert [
-        alias["source_id"] for alias in endpoint_provenance["catalog_aliases"]
-    ] == alias_fixture["source_ids"]
+    assert [alias["source_id"] for alias in endpoint_provenance["catalog_aliases"]] == alias_fixture["source_ids"]
     assert set(endpoint_provenance) == {
         "source",
         "source_ids",
@@ -284,9 +301,7 @@ def test_provider_directory_owner_source_expands_all_endpoint_aliases(
     )
 
     assert len(endpoint_sources) == 1
-    assert [
-        alias["source_id"] for alias in endpoint_sources[0]["catalog_aliases"]
-    ] == alias_fixture["source_ids"]
+    assert [alias["source_id"] for alias in endpoint_sources[0]["catalog_aliases"]] == alias_fixture["source_ids"]
 
 
 @pytest.mark.asyncio
@@ -307,9 +322,7 @@ async def test_provider_directory_source_fetch_keeps_endpoint_identity(monkeypat
     monkeypatch.setattr(npi_module, "_is_table_available", AsyncMock(return_value=True))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_source_query)
 
-    source_details = await npi_module._fetch_provider_directory_source_detail_map(
-        ["pdfhir_uhc_00"]
-    )
+    source_details = await npi_module._fetch_provider_directory_source_detail_map(["pdfhir_uhc_00"])
 
     assert source_details["pdfhir_uhc_00"]["endpoint_id"] == "pd_endpoint_uhc_public"
     assert source_details["pdfhir_uhc_00"]["canonical_api_base"] == (
@@ -341,8 +354,11 @@ async def test_provider_directory_overlay_fetch_projects_coordinates(monkeypatch
     assert rows == []
     assert "lat,\n            long," in captured_sql_statements[0]
     assert "address_precision, lat, long" in captured_sql_statements[0]
-    assert "mrf.provider_directory_source AS source" in captured_sql_statements[0]
-    assert "source.canonical_api_base" in captured_sql_statements[0]
+    assert "mrf.provider_directory_source AS source" not in captured_sql_statements[0]
+    assert "dataset.publication_metadata_summary_json -> 'source_ids'" in captured_sql_statements[0]
+    assert "endpoint.canonical_api_base" in captured_sql_statements[0]
+    assert "COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)" in captured_sql_statements[0]
+    assert "overlay.last_seen_run_id = current_resource.run_id" in captured_sql_statements[0]
 
 
 @pytest.mark.asyncio
@@ -354,17 +370,13 @@ async def test_provider_directory_overlay_qualifies_only_official_uhc_addresses(
         "type": "practice",
         "first_line": "1 Main St",
         "source_record_ids": [
-            "provider_directory_fhir:organization_address:"
-            f"{npi_module.UHC_PROVIDER_FILE_SOURCE_ID}:facility-1:1"
+            f"provider_directory_fhir:organization_address:{npi_module.UHC_PROVIDER_FILE_SOURCE_ID}:facility-1:1"
         ],
     }
     non_uhc_address_by_field = {
         "type": "practice",
         "first_line": "2 Main St",
-        "source_record_ids": [
-            "provider_directory_fhir:organization_address:"
-            "pdfhir_example:facility-2:1"
-        ],
+        "source_record_ids": ["provider_directory_fhir:organization_address:pdfhir_example:facility-2:1"],
     }
 
     class FakeResult:
@@ -387,9 +399,7 @@ async def test_provider_directory_overlay_qualifies_only_official_uhc_addresses(
         AsyncMock(return_value=FakeResult()),
     )
 
-    overlay_address_list = await npi_module._fetch_provider_directory_address_overlay(
-        1000000491
-    )
+    overlay_address_list = await npi_module._fetch_provider_directory_address_overlay(1000000491)
 
     assert overlay_address_list[0] == {
         **uhc_address_by_field,

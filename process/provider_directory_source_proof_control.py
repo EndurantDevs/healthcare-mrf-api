@@ -219,7 +219,8 @@ async def lock_proof_parent(publisher, dataset_id, *, acquiring):
     )
     _require(
         parent_by_field is not None
-        and parent_by_field["status"] not in {"acquisition_abandoned", "acquisition_retired"},
+        and parent_by_field["status"]
+        not in {"acquisition_abandoned", "acquisition_retired", "publication_acknowledged"},
         "proof_parent_immutable",
     )
     if acquiring:

@@ -156,6 +156,12 @@ async def _align_npi_receipt_validator_owner(connection, policy):
 async def _grant_detail_reads(connection, component, before_by_name, after_by_name):
     """Keep new supplemental models on the Source owner and expose only Reader SELECT."""
     policy = component.policy
+    await connection.execute(
+        text(
+            f"GRANT SELECT ON TABLE {storage_identifier(policy.schema)}.provider_directory_api_endpoint "
+            f"TO {storage_identifier(component.reader)}"
+        )
+    )
     model_names = {table.name for table in models.db.metadata.tables.values()}
     model_names.update((profile.PROFILE_TABLE, profile.PROFILE_EVIDENCE_TABLE))
     for qualified, oid in after_by_name.items():

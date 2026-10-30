@@ -67,9 +67,15 @@ def test_native_initial_receipt_refuses_unfunded_tablespace(monkeypatch, object_
 async def _create_cutover_tables(engine, schema, consumed):
     # No import-run write or admission is exercised here; its twelve-guard proof is separate.
     async with engine.begin() as connection:
-        await connection.execute(text(f'ALTER TABLE "{schema}".import_run ADD COLUMN status text'))
         await connection.execute(
-            text(f"INSERT INTO \"{schema}\".import_run VALUES (:run,'running')"), {"run": consumed["run_id"]}
+            text(
+                f'ALTER TABLE "{schema}".import_run ADD COLUMN status text, ADD COLUMN importer text, '
+                "ADD COLUMN finished_at timestamptz, ADD COLUMN metrics jsonb"
+            )
+        )
+        await connection.execute(
+            text(f"INSERT INTO \"{schema}\".import_run(run_id,status) VALUES (:run,'running')"),
+            {"run": consumed["run_id"]},
         )
         for table, evidence in (("initial_evidence_stage", True), ("initial_profile_stage", False)):
             statement = (
@@ -118,13 +124,14 @@ async def _create_cutover_tables(engine, schema, consumed):
             await connection.execute(text(trigger + f' EXECUTE FUNCTION "{schema}".{name}()'))
 
 
-async def _bind_fixture_geometry(consumed, preflight, receipt_payload, schema):
+async def _bind_fixture_geometry(consumed, preflight, receipt_payload, schema, initial_targets):
     raw = receipt_payload["capacity_geometry"]
     raw.update(
         executable_plan_hash=consumed["executable_plan_hash"],
         selection_proof_id=consumed["selection_proof_id"],
         desired_source_vector_hash=consumed["source_vector_hash"],
         desired_context_vector_hash=consumed["source_context_vector_hash"],
+        initial_target_state_sha256=contract.target_state_sha256(initial_targets.payload),
     )
     raw["physical_projection_contract_id"] = capacity.BOUNDED_ADMISSION_CONTRACT_ID
     raw["serving_generation_oid"] = await fhir._provider_directory_relation_oid(
@@ -148,6 +155,9 @@ async def _bind_fixture_geometry(consumed, preflight, receipt_payload, schema):
     preflight["capacity_geometry_hash"] = geometry_hash
     preflight_payload = json.loads(preflight["receipt_json"])
     preflight_payload["capacity_geometry"] = raw
+    preflight_payload["serving_generation_preflight"] = initial_targets.payload
+    preflight_payload["serving_generation_preflight_sha256"] = geometry.initial_target_state_sha256
+    preflight["serving_preflight_sha256"] = geometry.initial_target_state_sha256
     preflight["receipt_json"] = json.dumps(preflight_payload)
     envelope = json.loads(consumed["canonical_lease_json"])
     envelope["signing_preflight_guard"]["healthcare_receipt"] = preflight_payload
@@ -215,23 +225,40 @@ async def _cutover_fixture(engine, monkeypatch, prepare_authority=None):
     consumed, preflight, serving, receipt_payload = await fixture._publication_values(engine)
     schema = fixture._SCHEMA
     await _create_cutover_tables(engine, schema, consumed)
+    async with database.transaction():
+        initial_targets = await initial.capture_targets(fhir, schema)
     geometry, receipt_layout, projection, geometry_hash, raw = await _bind_fixture_geometry(
-        consumed, preflight, receipt_payload, schema
+        consumed, preflight, receipt_payload, schema, initial_targets
     )
     extra_by_field = {}
     if prepare_authority is not None:
         consumed, preflight, geometry, projection, extra_by_field = await prepare_authority(
             database, engine, consumed, preflight, geometry, projection
         )
+        initial_targets = extra_by_field["initial_targets"]
         geometry_hash = capacity.capacity_geometry_hash(geometry)
         raw = capacity.capacity_geometry_payload(geometry)
+    assert geometry.initial_target_state_sha256 == contract.target_state_sha256(initial_targets.payload)
     await fixture._seed_authority(engine, consumed, preflight)
-    admission = await _fixture_admission(database, geometry, projection, consumed, preflight)
-    if extra_by_field:
+    admission = await _fixture_admission(
+        database, geometry, projection, consumed, preflight, initial_targets, extra_by_field.get("build", {})
+    )
+    if "verified_lease" in extra_by_field:
         admission = replace(
             admission, lease=extra_by_field["verified_lease"], database_identity=extra_by_field["database_identity"]
         )
-    build = fhir._ProviderDirectoryProfileBuild(
+    build = _fixture_profile_build(schema, serving, consumed, geometry, geometry_hash)
+    if "build" in extra_by_field:
+        build = replace(build, **extra_by_field["build"])
+    cutover_by_field, stages = await _prepare_fixture_stages(
+        engine, build, geometry, admission, receipt_layout, extra_by_field, raw, geometry_hash
+    )
+    return database, cutover_by_field, stages
+
+
+def _fixture_profile_build(schema, serving, consumed, geometry, geometry_hash):
+    """Preserve the component fixture's original build metadata and prepared stages."""
+    return fhir._ProviderDirectoryProfileBuild(
         schema=schema,
         generation_id=serving["generation_id"],
         source_ids=(),
@@ -250,12 +277,6 @@ async def _cutover_fixture(engine, monkeypatch, prepare_authority=None):
         capacity_geometry_hash=geometry_hash,
         capacity_geometry_json=capacity.canonical_capacity_geometry_json(geometry),
     )
-    if extra_by_field:
-        build = replace(build, **extra_by_field["build"])
-    cutover_by_field, stages = await _prepare_fixture_stages(
-        engine, build, geometry, admission, receipt_layout, extra_by_field, raw, geometry_hash
-    )
-    return database, cutover_by_field, stages
 
 
 @pytest.mark.parametrize("failure", [False, True, "cancel"])
@@ -316,9 +337,6 @@ def test_native_initial_target_snapshot_and_evolved_legacy_context(monkeypatch, 
             database, _cutover, _stages = await _cutover_fixture(engine, monkeypatch)
             schema = fixture._SCHEMA
             async with database.transaction():
-                await database.status(
-                    f'ALTER TABLE "{schema}".import_run ADD COLUMN importer text, ADD COLUMN finished_at timestamptz, ADD COLUMN metrics jsonb'
-                )
                 if state != "empty":
                     legacy_result = await _seed_legacy_snapshot(
                         database, schema, state, selection, synthetic_profile_execution
@@ -343,7 +361,57 @@ def test_native_initial_target_snapshot_and_evolved_legacy_context(monkeypatch, 
     asyncio.run(exercise())
 
 
-async def _fixture_admission(database, geometry, projection, consumed, preflight):
+def _fixture_source_identity(geometry, initial_targets, build_by_field):
+    """Bind a genuine target observation without claiming full runtime admission."""
+    # The ledger helper imports replay, so defer this existing typed-model reuse until fixture execution.
+    from tests.test_provider_directory_cms_capacity_ledger import _resume_source_identity
+
+    assert geometry.initial_target_state_sha256 == contract.target_state_sha256(initial_targets.payload)
+    pairs = tuple(build_by_field.get("desired_source_vector", ()))
+    contexts = tuple(build_by_field.get("desired_source_context_vector", ()))
+    observed = replace(
+        _resume_source_identity(geometry, True),
+        source_ids=[source for source, _dataset in pairs],
+        dataset_ids=[dataset for _source, dataset in pairs],
+        desired_source_vector=pairs,
+        desired_source_context_vector=contexts,
+    )
+    return initial.bind_identity(fhir, observed, initial_targets)
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+def test_component_identity_preserves_exact_target_contract_and_vectors(recovered):
+    """Keep synthetic host binding separate from genuine native capture/admission proof."""
+    from process import provider_directory_profile_initial_recovery as recovery
+    from tests.test_provider_directory_profile_initial import _geometry, _target
+    from tests.test_provider_directory_profile_initial_recovery import _witness
+
+    payload = _target()
+    if recovered:
+        payload = recovery.recovered_target_state(payload, _witness(payload))
+    observed_targets = contract.InitialTargets(payload["evidence_target_oid"], payload["profile_target_oid"], payload)
+    pairs = (("synthetic-source", "synthetic-dataset"),)
+    contexts = (("synthetic-source", "ff" * 32),)
+    geometry = replace(
+        _geometry(),
+        initial_target_state_sha256=contract.target_state_sha256(payload),
+        desired_source_vector_hash=fhir._provider_directory_profile_source_vector_hash(pairs),
+        desired_context_vector_hash=fhir._provider_directory_profile_source_context_vector_hash(contexts),
+    )
+    build_by_field = {"desired_source_vector": pairs, "desired_source_context_vector": contexts}
+    identity = _fixture_source_identity(geometry, observed_targets, build_by_field)
+    assert type(identity) is fhir._ProviderDirectoryProfileIdentityInputs
+    assert identity.initial_targets is observed_targets
+    assert identity.desired_source_vector == pairs and identity.desired_source_context_vector == contexts
+    assert identity.source_ids == ["synthetic-source"] and identity.dataset_ids == ["synthetic-dataset"]
+    assert initial._receipt_key(identity.initial_targets.payload, 7) == ("7" if recovered else "global")
+    with pytest.raises(AssertionError):
+        _fixture_source_identity(
+            replace(geometry, initial_target_state_sha256="00" * 32), observed_targets, build_by_field
+        )
+
+
+async def _fixture_admission(database, geometry, projection, consumed, preflight, initial_targets, build_by_field):
     """Construct the original native fixture admission with its observed WAL origin."""
     admission = fhir._ProviderDirectoryProfileCapacityAdmission(
         geometry=geometry,
@@ -357,6 +425,7 @@ async def _fixture_admission(database, geometry, projection, consumed, preflight
             max_build_deadline=consumed["max_build_deadline"],
         ),
         database_identity=None,
+        admitted_identity=_fixture_source_identity(geometry, initial_targets, build_by_field),
         initial_wal_lsn=await database.scalar("SELECT pg_current_wal_insert_lsn()::text"),
         wal_tracker=fhir._ProviderDirectoryProfileWalTracker(
             accounted_control_operation_counts={

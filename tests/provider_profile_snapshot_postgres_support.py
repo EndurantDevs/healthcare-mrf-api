@@ -229,10 +229,10 @@ async def snapshot_database(monkeypatch, *, populated=True):
         await engine.dispose()
 
 
-async def create_families(database, schema):
+async def create_families(database, schema, *, unified_exists=False):
     """Stage old and new marker rows before a reader takes its snapshot."""
     for name in TABLES:
-        if name in snapshot._DOCTORS_TABLES:
+        if name in snapshot._DOCTORS_TABLES or (unified_exists and name == "entity_address_unified"):
             continue
         for suffix, marker in (("", "old"), ("_next", "new")):
             await database.status(f'CREATE TABLE "{schema}".{name}{suffix} (marker text)')
@@ -313,22 +313,30 @@ def address_oids_sql(schema):
     )
 
 
-async def publish_family(database, schema, started=None):
+async def publish_family(database, schema, started=None, *, locked=None, release=None):
     """Run the independent native publisher without inheriting a Reader request session."""
     component = database._snapshot_doctors_component
 
     async def publish():
         async with bind_generic_source_transaction_factory(component.factory):
-            await _publish_family(component, schema, started)
+            await _publish_family(component, schema, started, locked=locked, release=release)
 
     await asyncio.create_task(publish(), context=Context())
 
 
-async def _publish_family(component, schema, started):
+async def _publish_family(component, schema, started, *, locked, release):
     """Rename every serving family and advance its native receipt in one commit."""
     async with source_transaction(component.database) as session:
         previous = await doctors.capture_doctors_predecessor(session, schema)
         await session.execute(text("SET LOCAL statement_timeout = '5s'"))
+        if locked is not None:
+            assert release is not None
+            assert await session.scalar(text("SELECT current_user")) == component.owner
+            assert not await session.scalar(text("SELECT rolsuper FROM pg_roles WHERE rolname=current_user"))
+            names = ",".join(f'"{schema}"."{name}"' for name in sorted(TABLES))
+            await session.execute(text(f"LOCK TABLE {names} IN ACCESS EXCLUSIVE MODE"))
+            locked.set()
+            await release.wait()
         if started is not None:
             started.set()
         for table in TABLES:
@@ -340,3 +348,63 @@ async def _publish_family(component, schema, started):
             SET local_generation=2,origin_generation=2,published_at=clock_timestamp(),
                 relation_oids={address_oids_sql(schema)}''')
         )
+
+
+@asynccontextmanager
+async def near_snapshot_database(monkeypatch):
+    """Add the existing native publisher around the geo fixture's real Unified heaps."""
+    from tests.npi_near_snapshot_postgres_support import near_database
+
+    async with near_database(monkeypatch) as (database, schema), AsyncExitStack() as custody:
+        await create_families(database, schema, unified_exists=True)
+        await grant_profile_reader(database, schema, READ_TABLES)
+        await _enroll_snapshot_doctors(database.engine, database, schema, monkeypatch, custody)
+        yield database, schema
+
+
+@asynccontextmanager
+async def held_family_publication(database, schema):
+    """Hold the genuine publisher's complete family lock until the caller releases it."""
+    locked, release = asyncio.Event(), asyncio.Event()
+    publication = asyncio.create_task(publish_family(database, schema, locked=locked, release=release))
+    try:
+        await asyncio.wait_for(locked.wait(), 3)
+        yield release
+    finally:
+        release.set()
+        try:
+            await asyncio.wait_for(publication, 3)
+        finally:
+            publication.cancel()
+            await asyncio.gather(publication, return_exceptions=True)
+
+
+async def wait_for_snapshot_lock(database, schema):
+    """Observe the actual Reader wait without starting its catalog snapshot early."""
+
+    async def waiting_pid():
+        async with database.engine.connect() as observer:
+            while True:
+                await observer.execute(text("SELECT pg_stat_clear_snapshot()"))
+                pid = await observer.scalar(
+                    text("""SELECT activity.pid FROM pg_locks locked
+                        JOIN pg_stat_activity activity ON activity.pid=locked.pid
+                        JOIN pg_class relation ON relation.oid=locked.relation
+                        JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+                        WHERE activity.usename=:reader AND namespace.nspname=:schema
+                          AND locked.mode='AccessShareLock' AND NOT locked.granted LIMIT 1"""),
+                    {"reader": database._reader_database._reader_login[0], "schema": schema},
+                )
+                if pid is not None:
+                    return pid
+                await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(waiting_pid(), 3)
+
+
+async def release_after_snapshot_wait(database, schema, release):
+    """Keep the real lock held longer than all three former 250ms attempts."""
+    pid = await wait_for_snapshot_lock(database, schema)
+    await asyncio.sleep(1.1)
+    release.set()
+    return pid

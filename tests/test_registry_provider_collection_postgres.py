@@ -70,6 +70,7 @@ async def collection_transport(profile_transport, monkeypatch):
 
     context.writer_statements.clear()
     context.statements.clear()
+    context.setup_statements.clear()
     context.transactions.clear()
     yield SimpleNamespace(context=context, requests=requests, pins=pins, custody=custody, sentinel=sentinel)
 
@@ -109,6 +110,7 @@ def _reader_evidence(case):
 async def _post(case, document, *, headers=None):
     context = case.context
     context.statements.clear()
+    context.setup_statements.clear()
     context.transactions.clear()
     case.pins.clear()
     case.custody.clear()
@@ -237,10 +239,13 @@ async def test_native_collection_authority_refusal_precedes_reader(collection_tr
     document = v2_envelope(_query("list"))
     wrong = await _post(case, document, headers={"Authorization": "Bearer wrong"})
     assert wrong.status == 403
+    assert not case.context.setup_statements
     assert not case.context.statements and not case.pins and not case.custody
     invalid = await _post(case, document | {"access_scope_sha256": "0" * 64})
     assert invalid.status == 400
+    assert not case.context.setup_statements
     assert not case.context.statements and not case.pins and not case.custody
     typed = await _post(case, document | {"policy_revision": True})
     assert typed.status == 400
+    assert not case.context.setup_statements
     assert not case.context.statements and not case.pins and not case.custody

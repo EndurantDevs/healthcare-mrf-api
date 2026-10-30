@@ -59,7 +59,7 @@ def _assert_receipt_columns_match_model(elements) -> None:
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     """Preserve capacity and joined registry ancestry beneath the actual unique head."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["20261029010000_registry_source_inventory"]
+    assert script.get_heads() == ["20261031030000_profile_initial_inverse_guard"]
     inventory_migration = script.get_revision("20261029010000_registry_source_inventory")
     assert inventory_migration.down_revision == "20261028020000_registry_membership_refresh"
     assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (

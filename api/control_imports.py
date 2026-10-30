@@ -2963,6 +2963,10 @@ def _provider_directory_operation(
     from process.provider_directory_serving_recovery import is_recovery_request
 
     if is_recovery_request("provider-directory-fhir", params):
+        from process.provider_directory_serving_inverse_capacity_contract import EXECUTION_FIELD
+
+        if EXECUTION_FIELD in params:
+            return _PROVIDER_DIRECTORY_GLOBAL_PROFILE, frozenset(), None
         return _PROVIDER_DIRECTORY_SCOPED_ARTIFACT, _provider_directory_source_ids(params["source_ids"]), None
     if _is_current_version_census_control(params):
         return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
@@ -4977,21 +4981,16 @@ def _retry_child_params(
     retry_params_by_name: dict[str, Any],
 ) -> dict[str, Any]:
     current_params_by_name = current_run_map.get("params") if isinstance(current_run_map.get("params"), dict) else {}
-    from process.provider_directory_serving_recovery import OPERATION_PARAM, is_recovery_request
+    importer = current_run_map.get("importer")
+    from process.provider_directory_serving_recovery import OPERATION_PARAM, validated_recovery_retry_params
 
     if OPERATION_PARAM in current_params_by_name:
-        is_recovery_request(str(current_run_map.get("importer") or ""), current_params_by_name)
-        if any(
-            key not in current_params_by_name or override_value != current_params_by_name[key]
-            for key, override_value in retry_params_by_name.items()
-        ):
-            raise ValueError("provider_directory_serving_recovery_retry_scope_changed")
-        return dict(current_params_by_name)
+        return validated_recovery_retry_params(importer, current_params_by_name, retry_params_by_name, run_id)
     if current_params_by_name.get("frozen_rate_file_set_protected") is True:
         raise ValueError("protected frozen runs cannot be retried through the public API")
     if current_params_by_name.get(DIRECT_RATE_FILE_PUBLIC_MARKER) is True:
         raise ValueError("protected direct runs cannot be retried through the public API")
-    if current_run_map.get("importer") == "ptg" and (
+    if importer == "ptg" and (
         _has_ptg_full_rebuild_control(current_params_by_name) or _has_ptg_full_rebuild_control(retry_params_by_name)
     ):
         raise ValueError("full rebuild runs cannot be retried; create a new controlled rebuild attempt")
@@ -4999,7 +4998,7 @@ def _retry_child_params(
         **current_params_by_name,
         **retry_params_by_name,
     }
-    if current_run_map.get("importer") == "mrf-source-discovery":
+    if importer == "mrf-source-discovery":
         root_run_id = str(
             current_params_by_name.get("mrf_discovery_root_run_id")
             or retry_params_by_name.get("mrf_discovery_root_run_id")
@@ -5008,11 +5007,8 @@ def _retry_child_params(
         child_params_by_name["retry_of_run_id"] = run_id
         child_params_by_name["mrf_discovery_root_run_id"] = root_run_id
         return child_params_by_name
-    if current_run_map.get("importer") != "provider-directory-fhir":
-        return _params_for_import_run_storage(
-            str(current_run_map.get("importer") or ""),
-            child_params_by_name,
-        )
+    if importer != "provider-directory-fhir":
+        return _params_for_import_run_storage(str(importer or ""), child_params_by_name)
     return retained_pagination_retry_params(current_params_by_name, run_id, child_params_by_name)
 
 

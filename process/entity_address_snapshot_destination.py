@@ -160,20 +160,21 @@ def _require_caller_transaction(session: Any) -> None:
 
 
 @asynccontextmanager
-async def _preserve_receipt_settings() -> AsyncIterator[None]:
+async def _preserve_receipt_settings(database=None) -> AsyncIterator[None]:
     """Strictly restore receipt GUCs, including the list-valued search path."""
 
+    database = db if database is None else database
     previous_settings = []
     for setting_name in _RECEIPT_SETTING_NAMES:
-        setting_value = await db.scalar(
+        setting_value = await database.scalar(
             "SELECT pg_catalog.current_setting(:setting_name)",
             setting_name=setting_name,
         )
         previous_settings.append((setting_name, str(setting_value)))
-    async with db.transaction():
+    async with database.transaction():
         yield
         for setting_name, setting_value in previous_settings:
-            await db.scalar(
+            await database.scalar(
                 "SELECT pg_catalog.set_config(:setting_name, :setting_value, true)",
                 setting_name=setting_name,
                 setting_value=setting_value,

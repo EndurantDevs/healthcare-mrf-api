@@ -20,6 +20,7 @@ from api.network_address_scope import (
     scoped_address_parameters,
 )
 from api.network_read_execution import NetworkReadConnectionProxy
+from api.provider_directory_dataset_sql import _provider_directory_overlay_dataset_ctes_sql
 from db.connection import ConnectionProxy
 from db.models import EntityAddressUnified
 from process.custom_import.read_core import _local_statement_timeout
@@ -32,18 +33,12 @@ GEO_SERVICE_LOCATION_TYPES = ("primary", "secondary", "practice", "site")
 MIN_PROVIDER_LIST_PHONE_CANDIDATES = 100
 MAX_PROVIDER_LIST_PHONE_CANDIDATES = 500
 
-_CURRENT_PROVIDER_DIRECTORY_PHONE_CTES = """
+_CURRENT_PROVIDER_DIRECTORY_PHONE_CTES = (
+    _provider_directory_overlay_dataset_ctes_sql("mrf")
+    + """,
 current_provider_directory_runs AS MATERIALIZED (
-    SELECT source.source_id, dataset.dataset_id,
-           COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar
-               AS run_id
-      FROM mrf.provider_directory_source AS source
-      JOIN mrf.provider_directory_endpoint_dataset AS dataset
-        ON dataset.endpoint_id = source.endpoint_id
-     WHERE dataset.is_current IS TRUE
-       AND dataset.status = 'published'
-       AND dataset.published_at IS NOT NULL
-       AND dataset.superseded_at IS NULL
+    SELECT source_id, dataset_id, run_id
+      FROM current_datasets
 ), matching_provider_directory_phone_rows AS MATERIALIZED (
     SELECT overlay.npi, overlay.address_key, overlay.source_id,
            overlay.last_seen_run_id, overlay.source_record_id,
@@ -54,6 +49,7 @@ current_provider_directory_runs AS MATERIALIZED (
        AND overlay.address_key IS NOT NULL
 )
 """
+)
 
 _PHONE_CANDIDATE_ROWS_CTE = """
 phone_candidate_rows AS MATERIALIZED (
@@ -184,10 +180,11 @@ def _address_phone_candidates_cte(
     *,
     is_bounded: bool = True,
 ) -> str | None:
-    """Return indexed phone candidates, including current directory evidence."""
+    """Return indexed phone candidates with exact retained Overlay provenance."""
 
     if not _is_unified_address_table(address_table_sql) or is_scoped_address_relation(address_table_sql):
         return None
+    schema = address_table_sql.rsplit(".", 1)[0]
     direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
     service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
     phone_candidate_rows_cte = _PHONE_CANDIDATE_ROWS_CTE.format(
@@ -202,7 +199,7 @@ def _address_phone_candidates_cte(
             phone_candidate_rows_cte.strip(),
             _RANKED_PHONE_CANDIDATE_CTES.format(candidate_limit_clause=candidate_limit_clause).strip(),
         )
-    )
+    ).replace("mrf.", f"{schema}.")
 
 
 def _address_phone_candidates_join(
