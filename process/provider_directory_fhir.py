@@ -221,6 +221,12 @@ from process.provider_directory_fhir_census_execution import (
 from process.provider_directory_fhir_manual_catalog import (
     reviewed_manual_census_seed_rows,
 )
+from process.provider_directory_fhir_response import (
+    has_operation_outcome_error as _has_operation_outcome_error,
+)
+from process.provider_directory_fhir_response import (
+    is_access_denied_outcome as _is_access_denied_outcome,
+)
 from process.provider_directory_fhir_root_policy import (
     POLICY_PENDING_STATUS as PROVIDER_DIRECTORY_ROOT_POLICY_PENDING,
 )
@@ -41182,14 +41188,6 @@ def _resource_search_payload_error(
     return None
 
 
-def _has_operation_outcome_error(outcome: dict[str, Any]) -> bool:
-    """Treat missing, fatal, error, and unknown issue severities as failures."""
-    issues = [issue for issue in outcome.get("issue") or [] if isinstance(issue, dict)]
-    if not issues:
-        return True
-    return any(str(issue.get("severity") or "").strip().lower() not in {"warning", "information"} for issue in issues)
-
-
 def _source_fetch_retry_delay_seconds(attempt_index: int) -> float:
     return min(2.0, 0.25 * (2 ** max(0, attempt_index)))
 
@@ -41988,17 +41986,6 @@ def _capability_resource_types(capability_payload: dict[str, Any]) -> set[str]:
             if resource_type:
                 resource_types.add(resource_type)
     return resource_types
-
-
-def _is_access_denied_outcome(resource_payload: dict[str, Any] | None) -> bool:
-    if not resource_payload or resource_payload.get("resourceType") != "OperationOutcome":
-        return False
-    issue_text = " ".join(
-        str(issue.get("diagnostics") or issue.get("details", {}).get("text") or "")
-        for issue in resource_payload.get("issue") or []
-        if isinstance(issue, dict)
-    ).lower()
-    return any(marker in issue_text for marker in ("access denied", "not authorized", "not authorised", "forbidden"))
 
 
 def _targeted_required_resource_probe(
@@ -43661,7 +43648,7 @@ def _bulk_output_concurrency(source: dict[str, Any]) -> int:
         raise ValueError("bulk_export_output_concurrency_invalid") from exc
     if not 1 <= concurrency <= BULK_EXPORT_MAX_OUTPUT_CONCURRENCY:
         raise ValueError("bulk_export_output_concurrency_invalid")
-    return concurrency
+    return 1 if is_source_storage_required() else concurrency  # Reserve Source capacity for ownership checks.
 
 
 def _bulk_output_pool_capacity() -> int:
@@ -48875,6 +48862,12 @@ def _should_restart_expired_pagination_checkpoint(
     is_current_version_census: bool = False,
     allow_current_version_census_restart: bool = False,
 ) -> bool:
+    """Re-enumerate one unusable resumed collection without accepting partial data."""
+    is_cigna_outcome = (
+        status_code == 200
+        and fetch_error == RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+        and _is_url_within_api_base(request_url, CIGNA_PROVIDER_DIRECTORY_BASE)
+    )
     is_expired_status = status_code in {400, 404, 410} or (
         status_code == 403 and _is_humana_continuation_token_url(request_url)
     )
@@ -48883,8 +48876,8 @@ def _should_restart_expired_pagination_checkpoint(
         and resume_state
         and resume_state.resumed
         and not has_restart_attempted
-        and fetch_error is None
-        and is_expired_status
+        and (fetch_error is None or is_cigna_outcome)
+        and (is_expired_status or is_cigna_outcome)
         and _has_fhir_continuation_query(request_url)
     )
 

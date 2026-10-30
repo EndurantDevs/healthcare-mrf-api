@@ -107,9 +107,13 @@ class _ProbeSession:
     "configured_concurrency",
     [True, "not-a-number", 0, 9],
 )
+@pytest.mark.parametrize("source_storage", [False, True])
 def test_bulk_output_concurrency_rejects_invalid_configuration(
+    monkeypatch,
     configured_concurrency,
+    source_storage,
 ):
+    monkeypatch.setattr(importer, "is_source_storage_required", lambda: source_storage)
     source_map = {
         "metadata_json": {
             "provider_directory_bulk_export_range_resume": True,
