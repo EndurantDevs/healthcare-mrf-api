@@ -114,6 +114,7 @@ SHARD_SPEC_BY_KIND = {
             "directory-address",
             "profile-storage",
             "profile-publication",
+            "cms-successor",
         ),
     },
 }

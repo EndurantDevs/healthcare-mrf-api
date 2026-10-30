@@ -17,6 +17,7 @@ PYTHON_DEPENDENCY_JOBS = {
     "security",
     "worker-queue-smoke",
     "address-canonical-db-tests",
+    "fhir-catalog-integration",
 }
 LOCAL_SETUP_ACTION = "./ci/scripts/healthcare/setup"
 COMMON_TEST_JOBS = {"python-tests", "capacity-evidence"}
@@ -33,6 +34,7 @@ JOB_LABELS = {
     "security": "Security scans",
     "worker-queue-smoke": "Worker queue tests",
     "address-canonical-db-tests": "${{ matrix.label }}",
+    "fhir-catalog-integration": "FHIR catalog integration",
     "measurement": "Coverage results",
     "source-validation": "Validation complete",
     "dev-image-publication": "DEV image publication",
@@ -59,6 +61,7 @@ MATRIX_ROWS_BY_JOB = {
             ("directory-address", "directory address"),
             ("profile-storage", "profile storage"),
             ("profile-publication", "profile publication"),
+            ("cms-successor", "CMS successor"),
         )
     ],
 }
@@ -410,6 +413,9 @@ def test_public_test_matrices_preserve_independent_database_shards():
             assert set(job["strategy"]) == {"max-parallel", "fail-fast", "matrix"}
             assert job["strategy"]["max-parallel"] == 48
             assert job["strategy"]["fail-fast"] is False
+            assert job["timeout-minutes"] == "${{ matrix.shard == 'cms-successor' && 30 || 20 }}"
+            setup = next(step for step in job["steps"] if step.get("uses") == LOCAL_SETUP_ACTION)
+            assert setup["with"]["postgres-schema-cache"] == "true"
             assert set(job["strategy"]["matrix"]) == {"include"}
             assert sorted(job["strategy"]["matrix"]["include"], key=lambda row: row["shard"]) == sorted(
                 rows, key=lambda row: row["shard"]
@@ -450,7 +456,7 @@ def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
         for matrix_row in MATRIX_ROWS_BY_JOB["address-canonical-db-tests"]
     )
     assert identities == expected_ids
-    assert len(set(identities)) == 69
+    assert len(set(identities)) == 70
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
     assert jobs["source-validation"]["needs"] == ["measurement"]
@@ -466,6 +472,30 @@ def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
         "IMAGE_ARTIFACT_ID": "${{ needs.container-package.outputs.image_artifact_id }}",
         "MEASUREMENT_ARTIFACT_ID": "${{ needs.measurement.outputs.measurement_artifact_id }}",
     }
+
+
+def test_catalog_integration_requires_capability_and_complete_eligible_execution():
+    path = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+    jobs = yaml.safe_load(path.read_text())["jobs"]
+    job = jobs["fhir-catalog-integration"]
+    steps_by_name = {step["name"]: step for step in job["steps"]}
+    capability = steps_by_name["Check catalog integration capability"]
+    assert capability["id"] == "catalog-capability"
+    assert capability["run"] == 'bash "$CI_ROOT/scripts/healthcare/check" fhir-catalog-capability >> "$GITHUB_OUTPUT"'
+    for name in (
+        "Install PostgreSQL client",
+        "Download exact-source Rust test binaries",
+        "Run complete validation stage",
+        "Upload exact-source catalog integration evidence",
+    ):
+        assert steps_by_name[name]["if"] == "steps.catalog-capability.outputs.present == 'true'"
+    assert job["env"]["CI_SHARD"] == "fhir-catalog-integration"
+    assert (
+        'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"'
+        in steps_by_name["Run complete validation stage"]["run"]
+    )
+    assert steps_by_name["Upload exact-source catalog integration evidence"]["with"]["if-no-files-found"] == "error"
+    assert "fhir-catalog-integration" in jobs["measurement"]["needs"]
 
 
 def test_completed_cleanup_is_independent_and_executes_only_a_pinned_helper():
