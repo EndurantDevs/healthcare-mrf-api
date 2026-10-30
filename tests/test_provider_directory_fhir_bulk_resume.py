@@ -150,6 +150,23 @@ def test_aetna_alone_enables_eight_way_range_resume(monkeypatch):
     importer._assert_bulk_output_pool_capacity(8)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_concurrency", range(1, 9))
+async def test_source_bulk_output_concurrency_preserves_legacy_configuration(monkeypatch, configured_concurrency):
+    source_map = {
+        "metadata_json": {
+            "provider_directory_bulk_export_range_resume": True,
+            "provider_directory_bulk_export_output_concurrency": configured_concurrency,
+        }
+    }
+
+    assert importer._bulk_output_concurrency(source_map) == configured_concurrency
+    async with synthetic_source_database(monkeypatch, _Connection(1)):
+        assert importer._bulk_output_concurrency(source_map) == 1
+    assert importer._bulk_output_concurrency(source_map) == configured_concurrency
+    assert source_map["metadata_json"]["provider_directory_bulk_export_output_concurrency"] == configured_concurrency
+
+
 def test_bulk_output_validator_requires_immutable_byte_identity(monkeypatch):
     observed_at = datetime.datetime(2026, 7, 20, 12, 30, tzinfo=datetime.UTC)
     monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: observed_at)
@@ -330,12 +347,17 @@ async def test_bulk_stream_resumes_at_exact_committed_ndjson_boundary(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_bulk_output_concurrency_is_bounded(monkeypatch):
+@pytest.mark.parametrize("concurrency", [1, 2])
+async def test_bulk_output_concurrency_is_bounded(monkeypatch, concurrency):
     identity = _checkpoint_identity()
     manifest = _manifest(6)
     concurrency_by_name = {"active": 0, "maximum": 0}
+    checkpoints = _output_checkpoints(identity, manifest)
+    checkpoints[0]["state"] = importer.BULK_EXPORT_OUTPUT_COMPLETE
+    streamed_outputs = []
 
-    async def stream_one(*_args, **_kwargs):
+    async def stream_one(_session, _source, _identity, _manifest, output, _checkpoint, _options, _state):
+        streamed_outputs.append(output.output_index)
         concurrency_by_name["active"] += 1
         concurrency_by_name["maximum"] = max(
             concurrency_by_name["maximum"],
@@ -350,7 +372,7 @@ async def test_bulk_output_concurrency_is_bounded(monkeypatch):
         "_stream_one_checkpointed_bulk_output",
         stream_one,
     )
-    options = _resume_stream_options(2)
+    options = _resume_stream_options(concurrency)
 
     _stream_state, error = await importer._resume_checkpointed_bulk_outputs(
         object(),
@@ -358,8 +380,9 @@ async def test_bulk_output_concurrency_is_bounded(monkeypatch):
         identity,
         manifest,
         options,
-        _output_checkpoints(identity, manifest),
+        checkpoints,
     )
 
     assert error is None
-    assert concurrency_by_name["maximum"] == 2
+    assert concurrency_by_name["maximum"] == concurrency
+    assert sorted(streamed_outputs) == list(range(1, 6))

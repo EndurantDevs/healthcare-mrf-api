@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""A successor producer may adopt only one complete, detached failed intake."""
+"""A successor producer may adopt only one verified, detached failed intake."""
 
+import hashlib
 import re
 from copy import deepcopy
 from dataclasses import asdict
@@ -91,6 +92,9 @@ def _completed_input_evidence():
             rows_processed=3,
             pages_processed=1,
             completed_at="now",
+            canonical_api_base="https://example.test/fhir",
+            start_url_hash=hashlib.sha256(b"https://example.test/fhir/Organization?_count=100").hexdigest(),
+            next_url=None,
         )
     ]
     input_rows = [dict(dataset_id=DATASET, resource_type="Organization", total=3, active=3)]
@@ -223,6 +227,95 @@ async def test_exact_detached_candidate_changes_only_its_storage_binding(case):
     case.tables.assert_awaited_once()
     assert (await _transition(case))["already_applied"] is True
     assert len(case.writes) == 1
+
+
+def _include_active_collection(case):
+    """Retain an opaque cursor and the exact already-committed input census."""
+    metadata = case.header["candidate_storage_json"]["identity"]["metadata"]
+    metadata["selected_resources"] = ["Organization", "Location"]
+    metadata["expected_resources"] = ["Organization", "Location"]
+    case.header["publication_metadata_json"] = deepcopy(metadata)
+    case.checkpoints.append(
+        {
+            **case.checkpoints[0],
+            "resource_type": "Location",
+            "state": "active",
+            "rows_processed": 2,
+            "completed_at": None,
+            "start_url_hash": hashlib.sha256(b"https://example.test/fhir/Location?_count=100").hexdigest(),
+            "next_url": "https://example.test/fhir/Location?_getpages=opaque%2Btoken&_count=100",
+        }
+    )
+    case.input_rows.append(dict(dataset_id=DATASET, resource_type="Location", total=2, active=2))
+
+
+@pytest.mark.asyncio
+async def test_mixed_checkpoint_transition_and_replay_preserve_all_acquisition_evidence(case):
+    _include_active_collection(case)
+    checkpoints, inputs, runs = deepcopy((case.checkpoints, case.input_rows, case.runs))
+    before = deepcopy(case.header["candidate_storage_json"])
+    result = await _transition(case, {"Organization": 3, "Location": 2})
+    assert result["rows"] == 5 and result["already_applied"] is False
+    assert case.header["candidate_storage_json"] == {**before, "storage": case.new}
+    assert (await _transition(case, {"Organization": 3, "Location": 2}))["already_applied"] is True
+    assert len(case.writes) == 1
+    assert (case.checkpoints, case.input_rows, case.runs) == (checkpoints, inputs, runs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("state", "failed"),
+        ("completed_at", "now"),
+        ("pages_processed", 0),
+        ("pages_processed", -1),
+        ("rows_processed", 1),
+        ("dataset_id", "another-dataset"),
+        ("owner_run_id", ROOT),
+        ("next_url", None),
+        ("next_url", ""),
+        ("next_url", " https://example.test/fhir/Location?cursor=one"),
+        ("next_url", "https://example.test/fhir/Location?cursor=one\n"),
+        ("next_url", "/fhir/Location?cursor=one"),
+        ("next_url", "http://example.test/fhir/Location?cursor=one"),
+        ("next_url", "https://elsewhere.test/fhir/Location?cursor=one"),
+        ("next_url", "https://user@example.test/fhir/Location?cursor=one"),
+        ("next_url", "https://example.test/fhir/Location?cursor=one#fragment"),
+        ("next_url", "https://example.test:invalid/fhir/Location?cursor=one"),
+        ("next_url", "https://[invalid/fhir/Location?cursor=one"),
+        ("next_url", "https://example.test/fhir/Location?_count=100"),
+    ],
+)
+async def test_malformed_active_checkpoint_refuses_before_any_candidate_write(case, field, value):
+    _include_active_collection(case)
+    case.checkpoints[1][field] = value
+    with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
+        await _transition(case, {"Organization": 3, "Location": 2})
+    assert case.writes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drift", ["missing", "duplicate", "complete_without_time", "complete_without_pages", "inactive"]
+)
+async def test_mixed_transition_preserves_complete_checkpoint_and_full_input_requirements(case, drift):
+    _include_active_collection(case)
+    reason = "transition_checkpoint_changed"
+    if drift == "missing":
+        case.checkpoints.pop()
+    elif drift == "duplicate":
+        case.checkpoints.append(deepcopy(case.checkpoints[1]))
+    elif drift == "complete_without_time":
+        case.checkpoints[0]["completed_at"] = None
+    elif drift == "complete_without_pages":
+        case.checkpoints[0]["pages_processed"] = 0
+    else:
+        case.input_rows[1]["active"] = 1
+        reason = "transition_input_changed"
+    with pytest.raises(GenericCandidateError, match=reason):
+        await _transition(case, {"Organization": 3, "Location": 2})
+    assert case.writes == []
 
 
 @pytest.mark.asyncio
