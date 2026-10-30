@@ -14,6 +14,7 @@ import time
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
+from importlib import import_module
 from uuid import uuid4
 
 from db.plan_release_storage import storage_identifier, storage_relation
@@ -848,12 +849,35 @@ async def _verify_transition_run(connection, catalog_schema, identity_by_field, 
     return sorted(run_ids)
 
 
+def _is_resumable_transition_checkpoint(checkpoint):
+    """Keep completed scans or an unchanged, same-origin retained continuation."""
+    if checkpoint["state"] == "complete":
+        return checkpoint["completed_at"] is not None
+    cursor = checkpoint["next_url"]
+    if (
+        checkpoint["state"] != "active"
+        or checkpoint["completed_at"] is not None
+        or type(cursor) is not str
+        or not cursor
+        or any(character.isspace() for character in cursor)
+        or hashlib.sha256(cursor.encode()).hexdigest() == checkpoint["start_url_hash"]
+    ):
+        return False
+    directory = import_module("process.provider_directory_fhir")
+    base = checkpoint["canonical_api_base"]
+    try:
+        return directory._is_trusted_fhir_pagination_url({"canonical_api_base": base}, base, cursor)
+    except ValueError:
+        return False
+
+
 async def _verify_transition_inputs(connection, policy, candidate_by_field, identity_by_field, expected_counts):
-    """Compare complete checkpoints with every active detached input row."""
+    """Compare completed or resumable checkpoints with every active detached input row."""
     root_run_id = identity_by_field["acquisition_root_run_id"]
     dataset_id = identity_by_field["dataset_id"]
     checkpoint_rows = await connection.fetch(
-        "SELECT resource_type,state,owner_run_id,dataset_id,rows_processed,pages_processed,completed_at FROM "
+        "SELECT resource_type,state,owner_run_id,dataset_id,rows_processed,pages_processed,completed_at,"
+        "canonical_api_base,start_url_hash,next_url FROM "
         + storage_relation(policy.schema, "provider_directory_pagination_checkpoint")
         + " WHERE acquisition_root_run_id=$1 FOR SHARE NOWAIT",
         root_run_id,
@@ -862,12 +886,11 @@ async def _verify_transition_inputs(connection, policy, candidate_by_field, iden
         len(checkpoint_rows) == len(expected_counts)
         and {checkpoint_record["resource_type"] for checkpoint_record in checkpoint_rows} == set(expected_counts)
         and all(
-            checkpoint_record["state"] == "complete"
+            _is_resumable_transition_checkpoint(checkpoint_record)
             and checkpoint_record["owner_run_id"] == identity_by_field["failed_run_id"]
             and checkpoint_record["dataset_id"] == dataset_id
             and checkpoint_record["rows_processed"] == expected_counts[checkpoint_record["resource_type"]]
             and checkpoint_record["pages_processed"] > 0
-            and checkpoint_record["completed_at"] is not None
             for checkpoint_record in checkpoint_rows
         ),
         "transition_checkpoint_changed",
