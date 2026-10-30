@@ -301,11 +301,17 @@ async def _source_native_control_catalog(connection):
     return result, revision_function
 
 
-async def prepare_source_native_inputs(component, monkeypatch, tmp_path, source_commit):
+async def prepare_source_native_inputs(component, monkeypatch, tmp_path, source_commit, *, metadata_read_roles=()):
     """Finish genuine native prerequisites before the protected Source cut closes writers."""
+    from process.provider_directory_cms_control_privileges import cms_origin_metadata_read_roles
+
     assert component.policy.schema == "mrf" and not source.fhir.db._transaction_binding()
+    if metadata_read_roles:
+        metadata_read_roles = cms_origin_metadata_read_roles(component.policy, metadata_read_roles)
     database = Database(engine=component.admin_engine, session_factory=async_sessionmaker(component.admin_engine))
     async with component.admin_engine.begin() as connection:
+        for role in metadata_read_roles:
+            await connection.execute(text(f'GRANT USAGE ON SCHEMA "{component.policy.schema}" TO "{role}"'))
         original = await _source_native_control_catalog(connection)
     await _initialize_native_inputs(database, monkeypatch, tmp_path, source_commit, component=component)
     from tests.cms_output_snapshot_postgres_support import provision_native_outputs
@@ -357,7 +363,7 @@ async def _bootstrap_native_source(engine, policy, *, migration_prefixes):
 
 
 @asynccontextmanager
-async def source_native_publication_database(monkeypatch, tmp_path, source_commit):
+async def source_native_publication_database(monkeypatch, tmp_path, source_commit, *, metadata_read_roles=()):
     """Compose the original protected acquisition fixture with the verified combined bootstrap."""
     from tests import provider_directory_source_postgres_support as native_source
 
@@ -365,7 +371,11 @@ async def source_native_publication_database(monkeypatch, tmp_path, source_commi
     with monkeypatch.context() as settings:
         settings.setattr(native_source, "bootstrap_source_component", _bootstrap_native_source)
         prepare = partial(
-            prepare_source_native_inputs, monkeypatch=settings, tmp_path=tmp_path, source_commit=source_commit
+            prepare_source_native_inputs,
+            monkeypatch=settings,
+            tmp_path=tmp_path,
+            source_commit=source_commit,
+            metadata_read_roles=metadata_read_roles,
         )
         async with source.protected_admission_database(
             settings, before_provision=prepare, migration_prefixes=migrations, publisher_pool_size=6
@@ -379,7 +389,9 @@ async def source_native_publication_database(monkeypatch, tmp_path, source_commi
             try:
                 async with component.admin_engine.begin() as connection:
                     await connection.run_sync(lambda sync: upgrade_nppes_evidence_candidates(sync, "mrf"))
-                await nppes_fixture._enroll_native_custody(component, namespace, migrator, native_inputs=True)
+                await nppes_fixture._enroll_native_custody(
+                    component, namespace, migrator, native_inputs=True, metadata_read_roles=metadata_read_roles
+                )
                 await _adopt_native_counter(component)
                 await _grant_profile_controls(administrator, component.policy)
                 for module in (selection, selection_snapshot, entity_address_unified, address_canon):
@@ -978,7 +990,7 @@ def profile_preflight_inputs(execution, limits, storage, timing):
 
 
 @asynccontextmanager
-async def retained_pair(database, proof):
+async def retained_pair(database, proof, *, expected_address_rows=2):
     """Capture real publication authority and clean only this fixture's UUID custody."""
     capture_id, roles = uuid4(), tuple("pair_" + uuid4().hex for _ in range(2))
     created_roles = []
@@ -996,7 +1008,7 @@ async def retained_pair(database, proof):
             source_copy=_bounded_source_copy(),
         )
         assert len(pair.address_receipt.tables) == 7
-        assert pair.address_receipt.tables[0].row_count == 2
+        assert pair.address_receipt.tables[0].row_count == expected_address_rows
         async with database.session_factory() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             assert await require_registry_cms_source_pair(session, pair) == pair

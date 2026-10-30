@@ -3,6 +3,7 @@
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -18,6 +19,7 @@ from process.registry_publication_queue import (
     finish_registry_publication_request,
     read_registry_publication_request,
     renew_registry_publication_lease,
+    require_registry_source_rollback_composition,
     validated_registry_source_rollback_preview_command,
     validated_registry_source_rollback_publication_command,
 )
@@ -418,3 +420,50 @@ async def test_claim_partition_excludes_other_families_and_malformed_operations(
     assert [dict(request_record) for request_record in before if request_record["request_id"] not in expected] == [
         dict(request_record) for request_record in after if request_record["request_id"] not in expected
     ]
+
+
+async def test_source_composition_requires_exact_live_audited_rollback(publication_db):
+    fixture = publication_db
+    connection, schema = fixture.connection, fixture.control_schema
+    original, current = await _published_pair(fixture)
+    source_manifest = SimpleNamespace(generation_id=original["generation_id"])
+    async with connection.transaction():
+        with pytest.raises(ValueError, match="operation_required"):
+            await require_registry_source_rollback_composition(
+                connection, uuid4(), source_manifest, 0, current["generation_id"], control_schema=schema
+            )
+    actor = RegistryActor("platform_admin", uuid4(), "system")
+    async with connection.transaction():
+        queued = await enqueue_registry_source_rollback_preview(
+            connection,
+            {
+                "operation": "prepare_source_rollback",
+                "target_generation": source_manifest.generation_id,
+                "expected_serving_generation": current["generation_id"],
+                "expected_approved_revision": 0,
+                "reason": "Review exact retained source",
+                "idempotency_key": uuid4().hex,
+            },
+            actor,
+            session_token_sha256="a" * 64,
+            control_schema=schema,
+        )
+        claimed = await claim_registry_publication_request(
+            connection, operation_family="publication", request_id=UUID(queued["request_id"]), control_schema=schema
+        )
+    async with connection.transaction():
+        assert (
+            await require_registry_source_rollback_composition(
+                connection, claimed["request_id"], source_manifest, 0, current["generation_id"], control_schema=schema
+            )
+            == claimed["request_sha256"]
+        )
+        for wrong_source, revision, head in (
+            (SimpleNamespace(generation_id=current["generation_id"]), 0, current["generation_id"]),
+            (source_manifest, 1, current["generation_id"]),
+            (source_manifest, 0, source_manifest.generation_id),
+        ):
+            with pytest.raises(ValueError, match="operation_conflict"):
+                await require_registry_source_rollback_composition(
+                    connection, claimed["request_id"], wrong_source, revision, head, control_schema=schema
+                )

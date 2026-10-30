@@ -73,6 +73,7 @@ _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS = 144 * 60 * 60
 
 
 _START_WORKERS: tuple[WorkerSpec, ...] = (
+    WorkerSpec("arq:RegistryFHIRCatalogSync", "process.RegistryFHIRCatalogSync", ("registry-fhir-catalog-sync",)),
     WorkerSpec("arq:RegistrySourceCheck", "process.RegistrySourceCheck", ("registry-source-check",)),
     WorkerSpec("arq:RegistryACASource", "process.RegistryACASource", ("registry-aca-source-worker",)),
     WorkerSpec("arq:RegistryPTGSource", "process.RegistryPTGSource", ("registry-ptg-source-worker",)),
@@ -86,6 +87,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
         "arq:PTGCandidateAudit",
         "process.PTGCandidateAudit",
         (
+            "registry-publication-worker",
             "ptg-candidate-audit",
             "plan-pricing-projection",
             "plan-pricing-prewarm",
@@ -786,8 +788,10 @@ def _launcher_mode() -> str:
 
 
 def _configured_worker_job_image(spec: WorkerSpec) -> str:
-    """Select the optional discovery image while preserving the shared fallback."""
+    """Select optional worker images while preserving the shared fallback."""
     generic_image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
+    if (spec.worker_class, spec.importers) == ("process.RegistryFHIRCatalogSync", ("registry-fhir-catalog-sync",)):
+        return os.getenv("HLTHPRT_REGISTRY_FHIR_CATALOG_WORKER_IMAGE", "").strip() or generic_image
     if spec.importers == ("mrf-source-discovery",):
         return os.getenv("HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE", "").strip() or generic_image
     return generic_image

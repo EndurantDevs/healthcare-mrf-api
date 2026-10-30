@@ -15,10 +15,11 @@ from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 from process.network_approved_membership_source import pin_retained_approved_membership_source
 from process.network_serving_read import resolve_network_serving_manifest
+from process.registry_compact_target_addresses import required_target_addresses
 from process.registry_pricing_release_binding_lookup import append_pricing_binding_metadata
 from process.registry_required_target_business_report import business_target_report
 from process.registry_required_target_review_references import _REFERENCES_SQL, MAX_BUNDLE_BYTES, _verify_bundle
-from process.registry_source_recipe_store import verify_registry_source_recipes
+from process.registry_source_inventory_reference import verify_source_recipe_metadata
 from process.registry_source_selection_receipt import _unique_object, verify_registry_source_selection_receipt
 
 MAX_LEDGER_TEXT_BYTES = 32 * 1024 * 1024
@@ -57,7 +58,7 @@ WHERE snapshot.snapshot_id=$1::uuid
 _PROVENANCE_SQL = """SELECT manifest.generation_id,manifest.candidate_id,manifest.schema_revision,
   manifest.source_generations,manifest.approved_custom_revision,manifest.manifest_sha256,
   manifest.eligible,candidate.dataset_id,candidate.schema_id,candidate.producer_id,candidate.schema_name,
-  candidate.source_recipes_json,candidate.validation_json,
+  candidate.source_recipes_json,candidate.validation_json,candidate.expected_rows,
   candidate.validation_json->'writer_closure' AS writer_closure,
   candidate.validation_json->'registry_source_selection' AS source_selection,
   head.generation_id AS current_head_in_snapshot,
@@ -140,7 +141,7 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
       AND binding.location_key ~ '^[0-9a-f]{64}$' AS exact_site
   FROM members member LEFT JOIN __SERVING__.provider_location_binding binding
     USING(provider_system,provider_id,location_id)
-  LEFT JOIN __SERVING__.entity_address_unified address
+  LEFT JOIN __ADDRESSES__ address
     ON (address.location_key,address.entity_type,address.entity_id)
       =(binding.location_key,binding.entity_type,binding.entity_id)
 ), served_counts AS (
@@ -149,7 +150,10 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
     count(DISTINCT (provider_system,provider_id,location_id)) FILTER(WHERE NOT coalesce(exact_site,false))
       AS unresolved_served_site_count,
     count(*)<>count(DISTINCT (provider_system,provider_id,location_id))
-      OR count(*) FILTER(WHERE exact_site)<>count(DISTINCT location_key) FILTER(WHERE exact_site)
+      OR count(DISTINCT (location_key,provider_system,provider_id)) FILTER(WHERE exact_site)
+        <>count(DISTINCT location_key) FILTER(WHERE exact_site)
+      OR count(*) FILTER(WHERE exact_site AND provider_system='manual')
+        <>count(DISTINCT location_key) FILTER(WHERE exact_site AND provider_system='manual')
       AS duplicated_join_or_office
   FROM exact_matches GROUP BY network_id
 ), reverse_orphans AS (
@@ -159,7 +163,7 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
     WHERE member.network_id=network.network_id AND
       (binding.location_key,binding.entity_type,binding.entity_id)
         =(address.location_key,address.entity_type,address.entity_id))) AS orphan_projected_addresses
-  FROM networks network JOIN __SERVING__.entity_address_unified address
+  FROM networks network JOIN __ADDRESSES__ address
     ON network.network_id=ANY(address.canonical_network_ids) GROUP BY network.network_id
 ) , provider_conflicts AS (
   SELECT network_id,provider_system,provider_id FROM exact_matches
@@ -167,13 +171,15 @@ _COUNTS_SQL = """WITH approved AS MATERIALIZED (
   HAVING count(DISTINCT entity_name)>1 OR count(DISTINCT npi)>1
 ), orphan_selected_bindings AS (
   SELECT network.network_id,count(*) AS unresolved_bindings
-  FROM networks network JOIN __SERVING__.entity_address_unified address
+  FROM networks network JOIN __ADDRESSES__ address
     ON network.network_id=ANY(address.canonical_network_ids)
   JOIN __SERVING__.provider_location_binding binding
     ON address.location_key=binding.location_key
-  WHERE NOT EXISTS(SELECT 1 FROM members member WHERE member.network_id=network.network_id
-    AND (member.provider_system,member.provider_id,member.location_id)
-      =(binding.provider_system,binding.provider_id,binding.location_id))
+  WHERE (binding.entity_type,binding.entity_id) IS DISTINCT FROM (address.entity_type,address.entity_id)
+    OR (binding.provider_system,binding.provider_id) IS DISTINCT FROM (address.entity_type,address.entity_id)
+    OR (binding.provider_system='manual' AND NOT EXISTS(SELECT FROM members member
+      WHERE member.network_id=network.network_id AND (member.provider_system,member.provider_id,member.location_id)
+        =(binding.provider_system,binding.provider_id,binding.location_id)))
   GROUP BY network.network_id
 ), approved_expected_sites AS MATERIALIZED (
   SELECT DISTINCT member.network_id,member.provider_system,member.provider_id,member.location_id
@@ -273,8 +279,12 @@ SELECT bounds.valid,bounds.bounded AND octet_length(document.native_input)<=$5
   AND octet_length(document.provenance)<=$3 AS bounded,document.* FROM bounds,document"""
 
 
-def _sql(statement, namespace, serving=None):
-    return statement.replace("__CONTROL__", namespace).replace("__SERVING__", serving or "")
+def _sql(statement, namespace, serving=None, *, addresses=None):
+    return (
+        statement.replace("__CONTROL__", namespace)
+        .replace("__SERVING__", serving or "")
+        .replace("__ADDRESSES__", addresses if addresses is not None else (serving or "") + ".entity_address_unified")
+    )
 
 
 def _uuid(value):
@@ -379,9 +389,12 @@ async def _read(connection, snapshot_id, generation_id, control_schema):
     if candidate_entry is None or candidate_entry["candidate_id"] != UUID(manifest.candidate_id):
         raise RegistryRequiredTargetCoverageUnavailable("registry_required_target_coverage_manifest_invalid")
     candidate_by_field = dict(candidate_entry)
-    verify_registry_source_recipes(candidate_by_field)
+    verify_source_recipe_metadata(candidate_by_field)
     bundle = await _read_review_bundle(connection, namespace, manifest.approved_custom_revision)
-    query = _RESULT_SQL.replace("__COUNTS__", _sql(_COUNTS_SQL, namespace, _identifier(manifest.schema_name)))
+    addresses, address_arguments = required_target_addresses(manifest, first_parameter=6)
+    query = _RESULT_SQL.replace(
+        "__COUNTS__", _sql(_COUNTS_SQL, namespace, _identifier(manifest.schema_name), addresses=addresses)
+    )
     evidence_entry = await connection.fetchrow(
         query,
         snapshot_id,
@@ -389,6 +402,7 @@ async def _read(connection, snapshot_id, generation_id, control_schema):
         MAX_REPORT_BYTES,
         candidate_by_field["manifest_status"],
         MAX_NATIVE_INPUT_BYTES,
+        *address_arguments,
     )
     if evidence_entry is None or evidence_entry["valid"] is not True or evidence_entry["bounded"] is not True:
         raise RegistryRequiredTargetCoverageUnavailable("registry_required_target_coverage_serving_invalid")

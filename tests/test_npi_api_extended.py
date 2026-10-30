@@ -31,6 +31,18 @@ def _stub_detail_location_materialization(monkeypatch):
     )
 
 
+class _UnboundDatabase(types.SimpleNamespace):
+    """Loader-mocked detail routes have no active Reader or writer transaction."""
+
+    @staticmethod
+    def has_reader_session():
+        return False
+
+    @staticmethod
+    def _transaction_binding():
+        return None
+
+
 class FakeConnection:
     def __init__(self, responses):
         self._responses = list(responses)
@@ -313,7 +325,7 @@ class _AwaitableGeocodeInsertStatement:
         return None
 
 
-class _GeocodePathDB:
+class _GeocodePathDB(_UnboundDatabase):
     async def update(self, *_args, **_kwargs):
         return _AwaitableGeocodeUpdateStatement()
 
@@ -361,7 +373,8 @@ async def test_fast_has_insurance_count_global_uses_count_star_and_cache(monkeyp
     calls = []
 
     class FakeSession:
-        async def execute(self, stmt):
+        async def execute(self, stmt, parameters=None):
+            assert parameters == {}
             calls.append(str(stmt))
             return FakeResult()
 
@@ -399,7 +412,8 @@ async def test_fast_has_insurance_count_city_uses_distinct(monkeypatch):
     calls = []
 
     class FakeSession:
-        async def execute(self, stmt):
+        async def execute(self, stmt, parameters=None):
+            assert parameters == {}
             calls.append(str(stmt))
             return FakeResult()
 
@@ -1081,7 +1095,7 @@ async def test_get_npi_geocode_mapbox(monkeypatch):
     update = FakeUpdate()
     insert = FakeInsert()
 
-    fake_db = types.SimpleNamespace(
+    fake_db = _UnboundDatabase(
         update=lambda *_args, **_kwargs: update,
         insert=lambda *_args, **_kwargs: insert,
         scalar=AsyncMock(side_effect=[_make_address_row()]),
@@ -1130,7 +1144,7 @@ async def test_get_npi_geocode_omits_null_address_parts(monkeypatch):
 
     monkeypatch.setattr(npi_module, "download_it", fake_download)
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         def update(self, *_args, **_kwargs):
             return FakeUpdate()
 
@@ -1199,7 +1213,7 @@ async def test_get_npi_geocode_google(monkeypatch):
     update = FakeUpdate()
     insert = FakeInsert()
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         def __init__(self):
             self.scalar_values = [_make_address_row()]
 
@@ -1247,7 +1261,7 @@ async def test_get_npi_geocode_openaddresses_before_paid_providers(monkeypatch):
     update = FakeUpdate()
     insert = FakeInsert()
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         def update(self, *_args, **_kwargs):
             return update
 
@@ -1480,7 +1494,7 @@ async def test_get_near_npi_applies_name_before_knn_limit(monkeypatch):
     assert name_predicate in sql
     assert sql.index(name_predicate) < sql.index("ORDER BY Geography(")
     assert sql.index(name_predicate) < sql.index("LIMIT :limit")
-    assert captured_query_map["params"]["q"] == "%Clinic%"
+    assert captured_query_map["params"]["q"] == "%clinic%"
 
 
 def _near_provider_record(npi, address_key, distance, **fields):
@@ -1827,7 +1841,7 @@ async def test_get_npi_uses_cached_address(monkeypatch):
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
     monkeypatch.setattr(npi_module, "download_it", AsyncMock(side_effect=AssertionError("unexpected call")))
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         async def scalar(self, *_args, **_kwargs):
             return types.SimpleNamespace(long=-80.0, lat=40.0, formatted_address="Cached", place_id="pid")
 
@@ -1875,7 +1889,7 @@ def _install_latless_detail_cache_collaborators(monkeypatch):
             ],
         }
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         async def scalar(self, *_args, **_kwargs):
             raise AssertionError("stored geocode lookup should not execute")
 
@@ -1948,7 +1962,7 @@ async def test_get_npi_query_flags_disable_stored_and_live_geocode(monkeypatch):
             ],
         }
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         async def scalar(self, *_args, **_kwargs):
             raise AssertionError("stored geocode lookup should not execute")
 
@@ -2454,7 +2468,7 @@ async def test_get_npi_update_addr_coordinates_row_missing(monkeypatch):
     )
     monkeypatch.setattr(npi_module.random, "choice", lambda seq: seq[0])
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         def __init__(self):
             self.scalar_values = [_make_address_row(), None]
 
@@ -2558,7 +2572,7 @@ async def test_get_npi_update_addr_coordinates_handles_exception(monkeypatch):
         async def status(self):
             raise RuntimeError("boom")
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         def __init__(self):
             self.scalar_values = [_make_address_row(), _make_address_row()]
 
@@ -2624,7 +2638,7 @@ async def test_get_npi_skip_update_when_lat_present(monkeypatch):
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         async def scalar(self, *_args, **_kwargs):
             raise AssertionError("archive lookup should be skipped when lat present")
 
@@ -2685,7 +2699,7 @@ async def test_get_npi_v2_archive_is_disabled_without_cutover_flag(monkeypatch):
     monkeypatch.setattr(npi_module, "_build_npi_details", fake_build)
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         async def first(self, *_args, **_kwargs):
             raise AssertionError("v2 archive lookup should require explicit cutover flag")
 
@@ -2723,7 +2737,7 @@ async def test_get_npi_v2_archive_cutover_reads_geocodes_for_concurrent_addresse
     monkeypatch.setattr(npi_module, "_build_npi_details", _npi_details_builder(addresses))
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         def __init__(self):
             self.catalog_calls = 0
             self.first_calls = 0
@@ -2778,7 +2792,7 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
     )
     monkeypatch.setattr(npi_module, "_fetch_other_names", AsyncMock(return_value=[]))
 
-    class FakeDB:
+    class FakeDB(_UnboundDatabase):
         async def scalar(self, query, **_kwargs):
             if isinstance(query, str):
                 if "to_regclass" in query:
@@ -2812,7 +2826,7 @@ async def test_get_npi_v2_archive_geocodeless_row_falls_back_to_legacy(monkeypat
     assert response_body["address_list"][0]["lat"] == 41.0
 
 
-class _V2GeocodeWriteDB:
+class _V2GeocodeWriteDB(_UnboundDatabase):
     def __init__(self):
         self.status_sql = []
         self.status_kwargs = []

@@ -82,40 +82,66 @@ def _require_configured_writer_roles(roles_by_group, closure):
         raise NetworkMembershipPipelineError("Configured writer roles differ from retained closure")
 
 
-async def _prepare_phase(connection, copy_target, address_source, roles_by_group, control_schema):
+async def _prepare_phase(connection, copy_target, address_source, roles_by_group, control_schema, *, compact=False):
     async with connection.transaction(isolation="repeatable_read"):
-        candidate = await _locked_candidate(connection, copy_target, _identifier(control_schema))
-        if candidate["state"] == "published":
+        await _prepare_phase_snapshot(
+            connection, copy_target, address_source, roles_by_group, control_schema, compact=compact
+        )
+
+
+async def _prepare_phase_snapshot(
+    connection, copy_target, address_source, roles_by_group, control_schema, *, compact=False, office_authority=None
+):
+    """Prepare using the caller's genuine fenced snapshot when source authority requires it."""
+    candidate = await _locked_candidate(connection, copy_target, _identifier(control_schema))
+    if candidate["state"] == "published":
+        return
+    if candidate["state"] == "ready":
+        _validated_replay(candidate, _scope_report(candidate, address_source))
+        readiness = _publication_readiness(candidate)
+        if await _candidate_custody(connection, candidate, control_schema) is not None:
+            _require_configured_writer_roles(roles_by_group, readiness[3])
             return
-        if candidate["state"] == "ready":
-            _validated_replay(candidate, _scope_report(candidate, address_source))
-            readiness = _publication_readiness(candidate)
-            if await _candidate_custody(connection, candidate, control_schema) is not None:
-                _require_configured_writer_roles(roles_by_group, readiness[3])
-                return
-            await verify_network_candidate_writer_closure(
-                connection, copy_target, **roles_by_group, control_schema=control_schema
-            )
-            await prepare_network_serving_indexes(
-                connection, copy_target, address_source, control_schema=control_schema
+        await verify_network_candidate_writer_closure(
+            connection, copy_target, **roles_by_group, control_schema=control_schema
+        )
+        from process.network_compact_readiness import is_compact_candidate
+
+        if is_compact_candidate(candidate):
+            from process.network_compact_validation import verify_compact_final_proof
+
+            await verify_compact_final_proof(
+                connection, copy_target, candidate, control_schema=control_schema, office_authority=office_authority
             )
             return
-        if candidate["state"] not in ("sealed", "validated"):
-            raise NetworkMembershipPipelineError("Candidate state changed before preparation")
-        if not await connection.fetchval(
-            "SELECT pg_has_role(current_user,$1::name,'USAGE')", roles_by_group["owner_role"]
-        ):
-            raise NetworkMembershipPipelineError("Publisher must inherit protected ownership for native preparation")
+        await prepare_network_serving_indexes(connection, copy_target, address_source, control_schema=control_schema)
+        return
+    if candidate["state"] not in ("sealed", "validated"):
+        raise NetworkMembershipPipelineError("Candidate state changed before preparation")
+    if not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'USAGE')", roles_by_group["owner_role"]):
+        raise NetworkMembershipPipelineError("Publisher must inherit protected ownership for native preparation")
+    if compact:
+        from process.network_compact_preparation import prepare_compact_network_readiness
+
+        await prepare_compact_network_readiness(
+            connection,
+            copy_target,
+            address_source,
+            runtime_roles=tuple(sorted(set(roles_by_group["loader_roles"] + roles_by_group["reader_roles"]))),
+            control_schema=control_schema,
+            office_authority=office_authority,
+        )
+    else:
         await validate_network_membership_candidate(
             connection, copy_target, address_source, control_schema=control_schema
         )
         await project_network_address_arrays(connection, copy_target, address_source, control_schema=control_schema)
         await prepare_network_candidate_indexes(connection, copy_target, address_source, control_schema=control_schema)
         await prepare_network_serving_indexes(connection, copy_target, address_source, control_schema=control_schema)
-        final_closure = await freeze_network_candidate_writers(
-            connection, copy_target, **roles_by_group, control_schema=control_schema
-        )
-        await _retain_closure(connection, copy_target, control_schema, final_closure)
+    final_closure = await freeze_network_candidate_writers(
+        connection, copy_target, **roles_by_group, control_schema=control_schema
+    )
+    await _retain_closure(connection, copy_target, control_schema, final_closure)
 
 
 async def _publish_phase(connection, copy_target, roles_by_group, control_schema):
@@ -187,6 +213,7 @@ async def prepare_network_candidate(
     loader_roles,
     reader_roles,
     control_schema=None,
+    compact=None,
 ):
     """Close writers and prepare an isolated candidate before final authorization.
 
@@ -196,6 +223,8 @@ async def prepare_network_candidate(
     """
     if type(copy_target) is not MembershipCopyTarget or type(address_source) is not PinnedAddressSource:
         raise NetworkMembershipPipelineError("Trusted candidate and pinned source are required")
+    if compact is not None and type(compact) is not bool:
+        raise NetworkMembershipPipelineError("Serving storage selection is invalid")
     if connection.is_in_transaction():
         raise NetworkMembershipPipelineError("Phase-owned pipeline requires a connection outside a transaction")
     if address_source.schema_name == copy_target.schema_name:
@@ -204,15 +233,37 @@ async def prepare_network_candidate(
     roles_by_group = {"owner_role": owner_role, "loader_roles": loader_roles, "reader_roles": reader_roles}
     _role_names(**roles_by_group)
     candidate = await _inspect_candidate(connection, copy_target, schema_name)
+    compact = _compact_selection(candidate, compact)
     if candidate["state"] == "published":
         return candidate
     await _close_raw_phase(connection, copy_target, roles_by_group, schema_name)
-    await _prepare_phase(connection, copy_target, address_source, roles_by_group, schema_name)
+    await _prepare_phase(connection, copy_target, address_source, roles_by_group, schema_name, compact=compact)
     return await _inspect_candidate(connection, copy_target, schema_name)
 
 
+def _compact_selection(candidate, requested):
+    from process.registry_compact_composition import COMPACT_FORMAT, COMPACT_FORMAT_KEY
+
+    generations = candidate["source_generations"]
+    generations = json.loads(generations) if type(generations) is str else generations
+    if COMPACT_FORMAT_KEY in generations and generations[COMPACT_FORMAT_KEY] != COMPACT_FORMAT:
+        raise NetworkMembershipPipelineError("Registered serving format is unsupported")
+    has_registered_compact = generations.get(COMPACT_FORMAT_KEY) == COMPACT_FORMAT
+    if requested is False and has_registered_compact:
+        raise NetworkMembershipPipelineError("Registered compact serving cannot use legacy storage")
+    return has_registered_compact if requested is None else requested
+
+
 async def prepare_and_publish_network_candidate(
-    connection, copy_target, source, *, owner_role, loader_roles, reader_roles, control_schema=None, seal_candidate=None
+    connection,
+    copy_target,
+    source,
+    *,
+    owner_role,
+    loader_roles,
+    reader_roles,
+    control_schema=None,
+    seal_candidate=None,
 ):
     """Commit preparation, optionally seal under separate authority, then publish."""
     if seal_candidate is not None and not callable(seal_candidate):

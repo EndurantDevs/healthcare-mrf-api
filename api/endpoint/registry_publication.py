@@ -27,6 +27,15 @@ from process.registry_company_approval_fence import (
 from process.registry_imported_selection_preview import (
     RegistryImportedSelectionUnavailable,
 )
+from process.registry_membership_refresh_authority import RegistryMembershipRefreshAuthorityClient
+from process.registry_membership_refresh_contract import (
+    RegistryMembershipRefreshUnavailable,
+    validated_membership_refresh_envelope,
+)
+from process.registry_membership_refresh_queue import (
+    RegistryMembershipRefreshAddressProfile,
+    enqueue_registry_membership_refresh,
+)
 from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_ptg_scope_engine import RegistryPTGScopeEngineService
 from process.registry_publication_ptg_runtime import _IDENTITY_SQL
@@ -49,6 +58,7 @@ from process.registry_record_store import (
     RegistryRecordConflict,
     _validated_actor,
 )
+from process.registry_refresh_anchor_contract import MAX_BYTES as REFRESH_MAX_BYTES
 from process.registry_source_observation_store import _namespace
 
 blueprint = Blueprint("registry_publication", url_prefix="/registry/publication", version=1)
@@ -447,7 +457,7 @@ async def publication_request(request, request_id):
         return _error(404) if result is None else response.json(result, headers=_HEADERS)
     except ValueError:
         return _error(400)
-    except asyncpg.PostgresError, SQLAlchemyError:
+    except RegistryMembershipRefreshUnavailable, asyncpg.PostgresError, SQLAlchemyError:
         return _error(503)
 
 
@@ -492,4 +502,72 @@ async def approved_companies(request):
     except ValueError, TypeError:
         return _error(400)
     except asyncpg.PostgresError, SQLAlchemyError, RuntimeError:
+        return _error(503)
+
+
+@blueprint.post("/refresh-memberships")
+async def queue_membership_refresh(request):
+    """Queue exact service membership work without approving or editing manual records."""
+    require_registry_auth(request)
+    try:
+        if not request.body or len(request.body) > REFRESH_MAX_BYTES or request.query_string or request.args:
+            raise ValueError("registry_membership_refresh_body_invalid")
+        envelope_by_field = validated_membership_refresh_envelope(
+            json.loads(request.body, object_pairs_hook=_unique_object)
+        )
+        authorize = getattr(request.app.ctx, "registry_membership_refresh_authority", None)
+        profile = getattr(request.app.ctx, "registry_membership_refresh_address_profile", None)
+        if (
+            type(authorize) is not RegistryMembershipRefreshAuthorityClient
+            or authorize.is_enabled is not True
+            or type(profile) is not RegistryMembershipRefreshAddressProfile
+        ):
+            raise RegistryMembershipRefreshUnavailable("registry_membership_refresh_unconfigured")
+        async with request.ctx.sa_session.begin():
+            await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+            receipt = await enqueue_registry_membership_refresh(
+                await _driver(request.ctx.sa_session), envelope_by_field, authorize=authorize, address_profile=profile
+            )
+        return response.json(receipt, headers=_HEADERS)
+    except RegistryRecordConflict:
+        return _error(409)
+    except PermissionError:
+        return _error(403)
+    except ValueError, TypeError, UnicodeError, RecursionError:
+        return _error(400)
+    except RegistryMembershipRefreshUnavailable, asyncpg.PostgresError, SQLAlchemyError:
+        return _error(503)
+
+
+@blueprint.get("/membership-refresh/inputs")
+async def membership_refresh_inputs(request):
+    """Observe native desired inputs; this read never grants publication authority."""
+    require_registry_auth(request)
+    if request.body or request.query_string or request.args:
+        return _error(400)
+    service = getattr(request.app.ctx, "registry_membership_refresh_inputs", None)
+    if service is None:
+        return _error(503)
+    try:
+        from process.registry_membership_refresh_runtime import RegistryMembershipRefreshInputsService
+        from process.registry_refresh_anchor_contract import encoded_document
+
+        if type(service) is not RegistryMembershipRefreshInputsService:
+            raise RegistryMembershipRefreshUnavailable("registry_membership_refresh_unconfigured")
+        encoded = encoded_document(await service())
+        return response.raw(encoded, content_type="application/json", headers=_HEADERS)
+    except RegistryRecordConflict:
+        return _error(409)
+    except PermissionError:
+        return _error(403)
+    except (
+        ValueError,
+        TypeError,
+        UnicodeError,
+        RecursionError,
+        RuntimeError,
+        ImportError,
+        asyncpg.PostgresError,
+        SQLAlchemyError,
+    ):
         return _error(503)

@@ -3,7 +3,7 @@
 
 import json
 import secrets
-from contextlib import aclosing
+from contextlib import AsyncExitStack, aclosing
 from uuid import uuid4
 
 import pytest
@@ -19,6 +19,7 @@ from process.network_approved_membership_source import pin_approved_membership_s
 from tests import cms_npd_admission_postgres_support as support
 from tests import test_network_cms_registry_source_pair_postgres as pairs
 from tests.cms_registry_recipe_postgres_support import _reviewed_cms_binding
+from tests.source_contribution_custody_postgres_support import install_source_contribution_custody
 from tests.test_network_custom_address_source_postgres import custom_db
 from tests.test_network_fhir_membership_source_postgres import _reviewed_binding
 from tests.test_network_serving_schema_postgres import serving_schema
@@ -26,7 +27,7 @@ from tests.test_provider_directory_cms_resource_batch_postgres import cms_resour
 from tests.test_provider_profile_network_facts_postgres import (
     _compose_profile_manifest,
     _grant_profile_reader,
-    _publish_profile_recipe,
+    _profile_addresses,
     _remove_profile_pairs,
 )
 from tests.test_registry_approval_store_postgres import _approve, _command
@@ -49,6 +50,14 @@ def _raw_privacy_resources(original, revision):
     resources_by_type["Location"].append(
         {"id": "site-2", "name": "Hidden Office B", "address": {"line": ["2 Sample Street"]}}
     )
+    for ordinal, location in enumerate(resources_by_type["Location"]):
+        location["address"] = {
+            "line": ["123 Example Street"] + (["Suite 3"] if ordinal else []),
+            "city": "Sample City",
+            "state": "CA",
+            "postalCode": "90210",
+            "country": "US",
+        }
     resources_by_type["InsurancePlan"][0].update(
         name="Permitted Plan A", network=[{"reference": "Organization/network-1"}]
     )
@@ -154,25 +163,26 @@ async def privacy_publication(monkeypatch, tmp_path):
             database.engine.url.set(drivername="postgresql").render_as_string(hide_password=False),
         )
         async with aclosing(serving_schema.__wrapped__()) as registry:
-            async with aclosing(custom_db.__wrapped__(await anext(registry))) as custom:
+            async with aclosing(custom_db.__wrapped__(await anext(registry))) as custom, AsyncExitStack() as stack:
                 fixture = await anext(custom)
+                stack.push_async_callback(_remove_profile_pairs, fixture, capture_id)
+                stack.push_async_callback(_remove_candidates, fixture, copy_targets, uuid4())
                 for extension in ("intarray", "btree_gin", "postgis"):
                     await fixture.connection.execute(f'CREATE EXTENSION IF NOT EXISTS "{extension}"')
-                try:
-                    pair = await pairs._capture_bounded_pair(
-                        database,
-                        proof,
-                        capture_id,
-                        (fixture.roles["owner"], fixture.roles["reader"], database._source_component.owner),
-                    )
-                    reviewed = await _review_both_networks(fixture, pair)
-                    manifest = await _publish_profile_recipe(fixture, reviewed, copy_targets)
-                    manifest = await _compose_profile_manifest(fixture, manifest, reviewed[-1], copy_targets)
-                    await _grant_profile_reader(fixture)
-                    yield fixture, manifest, reviewed[2], pair
-                finally:
-                    await _remove_candidates(fixture, copy_targets, uuid4())
-                    await _remove_profile_pairs(fixture, capture_id)
+                pair = await pairs._capture_bounded_pair(
+                    database,
+                    proof,
+                    capture_id,
+                    (fixture.roles["owner"], fixture.roles["reader"], database._source_component.owner),
+                )
+                reviewed = await _review_both_networks(fixture, pair)
+                await _profile_addresses(fixture)
+                await _grant_profile_reader(fixture)
+                await install_source_contribution_custody(fixture, pair.recipe.source_pin, stack)
+                manifest = await _compose_profile_manifest(
+                    fixture, None, reviewed[-1], copy_targets, initial_recipe=pair.recipe
+                )
+                yield fixture, manifest, reviewed[2], pair
 
 
 @pytest.fixture

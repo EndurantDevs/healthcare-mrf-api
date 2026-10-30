@@ -301,7 +301,8 @@ async def test_global_attempt_composes_one_family_and_holds_fence_through_cas(mo
     monkeypatch.setattr(
         consumer, "_selection", AsyncMock(return_value=(1, SimpleNamespace(generation_id="approved"), pin, recipes))
     )
-    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    prepare = AsyncMock()
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
     monkeypatch.setattr(consumer, "_checkpoint", AsyncMock(return_value=({}, {})))
     monkeypatch.setattr(consumer, "_notice", AsyncMock(return_value=epoch))
     monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock())
@@ -336,4 +337,5 @@ async def test_global_attempt_composes_one_family_and_holds_fence_through_cas(mo
         connection.execute.assert_not_awaited()
         assert events == ["source_locked", "source_released"]
     compose.assert_awaited_once()
+    prepare.assert_awaited_once_with(connection, copy_target, compose.return_value[1], config)
     assert compose.await_args.kwargs["address_sources"].replacement_source_recipes == recipes

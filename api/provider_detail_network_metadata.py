@@ -9,12 +9,17 @@ from uuid import UUID
 from sqlalchemy import text
 
 from api.network_address_scope import (
+    _network_scope_claim,
+    _request_selector,
+    canonical_network_read,
     current_network_address_scope,
     scoped_address_parameters,
     scoped_address_relation_sql,
 )
+from api.network_read_execution import execute_network_read, has_network_read_inventory
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
+from process.network_read_identity import NetworkReadIdentityError
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_network_catalog_read import RegistryNetworkCatalogError, _closed_json
 
@@ -215,7 +220,9 @@ async def _read_memberships(session, manifest, copies_by_office, scope, include_
             candidate=_identifier(manifest.schema_name),
             control=_identifier(registry_schema()),
         )
-        summary_by_field = (await session.execute(text(statement), parameters_by_name)).mappings().one_or_none()
+        summary_by_field = (
+            (await execute_network_read(session, text(statement), parameters_by_name)).mappings().one_or_none()
+        )
         if summary_by_field is None or summary_by_field["bounded"] is not True:
             raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
         memberships_by_office = _membership_map(
@@ -304,51 +311,121 @@ async def project_provider_network_metadata(provider_rows, *, session, include_s
         ) from error
 
 
+def _can_reconstruct_detail_read(request, provider):
+    """Only an owned read without geocoding side effects can start a fresh response."""
+    session = getattr(getattr(request, "ctx", None), "sa_session", None)
+    config = getattr(getattr(request, "app", None), "config", {})
+    return (
+        not getattr(request, "responded", False)
+        and not provider.db.has_reader_session()
+        and provider.db._transaction_binding() is None
+        and not has_network_read_inventory(session)
+        and (session is None or not session.in_transaction())
+        and not config.get("NPI_API_UPDATE_GEOCODE")
+        and not provider._is_truthy_arg(request.args.get("force_address_update"), default=False)
+        and not provider._is_truthy_arg(
+            request.args.get("sync_geocode"),
+            default=provider._is_environment_flag_enabled(
+                "HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE"
+            ),
+        )
+    )
+
+
 async def read_direct_detail_response(request, npi):
     """Keep direct detail and exact membership on the same active Reader."""
-    from sanic.exceptions import ServiceUnavailable
+    from sanic.exceptions import SanicException, ServiceUnavailable
 
     from api.endpoint import npi as provider
 
     scope = current_network_address_scope()
-    if scope is None or scope.access_scope_sha256 is None:
-        return await provider.read_npi_detail(request, npi)
+    if scope is not None:
+        if scope.access_scope_sha256 is None:
+            return await provider.read_npi_detail(request, npi)
+        async with provider.provider_profile_read_snapshot(
+            provider.db, provider._runtime_db_schema(), include_detail=True
+        ) as session:
+            return await _project_direct_detail_response(request, npi, session)
+    try:
+        selector = _request_selector(request, None)
+        if selector is not None:
+            _network_scope_claim(request, selector)
+    except SanicException as refusal:
+        refusal.headers = {**(refusal.headers or {}), "Cache-Control": "private, no-store"}
+        raise
+    if selector is None:
+        max_attempts = 3 if _can_reconstruct_detail_read(request, provider) else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await provider.read_npi_detail(request, npi)
+            except ServiceUnavailable as error:
+                if (
+                    attempt == max_attempts
+                    or type(error.__cause__) is not NetworkReadIdentityError
+                    or not _can_reconstruct_detail_read(request, provider)
+                ):
+                    raise
     async with provider.provider_profile_read_snapshot(
         provider.db, provider._runtime_db_schema(), include_detail=True
     ) as session:
-        http_response = await provider.read_npi_detail(request, npi)
-        if http_response.status >= 400:
-            return http_response
+        prior = getattr(request.ctx, "sa_session", None)
+        had_session = hasattr(request.ctx, "sa_session")
+        request.ctx.sa_session = session
         try:
-            detail_by_field = _closed_json(http_response.body, MAX_METADATA_BYTES)
-            if (
-                type(detail_by_field) is not dict
-                or type(detail_by_field.get("npi")) is not int
-                or detail_by_field["npi"] != int(npi)
-            ):
-                raise _unavailable()
-            is_debug_enabled = provider._is_truthy_arg(request.args.get("debug"), default=False)
-            projected_rows = await project_provider_network_metadata(
-                [detail_by_field],
-                session=session,
-                include_sources=is_debug_enabled
-                or provider._is_truthy_arg(request.args.get("include_sources"), default=False),
-                include_evidence=is_debug_enabled
-                or provider._is_truthy_arg(request.args.get("include_evidence"), default=False),
-            )
-            response_body = json.dumps(
-                projected_rows[0], ensure_ascii=False, allow_nan=False, default=str, separators=(",", ":")
-            ).encode("utf-8")
-            if len(response_body) > MAX_METADATA_BYTES:
-                raise _unavailable()
-        except (ValueError, TypeError, UnicodeError) as error:
-            raise ServiceUnavailable(
-                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
-            ) from error
-        http_response.body = response_body
-        if "Content-Length" in http_response.headers:
-            http_response.headers["Content-Length"] = str(len(response_body))
+            return await _read_selected_direct_detail_response(request, npi, session=session)
+        finally:
+            if had_session:
+                request.ctx.sa_session = prior
+            else:
+                del request.ctx.sa_session
+
+
+@canonical_network_read
+async def _read_selected_direct_detail_response(request, npi, *, session):
+    """Resolve the canonical pin only after binding the authenticated Reader."""
+    return await _project_direct_detail_response(request, npi, session)
+
+
+async def _project_direct_detail_response(request, npi, session):
+    """Project the complete native response before releasing its original Reader."""
+    from sanic.exceptions import ServiceUnavailable
+
+    from api.endpoint import npi as provider
+
+    http_response = await provider.read_npi_detail(request, npi)
+    scope = current_network_address_scope()
+    if scope is None or scope.access_scope_sha256 is None or http_response.status >= 400:
         return http_response
+    try:
+        detail_by_field = _closed_json(http_response.body, MAX_METADATA_BYTES)
+        if (
+            type(detail_by_field) is not dict
+            or type(detail_by_field.get("npi")) is not int
+            or detail_by_field["npi"] != int(npi)
+        ):
+            raise _unavailable()
+        is_debug_enabled = provider._is_truthy_arg(request.args.get("debug"), default=False)
+        projected_rows = await project_provider_network_metadata(
+            [detail_by_field],
+            session=session,
+            include_sources=is_debug_enabled
+            or provider._is_truthy_arg(request.args.get("include_sources"), default=False),
+            include_evidence=is_debug_enabled
+            or provider._is_truthy_arg(request.args.get("include_evidence"), default=False),
+        )
+        response_body = json.dumps(
+            projected_rows[0], ensure_ascii=False, allow_nan=False, default=str, separators=(",", ":")
+        ).encode("utf-8")
+        if len(response_body) > MAX_METADATA_BYTES:
+            raise _unavailable()
+    except (ValueError, TypeError, UnicodeError) as error:
+        raise ServiceUnavailable(
+            "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+        ) from error
+    http_response.body = response_body
+    if "Content-Length" in http_response.headers:
+        http_response.headers["Content-Length"] = str(len(response_body))
+    return http_response
 
 
 async def attach_provider_source_details(addresses, *, include_sources, include_role_evidence=False, session=None):

@@ -9,9 +9,9 @@ import pytest
 
 from api.endpoint import network_catalog as endpoint
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
+from tests.test_network_catalog_routes import _OWNED_READ_EVENTS, envelope, send, v2_envelope
 from tests.test_network_catalog_routes import batch_boundary as batch_boundary
 from tests.test_network_catalog_routes import context as context
-from tests.test_network_catalog_routes import envelope, send, v2_envelope
 
 _PATH = "/api/v1/registry/serving/providers/plans"
 
@@ -56,14 +56,8 @@ async def test_provider_plans_full_policy_and_one_snapshot(plans_context, header
     query, exclusions = context.plan_calls[0]
     assert (query.npi, query.year, query.generation_id, exclusions) == ("0000000001", 2000, 9, (84,))
     assert len(context.plan_calls) == 1 and context.driver.calls == []
-    assert context.session.events == [
-        "begin",
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
-        "SET LOCAL lock_timeout='1s'",
-        "connection",
-        "driver",
-        ("exit", None),
-    ]
+    assert context.session.events == _OWNED_READ_EVENTS
+    assert len(context.session.snapshot_queries) == 3
 
 
 @pytest.mark.asyncio

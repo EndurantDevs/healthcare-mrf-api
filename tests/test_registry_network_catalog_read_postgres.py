@@ -66,6 +66,7 @@ from tests.test_registry_approval_store_postgres import _approve, _command, _Cou
 from tests.test_registry_candidate_composition_postgres import (
     _remove_candidates,
     _roles,
+    _seal_composition_target,
 )
 from tests.test_registry_company_links_postgres import _links
 from tests.test_registry_network_catalog_read import batch_boundary as batch_boundary
@@ -150,7 +151,7 @@ async def _publish(fixture, approved_revision, expected_head):
             fixture.connection, approved_revision=approved_revision, control_schema=fixture.control_schema
         )
     fixture.composition_ids.append(uuid5(request_id, "address:" + pin.generation_id))
-    target, source = await compose_registry_membership_candidate(
+    copy_target, address_source = await compose_registry_membership_candidate(
         fixture.connection,
         request_id=request_id,
         approved_revision=approved_revision,
@@ -159,9 +160,19 @@ async def _publish(fixture, approved_revision, expected_head):
         writer_roles=_roles(fixture),
         control_schema=fixture.control_schema,
     )
-    fixture.targets.append(target)
+    fixture.targets.append(copy_target)
+
+    async def seal_candidate(actual):
+        assert actual == copy_target
+        return await _seal_composition_target(fixture, actual, (fixture.roles["reader"],))
+
     await prepare_and_publish_network_candidate(
-        fixture.connection, target, source, **_roles(fixture), control_schema=fixture.control_schema
+        fixture.connection,
+        copy_target,
+        address_source,
+        **_roles(fixture),
+        control_schema=fixture.control_schema,
+        seal_candidate=seal_candidate if fixture.seal_initial_candidate else None,
     )
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
@@ -278,9 +289,10 @@ async def _catalog_permissions(fixture):
 
 
 @pytest.fixture
-async def catalog_db(custom_db):
+async def catalog_db(custom_db, request):
     """Own candidate and reader cleanup from before their first creation."""
     fixture = custom_db
+    fixture.seal_initial_candidate = getattr(request, "param", False)
     fixture.requests, fixture.targets, fixture.reader = [], [], None
     # The reused fixtures already register schema/role teardown before their DDL.
     # This finally is established before the additional connection and candidates.
@@ -1341,7 +1353,7 @@ async def test_native_autocomplete_authorizes_before_raw_limit_and_globally_reje
     ]
     first, small = await _autocomplete(fixture, limit=1, counted=True)
     larger, large = await _autocomplete(fixture, limit=50, counted=True)
-    assert len(first["plans"]) == 1 and len(larger["plans"]) == 50 and small == large == 15
+    assert len(first["plans"]) == 1 and len(larger["plans"]) == 50 and small == large == 18
     assert "42" in (await _autocomplete(fixture, query="Sample", exclusions=(42,)))["plans"][0]["network_checksum"]
     retained = fixture.manifest
     fixture.manifest = await _publish_legacy_batch_bindings(
@@ -2075,6 +2087,7 @@ async def _exercise_operator_custody(fixture, login_fixture, request_id, roles_b
         await _refuse_execution_mutations(admin, execution, copy_target, final_owner, roles_by_kind, expected_rows)
 
 
+@pytest.mark.parametrize("catalog_db", [True], indirect=True)
 async def test_safe_operator_custody_cancellation_restores_then_seals_without_execution_owner_reach(
     catalog_db, tmp_path
 ):

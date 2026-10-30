@@ -565,7 +565,7 @@ async def test_projection_row_count_does_not_add_publication_queries(publication
         logged_queries.clear()
         first_manifest = await _publish(fixture)
         await asyncio.sleep(0)
-        baseline_roundtrips = len(logged_queries)
+        baseline_queries = [entry.query for entry in logged_queries]
     await fixture.connection.execute(f"""INSERT INTO "{fixture.control_schema}".retained_addresses
         SELECT lpad(to_hex(sequence_id),64,'0'),'npi','extra-'||sequence_id,'synthetic address','{{42}}'::int[],'{{999}}'::int[]
         FROM generate_series(1,20000) sequence_id""")
@@ -575,7 +575,19 @@ async def test_projection_row_count_does_not_add_publication_queries(publication
         logged_queries.clear()
         await _publish(successor)
         await asyncio.sleep(0)
-        assert len(logged_queries) == baseline_roundtrips < 64
+        publication_queries = [entry.query for entry in logged_queries]
+        # Successors authenticate their predecessor with one manifest and two optional custody queries.
+        predecessor_queries = (
+            "SELECT to_jsonb(candidate)::text AS candidate_json,to_jsonb(manifest)::text AS manifest_json,",
+            "SELECT to_regclass($1)::oid",
+            f'SELECT seal_sha256,receipt_json::text AS receipt_json FROM "{fixture.control_schema}".'
+            "network_candidate_custody WHERE candidate_id=$1",
+        )
+        for prefix in predecessor_queries:
+            assert sum(query.startswith(prefix) for query in publication_queries) == (
+                sum(query.startswith(prefix) for query in baseline_queries) + 1
+            )
+        assert len(publication_queries) == len(baseline_queries) + len(predecessor_queries) < 64
     report = json.loads((await _snapshot(successor))["validation_json"])
     assert report["candidate_readiness"]["address_rows"] == 20004
 

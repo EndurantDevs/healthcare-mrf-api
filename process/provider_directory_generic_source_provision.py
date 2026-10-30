@@ -531,12 +531,16 @@ async def capture_generic_source_global_roots(publisher, roots):
     return {root: _layout_proof(selected_by_root[root]) for root in roots}
 
 
-def _fhir_catalog_row(row):
+def fhir_source_catalog_row(row):
+    """Decode serialized native catalog fields while retaining all other row values."""
     catalog_by_field = dict(row)
     for key in ("columns", "constraints", "indexes", "column_acls"):
         if key in catalog_by_field and isinstance(catalog_by_field[key], str):
             catalog_by_field[key] = json.loads(catalog_by_field[key])
     return catalog_by_field
+
+
+_fhir_catalog_row = fhir_source_catalog_row
 
 
 def _fhir_digest(value):

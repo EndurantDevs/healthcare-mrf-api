@@ -158,17 +158,32 @@ def collect_nodeids(pytest_arguments: Sequence[str]) -> list[str]:
     return nodeids
 
 
+def _registry_shard_index(nodeid: str, shard_count: int) -> int:
+    """Isolate the new anchor while preserving all other registry hash buckets."""
+    if shard_count == 48 and nodeid == (
+        "tests/test_registry_cms_refresh_anchors_postgres.py"
+        "::test_cms_anchor_uses_genuine_accepted_notification_and_original_native_evidence"
+    ):
+        return 21
+    exclusive = EXCLUSIVE_REGISTRY_TEST_SHARDS.get(nodeid)
+    if exclusive is not None:
+        return exclusive
+    digest = hashlib.sha256(nodeid.encode("utf-8")).digest()
+    reserved = len(EXCLUSIVE_REGISTRY_TEST_SHARDS)
+    shard_index = reserved + int.from_bytes(digest, byteorder="big") % (shard_count - reserved)
+    if shard_count == 48 and shard_index == 21:
+        # Keep colliding cases together to avoid repeating module fixture setup across shards.
+        module_digest = hashlib.sha256(nodeid.split("::", 1)[0].encode("utf-8")).digest()
+        return (1, 6, 10, 16)[int.from_bytes(module_digest, byteorder="big") % 4]
+    return shard_index
+
+
 def shard_index_for_nodeid(nodeid: str, shard_count: int) -> int:
     """Map one node ID to a stable shard index."""
     if shard_count == 6 and nodeid in MAIN_TEST_SHARDS:
         return MAIN_TEST_SHARDS[nodeid]
     if shard_count in (32, 48):
-        exclusive = EXCLUSIVE_REGISTRY_TEST_SHARDS.get(nodeid)
-        if exclusive is not None:
-            return exclusive
-        digest = hashlib.sha256(nodeid.encode("utf-8")).digest()
-        reserved = len(EXCLUSIVE_REGISTRY_TEST_SHARDS)
-        return reserved + int.from_bytes(digest, byteorder="big") % (shard_count - reserved)
+        return _registry_shard_index(nodeid, shard_count)
     if shard_count == 16 and nodeid in (
         "tests/test_network_cms_registry_complete_publication_postgres.py::test_complete_publication_and_retained_pair",
         "tests/test_registry_publication_consumer_postgres.py::test_provider_custody_timeout_retains_lease_and_resumes_exact_request",

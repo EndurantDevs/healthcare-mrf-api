@@ -342,3 +342,175 @@ fn python_graph_locator_bridge_preserves_coordinates_and_refuses_invalid_metadat
         );
     });
 }
+
+fn retained_python_input() -> Value {
+    let rows: Vec<_> = [
+        ("Location", "site-1", r#"{"resource_id": "site-1"}"#),
+        ("Organization", "org-1", r#"{"name": "Network", "resource_id": "org-1"}"#),
+        ("InsurancePlan", "plan-1", r#"{"network_refs": ["Organization/network-a"], "resource_id": "plan-1"}"#),
+        ("Practitioner", "person-1", r#"{"ratio": 1.5, "resource_id": "person-1"}"#),
+    ]
+    .into_iter()
+    .map(|(kind, id, payload)| serde_json::json!({
+        "resource_type": kind, "resource_id": id, "payload_json": payload,
+        "payload_hash": registry_bytes_digest(payload.as_bytes()),
+        "acquired_resource_sha256": null,
+        "site_id": if kind == "Location" { Some("01234567-89ab-cdef-8123-456789abcdef") } else { None },
+    }))
+    .collect();
+    serde_json::json!({
+        "source_id": "source-a", "release_id": "release-1", "observed_at_pg_micros": 1234,
+        "hash_contract": "transport_bound_v1", "derive": true,
+        "resource_types": ["Location", "Organization", "InsurancePlan", "Practitioner", "Medication"],
+        "rows": rows,
+    })
+}
+
+#[test]
+fn python_retained_capture_preserves_copy_roots_families_and_fallback_accounting() {
+    Python::initialize();
+    Python::attach(|py| {
+        let input = retained_python_input();
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let encoded = module
+            .getattr("encode_retained_fhir_capture_batch")
+            .unwrap()
+            .call1((PyBytes::new(py, &serde_json::to_vec(&input).unwrap()),))
+            .unwrap();
+        let (bindings, evidence, plans, roots, families, count, fallback, owned):
+            RetainedCaptureOutput = encoded.extract().unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(fallback, [3]);
+        let mut copy_bytes = 0;
+        for (batches, columns, rows) in [(&bindings, 6i16, 1), (&evidence, 7, 2), (&plans, 11, 1)] {
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].1, rows);
+            let bytes = batches[0].0.bind(py).as_bytes();
+            assert!(bytes.starts_with(crate::network_membership_codec::COPY_HEADER));
+            assert_eq!(&bytes[19..21], &columns.to_be_bytes());
+            assert_eq!(&bytes[bytes.len() - 2..], &(-1i16).to_be_bytes());
+            copy_bytes += bytes.len();
+        }
+        let expected_roots: Vec<_> = input["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                serde_json::to_vec(&serde_json::json!([
+                    row["resource_type"],
+                    row["resource_id"],
+                    row["payload_hash"]
+                ]))
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(roots.bind(py).as_bytes(), expected_roots.join(&b'\n'));
+        assert_eq!(families.len(), 5);
+        for (index, kind) in ["Location", "Organization", "InsurancePlan", "Practitioner"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(families[*kind].1, 1);
+            assert_eq!(families[*kind].0.bind(py).as_bytes(), expected_roots[index]);
+        }
+        assert_eq!(families["Medication"].1, 0);
+        assert!(families["Medication"].0.bind(py).as_bytes().is_empty());
+        assert_eq!(
+            owned,
+            copy_bytes
+                + roots.bind(py).as_bytes().len()
+                + families
+                    .values()
+                    .map(|(bytes, _)| bytes.bind(py).as_bytes().len())
+                    .sum::<usize>()
+                + std::mem::size_of::<usize>()
+        );
+    });
+}
+
+#[test]
+fn python_retained_capture_errors_preserve_row_identity_without_payloads() {
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let encoder = module
+            .getattr("encode_retained_fhir_capture_batch")
+            .unwrap();
+        let mut invalid = retained_python_input();
+        invalid["rows"][1]["payload_hash"] = serde_json::json!("0".repeat(64));
+        for (input, expected) in [
+            (
+                b"{}".to_vec(),
+                serde_json::json!({"code":"invalid_input","row_index":null}),
+            ),
+            (
+                serde_json::to_vec(&invalid).unwrap(),
+                serde_json::json!({"code":"payload_hash","row_index":1}),
+            ),
+        ] {
+            let error = encoder.call1((PyBytes::new(py, &input),)).unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+            let message = error.value(py).str().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(message.to_str().unwrap()).unwrap(),
+                expected
+            );
+        }
+        let error = encoder.call1((42,)).unwrap_err();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+    });
+}
+
+#[test]
+fn python_entity_rows_preserve_binary_copy_defaults_and_reject_bad_inputs() {
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let version: String = module
+            .getattr("entity_address_rows_version")
+            .unwrap()
+            .call0()
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert_eq!(version, "entity_address_rows.v1");
+        let encoder = module.getattr("prepare_entity_address_rows").unwrap();
+        let mut input = crate::network_membership_codec::COPY_HEADER.to_vec();
+        input.extend_from_slice(&14i16.to_be_bytes());
+        input.extend_from_slice(&8i32.to_be_bytes());
+        input.extend_from_slice(&7i64.to_be_bytes());
+        for _ in 0..13 {
+            input.extend_from_slice(&(-1i32).to_be_bytes());
+        }
+        input.extend_from_slice(&(-1i16).to_be_bytes());
+        let encoded = encoder.call1((PyBytes::new(py, &input),)).unwrap();
+        let (copy, count): (Py<PyBytes>, usize) = encoded.extract().unwrap();
+        assert_eq!(count, 1);
+        let mut expected = crate::network_membership_codec::COPY_HEADER.to_vec();
+        expected.extend_from_slice(&27i16.to_be_bytes());
+        expected.extend_from_slice(&8i32.to_be_bytes());
+        expected.extend_from_slice(&7i64.to_be_bytes());
+        for field in 0..24 {
+            match field {
+                2 => expected.extend_from_slice(b"\0\0\0\x07primary"),
+                9 | 22 => expected.extend_from_slice(b"\0\0\0\x02US"),
+                _ => expected.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        expected.extend_from_slice(b"\0\0\0\x01\x01\0\0\0\x01\x01\xff\xff");
+        assert_eq!(copy.bind(py).as_bytes(), expected);
+        let error = encoder
+            .call1((PyBytes::new(py, &input[..input.len() - 1]),))
+            .unwrap_err();
+        assert!(error.is_instance_of::<PyValueError>(py));
+        assert_eq!(
+            error.value(py).str().unwrap().to_str().unwrap(),
+            "Address row COPY is truncated"
+        );
+        let error = encoder.call1((42,)).unwrap_err();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+    });
+}

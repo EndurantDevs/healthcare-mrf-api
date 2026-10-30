@@ -15,7 +15,6 @@ from tests.test_reports_api import (
 )
 
 
-
 @pytest.mark.asyncio
 async def test_get_pharmacy_chain_summary_returns_payload(monkeypatch):
     monkeypatch.setattr(
@@ -30,7 +29,15 @@ async def test_get_pharmacy_chain_summary_returns_payload(monkeypatch):
                     "pharmacist_count": 210,
                 },
                 [{"label": "1", "count": 30}],
-                [{"state": "CA", "active_pharmacy_count": 10, "pharmacy_npi_count": 12, "insured_pharmacy_npi_count": 8, "pharmacist_count": 22}],
+                [
+                    {
+                        "state": "CA",
+                        "active_pharmacy_count": 10,
+                        "pharmacy_npi_count": 12,
+                        "insured_pharmacy_npi_count": 8,
+                        "pharmacist_count": 22,
+                    }
+                ],
                 True,
             )
         ),
@@ -39,12 +46,12 @@ async def test_get_pharmacy_chain_summary_returns_payload(monkeypatch):
     response = await reports.get_pharmacy_chain_summary(
         make_request({"name_like": ["cvs", "longs drugs stores"], "include_states": "1"})
     )
-    payload = json.loads(response.body)
+    chain_summary = json.loads(response.body)
 
-    assert payload["summary"]["pharmacy_npi_count"] == 120
-    assert payload["histogram"][0]["label"] == "1"
-    assert payload["states"][0]["state"] == "CA"
-    assert payload["methodology"]["staffing_mode"] == "helper_table"
+    assert chain_summary["summary"]["pharmacy_npi_count"] == 120
+    assert chain_summary["histogram"][0]["label"] == "1"
+    assert chain_summary["states"][0]["state"] == "CA"
+    assert chain_summary["methodology"]["staffing_mode"] == "helper_table"
 
 
 @pytest.mark.asyncio
@@ -116,14 +123,13 @@ async def test_query_pharmacy_state_stats_normalizes_and_zero_fills_states(monke
     ]
 
     class Session:
-        async def execute(self, stmt):
+        async def execute(self, stmt, params):
             assert "WITH pharmacy_taxonomy AS" in stmt.text
+            assert params == {}
             return _FakeMappingsResult(pharmacy_rows)
 
     state_summaries, has_helper = await reports._query_pharmacy_state_stats(Session())
-    by_state = {
-        state_summary["state"]: state_summary for state_summary in state_summaries
-    }
+    by_state = {state_summary["state"]: state_summary for state_summary in state_summaries}
 
     assert has_helper is False
     assert len(state_summaries) == 51

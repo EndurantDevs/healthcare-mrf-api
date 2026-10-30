@@ -69,9 +69,10 @@ class RegistryPublicationWorkerPermissionError(ValueError):
     """Native worker identities or exact publication privileges are unsafe."""
 
 
-async def _context(
+async def publication_permission_context(
     connection, lifecycle_role, execution_role, api_role, queue_owner_role, physical_owner_role, control_schema
 ):
+    """Verify publication role separation and return the protected control namespace and OID."""
     from process.network_membership_candidate_lifecycle import _control_namespace
 
     names = (lifecycle_role, execution_role, api_role, queue_owner_role, physical_owner_role)
@@ -106,6 +107,9 @@ async def _context(
             raise RegistryPublicationWorkerPermissionError("Runtime roles cannot assume the physical owner")
     oid = await connection.fetchval("SELECT oid FROM pg_namespace WHERE nspname=$1", namespace)
     return namespace, oid
+
+
+_context = publication_permission_context
 
 
 async def _verify_columns(connection, namespace, lifecycle_role, execution_role):
@@ -149,7 +153,8 @@ async def _verify_columns(connection, namespace, lifecycle_role, execution_role)
             raise RegistryPublicationWorkerPermissionError("Worker effective column privileges differ")
 
 
-async def _verify_queue(connection, namespace, schema_oid, role):
+async def verify_publication_queue_shape(connection, namespace, schema_oid, role):
+    """Require immutable queue custody for the configured lifecycle and execution columns."""
     queue = await connection.fetchrow(
         "SELECT c.oid::bigint,c.relowner::bigint,r.oid::bigint AS runtime_oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN pg_roles r WHERE n.nspname=$1 AND c.relname='registry_publication_request' AND r.rolname=$2",
         namespace,
@@ -165,6 +170,9 @@ async def _verify_queue(connection, namespace, schema_oid, role):
         sorted(INSERT_COLUMNS),
     ):
         raise RegistryPublicationWorkerPermissionError("Queue audit custody is not closed")
+
+
+_verify_queue = verify_publication_queue_shape
 
 
 async def _verify_sequences(connection, sequences, lifecycle_role, execution_role):

@@ -282,7 +282,7 @@ async def test_maximum_page_uses_the_same_five_reads(catalog_db):
         "manifest",
         "identity",
         "missing_address",
-        "duplicate_key",
+        "contradictory_alias",
         "nil_site",
         "bad_key",
     ],
@@ -300,8 +300,8 @@ async def test_native_changes_fail_closed_before_pagination_and_rollback(catalog
         "manifest": f'''UPDATE "{fixture.control_schema}".network_serving_manifest SET manifest_sha256=repeat('0',64)''',
         "identity": f"UPDATE {namespace}.provider_location_binding SET entity_id='unresolved-provider'",
         "missing_address": f"DELETE FROM {namespace}.entity_address_unified WHERE location_key=repeat('a',64)",
-        "duplicate_key": f"""INSERT INTO {namespace}.provider_location_binding
-          SELECT provider_system,provider_id,'{uuid4()}'::uuid,location_key,entity_type,entity_id
+        "contradictory_alias": f"""INSERT INTO {namespace}.provider_location_binding
+          SELECT provider_system,provider_id,'{uuid4()}'::uuid,location_key,entity_type,'unresolved-provider'
           FROM {namespace}.provider_location_binding WHERE location_key=repeat('a',64)""",
         "nil_site": f"""UPDATE {namespace}.provider_location_binding SET location_id='00000000-0000-0000-0000-000000000000'
           WHERE location_key=repeat('a',64)""",

@@ -469,3 +469,88 @@ def test_resolver_refuses_manifest_generation_digest_even_with_valid_receipt(mon
         asyncio.run(inputs.resolve_em_provider_inputs(conn, wrong))
     conn.fetch.assert_not_awaited()
     conn.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_api_input_resolution_requires_a_typed_manifest_before_catalog_reads():
+    conn = connection()
+    with pytest.raises(inputs.PlanPricingProjectionUnavailable):
+        await inputs._resolve_em_provider_inputs_api(conn, SimpleNamespace(), "control")
+    conn.fetchrow.assert_not_awaited()
+    conn.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pid", [True, 0, 2**31])
+async def test_legacy_control_pin_requires_a_bounded_actual_backend_identity(pid):
+    conn = connection()
+    with pytest.raises(ValueError):
+        await inputs._legacy_em_control_pins(conn, "control", pid)
+    conn.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_input_read_refuses_missing_root_transaction_before_resolution(monkeypatch):
+    resolve = AsyncMock()
+    monkeypatch.setattr(inputs, "resolve_em_provider_inputs", resolve)
+    session = SimpleNamespace(get_transaction=lambda: None)
+    with pytest.raises(inputs.PlanPricingProjectionUnavailable):
+        await inputs.resolve_em_provider_inputs_in_session(
+            session,
+            manifest(
+                await inputs.prepare_em_provider_inputs(connection(), family(), runtime_roles=("runtime_reader",))
+            ),
+            "control",
+        )
+    resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_input_read_installs_every_verified_relation_on_original_backend(monkeypatch):
+    from api import network_read_execution as execution
+    from tests.test_network_optional_sql_recovery import _Session
+
+    held = family()
+    session = _Session()
+    session.names.update(
+        {f'"{relation.schema_name}"."{relation.table_name}"': relation.relation_oid for relation in held.relations}
+    )
+    pinned = manifest(
+        await inputs.prepare_em_provider_inputs(connection(), family(), runtime_roles=("runtime_reader",))
+    )
+    resolved = AsyncMock(return_value=held)
+    monkeypatch.setattr(inputs, "resolve_em_provider_inputs", resolved)
+    assert await inputs.resolve_em_provider_inputs_in_session(session, pinned, "control") is held
+    installed = session.info[execution._SESSION_INVENTORY_KEY]
+    assert installed.transaction is session.transaction
+    assert installed.inventory.connection is session.driver and installed.inventory.backend_pid == 42
+    assert {pin.table_oid for pin in installed.inventory.relations} == {
+        relation.relation_oid for relation in held.relations
+    }
+    resolved.assert_awaited_once_with(session.driver, pinned, "control", api_read=True)
+    assert session.events == ["names"]
+
+
+@pytest.mark.asyncio
+async def test_canceled_input_resolution_never_installs_partial_relation_inventory(monkeypatch):
+    from api import network_read_execution as execution
+    from tests.test_network_optional_sql_recovery import _Session
+
+    session = _Session()
+    entered = asyncio.Event()
+
+    async def pending(*_arguments, **_options):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(inputs, "resolve_em_provider_inputs", pending)
+    pinned = manifest(
+        await inputs.prepare_em_provider_inputs(connection(), family(), runtime_roles=("runtime_reader",))
+    )
+    task = asyncio.create_task(inputs.resolve_em_provider_inputs_in_session(session, pinned, "control"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert execution._SESSION_INVENTORY_KEY not in session.info
+    assert session.events == []

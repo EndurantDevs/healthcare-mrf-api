@@ -4,11 +4,12 @@
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from uuid import UUID
 
 from process import provider_directory_cms_serving_receipt as serving
 from process.network_address_projection import _identifier
+from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_cms_registry_address_capture import native_driver
 from process.network_cms_registry_source_pair import (
     RegistryCMSRetainedSourcePair,
@@ -163,13 +164,12 @@ SELECT EXISTS(SELECT 1 FROM target c CROSS JOIN closure_scope s JOIN pg_roles o 
 
 
 @dataclass(frozen=True)
-class RegistryCMSSourceNotificationStore:
-    """Bind the callback to authenticated bootstrap context, never a decoded caller tag."""
+class RegistryCMSSourceNotificationReader:
+    """Fixed read capability with no publication attempt or notification writer."""
 
     control_schema: str
     owner_role: str
     publisher_role: str
-    source_attempt: RegistryCMSSourceAttempt
     reader_roles: tuple[str, ...] = ()
 
     def __post_init__(self):
@@ -183,34 +183,54 @@ class RegistryCMSSourceNotificationStore:
             self.reader_roles
         ):
             _invalid()
+
+    async def _connection(self, session, *, writing):
+        if writing:
+            _invalid()
+        return await _notification_connection(self, session, writing=False)
+
+    async def read(self, session, *, source_schema, receipt_id):
+        """Reprove committed source evidence under the fixed native reader profile."""
+        return await _read_notification(self, session, source_schema, receipt_id)
+
+    async def matching_headers(self, session, coordinates):
+        """Discover a bounded exact six-coordinate capture, never a latest alias."""
+        if type(coordinates) is not RegistryNetworkSourceCoordinates:
+            _invalid()
+        connection = await self._connection(session, writing=False)
+        headers = await connection.fetch(
+            f"SELECT receipt_id,octet_length(notification_json) AS raw_byte_count "
+            f"FROM {_identifier(self.control_schema)}.{TABLE} "
+            "WHERE source_schema=$1 AND notification_json::jsonb#>'{pair,proof,binding_coordinates}'=$2::jsonb "
+            'ORDER BY receipt_id COLLATE "C" LIMIT 101',
+            coordinates.dataset_schema,
+            _json(asdict(coordinates)),
+        )
+        if len(headers) > 100 or any(not 1 <= header["raw_byte_count"] <= MAX_NOTIFICATION_BYTES for header in headers):
+            _invalid()
+        return tuple(dict(header) for header in headers)
+
+
+@dataclass(frozen=True)
+class RegistryCMSSourceNotificationStore:
+    """Bind the callback to authenticated bootstrap context, never a decoded caller tag."""
+
+    control_schema: str
+    owner_role: str
+    publisher_role: str
+    source_attempt: RegistryCMSSourceAttempt
+    reader_roles: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        RegistryCMSSourceNotificationReader(
+            self.control_schema, self.owner_role, self.publisher_role, self.reader_roles
+        )
         if type(self.source_attempt) is not RegistryCMSSourceAttempt:
             _invalid()
         RegistryCMSSourceAttempt.from_dict(self.source_attempt.as_dict())
 
     async def _connection(self, session, *, writing):
-        connection = await native_driver(session)
-        roles = tuple(sorted({self.publisher_role, *self.reader_roles}))
-        if (
-            not connection.is_in_transaction()
-            or await connection.fetchval("SHOW transaction_isolation")
-            not in (
-                {"read committed", "repeatable read", "serializable"}
-                if writing
-                else {"repeatable read", "serializable"}
-            )
-            or await connection.fetchval("SHOW transaction_read_only") != ("off" if writing else "on")
-            or await connection.fetchval("SELECT current_user") not in ((self.publisher_role,) if writing else roles)
-            or not await connection.fetchval(
-                _PRIVILEGES_SQL,
-                self.control_schema,
-                self.owner_role,
-                roles,
-                self.publisher_role,
-                INSERT_COLUMNS,
-            )
-        ):
-            _invalid()
-        return connection
+        return await _notification_connection(self, session, writing=writing)
 
     async def notify_receipt(self, session, *, receipt_id, pair):
         """Append only a bound pair from this exact native publication transaction.
@@ -242,20 +262,49 @@ class RegistryCMSSourceNotificationStore:
 
     async def read(self, session, *, source_schema, receipt_id):
         """Load closed committed evidence and revalidate it; do not approve or enqueue it."""
-        _identifier(source_schema)
-        if type(receipt_id) is not str or re.fullmatch(r"[0-9a-f]{64}", receipt_id) is None:
-            _invalid()
-        connection = await self._connection(session, writing=False)
-        row = await _read_row(connection, _identifier(self.control_schema), source_schema, receipt_id)
-        if row is None:
-            _invalid()
-        notification = decode_registry_cms_source_notification(row["notification_json"], row["notification_sha256"])
-        if tuple(row[column] for column in INSERT_COLUMNS) != _row_values(notification):
-            _invalid()
-        resolved = await resolve_committed_registry_cms_source_pair(session, notification.pair.recipe)
-        if resolved.pair != notification.pair:
-            _invalid()
-        return notification
+        return await _read_notification(self, session, source_schema, receipt_id)
+
+
+async def _notification_connection(configuration, session, *, writing):
+    connection = await native_driver(session)
+    roles = tuple(sorted({configuration.publisher_role, *configuration.reader_roles}))
+    if (
+        not connection.is_in_transaction()
+        or await connection.fetchval("SHOW transaction_isolation")
+        not in (
+            {"read committed", "repeatable read", "serializable"} if writing else {"repeatable read", "serializable"}
+        )
+        or await connection.fetchval("SHOW transaction_read_only") != ("off" if writing else "on")
+        or await connection.fetchval("SELECT current_user")
+        not in ((configuration.publisher_role,) if writing else roles)
+        or not await connection.fetchval(
+            _PRIVILEGES_SQL,
+            configuration.control_schema,
+            configuration.owner_role,
+            roles,
+            configuration.publisher_role,
+            INSERT_COLUMNS,
+        )
+    ):
+        _invalid()
+    return connection
+
+
+async def _read_notification(reader, session, source_schema, receipt_id):
+    _identifier(source_schema)
+    if type(receipt_id) is not str or re.fullmatch(r"[0-9a-f]{64}", receipt_id) is None:
+        _invalid()
+    connection = await reader._connection(session, writing=False)
+    row = await _read_row(connection, _identifier(reader.control_schema), source_schema, receipt_id)
+    if row is None:
+        _invalid()
+    notification = decode_registry_cms_source_notification(row["notification_json"], row["notification_sha256"])
+    if tuple(row[column] for column in INSERT_COLUMNS) != _row_values(notification):
+        _invalid()
+    resolved = await resolve_committed_registry_cms_source_pair(session, notification.pair.recipe)
+    if resolved.pair != notification.pair:
+        _invalid()
+    return notification
 
 
 def _row_values(notification):

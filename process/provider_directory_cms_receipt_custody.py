@@ -6,11 +6,16 @@ import json
 from copy import deepcopy
 
 from db.plan_release_storage import storage_identifier, storage_relation
+from process.plan_release_storage_catalog import ROLE_SQL
 from process.provider_directory_cms_callable_custody import _admin_identity, capture_cms_callable_custody
 from process.provider_directory_cms_control_privileges import (
+    ORIGIN_METADATA_COLUMNS,
     READ_COLUMN_GRANTS,
     cms_control_read_edges,
     cms_control_read_oids,
+    cms_origin_metadata_read_oids,
+    cms_origin_metadata_read_roles,
+    grant_cms_origin_metadata_read_privileges,
 )
 from process.provider_directory_cms_receipt_policy import (
     POLICY_SQL,
@@ -233,7 +238,7 @@ def _read_acl(catalog, old_owner, owner):
     return table_reads, columns
 
 
-def _require_acl_edges(catalog, root, principal_oids, readers, *, legacy):
+def _require_acl_edges(catalog, root, principal_oids, readers, *, legacy, metadata_readers=()):
     owner, publisher, builder, migration = principal_oids
     old_owner = int(root["relowner"])
     _require(old_owner in {owner, builder} if legacy else old_owner == owner, "owner_changed")
@@ -253,6 +258,11 @@ def _require_acl_edges(catalog, root, principal_oids, readers, *, legacy):
         for entry in catalog["attributes"]
         if entry["attrelid"] == root["oid"] and entry["attname"] in READ_COLUMN_GRANTS[ROOT]
     }
+    metadata_columns = {
+        entry["attnum"]
+        for entry in catalog["attributes"]
+        if entry["attrelid"] == root["oid"] and entry["attname"] in ORIGIN_METADATA_COLUMNS
+    }
     for column, grantee, grantor, right, grantable in catalog["column_acl"]:
         _require(
             not grantable
@@ -260,6 +270,7 @@ def _require_acl_edges(catalog, root, principal_oids, readers, *, legacy):
             and (
                 (grantee in readers | {owner} and right == "SELECT")
                 or (grantee == publisher and column in read_columns and right == "SELECT")
+                or (grantee in metadata_readers and column in metadata_columns and right == "SELECT")
                 or (old_owner == owner and grantee == builder and column in {1, 2} and right == "INSERT")
             ),
             "column_acl_changed",
@@ -275,8 +286,25 @@ def _require_acl_edges(catalog, root, principal_oids, readers, *, legacy):
         )
 
 
-def _require_acl(catalog, root, principal_oids, readers, *, legacy, role_graph=None):
-    _require_acl_edges(catalog, root, principal_oids, readers, legacy=legacy)
+def _require_acl(catalog, root, principal_oids, readers, *, legacy, role_graph=None, metadata_readers=()):
+    _require_acl_edges(catalog, root, principal_oids, readers, legacy=legacy, metadata_readers=metadata_readers)
+    metadata_columns = {
+        entry["attnum"]
+        for entry in catalog["attributes"]
+        if entry["attrelid"] == root["oid"] and entry["attname"] in ORIGIN_METADATA_COLUMNS
+    }
+    for access in catalog["access"]:
+        if access["role"] in metadata_readers:
+            _require(
+                not access["owner_reach"]
+                and not access["builder_reach"]
+                and not access["table"]
+                and all(
+                    set(rights) <= ({"SELECT"} if column in metadata_columns else set())
+                    for column, rights in access["columns"]
+                ),
+                "metadata_reader_access_changed",
+            )
     if root["relrowsecurity"]:
         _require(role_graph is not None, "role_graph_required")
         require_bound_access(catalog["access"], principal_oids, role_graph)
@@ -387,19 +415,97 @@ def _receipt_principals(receipt, policy):
     }
 
 
-async def capture_cms_serving_receipt_custody(connection, policy, *, migration_role, legacy=False):
+_METADATA_READERS_SQL = """SELECT jsonb_build_object(
+ 'namespace',(SELECT to_jsonb(n) FROM pg_namespace n WHERE n.oid=$1::oid),
+ 'access',(SELECT jsonb_agg(jsonb_build_object('role',r.oid::bigint,
+ 'usage',has_schema_privilege(r.oid,$1::oid,'USAGE'),'create',has_schema_privilege(r.oid,$1::oid,'CREATE'),
+ 'source_reach',EXISTS(SELECT FROM pg_roles source WHERE source.rolname=ANY($3::text[]) AND
+ (pg_has_role(r.oid,source.oid,'MEMBER') OR pg_has_role(r.oid,source.oid,'USAGE')
+ OR pg_has_role(r.oid,source.oid,'SET')))) ORDER BY r.oid) FROM pg_roles r WHERE r.oid=ANY($2::oid[])),
+ 'beneficiaries',(SELECT COALESCE(jsonb_agg(jsonb_build_array(actor.oid::bigint,recipient.oid::bigint)
+ ORDER BY actor.oid,recipient.oid),'[]'::jsonb) FROM pg_roles actor,pg_roles recipient
+ WHERE recipient.oid=ANY($2::oid[]) AND NOT actor.rolsuper AND actor.oid<>recipient.oid AND
+ (pg_has_role(actor.oid,recipient.oid,'MEMBER') OR pg_has_role(actor.oid,recipient.oid,'USAGE')
+ OR pg_has_role(actor.oid,recipient.oid,'SET'))))"""
+
+
+async def _capture_metadata_readers(connection, policy, receipt, roles):
+    graph = receipt["functions"]["role_graph"]
+    oids = cms_origin_metadata_read_oids(policy, graph, roles)
+    _require(receipt["migration"] not in oids, "metadata_reader_source_overlap")
+    native = _decoded(
+        await connection.fetchval(
+            _METADATA_READERS_SQL,
+            receipt["functions"]["schema_oid"],
+            list(oids),
+            [policy.owner_role, policy.publisher_role, *policy.runtime_roles],
+        )
+    )
+    native["role_access"] = [
+        dict(entry)
+        for entry in await connection.fetch(
+            ROLE_SQL, list(roles), policy.owner_role, policy.publisher_role, policy.schema
+        )
+    ]
+    _require(
+        native["namespace"] is not None
+        and int(native["namespace"]["oid"]) == receipt["functions"]["schema_oid"]
+        and native["namespace"]["nspname"] == policy.schema
+        and len(native["access"] or ()) == len(oids)
+        and {entry["role"] for entry in native["access"]} == set(oids)
+        and all(
+            entry["usage"] is True and entry["create"] is False and entry["source_reach"] is False
+            for entry in native["access"]
+        )
+        and all(actor in oids and recipient in oids for actor, recipient in native["beneficiaries"]),
+        "metadata_reader_authority_changed",
+    )
+    _require(
+        [(entry["rolname"], int(entry["oid"])) for entry in native["role_access"]]
+        == list(zip(roles, oids, strict=True))
+        and all(
+            entry["namespace_usage"] is True
+            and entry["namespace_owner_protected"] is True
+            and all(
+                entry[key] is False
+                for key in ("elevated", "namespace_create", "namespace_owner_reachable", "owner_set", "publisher_set")
+            )
+            for entry in native["role_access"]
+        ),
+        "metadata_reader_authority_changed",
+    )
+    return {"version": 1, "roles": [[role, oid] for role, oid in zip(roles, oids, strict=True)], **native}
+
+
+async def capture_cms_serving_receipt_custody(
+    connection, policy, *, migration_role, legacy=False, metadata_read_roles=()
+):
     """Attest final session-bound intake, or the unchanged strict legacy runtime boundary."""
     _require(
         type(policy) is GenericSourcePolicy and type(legacy) is bool and bool(policy.control_runtime_roles),
         "policy_required",
     )
     receipt = await _capture_receipt(connection, policy, migration_role)
+    metadata_read_roles = cms_origin_metadata_read_roles(policy, metadata_read_roles)
+    metadata_readers = ()
+    if metadata_read_roles:
+        _require(not legacy, "metadata_reader_protected_receipt_required")
+        receipt["metadata_readers"] = await _capture_metadata_readers(connection, policy, receipt, metadata_read_roles)
+        metadata_readers = tuple(oid for _name, oid in receipt["metadata_readers"]["roles"])
     catalog, functions = receipt["catalog"], receipt["functions"]
     root = _require_layout(catalog, policy.schema, functions, protected=not legacy)
     if not legacy:
         require_receipt_policies(catalog, root, policy.control_runtime_roles[0])
     principals, readers = _receipt_principals(receipt, policy)
-    _require_acl(catalog, root, principals, readers, legacy=legacy, role_graph=functions["role_graph"])
+    _require_acl(
+        catalog,
+        root,
+        principals,
+        readers,
+        legacy=legacy,
+        role_graph=functions["role_graph"],
+        metadata_readers=metadata_readers,
+    )
     return receipt
 
 
@@ -407,7 +513,7 @@ _LOCK_SQL = """SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid()
  AND relation=to_regclass($1) AND mode='AccessExclusiveLock' AND granted)"""
 
 
-async def _capture_locked_transition(connection, policy, migration_role, actor):
+async def _capture_locked_transition(connection, policy, migration_role, actor, metadata_read_roles=()):
     """Observe only an original-admin locked migration, never issue a legacy runtime capability."""
     _require(await _admin_identity(connection, policy) == actor, "admin_transaction_changed")
     _require(
@@ -417,7 +523,10 @@ async def _capture_locked_transition(connection, policy, migration_role, actor):
     catalog, functions = receipt["catalog"], receipt["functions"]
     protected = next(entry for entry in catalog["classes"] if entry["relname"] == ROOT)["relrowsecurity"]
     if protected:
-        return await capture_cms_serving_receipt_custody(connection, policy, migration_role=migration_role)
+        return await capture_cms_serving_receipt_custody(
+            connection, policy, migration_role=migration_role, metadata_read_roles=metadata_read_roles
+        )
+    _require(not metadata_read_roles, "metadata_reader_protected_receipt_required")
     root = _require_layout(catalog, policy.schema, functions)
     principals, readers = _receipt_principals(receipt, policy)
     _require_acl_edges(catalog, root, principals, readers, legacy=True)
@@ -480,7 +589,9 @@ def require_cms_serving_receipt_adoption_delta(before, after):
     _require(expected == after["catalog"], "adoption_catalog_changed")
 
 
-async def provision_cms_serving_receipt_custody(connection, policy, *, migration_role, verify_role_profile):
+async def provision_cms_serving_receipt_custody(
+    connection, policy, *, migration_role, verify_role_profile, metadata_read_roles=()
+):
     """Use one supplied genuine admin transaction; no receipt, profile, role or namespace is created."""
     _require(
         type(policy) is GenericSourcePolicy
@@ -489,12 +600,13 @@ async def provision_cms_serving_receipt_custody(connection, policy, *, migration
         and callable(verify_role_profile),
         "explicit_admin_required",
     )
+    metadata_read_roles = cms_origin_metadata_read_roles(policy, metadata_read_roles)
     task, actor = asyncio.current_task(), await _admin_identity(connection, policy)
     async with connection.transaction():
         await verify_role_profile(connection, policy.schema, **policy.role_arguments())
         table = storage_relation(policy.schema, ROOT)
         await connection.execute(f"LOCK TABLE ONLY {table} IN ACCESS EXCLUSIVE MODE NOWAIT")
-        before = await _capture_locked_transition(connection, policy, migration_role, actor)
+        before = await _capture_locked_transition(connection, policy, migration_role, actor, metadata_read_roles)
         if next(entry for entry in before["catalog"]["classes"] if entry["relname"] == ROOT)["relowner"] != str(
             before["owner"]
         ):
@@ -506,7 +618,9 @@ async def provision_cms_serving_receipt_custody(connection, policy, *, migration
         if not before_root["relrowsecurity"]:
             for statement in policy_statements(table, policy.control_runtime_roles[0]):
                 await connection.execute(statement)
-        after = await capture_cms_serving_receipt_custody(connection, policy, migration_role=migration_role)
+        after = await capture_cms_serving_receipt_custody(
+            connection, policy, migration_role=migration_role, metadata_read_roles=metadata_read_roles
+        )
         require_cms_serving_receipt_adoption_delta(before, after)
         await verify_role_profile(connection, policy.schema, **policy.role_arguments())
         _require(
@@ -516,19 +630,39 @@ async def provision_cms_serving_receipt_custody(connection, policy, *, migration
         return after
 
 
-def require_cms_serving_receipt_read_delta(before, after, policy):
+def require_cms_serving_receipt_read_delta(before, after, policy, *, metadata_read_roles=()):
     """Admit only this policy's exact metadata SELECT edges, preserving all other custody."""
     _require(policy.schema == before["schema"], "read_scope_changed")
     _require(
-        {key: value for key, value in before.items() if key != "catalog"}
-        == {key: value for key, value in after.items() if key != "catalog"},
+        {key: field_value for key, field_value in before.items() if key != "catalog"}
+        == {key: field_value for key, field_value in after.items() if key != "catalog"},
         "read_scope_changed",
     )
-    grantees = cms_control_read_oids(policy, before["functions"]["role_graph"])
+    metadata_read_roles = cms_origin_metadata_read_roles(policy, metadata_read_roles)
+    if metadata_read_roles:
+        grantees = cms_origin_metadata_read_oids(policy, before["functions"]["role_graph"], metadata_read_roles)
+        declaration = before.get("metadata_readers", {})
+        _require(
+            declaration.get("version") == 1
+            and declaration.get("roles")
+            == [[role, oid] for role, oid in zip(metadata_read_roles, grantees, strict=True)],
+            "read_declaration_changed",
+        )
+    else:
+        grantees = cms_control_read_oids(policy, before["functions"]["role_graph"])
     expected = deepcopy(before["catalog"])
     root = next(entry for entry in expected["classes"] if entry["relname"] == ROOT)
     attributes = [entry for entry in expected["attributes"] if entry["attrelid"] == root["oid"]]
-    additions = cms_control_read_edges(ROOT, attributes, grantees, int(root["relowner"]))
+    additions = (
+        {
+            (entry["attnum"], grantee, int(root["relowner"]), "SELECT", False)
+            for entry in attributes
+            if entry["attname"] in ORIGIN_METADATA_COLUMNS
+            for grantee in grantees
+        }
+        if metadata_read_roles
+        else cms_control_read_edges(ROOT, attributes, grantees, int(root["relowner"]))
+    )
     _require(
         {tuple(entry) for entry in after["catalog"]["column_acl"]}
         == {tuple(entry) for entry in expected["column_acl"]} | additions,
@@ -542,5 +676,49 @@ def require_cms_serving_receipt_read_delta(before, after, policy):
                 if (entry["attrelid"], entry["attnum"]) == (attribute["attrelid"], attribute["attnum"])
             )
     expected["column_acl"] = after["catalog"]["column_acl"]
-    expected["access"] = after["catalog"]["access"]
+    if metadata_read_roles:
+        columns = {edge[0] for edge in additions}
+        for access in (entry for entry in expected["access"] if entry["role"] in grantees):
+            for column, rights in access["columns"]:
+                if column in columns and "SELECT" not in rights:
+                    rights.append("SELECT")
+    else:
+        expected["access"] = after["catalog"]["access"]
     _require(expected == after["catalog"], "read_catalog_changed")
+
+
+async def provision_cms_origin_metadata_readers(
+    connection, policy, *, migration_role, metadata_read_roles, verify_role_profile
+):
+    """Grant only declared origin reads on an already protected receipt under its original admin."""
+    roles = cms_origin_metadata_read_roles(policy, metadata_read_roles)
+    _require(
+        bool(roles) and connection.is_in_transaction() is True and callable(verify_role_profile),
+        "explicit_admin_required",
+    )
+    task, actor = asyncio.current_task(), await _admin_identity(connection, policy)
+    async with connection.transaction():
+        await verify_role_profile(connection, policy.schema, **policy.role_arguments())
+        await connection.execute(
+            f"LOCK TABLE ONLY {storage_relation(policy.schema, ROOT)} IN ACCESS EXCLUSIVE MODE NOWAIT"
+        )
+        before = await capture_cms_serving_receipt_custody(
+            connection,
+            policy,
+            migration_role=migration_role,
+            metadata_read_roles=roles,
+        )
+        await grant_cms_origin_metadata_read_privileges(connection, policy, metadata_read_roles=roles)
+        after = await capture_cms_serving_receipt_custody(
+            connection,
+            policy,
+            migration_role=migration_role,
+            metadata_read_roles=roles,
+        )
+        require_cms_serving_receipt_read_delta(before, after, policy, metadata_read_roles=roles)
+        await verify_role_profile(connection, policy.schema, **policy.role_arguments())
+        _require(
+            asyncio.current_task() is task and await _admin_identity(connection, policy) == actor,
+            "admin_transaction_changed",
+        )
+        return after

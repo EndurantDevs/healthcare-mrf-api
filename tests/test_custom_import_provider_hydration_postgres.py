@@ -942,14 +942,15 @@ class _NativeSeedSession:
         return await self.session.execute(_native_schema_statement(self.session, statement), parameters)
 
 
-class _ScopedNativeProxy:
+class _ScopedNativeProxy(list_fixture._PostgresConnectionProxy):
     def __init__(self, _database, session, raw_connection):
         assert raw_connection is None
+        super().__init__(_database, session, raw_connection)
         self.session = session
 
     async def all(self, statement, **parameters):
         self.session.info.setdefault("scoped_native_sql", []).append((str(statement), dict(parameters)))
-        return (await self.session.execute(_native_schema_statement(self.session, statement), parameters)).all()
+        return await super().all(_native_schema_statement(self.session, statement), **parameters)
 
 
 @asynccontextmanager
@@ -978,7 +979,7 @@ async def _native_scope_case(monkeypatch, *, is_geo, signed=False):
         if signed:
             await grant_signed_reader_tables(case, "npi", "npi_address", "npi_taxonomy", "nucc_taxonomy")
         list_fixture._configure_postgres_provider_list(monkeypatch)
-        monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _ScopedNativeProxy)
+        monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", _ScopedNativeProxy)
         yield case, target
 
 

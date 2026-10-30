@@ -11,6 +11,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from sqlalchemy import MetaData, text
@@ -558,6 +559,160 @@ async def test_prepared_retention_native_binding(monkeypatch, tmp_path, copy_bou
 
     async with genuine_prepared_publication(monkeypatch, tmp_path, copy_bounds, observe_preparation=True) as state:
         await _verify_genuine_retained_state(state, monkeypatch)
+
+
+async def _origin_source_authority(database):
+    """Observe original Source namespace, role and relation custody without changing it."""
+    from process.provider_directory_source_namespace_custody import capture_source_namespace_custody
+
+    component = database._source_component
+    component.factory._require_current_policy()
+    assert component.factory.policy is component.policy
+    async with component.admin_engine.connect() as connection, connection.begin():
+        await connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+        driver = (await connection.get_raw_connection()).driver_connection
+        namespace = await capture_source_namespace_custody(
+            driver, component.policy, namespace_owner_role=component.factory.namespace_owner_role
+        )
+        assert await driver.fetchval("SELECT to_regclass('mrf.provider_directory_dataset_resource')") is not None
+        publisher = next(
+            role["oid"] for role in namespace["role_graph"]["roles"] if role["rolname"] == component.retained_publisher
+        )
+        actor = await driver.fetchrow(
+            "SELECT r.oid::bigint AS oid,pg_has_role(r.oid,$2::regrole,'USAGE') AS owner_usage,"
+            "pg_has_role(r.oid,$2::regrole,'SET') AS owner_set FROM pg_roles r WHERE r.rolname=$1::name",
+            component.retained_publisher,
+            component.policy.owner_role,
+        )
+        assert actor is not None and actor["oid"] == int(publisher)
+        assert actor["owner_usage"] is False and actor["owner_set"] is False
+        relations = await driver.fetch(
+            "SELECT c.oid,c.relowner,c.relacl,"
+            "COALESCE((SELECT jsonb_agg(jsonb_build_array(a.attnum,a.attacl) ORDER BY a.attnum) "
+            "FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb) AS columns "
+            "FROM pg_class c WHERE c.relnamespace=$1::oid ORDER BY c.oid",
+            int(namespace["namespace"]["oid"]),
+        )
+        return component.policy, namespace, relations
+
+
+async def _origin_pair_read(connection, pair, *, granted):
+    from process import network_cms_registry_source_pair as pair_reader
+
+    session = address_capture.NativeReceiptSession(connection)
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        if not granted:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await pair_reader._publication(session, pair.proof, current=False)
+            return
+        resolved, oid = await pair_reader._read_committed_pair(connection, pair.address_source.schema_name)
+        assert resolved == pair and oid == pair.address_ownership.schema_oid
+        assert (
+            await pair_reader.require_registry_cms_source_pair_connection(connection, pair, verify_content=False)
+            == pair
+        )
+        with pytest.raises(epoch_capture.FHIRSourceEpochError):
+            await epoch_capture.require_retained_cms_fhir_source_epoch(
+                connection,
+                pair.proof.source_pin,
+                replace(pair.recipe.source_pin.retained_epoch, metadata_sha256="0" * 64),
+                verify_content=False,
+            )
+        for proof in (
+            replace(pair.proof, serving_receipt_id="0" * 64),
+            replace(pair.proof, publication_xid=str(int(pair.proof.publication_xid) + 1)),
+            replace(pair.proof, profile_generation_id="pdprofile_" + "0" * 32),
+        ):
+            with pytest.raises(ValueError, match="publication_unavailable"):
+                await pair_reader._publication(session, proof, current=False)
+        assert await serving.read_registry_source_pair_receipt(session, "mrf", uuid4()) is None
+
+
+async def _origin_wider_reads_refused(connection, owner):
+    for statement in (
+        "SELECT created_at FROM mrf.provider_directory_cms_serving_receipt",
+        "SELECT * FROM mrf.provider_directory_cms_serving_receipt",
+        "SELECT * FROM mrf.provider_directory_dataset_resource",
+        "UPDATE mrf.provider_directory_cms_serving_receipt SET payload=payload WHERE false",
+        f'SET ROLE "{owner}"',
+    ):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with connection.transaction():
+                await connection.execute(statement)
+
+
+async def _origin_native_acl_refusals(database, roles, *, metadata_read_roles=None):
+    from process import provider_directory_cms_receipt_custody as custody
+
+    component = database._source_component
+    custody_options_by_name = dict(
+        migration_role=component.factory.migration_role,
+        metadata_read_roles=roles[:2] if metadata_read_roles is None else metadata_read_roles,
+    )
+    async with component.admin_engine.begin() as connection:
+        await connection.exec_driver_sql("SELECT 1")
+        driver = (await connection.get_raw_connection()).driver_connection
+        before = await custody.capture_cms_serving_receipt_custody(driver, component.policy, **custody_options_by_name)
+        for privilege, role, suffix in (
+            ("SELECT", roles[0], ""),
+            ("SELECT(created_at)", roles[0], ""),
+            ("SELECT(receipt_id)", roles[0], " WITH GRANT OPTION"),
+            ("SELECT(receipt_id)", roles[2], ""),
+            ("UPDATE(payload)", roles[0], ""),
+        ):
+            savepoint = driver.transaction()
+            await savepoint.start()
+            try:
+                await driver.execute(
+                    f'GRANT {privilege} ON mrf.provider_directory_cms_serving_receipt TO "{role}"{suffix}'
+                )
+                with pytest.raises(ValueError, match="acl_changed"):
+                    await custody.capture_cms_serving_receipt_custody(
+                        driver, component.policy, **custody_options_by_name
+                    )
+            finally:
+                await savepoint.rollback()
+            assert (
+                await custody.capture_cms_serving_receipt_custody(driver, component.policy, **custody_options_by_name)
+                == before
+            )
+
+
+async def _origin_set_authority_refusals(database, roles, *, metadata_read_roles=None):
+    from process import provider_directory_cms_receipt_custody as custody
+
+    component = database._source_component
+    custody_options_by_name = dict(
+        migration_role=component.factory.migration_role,
+        metadata_read_roles=roles[:2] if metadata_read_roles is None else metadata_read_roles,
+    )
+    async with component.admin_engine.begin() as connection:
+        await connection.exec_driver_sql("SELECT 1")
+        driver = (await connection.get_raw_connection()).driver_connection
+        before = await custody.capture_cms_serving_receipt_custody(driver, component.policy, **custody_options_by_name)
+        for reachable, setup in (
+            (component.factory.namespace_owner_role, None),
+            (roles[2], f'GRANT CREATE ON SCHEMA mrf TO "{roles[2]}"'),
+            (roles[2], f'ALTER ROLE "{roles[2]}" CREATEROLE'),
+        ):
+            savepoint = driver.transaction()
+            await savepoint.start()
+            try:
+                if setup is not None:
+                    await driver.execute(setup)
+                await driver.execute(f'GRANT "{reachable}" TO "{roles[0]}" WITH INHERIT FALSE, SET TRUE')
+                assert not await driver.fetchval("SELECT has_schema_privilege($1::name,'mrf'::name,'CREATE')", roles[0])
+                assert await driver.fetchval("SELECT pg_has_role($1::name,$2::name,'SET')", roles[0], reachable)
+                with pytest.raises(ValueError, match="metadata_reader_authority_changed"):
+                    await custody.capture_cms_serving_receipt_custody(
+                        driver, component.policy, **custody_options_by_name
+                    )
+            finally:
+                await savepoint.rollback()
+            assert (
+                await custody.capture_cms_serving_receipt_custody(driver, component.policy, **custody_options_by_name)
+                == before
+            )
 
 
 @pytest.mark.asyncio

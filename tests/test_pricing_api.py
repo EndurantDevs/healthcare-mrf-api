@@ -190,8 +190,11 @@ class FakeResult:
 
 class FakeSession:
     def __init__(self, results=None):
+        from tests.network_read_execution_support import with_read_identity_receipts
+
         self._results = list(results or [])
         self.executions = []
+        with_read_identity_receipts(self)
 
     async def execute(self, *_args, **_kwargs):
         self.executions.append((_args, _kwargs))

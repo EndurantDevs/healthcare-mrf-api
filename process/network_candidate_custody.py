@@ -21,6 +21,7 @@ from process.network_membership_writer_closure import (
     _NATIVE_RUNTIME_ROLE_UNSAFE_SQL,
     _catalog,
     _check_closed,
+    _check_identity,
     _protected_owner,
     _receipt,
     _remove_default_grants,
@@ -106,9 +107,73 @@ class NetworkCandidateCustodyError(ValueError):
     """Native identity, original authority or retained candidate custody changed."""
 
 
+_API_CONTROL_TABLES = frozenset(
+    ("network_membership_candidate", "network_serving_manifest", "registry_approved_record")
+)
+_API_CONTROL_TABLE_SQL = """SELECT c.relname,c.oid::bigint,c.relowner::bigint,c.relkind::text,c.relpersistence::text,
+ c.relrowsecurity,c.relforcerowsecurity,c.relispartition,
+ c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap') AS heap,
+ EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
+ EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) AS rules,
+ ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0
+   AND NOT a.attisdropped ORDER BY a.attnum LIMIT $3) AS columns
+ FROM pg_catalog.pg_class c WHERE c.relnamespace=$1::oid AND c.relname=ANY($2::text[]) ORDER BY c.relname"""
+
+
 def _require(condition):
     if not condition:
         raise NetworkCandidateCustodyError("network_candidate_custody_unavailable")
+
+
+async def read_network_control_relation_pins(
+    connection, relation_names, *, control_schema, expected_candidate_table_oid=None
+):
+    """Authenticate bounded current control-table identities, without acquiring reader locks.
+
+    These are race pins for subsequent consumed-data checks, not historical seals
+    or Source/publication authority. Existing native write guards remain intact.
+    """
+    from process.network_compact_layout import CompactAddressRelation
+    from process.registry_management_permissions import _TABLES
+
+    _require(connection.is_in_transaction() and type(relation_names) is tuple)
+    _require(0 < len(relation_names) <= len(_API_CONTROL_TABLES))
+    _require(all(type(name) is str and name in _API_CONTROL_TABLES for name in relation_names))
+    _require(len(set(relation_names)) == len(relation_names))
+    modes = await connection.fetchrow(
+        "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+    )
+    _require(tuple(modes) in (("repeatable read", "on"), ("serializable", "on")))
+    control = await _control(connection, control_schema)
+    if expected_candidate_table_oid is not None:
+        _require(type(expected_candidate_table_oid) is int and 0 < expected_candidate_table_oid < 2**32)
+        _require(control["candidate_table_oid"] == expected_candidate_table_oid)
+    tables = await connection.fetch(
+        _API_CONTROL_TABLE_SQL,
+        control["schema_oid"],
+        list(relation_names),
+        max(len(_TABLES[name]) for name in relation_names) + 1,
+    )
+    _require(len(tables) == len(relation_names))
+    by_name = {table["relname"]: table for table in tables}
+    _require(set(by_name) == set(relation_names))
+    pins = []
+    for name in relation_names:
+        table = by_name[name]
+        _require(table["relowner"] == control["schema_owner_oid"])
+        _require(table["relkind"] == "r" and table["relpersistence"] == "p" and table["heap"] is True)
+        _require(
+            not any(
+                table[field]
+                for field in ("relrowsecurity", "relforcerowsecurity", "relispartition", "inherited", "rules")
+            )
+        )
+        _require(tuple(table["columns"]) == _TABLES[name])
+        if name == "network_membership_candidate":
+            _require(table["oid"] == control["candidate_table_oid"])
+        pins.append(CompactAddressRelation(control_schema, name, table["oid"]))
+    _require(await _control(connection, control_schema) == control)
+    return tuple(pins)
 
 
 def _encoded(value):
@@ -170,16 +235,18 @@ def _source_event_assertion(report):
 
 
 def _evidence(candidate, *, revision=1):
-    _require(type(revision) is int and revision in (1, 2, 3))
+    _require(type(revision) is int and revision in (1, 2, 3, 4))
     evidence_by_name = {}
     _require(set(candidate) == set(_STABLE) | {"state"})
     for field in _STABLE:
         field_value = candidate[field]
         if field in ("source_generations", "source_recipes_json", "validation_json") and type(field_value) is str:
             field_value = json.loads(field_value)
-        if field == "validation_json" and revision in (2, 3):
+        if field == "validation_json" and revision in (2, 3, 4):
             _require(type(field_value) is dict)
-        if field == "validation_json" and (revision == 2 or (revision == 3 and SOURCE_EVENT_ASSERTION in field_value)):
+        if field == "validation_json" and (
+            revision == 2 or (revision in (3, 4) and SOURCE_EVENT_ASSERTION in field_value)
+        ):
             key, checkpoint = _source_event_assertion(field_value)
             _require(candidate["state"] != "published" or key in field_value)
             report_by_name = dict(field_value)
@@ -366,26 +433,91 @@ async def _retained_address_runtime_closure(connection, address_source, runtime_
     _require(safe is True)
 
 
-async def _final_proof(connection, target, candidate, schema):
+@asynccontextmanager
+async def _preservation_scope(connection, copy_target, candidate, schema, inventory_entries):
+    """Keep authenticated carry selections alive through full and compact custody, then drain cleanup."""
+    from process.registry_fhir_serving_preservation import (
+        cleanup_fhir_serving_preservation,
+        rederive_fhir_serving_preservation,
+        verify_fhir_preservation_target_rows,
+    )
+
+    preservation = await rederive_fhir_serving_preservation(
+        connection, copy_target, candidate, control_schema=schema, inventory_entries=inventory_entries
+    )
+    primary = None
+    try:
+        if preservation is not None:
+            await verify_fhir_preservation_target_rows(
+                connection, copy_target, candidate, preservation, control_schema=schema
+            )
+        yield preservation
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            await cleanup_fhir_serving_preservation(connection, preservation, primary=primary)
+        except BaseException as cleanup_error:
+            if primary is None:
+                raise
+            primary.add_note("FHIR preservation cleanup failed; caller rollback remains required.")
+            primary._registry_preservation_cleanup_error = cleanup_error
+
+
+async def _final_proof(connection, copy_target, candidate, schema, *, office_authority=None, inventory_entries=None):
     from process.network_membership_publication import _publication_readiness, _verify_provider_custody
 
     readiness = _publication_readiness(candidate)
     report = _json_object(candidate["validation_json"])
-    source = PinnedAddressSource(**report["address_source"])
-    await verify_registry_source_retention_rows(connection, target, candidate)
-    # Unlike the READY public replay, this helper reruns complete accounting and parity.
-    await _matching_inputs(connection, candidate, target, source, schema)
-    await _source_semantics(
-        connection,
-        f"{_identifier(source.schema_name)}.{_identifier(source.table_name)}",
-        f"{_identifier(target.schema_name)}.entity_address_unified",
-        replay=True,
-    )
-    _require(
-        await _index_digest(connection, target.schema_name, _serving_plan(target.schema_name))
-        == readiness[2]["index_definition_sha256"]
-    )
-    await _verify_provider_custody(connection, candidate, readiness[3])
+    address_source = PinnedAddressSource(**report["address_source"])
+    async with _preservation_scope(connection, copy_target, candidate, schema, inventory_entries) as preservation:
+        await verify_registry_source_retention_rows(connection, copy_target, candidate)
+        from process.network_source_contribution_custody import verify_independent_source_contributions
+
+        source_preservation = await verify_independent_source_contributions(
+            connection,
+            copy_target,
+            candidate,
+            control_schema=schema,
+            office_authority=office_authority,
+            preservation=preservation,
+            **({"inventory_entries": inventory_entries} if inventory_entries is not None else {}),
+        )
+        from process.registry_source_office_custody import verify_independent_initial_source_offices
+
+        if inventory_entries is None and source_preservation is None:
+            await verify_independent_initial_source_offices(
+                connection,
+                copy_target,
+                candidate,
+                control_schema=schema,
+                office_authority=office_authority,
+                preservation=preservation,
+            )
+        from process.network_compact_readiness import is_compact_candidate
+
+        if is_compact_candidate(candidate):
+            from process.network_compact_validation import verify_compact_final_proof
+
+            await verify_compact_final_proof(
+                connection, copy_target, candidate, control_schema=schema, office_authority=office_authority
+            )
+            await _verify_provider_custody(connection, candidate, readiness[3])
+            return
+        # Unlike the READY public replay, this helper reruns complete accounting and parity.
+        await _matching_inputs(connection, candidate, copy_target, address_source, schema)
+        await _source_semantics(
+            connection,
+            f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}",
+            f"{_identifier(copy_target.schema_name)}.entity_address_unified",
+            replay=True,
+        )
+        _require(
+            await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
+            == readiness[2]["index_definition_sha256"]
+        )
+        await _verify_provider_custody(connection, candidate, readiness[3])
 
 
 async def _original_actor(connection):
@@ -492,7 +624,7 @@ def _sealed_receipt(seal):
     _require(
         receipt_by_name["component"] == "network_candidate_custody"
         and type(receipt_by_name["revision"]) is int
-        and receipt_by_name["revision"] in (1, 2, 3)
+        and receipt_by_name["revision"] in (1, 2, 3, 4)
         and _digest(receipt_by_name) == seal["seal_sha256"]
     )
     return receipt_by_name
@@ -500,22 +632,35 @@ def _sealed_receipt(seal):
 
 def _control_identity(control, revision):
     keys = ("database_oid", "database_name", "schema_oid", "owner_oid", "candidate_table_oid", "seal_table_oid")
-    if revision == 3:
-        _require(control["schema_owner_oid"] != control["owner_oid"])
+    if revision in (3, 4):
+        if revision == 3:
+            _require(control["schema_owner_oid"] != control["owner_oid"])
         keys += ("schema_owner_oid", "schema_owner_role", "candidate_owner_oid", "candidate_owner_role")
     else:
         # Old seals bind the single owner and cannot survive a ledger-only transfer.
         _require(control["schema_owner_oid"] == control["candidate_owner_oid"] == control["owner_oid"])
     identity_by_name = {key: control[key] for key in keys}
-    if revision == 3:
+    if revision in (3, 4):
         identity_by_name["owner_role"] = control["rolname"]
     return identity_by_name
 
 
-async def _verify(connection, copy_target, schema, control, candidate, seal, *, operator=False):
-    """Verify exact sealed metadata and hold immutable native relation locks."""
+async def _candidate_index_digest(connection, candidate):
+    from process.network_compact_readiness import compact_index_digest, is_compact_candidate
+
+    if is_compact_candidate(candidate):
+        return await compact_index_digest(connection, candidate["schema_name"], candidate=candidate)
+    return await _index_digest(connection, candidate["schema_name"], _serving_plan(candidate["schema_name"]))
+
+
+async def _verify(connection, copy_target, schema, control, candidate, seal, *, operator=False, api_read=False):
+    """Verify sealed metadata; API metadata checks defer physical pins to actual data reads."""
+    _require(type(api_read) is bool and not (api_read and operator))
     _require(candidate["state"] in ("ready", "published") and seal is not None)
     receipt = _sealed_receipt(seal)
+    from process.network_compact_readiness import is_compact_candidate
+
+    _require((receipt["revision"] == 4) == is_compact_candidate(candidate))
     control_identity_by_name = _control_identity(control, receipt["revision"])
     _require(
         receipt["control"] == control_identity_by_name
@@ -537,16 +682,46 @@ async def _verify(connection, copy_target, schema, control, candidate, seal, *, 
     _require(set(closure["reader_roles"]) <= set(runtime_roles))
     roles = _final_roles(control["rolname"], tuple(closure["reader_roles"]))
     _require(closure["owner_role"] == control["rolname"] and closure["loader_roles"] == [])
-    catalog = await _lock_objects(connection, copy_target, candidate, exclusive=False, assume_owner=operator)
+    if api_read:
+        catalog = await _catalog(connection, copy_target, candidate)
+        await _heap_guards(connection, catalog)
+    else:
+        catalog = await _lock_objects(connection, copy_target, candidate, exclusive=False, assume_owner=operator)
     _require(_receipt(copy_target, roles, catalog) == closure)
     await _check_closed(connection, roles, catalog)
     await _census_closed(connection, control, catalog, runtime_roles)
     await _address_runtime_closure(connection, candidate, runtime_roles)
-    _require(
-        await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
-        == receipt["index_definition_sha256"]
-    )
+    _require(await _candidate_index_digest(connection, candidate) == receipt["index_definition_sha256"])
     return {"seal_sha256": seal["seal_sha256"], "receipt": receipt}
+
+
+async def verify_network_candidate_read_metadata(connection, copy_target, *, control_schema, required=True):
+    """Authenticate API metadata without acquiring locks on candidate data tables.
+
+    This does not authorize exposing data. Every consuming query must verify its
+    actual physical identities on this same backend/transaction before rows reach
+    application code or a cache. Producers and custodians use the locking verifier.
+    """
+    _require(connection.is_in_transaction() and type(copy_target) is MembershipCopyTarget and type(required) is bool)
+    _identifier(control_schema)
+    modes = await connection.fetchrow(
+        "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+    )
+    _require(tuple(modes) in (("repeatable read", "on"), ("serializable", "on")))
+    if not required:
+        exists = await connection.fetchval(
+            "SELECT to_regclass($1)::oid", f"{_identifier(control_schema)}.network_candidate_custody"
+        )
+        if exists is None:
+            return None
+    seal = await _seal(connection, copy_target, control_schema)
+    if seal is None and not required:
+        return None
+    control = await _control(connection, control_schema)
+    candidate = await _candidate(connection, copy_target, control_schema)
+    result = await _verify(connection, copy_target, control_schema, control, candidate, seal, api_read=True)
+    _require(await _control(connection, control_schema) == control)
+    return result
 
 
 async def verify_network_candidate_custody(connection, copy_target, *, control_schema, required=True):
@@ -569,9 +744,10 @@ async def verify_network_candidate_custody(connection, copy_target, *, control_s
         if seal is None:
             return None
     else:
-        await _control(connection, control_schema)
+        control = await _control(connection, control_schema)
         seal = await _seal(connection, copy_target, control_schema)
-    control = await _control(connection, control_schema)
+    if not required:
+        control = await _control(connection, control_schema)
     candidate = await _candidate(connection, copy_target, control_schema)
     _require(await connection.fetchval("SHOW transaction_isolation") in ("repeatable read", "serializable"))
     result = await _verify(connection, copy_target, control_schema, control, candidate, seal)
@@ -590,8 +766,12 @@ async def _store_candidate_seal(
     *,
     pre_enrolled_only=False,
 ):
+    from process.network_compact_readiness import is_compact_candidate
+
     revision = (
-        3
+        4
+        if is_compact_candidate(candidate)
+        else 3
         if control["schema_owner_oid"] != control["owner_oid"]
         else 2
         if SOURCE_EVENT_ASSERTION in _json_object(candidate["validation_json"])
@@ -604,9 +784,7 @@ async def _store_candidate_seal(
         "control": _control_identity(control, revision),
         "candidate_sha256": _digest(_evidence(candidate, revision=revision)),
         "closure": final_closure,
-        "index_definition_sha256": await _index_digest(
-            connection, copy_target.schema_name, _serving_plan(copy_target.schema_name)
-        ),
+        "index_definition_sha256": await _candidate_index_digest(connection, candidate),
     }
     _require(len(_encoded(receipt_by_name)) <= MAX_RECEIPT_BYTES)
     if pre_enrolled_only:
@@ -636,19 +814,35 @@ async def _store_candidate_seal(
     )
 
 
+def _validated_seal_options(options):
+    """Keep the two private seal modes closed without changing public authority checks."""
+    _require(set(options) <= {"pre_enrolled_only", "office_authority"})
+    pre_enrolled_only = options.get("pre_enrolled_only", False)
+    _require(type(pre_enrolled_only) is bool)
+    return pre_enrolled_only, options.get("office_authority")
+
+
 async def _seal_ready_candidate(
-    connection, copy_target, candidate, control, control_schema, runtime_roles, actor, *, pre_enrolled_only=False
+    connection,
+    copy_target,
+    candidate,
+    control,
+    control_schema,
+    runtime_roles,
+    actor,
+    **seal_options,
 ):
+
+    pre_enrolled_only, office_authority = _validated_seal_options(seal_options)
     _require(candidate["state"] == "ready")
     report = _json_object(candidate["validation_json"])
     revision = 2 if SOURCE_EVENT_ASSERTION in report else 1
     if revision == 2:
         checkpoint_key, _ = _source_event_assertion(report)
         _require(checkpoint_key not in report)
-    catalog = await _lock_objects(connection, copy_target, candidate, exclusive=True, assume_owner=True)
-    await _operator(connection, actor, control, catalog, runtime_roles)
-    await _address_runtime_closure(connection, candidate, runtime_roles)
-    await _final_proof(connection, copy_target, candidate, control_schema)
+    catalog = await _prove_ready_candidate(
+        connection, copy_target, candidate, control, control_schema, runtime_roles, actor, office_authority
+    )
     # Preserve only pre-existing effective reads; the forbidden census grants no fact access.
     readers = await _existing_readers(connection, catalog, runtime_roles)
     roles = _final_roles(control["rolname"], readers)
@@ -673,9 +867,59 @@ async def _seal_ready_candidate(
     )
 
 
-async def _seal_or_verify_candidate(
-    connection, copy_target, candidate, control, control_schema, runtime_roles, actor, *, pre_enrolled_only
+async def _prove_ready_candidate(
+    connection, copy_target, candidate, control, schema, runtime_roles, actor, office_authority
 ):
+    from process.network_membership_publication import _publication_writer_closure
+    from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
+    from process.registry_source_inventory_reference import source_inventory_heaps
+    from process.registry_source_inventory_store import INVENTORY_TABLE, _load_locked_source_inventory
+    from process.registry_source_recipe_store import decode_registry_source_recipes, verify_registry_source_recipes
+
+    catalog = await _lock_objects(connection, copy_target, candidate, exclusive=True, assume_owner=True)
+    retained = _publication_writer_closure(candidate, _json_object(candidate["validation_json"]))
+    prepared_roles_by_group = {name: retained[name] for name in ("owner_role", "loader_roles", "reader_roles")}
+    _check_identity(_receipt(copy_target, prepared_roles_by_group, catalog), retained, extending=False)
+    await _operator(connection, actor, control, catalog, runtime_roles)
+    await _address_runtime_closure(connection, candidate, runtime_roles)
+    entries = None
+    if source_inventory_heaps(candidate):
+        _inventory, entries = await _load_locked_source_inventory(
+            connection,
+            copy_target,
+            candidate,
+            expected_table_oid=catalog["heaps"][INVENTORY_TABLE],
+            control_schema=schema,
+        )
+    if office_authority is None:
+        recipes = (
+            verify_registry_source_recipes(candidate)
+            if entries is None
+            else (decode_registry_source_recipes("[" + entry.recipe_json + "]")[0] for entry in entries)
+        )
+        _require(not any(type(recipe.source_pin) is PinnedPTGOfficeMembershipSource for recipe in recipes))
+    options_by_name = {}
+    if office_authority is not None:
+        options_by_name["office_authority"] = office_authority
+    if entries is not None:
+        options_by_name["inventory_entries"] = entries
+    await _final_proof(connection, copy_target, candidate, schema, **options_by_name)
+    return catalog
+
+
+async def _seal_or_verify_candidate(
+    connection,
+    copy_target,
+    candidate,
+    control,
+    control_schema,
+    runtime_roles,
+    actor,
+    **seal_options,
+):
+
+    _require("pre_enrolled_only" in seal_options)
+    pre_enrolled_only, office_authority = _validated_seal_options(seal_options)
     async with _control_owner(connection, control["rolname"]):
         existing = await _seal(connection, copy_target, control_schema)
     if existing is not None:
@@ -697,7 +941,56 @@ async def _seal_or_verify_candidate(
         runtime_roles,
         actor,
         pre_enrolled_only=pre_enrolled_only,
+        office_authority=office_authority,
     )
+
+
+def _seal_options(runtime_roles, authorize, pre_enrolled_only):
+    _require(callable(authorize) and type(pre_enrolled_only) is bool)
+    _require(
+        type(runtime_roles) is tuple and 0 < len(runtime_roles) <= 128 and len(set(runtime_roles)) == len(runtime_roles)
+    )
+    for role in runtime_roles:
+        _identifier(role)
+
+
+async def _seal_in_transaction(
+    connection, copy_target, *, control_schema, runtime_roles, authorize, pre_enrolled_only, office_authority=None
+):
+    from process.network_membership_publication import _publication_readiness
+
+    _require(connection.is_in_transaction())
+    _require(await connection.fetchval("SHOW transaction_isolation") in ("repeatable read", "serializable"))
+    task = asyncio.current_task()
+    actor = await _original_actor(connection)
+    control = await _control(connection, control_schema)
+    _require(await authorize(connection, copy_target) is True)
+    _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::oid,'SET')", control["owner_oid"]))
+    if control["schema_owner_oid"] != control["owner_oid"]:
+        candidate = await _candidate(connection, copy_target, control_schema, lock=True)
+    else:
+        async with _control_owner(connection, control["rolname"]):
+            candidate = await _candidate(connection, copy_target, control_schema, lock=True)
+    initial_catalog = await _catalog(connection, copy_target, candidate)
+    await _operator(connection, actor, control, initial_catalog, runtime_roles)
+    loading_owner = _publication_readiness(candidate)[3]["owner_role"]
+    _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", loading_owner))
+    sealed_result = await _seal_or_verify_candidate(
+        connection,
+        copy_target,
+        candidate,
+        control,
+        control_schema,
+        runtime_roles,
+        actor,
+        pre_enrolled_only=pre_enrolled_only,
+        office_authority=office_authority,
+    )
+    _require(await authorize(connection, copy_target) is True)
+    _require(asyncio.current_task() is task and await _original_actor(connection) == actor)
+    await _q_reach_closed(connection, control, runtime_roles)
+    _require(await _control(connection, control_schema) == control)
+    return sealed_result
 
 
 async def seal_network_candidate_custody(
@@ -713,41 +1006,54 @@ async def seal_network_candidate_custody(
     `runtime_roles` is the trusted complete ordinary publisher/loader/reader census.
     `pre_enrolled_only` requires existing ledger reader grants and never enrolls them.
     """
-    from process.network_membership_publication import _publication_readiness
-
-    _require(not connection.is_in_transaction() and callable(authorize) and type(pre_enrolled_only) is bool)
-    _require(
-        type(runtime_roles) is tuple and 0 < len(runtime_roles) <= 128 and len(set(runtime_roles)) == len(runtime_roles)
-    )
-    for role in runtime_roles:
-        _identifier(role)
-    task = asyncio.current_task()
+    _require(not connection.is_in_transaction())
+    _seal_options(runtime_roles, authorize, pre_enrolled_only)
     async with connection.transaction(isolation="repeatable_read"):
-        actor = await _original_actor(connection)
-        control = await _control(connection, control_schema)
-        _require(await authorize(connection, copy_target) is True)
-        _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::oid,'SET')", control["owner_oid"]))
-        if control["schema_owner_oid"] != control["owner_oid"]:
-            candidate = await _candidate(connection, copy_target, control_schema, lock=True)
-        else:
-            async with _control_owner(connection, control["rolname"]):
-                candidate = await _candidate(connection, copy_target, control_schema, lock=True)
-        initial_catalog = await _catalog(connection, copy_target, candidate)
-        await _operator(connection, actor, control, initial_catalog, runtime_roles)
-        loading_owner = _publication_readiness(candidate)[3]["owner_role"]
-        _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", loading_owner))
-        sealed_result = await _seal_or_verify_candidate(
+        return await _seal_in_transaction(
             connection,
             copy_target,
-            candidate,
-            control,
-            control_schema,
-            runtime_roles,
-            actor,
+            control_schema=control_schema,
+            runtime_roles=runtime_roles,
+            authorize=authorize,
             pre_enrolled_only=pre_enrolled_only,
         )
-        _require(await authorize(connection, copy_target) is True)
-        _require(asyncio.current_task() is task and await _original_actor(connection) == actor)
-        await _q_reach_closed(connection, control, runtime_roles)
-        _require(await _control(connection, control_schema) == control)
-        return sealed_result
+
+
+async def seal_network_candidate_custody_in_session(
+    session,
+    copy_target,
+    *,
+    control_schema,
+    runtime_roles,
+    authorize,
+    office_store,
+    office_read_budget,
+    pre_enrolled_only=False,
+):
+    """Seal under the independent custodian's genuine pre-snapshot fenced session.
+
+    The caller owns the company-approval transaction and commits it after this
+    returns. Producer sessions and manufactured office authority are refused.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from process.registry_ptg_office_membership import require_ptg_office_authority
+
+    _seal_options(runtime_roles, authorize, pre_enrolled_only)
+    _require(type(session) is AsyncSession and session.in_transaction())
+    connection = (await (await session.connection()).get_raw_connection()).driver_connection
+    office_authority = await require_ptg_office_authority(
+        connection, control_schema, (session, office_store, office_read_budget)
+    )
+    async with connection.transaction():
+        sealed = await _seal_in_transaction(
+            connection,
+            copy_target,
+            control_schema=control_schema,
+            runtime_roles=runtime_roles,
+            authorize=authorize,
+            pre_enrolled_only=pre_enrolled_only,
+            office_authority=office_authority,
+        )
+        await require_ptg_office_authority(connection, control_schema, office_authority)
+        return sealed

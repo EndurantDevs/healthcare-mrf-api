@@ -32,6 +32,7 @@ from tests import test_registry_cms_source_consumer_postgres as cms
 from tests import test_registry_ptg_office_coordinator_postgres as coordinator
 from tests import test_registry_publication_ptg_runtime_postgres as ptg
 from tests.test_provider_directory_cms_resource_batch_postgres import cms_source_template as cms_source_template
+from tests.test_registry_candidate_composition_postgres import _seal_composition_target
 
 pytestmark = pytest.mark.usefixtures(cms_source_template.__name__)
 
@@ -51,7 +52,25 @@ async def _mixed_fixture(database, monkeypatch, stack, tmp_path, state_by_name, 
     extensions = await fixture.connection.fetch("SELECT extname FROM pg_extension")
     assert {"intarray", "btree_gin", "postgis"} <= {extension["extname"] for extension in extensions}
     publisher = await _enter_fixture(stack, coordinator.office_publisher.__wrapped__(fixture, tmp_path))
-    offices = await _enter_fixture(stack, coordinator.office_db.__wrapped__(fixture, tmp_path, monkeypatch, publisher))
+    publish = coordinator.office_fixtures.prepare_and_publish_network_candidate
+
+    async def publish_sealed(connection, target, address, **options):
+        assert connection is fixture.connection
+        runtime_roles = tuple(
+            sorted({*options["reader_roles"], fixture.executor_role, fixture.writer_roles["owner_role"]})
+        )
+
+        async def seal_candidate(actual):
+            assert actual == target
+            return await _seal_composition_target(fixture, actual, runtime_roles)
+
+        return await publish(connection, target, address, **options, seal_candidate=seal_candidate)
+
+    with monkeypatch.context() as native_patch:
+        native_patch.setattr(coordinator.office_fixtures, "prepare_and_publish_network_candidate", publish_sealed)
+        offices = await _enter_fixture(
+            stack, coordinator.office_db.__wrapped__(fixture, tmp_path, monkeypatch, publisher)
+        )
     native = await _enter_fixture(
         stack, coordinator.coordinator_db.__wrapped__(offices, fixture, tmp_path, monkeypatch, publisher)
     )
@@ -242,7 +261,8 @@ async def _assert_carried_hash(fixture, current, site):
             address_schema,
         )
     )
-    assert receipt["revision"] == 3 and len(receipt["ptg_carry_sha256"]) == 64
+    assert receipt["revision"] == 5 and "source_aliases" not in receipt
+    assert all(len(receipt[name]) == 64 for name in ("ptg_carry_sha256", "fhir_carry_sha256"))
 
 
 async def _flow(database, pair, notice, old, fixture, store, sessions, state_by_name):

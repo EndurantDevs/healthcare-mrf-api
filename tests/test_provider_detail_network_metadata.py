@@ -13,7 +13,8 @@ from uuid import UUID
 import pytest
 from asyncpg.pgproto.pgproto import UUID as DriverUUID
 from sanic import response
-from sanic.exceptions import ServiceUnavailable
+from sanic.compat import Header
+from sanic.exceptions import Forbidden, InvalidUsage, ServiceUnavailable
 from sqlalchemy.exc import DBAPIError
 
 from api import network_address_scope as address_scope
@@ -22,7 +23,9 @@ from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi as provider
 from api.network_address_scope import network_address_read_scope
 from db import connection as db_connection
+from process.network_read_identity import NetworkReadIdentityError
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
+from tests.network_read_execution_support import mock_approved_control_metadata, with_read_identity_receipts
 from tests.test_provider_profile_network_read import address_manifest
 
 _NPI = "1000000491"
@@ -61,7 +64,9 @@ def _fact(**changes):
 def _session(facts, *, bounded=True):
     summary_by_field = {"bounded": bounded, "facts_json": json.dumps(facts)}
     query_result = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: summary_by_field))
-    return SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(return_value=query_result))
+    return with_read_identity_receipts(
+        SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(return_value=query_result))
+    )
 
 
 async def _project(session, detail_by_field, *, selected=None, evidence=False):
@@ -485,11 +490,17 @@ def _direct_reader_snapshot(boundary):
 @pytest.fixture
 def direct_detail(monkeypatch):
     """Keep ordinary and nested Reader lifetimes distinct without database I/O."""
+    mock_approved_control_metadata(monkeypatch)
     manifest = address_manifest()
     session = _session([_fact()])
     ordinary_session = _session([])
     ordinary_session.execute.side_effect = AssertionError("Metadata must use the active Reader session")
-    request = SimpleNamespace(args={"network_ids": "42"}, ctx=SimpleNamespace(sa_session=ordinary_session))
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-detail-control")
+    request = SimpleNamespace(
+        args={"network_ids": "42"},
+        headers=Header({"Authorization": "Bearer synthetic-detail-control"}),
+        ctx=SimpleNamespace(sa_session=ordinary_session),
+    )
     document_by_field = deepcopy(_DIRECT_DETAIL_DOCUMENT)
     boundary = SimpleNamespace(
         request=request,
@@ -511,6 +522,8 @@ def direct_detail(monkeypatch):
 
     async def pin(actual_request, selectors):
         assert actual_request is request and selectors["network_ids"] == "42"
+        assert actual_request.ctx.sa_session is session and boundary.depth == 1
+        ordinary_session.connection.assert_not_awaited()
         return manifest, (42,), boundary.access_scope, None
 
     async def native_read(actual_request, npi):
@@ -534,6 +547,64 @@ def direct_detail(monkeypatch):
     boundary.native_read = AsyncMock(side_effect=native_read)
     monkeypatch.setattr(provider, "read_npi_detail", boundary.native_read)
     return boundary
+
+
+@pytest.mark.parametrize(
+    "arguments,headers,error",
+    [
+        ({}, {"Authorization": "Bearer denied"}, Forbidden),
+        ({"network_ids": "42,42"}, {}, InvalidUsage),
+        ({"plan_network": "42"}, {}, InvalidUsage),
+        ({"network_generation": "0"}, {}, InvalidUsage),
+        ({}, {"X-Network-Access-Scope": "invalid"}, InvalidUsage),
+        ({}, {"X-Network-Legacy-Checksums": "42"}, InvalidUsage),
+    ],
+    ids=("authority", "ids", "mixed", "generation", "access", "legacy"),
+)
+async def test_direct_claim_refusal_precedes_authenticated_reader(direct_detail, arguments, headers, error):
+    boundary = direct_detail
+    request = boundary.request
+    request.args.update(arguments)
+    request.headers.update(headers)
+    prior = request.ctx.sa_session
+    with pytest.raises(error) as caught:
+        await provider.get_npi(request, _NPI)
+    assert caught.value.headers["Cache-Control"] == "private, no-store"
+    assert boundary.snapshot_calls == boundary.reader_opens == boundary.depth == 0
+    assert request.ctx.sa_session is prior and address_scope.current_network_address_scope() is None
+    boundary.native_read.assert_not_awaited()
+    boundary.session.execute.assert_not_awaited()
+    prior.execute.assert_not_awaited()
+    prior.connection.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("synthetic native failure"), asyncio.CancelledError()])
+async def test_direct_native_failure_restores_original_request_session(direct_detail, failure):
+    boundary = direct_detail
+    prior = boundary.request.ctx.sa_session
+    boundary.native_read.side_effect = failure
+    with pytest.raises(type(failure)) as caught:
+        await provider.get_npi(boundary.request, _NPI)
+    assert caught.value is failure
+    assert boundary.request.ctx.sa_session is prior and boundary.depth == 0
+    assert address_scope.current_network_address_scope() is None
+    boundary.session.execute.assert_not_awaited()
+    prior.execute.assert_not_awaited()
+    prior.connection.assert_not_awaited()
+
+
+async def test_direct_canonical_without_metadata_scope_preserves_native_response(direct_detail):
+    boundary = direct_detail
+    boundary.access_scope = None
+    prior = boundary.request.ctx.sa_session
+    reply = await provider.get_npi(boundary.request, _NPI)
+    assert reply.status == 206 and json.loads(reply.body) == boundary.document
+    assert reply.headers["X-Network-Generation"] == str(address_manifest().generation_id)
+    assert boundary.request.ctx.sa_session is prior and boundary.depth == 0
+    assert boundary.snapshot_calls == 2 and boundary.reader_opens == 1
+    boundary.session.execute.assert_not_awaited()
+    prior.execute.assert_not_awaited()
+    prior.connection.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -747,7 +818,7 @@ def _install_geocode_detail_loaders(monkeypatch):
         monkeypatch.setattr(provider, name, AsyncMock(return_value=value))
     monkeypatch.setattr(provider, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 0)
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "false")
-    monkeypatch.setattr(snapshot, "_lock_serving_relations", AsyncMock(return_value={}))
+    monkeypatch.setattr(snapshot, "_inventory_serving_relations", AsyncMock(return_value={}))
     monkeypatch.setattr(snapshot, "_requires_cms_receipt", AsyncMock(return_value=False))
     monkeypatch.setattr(snapshot, "_read_native_authorities", AsyncMock(return_value={}))
 
@@ -809,3 +880,146 @@ async def test_legacy_offices_without_canonical_coverage_keep_facts_without_inve
     assert [office["first_line"] for office in offices] == [
         office["first_line"] for office in document_by_field["address_list"]
     ]
+
+
+def _detail_identity_refusal():
+    error = ServiceUnavailable("Synthetic read changed")
+    error.__cause__ = NetworkReadIdentityError("network_read_identity_invalid")
+    return error
+
+
+@pytest.fixture
+def detail_reconstruction(monkeypatch):
+    """Observe complete, unexposed attempts and their distinct owned Reader lifetimes."""
+    for name in ("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE"):
+        monkeypatch.delenv(name, raising=False)
+    state = SimpleNamespace(
+        active=False, borrowed=False, writer=None, sessions=[], failures=[], result=response.json({"npi": int(_NPI)})
+    )
+    state.request = SimpleNamespace(args={}, app=SimpleNamespace(config={}), ctx=SimpleNamespace(sa_session=None))
+
+    @asynccontextmanager
+    async def reader_session():
+        assert not state.active
+        session = object()
+        state.sessions.append(session)
+        state.active = True
+        try:
+            yield session
+        finally:
+            state.active = False
+
+    database = SimpleNamespace(
+        has_reader_session=lambda: state.active or state.borrowed,
+        _transaction_binding=lambda: state.writer,
+        reader_session=reader_session,
+    )
+
+    async def native_read(request, npi):
+        assert request is state.request and npi == _NPI
+        async with database.reader_session():
+            if state.failures:
+                raise state.failures.pop(0)
+            return state.result
+
+    monkeypatch.setattr(provider, "db", database)
+    state.read = AsyncMock(side_effect=native_read)
+    monkeypatch.setattr(provider, "read_npi_detail", state.read)
+    return state
+
+
+@pytest.mark.parametrize("failures", [1, 2, 3])
+async def test_unselected_detail_reconstructs_only_before_return_with_fresh_owned_reader(
+    detail_reconstruction, failures
+):
+    state = detail_reconstruction
+    state.failures = [_detail_identity_refusal() for _ in range(failures)]
+    if failures < 3:
+        assert await metadata.read_direct_detail_response(state.request, _NPI) is state.result
+    else:
+        final_error = state.failures[-1]
+        with pytest.raises(ServiceUnavailable) as caught:
+            await metadata.read_direct_detail_response(state.request, _NPI)
+        assert caught.value is final_error
+    assert state.read.await_count == len(state.sessions) == min(failures + 1, 3)
+    assert len(set(state.sessions)) == len(state.sessions) and not state.active
+
+
+@pytest.mark.parametrize("cause", [None, ValueError("metadata"), DBAPIError(None, None, ValueError("SQL"))])
+async def test_unselected_detail_does_not_reconstruct_other_failures(detail_reconstruction, cause):
+    state = detail_reconstruction
+    error = ServiceUnavailable("Synthetic refusal")
+    error.__cause__ = cause
+    state.failures = [error]
+    with pytest.raises(ServiceUnavailable) as caught:
+        await metadata.read_direct_detail_response(state.request, _NPI)
+    assert caught.value is error and state.read.await_count == 1 and not state.active
+
+
+async def test_unselected_detail_cancellation_never_reconstructs(detail_reconstruction):
+    state = detail_reconstruction
+    error = asyncio.CancelledError()
+    state.failures = [error]
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await metadata.read_direct_detail_response(state.request, _NPI)
+    assert caught.value is error and state.read.await_count == 1 and not state.active
+
+
+async def test_started_response_cannot_be_reconstructed(detail_reconstruction):
+    state = detail_reconstruction
+
+    async def started_response(_request, _npi):
+        state.request.responded = True
+        raise _detail_identity_refusal()
+
+    state.read.side_effect = started_response
+    with pytest.raises(ServiceUnavailable):
+        await metadata.read_direct_detail_response(state.request, _NPI)
+    assert state.read.await_count == 1
+
+
+@pytest.mark.parametrize(
+    "boundary", ["reader", "writer", "request", "inventory", "force", "sync", "primary_env", "alias_env", "updates"]
+)
+async def test_unselected_detail_does_not_reconstruct_borrowed_or_effectful_reads(
+    detail_reconstruction, monkeypatch, boundary
+):
+    state = detail_reconstruction
+    if boundary == "reader":
+        state.borrowed = True
+    if boundary == "writer":
+        state.writer = object()
+    if boundary == "request":
+        state.request.ctx.sa_session = SimpleNamespace(in_transaction=lambda: True)
+    if boundary == "inventory":
+        monkeypatch.setattr(metadata, "has_network_read_inventory", lambda _session: True)
+    if boundary in {"force", "sync"}:
+        state.request.args[{"force": "force_address_update", "sync": "sync_geocode"}[boundary]] = "yes"
+    if boundary.endswith("_env"):
+        name = "HLTHPRT_NPI_DETAIL_SYNC_GEOCODE" if boundary == "primary_env" else "HLTHPRT_NPI_API_SYNC_GEOCODE"
+        monkeypatch.setenv(name, "true")
+    if boundary == "updates":
+        state.request.app.config["NPI_API_UPDATE_GEOCODE"] = True
+    state.failures = [_detail_identity_refusal()]
+    with pytest.raises(ServiceUnavailable):
+        await metadata.read_direct_detail_response(state.request, _NPI)
+    assert state.read.await_count == 1 and not state.active
+
+
+async def test_explicit_false_sync_flag_keeps_native_default_precedence(detail_reconstruction, monkeypatch):
+    state = detail_reconstruction
+    monkeypatch.setenv("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "true")
+    state.request.args["sync_geocode"] = "false"
+    state.failures = [_detail_identity_refusal()]
+    assert await metadata.read_direct_detail_response(state.request, _NPI) is state.result
+    assert state.read.await_count == 2
+
+
+async def test_selected_detail_identity_refusal_does_not_reconstruct(direct_detail):
+    boundary = direct_detail
+    error = _detail_identity_refusal()
+    boundary.native_read.side_effect = error
+    with pytest.raises(ServiceUnavailable) as caught:
+        await metadata.read_direct_detail_response(boundary.request, _NPI)
+    assert caught.value is error and boundary.native_read.await_count == 1
+    assert boundary.depth == 0 and address_scope.current_network_address_scope() is None

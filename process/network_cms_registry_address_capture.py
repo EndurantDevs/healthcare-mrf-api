@@ -152,14 +152,20 @@ async def freeze_address_clone(session, ownership, owner_role, runtime_roles):
     return await address_clone_identity(session, ownership, owner_role, runtime_roles)
 
 
-async def address_clone_identity(session, ownership, owner_role, runtime_roles, *, verify_content=True):
+async def address_clone_identity(session, ownership, owner_role, runtime_roles, *, verify_content=True, api_read=False):
     """Verify full-model OIDs, indexes, owner and SELECT-only physical custody."""
+    from process.network_fhir_source_epoch import _require_api_metadata_read
+
     connection = await native_driver(session)
-    await connection.execute(
-        "LOCK TABLE "
-        + ",".join(_identifier(ownership.schema_name) + "." + _identifier(name) for name, _ in ownership.relation_oids)
-        + " IN ACCESS SHARE MODE NOWAIT"
-    )
+    await _require_api_metadata_read(connection, api_read, verify_content=verify_content)
+    if not api_read:
+        await connection.execute(
+            "LOCK TABLE "
+            + ",".join(
+                _identifier(ownership.schema_name) + "." + _identifier(name) for name, _ in ownership.relation_oids
+            )
+            + " IN ACCESS SHARE MODE NOWAIT"
+        )
     await verify_entity_address_archive_stage_ownership(session, owner=ownership)
     owner_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", owner_role)
     if (

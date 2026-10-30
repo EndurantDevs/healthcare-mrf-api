@@ -17,12 +17,16 @@ from process.network_custom_address_source import _artifact_dependency_identity,
 from process.network_fhir_membership_source import (
     FHIRMembershipBatch,
     PinnedFHIRMembershipSource,
+    RetainedFHIRSuccessorReads,
+    fhir_physical_source,
     read_fhir_membership_batch,
     read_retained_fhir_membership_batch,
 )
 from process.network_initial_source_office_bindings import _candidate, _copy_bindings, _validate_roles
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, MembershipCopyTarget, _encode
+from process.registry_source_office_errors import SourceOfficeNotReady
+from process.registry_source_office_origin import resolve_source_office_origin, source_office_pin_document
 from process.registry_source_recipe_composition import _require_recipe_custody
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -42,6 +46,7 @@ class PinnedCMSOfficeAddressSource:
     selected_offices_sha256: str
     after_resource: tuple[str, str] | None
     office_count: int
+    origin_manifest_sha256: str | None = None
 
 
 def _digest(document):
@@ -66,7 +71,7 @@ async def _verify_batch(connection, batch, after_resource, control_schema, retai
     if batch.source.retained_capture is None:
         await _require_recipe_custody(connection, recipe)
     elif retained_read is not None:
-        await retained_read.verify(connection, batch.source.retained_capture)
+        await _verify_retained_office_read(connection, batch.source, retained_read)
     options_by_name = {
         "after_resource": after_resource,
         "limit": max(1, batch.source_rows),
@@ -84,6 +89,29 @@ async def _verify_batch(connection, batch, after_resource, control_schema, retai
     _, count = await drain_operation(asyncio.to_thread(_encode, batch.input_bytes), preserve_cancellation=True)
     if count != batch.membership_rows:
         raise InitialCMSOfficeBindingError("initial_cms_office_accounting_invalid")
+
+
+async def _verify_retained_office_read(connection, source_pin, retained_read):
+    """Verify both admission anchors before reading a successor's actual Location payloads."""
+    from process.network_fhir_retained_capture import RetainedFHIRRead
+
+    if type(source_pin) is not PinnedFHIRMembershipSource or source_pin.retained_capture is None:
+        raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
+    physical = fhir_physical_source(source_pin)
+    if physical is source_pin:
+        if type(retained_read) is not RetainedFHIRRead:
+            raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
+        await retained_read.verify(connection, source_pin.retained_capture)
+        return
+    if (
+        type(retained_read) is not RetainedFHIRSuccessorReads
+        or type(retained_read.original) is not RetainedFHIRRead
+        or type(retained_read.physical) is not RetainedFHIRRead
+        or physical.retained_capture is None
+    ):
+        raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
+    await retained_read.original.verify(connection, source_pin.retained_capture)
+    await retained_read.physical.verify(connection, physical.retained_capture)
 
 
 _SOURCE_SQL = """WITH pairs AS MATERIALIZED (
@@ -122,22 +150,23 @@ _MATCH_BODY = """matched AS MATERIALIZED (
  SELECT {page_column}office||jsonb_build_object('canonical',canonical,'location_key',location_key,
  'address',jsonb_build_array(address->'first_line',address->'second_line',address->'city_name',
  address->'state_name',address->'postal_code',address->'country_code'),
- 'address_row_sha256',encode(sha256(convert_to(address::text,'UTF8')),'hex')) AS office,
- matches<>1 OR canonical->>'identity_key' NOT LIKE '%|street'
- OR location_key !~ '^[0-9a-f]{{64}}$' OR canonical IS NULL AS invalid FROM matched
+ 'address_row_sha256',encode(sha256(convert_to(address::text,'UTF8')),'hex')) AS office,matches,
+ matches>1 OR canonical IS NULL OR jsonb_typeof(canonical) IS DISTINCT FROM 'object'
+ OR canonical->>'identity_key' IS NULL OR canonical->>'identity_key' NOT LIKE '%|street'
+ OR canonical->>'address_key' IS NULL
+ OR (matches=1 AND (location_key IS NULL OR location_key !~ '^[0-9a-f]{{64}}$')) AS invalid FROM matched
 )"""
 
 _MATCH_SQL = (
     """WITH offices AS MATERIALIZED (
  SELECT office,ordinal,($2::jsonb)->(ordinal::integer-1) AS canonical
  FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY item(office,ordinal)
-),
-"""
+), """
     + _MATCH_BODY.replace("{page_column}", "")
     + """
-SELECT coalesce(bool_or(invalid),false) AS invalid,
+SELECT coalesce(bool_or(invalid),false) AS invalid,count(*) FILTER(WHERE matches=0) AS missing_count,
  CASE WHEN count(*)<=5000 AND coalesce(sum(octet_length(office::text)),0)+2*count(*)+2<=8388608
- THEN coalesce(jsonb_agg(office ORDER BY office::text),'[]'::jsonb)::text END AS offices_json FROM encoded"""
+ THEN coalesce(jsonb_agg(office ORDER BY office::text) FILTER(WHERE matches=1),'[]'::jsonb)::text END AS offices_json FROM encoded"""
 )
 
 
@@ -153,7 +182,11 @@ _CHECK_SQL = """WITH offices AS MATERIALIZED (
 SELECT NOT EXISTS(SELECT 1 FROM checked WHERE valid IS DISTINCT FROM true)
  AND jsonb_array_length($2::jsonb)=(SELECT count(*) FROM offices)
  AND (SELECT count(*) FROM bindings)=(SELECT count(DISTINCT (provider_system,provider_id,location_id)) FROM bindings)
- AND (SELECT count(*) FROM bindings)=(SELECT count(DISTINCT location_key) FROM bindings) AS valid,
+ AND NOT EXISTS(SELECT FROM checked GROUP BY office->>'location_key'
+   HAVING count(DISTINCT office->'canonical')>1 OR count(DISTINCT office->'address')>1
+     OR count(DISTINCT office->>'address_row_sha256')>1)
+ AND NOT EXISTS(SELECT FROM bindings GROUP BY location_key
+   HAVING count(DISTINCT (provider_system,provider_id,entity_type,entity_id))>1) AS valid,
  coalesce(jsonb_agg(to_jsonb(bindings) ORDER BY provider_id,location_id),'[]'::jsonb)::text AS bindings_json
  FROM bindings"""
 
@@ -174,7 +207,7 @@ async def _source_offices(connection, batch):
         _SOURCE_SQL.format(source=_identifier(batch.source.read_schema_name)),
         batch.input_bytes.decode(),
         batch.source.source_id,
-        batch.source.dataset_id,
+        fhir_physical_source(batch.source).dataset_id,
     )
     if (
         source_summary["invalid"]
@@ -255,7 +288,7 @@ async def _match_complete_inputs(connection, input_name, result_name, address_so
         + _identifier(input_name)
         + ") , "
         + _MATCH_BODY.replace("{page_column}", "page_key,")
-        + " SELECT page_key,office,invalid FROM encoded"
+        + " SELECT page_key,office,invalid,matches FROM encoded"
     )
     await connection.execute(
         f"CREATE TEMP TABLE {_identifier(result_name)} ON COMMIT DROP AS "
@@ -265,6 +298,8 @@ async def _match_complete_inputs(connection, input_name, result_name, address_so
         f"SELECT EXISTS(SELECT 1 FROM pg_temp.{_identifier(result_name)} WHERE invalid IS DISTINCT FROM false)"
     ):
         raise InitialCMSOfficeBindingError("initial_cms_office_correspondence_unresolved")
+    if await connection.fetchval(f"SELECT EXISTS(SELECT 1 FROM pg_temp.{_identifier(result_name)} WHERE matches=0)"):
+        raise SourceOfficeNotReady("registry_source_office_not_ready")
     await connection.execute(f"CREATE INDEX ON {_identifier(result_name)}(page_key)")
 
 
@@ -311,7 +346,16 @@ async def prepare_cms_office_matches(connection, address_source, runtime_roles, 
         await drain_operation(savepoint.commit(), preserve_cancellation=True)
 
 
-async def _office_records(connection, batch, address_source, office_matches=None, after_resource=None):
+async def _office_records(
+    connection,
+    batch,
+    address_source,
+    office_matches=None,
+    after_resource=None,
+    *,
+    address_relation=None,
+    address_arguments=(),
+):
     if office_matches is not None:
         if (
             type(office_matches) is not _OfficeMatches
@@ -328,13 +372,18 @@ async def _office_records(connection, batch, address_source, office_matches=None
             raise InitialCMSOfficeBindingError("initial_cms_office_match_scope_differs")
         matched_by_field = {"invalid": False, "offices_json": matched_json}
     else:
-        source_json, canonical = await _source_offices(connection, batch)
-        matched_by_field = await connection.fetchrow(
-            _MATCH_SQL.format(
-                address=f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}"
-            ),
-            source_json,
-            canonical,
+        source_summary = await connection.fetchrow(
+            _SOURCE_SQL.format(source=_identifier(batch.source.read_schema_name)),
+            batch.input_bytes.decode(),
+            batch.source.source_id,
+            fhir_physical_source(batch.source).dataset_id,
+        )
+        return await _match_source_office_records(
+            connection,
+            source_summary,
+            address_source,
+            address_relation=address_relation,
+            address_arguments=address_arguments,
         )
     if matched_by_field["invalid"] or matched_by_field["offices_json"] is None:
         raise InitialCMSOfficeBindingError("initial_cms_office_correspondence_unresolved")
@@ -364,33 +413,53 @@ async def _capture_offices(
     runtime_roles,
     after_resource,
     control_schema,
+    origin_manifest_sha256=None,
+    *,
     retained_read=None,
 ):
-    office_matches = _ACTIVE_OFFICE_MATCHES.get()
     if type(address_source) is not PinnedAddressSource or address_source.table_name != "entity_address_unified":
         raise InitialCMSOfficeBindingError("initial_cms_office_address_pin_invalid")
     _validate_roles(runtime_roles)
     await _require_transaction(connection)
-    await _verify_batch(connection, batch, after_resource, control_schema, retained_read)
-    identity = await _artifact_dependency_identity(
-        connection, address_source, runtime_roles, address=True, control_schema=_control_namespace(control_schema)[1:-1]
+    if batch.source.retained_capture is None:
+        await _verify_batch(connection, batch, after_resource, control_schema)
+    else:
+        await _verify_batch(connection, batch, after_resource, control_schema, retained_read=retained_read)
+    origin = await resolve_source_office_origin(
+        connection,
+        address_source,
+        runtime_roles=runtime_roles,
+        control_schema=_control_namespace(control_schema)[1:-1],
+        origin_manifest_sha256=origin_manifest_sha256,
+        first_parameter=3,
     )
+    office_matches = _ACTIVE_OFFICE_MATCHES.get()
     if office_matches is not None and (
         type(office_matches) is not _OfficeMatches
         or office_matches.task is not asyncio.current_task()
-        or identity != office_matches.address_identity
+        or origin_manifest_sha256 is not None
+        or origin.address_identity != office_matches.address_identity
     ):
         raise InitialCMSOfficeBindingError("initial_cms_office_match_scope_differs")
-    offices, bindings = await _office_records(connection, batch, address_source, office_matches, after_resource)
+    offices, bindings = await _office_records(
+        connection,
+        batch,
+        address_source,
+        office_matches,
+        after_resource,
+        address_relation=origin.relation_sql,
+        address_arguments=origin.arguments,
+    )
     pin = PinnedCMSOfficeAddressSource(
         address_source,
-        identity,
+        origin.address_identity,
         batch.source.generation_id,
         batch.generation_id,
         batch.input_sha256,
         _digest(offices),
         after_resource,
         len(bindings),
+        origin_manifest_sha256,
     )
     return pin, bindings
 
@@ -403,6 +472,7 @@ async def pin_cms_office_address_source(
     runtime_roles,
     after_resource=None,
     control_schema=None,
+    origin_manifest_sha256=None,
     retained_read=None,
 ):
     """Pin full immutable source and selected office correspondence before candidate creation.
@@ -412,7 +482,14 @@ async def pin_cms_office_address_source(
     address UUIDs remain distinct identities.
     """
     pin, _ = await _capture_offices(
-        connection, batch, address_source, runtime_roles, after_resource, control_schema, retained_read
+        connection,
+        batch,
+        address_source,
+        runtime_roles,
+        after_resource,
+        control_schema,
+        origin_manifest_sha256,
+        retained_read=retained_read,
     )
     return pin
 
@@ -443,7 +520,14 @@ async def copy_initial_cms_office_bindings(
         raise InitialCMSOfficeBindingError("initial_cms_office_input_invalid")
     await _require_transaction(connection)
     async with connection.transaction():
-        await _candidate(connection, copy_target, batch, address_pin.address_source, _control_namespace(control_schema))
+        await _candidate(
+            connection,
+            copy_target,
+            batch,
+            address_pin.address_source,
+            _control_namespace(control_schema),
+            origin_manifest_sha256=address_pin.origin_manifest_sha256,
+        )
         actual, bindings = await _capture_offices(
             connection,
             batch,
@@ -451,24 +535,24 @@ async def copy_initial_cms_office_bindings(
             runtime_roles,
             after_resource,
             control_schema,
-            retained_read,
+            address_pin.origin_manifest_sha256,
+            retained_read=retained_read,
         )
         if actual != address_pin:
             raise InitialCMSOfficeBindingError("initial_cms_office_pin_differs")
-        await _copy_bindings(connection, copy_target, bindings)
-        if await connection.fetchval(
-            f"""SELECT EXISTS(SELECT 1 FROM {_identifier(copy_target.schema_name)}.provider_location_binding
-              WHERE location_key=ANY($1::varchar[]) GROUP BY location_key HAVING count(*)>1)""",
-            [binding[3] for binding in bindings],
-        ):
-            raise InitialCMSOfficeBindingError("initial_cms_office_binding_ambiguous")
+        await _copy_source_office_records(connection, copy_target, bindings)
         return {
             "component": "initial_retained_fhir_office_correspondence"
             if batch.source.retained_capture is not None
             else "initial_cms_office_correspondence",
-            "revision": 1,
+            "revision": 2 if actual.origin_manifest_sha256 is not None else 1,
             "office_count": len(bindings),
-            "correspondence_sha256": _digest(asdict(actual)),
+            "correspondence_sha256": _digest(source_office_pin_document(actual)),
+            **(
+                {"origin_manifest_sha256": actual.origin_manifest_sha256}
+                if actual.origin_manifest_sha256 is not None
+                else {}
+            ),
         }
 
 
@@ -491,8 +575,6 @@ SELECT CASE WHEN count(*)<=5000 AND coalesce(sum(octet_length(office::text)),0)+
 
 def _verified_membership_input(batch):
     """Validate each distinct NPI before invoking the unchanged strict native codec."""
-    from process.provider_directory_projection_fhir_values import is_valid_npi
-
     if (
         type(batch) is not FHIRMembershipBatch
         or batch.source.retained_capture is None
@@ -501,8 +583,22 @@ def _verified_membership_input(batch):
         or hashlib.sha256(batch.input_bytes).hexdigest() != batch.input_sha256
     ):
         raise InitialCMSOfficeBindingError("initial_retained_mapping_input_invalid")
-    members = json.loads(batch.input_bytes)
-    if type(members) is not list or len(members) != batch.membership_rows:
+    return _verified_member_input(batch.input_bytes, batch.membership_rows)
+
+
+def _verified_member_input(input_bytes, membership_rows):
+    """Apply the same NPI policy to authenticated batch or native mapped rows."""
+    from process.provider_directory_projection_fhir_values import is_valid_npi
+
+    if (
+        type(input_bytes) is not bytes
+        or len(input_bytes) > MAX_INPUT_BYTES
+        or type(membership_rows) is not int
+        or not 0 <= membership_rows <= MAX_ROWS
+    ):
+        raise InitialCMSOfficeBindingError("initial_retained_mapping_input_invalid")
+    members = json.loads(input_bytes)
+    if type(members) is not list or len(members) != membership_rows:
         raise InitialCMSOfficeBindingError("initial_retained_mapping_accounting_invalid")
     distinct_npis = {member["provider_id"] for member in members if member["provider_system"] == "npi"}
     validity_by_npi = {npi: is_valid_npi(npi) for npi in distinct_npis}
@@ -528,35 +624,53 @@ def _safe_source_address(office):
 
 async def _stage_verified_retained_page(connection, batch, cursor, input_name, source_table, proofs_by_page):
     members, selected_bytes = _verified_membership_input(batch)
+    await _stage_verified_member_page(
+        connection,
+        batch.source,
+        members,
+        selected_bytes,
+        _page_key(batch, cursor),
+        input_name,
+        source_table,
+        proofs_by_page,
+    )
+
+
+async def _stage_verified_member_page(
+    connection, source_pin, members, selected_bytes, key, input_name, source_table, proofs_by_page
+):
+    """Stage native mapped members; the caller must first verify their Source read."""
     _, count = await drain_operation(asyncio.to_thread(_encode, selected_bytes), preserve_cancellation=True)
     if count != len(members):
         raise InitialCMSOfficeBindingError("initial_retained_mapping_accounting_invalid")
-    key = _page_key(batch, cursor)
     if key in proofs_by_page or len(proofs_by_page) >= MAX_INPUT_BYTES // 512:
         raise InitialCMSOfficeBindingError("initial_cms_office_page_accounting_invalid")
-    copied = await connection.copy_records_to_table(
-        source_table,
-        schema_name="pg_temp",
-        columns=("network_id", "provider_system", "provider_id", "location_id", "evidence_id", "page_key"),
-        records=[
-            (
-                member["network_id"],
-                member["provider_system"],
-                member["provider_id"],
-                UUID(member["location_id"]),
-                member["evidence_id"],
-                key,
-            )
-            for member in members
-        ],
+    copied = await drain_operation(
+        connection.copy_records_to_table(
+            source_table,
+            schema_name="pg_temp",
+            columns=("network_id", "provider_system", "provider_id", "location_id", "evidence_id", "page_key"),
+            records=[
+                (
+                    member["network_id"],
+                    member["provider_system"],
+                    member["provider_id"],
+                    UUID(member["location_id"]),
+                    member["evidence_id"],
+                    key,
+                )
+                for member in members
+            ],
+        ),
+        preserve_cancellation=True,
     )
     if copied != f"COPY {len(members)}":
         raise InitialCMSOfficeBindingError("initial_retained_mapping_accounting_invalid")
     summary = await connection.fetchrow(
-        _VERIFIED_SOURCE_SQL.format(source=_identifier(batch.source.read_schema_name)),
+        _VERIFIED_SOURCE_SQL.format(source=_identifier(source_pin.read_schema_name)),
         selected_bytes.decode(),
-        batch.source.source_id,
-        batch.source.dataset_id,
+        source_pin.source_id,
+        fhir_physical_source(source_pin).dataset_id,
     )
     if summary["offices_json"] is None:
         raise InitialCMSOfficeBindingError("initial_cms_office_canonical_bound_exceeded")
@@ -569,11 +683,14 @@ async def _stage_verified_retained_page(connection, batch, cursor, input_name, s
         for ordinal, office in enumerate(offices, 1)
     ]
     if (
-        await connection.copy_records_to_table(
-            input_name,
-            schema_name="pg_temp",
-            columns=("page_key", "ordinal", "office", "canonical"),
-            records=office_inputs,
+        await drain_operation(
+            connection.copy_records_to_table(
+                input_name,
+                schema_name="pg_temp",
+                columns=("page_key", "ordinal", "office", "canonical"),
+                records=office_inputs,
+            ),
+            preserve_cancellation=True,
         )
         != f"COPY {len(office_inputs)}"
     ):
@@ -613,8 +730,12 @@ async def _verified_office_match_keys(connection, input_name, address_relation):
     return winners_name
 
 
-async def _finish_verified_office_matches(connection, input_name, result_name, address_source, proofs_by_page):
+async def _finish_verified_office_matches(
+    connection, input_name, result_name, address_source, proofs_by_page, *, source_aliases=False
+):
     """Join the complete staged input once, then retain exact unambiguous addresses."""
+    if type(source_aliases) is not bool:
+        raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
     address_relation = f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}"
     winners_name = await _verified_office_match_keys(connection, input_name, address_relation)
     # Keep late hydration on the primary key instead of hashing or spooling full base rows.
@@ -655,9 +776,17 @@ async def _finish_verified_office_matches(connection, input_name, result_name, a
             key,
             json.dumps(verified_offices),
         )
+    await _prune_verified_offices(connection, result_name, source_aliases)
+
+
+async def _prune_verified_offices(connection, result_name, source_aliases):
+    """Keep same-provider source aliases only under the explicit v2 matching policy."""
+    identity_sql = "office->>'provider_system',office->>'provider_id'"
+    if not source_aliases:
+        identity_sql += ",office->>'location_id'"
     await connection.execute(f"""WITH ambiguous_locations AS MATERIALIZED (
       SELECT office->>'location_key' AS location_key FROM pg_temp.{_identifier(result_name)}
-      GROUP BY 1 HAVING count(DISTINCT jsonb_build_array(office->>'provider_system',office->>'provider_id',office->>'location_id'))>1
+      GROUP BY 1 HAVING count(DISTINCT jsonb_build_array({identity_sql}))>1
     ), ambiguous_sources AS MATERIALIZED (
       SELECT office->>'provider_system' AS provider_system,office->>'provider_id' AS provider_id,
         office->>'location_id' AS location_id FROM pg_temp.{_identifier(result_name)}
@@ -683,7 +812,7 @@ async def prepare_verified_retained_office_mapping(
     )
     proofs_by_page = {}
     async for batch, cursor, retained_read in pages:
-        await retained_read.verify(connection, batch.source.retained_capture)
+        await _verify_retained_office_read(connection, batch.source, retained_read)
         await _stage_verified_retained_page(connection, batch, cursor, input_name, source_table, proofs_by_page)
     await _finish_verified_office_matches(connection, input_name, result_name, address_source, proofs_by_page)
     await connection.execute(f"""DELETE FROM pg_temp.{_identifier(source_table)} member WHERE NOT EXISTS(
@@ -766,4 +895,60 @@ async def copy_verified_retained_offices(connection, matches, copy_target):
         await _copy_bindings(connection, copy_target, bindings)
     if await connection.fetchval(f"""SELECT EXISTS(SELECT 1 FROM {_identifier(copy_target.schema_name)}.provider_location_binding
       GROUP BY location_key HAVING count(*)>1)"""):
+        raise InitialCMSOfficeBindingError("initial_cms_office_binding_ambiguous")
+
+
+async def _match_source_office_records(
+    connection, source_summary, address_source, *, address_relation=None, address_arguments=()
+):
+    """Share canonical matching after each distinct caller establishes source authority."""
+    if (
+        source_summary["invalid"]
+        or source_summary["pair_count"] != source_summary["source_count"]
+        or source_summary["offices_json"] is None
+    ):
+        raise InitialCMSOfficeBindingError("initial_cms_office_source_unresolved")
+    source_offices = json.loads(source_summary["offices_json"])
+    canonical = await _canonicalize([tuple(office["source_address"]) for office in source_offices])
+    matched = await connection.fetchrow(
+        _MATCH_SQL.format(
+            address=address_relation
+            or f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}"
+        ),
+        source_summary["offices_json"],
+        canonical,
+        *address_arguments,
+    )
+    if matched["invalid"] or matched["offices_json"] is None:
+        raise InitialCMSOfficeBindingError("initial_cms_office_correspondence_unresolved")
+    offices = json.loads(matched["offices_json"])
+    retained = await _canonicalize([tuple(office["address"]) for office in offices])
+    checked = await connection.fetchrow(_CHECK_SQL, matched["offices_json"], retained)
+    if checked["valid"] is not True:
+        raise InitialCMSOfficeBindingError("initial_cms_office_full_identity_differs")
+    if matched["missing_count"]:
+        raise SourceOfficeNotReady("registry_source_office_not_ready")
+    bindings = [
+        (
+            binding["provider_system"],
+            binding["provider_id"],
+            UUID(binding["location_id"]),
+            binding["location_key"],
+            binding["entity_type"],
+            binding["entity_id"],
+        )
+        for binding in json.loads(checked["bindings_json"])
+    ]
+    return offices, bindings
+
+
+async def _copy_source_office_records(connection, copy_target, bindings):
+    """Keep every authenticated alias while checking physical ownership across pages."""
+    await _copy_bindings(connection, copy_target, bindings)
+    if await connection.fetchval(
+        f"""SELECT EXISTS(SELECT 1 FROM {_identifier(copy_target.schema_name)}.provider_location_binding
+          WHERE location_key=ANY($1::varchar[]) GROUP BY location_key
+          HAVING count(DISTINCT (provider_system,provider_id,entity_type,entity_id))>1)""",
+        [binding[3] for binding in bindings],
+    ):
         raise InitialCMSOfficeBindingError("initial_cms_office_binding_ambiguous")

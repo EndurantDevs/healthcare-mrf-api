@@ -4,6 +4,7 @@
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from uuid import UUID
 
 import asyncpg
@@ -64,7 +65,8 @@ from process.registry_source_observation_store import _namespace
 from process.registry_source_selection_receipt import verify_registry_source_selection_receipt
 
 
-async def _request(connection, request_id, lease_id, namespace, *, lock=False):
+async def publication_request(connection, request_id, lease_id, namespace, *, lock=False):
+    """Read an active, unexpired publication lease and optionally lock its exact request."""
     if not isinstance(request_id, UUID) or not request_id.int or not isinstance(lease_id, UUID) or not lease_id.int:
         raise ValueError("registry_queue_lease_invalid")
     request_record = await connection.fetchrow(
@@ -77,6 +79,9 @@ async def _request(connection, request_id, lease_id, namespace, *, lock=False):
     if request_record is None:
         raise RegistryApprovalConflict("registry_queue_lease_conflict")
     return dict(request_record)
+
+
+_request = publication_request
 
 
 def _command_actor(request_record):
@@ -145,7 +150,7 @@ def _require_outside_transaction(connection):
 
 
 @asynccontextmanager
-async def _locked_request_transaction(connection, request_id, lease_id, namespace):
+async def locked_publication_request_transaction(connection, request_id, lease_id, namespace):
     """Refresh a snapshot raced by renewal before any publication work starts."""
     _require_outside_transaction(connection)
     for attempt in range(3):
@@ -159,6 +164,9 @@ async def _locked_request_transaction(connection, request_id, lease_id, namespac
         except asyncpg.SerializationError:
             if has_request_lock or attempt == 2 or connection.is_in_transaction():
                 raise
+
+
+_locked_request_transaction = locked_publication_request_transaction
 
 
 async def _fresh_operation_authority(authorize, request_record, operation):
@@ -303,20 +311,27 @@ async def _verified_source_rollback_candidate(connection, copy_target, command, 
     ):
         raise RegistryApprovalConflict("registry_source_rollback_candidate_conflict")
     from process.network_candidate_custody import verify_network_candidate_custody
+    from process.network_compact_readiness import compact_index_digest, is_compact_candidate
+    from process.registry_source_inventory_reference import source_inventory_heaps
 
+    is_compact = is_compact_candidate(candidate_by_name)
     custody = await verify_network_candidate_custody(
-        connection, copy_target, control_schema=control_schema, required=False
+        connection,
+        copy_target,
+        control_schema=control_schema,
+        required=is_compact or bool(source_inventory_heaps(candidate_by_name)),
     )
     if custody is None:
         await verify_network_candidate_writer_closure(
             connection, copy_target, **writer_roles, control_schema=control_schema
         )
     readiness = _publication_readiness(candidate_by_name)
-    await _catalog_readiness(connection, copy_target.schema_name)
-    if (
-        await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
-        != readiness[2]["index_definition_sha256"]
-    ):
+    if is_compact:
+        index_digest = await compact_index_digest(connection, copy_target.schema_name, candidate=candidate_by_name)
+    else:
+        await _catalog_readiness(connection, copy_target.schema_name)
+        index_digest = await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
+    if index_digest != readiness[2]["index_definition_sha256"]:
         raise ValueError("registry_source_rollback_candidate_changed")
     readiness_receipt_by_name = {
         "scope": readiness[0],
@@ -336,7 +351,11 @@ async def _source_rollback_preview_result(
     )
     difference = await _source_rollback_difference(connection, candidate_by_name, current_pin)
     selection = verify_registry_source_selection_receipt(candidate_by_name)
-    if selection is None and (difference["has_imported"] or _document(candidate_by_name["source_recipes_json"])):
+    from process.registry_source_inventory_reference import verify_source_recipe_metadata
+
+    if selection is None and (
+        difference["has_imported"] or verify_source_recipe_metadata(candidate_by_name).recipe_count
+    ):
         raise ValueError("registry_source_rollback_selection_unproven")
     report = _document(candidate_by_name["validation_json"])
     result_by_name = {
@@ -431,6 +450,12 @@ async def _source_rollback_address_sources(connection, source_pin, control_schem
         )
         _publication_readiness(dict(candidate))
         address_pin = PinnedAddressSource(**_document(candidate["validation_json"])["address_source"])
+        if source_pin.compact_layout is not None:
+            from process.network_compact_custom_preparation import compact_custom_receipt
+
+            custom = compact_custom_receipt(candidate)
+            npi_source = None if custom is None else custom.npi_source
+            return RegistryCompositionAddressSources(address_pin, npi_source, compact=True)
         document = await connection.fetchval(
             "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
             address_pin.schema_name,
@@ -447,6 +472,42 @@ async def _source_rollback_address_sources(connection, source_pin, control_schem
         else:
             await verify_retained_custom_address_source(connection, receipt)
         return RegistryCompositionAddressSources(address_sources.base_source, receipt.npi_source)
+
+
+async def source_worker_address_sources(connection, source_pin, control_schema):
+    """Preserve legacy worker inputs and recover a compact head's authenticated base."""
+    if getattr(source_pin, "compact_layout", None) is not None:
+        return await _source_rollback_address_sources(connection, source_pin, control_schema)
+    return RegistryCompositionAddressSources(
+        PinnedAddressSource(source_pin.schema_name, "entity_address_unified", source_pin.manifest_sha256)
+    )
+
+
+async def prepare_registry_publication_candidate(
+    connection, copy_target, address_source, *, writer_roles, control_schema, composition_runtime=None
+):
+    """Use the genuine source session when compact carriers need native office proof."""
+    if composition_runtime is not None:
+        if type(composition_runtime) is not RegistryPublicationPTGRuntime:
+            raise ValueError("registry_publication_ptg_runtime_invalid")
+        return await composition_runtime.prepare(
+            connection, copy_target, address_source, writer_roles=writer_roles, control_schema=control_schema
+        )
+    return await prepare_network_candidate(
+        connection, copy_target, address_source, **writer_roles, control_schema=control_schema
+    )
+
+
+async def prepare_registry_candidate_for_context(connection, copy_target, address_source, writer_context):
+    """Prepare from the caller's fixed writer roles and native source runtime."""
+    return await prepare_registry_publication_candidate(
+        connection,
+        copy_target,
+        address_source,
+        writer_roles=writer_context.writer_roles,
+        control_schema=writer_context.control_schema,
+        composition_runtime=writer_context.composition_runtime,
+    )
 
 
 async def complete_queued_registry_source_rollback_preview(
@@ -539,7 +600,14 @@ async def _prepare_rollback_candidate(
         writer_roles=writer_roles,
         control_schema=control_schema,
     )
-    await prepare_network_candidate(connection, copy_target, addresses, **writer_roles, control_schema=control_schema)
+    await prepare_registry_publication_candidate(
+        connection,
+        copy_target,
+        addresses,
+        writer_roles=writer_roles,
+        control_schema=control_schema,
+        composition_runtime=composition_runtime,
+    )
     return copy_target, source_pin, current_pin
 
 
@@ -653,7 +721,12 @@ async def complete_queued_registry_source_rollback_publication(
             connection, command_by_name, writer_roles, control_schema, lock=True
         )
         await _fresh_retained_operation_authority(authorize, locked, "publish_source_rollback")
-        manifest = await publish_network_candidate(connection, copy_target, control_schema=control_schema)
+        manifest = await publish_network_candidate(
+            connection,
+            copy_target,
+            control_schema=control_schema,
+            source_rollback_authority=RegistrySourceRollbackPublicationAuthority(request_id, lease_id, authorize),
+        )
         result_by_name = {
             "operation": "publish_source_rollback",
             "preview_request_id": command_by_name["preview_request_id"],
@@ -669,6 +742,42 @@ async def complete_queued_registry_source_rollback_publication(
             connection, request_id, lease_id, state="completed", result=result_by_name, control_schema=control_schema
         )
         return result_by_name
+
+
+@dataclass(frozen=True)
+class RegistrySourceRollbackPublicationAuthority:
+    """Locate an existing audited operation; construction grants no authority."""
+
+    request_id: UUID
+    lease_id: UUID
+    authorize: object
+
+
+async def require_registry_source_rollback_publication_authority(
+    connection, authority, copy_target, candidate, *, control_schema
+):
+    """Recheck the exact lease, fresh administrator policy and immutable reviewed target."""
+    if type(authority) is not RegistrySourceRollbackPublicationAuthority:
+        raise ValueError("registry_source_rollback_authority_required")
+    request = await publication_request(
+        connection, authority.request_id, authority.lease_id, _namespace(control_schema), lock=True
+    )
+    command = await _fresh_retained_operation_authority(authority.authorize, request, "publish_source_rollback")
+    closure = _publication_readiness(candidate)[3]
+    roles_by_kind = {
+        "owner_role": closure["owner_role"],
+        "loader_roles": tuple(closure["loader_roles"]),
+        "reader_roles": tuple(closure["reader_roles"]),
+    }
+    reviewed = await _verify_source_rollback_publication_target(
+        connection, command, roles_by_kind, control_schema, lock=True
+    )
+    if reviewed != copy_target:
+        raise ValueError("registry_source_rollback_candidate_changed")
+    _, preview = await _source_rollback_publication_target(connection, command, _namespace(control_schema), lock=True)
+    return await _source_rollback_manifest(
+        connection, generation_id=preview.target_generation, control_schema=control_schema
+    )
 
 
 async def complete_queued_registry_reactivation(connection, request_id, lease_id, *, authorize, control_schema=None):
@@ -876,13 +985,7 @@ async def complete_queued_registry_initial_inventory(
         writer_roles=writer_context.writer_roles,
         control_schema=control_schema,
     )
-    await prepare_network_candidate(
-        connection,
-        copy_target,
-        address_source,
-        **writer_context.writer_roles,
-        control_schema=control_schema,
-    )
+    await prepare_registry_candidate_for_context(connection, copy_target, address_source, writer_context)
     await _fresh_operation_authority(authorize, request_record, "publish_initial_inventory")
     await _initial_candidate_custody_enrollment(connection, copy_target, writer_context)
     await writer_context.seal_candidate(copy_target, pre_enrolled_only=True)
@@ -1036,14 +1139,11 @@ async def complete_queued_registry_publication(
 
     if type(writer_context) is not RegistryPublicationConsumerConfig:
         raise ValueError("registry_publication_consumer_config_invalid")
-    writer_roles = writer_context.writer_roles
     control_schema = writer_context.control_schema
     _require_outside_transaction(connection)
     namespace = _namespace(control_schema)
     await _request(connection, request_id, lease_id, namespace)
-    await prepare_network_candidate(
-        connection, copy_target, address_source, **writer_roles, control_schema=control_schema
-    )
+    await prepare_registry_candidate_for_context(connection, copy_target, address_source, writer_context)
     request_record = await _request(connection, request_id, lease_id, namespace)
     await _fresh_authority(authorize, request_record)
     if seal_candidate is not None:

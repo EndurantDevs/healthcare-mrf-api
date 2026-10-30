@@ -8,9 +8,13 @@ from uuid import uuid4, uuid5
 
 import asyncpg
 import pytest
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from api.network_read_execution import _installed_read_inventory, execute_network_read
 from process.network_approved_membership_source import pin_approved_membership_source
-from process.network_em_provider_inputs import resolve_em_provider_inputs
+from process.network_em_provider_inputs import resolve_em_provider_inputs, resolve_em_provider_inputs_in_session
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
@@ -70,12 +74,37 @@ async def _publish_fixture(fixture, schema, copy_targets, created_schema_oids_by
     return inputs, candidate
 
 
+def _write_resolver_evidence(manifest):
+    """Write only the established native resolver scope when explicitly requested."""
+    if evidence := os.getenv("MANAGED_EM_NATIVE_EVIDENCE"):
+        Path(evidence).write_text(
+            json.dumps(
+                {
+                    "full_published_provider_resolver": True,
+                    "actual_composition_publication": True,
+                    "ordinary_reader": True,
+                    "repeatable_read_readonly": True,
+                    "provider_relations": 9,
+                    "api_read_provider_resolver": True,
+                    "api_original_session_nine_input_inventory": True,
+                    "api_guarded_native_provider_read": True,
+                    "legacy_no_seal_control_identity_only": True,
+                    "manifest_sha256": manifest.manifest_sha256,
+                    "full_pricing_release_attribution_resolution": False,
+                    "http": False,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+
+
 async def test_published_provider_resolver(custom_db, monkeypatch):
     """Publish through composition and verify the exact manifest with an ordinary Reader."""
     fixture = custom_db
     connection = fixture.connection
     schema = "em_resolver_" + uuid4().hex
-    reader = None
+    reader, reader_engine = None, None
     copy_targets, created_schema_oids_by_name = [], {}
     password = uuid4().hex
     try:
@@ -92,24 +121,37 @@ async def test_published_provider_resolver(custom_db, monkeypatch):
                 "SELECT session_user,current_user,current_setting('transaction_read_only'),current_setting('transaction_isolation'),(SELECT rolsuper FROM pg_roles WHERE rolname=current_user)"
             )
             assert tuple(identity) == (fixture.roles["reader"], fixture.roles["reader"], "on", "repeatable read", False)
-        if evidence := os.getenv("MANAGED_EM_NATIVE_EVIDENCE"):
-            Path(evidence).write_text(
-                json.dumps(
-                    {
-                        "full_published_provider_resolver": True,
-                        "actual_composition_publication": True,
-                        "ordinary_reader": True,
-                        "repeatable_read_readonly": True,
-                        "provider_relations": 9,
-                        "manifest_sha256": manifest.manifest_sha256,
-                        "full_pricing_release_attribution_resolution": False,
-                        "http": False,
-                    },
-                    indent=2,
-                )
-                + "\n"
+        reader_engine = create_async_engine(
+            make_url(dsn).set(drivername="postgresql+asyncpg", username=fixture.roles["reader"], password=password),
+            isolation_level="REPEATABLE READ",
+        )
+        async with AsyncSession(reader_engine) as session, session.begin():
+            await session.execute(text("SET TRANSACTION READ ONLY"))
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
+            api_manifest = await resolve_network_serving_manifest(
+                driver, generation_id=manifest.generation_id, control_schema=fixture.control_schema, api_read=True
             )
+            assert api_manifest == manifest
+            assert api_manifest.custody_control is None and api_manifest.compact_layout is None
+            assert (
+                await resolve_em_provider_inputs(driver, api_manifest, fixture.control_schema, api_read=True) == inputs
+            )
+            assert await resolve_em_provider_inputs_in_session(session, api_manifest, fixture.control_schema) == inputs
+            inventory = _installed_read_inventory(session)
+            assert inventory.connection is driver and len(inventory.relations) == 9
+            provider_result = await execute_network_read(
+                session, f"SELECT npi FROM ONLY {inputs.relation('npi')} LIMIT 1"
+            )
+            assert len(provider_result.all()) <= 1
+            api_identity = await driver.fetchrow(
+                "SELECT session_user,current_user,current_setting('transaction_read_only'),"
+                "current_setting('transaction_isolation'),(SELECT rolsuper FROM pg_roles WHERE rolname=current_user)"
+            )
+            assert tuple(api_identity) == tuple(identity)
+        _write_resolver_evidence(manifest)
     finally:
+        if reader_engine is not None:
+            await reader_engine.dispose()
         if reader is not None:
             await reader.close()
         await _remove_candidates(fixture, copy_targets, uuid4())

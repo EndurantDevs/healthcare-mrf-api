@@ -12,6 +12,7 @@ from api import provider_list_sql
 from api.endpoint import npi
 from api.network_address_scope import network_address_read_scope, scoped_address_insurance_predicate
 from process.network_serving_read import PinnedNetworkServingManifest
+from tests.network_read_execution_support import with_read_identity_receipts
 
 
 @pytest.mark.asyncio
@@ -21,7 +22,7 @@ async def test_real_list_branches_use_same_insurance_scope_before_count_and_limi
     """Check membership predicates before every real count and page branch."""
     statements = []
 
-    _record_insurance_statements(monkeypatch, statements)
+    session = _record_insurance_statements(monkeypatch, statements)
     manifest = PinnedNetworkServingManifest(
         1,
         "00000000-0000-0000-0000-000000000001",
@@ -47,7 +48,7 @@ async def test_real_list_branches_use_same_insurance_scope_before_count_and_limi
             "count_only": "0" if kind == "page" else "1",
             "format": "all" if kind == "classification" else "",
         },
-        ctx=SimpleNamespace(sa_session=SimpleNamespace(in_transaction=lambda: True)),
+        ctx=SimpleNamespace(sa_session=session),
         app=SimpleNamespace(),
     )
     with context:
@@ -95,3 +96,9 @@ def _record_insurance_statements(monkeypatch, statements):
     monkeypatch.setattr(npi, "db", SimpleNamespace(acquire=acquire))
     monkeypatch.setattr(npi, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
     monkeypatch.setattr(npi, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
+
+    async def execute(statement, parameters):
+        rows = await query(statement, **parameters)
+        return SimpleNamespace(all=lambda: rows)
+
+    return with_read_identity_receipts(SimpleNamespace(execute=execute))

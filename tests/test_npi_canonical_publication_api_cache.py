@@ -11,7 +11,6 @@ import pytest
 
 from api.endpoint import npi as npi_module
 
-
 PUBLICATION_ONE = "1:nppub1_" + "a" * 43
 PUBLICATION_TWO = "2:nppub1_" + "b" * 43
 
@@ -36,9 +35,7 @@ class _ScalarResult:
 async def test_publication_identity_requires_one_sealed_live_oid_match(monkeypatch):
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
-    execute_stmt = AsyncMock(
-        return_value=_RowsResult([(7, "nppub1_" + "c" * 43)])
-    )
+    execute_stmt = AsyncMock(return_value=_RowsResult([(7, "nppub1_" + "c" * 43)]))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
 
     identity = await npi_module._npi_canonical_publication_identity()
@@ -202,9 +199,7 @@ async def test_primary_count_cache_misses_after_unified_address_swap(monkeypatch
     monkeypatch.setattr(
         npi_module,
         "_execute_stmt",
-        AsyncMock(
-            side_effect=[_ScalarResult(101), _ScalarResult(101), _ScalarResult(202)]
-        ),
+        AsyncMock(side_effect=[_ScalarResult(101), _ScalarResult(101), _ScalarResult(202)]),
     )
     scalar = AsyncMock(side_effect=[11, 22])
     monkeypatch.setattr(npi_module.db, "scalar", scalar)
@@ -218,11 +213,7 @@ async def test_primary_count_cache_misses_after_unified_address_swap(monkeypatch
 @pytest.mark.asyncio
 async def test_insurance_count_cache_misses_after_publication_change(monkeypatch):
     counts = iter((31, 42))
-    execute = AsyncMock(
-        side_effect=lambda _statement: SimpleNamespace(
-            scalar=lambda: next(counts)
-        )
-    )
+    execute = AsyncMock(side_effect=lambda _statement, _parameters=None: SimpleNamespace(scalar=lambda: next(counts)))
 
     class _SessionContext:
         async def __aenter__(self):
@@ -272,15 +263,9 @@ async def test_classification_cache_misses_after_publication_change(monkeypatch)
         AsyncMock(return_value=["282N00000X"]),
     )
 
-    assert await npi_module._get_classification_npi_list(
-        "Hospital", session=session
-    ) == [1003000100]
-    assert await npi_module._get_classification_npi_list(
-        "Hospital", session=session
-    ) == [1003000100]
-    assert await npi_module._get_classification_npi_list(
-        "Hospital", session=session
-    ) == [1003000118]
+    assert await npi_module._get_classification_npi_list("Hospital", session=session) == [1003000100]
+    assert await npi_module._get_classification_npi_list("Hospital", session=session) == [1003000100]
+    assert await npi_module._get_classification_npi_list("Hospital", session=session) == [1003000118]
     assert execute.await_count == 2
 
 

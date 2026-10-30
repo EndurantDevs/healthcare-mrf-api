@@ -45,12 +45,16 @@ class RetainedSiteAdoptionReceipt:
     binding_table_oid: int
     owner_role_oid: int
     records: tuple[RetainedSiteAdoption, ...]
+    compact_address_relations: tuple[tuple[str, str, str, int], ...] = ()
 
     def as_dict(self):
         """Return a fresh JSON envelope without exposing mutable receipt state."""
         envelope = asdict(self)
         envelope["source_generations"] = dict(self.source_generations)
         envelope["records"] = [asdict(record) for record in self.records]
+        relations = envelope.pop("compact_address_relations")
+        if relations:
+            envelope["compact_address_relations"] = [list(relation) for relation in relations]
         return envelope
 
 
@@ -92,8 +96,10 @@ def _input_rows(input_bytes):
     return rows, json.dumps(projected_rows, separators=(",", ":")).encode()
 
 
-async def _selected_rows(connection, namespace, selection_rows):
+async def _selected_rows(connection, manifest, selection_rows):
     """Resolve the entire selection and physical receipt coordinates in one query."""
+    namespace = _identifier(manifest.schema_name)
+    addresses, address_oid_sql, address_arguments = _source_addresses(manifest, namespace)
     return await connection.fetchrow(
         f"""WITH requested AS MATERIALIZED (
           SELECT * FROM jsonb_to_recordset($1::jsonb) AS item(provider_system text,provider_id text,
@@ -103,7 +109,7 @@ async def _selected_rows(connection, namespace, selection_rows):
           FROM requested item LEFT JOIN {namespace}.provider_location_binding binding
             ON (binding.provider_system,binding.provider_id,binding.location_id,binding.location_key)
               =(item.provider_system,item.provider_id,item.location_id,item.location_key)
-          LEFT JOIN {namespace}.entity_address_unified address
+          LEFT JOIN {addresses} address
             ON (address.location_key,address.entity_type,address.entity_id)
               =(binding.location_key,binding.entity_type,binding.entity_id)
             AND encode(sha256(convert_to(to_jsonb(address)::text,'UTF8')),'hex')=item.address_row_sha256
@@ -116,15 +122,38 @@ async def _selected_rows(connection, namespace, selection_rows):
             'entity_id',entity_id,'address_row_sha256',address_row_sha256)
             ORDER BY provider_system,provider_id,location_id)::text AS records_json,
           (SELECT oid::bigint FROM pg_namespace WHERE nspname=$2) AS schema_oid,
-          (SELECT oid::bigint FROM pg_class WHERE relnamespace=to_regnamespace($2)
-            AND relname='entity_address_unified' AND relkind='r') AS address_table_oid,
+          {address_oid_sql} AS address_table_oid,
           (SELECT oid::bigint FROM pg_class WHERE relnamespace=to_regnamespace($2)
             AND relname='provider_location_binding' AND relkind='r') AS binding_table_oid,
           (SELECT nspowner::bigint FROM pg_namespace WHERE nspname=$2) AS owner_role_oid
         FROM matched""",
         json.dumps(selection_rows, separators=(",", ":")),
         namespace[1:-1],
+        *address_arguments,
     )
+
+
+def _source_addresses(source, namespace):
+    if source.compact_layout is None:
+        oid_sql = "(SELECT oid::bigint FROM pg_class WHERE relnamespace=to_regnamespace($2) "
+        oid_sql += "AND relname='entity_address_unified' AND relkind='r')"
+        return namespace + ".entity_address_unified", oid_sql, ()
+    from api.network_compact_address import compact_address_native_sql
+
+    addresses, arguments = compact_address_native_sql(
+        source.compact_layout, first_parameter=4, visible_membership_sql="TRUE"
+    )
+    return addresses, "$3::bigint", (source.address_table_oid, *arguments)
+
+
+def _compact_relations(source):
+    if source.compact_layout is None:
+        return ()
+    layout = source.compact_layout
+    relations = [("base", layout.base.schema_name, "entity_address_unified", layout.base.table_oid)]
+    if layout.custom is not None:
+        relations.append(("custom", layout.custom.schema_name, "entity_address_unified", layout.custom.table_oid))
+    return tuple(relations)
 
 
 def _receipt(source, selected):
@@ -146,6 +175,7 @@ def _receipt(source, selected):
         **manifest,
         **{field: selected[field] for field in oid_fields if field != "address_table_oid"},
         records=tuple(RetainedSiteAdoption(**row) for row in json.loads(selected["records_json"])),
+        compact_address_relations=_compact_relations(source),
     )
     if len(json.dumps(receipt.as_dict(), separators=(",", ":"), sort_keys=True).encode()) > MAX_INPUT_BYTES:
         raise RetainedSiteAdoptionError("Retained site adoption receipt exceeds the byte limit")
@@ -189,7 +219,7 @@ async def resolve_retained_site_adoptions(
         if row_count != len(selection_rows):
             raise RetainedSiteAdoptionError("Retained site adoption input is invalid")
         verified = await _verified_source(connection, generation_id, expected_source, control_schema)
-        selected = await _selected_rows(connection, _identifier(verified.schema_name), selection_rows)
+        selected = await _selected_rows(connection, verified, selection_rows)
         return _receipt(verified, selected)
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, asyncpg.PostgresError) as error:
         if isinstance(error, RetainedSiteAdoptionError):

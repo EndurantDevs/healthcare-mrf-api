@@ -15,7 +15,11 @@ from uuid import UUID
 from db.registry_schema import registry_schema
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import _VALIDATION_SQL, APPROVED_NETWORK_BINDINGS_SQL
-from process.network_fhir_membership_source import FHIRMembershipSourceError, PinnedFHIRMembershipSource
+from process.network_fhir_membership_source import (
+    FHIRMembershipSourceError,
+    PinnedFHIRMembershipSource,
+    fhir_physical_source,
+)
 from process.network_fhir_membership_source import _extraction_sql as fhir_extraction_sql
 from process.network_fhir_membership_source import _require_pinned_source as require_fhir_source
 from process.network_legacy_membership_source import (
@@ -53,6 +57,12 @@ _FHIR_SOURCE_PAGE = (
 )
 _FHIR_EXPANDED_PAGE = "\n        LIMIT 5001\n"
 
+_IMPACT_COUNTS_SQL = """
+      SELECT (SELECT count(*) FROM page) AS source_rows,count(*) AS expanded_rows,
+        count(*) FILTER(WHERE NOT unresolved AND NOT omitted) AS mapped_rows,
+        count(*) FILTER(WHERE omitted) AS omitted_rows,
+        count(*) FILTER(WHERE unresolved AND NOT omitted) AS unresolved_rows FROM resolved"""
+
 
 class RegistryImportedSelectionUnavailable(RuntimeError):
     """Bounded imported preview failed; this static error maps to unavailability."""
@@ -61,21 +71,21 @@ class RegistryImportedSelectionUnavailable(RuntimeError):
 def _prospective_sql(namespace, staging):
     return f"""prospective AS MATERIALIZED (
       SELECT previous.approved_revision,previous.record_kind,previous.record_key,
-        previous.record_revision,previous.custom_revision,previous.record_json FROM {namespace}.registry_approved_record previous
+        previous.record_revision,previous.custom_revision,previous.record_json FROM ONLY {namespace}.registry_approved_record previous
       WHERE approved_revision=$1 AND NOT EXISTS(SELECT 1 FROM {staging} selected
         WHERE (selected.record_kind,selected.record_key)=(previous.record_kind,previous.record_key))
       UNION ALL
       SELECT $1::bigint AS approved_revision,history.record_kind,history.record_key,
         history.revision AS record_revision,history.custom_revision,history.record_json
-      FROM {staging} selected JOIN {namespace}.registry_record_history history
+      FROM {staging} selected JOIN ONLY {namespace}.registry_record_history history
         ON (history.record_kind,history.record_key,history.revision)=
           (selected.record_kind,selected.record_key,selected.revision)
     )"""
 
 
 def _binding_validation_sql(namespace, staging):
-    bindings = APPROVED_NETWORK_BINDINGS_SQL.replace("{namespace}.registry_approved_record", "prospective")
-    validation = _VALIDATION_SQL.replace("{namespace}.registry_approved_record", "prospective")
+    bindings = APPROVED_NETWORK_BINDINGS_SQL.replace("ONLY {namespace}.registry_approved_record", "prospective")
+    validation = _VALIDATION_SQL.replace("ONLY {namespace}.registry_approved_record", "prospective")
     return validation.replace("WITH {bindings}", "WITH {prospective},{bindings}").format(
         prospective=_prospective_sql(namespace, staging),
         bindings=bindings.format(namespace=namespace),
@@ -84,6 +94,7 @@ def _binding_validation_sql(namespace, staging):
 
 
 def _impact_sql(recipe, namespace, staging, control_schema):
+    """Aggregate the prospective map through the unchanged source extraction predicates."""
     if type(recipe.source_pin) is PinnedFHIRMembershipSource:
         sql = fhir_extraction_sql(recipe.source_pin, namespace, reviewed=True, approved_only=True)
         source_page, expanded_page = _FHIR_SOURCE_PAGE, _FHIR_EXPANDED_PAGE
@@ -103,7 +114,7 @@ def _impact_sql(recipe, namespace, staging, control_schema):
         source_page, expanded_page = _ACA_SOURCE_PAGE, _ACA_EXPANDED_PAGE
         aggregate_marker = ", encoded AS ("
     approved = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=namespace)
-    prospective_bindings = approved.replace(f"{namespace}.registry_approved_record", "prospective")
+    prospective_bindings = approved.replace(f"ONLY {namespace}.registry_approved_record", "prospective")
     prefix = "WITH " + approved + ","
     if (
         not sql.startswith(prefix)
@@ -118,14 +129,7 @@ def _impact_sql(recipe, namespace, staging, control_schema):
     # Retain complete lineage/omission checks, but omit outcome documents and
     # their generation bind along with membership JSON and COPY paging.
     sql = sql.replace(source_page, "", 1).replace(expanded_page, "\n", 1)
-    sql = (
-        sql.split(aggregate_marker, 1)[0]
-        + """
-      SELECT (SELECT count(*) FROM page) AS source_rows,count(*) AS expanded_rows,
-        count(*) FILTER(WHERE NOT unresolved AND NOT omitted) AS mapped_rows,
-        count(*) FILTER(WHERE omitted) AS omitted_rows,
-        count(*) FILTER(WHERE unresolved AND NOT omitted) AS unresolved_rows FROM resolved"""
-    )
+    sql = sql.split(aggregate_marker, 1)[0] + _IMPACT_COUNTS_SQL
     if type(recipe.source_pin) is PinnedACAMembershipSource and (
         recipe.source_pin.retained_successor is not None or recipe.source_pin.retained_epoch is not None
     ):
@@ -135,10 +139,39 @@ def _impact_sql(recipe, namespace, staging, control_schema):
             1,
         )
     if type(recipe.source_pin) is PinnedFHIRMembershipSource:
-        sql = sql.replace(", resolved AS MATERIALIZED (", ", resolved AS NOT MATERIALIZED (", 1)
-        if any(int(parameter) in {9, 10, 11} for parameter in re.findall(r"\$(\d+)", sql)):
+        return _fhir_impact_sql(sql, recipe.source_pin)
+    return sql
+
+
+def _fhir_impact_sql(sql, source_pin):
+    """Retain complete product checks while counting deduplicated membership facts."""
+    sql = sql.replace(", resolved AS MATERIALIZED (", ", resolved AS NOT MATERIALIZED (", 1)
+    if source_pin.retained_capture is not None:
+        if (
+            sql.count("LIMIT 5001 /* reviewed mappings */") != 1
+            or sql.count("fhir_product_selection_guard AS MATERIALIZED (") != 1
+        ):
             raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
-        sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) - (3 if int(match[1]) > 11 else 0)), sql)
+        sql = sql.replace("LIMIT 5001 /* reviewed mappings */", "", 1)
+        sql = sql.replace(
+            "SELECT (SELECT count(*) FROM page) AS source_rows,",
+            "SELECT (SELECT invalid FROM fhir_product_selection_guard) AS product_selection_invalid,"
+            "(SELECT count(*) FROM page) AS source_rows,",
+            1,
+        )
+        sql = sql.replace(
+            "count(*) FILTER(WHERE NOT unresolved AND NOT omitted) AS mapped_rows",
+            "count(DISTINCT (resource_type,resource_id,payload_hash,network_id,provider_system,provider_id,site_id)) "
+            "FILTER(WHERE NOT unresolved AND NOT omitted) AS mapped_rows",
+            1,
+        )
+    if any(int(parameter) in {9, 10, 11} for parameter in re.findall(r"\$(\d+)", sql)):
+        raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
+    sql = re.sub(
+        r"\$(\d+)",
+        lambda match: "$" + str(int(match[1]) - (4 if int(match[1]) > 16 else 3 if int(match[1]) > 11 else 0)),
+        sql,
+    )
     return sql
 
 
@@ -149,14 +182,16 @@ async def _require_recipe_source(connection, recipe):
         await require_aca_archive(connection, source)
         physical = aca_physical_source(source)
         return (physical.import_id, physical.issuer_id, physical.year, physical.source_url)
-    await _require_recipe_custody(connection, recipe)
+    retained_read = await _require_recipe_custody(connection, recipe)
     descriptor_by_field = {
         **asdict(recipe.binding_coordinates),
         "alias_scope": source.alias_scope,
         "source_key_kind": "organization_resource_id",
     }
-    await require_fhir_source(connection, source, descriptor_by_field)
-    return (source.dataset_id, source.source_id, source.release_id, source.alias_scope, source.as_of)
+    await require_fhir_source(connection, source, descriptor_by_field, retained_read=retained_read)
+    physical = fhir_physical_source(source)
+    parameters = (physical.dataset_id, physical.source_id, physical.release_id, physical.alias_scope, physical.as_of)
+    return parameters + ((source.retained_capture.capture_sha256,) if source.retained_capture is not None else ())
 
 
 async def _recipe_impact(connection, recipe, command, staging, control_schema):
@@ -176,10 +211,14 @@ async def _recipe_impact(connection, recipe, command, staging, control_schema):
         *recipe.binding_coordinates.sql_parameters,
         *source_parameters,
     )
-    if counts is None or (
-        type(recipe.source_pin) is PinnedACAMembershipSource
-        and (recipe.source_pin.retained_successor is not None or recipe.source_pin.retained_epoch is not None)
-        and counts["successor_invalid"]
+    if (
+        counts is None
+        or counts.get("product_selection_invalid", False)
+        or (
+            type(recipe.source_pin) is PinnedACAMembershipSource
+            and (recipe.source_pin.retained_successor is not None or recipe.source_pin.retained_epoch is not None)
+            and counts["successor_invalid"]
+        )
     ):
         raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
     return {field: counts[field] for field in ("mapped_rows", "omitted_rows", "unresolved_rows")}

@@ -300,9 +300,15 @@ async def cleanup_entity_address_archive_stage(
 
 
 async def cleanup_entity_address_archive_publication(session, *, owner, publication, assert_unreferenced):
-    """Retire only authenticated non-serving physical OIDs after the local pin check."""
+    """Retire authenticated non-serving OIDs after local and sealed compact pin checks.
+
+    Registry controls require READ COMMITTED so the post-lock check can observe
+    seals committed since the first check.
+    """
     from process import entity_address_snapshot_preparation as protected
     from process.entity_address_snapshot_alias import AUTHORITY_TABLE
+    from process.network_cms_registry_address_capture import native_driver
+    from process.network_compact_retention import require_network_compact_artifacts_unreferenced
 
     _require_caller_transaction(session)
     owner = validate_entity_address_archive_stage_ownership(owner)
@@ -311,6 +317,8 @@ async def cleanup_entity_address_archive_publication(session, *, owner, publicat
     if not callable(assert_unreferenced) or await assert_unreferenced(session, owner, publication) is not True:
         raise EntityAddressArchiveOwnershipError("entity-address publication remains referenced")
     oids = [entry["relation_oid"] for entry in expected_relations] + [authority["relation_oid"]]
+    connection = await native_driver(session)
+    await require_network_compact_artifacts_unreferenced(connection, oids)
     catalog_rows = await _retained_relation_catalog(session, oids)
     _require_retained_catalog(catalog_rows, protected_oid, owner, schema, expected_relations)
     tables = ",".join(f"{_quoted(entry['nspname'])}.{_quoted(entry['relname'])}" for entry in catalog_rows)
@@ -324,6 +332,7 @@ async def cleanup_entity_address_archive_publication(session, *, owner, publicat
     )
     if await assert_unreferenced(session, owner, publication) is not True:
         raise EntityAddressArchiveOwnershipError("entity-address publication remains referenced")
+    await require_network_compact_artifacts_unreferenced(connection, oids)
     await session.execute(text(f"DROP TABLE {tables} RESTRICT"))
     await session.execute(text(f"DROP SCHEMA {_quoted(owner.schema_name)} RESTRICT"))
 

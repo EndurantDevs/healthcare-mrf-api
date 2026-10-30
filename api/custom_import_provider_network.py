@@ -10,10 +10,12 @@ import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from sqlalchemy import text
-
 from api import custom_import_read_http as transport
-from api.network_address_scope import current_network_address_scope, network_address_read_scope
+from api.network_address_scope import (
+    _LegacyNetworkScopeMismatch,
+    current_network_address_scope,
+    network_address_read_session_scope,
+)
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
 from process.network_serving_read import resolve_network_serving_manifest
 
@@ -132,24 +134,6 @@ def _binding_legacy_checksums(binding):
     return tuple(checksums)
 
 
-async def _require_legacy_mapping(driver, manifest, binding):
-    """Recheck the signed subset against the same pinned approved catalog."""
-
-    from db.registry_schema import registry_schema
-    from process.network_address_projection import _identifier
-    from process.registry_network_catalog_read import _LEGACY_BATCH_SQL
-
-    mapping = await driver.fetchrow(
-        _LEGACY_BATCH_SQL.format(control=_identifier(registry_schema())),
-        manifest.approved_custom_revision,
-        tuple(map(str, binding.legacy_checksums)),
-        "checksum_network",
-        (),
-    )
-    if mapping is None or mapping["complete"] is not True or mapping["network_ids"] != list(binding.network_ids):
-        raise CustomImportReadUnavailableError("canonical provider legacy scope is unavailable")
-
-
 @asynccontextmanager
 async def provider_network_read_scope(session, binding: ProviderNetworkBinding | None):
     """Resolve and hold the eligible retained heap in the caller's Reader transaction."""
@@ -159,21 +143,22 @@ async def provider_network_read_scope(session, binding: ProviderNetworkBinding |
         return
     connection = await session.connection()
     driver = (await connection.get_raw_connection()).driver_connection
-    manifest = await resolve_network_serving_manifest(driver, generation_id=binding.generation_id)
+    manifest = await resolve_network_serving_manifest(driver, generation_id=binding.generation_id, api_read=True)
     if manifest.generation_id != binding.generation_id or not hmac.compare_digest(
         manifest.manifest_sha256, binding.manifest_sha256
     ):
         raise CustomImportReadUnavailableError("canonical provider generation is unavailable")
-    await session.execute(text(f'LOCK TABLE "{manifest.schema_name}".entity_address_unified IN ACCESS SHARE MODE'))
-    if binding.legacy_checksums is not None:
-        await _require_legacy_mapping(driver, manifest, binding)
-    with network_address_read_scope(
-        manifest,
-        binding.network_ids,
-        access_scope_sha256=binding.access_scope_sha256,
-        legacy_checksums=binding.legacy_checksums,
-    ):
-        yield manifest
+    try:
+        async with network_address_read_session_scope(
+            session,
+            manifest,
+            binding.network_ids,
+            access_scope_sha256=binding.access_scope_sha256,
+            legacy_checksums=binding.legacy_checksums,
+        ):
+            yield manifest
+    except _LegacyNetworkScopeMismatch as error:
+        raise CustomImportReadUnavailableError("canonical provider legacy scope is unavailable") from error
 
 
 def provider_network_response(body, manifest):

@@ -92,7 +92,7 @@ UPDATE {schema}.{root}
 RETURNING snapshot_key
 """
 
-_ROOT_SELECTION_SQL = """
+_ROOT_SELECTION_SQL_TEMPLATE = """
     WITH requested AS (
         SELECT DISTINCT snapshot_key
           FROM unnest(CAST(:snapshot_keys AS bigint[])) AS keys(snapshot_key)
@@ -118,16 +118,23 @@ _ROOT_SELECTION_SQL = """
            root.completed_at AS root_completed_at,
            EXISTS (
                SELECT 1
-                 FROM {schema}.ptg2_v3_snapshot_block AS mapping
+                 FROM {snapshot_block_relation} AS mapping
                 WHERE mapping.snapshot_key = requested.snapshot_key
                   AND mapping.object_kind = ANY(CAST(:packed_object_kinds AS text[]))
            ) AS relational_mapping_present
       FROM requested
-      LEFT JOIN {schema}.ptg2_v3_snapshot_layout AS layout
+      LEFT JOIN {layout_relation} AS layout
         ON layout.snapshot_key = requested.snapshot_key
-      LEFT JOIN {schema}.{root_table} AS root
+      LEFT JOIN {root_relation} AS root
         ON root.snapshot_key = requested.snapshot_key
 """
+
+_ROOT_SELECTION_SQL = _ROOT_SELECTION_SQL_TEMPLATE.format(
+    root_relation="{schema}.{root_table}",
+    layout_relation="{schema}.ptg2_v3_snapshot_layout",
+    snapshot_block_relation="{schema}.ptg2_v3_snapshot_block",
+    manifest_key="{manifest_key}",
+)
 
 _TARGET_ANCHOR_SQL = """
     SELECT target.block_hash, block.format_version, block.object_kind,

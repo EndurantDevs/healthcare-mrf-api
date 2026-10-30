@@ -25,6 +25,7 @@ from tests.provider_directory_profile_delta_schema_fixtures import (
     _create_delta_contract_tables,
 )
 from tests.provider_directory_profile_delta_test_support import _delta_database
+from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
 from tests.test_provider_directory_profile_capacity_preflight import _serving_state
 from tests.test_provider_directory_profile_capacity_preflight_postgres import (
     _POSTGRES_DSN_ENV,
@@ -350,7 +351,7 @@ def _assert_registry_migration_lineage():
     """Require the current joined head and every protected registry parent edge."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     expected_heads = set(script.get_heads())
-    assert expected_heads == {"20261025020000_company_affiliation_join"}
+    _assert_source_inventory_migration_head(script)
     _assert_custom_import_manual_acceptance_lineage(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision

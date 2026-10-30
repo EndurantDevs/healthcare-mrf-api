@@ -34,9 +34,12 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
+    RegistryAddressArtifactCustody,
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
+    prepare_registry_composition_address_artifact,
 )
+from process.registry_candidate_custody_preparation import split_registry_candidate_custody
 from process.registry_publication_authority import RegistryPublicationAuthorityClient
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig, consume_registry_publication_once
 from process.registry_publication_execution import _source_rollback_address_sources
@@ -56,6 +59,7 @@ from tests.test_network_custom_address_source_postgres import _draft
 from tests.test_network_fhir_membership_source_postgres import fhir_source as fhir_source
 from tests.test_network_fhir_membership_source_postgres import reviewed_fhir_source as reviewed_fhir_source
 from tests.test_registry_approval_store_postgres import _command, _create
+from tests.test_registry_candidate_composition_postgres import _seal_composition_target
 from tests.test_registry_publication_authority import _reply
 from tests.test_registry_publication_worker_permissions_postgres import (
     _fixture_dsn,
@@ -72,7 +76,7 @@ from tests.test_registry_publication_worker_permissions_postgres import (
 from tests.test_registry_publication_worker_permissions_postgres import (
     worker_permissions as worker_permissions,
 )
-from tests.test_registry_source_recipe_composition_postgres import _publish_raw_recipe
+from tests.test_registry_source_recipe_composition_postgres import _complete_cms_office_source, _publish_raw_recipe
 from tests.test_registry_source_retention import candidate_receipt
 
 pytestmark = pytest.mark.asyncio
@@ -81,7 +85,11 @@ pytestmark = pytest.mark.asyncio
 @asynccontextmanager
 async def _consumer(fixture, *, authority_hook=None):
     await _install(fixture)
-    config = RegistryPublicationConsumerConfig(**_options(fixture), reader_roles=(fixture.fixture.roles["reader"],))
+    config = RegistryPublicationConsumerConfig(
+        **_options(fixture),
+        reader_roles=(fixture.fixture.roles["reader"],),
+        **getattr(fixture, "publication_custody_by_name", {}),
+    )
     dsn = _fixture_dsn()
     pools = []
     calls = []
@@ -566,6 +574,9 @@ async def test_database_wrappers_preserve_transient_cause(monkeypatch, reader):
         async def fetchrow(self, *arguments):
             raise failure
 
+        async def fetchval(self, *arguments):
+            raise failure
+
         async def execute(self, *arguments):
             raise failure
 
@@ -1005,23 +1016,112 @@ async def retained_recipe_worker(cms_recipe_template, cms_recipe_database, monke
         custom_fixture = await anext(custom)
         workers = await stack.enter_async_context(aclosing(worker_permissions.__wrapped__(custom_fixture)))
         fixture = await anext(workers)
-        sources = await stack.enter_async_context(
-            aclosing(
-                cms_recipes.reviewed_cms_source.__wrapped__(cms_recipe_database, registry_schema, monkeypatch, tmp_path)
-            )
+        reviewed_source = await stack.enter_async_context(
+            _complete_cms_office_source(cms_recipe_database, registry_schema, monkeypatch, tmp_path)
         )
-        reviewed_source = await anext(sources)
         source_pin = reviewed_source[0][2]
         reader = source_pin.retained_epoch.runtime_roles[0]
         await fixture.fixture.connection.execute(
             f'GRANT "{reader}" TO "{fixture.roles_by_kind["execution"]}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
         )
+        operator = await stack.enter_async_context(_retained_recipe_custodian(fixture))
+        fixture.publication_custody_by_name = _retained_recipe_custody(fixture, operator)
         yield fixture, reviewed_source
+
+
+async def _remove_retained_recipe_custodian(fixture, roles_by_kind):
+    admin = fixture.fixture.connection
+    schema = fixture.fixture.control_schema
+    await admin.execute(f'ALTER TABLE "{schema}".network_candidate_custody OWNER TO "{fixture.roles_by_kind["queue"]}"')
+    schemas = await admin.fetch(
+        "SELECT nspname FROM pg_namespace WHERE nspowner=(SELECT oid FROM pg_roles WHERE rolname=$1)",
+        roles_by_kind["custody"],
+    )
+    for owned_schema in schemas:
+        await admin.execute('DROP SCHEMA "' + owned_schema["nspname"] + '" CASCADE')
+    for role in reversed(tuple(roles_by_kind.values())):
+        if await admin.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role):
+            await admin.execute(f'DROP OWNED BY "{role}"')
+            await admin.execute(f'DROP ROLE "{role}"')
+
+
+@asynccontextmanager
+async def _retained_recipe_custodian(fixture):
+    """Split the empty seal ledger before the retained predecessor or successor exists."""
+    admin = fixture.fixture.connection
+    schema = fixture.fixture.control_schema
+    roles_by_kind = {kind: "recipe_" + kind + "_" + uuid4().hex for kind in ("custodian", "custody")}
+    password = uuid4().hex
+    async with AsyncExitStack() as stack:
+        stack.push_async_callback(_remove_retained_recipe_custodian, fixture, roles_by_kind)
+        await _install(fixture)
+        for kind, role in roles_by_kind.items():
+            options = f"LOGIN PASSWORD '{password}'" if kind == "custodian" else "NOLOGIN"
+            await admin.execute(
+                f'CREATE ROLE "{role}" {options} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS'
+            )
+        await admin.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{roles_by_kind["custody"]}"')
+        async with fixture.fixture.engine.begin() as original_admin:
+            await split_registry_candidate_custody(
+                original_admin,
+                owner_role=fixture.roles_by_kind["queue"],
+                custody_owner_role=roles_by_kind["custody"],
+                control_schema=schema,
+            )
+        database = await admin.fetchval("SELECT quote_ident(current_database())")
+        for role in roles_by_kind.values():
+            await admin.execute(f'GRANT CREATE ON DATABASE {database} TO "{role}"')
+        for role, inherit, assume in (
+            (fixture.roles_by_kind["execution"], "TRUE", "FALSE"),
+            (fixture.roles_by_kind["physical"], "TRUE", "TRUE"),
+            (roles_by_kind["custody"], "FALSE", "TRUE"),
+        ):
+            await admin.execute(
+                f'GRANT "{role}" TO "{roles_by_kind["custodian"]}" WITH ADMIN FALSE, INHERIT {inherit}, SET {assume}'
+            )
+        custodian = await asyncpg.connect(_fixture_dsn(), user=roles_by_kind["custodian"], password=password)
+        stack.push_async_callback(custodian.close)
+        yield SimpleNamespace(connection=custodian, control_schema=schema, owner_role=roles_by_kind["custody"])
+
+
+def _retained_recipe_custody(fixture, operator):
+    """Keep native preparation and sealing independent of the actual worker actors."""
+    config = RegistryPublicationConsumerConfig(**_options(fixture), reader_roles=(fixture.fixture.roles["reader"],))
+    runtime_roles = config.custody_roles
+    custody = RegistryAddressArtifactCustody(operator.owner_role, runtime_roles, fixture.fixture.control_schema)
+
+    async def seal_candidate(target):
+        return await _seal_composition_target(operator, target, runtime_roles)
+
+    async def prepare_address_sources(**arguments):
+        address_sources = arguments["address_sources"]
+        arguments["request_id"] = UUID(str(arguments["request_id"]))
+        async with operator.connection.transaction(isolation="repeatable_read"):
+            artifact = await prepare_registry_composition_address_artifact(
+                operator.connection, custody=custody, **arguments
+            )
+        if artifact is None:
+            return address_sources
+        fixture.fixture.composition_ids.append(UUID(artifact.composition_id))
+        return replace(address_sources, prepared_address_artifact=artifact)
+
+    return dict(seal_candidate=seal_candidate, prepare_address_sources=prepare_address_sources)
 
 
 async def _retained_recipe_head(fixture, reviewed_source):
     copy_targets = []
-    manifest = await _publish_raw_recipe(fixture.fixture, reviewed_source, copy_targets)
+    await _install(fixture)
+    manifest = await _publish_raw_recipe(
+        fixture.fixture,
+        reviewed_source,
+        copy_targets,
+        seal_candidate=fixture.publication_custody_by_name["seal_candidate"],
+        writer_roles=dict(
+            owner_role=fixture.roles_by_kind["physical"],
+            loader_roles=(),
+            reader_roles=(fixture.fixture.roles["reader"],),
+        ),
+    )
     assert "registry_source_recipes" in manifest.source_generations
     return manifest.generation_id
 

@@ -19,11 +19,13 @@ from api import network_address_scope as address_scope
 from api import plan_pricing_em_attribution as attribution
 from api import plan_pricing_em_distance as distance
 from api import plan_pricing_em_managed as managed
+from api.network_read_execution import install_network_read_inventory
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from api.plan_release_serving import PlanReleaseServingSelection, PlanReleaseSnapshotBinding
 from api.ptg2_serving import PTG2LocationScopeError
 from db.models import EntityAddressUnified
 from process import network_em_provider_inputs as provider_inputs
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_plan_pricing_projection_postgres import POSTGRES_DSN_ENV, _sqlalchemy_async_dsn
 from tests.test_plan_pricing_projection_v3_differential_postgres import migrated_v3_database as migrated_v3_database
@@ -247,8 +249,7 @@ async def _read_page(session, held, ordinals, *, limit=2, offset=0):
         extra_parameters=parameters,
     )
     rows, exact, boundary, total = window
-    driver = (await (await session.connection()).get_raw_connection()).driver_connection
-    cards = await managed._complete_page(driver, held.inputs, held.rates.rates_relation, rows, ordinals, 3)
+    cards = await managed._complete_page(session, held.inputs, held.rates.rates_relation, rows, ordinals, 3)
     return cards, exact, boundary, total
 
 
@@ -336,10 +337,16 @@ async def _assert_native_bounds(session, held, owner):
     held.completion_bytes = bounds["bytes"]
     with pytest.raises(PlanPricingProjectionUnavailable, match="completion"):
         await managed._complete_page(
-            driver, held.inputs, held.rates.rates_relation, [{"npi": 108, "distance_miles": 0}], (42,), 3
+            session, held.inputs, held.rates.rates_relation, [{"npi": 108, "distance_miles": 0}], (42,), 3
         )
-    for statement in (f"INSERT INTO {held.inputs.relation('npi')} (npi) VALUES(999)", f'SET LOCAL ROLE "{owner}"'):
-        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+    assert not await driver.fetchval(
+        "SELECT has_column_privilege(current_user,$1::regclass,'npi','INSERT')", held.inputs.relation("npi")
+    )
+    for statement, error_type in (
+        (f"INSERT INTO {held.inputs.relation('npi')} (npi) VALUES(999)", asyncpg.ReadOnlySQLTransactionError),
+        (f'SET LOCAL ROLE "{owner}"', asyncpg.InsufficientPrivilegeError),
+    ):
+        with pytest.raises(error_type):
             async with driver.transaction():
                 await driver.execute(statement)
     proof = await provider_inputs.prepare_em_provider_inputs(
@@ -382,6 +389,34 @@ def _observe_windows(held):
     return observe
 
 
+async def _bind_native_pricing_read(session, held, control_schema, reader):
+    """Bind actual prepared receipts to the original Reader before guarded native completion."""
+    driver = (await (await session.connection()).get_raw_connection()).driver_connection
+    assert await provider_inputs.prepare_em_provider_inputs(driver, held.inputs, runtime_roles=(reader,)) == held.proof
+    assert (
+        await attribution._verify(driver, held.rates, attribution._identity(held.selection)[0], api_read=True)
+        == held.rates
+    )
+    approved_oid = await driver.fetchval(
+        "SELECT to_regclass($1)::oid::bigint", f'"{control_schema}".registry_approved_record'
+    )
+    relations = tuple(
+        CompactAddressRelation(relation.schema_name, relation.table_name, relation.relation_oid)
+        for relation in held.inputs.relations
+    )
+    await install_network_read_inventory(
+        session,
+        (
+            *relations,
+            CompactAddressRelation(held.rates.schema_name, "rates", held.rates.table_oid),
+            CompactAddressRelation(
+                held.manifest.schema_name, "entity_address_unified", held.manifest.address_table_oid
+            ),
+            CompactAddressRelation(control_schema, "registry_approved_record", approved_oid),
+        ),
+    )
+
+
 async def test_managed_em_native_read(migrated_v3_database, monkeypatch):
     """Execute the unchanged managed SQL under real protected custody and Reader RR."""
     fixture = migrated_v3_database
@@ -400,11 +435,13 @@ async def test_managed_em_native_read(migrated_v3_database, monkeypatch):
         event.listen(reader_engine.sync_engine, "before_cursor_execute", _observe_windows(held))
         monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.schema)
         async with async_sessionmaker(reader_engine)() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
             driver = (await (await session.connection()).get_raw_connection()).driver_connection
             role = await driver.fetchrow(
                 "SELECT rolname,rolsuper,rolbypassrls FROM pg_roles WHERE rolname=current_user"
             )
             assert role["rolname"] == reader and not role["rolsuper"] and not role["rolbypassrls"]
+            await _bind_native_pricing_read(session, held, fixture.schema, reader)
             with address_scope.network_address_read_scope(
                 held.manifest, None, access_scope_sha256="c" * 64, excluded_network_ids=(7,)
             ):

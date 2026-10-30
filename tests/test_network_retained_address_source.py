@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Retained addresses use the same immutable custody proof as serving reads."""
 
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -10,6 +12,7 @@ import pytest
 from process import network_custom_address_source as custom
 from process import network_serving_read as serving
 from process.network_address_projection import PinnedAddressSource
+from tests.test_registry_ptg_address_carry import _artifact
 
 
 def source():
@@ -118,6 +121,7 @@ def catalog():
 @pytest.mark.parametrize("damage", (None, "oid", "custody"))
 async def test_source_identity_uses_full_registered_custody_and_never_falls_back(monkeypatch, damage):
     connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=None),
         fetchrow=AsyncMock(return_value=catalog()),
         fetch=AsyncMock(
             return_value=[{"attname": name} for name in custom.EntityAddressUnified.__table__.columns.keys()]
@@ -145,6 +149,7 @@ async def test_source_identity_uses_full_registered_custody_and_never_falls_back
 async def test_ordinary_source_keeps_the_original_runtime_role_closure(monkeypatch):
     ordinary = PinnedAddressSource("retained_addresses", "entity_address_unified", "edition-a")
     connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=None),
         fetchrow=AsyncMock(return_value=catalog()),
         fetch=AsyncMock(
             return_value=[{"attname": name} for name in custom.EntityAddressUnified.__table__.columns.keys()]
@@ -170,7 +175,11 @@ def native_columns():
 async def test_source_identity_accepts_compacted_metadata_and_pins_native_order(monkeypatch):
     ordinary = PinnedAddressSource("retained_addresses", "entity_address_unified", "edition-a")
     columns = native_columns()
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=catalog()), fetch=AsyncMock(return_value=columns))
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=None),
+        fetchrow=AsyncMock(return_value=catalog()),
+        fetch=AsyncMock(return_value=columns),
+    )
     closed = AsyncMock()
     monkeypatch.setattr(custom, "_closed", closed)
     original = await custom._source_identity(connection, ordinary, ("reader",), address=True)
@@ -197,7 +206,11 @@ async def test_source_identity_refuses_changed_column_membership(monkeypatch, da
         columns.append(dict(columns[-1]))
     else:
         columns[-1]["attname"] = "renamed"
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=catalog()), fetch=AsyncMock(return_value=columns))
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=None),
+        fetchrow=AsyncMock(return_value=catalog()),
+        fetch=AsyncMock(return_value=columns),
+    )
     monkeypatch.setattr(custom, "_closed", AsyncMock())
     with pytest.raises(custom.NetworkCustomAddressSourceError, match="Retained unified address shape differs"):
         await custom._source_identity(connection, source(), ("reader",), address=True)
@@ -210,10 +223,82 @@ async def test_source_identity_refuses_changed_column_membership(monkeypatch, da
 )
 async def test_source_identity_digest_keeps_every_native_column_attribute(monkeypatch, field_name, changed_value):
     columns = native_columns()
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=catalog()), fetch=AsyncMock(return_value=columns))
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=None),
+        fetchrow=AsyncMock(return_value=catalog()),
+        fetch=AsyncMock(return_value=columns),
+    )
     monkeypatch.setattr(custom, "_closed", AsyncMock())
     original = await custom._source_identity(connection, source(), ("reader",), address=True)
     columns[0][field_name] = changed_value
     changed = await custom._source_identity(connection, source(), ("reader",), address=True)
     assert changed[:3] == original[:3]
     assert changed[3] != original[3]
+
+
+@pytest.fixture
+def composition_verification(monkeypatch):
+    receipt = _artifact()
+    generation = custom._generation(receipt)
+    receipt = replace(
+        receipt,
+        generation_sha256=generation,
+        address_source=PinnedAddressSource(
+            "network_composition_" + receipt.composition_id.replace("-", ""), "entity_address_unified", generation
+        ),
+    )
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=json.dumps(receipt.as_dict())))
+    monkeypatch.setattr(custom, "_require_transaction", AsyncMock())
+    monkeypatch.setattr(
+        custom,
+        "_approved_identity",
+        AsyncMock(return_value={"fingerprint": receipt.approved_records_sha256, "pairs": receipt.custom_pair_count}),
+    )
+    monkeypatch.setattr(custom, "verify_approved_site_sources", AsyncMock(return_value=()))
+    monkeypatch.setattr(custom, "_source_alias_layout", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        custom,
+        "_artifact_identity",
+        AsyncMock(
+            return_value=(
+                receipt.schema_oid,
+                receipt.address_table_oid,
+                receipt.binding_table_oid,
+                receipt.office_lookup_index_oid,
+            )
+        ),
+    )
+    return connection, receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native_base", [False, True])
+@pytest.mark.parametrize("damage", [None, "output_shape", "base_custody"])
+async def test_composition_keeps_custody_and_column_shape_separate(
+    composition_verification, monkeypatch, native_base, damage
+):
+    connection, receipt = composition_verification
+    shape = "a" * 64 if not native_base else "d" * 64
+    identity = receipt.source_oids if damage != "base_custody" else (99, *receipt.source_oids[1:])
+    dependency = AsyncMock(return_value=identity)
+    base_shape = AsyncMock(return_value=shape)
+    output = AsyncMock(return_value=(11, 12, 15, "e" * 64 if damage == "output_shape" else shape))
+    monkeypatch.setattr(custom, "_artifact_dependency_identity", dependency)
+    monkeypatch.setattr(custom, "_source_shape", base_shape)
+    monkeypatch.setattr(custom, "_source_identity", output)
+    if damage:
+        message = "address shape differs" if damage == "output_shape" else "source physical identity differs"
+        with pytest.raises(custom.NetworkCustomAddressSourceError, match=message):
+            await custom.verify_custom_address_source(connection, receipt)
+    else:
+        assert await custom.verify_custom_address_source(connection, receipt) == receipt
+        assert custom._from_document(connection.fetchval.return_value) == receipt
+    dependency.assert_awaited_once_with(
+        connection, receipt.base_source, receipt.runtime_roles, address=True, control_schema=receipt.control_schema
+    )
+    if damage == "base_custody":
+        base_shape.assert_not_awaited()
+        output.assert_not_awaited()
+    else:
+        base_shape.assert_awaited_once_with(connection, receipt.source_oids[1], address=True)
+        output.assert_awaited_once_with(connection, receipt.address_source, receipt.runtime_roles, address=True)

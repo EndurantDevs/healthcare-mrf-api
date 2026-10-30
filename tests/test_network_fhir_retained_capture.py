@@ -25,6 +25,7 @@ from process.network_fhir_membership_source import (
 from process.network_fhir_retained_capture_contract import (
     PRODUCER,
     REFUSAL,
+    SEMANTIC_PROFILE,
     TABLES,
     RetainedFHIRCapture,
     RetainedFHIRCaptureError,
@@ -78,6 +79,56 @@ def retained():
         "0" * 64,
     )
     return replace(capture, capture_sha256=capture_digest(capture))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["legacy", "historical_semantic", "native"])
+async def test_capture_guard_route_never_falls_back_from_failed_native_proof(monkeypatch, profile):
+    origin = retained().origin
+    if profile != "legacy":
+        origin = replace(
+            origin,
+            admission_profile=SEMANTIC_PROFILE,
+            original_admission_refusal=None,
+            admission_metadata_sha256="4" * 64,
+            semantic_projection_as_of="2026-01-01",
+            descriptor_counts=origin.resource_counts,
+        )
+    for name in ("_reader_identity", "_require_transaction", "_check_roles", "_same_database"):
+        monkeypatch.setattr(capture, name, AsyncMock())
+    monkeypatch.setattr(capture, "_origin_header", AsyncMock(return_value={} if profile == "native" else None))
+    legacy_guard = AsyncMock(side_effect=RetainedFHIRCaptureError("historical-guard"))
+    native_proof = AsyncMock(side_effect=RetainedFHIRCaptureError("native-proof"))
+    monkeypatch.setattr(capture, "_origin_guard", legacy_guard)
+    monkeypatch.setattr(capture, "require_native_generic_snapshot", native_proof)
+    writer = SimpleNamespace(
+        fetchrow=AsyncMock(
+            return_value=dict(
+                login="capture_writer",
+                actor="capture_writer",
+                rolcanlogin=True,
+                rolsuper=False,
+                rolcreatedb=False,
+                rolcreaterole=False,
+                rolreplication=False,
+                rolbypassrls=False,
+            )
+        ),
+        execute=AsyncMock(),
+    )
+    expected = "native-proof" if profile == "native" else "historical-guard"
+    with pytest.raises(RetainedFHIRCaptureError, match=expected):
+        await capture.capture_retained_fhir_source(
+            object(),
+            writer,
+            origin,
+            capture_id=uuid4(),
+            owner_role="capture_owner",
+            runtime_roles=(origin.reader_role,),
+        )
+    assert native_proof.await_count == (1 if profile == "native" else 0)
+    assert legacy_guard.await_count == (0 if profile == "native" else 1)
+    writer.execute.assert_not_awaited()
 
 
 def pin(value):
@@ -305,6 +356,190 @@ def test_modern_payload_hash_uses_declared_algorithm_without_legacy_fallback():
 
 
 @pytest.mark.asyncio
+async def test_reader_export_preserves_start_failure_without_rollback():
+    start = AsyncMock(side_effect=ValueError("synthetic savepoint start failure"))
+    rollback = AsyncMock()
+    reader = SimpleNamespace(transaction=lambda: SimpleNamespace(start=start, rollback=rollback))
+    with pytest.raises(ValueError, match="synthetic savepoint start failure"):
+        await capture._reader_export(reader, "SELECT 1")
+    rollback.assert_not_awaited()
+
+
+def derived_plan_rows(count, *, references=6):
+    """Expand a normal resource page into more derived network rows than one COPY."""
+    rows = []
+    for index in range(count):
+        payload = {
+            "source_id": "source-one",
+            "resource_id": f"plan-{index}",
+            "name": "Example visión plan",
+            "network_refs": [f"Organization/network-{number}" for number in range(references)],
+            "owned_by_ref": "Organization/owner-one",
+            "administered_by_ref": "Organization/administrator-one",
+        }
+        rows.append(
+            {
+                "resource_type": "InsurancePlan",
+                "resource_id": payload["resource_id"],
+                "payload_json": json.dumps(payload, ensure_ascii=False),
+                "payload_hash": legacy_resource_payload_sha256(payload),
+            }
+        )
+    return rows
+
+
+def derived_writer():
+    """Retain each exact COPY batch before the caller releases its buffer."""
+    batches = []
+
+    async def copy(table, *, schema_name, records):
+        batches.append((table, schema_name, tuple(records)))
+        return f"COPY {len(records)}"
+
+    return SimpleNamespace(copy_records_to_table=AsyncMock(side_effect=copy)), batches
+
+
+@pytest.mark.asyncio
+async def test_derived_copy_splits_expanded_plan_page_without_losing_evidence():
+    origin, rows = retained().origin, derived_plan_rows(1000)
+    writer, batches = derived_writer()
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    await capture._derived(writer, "capture_example", origin, "release-one", rows, observed_at)
+    assert [len(batch) for _, _, batch in batches] == [5000, 1000]
+    assert {(table, schema) for table, schema, _ in batches} == {(TABLES[4], "capture_example")}
+    expected_rows = []
+    for resource in rows:
+        payload = json.loads(resource["payload_json"])
+        for reference in sorted(payload["network_refs"]):
+            expected_rows.append(
+                (
+                    origin.source_id,
+                    "release-one",
+                    "Organization",
+                    reference.split("/", 1)[1],
+                    resource["resource_id"],
+                    capture.canonical(payload["network_refs"]),
+                    payload["owned_by_ref"],
+                    payload["administered_by_ref"],
+                    resource["payload_hash"],
+                    capture.canonical(payload),
+                    observed_at,
+                )
+            )
+    assert [record for _, _, batch in batches for record in batch] == expected_rows
+
+
+@pytest.mark.asyncio
+async def test_derived_copy_splits_at_encoded_byte_bound_and_preserves_exact_boundary(monkeypatch):
+    origin, rows = retained().origin, derived_plan_rows(3, references=1)
+    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    writer, baseline = derived_writer()
+    await capture._derived(writer, "capture_example", origin, "release-one", rows, observed_at)
+    expected_rows = baseline[0][2]
+    encoded_rows = [capture.canonical([str(value) for value in record]) for record in expected_rows]
+    sizes = [len(value.encode()) for value in encoded_rows]
+    assert len(set(sizes)) == 1 and sizes[0] > len(encoded_rows[0])
+    assert capture._DERIVED_BATCH_ROWS == 5000 and capture._DERIVED_BATCH_BYTES == 64 * 1024**2
+    monkeypatch.setattr(capture, "_DERIVED_BATCH_BYTES", 2 * sizes[0])
+    writer, batches = derived_writer()
+    await capture._derived(writer, "capture_example", origin, "release-one", rows, observed_at)
+    assert [len(batch) for _, _, batch in batches] == [2, 1]
+    assert [record for _, _, batch in batches for record in batch] == list(expected_rows)
+    assert all(
+        sum(len(capture.canonical([str(value) for value in record]).encode()) for record in batch)
+        <= capture._DERIVED_BATCH_BYTES
+        for _, _, batch in batches
+    )
+    monkeypatch.setattr(capture, "_DERIVED_BATCH_BYTES", sizes[0] - 1)
+    writer, _ = derived_writer()
+    with pytest.raises(RetainedFHIRCaptureError):
+        await capture._derived(writer, "capture_example", origin, "release-one", rows, observed_at)
+    writer.copy_records_to_table.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_derived_copy_still_refuses_wrong_native_copy_accounting():
+    writer = SimpleNamespace(copy_records_to_table=AsyncMock(return_value="COPY 0"))
+    with pytest.raises(RetainedFHIRCaptureError):
+        await capture._derived(
+            writer,
+            "capture_example",
+            retained().origin,
+            "release-one",
+            derived_plan_rows(1, references=1),
+            datetime(2026, 1, 1, tzinfo=UTC),
+        )
+    writer.copy_records_to_table.assert_awaited_once()
+
+
+async def test_reference_derived_batches_verify_in_owner_task_before_drained_copy(monkeypatch):
+    owner, events = asyncio.current_task(), []
+
+    async def verify():
+        assert asyncio.current_task() is owner
+        events.append("verify")
+
+    async def copy(_table, *, schema_name, records):
+        assert asyncio.current_task() is not owner
+        events.append("copy")
+        return f"COPY {len(records)}"
+
+    monkeypatch.setattr(capture, "_DERIVED_BATCH_ROWS", 1)
+    writer = SimpleNamespace(copy_records_to_table=copy)
+    await capture._derived(
+        writer,
+        "capture_example",
+        retained().origin,
+        "release-one",
+        derived_plan_rows(3, references=1),
+        datetime(2026, 1, 1, tzinfo=UTC),
+        verify=verify,
+    )
+    assert events == ["verify", "copy"] * 3
+
+
+def test_registered_native_capture_caller_matches_reference_rows_and_roots():
+    from process import network_fhir_retained_native as native
+    from tests.test_network_fhir_retained_native import _decode
+
+    origin, observed = retained().origin, datetime(2026, 1, 1, tzinfo=UTC)
+    resource_rows = []
+    for kind, identity, fields in [
+        ("Location", "site-one", {"latitude": 1.5}),
+        ("Organization", "org-one", {"name": "Example"}),
+        ("Organization", "org-two", {"name": "Café"}),
+    ]:
+        payload_by_field = {"source_id": origin.source_id, "resource_id": identity, **fields}
+        resource_rows.append(
+            dict(
+                resource_type=kind,
+                resource_id=identity,
+                payload_json=json.dumps(payload_by_field),
+                payload_hash=legacy_resource_payload_sha256(payload_by_field),
+                acquired_resource_sha256=None,
+            )
+        )
+    prepared = capture._prepare_native_resources(resource_rows, origin, "release-one", observed, True)
+    assert prepared.fallback_rows == (0,) and prepared.row_count == 3
+    reference, _ = native._fallback_batches(capture._derived_records(origin, "release-one", resource_rows, observed), 0)
+    for actual, expected in zip(prepared.copy_batches, reference, strict=True):
+        order = lambda row: tuple(b"" if field is None else field for field in row)
+        assert sorted(_decode(actual), key=order) == sorted(_decode(expected), key=order)
+    roots, counts = {kind: hashlib.sha256() for kind, _ in origin.resource_counts}, dict(origin.resource_counts)
+    counts = dict.fromkeys(counts, 0)
+    root = hashlib.sha256()
+    capture._fold_rows(resource_rows, origin, roots, counts, root, 0)
+    native_root_by_family = {kind: hashlib.sha256() for kind in roots}
+    native_counts = dict.fromkeys(counts, 0)
+    native_root = hashlib.sha256()
+    assert capture._fold_prepared(prepared, native_root_by_family, native_counts, native_root, 0) == 3
+    assert native_root.hexdigest() == root.hexdigest() and native_counts == counts
+    assert {kind: family_digest.hexdigest() for kind, family_digest in native_root_by_family.items()} == {
+        kind: family_digest.hexdigest() for kind, family_digest in roots.items()
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["start", "copy"])
 async def test_reader_export_preserves_failure(phase):
     failure = ValueError("synthetic export failure")
@@ -491,110 +726,3 @@ async def test_resource_verify_reduces_page_without_skipping():
     reader.fetch.assert_awaited_once()
     assert reader.fetch.await_args.args[1:] == (origin.dataset_id,)
     assert '"capture_example".' in reader.fetch.await_args.args[0]
-
-
-def derived_plan_rows(count, *, references=6):
-    """Expand a normal resource page into more derived network rows than one COPY."""
-    rows = []
-    for index in range(count):
-        payload = {
-            "source_id": "source-one",
-            "resource_id": f"plan-{index}",
-            "name": "Example visión plan",
-            "network_refs": [f"Organization/network-{number}" for number in range(references)],
-            "owned_by_ref": "Organization/owner-one",
-            "administered_by_ref": "Organization/administrator-one",
-        }
-        rows.append(
-            {
-                "resource_type": "InsurancePlan",
-                "resource_id": payload["resource_id"],
-                "payload_json": json.dumps(payload, ensure_ascii=False),
-                "payload_hash": legacy_resource_payload_sha256(payload),
-            }
-        )
-    return rows
-
-
-def derived_writer():
-    """Retain each exact COPY batch before the caller releases its buffer."""
-    batches = []
-
-    async def copy(table, *, schema_name, records):
-        batches.append((table, schema_name, tuple(records)))
-        return f"COPY {len(records)}"
-
-    return SimpleNamespace(copy_records_to_table=AsyncMock(side_effect=copy)), batches
-
-
-@pytest.mark.asyncio
-async def test_derived_copy_splits_expanded_plan_page_without_losing_evidence():
-    origin, rows = retained().origin, derived_plan_rows(1000)
-    writer, batches = derived_writer()
-    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
-    await capture._derived(writer, "capture_example", origin, "release-one", rows, observed_at)
-    assert [len(batch) for _, _, batch in batches] == [5000, 1000]
-    assert {(table, schema) for table, schema, _ in batches} == {(TABLES[4], "capture_example")}
-    expected_rows = []
-    for resource in rows:
-        payload = json.loads(resource["payload_json"])
-        for reference in sorted(payload["network_refs"]):
-            expected_rows.append(
-                (
-                    origin.source_id,
-                    "release-one",
-                    "Organization",
-                    reference.split("/", 1)[1],
-                    resource["resource_id"],
-                    capture.canonical(payload["network_refs"]),
-                    payload["owned_by_ref"],
-                    payload["administered_by_ref"],
-                    resource["payload_hash"],
-                    capture.canonical(payload),
-                    observed_at,
-                )
-            )
-    assert [record for _, _, batch in batches for record in batch] == expected_rows
-
-
-@pytest.mark.asyncio
-async def test_derived_copy_splits_at_encoded_byte_bound_and_preserves_exact_boundary(monkeypatch):
-    origin, rows = retained().origin, derived_plan_rows(3, references=1)
-    observed_at = datetime(2026, 1, 1, tzinfo=UTC)
-    writer, baseline = derived_writer()
-    await capture._derived(writer, "capture_example", origin, "release-one", rows, observed_at)
-    expected_rows = baseline[0][2]
-    encoded_rows = [capture.canonical([str(value) for value in record]) for record in expected_rows]
-    sizes = [len(value.encode()) for value in encoded_rows]
-    assert len(set(sizes)) == 1 and sizes[0] > len(encoded_rows[0])
-    assert capture._DERIVED_BATCH_ROWS == 5000 and capture._DERIVED_BATCH_BYTES == 64 * 1024**2
-    monkeypatch.setattr(capture, "_DERIVED_BATCH_BYTES", 2 * sizes[0])
-    writer, batches = derived_writer()
-    await capture._derived(writer, "capture_example", origin, "release-one", rows, observed_at)
-    assert [len(batch) for _, _, batch in batches] == [2, 1]
-    assert [record for _, _, batch in batches for record in batch] == list(expected_rows)
-    assert all(
-        sum(len(capture.canonical([str(value) for value in record]).encode()) for record in batch)
-        <= capture._DERIVED_BATCH_BYTES
-        for _, _, batch in batches
-    )
-    monkeypatch.setattr(capture, "_DERIVED_BATCH_BYTES", sizes[0] - 1)
-    writer, _ = derived_writer()
-    with pytest.raises(RetainedFHIRCaptureError):
-        await capture._derived(writer, "capture_example", origin, "release-one", rows, observed_at)
-    writer.copy_records_to_table.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_derived_copy_still_refuses_wrong_native_copy_accounting():
-    writer = SimpleNamespace(copy_records_to_table=AsyncMock(return_value="COPY 0"))
-    with pytest.raises(RetainedFHIRCaptureError):
-        await capture._derived(
-            writer,
-            "capture_example",
-            retained().origin,
-            "release-one",
-            derived_plan_rows(1, references=1),
-            datetime(2026, 1, 1, tzinfo=UTC),
-        )
-    writer.copy_records_to_table.assert_awaited_once()

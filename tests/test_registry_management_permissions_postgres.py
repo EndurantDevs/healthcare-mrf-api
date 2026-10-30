@@ -145,7 +145,7 @@ async def _draft(fixture, command, actor):
 async def test_full_draft_services_and_protected_publisher_approval(permissions_db):
     fixture, actor = permissions_db, _actor()
     receipt = await _install(fixture)
-    assert len(receipt["table_oids"]) == 39 and len(receipt["sequence_oids"]) == 2
+    assert len(receipt["table_oids"]) == 40 and len(receipt["sequence_oids"]) == 2
     assert set(receipt["table_oids"]) == set(_TABLES)
     commands = [create_record(kind) for kind in ("group", "company", "network")]
     created_records = [await _draft(fixture, command, actor) for command in commands]
@@ -697,7 +697,7 @@ async def _assert_read_bridge_denies_writes(fixture):
 async def _retire_read_bridge(fixture, namespace):
     async with fixture.connection.transaction():
         retired = await retire_registry_read_views(fixture.connection, **_provision_arguments(fixture, namespace))
-    assert retired["retired_views"] == len(_TABLES) == 39
+    assert retired["retired_views"] == len(_TABLES) == 40
     assert set(retired["view_oids"]) == set(_TABLES)
     assert (
         await fixture.connection.fetchval(
@@ -934,7 +934,7 @@ async def test_ptg_protected_lookup_preserves_approver_grants_after_cutover(perm
     engine = create_async_engine(fixture.sessions.kw["bind"].url, pool_size=1, max_overflow=0)
     try:
         receipt = await _provision_registry(fixture, namespace)
-        assert set(_PTG_TABLES) <= set(receipt["table_oids"]) and len(receipt["table_oids"]) == 39
+        assert set(_PTG_TABLES) <= set(receipt["table_oids"]) and len(receipt["table_oids"]) == 40
         assert await _ptg_grants(fixture, namespace) == original_grants
         await _assert_ptg_protected_stores(fixture, namespace)
         await _assert_dormant_ptg_reader(fixture, namespace, dormant)
@@ -1063,7 +1063,7 @@ async def test_retained_ptg_receipts_refuse_empty_cutover_without_rewriting(perm
         )
         == original_oids
     )
-    assert len(original_oids) == 39
+    assert len(original_oids) == 40
     for name, rows in originals_by_table.items():
         assert await fixture.connection.fetch(f'SELECT * FROM "{fixture.schema}"."{name}" ORDER BY 1') == rows
 
@@ -1169,7 +1169,7 @@ async def test_read_bridge_retirement_refuses_dependents_and_api(permissions_db)
                 fixture.schema,
                 sorted(_TABLES),
             )
-            == 39
+            == 40
         )
         await connection.execute(f"DROP VIEW {dependency} RESTRICT")
         await _retire_read_bridge(fixture, namespace)

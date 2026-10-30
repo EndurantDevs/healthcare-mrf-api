@@ -253,11 +253,12 @@ def test_nested_billing_authority_can_be_checked_before_reader(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_exact_retained_lineage_is_one_set_query_on_same_reader():
+    from tests.network_read_execution_support import with_read_identity_receipts
     from tests.ptg2_billing_geo_reader_support import NPI_A, _location_row
     from tests.ptg2_serving_coverage_paydown_support import FakeResult, FakeSession
 
     rows = [{**_location_row(NPI_A), "_geo_evidence_level": "nppes_registry_address", "_geo_evidence_source_id": 1}]
-    session = FakeSession([FakeResult([])])
+    session = with_read_identity_receipts(FakeSession([FakeResult([])]))
     with _scope(exclusions=(19,)) as manifest:
         await policy._retained_lineage(session, native, rows)
     assert len(session.calls) == 1

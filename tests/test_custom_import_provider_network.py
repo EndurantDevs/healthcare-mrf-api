@@ -22,6 +22,7 @@ from process.custom_import.read_contracts import CustomImportReadRequestError
 from process.network_serving_read import NetworkServingReadUnavailable, PinnedNetworkServingManifest
 from tests import test_custom_import_provider_batch as batch_fixtures
 from tests import test_custom_import_provider_http as page_fixtures
+from tests.network_read_execution_support import _ReceiptDriver, mock_approved_control_metadata
 from tests.openapi_route_contract_support import load_openapi_document
 
 _MANIFEST = PinnedNetworkServingManifest(
@@ -58,7 +59,14 @@ def _body(document):
 class _ScopedSession(page_fixtures._Session):
     def __init__(self):
         super().__init__()
-        self.driver = object()
+        self._transaction = object()
+        self.driver = _ReceiptDriver(self, None)
+
+    def in_transaction(self):
+        return self.already_active or "begin" in self.events and "end" not in self.events
+
+    def get_transaction(self):
+        return self._transaction if self.in_transaction() else None
 
     async def connection(self):
         self.events.append("connection")
@@ -66,7 +74,7 @@ class _ScopedSession(page_fixtures._Session):
             get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=self.driver))
         )
 
-    async def execute(self, statement):
+    async def execute(self, statement, parameters=None):
         if str(statement).startswith("LOCK TABLE"):
             assert str(statement) == f'LOCK TABLE "{_MANIFEST.schema_name}".entity_address_unified IN ACCESS SHARE MODE'
             self.events.append("heap-lock")
@@ -75,7 +83,10 @@ class _ScopedSession(page_fixtures._Session):
 
 
 def _install_manifest(monkeypatch, session, *, failure=None, manifest=_MANIFEST):
-    async def resolve(driver, *, generation_id):
+    mock_approved_control_metadata(monkeypatch, events=session.events)
+
+    async def resolve(driver, *, generation_id, api_read):
+        assert api_read is True
         assert driver is session.driver and generation_id == 7
         assert session.events[:2] == ["begin", "snapshot"]
         session.events.append("manifest")
@@ -236,7 +247,8 @@ async def test_signed_page_pins_scope_before_import_preparation_and_keeps_inclus
     assert reply.headers["Cache-Control"] == "private, no-store"
     assert ("hydrate" in session.events) is include_filter
     assert ("custom_import" in json.loads(reply.body)["rows"][0]) is include_filter
-    assert session.events.index("heap-lock") < session.events.index("prepare") < session.events.index("page")
+    assert "heap-lock" not in session.events
+    assert session.events.index("approved-pin") < session.events.index("prepare") < session.events.index("page")
     assert current_network_address_scope() is None
 
 
@@ -400,7 +412,9 @@ async def test_signed_legacy_subset_is_resolved_pinned_enforced_and_acknowledged
     """The acknowledgement comes from the enforced context after actual mapping."""
     session = _ScopedSession()
     page_fixtures._install(monkeypatch, session, page_rows=[{"npi": 1104212877}])
-    session.driver = SimpleNamespace(fetchrow=AsyncMock(return_value={"complete": True, "network_ids": [42, 88]}))
+    session.driver.delegate = SimpleNamespace(
+        fetchrow=AsyncMock(return_value={"complete": True, "network_ids": [42, 88]})
+    )
     _install_manifest(monkeypatch, session)
     original_reader = providers._read_provider_payload
 
@@ -418,7 +432,12 @@ async def test_signed_legacy_subset_is_resolved_pinned_enforced_and_acknowledged
     reply = await providers.serve_custom_import_providers(page_fixtures._request(_body(document)), session)
     assert reply.status == 200
     assert reply.headers["X-Network-Legacy-Checksums"] == ",".join(map(str, checksums))
-    assert session.driver.fetchrow.await_args.args[1:] == (0, tuple(map(str, checksums)), "checksum_network", ())
+    assert session.driver.delegate.fetchrow.await_args.args[1:] == (
+        0,
+        tuple(map(str, checksums)),
+        "checksum_network",
+        (),
+    )
     assert current_network_address_scope() is None
     assert "X-Network-Legacy-Checksums" not in network.provider_network_response({}, _MANIFEST).headers
 
@@ -437,7 +456,7 @@ async def test_signed_legacy_subset_refuses_missing_or_different_pinned_mapping(
     """Never prepare, read or acknowledge a partially resolved legacy subset."""
     session = _ScopedSession()
     page_fixtures._install(monkeypatch, session)
-    session.driver = SimpleNamespace(fetchrow=AsyncMock(return_value=mapping))
+    session.driver.delegate = SimpleNamespace(fetchrow=AsyncMock(return_value=mapping))
     _install_manifest(monkeypatch, session)
     document = _bound_document()
     document["network_binding"]["legacy_checksums"] = [42]

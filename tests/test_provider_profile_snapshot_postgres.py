@@ -16,7 +16,12 @@ from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
 from db.connection import current_session
 from tests.npi_near_snapshot_postgres_support import check_near_cleanup, check_near_cutover
-from tests.provider_profile_snapshot_postgres_support import grant_profile_reader, publish_family, snapshot_database
+from tests.provider_profile_snapshot_postgres_support import (
+    create_directory_partitions,
+    grant_profile_reader,
+    publish_family,
+    snapshot_database,
+)
 
 NPI = 1000000004
 
@@ -84,6 +89,7 @@ async def test_snapshot_pins_rows_when_independent_updates_commit(monkeypatch):
 
 async def test_cancelled_read_releases_all_relation_locks(monkeypatch):
     async with snapshot_database(monkeypatch) as (database, schema):
+        await create_directory_partitions(database, schema)
         reached_read = asyncio.Event()
         sessions = []
 
@@ -99,6 +105,9 @@ async def test_cancelled_read_releases_all_relation_locks(monkeypatch):
         with pytest.raises(asyncio.CancelledError):
             await reader
         assert not sessions[0].in_transaction()
+        async with database.engine.begin() as connection:
+            roots = ", ".join(f'"{schema}"."{name}"' for name in sorted(snapshot._DIRECTORY_PARTITION_ROOTS))
+            await connection.execute(text(f"LOCK TABLE {roots} IN ACCESS EXCLUSIVE MODE NOWAIT"))
         await asyncio.wait_for(publish_family(database, schema), 3)
 
 
@@ -107,7 +116,10 @@ async def test_cutover_lock_timeout_releases_snapshot(monkeypatch):
         async with database.session_factory() as writer, writer.begin():
             await writer.execute(text(f'LOCK TABLE "{schema}".cms_doctor_education IN ACCESS EXCLUSIVE MODE'))
             with pytest.raises(ServiceUnavailable) as caught:
-                async with snapshot.provider_profile_read_snapshot(database, schema):
+                async with snapshot.provider_profile_read_snapshot(database, schema) as session:
+                    await snapshot.execute_network_read(
+                        session, text(f'SELECT medical_school FROM "{schema}".cms_doctor_education')
+                    )
                     pytest.fail("A contended family cannot be read")
             assert "cms_doctor_education" not in str(caught.value)
             assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
@@ -130,29 +142,32 @@ async def test_lock_conflict_retries_a_fresh_snapshot_after_real_publication(mon
     async with snapshot_database(monkeypatch) as (database, schema):
         entered, release = asyncio.Event(), asyncio.Event()
         sessions = []
-        lock_relations = snapshot._lock_serving_relations
+        read_authorities = snapshot._read_native_authorities
 
         async def publish():
             async with database.session_factory() as writer:
                 async with writer.begin():
-                    await writer.execute(text(f'LOCK TABLE "{schema}".cms_doctor_education IN ACCESS EXCLUSIVE MODE'))
+                    await writer.execute(
+                        text(f'LOCK TABLE "{schema}".reference_family_result_generation IN ACCESS EXCLUSIVE MODE')
+                    )
                     entered.set()
                     await release.wait()
                 await publish_family(database, schema)
 
         publication = asyncio.create_task(publish())
 
-        async def lock(session, schema_name, **options):
+        async def authority(session, schema_name, relation_oids, **options):
             sessions.append(session)
             try:
-                return await lock_relations(session, schema_name, **options)
-            except DBAPIError as error:
-                assert snapshot.postgres_sqlstate(error) == "55P03" and len(sessions) == 1
+                return await read_authorities(session, schema_name, relation_oids, **options)
+            except snapshot._ReadSQLFailure as error:
+                original = snapshot._read_sql_failure_cause(error, session)
+                assert original is not None and snapshot.postgres_sqlstate(original) == "55P03" and len(sessions) == 1
                 release.set()
                 await asyncio.wait_for(publication, 3)
                 raise
 
-        monkeypatch.setattr(snapshot, "_lock_serving_relations", lock)
+        monkeypatch.setattr(snapshot, "_read_native_authorities", authority)
         try:
             await asyncio.wait_for(entered.wait(), 3)
             async with snapshot.provider_profile_read_snapshot(database, schema):
@@ -191,8 +206,8 @@ async def test_rename_setup_retries_only_a_fresh_owned_snapshot(monkeypatch):
 
 async def test_writer_transaction_cannot_enter_reader_snapshot(monkeypatch):
     async with snapshot_database(monkeypatch) as (database, schema):
-        setup = AsyncMock(wraps=snapshot._lock_serving_relations)
-        monkeypatch.setattr(snapshot, "_lock_serving_relations", setup)
+        setup = AsyncMock(wraps=snapshot._inventory_serving_relations)
+        monkeypatch.setattr(snapshot, "_inventory_serving_relations", setup)
         async with database.transaction():
             with pytest.raises(RuntimeError, match="Cannot open a Reader inside a Writer transaction"):
                 async with snapshot.provider_profile_read_snapshot(database, schema):
@@ -372,3 +387,65 @@ async def test_near_read_failure_releases_snapshot(monkeypatch):
 async def test_near_cancellation_releases_snapshot(monkeypatch):
     """Cancellation must release the Reader before publication."""
     await check_near_cleanup(monkeypatch, cancelled=True)
+
+
+@pytest.mark.parametrize(
+    "populated,partition_kind", [(False, "single"), (True, "single"), (True, "history"), (True, "default")]
+)
+async def test_directory_partition_snapshot_reads_native_models(monkeypatch, populated, partition_kind):
+    """The actual catalog admits empty roots and ordinary leaves under the same Reader."""
+    async with snapshot_database(monkeypatch) as (database, schema):
+        await create_directory_partitions(database, schema, populated=populated, partition_kind=partition_kind)
+        async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
+            for name in sorted(snapshot._DIRECTORY_PARTITION_ROOTS):
+                result = await snapshot.execute_network_read(session, text(f'SELECT count(*) FROM "{schema}"."{name}"'))
+                assert result.scalar() == int(populated)
+                assert snapshot.snapshot_relation_available(f"{schema}.{name}") is True
+            assert await session.scalar(text("SHOW transaction_read_only")) == "on"
+            assert await session.scalar(text("SHOW transaction_isolation")) == "repeatable read"
+        assert not session.in_transaction() and snapshot._SNAPSHOT.get() is None
+
+
+@pytest.mark.parametrize("topology", ["wrong-key", "nested", "inheritance"])
+async def test_directory_partition_snapshot_refuses_unsupported_shapes(monkeypatch, topology):
+    async with snapshot_database(monkeypatch) as (database, schema):
+        name = "provider_directory_dataset_resource"
+        root = f'"{schema}"."{name}"'
+        partitioning = (
+            ""
+            if topology == "inheritance"
+            else f" PARTITION BY LIST ({'marker' if topology == 'wrong-key' else 'dataset_id'})"
+        )
+        await database.status(f"CREATE TABLE {root} (dataset_id text, marker text){partitioning}")
+        if topology == "nested":
+            await database.status(
+                f"CREATE TABLE \"{schema}\".leaf PARTITION OF {root} FOR VALUES IN ('fixture') PARTITION BY LIST(marker)"
+            )
+        elif topology == "inheritance":
+            await database.status(f'CREATE TABLE "{schema}".leaf () INHERITS ({root})')
+        await grant_profile_reader(database, schema, (name,))
+        with pytest.raises(ServiceUnavailable):
+            async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True):
+                pytest.fail("unsupported partition shape reached a loader")
+        assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
+
+
+async def test_directory_partition_snapshot_blocks_leaf_detach(monkeypatch):
+    """Legacy recursive locks preserve existing leaf semantics until the Reader exits."""
+    async with snapshot_database(monkeypatch) as (database, schema):
+        await create_directory_partitions(database, schema)
+        root = f'"{schema}".provider_directory_dataset_resource'
+        detach = text(f'ALTER TABLE {root} DETACH PARTITION "{schema}".provider_directory_dataset_resource_leaf')
+        async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
+            assert (await snapshot.execute_network_read(session, text(f"SELECT count(*) FROM {root}"))).scalar() == 1
+            with pytest.raises(DBAPIError) as caught:
+                async with database.engine.begin() as writer:
+                    await writer.execute(text("SET LOCAL lock_timeout='50ms'"))
+                    await writer.execute(detach)
+            assert snapshot.postgres_sqlstate(caught.value) == "55P03"
+            assert (await snapshot.execute_network_read(session, text(f"SELECT count(*) FROM {root}"))).scalar() == 1
+        async with database.engine.begin() as writer:
+            await writer.execute(text("SET LOCAL lock_timeout='250ms'"))
+            await writer.execute(detach)
+        async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
+            assert (await snapshot.execute_network_read(session, text(f"SELECT count(*) FROM {root}"))).scalar() == 0

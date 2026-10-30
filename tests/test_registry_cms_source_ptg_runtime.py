@@ -137,7 +137,7 @@ async def test_mixed_attempt_dispatches_real_adapter_after_snapshot_and_keeps_ra
         monkeypatch.setattr(
             consumer, "compose_registry_membership_candidate", AsyncMock(side_effect=AssertionError("raw path"))
         )
-        monkeypatch.setattr(consumer, "prepare_network_candidate", prepare)
+        monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
         monkeypatch.setattr(consumer, "publish_network_candidate", publish)
         publication = await consumer._attempt(
             connection, notice, consumer._event(notice, config), config, "endpoint-one"
@@ -166,7 +166,7 @@ async def test_missing_runtime_keeps_ptg_owner_refusal_before_prepare_or_publish
 
     prepare, publish = AsyncMock(), AsyncMock()
     monkeypatch.setattr(consumer, "compose_registry_membership_candidate", compose)
-    monkeypatch.setattr(consumer, "prepare_network_candidate", prepare)
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
     monkeypatch.setattr(consumer, "publish_network_candidate", publish)
     with pytest.raises(ValueError, match="registry_ptg_office_recipe_owner_unavailable"):
         await consumer._attempt(connection, notice, consumer._event(notice, config), config, "endpoint-one")
@@ -300,7 +300,7 @@ async def test_runtime_identity_refusal_has_no_raw_composer_fallback(monkeypatch
         raw_compose, prepare = AsyncMock(), AsyncMock()
         monkeypatch.setattr(adapter.RegistryPublicationPTGRuntime, "_same_execution_database", identity)
         monkeypatch.setattr(consumer, "compose_registry_membership_candidate", raw_compose)
-        monkeypatch.setattr(consumer, "prepare_network_candidate", prepare)
+        monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
         with pytest.raises(ValueError, match="registry_publication_ptg_execution_changed"):
             await consumer._attempt(connection, notice, consumer._event(notice, config), config, "endpoint-one")
         assert not connection.active

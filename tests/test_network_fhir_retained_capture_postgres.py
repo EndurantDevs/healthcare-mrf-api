@@ -67,8 +67,10 @@ from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
+from process.registry_source_office_errors import SourceOfficeNotReady
 from process.registry_source_recipe_composition import (
     RegistrySourceCompositionError,
+    SourceRecipeReadContext,
     _read_recipe_page,
     _require_recipe_custody,
     stage_registry_source_recipes,
@@ -85,6 +87,7 @@ from tests.test_network_custom_address_source_postgres import (
     bootstrap_db as bootstrap_db,
 )
 from tests.test_network_membership_pipeline_postgres import pipeline_db as pipeline_db
+from tests.test_network_membership_publication_postgres import _restore_candidate_owners
 from tests.test_network_membership_validation_postgres import (
     validation_db as validation_db,
 )
@@ -764,7 +767,12 @@ async def test_closed_capture_recipe_selects_only_exact_office(legacy_capture_db
             )
             assert pin.office_count == 1
         else:
-            with pytest.raises(InitialCMSOfficeBindingError, match="correspondence_unresolved"):
+            expected_error, reason = (
+                (SourceOfficeNotReady, "registry_source_office_not_ready")
+                if office_case == "sibling"
+                else (InitialCMSOfficeBindingError, "initial_cms_office_correspondence_unresolved")
+            )
+            with pytest.raises(expected_error, match=reason):
                 await pin_cms_office_address_source(
                     reader,
                     batch,
@@ -1248,7 +1256,7 @@ async def test_unselected_missing_organization_keeps_complete_read_and_stage_acc
             approved,
             request_id=uuid4(),
             control_schema=serving_schema[1],
-            retained_fhir_reads={capture: read},
+            read_context=SourceRecipeReadContext(retained_fhir_reads={capture: read}),
         )
         assert stage.raw_source_rows == 2 and stage.accepted_raw_source_rows == accepted_resources
         assert stage.omitted_raw_source_rows == omitted_resources and stage.omitted_rows == 1
@@ -1302,7 +1310,7 @@ async def test_retained_selected_or_invalid_network_refuses_the_complete_stage(
                 approved,
                 request_id=uuid4(),
                 control_schema=serving_schema[1],
-                retained_fhir_reads={capture: read},
+                read_context=SourceRecipeReadContext(retained_fhir_reads={capture: read}),
             )
         assert (
             await reader.fetchval("SELECT count(*) FROM pg_class WHERE relnamespace=pg_my_temp_schema()")
@@ -1598,6 +1606,7 @@ async def retained_address_custody_db(pipeline_db, bootstrap_db):
     for extension in ("intarray", "postgis", "btree_gin"):
         await connection.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
     roles = tuple(sorted(case.writer_roles.values()))
+    original_owner = await connection.fetchval("SELECT quote_ident(current_user)")
     control_owner = "retained_control_" + uuid4().hex
     await connection.execute(f'CREATE ROLE "{control_owner}" NOLOGIN')
     try:
@@ -1630,17 +1639,11 @@ async def retained_address_custody_db(pipeline_db, bootstrap_db):
         yield case
     finally:
         await connection.execute("RESET ROLE")
-        await connection.execute(f'ALTER SCHEMA "{case.control_schema}" OWNER TO postgres')
+        await connection.execute(f'ALTER SCHEMA "{case.control_schema}" OWNER TO {original_owner}')
         for table in ("network_membership_candidate", "network_candidate_custody"):
-            await connection.execute(f'ALTER TABLE "{case.control_schema}".{table} OWNER TO postgres')
+            await connection.execute(f'ALTER TABLE "{case.control_schema}".{table} OWNER TO {original_owner}')
         # The outer candidate fixture still owns exact candidate-schema cleanup.
-        for schema in (case.copy_target.schema_name, *case.additional_schemas):
-            for relation in await connection.fetch(
-                "SELECT relname FROM pg_class WHERE relnamespace=to_regnamespace($1) AND relkind='r'",
-                schema,
-            ):
-                await connection.execute(f'ALTER TABLE "{schema}"."{relation["relname"]}" OWNER TO postgres')
-            await connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO postgres')
+        await _restore_candidate_owners(case, original_owner)
         await connection.execute(f'DROP OWNED BY "{control_owner}"')
         await connection.execute(f'DROP ROLE "{control_owner}"')
 

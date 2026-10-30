@@ -52,6 +52,7 @@ RELATIONS = tuple(
             snapshot.reference_generation.TABLE_NAME,
             address_generation.TABLE_NAME,
             snapshot._CMS_RECEIPT_TABLE,
+            "address_alias_state_v1",
         )
     )
 )
@@ -88,7 +89,7 @@ async def _install_detail_tables(component, monkeypatch):
         await _align_npi_receipt_validator_owner(connection, component.policy)
         await _grant_nppes_fixture_inputs(connection, component.policy)
         after_by_name = await snapshot._relation_oids(connection, schema, RELATIONS)
-        assert len(after_by_name) == 57
+        assert len(after_by_name) == 59
         assert all(
             oid is not None
             for name, oid in after_by_name.items()
@@ -466,7 +467,7 @@ async def _detail_source_fixture(monkeypatch):
             monkeypatch.setattr(fhir, "db", component.database)
             async with component.admin_engine.begin() as connection:
                 after_by_name = await snapshot._relation_oids(connection, component.policy.schema, RELATIONS)
-                assert len(after_by_name) == 57 and all(after_by_name.values())
+                assert len(after_by_name) == 59 and all(after_by_name.values())
                 await _grant_detail_reads(connection, component, after_by_name, after_by_name)
             yield SimpleNamespace(
                 engine=component.admin_engine,
@@ -480,7 +481,7 @@ async def _detail_source_fixture(monkeypatch):
 @asynccontextmanager
 async def detail_database(monkeypatch, tmp_path):
     """Install all detail families and seal the genuine NPI receipt on populated tables."""
-    assert len(RELATIONS) == 57
+    assert len(RELATIONS) == 59
 
     async with (
         _detail_source_fixture(monkeypatch) as fixture,
@@ -511,7 +512,7 @@ async def detail_database(monkeypatch, tmp_path):
             await raw.close()
         async with fixture.database.transaction() as session:
             oids = await snapshot._relation_oids(session, fixture.schema, RELATIONS)
-            assert len(oids) == 57 and all(oids.values())
+            assert len(oids) == 59 and all(oids.values())
             fixture.npi_identity = await npi_api._npi_canonical_publication_identity(session=session)
             assert fixture.npi_identity is not None
             assert (await npi_api._fetch_provider_enrichment_detail(NPI, session=session))["summary"] is not None

@@ -240,6 +240,8 @@ def test_retention_policy_survives_both_prepared_doctors_extension_orders(addres
         "process.provider_directory_address_overlay_components",
         "process.provider_directory_cms_overlay_projection",
         "process.provider_directory_cms_native_projection",
+        "process.entity_address_rows_native",
+        "process.entity_address_rows_preparation",
     ],
 )
 def test_mapper_digest_binds_desired_projection_code(monkeypatch, module_name):
@@ -253,6 +255,17 @@ def test_mapper_digest_binds_desired_projection_code(monkeypatch, module_name):
         return source + b"\n# changed query mapping\n" if path == target else source
 
     monkeypatch.setattr(address.Path, "read_bytes", changed_bytes)
+    assert address._mapping_digest() != original
+
+
+def test_mapper_digest_binds_native_preparation_implementation(monkeypatch):
+    """Changing installed native bytes invalidates the signed address mapper input."""
+    native = address.importlib.import_module("process.entity_address_rows_native")
+    identity = native.native_preparation_identity()
+    monkeypatch.setattr(native, "native_preparation_identity", lambda: identity)
+    original = address._mapping_digest()
+    replacement_by_field = {**identity, "implementation": "native", "artifact_sha256": "f" * 64}
+    monkeypatch.setattr(native, "native_preparation_identity", lambda: replacement_by_field)
     assert address._mapping_digest() != original
 
 

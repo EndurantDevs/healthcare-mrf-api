@@ -3,12 +3,14 @@
 
 import base64
 import re
+from contextlib import nullcontext
 from uuid import UUID
 
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read
 from api.plan_pricing_code_contract import CONTRACT, SPEC, ZIP_CONTRACT, identity_digest
-from api.ptg_membership_storage import protected_owner
+from api.ptg_membership_storage import _api_read_snapshot, _api_storage_read, _read_metadata, protected_owner
 from process import reference_family_archive as native
 from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -73,6 +75,25 @@ async def source_pins(session, identity, *, create=False):
     return _pins(identity)
 
 
+async def _api_source_pins(session, identity):
+    """Keep every source retention predicate inside the authenticated API scope."""
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    for pin in _pins(identity):
+        present = (
+            await execute_network_read(
+                session,
+                text(
+                    f"SELECT EXISTS(SELECT 1 FROM ONLY {native._quoted(PTG2_SCHEMA)}.ptg2_snapshot_pin WHERE owner_type=:owner_type AND owner_id=:owner_id AND snapshot_id=:snapshot_id)"
+                ),
+                pin,
+            )
+        ).scalar_one()
+        if present is not True:
+            raise PTG2ManifestArtifactError("code pricing source retention pin is missing")
+    return _pins(identity)
+
+
 def _membership_views(identity):
     view_oid_by_name = {}
     for source in identity["sources"]:
@@ -86,7 +107,7 @@ def _membership_views(identity):
     return view_oid_by_name
 
 
-async def _storage(session, view_oid, owner, identity):
+async def _storage(session, view_oid, owner, identity, *, api_read=False):
     dependencies = (
         await session.execute(
             text(
@@ -118,7 +139,10 @@ async def _storage(session, view_oid, owner, identity):
         dataset = UUID(schema[len(prefix) :])
     except ValueError as error:
         raise PTG2ManifestArtifactError("code pricing namespace differs") from error
-    await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
+    if api_read is True:
+        await _api_read_snapshot(session)
+    else:
+        await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
     ownership = await native.capture_model_family_stage_ownership(session, SPEC, dataset)
     if ownership.schema_oid != schema_oid or set(ownership.relation_oids) != {
         (dependency_row[3], int(dependency_row[0])) for dependency_row in storage_relations
@@ -128,8 +152,11 @@ async def _storage(session, view_oid, owner, identity):
     return ownership
 
 
-async def locate(session, identity, *, allow_stale_provider=False):
+async def locate(session, identity, *, allow_stale_provider=False, api_read=False):
     """An exact closed native view, never a comment or caller receipt, authorizes reads."""
+    if type(api_read) is not bool:
+        raise PTG2ManifestArtifactError("capability API read mode is invalid")
+    driver, transaction, backend_pid = await _api_read_snapshot(session) if api_read else (None, None, None)
     owner = await protected_owner(session)
     if owner is None:
         return None
@@ -147,33 +174,38 @@ async def locate(session, identity, *, allow_stale_provider=False):
         raise PTG2ManifestArtifactError("code pricing attachment custody differs")
     view_oid = int(attachment_record[0])
     await _require_no_untrusted_mutation(session, [view_oid], owner)
-    ownership = await _storage(session, view_oid, owner, identity)
-    header = (
-        (
-            await session.execute(
-                text(
-                    f"SELECT identity,content_digest,counts FROM {native._quoted(ownership.schema_name)}.plan_pricing_code_manifest WHERE singleton=1"
+    ownership = await _storage(session, view_oid, owner, identity, **({"api_read": True} if api_read else {}))
+    async with _api_storage_read(session, ownership, driver, transaction, backend_pid) if api_read else nullcontext():
+        header = (
+            (
+                await _read_metadata(
+                    session,
+                    text(
+                        f"SELECT identity,content_digest,counts FROM {('ONLY ' if api_read else '') + native._quoted(ownership.schema_name)}.plan_pricing_code_manifest WHERE singleton=1"
+                    ),
+                    api_read=api_read,
                 )
             )
+            .mappings()
+            .one()
         )
-        .mappings()
-        .one()
-    )
-    if re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
-        raise PTG2ManifestArtifactError("code pricing sealed identity differs")
-    if header["identity"] != identity:
-        old, new = dict(header["identity"]), dict(identity)
-        if identity["contract"] == ZIP_CONTRACT and old.get("provider_signature") != new.get("provider_signature"):
-            old["scope"] = {key: scope_value for key, scope_value in old.get("scope", {}).items() if key != "geo_cells"}
-            new["scope"] = {key: scope_value for key, scope_value in new["scope"].items() if key != "geo_cells"}
-        old.pop("provider_signature", None)
-        new.pop("provider_signature", None)
-        if allow_stale_provider and old == new:
-            await source_pins(session, header["identity"])
-            return None
-        raise PTG2ManifestArtifactError("code pricing sealed identity differs")
-    await source_pins(session, identity)
-    return ownership, dict(header), owner, view_oid
+        if re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
+            raise PTG2ManifestArtifactError("code pricing sealed identity differs")
+        if header["identity"] != identity:
+            old, new = dict(header["identity"]), dict(identity)
+            if identity["contract"] == ZIP_CONTRACT and old.get("provider_signature") != new.get("provider_signature"):
+                old["scope"] = {
+                    key: scope_value for key, scope_value in old.get("scope", {}).items() if key != "geo_cells"
+                }
+                new["scope"] = {key: scope_value for key, scope_value in new["scope"].items() if key != "geo_cells"}
+            old.pop("provider_signature", None)
+            new.pop("provider_signature", None)
+            if allow_stale_provider and old == new:
+                await (_api_source_pins if api_read else source_pins)(session, header["identity"])
+                return None
+            raise PTG2ManifestArtifactError("code pricing sealed identity differs")
+        await (_api_source_pins if api_read else source_pins)(session, identity)
+        return ownership, dict(header), owner, view_oid
 
 
 async def seal(session, ownership, identity, *, reader_principals):

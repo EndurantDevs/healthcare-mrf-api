@@ -14,6 +14,7 @@ from sqlalchemy.dialects import postgresql
 
 from api import custom_import_read_http as transport
 from api import provider_detail_network_metadata as metadata
+from api.endpoint.npi import GEO_SERVICE_LOCATIONS_ENV
 from api.provider_detail_network_contract import parse_managed_detail_query
 from api.provider_detail_network_read import managed_provider_detail_read_scope
 from api.provider_profile_snapshot import provider_profile_read_snapshot
@@ -400,14 +401,15 @@ async def test_native_collection_aggregate_refuses_before_fact_transfer(
 
 @pytest.fixture
 def signed_collection_coordinates(monkeypatch):
-    """Prepare real coordinates before the retained source publication is sealed."""
+    """Prepare serving coordinates before Registry composition, preserving Source office types."""
+    monkeypatch.setenv(GEO_SERVICE_LOCATIONS_ENV, "true")
     from tests import test_provider_profile_network_facts_postgres as profile_source
 
     original = profile_source._public_address_contacts
 
     async def prepare_coordinates(connection, source_table):
         await original(connection, source_table)
-        await connection.execute(f"UPDATE {source_table} SET lat=37.5,long=-122.5,type='primary'")
+        await connection.execute(f"UPDATE {source_table} SET lat=37.5,long=-122.5")
 
     monkeypatch.setattr(profile_source, "_public_address_contacts", prepare_coordinates)
 
@@ -436,8 +438,9 @@ async def signed_collection_transport(signed_collection_coordinates, managed_imp
         return await original_pin(*args, **kwargs)
 
     async def observe_custody(*args, **kwargs):
-        observed.custody.append(args)
-        return await original_custody(*args, **kwargs)
+        manifest = await original_custody(*args, **kwargs)
+        observed.custody.append((args, kwargs, manifest))
+        return manifest
 
     def observe_import_method(name):
         original = getattr(CustomImportReadService, name)
@@ -532,6 +535,20 @@ async def _signed_collection_post(case, kind, document, *, invalid_signature=Fal
     return reply
 
 
+def _assert_collection_custody(case):
+    """Require the original single native resolution and its exact authenticated manifest."""
+    context = case.fixture.context
+    assert len(case.pins) == len(case.custody) == 1
+    arguments, options_by_name, manifest = case.custody[0]
+    assert len(arguments) == 1 and arguments[0] is case.pins[0][0]
+    assert case.pins[0][1:] == (context.manifest.generation_id, context.fixture.control_schema)
+    assert options_by_name == {"generation_id": case.pins[0][1], "control_schema": case.pins[0][2]}
+    assert arguments[0].get_server_pid() == context.statements[0][1][4]
+    assert manifest == context.manifest
+    seal = getattr(manifest, "_custody_seal_sha256", None)
+    assert type(seal) is str and re.fullmatch(r"[0-9a-f]{64}", seal)
+
+
 def _signed_collection_success(case, reply, document, *, include_filter, has_rows=True):
     from tests.test_registry_provider_collection_postgres import _providers
 
@@ -547,8 +564,7 @@ def _signed_collection_success(case, reply, document, *, include_filter, has_row
     assert reply.headers["X-Network-Generation"] == str(context.manifest.generation_id)
     assert reply.headers["X-Network-Access-Scope"] == document["managed_collection"]["access_scope_sha256"]
     _assert_collection_reader(context)
-    assert len(case.pins) == 1 and len(case.custody) == 2
-    assert case.custody[0] == case.custody[1]
+    _assert_collection_custody(case)
     names = [name for name, _ in case.import_reads]
     assert "prepare_npi_entity_relation" in names and "scope_npi_entity_relation" in names
     assert len({session for _, session in case.import_reads}) == 1
@@ -782,9 +798,8 @@ def _service_http_success(case, reply, document, *, signed, include_filter=False
     context = case.fixture.context
     assert reply.status == 200, json.dumps({"response": reply.json, "failures": case.failures})
     _assert_collection_reader(context)
-    assert len(case.pins) == len(case.driver_proofs) == len(case.native_reads) == 1
-    assert len(case.custody) == 2 and case.custody[0] == case.custody[1]
-    assert case.pins[0][0] is case.custody[0][0]
+    assert len(case.driver_proofs) == len(case.native_reads) == 1
+    _assert_collection_custody(case)
     proof = case.driver_proofs[0]
     assert proof[:4] == (context.role, context.role, "on", "repeatable read")
     assert proof[4] == context.statements[0][1][4] and proof[5] == context.transactions[0]
@@ -866,8 +881,8 @@ async def _assert_service_optional_metric_refusal(case):
     assert refused.status == 400
     assert case.failures == [("CustomImportReadRequestError", "metric predicates require imported membership")]
     _assert_collection_reader(case.fixture.context)
-    assert len(case.pins) == 1 and len(case.custody) == 2 and not case.native_reads
-    assert case.custody[0] == case.custody[1]
+    _assert_collection_custody(case)
+    assert not case.native_reads
 
 
 async def _assert_service_empty_required_page(case):

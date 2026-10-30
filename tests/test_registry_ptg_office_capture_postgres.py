@@ -80,6 +80,9 @@ async def serving_schema():
 
 async def _seed_retained_membership(fixture, copy_target, source_table, provider_id, network_id):
     connection = fixture.connection
+    location_key_sql = "location_key"
+    if getattr(fixture, "source_aliases", False):
+        location_key_sql = "first_value(location_key) OVER(ORDER BY location_key)"
     async with connection.transaction():
         await create_network_candidate(
             connection,
@@ -96,7 +99,7 @@ async def _seed_retained_membership(fixture, copy_target, source_table, provider
           PRIMARY KEY(provider_system,provider_id,location_id))''')
         await connection.execute(
             f'''INSERT INTO "{copy_target.schema_name}".provider_location_binding
-              SELECT 'npi',$1,md5(location_key)::uuid,location_key,entity_type,entity_id FROM {source_table}''',
+              SELECT 'npi',$1,md5(location_key)::uuid,{location_key_sql},entity_type,entity_id FROM {source_table}''',
             provider_id,
         )
         bindings = await connection.fetch(f'SELECT * FROM "{copy_target.schema_name}".provider_location_binding')

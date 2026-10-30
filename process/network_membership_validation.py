@@ -75,13 +75,40 @@ def _em_provider_receipt(candidate):
     return receipt_by_field
 
 
+def _compact_receipts(candidate):
+    from process.network_compact_custom_preparation import (
+        CARRIER_OFFICES_KEY,
+        CUSTOM_OFFICES_KEY,
+        compact_carrier_receipt,
+        compact_custom_receipt,
+    )
+
+    custom = compact_custom_receipt(candidate)
+    carriers = compact_carrier_receipt(candidate)
+    return {
+        **({CUSTOM_OFFICES_KEY: custom.as_dict()} if custom is not None else {}),
+        **({CARRIER_OFFICES_KEY: carriers.as_dict()} if carriers is not None else {}),
+    }
+
+
 def _scope_report(candidate, address_source):
+    """Verify every retained receipt before binding the candidate validation scope."""
+    from process.registry_fhir_serving_preservation import (
+        SUMMARY_KEY as PRESERVATION_KEY,
+    )
+    from process.registry_fhir_serving_preservation import (
+        verify_fhir_serving_preservation,
+    )
     from process.registry_initial_source_composition import (
         SUMMARY_KEY as INITIAL_SUMMARY_KEY,
     )
     from process.registry_initial_source_composition import (
         RegistryInitialSourceError,
         verify_initial_source_office_receipt,
+    )
+    from process.registry_publication_queue import (
+        SOURCE_ROLLBACK_PROVENANCE,
+        verify_registry_source_rollback_provenance,
     )
     from process.registry_source_selection_receipt import (
         SUMMARY_KEY,
@@ -90,19 +117,39 @@ def _scope_report(candidate, address_source):
     )
 
     candidate_by_field = dict(candidate)
+    source_operation = verify_registry_source_rollback_provenance(candidate_by_field)
+    preservation = verify_fhir_serving_preservation(candidate_by_field)
     provider_receipt = _em_provider_receipt(candidate_by_field)
+    from process.registry_source_contribution_store import (
+        SUMMARY_KEY as CONTRIBUTION_KEY,
+    )
+    from process.registry_source_contribution_store import (
+        verify_registry_source_contributions,
+    )
+
+    contributions = verify_registry_source_contributions(candidate_by_field)
     try:
         source_selection = verify_registry_source_selection_receipt(candidate_by_field)
         initial_source_offices = verify_initial_source_office_receipt(candidate_by_field)
         source_retention = verify_registry_source_retention(candidate_by_field)
     except RegistrySourceSelectionError, RegistryInitialSourceError, RegistrySourceRetentionError:
         raise NetworkMembershipValidationError("Candidate source selection differs from its immutable scope") from None
-    identity_fields = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
     return {
+        **({SOURCE_ROLLBACK_PROVENANCE: source_operation} if source_operation is not None else {}),
+        **({PRESERVATION_KEY: preservation} if preservation is not None else {}),
         **({"em_provider_inputs": provider_receipt} if provider_receipt is not None else {}),
+        **({CONTRIBUTION_KEY: contributions} if contributions is not None else {}),
+        **_compact_receipts(candidate_by_field),
         **({RETENTION_KEY: source_retention} if source_retention is not None else {}),
         **({SUMMARY_KEY: source_selection} if source_selection is not None else {}),
         **({INITIAL_SUMMARY_KEY: initial_source_offices} if initial_source_offices is not None else {}),
+        **_candidate_identity_scope(candidate, address_source),
+    }
+
+
+def _candidate_identity_scope(candidate, address_source):
+    identity_fields = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
+    return {
         **{field: str(candidate[field]) for field in identity_fields},
         "validation_revision": 1,
         "source_generations": _validated_sources(candidate),
@@ -192,20 +239,40 @@ def _validation_report(scope_report, address_counts, native_counts):
     return report_by_field
 
 
-async def _validate_sealed(connection, copy_target, address_source, control_schema):
-    candidate = await _lock_candidate(connection, copy_target, address_source, control_schema)
-    scope_report = _scope_report(candidate, address_source)
+async def _validate_sealed(connection, copy_target, address_source, control_schema, office_sources=None):
+    from process.registry_source_contribution_store import verify_registry_source_contributions_rows
+
+    candidate_by_field = dict(await _lock_candidate(connection, copy_target, address_source, control_schema))
+    scope_report = _scope_report(candidate_by_field, address_source)
+    from process.registry_source_inventory_store import _registered_inventory_entries
+
+    entries = await _registered_inventory_entries(
+        connection, copy_target, candidate_by_field, control_schema=control_schema
+    )
+    await verify_registry_source_contributions_rows(
+        connection,
+        copy_target,
+        candidate_by_field,
+        control_schema=control_schema,
+        **({"inventory_entries": entries} if entries is not None else {}),
+    )
     if RETENTION_KEY in scope_report:
         try:
-            await verify_registry_source_retention_rows(connection, copy_target, candidate)
+            await verify_registry_source_retention_rows(connection, copy_target, candidate_by_field)
         except RegistrySourceRetentionError as error:
             raise NetworkMembershipValidationError(str(error)) from error
-    if candidate["state"] == "validated":
-        return _validated_replay(candidate, scope_report)
+    if candidate_by_field["state"] == "validated":
+        return _validated_replay(candidate_by_field, scope_report)
     candidate_schema = _identifier(copy_target.schema_name)
     membership_table = f"{candidate_schema}.network_membership"
     binding_table = f"{candidate_schema}.provider_location_binding"
     address_table = f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}"
+    if office_sources is not None:
+        from process.network_compact_offices import CompactOfficeSources, pin_compact_office_sources
+
+        if type(office_sources) is not CompactOfficeSources or office_sources.base != address_source:
+            raise NetworkMembershipValidationError("Compact office source differs from the pinned addresses")
+        address_table = await pin_compact_office_sources(connection, copy_target, office_sources)
     await connection.execute(f"LOCK TABLE {membership_table},{binding_table} IN SHARE MODE")
     await connection.execute(
         f"CREATE INDEX IF NOT EXISTS network_membership_network_idx ON {membership_table}(network_id)"
@@ -217,7 +284,7 @@ async def _validate_sealed(connection, copy_target, address_source, control_sche
     address_counts = await _membership_accounting(connection, membership_table, binding_table, address_table)
     native_counts = await _native_accounting(connection, membership_table, control_schema, copy_target.candidate_id)
     report = _validation_report(scope_report, address_counts, native_counts)
-    retained = _json_object(candidate["validation_json"])
+    retained = _json_object(candidate_by_field["validation_json"])
     if type(retained) is dict and "writer_closure" in retained:
         report["writer_closure"] = retained["writer_closure"]
     await connection.execute(
@@ -229,7 +296,9 @@ async def _validate_sealed(connection, copy_target, address_source, control_sche
     return report
 
 
-async def validate_network_membership_candidate(connection, copy_target, source, *, control_schema=None):
+async def validate_network_membership_candidate(
+    connection, copy_target, source, *, control_schema=None, office_sources=None
+):
     """Return the successful pinned report; invalid candidates raise a typed error.
 
     Aggregate failures carry their report on the error. Ownership, source and
@@ -250,6 +319,7 @@ async def validate_network_membership_candidate(connection, copy_target, source,
                 copy_target,
                 source,
                 control_schema if control_schema is not None else registry_schema(),
+                office_sources,
             )
     except NetworkAddressProjectionError as error:
         raise NetworkMembershipValidationError(str(error)) from error

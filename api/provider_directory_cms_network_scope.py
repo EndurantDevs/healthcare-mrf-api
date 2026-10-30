@@ -36,6 +36,7 @@ class CMSNetworkScope:
     source_pin: PinnedFHIRMembershipSource
     source_generation: dict
     excluded_network_ids: tuple[int, ...] | None = None
+    read_relations: tuple = ()
 
 
 def _mapped_networks(scope, *, include_all=False):

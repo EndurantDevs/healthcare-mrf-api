@@ -190,6 +190,7 @@ def source_publication_request(directory, source_records, enabled):
             source.source_producer_identity(),
             source_record_by_field["source_id"],
             request_lifecycle_by_field,
+            getattr(source._FACTORY.get(), "policy", None),
         )
     )
     try:
@@ -262,10 +263,22 @@ async def publish_source_candidate(directory, candidate):
         and candidate.source_ids == (selected[4],),
         "rest_source_publication_scope_changed",
     )
+    continuation = getattr(selected[1], "generic_fhir_capture_continuation", None)
     if not getattr(candidate, "already_published", False):
         from process.provider_directory_source_local_publication import publish_validated_source_local_dataset
 
         await publish_validated_source_local_dataset(directory, candidate, selected[4])
+    if continuation is not None:
+        from process.provider_directory_generic_capture_continuation import (
+            GenericSourceCaptureContinuation,
+            _require_scope,
+        )
+
+        require_output(
+            type(continuation) is GenericSourceCaptureContinuation, "rest_source_capture_continuation_invalid"
+        )
+        _require_scope(directory, candidate, selected, continuation)
+        await continuation.capture(directory, candidate, selected)
 
 
 @dataclass(frozen=True)

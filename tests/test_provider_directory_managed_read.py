@@ -28,9 +28,11 @@ from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from tests.network_read_execution_support import with_read_identity_receipts
 from tests.test_network_catalog_routes import v2_envelope
 from tests.test_provider_collection_network_read import boundary as boundary
 from tests.test_provider_directory_entities import ENTITY_ID, KEY
+from tests.test_provider_directory_medical_groups_identity import _catalog
 
 PATH = "/api/v1/registry/serving/directory/entities"
 AUTH = {"Authorization": "Bearer synthetic-source-control-token"}
@@ -339,6 +341,19 @@ async def test_cms_default_reuses_only_active_manifest_without_selected_or_offic
 @pytest.mark.parametrize("kind", ["medical-groups", "sites"])
 async def test_doctors_default_stays_public_on_same_snapshot(directory_boundary, monkeypatch, kind):
     held = directory_boundary
+    with_read_identity_receipts(held.session, driver=held.driver)
+    held.driver = held.session.connection.return_value.get_raw_connection.return_value.driver_connection
+
+    async def execute(statement, parameters=None):
+        sql = str(statement)
+        if "current_setting('transaction_isolation')" in sql:
+            return SimpleNamespace(one=lambda: ("repeatable read", "on"))
+        if "pg_catalog.pg_class" in sql:
+            assert parameters == {"names": list(doctors._READ_TABLES), "schema": "mrf"}
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(all=_catalog))
+        assert sql in {"SET LOCAL lock_timeout = '250ms'", "SET LOCAL work_mem = '4MB'"}
+
+    held.session.execute.side_effect = execute
     monkeypatch.setattr(managed, "read_medical_groups_snapshot", doctors.read_medical_groups_snapshot)
     monkeypatch.setattr(doctors, "_accepted_generation", AsyncMock(return_value="gen_doctors"))
     monkeypatch.setattr(doctors, "_require_complete_bindings", AsyncMock())
@@ -352,17 +367,17 @@ async def test_doctors_default_stays_public_on_same_snapshot(directory_boundary,
     }
     if kind == "sites":
         record_by_field["site_id"] = ENTITY_ID
-    rows = AsyncMock(return_value=[record_by_field])
-    monkeypatch.setattr(doctors, "_entity_rows", rows)
-    monkeypatch.setattr(doctors, "_site_rows", rows)
+    source_rows = AsyncMock(return_value=[record_by_field])
+    monkeypatch.setattr(doctors, "_entity_rows", source_rows)
+    monkeypatch.setattr(doctors, "_site_rows", source_rows)
     document = v2_envelope(_query("cms-doctors", kind=kind), excluded_network_ids=[7, 9])
     reply = await _send(held, document=document)
     assert reply.status == 200 and reply.json["data"]["items"][0]["id"] == ENTITY_ID
     assert reply.json["data"]["items"][0]["display_name"] == "Public source"
     assert reply.json["data"]["generation_id"] != "gen_doctors"
     assert "X-CMS-Retained-Publication" not in reply.headers
-    assert rows.await_args.args[0] is held.session and rows.await_args.args[2].network_ids is None
-    assert rows.await_args.args[2].excluded_network_ids == (7, 9)
+    assert source_rows.await_args.args[0] is held.session and source_rows.await_args.args[2].network_ids is None
+    assert source_rows.await_args.args[2].excluded_network_ids == (7, 9)
 
 
 @pytest.mark.asyncio

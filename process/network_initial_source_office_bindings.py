@@ -25,6 +25,7 @@ from process.network_legacy_membership_source import (
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, MembershipCopyTarget, _encode
 from process.reference_family_archive import CONTRACT, MODEL_CLOSURE_CONTRACTS, TYPED_MRF_CONTRACT
+from process.registry_source_office_origin import resolve_source_office_origin
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
@@ -45,9 +46,10 @@ class PinnedACAOfficeAddressSource:
     after_evidence_checksum: int | None
     office_count: int
     after_source_position: ACARawFactPosition | None = None
+    origin_manifest_sha256: str | None = None
 
 
-async def pin_aca_office_address_source(
+async def capture_aca_office_address_source(
     connection,
     batch,
     address_source,
@@ -56,6 +58,7 @@ async def pin_aca_office_address_source(
     after_evidence_checksum=None,
     after_source_position=None,
     control_schema=None,
+    origin_manifest_sha256=None,
 ):
     """Pin closed native identities and actual selected office hashes before COPY."""
     _validate_batch(batch)
@@ -68,22 +71,56 @@ async def pin_aca_office_address_source(
     await _verify_batch(
         connection, batch, _control_namespace(control_schema)[1:-1], after_evidence_checksum, after_source_position
     )
-    identity = await _artifact_dependency_identity(
-        connection, address_source, runtime_roles, address=True, control_schema=_control_namespace(control_schema)[1:-1]
+    origin = await resolve_source_office_origin(
+        connection,
+        address_source,
+        runtime_roles=runtime_roles,
+        control_schema=_control_namespace(control_schema)[1:-1],
+        origin_manifest_sha256=origin_manifest_sha256,
+        first_parameter=7,
     )
-    office_records = await _office_records(connection, batch, address_source)
+    office_records = await _office_records(
+        connection, batch, address_source, address_relation=origin.relation_sql, address_arguments=origin.arguments
+    )
     bindings = await _canonical_bindings(connection, office_records)
-    return PinnedACAOfficeAddressSource(
+    pin = PinnedACAOfficeAddressSource(
         address_source,
         batch.source.generation_id,
-        identity,
+        origin.address_identity,
         batch.generation_id,
         batch.input_sha256,
         _digest(office_records),
         after_evidence_checksum,
         len(bindings),
         after_source_position,
+        origin_manifest_sha256,
     )
+    return pin, bindings
+
+
+async def pin_aca_office_address_source(
+    connection,
+    batch,
+    address_source,
+    *,
+    runtime_roles,
+    after_evidence_checksum=None,
+    after_source_position=None,
+    control_schema=None,
+    origin_manifest_sha256=None,
+):
+    """Pin exact native address correspondence without retaining the selected rows."""
+    pin, _ = await capture_aca_office_address_source(
+        connection,
+        batch,
+        address_source,
+        runtime_roles=runtime_roles,
+        after_evidence_checksum=after_evidence_checksum,
+        after_source_position=after_source_position,
+        control_schema=control_schema,
+        origin_manifest_sha256=origin_manifest_sha256,
+    )
+    return pin
 
 
 _COLUMNS = ("provider_system", "provider_id", "location_id", "location_key", "entity_type", "entity_id")
@@ -266,7 +303,7 @@ async def _verify_batch(connection, batch, control_schema, after, after_source_p
         raise InitialACAOfficeBindingError("initial_aca_office_batch_accounting_invalid")
 
 
-async def _candidate(connection, target, batch, address_source, control):
+async def _candidate(connection, target, batch, address_source, control, *, origin_manifest_sha256=None):
     candidate = await _locked_candidate(connection, target, control)
     _require_open(candidate)
     generations = candidate["source_generations"]
@@ -274,7 +311,7 @@ async def _candidate(connection, target, batch, address_source, control):
         generations = json.loads(generations)
     if (
         generations.get("unified_address") != address_source.generation_id
-        or batch.generation_id not in generations.values()
+        or (origin_manifest_sha256 is not None and generations.get("retained_network_source") != origin_manifest_sha256)
         or (
             batch.approved_source is not None
             and (
@@ -284,9 +321,94 @@ async def _candidate(connection, target, batch, address_source, control):
         )
     ):
         raise InitialACAOfficeBindingError("initial_aca_office_candidate_pin_differs")
+    recipes = candidate.get("source_recipes_json")
+    has_inventory = type(recipes) is dict or type(recipes) is str and recipes.lstrip().startswith("{")
+    matches = (
+        await _is_inventory_pin_registered(connection, target, candidate, batch, control)
+        if has_inventory
+        else batch.generation_id in generations.values()
+    )
+    if not matches:
+        raise InitialACAOfficeBindingError("initial_aca_office_candidate_pin_differs")
 
 
-async def _office_records(connection, batch, address_source):
+def _office_recipe(batch):
+    from process.network_approved_membership_source import ApprovedMembershipSource
+    from process.network_fhir_membership_source import FHIRMembershipBatch
+    from process.registry_ptg_office_membership import PTGOfficeMembershipBatch
+    from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+
+    if type(batch.approved_source) is not ApprovedMembershipSource:
+        raise InitialACAOfficeBindingError("initial_aca_office_candidate_pin_differs")
+    if type(batch) is PTGOfficeMembershipBatch:
+        coordinates = batch.source.coordinates
+    elif type(batch) in {ACAMembershipBatch, FHIRMembershipBatch} and batch.approved_only is True:
+        coordinates = batch.binding_coordinates
+    else:
+        raise InitialACAOfficeBindingError("initial_aca_office_candidate_pin_differs")
+    return RegistrySourceMembershipRecipe(batch.source, coordinates)
+
+
+_REGISTERED_PIN_SQL = """SELECT count(*) AS entry_count,max(ordinal) AS ordinal,
+ max(octet_length(recipe_json)) AS recipe_bytes,
+ coalesce(bool_and(CASE WHEN octet_length(recipe_json) BETWEEN 1 AND $11::integer THEN
+   convert_to(recipe_json,'UTF8')=convert_to($2::text,'UTF8') AND
+   office_derivation_json IS NOT NULL AND (contribution_json IS NOT NULL)=($3::text='fhir') AND
+   (source_system,source_id,dataset_schema,dataset_id,producer_id,edition_id,fhir_scope_key,fhir_scope_value)
+   IS NOT DISTINCT FROM ($3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text)
+   ELSE false END),false) AS is_exact
+ FROM (SELECT ordinal,recipe_json,contribution_json,office_derivation_json,source_system,source_id,dataset_schema,dataset_id,
+   producer_id,edition_id,fhir_scope_key,fhir_scope_value FROM {relation}
+   WHERE recipe_sha256=$1 ORDER BY ordinal LIMIT 2) selected"""
+
+
+async def _is_inventory_pin_registered(connection, copy_target, candidate, batch, control):
+    """Check one raw registration row, never Source authority or membership in the complete root.
+
+    The producer folds the complete inventory before office COPY in this locked
+    preparation transaction. Selected metadata can still be tampered with while
+    OPEN; Source admission/page replay remain mandatory below, and independent
+    complete-root/Source/office custody must succeed before publication.
+    """
+    from process.registry_source_inventory_contract import make_source_inventory_entry
+    from process.registry_source_inventory_reference import verify_source_recipe_metadata
+    from process.registry_source_inventory_store import _physical_context, _relation, source_inventory_record
+    from process.registry_source_recipe_store import MAX_SOURCE_RECIPE_BYTES
+
+    root = verify_source_recipe_metadata(candidate).inventory.root
+    if (
+        root.entry_count < 1
+        or root.derivation_count != root.entry_count
+        or await connection.fetchval("SHOW transaction_isolation") not in {"repeatable read", "serializable"}
+    ):
+        return False
+    pin_record = source_inventory_record(make_source_inventory_entry(1, _office_recipe(batch)))
+    if (pin_record[5] == "fhir" and root.contribution_count < 1) or (
+        pin_record[5] != "fhir" and root.contribution_count >= root.entry_count
+    ):
+        return False
+    oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", _relation(copy_target))
+    relation = await _physical_context(connection, copy_target, oid, control[1:-1])
+    selected = await connection.fetchrow(
+        _REGISTERED_PIN_SQL.format(relation=relation),
+        pin_record[4],
+        pin_record[1],
+        *pin_record[5:],
+        MAX_SOURCE_RECIPE_BYTES - 2,
+    )
+    return (
+        selected is not None
+        and type(selected["entry_count"]) is int
+        and selected["entry_count"] == 1
+        and type(selected["ordinal"]) is int
+        and 1 <= selected["ordinal"] <= root.entry_count
+        and type(selected["recipe_bytes"]) is int
+        and 1 <= selected["recipe_bytes"] <= MAX_SOURCE_RECIPE_BYTES - 2
+        and selected["is_exact"] is True
+    )
+
+
+async def _office_records(connection, batch, address_source, *, address_relation=None, address_arguments=()):
     source_pin = aca_physical_source(batch.source) if type(batch.source) is PinnedACAMembershipSource else batch.source
     source_sql = _OFFICES_SQL
     if type(source_pin) is ACAGlobalEpochReadScope:
@@ -296,7 +418,8 @@ async def _office_records(connection, batch, address_source):
         source_sql.format(
             source=_identifier(source_pin.prepared.ownership.schema_name),
             canonical=_canonical_source(source_pin)[1],
-            address=f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}",
+            address=address_relation
+            or f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}",
         ),
         batch.input_bytes.decode(),
         source_pin.import_id,
@@ -304,6 +427,7 @@ async def _office_records(connection, batch, address_source):
         source_pin.year,
         source_pin.source_url,
         list(batch.accepted_evidence_checksums),
+        *address_arguments,
     )
     if result["invalid"] or result["pairs"] != result["covered_pairs"] or result["records_json"] is None:
         raise InitialACAOfficeBindingError("initial_aca_office_unresolved")
@@ -366,31 +490,46 @@ async def _canonical_bindings(connection, office_records):
     ]
 
 
-async def _copy_bindings(connection, target, bindings):
-    namespace = _identifier(target.schema_name)
+async def copy_source_office_binding_rows(connection, schema_name, table_name, bindings):
+    """COPY verified page rows; admission authority belongs to each enclosing caller."""
+    namespace = _identifier(schema_name)
+    relation = namespace + "." + _identifier(table_name)
     columns = ",".join(_COLUMNS)
-    await connection.execute(f"""CREATE TABLE IF NOT EXISTS {namespace}.provider_location_binding(
+    temporary_ddl = "TEMP " if schema_name == "pg_temp" else ""
+    await connection.execute(f"""CREATE {temporary_ddl}TABLE IF NOT EXISTS {relation}(
       provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,
       location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,
       PRIMARY KEY(provider_system,provider_id,location_id))""")
     temporary = "initial_aca_offices_" + uuid4().hex
-    await connection.execute(f"CREATE TEMP TABLE {_identifier(temporary)} (LIKE {namespace}.provider_location_binding)")
+    await connection.execute(f"CREATE TEMP TABLE {_identifier(temporary)} (LIKE {relation}) ON COMMIT DROP")
     status = await connection.copy_records_to_table(
         temporary, records=bindings, columns=_COLUMNS, schema_name="pg_temp"
     )
     if status != f"COPY {len(bindings)}":
         raise InitialACAOfficeBindingError("initial_aca_office_copy_accounting_invalid")
     await connection.execute(
-        f"INSERT INTO {namespace}.provider_location_binding({columns}) "
-        f"SELECT {columns} FROM {_identifier(temporary)} ON CONFLICT DO NOTHING"
+        f"INSERT INTO {relation}({columns}) SELECT {columns} FROM {_identifier(temporary)} ON CONFLICT DO NOTHING"
     )
     differs = await connection.fetchval(f"""SELECT EXISTS(SELECT 1 FROM {_identifier(temporary)} expected
-      LEFT JOIN {namespace}.provider_location_binding actual USING(provider_system,provider_id,location_id)
+      LEFT JOIN {relation} actual USING(provider_system,provider_id,location_id)
       WHERE actual.location_key IS NULL OR (actual.location_key,actual.entity_type,actual.entity_id)
         IS DISTINCT FROM (expected.location_key,expected.entity_type,expected.entity_id))""")
     if differs:
         raise InitialACAOfficeBindingError("initial_aca_office_binding_conflict")
     await connection.execute(f"DROP TABLE {_identifier(temporary)}")
+
+
+async def _copy_bindings(connection, target, bindings):
+    await copy_source_office_binding_rows(connection, target.schema_name, "provider_location_binding", bindings)
+
+
+def _require_matching_aca_office_pin(actual, expected, bindings):
+    if actual.address_identity != expected.address_identity:
+        raise InitialACAOfficeBindingError("initial_aca_office_native_identity_differs")
+    if actual.selected_offices_sha256 != expected.selected_offices_sha256:
+        raise InitialACAOfficeBindingError("initial_aca_office_rows_differ")
+    if len(bindings) != expected.office_count:
+        raise InitialACAOfficeBindingError("initial_aca_office_count_differs")
 
 
 async def copy_initial_aca_office_bindings(
@@ -422,30 +561,43 @@ async def copy_initial_aca_office_bindings(
     await _require_transaction(connection)
     control = _control_namespace(control_schema)
     async with connection.transaction():
-        await _candidate(connection, copy_target, batch, address_source, control)
-        await _verify_batch(connection, batch, control[1:-1], after_evidence_checksum, after_source_position)
-        address_identity = await _artifact_dependency_identity(
-            connection, address_source, runtime_roles, address=True, control_schema=control[1:-1]
+        await _candidate(
+            connection,
+            copy_target,
+            batch,
+            address_source,
+            control,
+            origin_manifest_sha256=address_pin.origin_manifest_sha256,
         )
-        if address_identity != address_pin.address_identity:
-            raise InitialACAOfficeBindingError("initial_aca_office_native_identity_differs")
-        office_records = await _office_records(connection, batch, address_source)
-        if _digest(office_records) != address_pin.selected_offices_sha256:
-            raise InitialACAOfficeBindingError("initial_aca_office_rows_differ")
-        bindings = await _canonical_bindings(connection, office_records)
-        if len(bindings) != address_pin.office_count:
-            raise InitialACAOfficeBindingError("initial_aca_office_count_differs")
+        actual, bindings = await capture_aca_office_address_source(
+            connection,
+            batch,
+            address_source,
+            runtime_roles=runtime_roles,
+            control_schema=control[1:-1],
+            after_evidence_checksum=after_evidence_checksum,
+            after_source_position=after_source_position,
+            origin_manifest_sha256=address_pin.origin_manifest_sha256,
+        )
+        _require_matching_aca_office_pin(actual, address_pin, bindings)
         await _copy_bindings(connection, copy_target, bindings)
-        await _candidate(connection, copy_target, batch, address_source, control)
-        return _correspondence_receipt(copy_target, batch, address_source, address_identity, bindings, office_records)
+        await _candidate(
+            connection,
+            copy_target,
+            batch,
+            address_source,
+            control,
+            origin_manifest_sha256=address_pin.origin_manifest_sha256,
+        )
+        return _correspondence_receipt(copy_target, batch, actual, bindings)
 
 
-def _correspondence_receipt(copy_target, batch, address_source, address_identity, bindings, office_records):
+def _correspondence_receipt(copy_target, batch, address_pin, bindings):
     source_pin = aca_physical_source(batch.source) if type(batch.source) is PinnedACAMembershipSource else batch.source
     ownership = source_pin.prepared.ownership
     receipt_by_field = {
         "component": "initial_aca_office_correspondence",
-        "revision": 1,
+        "revision": 2 if address_pin.origin_manifest_sha256 is not None else 1,
         "candidate": asdict(copy_target),
         "source_generation": batch.generation_id,
         "aca_source": {
@@ -458,11 +610,13 @@ def _correspondence_receipt(copy_target, batch, address_source, address_identity
             "canonical_address_oid": _canonical_source(source_pin)[0],
             "owner_oid": source_pin.validation.sealed_owner_oid,
         },
-        "address_source": asdict(address_source),
-        "address_identity": list(address_identity),
+        "address_source": asdict(address_pin.address_source),
+        "address_identity": list(address_pin.address_identity),
         "membership_input_sha256": batch.input_sha256,
         "office_count": len(bindings),
-        "selected_offices_sha256": _digest(office_records),
+        "selected_offices_sha256": address_pin.selected_offices_sha256,
     }
+    if address_pin.origin_manifest_sha256 is not None:
+        receipt_by_field["origin_manifest_sha256"] = address_pin.origin_manifest_sha256
     receipt_by_field["correspondence_sha256"] = _digest(receipt_by_field)
     return receipt_by_field

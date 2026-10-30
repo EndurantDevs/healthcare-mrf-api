@@ -21,6 +21,8 @@ from click.testing import CliRunner
 os.environ.setdefault("HLTHPRT_REDIS_ADDRESS", "redis://localhost")
 
 import process as process_cli
+from process import registry_publication_consumer as consumer
+from process import registry_publication_ptg_runtime as ptg_runtime
 from process import registry_publication_worker as worker
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
@@ -164,6 +166,25 @@ def test_initial_source_pins_are_syntax_only_and_preserve_exact_generation():
     assert parsed.initial_address_sources.base_source.generation_id == pin_by_field["generation_id"]
     assert parsed.initial_address_sources.npi_source.table_name == "npi"
     assert parsed.initial_address_sources.office_scope_store is None
+
+
+@pytest.mark.parametrize("compact", [False, True, 0, 1, None, "true", {}, []])
+def test_initial_compact_selection_is_explicit_and_strict(compact):
+    configured = configuration()
+    configured["initial_address_sources"] = {
+        "base_source": {
+            "schema_name": "address_example",
+            "table_name": "entity_address_unified",
+            "generation_id": "a" * 64,
+        },
+        "compact": compact,
+    }
+    if type(compact) is not bool:
+        with pytest.raises(ValueError):
+            worker.parse_registry_publication_worker_config(json.dumps(configured))
+    else:
+        parsed = worker.parse_registry_publication_worker_config(json.dumps(configured))
+        assert parsed.initial_address_sources.compact is compact
 
 
 def _configured_recipe(kind="fhir"):
@@ -1184,6 +1205,7 @@ async def test_rollback_hash_binds_verified_final_custody_and_preserves_validati
         "approved_custom_revision": 2,
         "validation_json": validation_by_name,
         "source_recipes_json": [],
+        "source_generations": {},
     }
     copy_target = SimpleNamespace(schema_name="candidate")
     command = SimpleNamespace(expected_serving_generation=1, expected_approved_revision=2)
@@ -1287,3 +1309,205 @@ async def test_source_rollback_preview_finishes_in_repeatable_read_and_refuses_c
     verifier.assert_awaited_once()
     assert connection.transaction_options == [{"isolation": "repeatable_read"}]
     assert not connection.active
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"membership_refresh_only": 1},
+        {"membership_refresh_only": True},
+        {"membership_refresh_runtime": {}, "only_request_id": UUID(int=1)},
+        {"only_request_id": UUID(int=0)},
+        {"only_request_id": str(UUID(int=1))},
+        {"seal_candidate": {}},
+        {"prepare_address_sources": {}},
+        {"composition_runtime": {}},
+        {"reader_roles": []},
+    ],
+)
+def test_consumer_rejects_uninstalled_capabilities_and_ambiguous_request_identity(changes):
+    configured = worker.parse_registry_publication_worker_config(json.dumps(configuration())).consumer
+    with pytest.raises(ValueError, match="consumer_config_invalid"):
+        replace(configured, **changes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["shared_pool", "authority", "source", "configuration"])
+async def test_consumer_refuses_invalid_host_context_before_acquiring_a_backend(fault):
+    configured = worker.parse_registry_publication_worker_config(json.dumps(configuration())).consumer
+    lifecycle = SimpleNamespace(acquire=AsyncMock())
+    execution = lifecycle if fault == "shared_pool" else SimpleNamespace(acquire=AsyncMock())
+    with pytest.raises(ValueError, match="consumer_config_invalid"):
+        await consumer.consume_registry_publication_once(
+            lifecycle_pool=lifecycle,
+            execution_pool=execution,
+            authorize=None if fault == "authority" else AsyncMock(),
+            config={} if fault == "configuration" else configured,
+            initial_address_sources={} if fault == "source" else None,
+        )
+    lifecycle.acquire.assert_not_called()
+    execution.acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["refresh_memberships", "unknown_operation"])
+async def test_execution_dispatch_cannot_invent_a_refresh_runtime_or_operation(monkeypatch, operation):
+    configured = worker.parse_registry_publication_worker_config(json.dumps(configuration())).consumer
+    close_events = []
+
+    @asynccontextmanager
+    async def acquire():
+        try:
+            yield object()
+        finally:
+            close_events.append(True)
+
+    monkeypatch.setattr(consumer, "_verify_execution", AsyncMock())
+    execute = AsyncMock()
+    monkeypatch.setattr(consumer, "complete_queued_membership_refresh", execute)
+    with pytest.raises(ValueError, match="refresh_runtime_unavailable|publication_operation_invalid"):
+        await consumer._execute_publication_request(
+            SimpleNamespace(acquire=acquire), configured, {"command_json": {"operation": operation}}, AsyncMock(), None
+        )
+    assert close_events == [True]
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_address_preparation_cannot_continue_under_a_replaced_queue_request(monkeypatch):
+    from process.registry_approval_store import RegistryApprovalConflict
+
+    prepare = AsyncMock()
+    configured = replace(
+        worker.parse_registry_publication_worker_config(json.dumps(configuration())).consumer,
+        prepare_address_sources=prepare,
+    )
+    monkeypatch.setattr(consumer, "_request", AsyncMock(return_value={"request_sha256": "b" * 64}))
+    authorize = AsyncMock()
+    with pytest.raises(RegistryApprovalConflict, match="queue_request_changed"):
+        await consumer._prepared_address_sources(
+            object(),
+            configured,
+            {"request_id": UUID(int=1), "lease_id": UUID(int=2), "request_sha256": "a" * 64},
+            1,
+            None,
+            None,
+            authorize,
+        )
+    prepare.assert_not_awaited()
+    authorize.assert_not_awaited()
+
+
+@pytest.fixture
+async def isolated_ptg_runtime():
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://publisher@localhost:1/worker_contract", pool_size=1, max_overflow=0
+    )
+    try:
+        yield ptg_runtime.RegistryPublicationPTGRuntime(
+            async_sessionmaker(engine),
+            RegistryPTGProducerScopeStore("owner", "approver", "registry"),
+            RegistryPTGGraphReadBudget(1048576),
+        )
+    finally:
+        assert engine.pool.checkedout() == 0
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("changes", [{"sql_limits": {}}, {"store": {}}, {"read_budget": {}}])
+def test_ptg_runtime_requires_typed_host_limits_and_source_capabilities(isolated_ptg_runtime, changes):
+    with pytest.raises(ValueError, match="ptg_runtime_invalid"):
+        replace(isolated_ptg_runtime, **changes)
+
+
+@pytest.mark.asyncio
+async def test_ptg_runtime_refuses_nested_preparation_and_untyped_address_sources(isolated_ptg_runtime):
+    with pytest.raises(ValueError, match="ptg_runtime_invalid"):
+        await isolated_ptg_runtime.compose(
+            SimpleNamespace(is_in_transaction=lambda: False), control_schema="registry", address_sources={}
+        )
+    with pytest.raises(ValueError, match="ptg_runtime_invalid"):
+        await isolated_ptg_runtime.prepare(
+            SimpleNamespace(is_in_transaction=lambda: True), None, None, writer_roles={}, control_schema="registry"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ptg_published_candidate_resume_never_reopens_raw_preparation(monkeypatch, isolated_ptg_runtime):
+    from process import network_membership_pipeline as pipeline
+    from process.registry_compact_composition import COMPACT_FORMAT, COMPACT_FORMAT_KEY
+
+    candidate_by_field = {"state": "published", "source_generations": {COMPACT_FORMAT_KEY: COMPACT_FORMAT}}
+    monkeypatch.setattr(ptg_runtime.RegistryPublicationPTGRuntime, "_same_execution_database", AsyncMock())
+    inspect = AsyncMock(return_value=candidate_by_field)
+    close = AsyncMock()
+    monkeypatch.setattr(pipeline, "_inspect_candidate", inspect)
+    monkeypatch.setattr(pipeline, "_close_raw_phase", close)
+    assert (
+        await isolated_ptg_runtime.prepare(
+            SimpleNamespace(is_in_transaction=lambda: False), None, None, writer_roles={}, control_schema="registry"
+        )
+        is candidate_by_field
+    )
+    inspect.assert_awaited_once()
+    close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_fence_available", [True, False])
+async def test_ptg_sealed_preparation_requires_fence_before_raw_driver(
+    monkeypatch, isolated_ptg_runtime, is_fence_available
+):
+    """A failed fence must prevent raw preparation, even after the logical transaction begins."""
+    from process import network_membership_pipeline as pipeline
+    from process.registry_compact_composition import COMPACT_FORMAT, COMPACT_FORMAT_KEY
+
+    events, driver, session = [], object(), SimpleNamespace()
+    candidate_by_field = {"state": "sealed", "source_generations": {COMPACT_FORMAT_KEY: COMPACT_FORMAT}}
+    prepared_by_field = {**candidate_by_field, "state": "ready"}
+
+    async def require_fence(actual_session, schema):
+        assert actual_session is session and schema == "registry"
+        events.append("fence")
+        if not is_fence_available:
+            raise ValueError("registry_ptg_scope_company_fence_unavailable")
+
+    async def raw_connection():
+        assert events == ["begin", "fence"]
+        events.append("raw")
+        return SimpleNamespace(driver_connection=driver)
+
+    session.connection = AsyncMock(return_value=SimpleNamespace(get_raw_connection=raw_connection))
+
+    @asynccontextmanager
+    async def transaction(sessions, *, control_schema):
+        assert sessions is isolated_ptg_runtime.sessions and control_schema == "registry"
+        events.append("begin")
+        yield session
+
+    inspect = AsyncMock(side_effect=[candidate_by_field, prepared_by_field])
+    prepare = AsyncMock()
+    monkeypatch.setattr(ptg_runtime.RegistryPublicationPTGRuntime, "_same_execution_database", AsyncMock())
+    monkeypatch.setattr(ptg_runtime, "registry_company_approval_transaction", transaction)
+    monkeypatch.setattr(ptg_runtime, "require_registry_company_approval_fence", require_fence, raising=False)
+    monkeypatch.setattr(pipeline, "_inspect_candidate", inspect)
+    monkeypatch.setattr(pipeline, "_close_raw_phase", AsyncMock())
+    monkeypatch.setattr(pipeline, "_prepare_phase_snapshot", prepare)
+    operation = isolated_ptg_runtime.prepare(
+        SimpleNamespace(is_in_transaction=lambda: False), None, None, writer_roles={}, control_schema="registry"
+    )
+    if is_fence_available:
+        assert await operation is prepared_by_field
+        assert prepare.await_args.args[0] is driver
+        assert prepare.await_args.kwargs["office_authority"][0] is session
+        assert events == ["begin", "fence", "raw"]
+    else:
+        with pytest.raises(ValueError, match="company_fence_unavailable"):
+            await operation
+        session.connection.assert_not_awaited()
+        prepare.assert_not_awaited()

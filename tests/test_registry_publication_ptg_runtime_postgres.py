@@ -24,6 +24,7 @@ from process.registry_publication_ptg_runtime import RegistryPublicationPTGRunti
 from process.registry_publication_worker_permissions import install_registry_publication_worker_permissions
 from process.registry_record_store import RegistryActor, RegistryRecordCommand, apply_registry_record_command
 from process.registry_source_recipe_store import decode_registry_source_recipes
+from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
 from tests.test_network_custom_address_source_postgres import _draft
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _create
 from tests.test_registry_ptg_office_coordinator_postgres import (
@@ -62,6 +63,76 @@ def test_retained_command_relaxes_only_monotonic_approval_revision(damage):
     if damage == "fresh":
         current = None
     assert _is_retained_review_command_match(expected, original_by_name, current) is (damage is None)
+
+
+def _observe_native_preparation(monkeypatch, runtime):
+    """Observe the genuine session and driver without issuing the first adapted statement."""
+    from process import network_membership_pipeline as pipeline
+    from process.registry_company_approval_fence import require_registry_company_approval_fence
+
+    original = pipeline._prepare_phase_snapshot
+    backend_pids = []
+
+    async def prepare(driver, *arguments, **options_by_name):
+        assert driver.is_in_transaction()
+        assert await driver.fetchval("SHOW transaction_isolation") == "repeatable read"
+        session, store, budget = options_by_name["office_authority"]
+        assert session.in_transaction() and store is runtime.store and budget == runtime.read_budget
+        assert (await (await session.connection()).get_raw_connection()).driver_connection is driver
+        await require_registry_company_approval_fence(session, runtime.store.control_schema)
+        backend_pids.append(await driver.fetchval("SELECT pg_backend_pid()"))
+        return await original(driver, *arguments, **options_by_name)
+
+    monkeypatch.setattr(pipeline, "_prepare_phase_snapshot", prepare)
+    return backend_pids
+
+
+@pytest.mark.asyncio
+async def test_sealed_compact_native_origin_prepares_in_genuine_fenced_session(compact_publication_db, monkeypatch):
+    """Prepare and replay a real sealed compact candidate on the same fenced native session."""
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+    from tests.test_network_compact_address_origin_postgres import _aca_candidate, _approved_aca_origin
+    from tests.test_network_compact_publication_postgres import _publish, _seal
+
+    fixture = compact_publication_db
+    engine = create_async_engine(fixture.execution_url, pool_size=1, max_overflow=0, hide_parameters=True)
+    try:
+        runtime = RegistryPublicationPTGRuntime(
+            async_sessionmaker(engine),
+            RegistryPTGProducerScopeStore(fixture.roles["owner"], fixture.executor_role, fixture.control_schema),
+            RegistryPTGGraphReadBudget(16 * 1024 * 1024),
+        )
+        backend_pids = _observe_native_preparation(monkeypatch, runtime)
+        async with _approved_aca_origin(fixture) as aca_source:
+            copy_target = await _aca_candidate(fixture, aca_source, 0)
+            assert (
+                await fixture.connection.fetchval(
+                    f'SELECT state FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+                    UUID(copy_target.candidate_id),
+                )
+                == "sealed"
+            )
+            for attempt in range(2):
+                prepared = await runtime.prepare(
+                    fixture.execution_connection,
+                    copy_target,
+                    fixture.source,
+                    writer_roles=fixture.writer_roles,
+                    control_schema=fixture.control_schema,
+                )
+                assert prepared["state"] == "ready"
+                assert not fixture.execution_connection.is_in_transaction()
+                assert not await fixture.connection.fetchval(
+                    "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=ANY($1::integer[]) AND locktype='advisory' AND granted)",
+                    backend_pids,
+                )
+                if attempt == 0:
+                    await _seal(fixture, copy_target)
+            assert len(backend_pids) == 2
+            published = await _publish(fixture, copy_target)
+            assert published["generation_id"] == 1
+    finally:
+        await engine.dispose()
 
 
 async def _review_offices(native, *, select=True):

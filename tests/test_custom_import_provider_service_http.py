@@ -19,6 +19,7 @@ from api import custom_import_read_http as transport
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadFieldValue
 from tests import test_custom_import_read_http as fixtures
+from tests.network_read_execution_support import _ReceiptDriver, mock_approved_control_metadata
 
 
 def _body(**changes):
@@ -561,14 +562,22 @@ def _network_service_body():
 class _NetworkServiceSession(_Session):
     def __init__(self):
         super().__init__()
-        self.driver = object()
+        self._transaction = object()
+        self.driver = _ReceiptDriver(self, None)
+
+    def in_transaction(self):
+        return "begin" in self.events and "end" not in self.events
+
+    def get_transaction(self):
+        return self._transaction if self.in_transaction() else None
 
     async def connection(self):
         return SimpleNamespace(
             get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=self.driver))
         )
 
-    async def execute(self, statement):
+    async def execute(self, statement, parameters=None):
+        assert parameters in (None, {})
         if str(statement).startswith("LOCK TABLE"):
             self.events.append("heap-lock")
         else:
@@ -581,9 +590,11 @@ def _install_network_service(monkeypatch, session, *, fail_pin=False):
     from tests.test_custom_import_provider_network import _MANIFEST
 
     _install(monkeypatch, session, page_items=[{"npi": "1104212877"}])
+    mock_approved_control_metadata(monkeypatch, events=session.events)
     service_page = service_http._service_page
 
-    async def resolve(driver, *, generation_id):
+    async def resolve(driver, *, generation_id, api_read):
+        assert api_read is True
         assert driver is session.driver and generation_id == 7
         assert session.events[:2] == ["begin", "snapshot"]
         session.events.append("manifest")

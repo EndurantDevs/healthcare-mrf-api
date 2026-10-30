@@ -13,7 +13,7 @@ from uuid import UUID
 
 import asyncpg
 import click
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -25,15 +25,36 @@ from process.registry_candidate_composition import RegistryCompositionAddressSou
 from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
 from process.registry_ptg_scope_runtime import _database_url
-from process.registry_publication_authority import RegistryPublicationAuthorityClient, _origin
-from process.registry_publication_consumer import RegistryPublicationConsumerConfig, consume_registry_publication_once
-from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime, RegistryPublicationSQLLimits
+from process.registry_publication_authority import (
+    RegistryPublicationAuthorityClient,
+    _origin,
+)
+from process.registry_publication_consumer import (
+    RegistryPublicationConsumerConfig,
+    consume_registry_publication_once,
+)
+from process.registry_publication_ptg_runtime import (
+    RegistryPublicationPTGRuntime,
+    RegistryPublicationSQLLimits,
+)
 from process.registry_source_recipe_store import decode_registry_source_recipes
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_PUBLICATION_WORKER"
 MAX_CONFIG_BYTES = 16 * 1024
-_REQUIRED = {"lifecycle_dsn", "execution_dsn", "app_origin", "service_token", "consumer"}
-_ROLES = {"lifecycle_role", "execution_role", "api_role", "queue_owner_role", "physical_owner_role"}
+_REQUIRED = {
+    "lifecycle_dsn",
+    "execution_dsn",
+    "app_origin",
+    "service_token",
+    "consumer",
+}
+_ROLES = {
+    "lifecycle_role",
+    "execution_role",
+    "api_role",
+    "queue_owner_role",
+    "physical_owner_role",
+}
 
 
 @dataclass(frozen=True, repr=False)
@@ -68,7 +89,8 @@ def _invalid(_value=None):
     raise ValueError("registry_publication_worker_config_invalid")
 
 
-def _unique_fields(pairs):
+def unique_json_fields(pairs):
+    """Decode configuration fields while rejecting duplicate names."""
     configured_by_name = {}
     for name, configured in pairs:
         if name in configured_by_name:
@@ -77,7 +99,11 @@ def _unique_fields(pairs):
     return configured_by_name
 
 
-def _consumer_config(configured):
+_unique_fields = unique_json_fields
+
+
+def parse_publication_consumer_config(configured):
+    """Validate distinct publication roles and bounded optional reader and loader identities."""
     required = _ROLES | {"control_schema"}
     if (
         type(configured) is not dict
@@ -102,8 +128,15 @@ def _consumer_config(configured):
     return consumer
 
 
+_consumer_config = parse_publication_consumer_config
+
+
 def _address_pin(configured):
-    if type(configured) is not dict or set(configured) != {"schema_name", "table_name", "generation_id"}:
+    if type(configured) is not dict or set(configured) != {
+        "schema_name",
+        "table_name",
+        "generation_id",
+    }:
         _invalid()
     return PinnedAddressSource(**configured)
 
@@ -115,15 +148,26 @@ def _initial_sources(configured):
         type(configured) is not dict
         or "base_source" not in configured
         or set(configured)
-        - {"base_source", "npi_source", "em_provider_inputs", "initial_source_recipes", "replacement_source_recipes"}
+        - {
+            "base_source",
+            "npi_source",
+            "em_provider_inputs",
+            "initial_source_recipes",
+            "replacement_source_recipes",
+            "compact",
+        }
     ):
         _invalid()
     npi = configured.get("npi_source")
     provider_inputs = configured.get("em_provider_inputs")
     if provider_inputs is not None:
-        if type(provider_inputs) is not list or any(type(item) is not dict for item in provider_inputs):
+        if type(provider_inputs) is not list or any(
+            type(provider_input) is not dict for provider_input in provider_inputs
+        ):
             _invalid()
-        provider_inputs = EMProviderInputs(tuple(EMProviderInputRelation(**item) for item in provider_inputs))
+        provider_inputs = EMProviderInputs(
+            tuple(EMProviderInputRelation(**provider_input) for provider_input in provider_inputs)
+        )
     recipes_by_phase = {}
     for phase in ("initial_source_recipes", "replacement_source_recipes"):
         recipes = configured.get(phase, [])
@@ -134,12 +178,17 @@ def _initial_sources(configured):
         _address_pin(configured["base_source"]),
         None if npi is None else _address_pin(npi),
         em_provider_inputs=provider_inputs,
+        compact=configured.get("compact", False),
         **recipes_by_phase,
     )
 
 
 def _ptg_config(configured, control_schema):
-    if type(configured) is not dict or set(configured) != {"owner_role", "approval_role", "read_limits"}:
+    if type(configured) is not dict or set(configured) != {
+        "owner_role",
+        "approval_role",
+        "read_limits",
+    }:
         _invalid()
     for name in ("owner_role", "approval_role"):
         _identifier(configured[name])
@@ -186,24 +235,17 @@ def parse_registry_publication_worker_config(encoded):
             or not _REQUIRED <= set(configured_by_name)
             or set(configured_by_name)
             - _REQUIRED
-            - {"initial_address_sources", "ptg", "operation_seconds", "sql_limits", "custody_dsn"}
+            - {
+                "initial_address_sources",
+                "ptg",
+                "operation_seconds",
+                "sql_limits",
+                "custody_dsn",
+            }
         ):
             _invalid()
         consumer = _consumer_config(configured_by_name["consumer"])
-        urls = []
-        for name in ("lifecycle_dsn", "execution_dsn"):
-            dsn = configured_by_name[name]
-            if type(dsn) is not str or not 0 < len(dsn) <= 4096:
-                _invalid()
-            urls.append(_database_url(dsn))
-        lifecycle, execution = urls
-        identity = lambda url: (url.host.lower(), url.port or 5432, url.database, dict(url.query))
-        if (
-            identity(lifecycle) != identity(execution)
-            or lifecycle.username != consumer.lifecycle_role
-            or execution.username != consumer.execution_role
-        ):
-            _invalid()
+        lifecycle, execution = _worker_database_urls(configured_by_name, consumer)
         token = configured_by_name["service_token"]
         if type(token) is not str or not 0 < len(token) <= 4096 or re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is None:
             _invalid()
@@ -313,7 +355,10 @@ async def _qualify_fresh_backends(connection, *, schema, observer_role, executio
     observed = await _backend_observation(connection, schema, roles)
     role_oids = _backend_actor(connection, observed, observer_role, roles)
     return _FreshBackendQualification(
-        schema, observed["observed_at"], tuple(observed[name] for name in _BACKEND_IDENTITY_FIELDS), role_oids
+        schema,
+        observed["observed_at"],
+        tuple(observed[name] for name in _BACKEND_IDENTITY_FIELDS),
+        role_oids,
     )
 
 
@@ -323,7 +368,10 @@ async def _worker_backend_qualification(config, connection, observer_role):
     if config.custody_url is not None:
         execution_roles += (config.custody_url.username,)
     return await _qualify_fresh_backends(
-        connection, schema=config.consumer.control_schema, observer_role=observer_role, execution_roles=execution_roles
+        connection,
+        schema=config.consumer.control_schema,
+        observer_role=observer_role,
+        execution_roles=execution_roles,
     )
 
 
@@ -404,7 +452,7 @@ def _summary(result_by_name):
     return {"request_id": identity, "state": "completed"}
 
 
-def _bounded_sessions(config, stack, url, *, backend_verifier=None):
+def _worker_sessions(config, stack, url, *, backend_verifier=None):
     """Own one qualified genuine session factory for the selected existing login."""
     engine = create_async_engine(
         url,
@@ -433,7 +481,7 @@ def _bounded_sessions(config, stack, url, *, backend_verifier=None):
 def _ptg_runtime(config, stack, *, backend_verifier=None):
     if config.ptg is None:
         return config.consumer
-    sessions = _bounded_sessions(config, stack, config.execution_url, backend_verifier=backend_verifier)
+    sessions = _worker_sessions(config, stack, config.execution_url, backend_verifier=backend_verifier)
     runtime = RegistryPublicationPTGRuntime(sessions, config.ptg.store, config.ptg.read_budget, config.sql_limits)
     return replace(config.consumer, composition_runtime=runtime)
 
@@ -451,7 +499,13 @@ def _custody_roles(config):
     else:
         roles = {
             getattr(consumer, name, None)
-            for name in ("lifecycle_role", "execution_role", "api_role", "physical_owner_role", "owner_role")
+            for name in (
+                "lifecycle_role",
+                "execution_role",
+                "api_role",
+                "physical_owner_role",
+                "owner_role",
+            )
         }
         roles.update(consumer.loader_roles)
         roles.update(consumer.reader_roles)
@@ -478,7 +532,13 @@ def _custody_actor_roles(config, consumer=None):
     for current in (config.consumer, consumer):
         roles.update(
             getattr(current, name, None)
-            for name in ("lifecycle_role", "execution_role", "api_role", "physical_owner_role", "owner_role")
+            for name in (
+                "lifecycle_role",
+                "execution_role",
+                "api_role",
+                "physical_owner_role",
+                "owner_role",
+            )
         )
         roles.update(current.loader_roles)
         roles.update(current.reader_roles)
@@ -488,7 +548,12 @@ def _custody_actor_roles(config, consumer=None):
     roles.update(getattr(config, "source_authority_roles", ()))
     store = getattr(config, "notification_store", None)
     if store is not None:
-        roles.update((getattr(store, "publisher_role", None), getattr(store, "approval_role", None)))
+        roles.update(
+            (
+                getattr(store, "publisher_role", None),
+                getattr(store, "approval_role", None),
+            )
+        )
         roles.update(getattr(store, "reader_roles", ()))
     roles.add(getattr(config, "reader_role", None))
     roles.add(getattr(getattr(config.ptg, "store", None), "approval_role", None))
@@ -520,7 +585,12 @@ def _verify_custody_config(config, consumer=None):
         _invalid()
     url = _database_url(config.custody_url.render_as_string(hide_password=False))
     execution = config.execution_url
-    endpoint = lambda item: (item.host.lower(), item.port or 5432, item.database, dict(item.query))
+    endpoint = lambda item: (
+        item.host.lower(),
+        item.port or 5432,
+        item.database,
+        dict(item.query),
+    )
     consumer = config.consumer if consumer is None else consumer
     forbidden_roles = {
         *_custody_roles(config),
@@ -577,7 +647,10 @@ async def _custody_identity(connection, schema, role):
 async def _address_preparation_snapshot(pool, sessions, consumer):
     """Keep PTG's genuine approval fence on the independent preparation backend."""
     if sessions is None:
-        async with pool.acquire() as custodian, custodian.transaction(isolation="repeatable_read"):
+        async with (
+            pool.acquire() as custodian,
+            custodian.transaction(isolation="repeatable_read"),
+        ):
             yield custodian, None
         return
     from process.registry_company_approval_fence import (
@@ -600,24 +673,29 @@ def _address_preparer(config, consumer, pool, identity, role, *, sessions=None):
         prepare_registry_composition_address_artifact,
     )
 
-    async def prepare(*, request_id, approved_revision, source_manifest, expected_head, address_sources):
+    async def prepare(
+        *,
+        request_id,
+        approved_revision,
+        source_manifest,
+        expected_head,
+        address_sources,
+    ):
         """Return only a committed independently sealed artifact or the verified retained-only inputs."""
         runtime_roles = _custody_runtime_roles(config, identity, consumer)
         _final_roles(identity["custody_owner_role"], runtime_roles)
         schema = consumer.control_schema
-        async with _address_preparation_snapshot(pool, sessions, consumer) as (custodian, office_authority):
+        async with _address_preparation_snapshot(pool, sessions, consumer) as (
+            custodian,
+            office_authority,
+        ):
             if await _custody_identity(custodian, schema, role) != identity:
                 raise ValueError("registry_candidate_custody_connection_invalid")
             await _q_reach_closed(custodian, identity, runtime_roles)
-            for input_pin in (address_sources.base_source, address_sources.npi_source):
-                if input_pin is not None and not await custodian.fetchval(
-                    "SELECT has_schema_privilege($1::name,to_regnamespace($2)::oid,'USAGE') "
-                    "AND has_table_privilege($1::name,to_regclass($3)::oid,'SELECT')",
-                    consumer.execution_role,
-                    input_pin.schema_name,
-                    f"{_identifier(input_pin.schema_name)}.{_identifier(input_pin.table_name)}",
-                ):
-                    raise ValueError("registry_composition_execution_input_reader_unavailable")
+            address_sources = await _registered_address_sources(
+                custodian, (request_id, approved_revision, expected_head), address_sources, schema
+            )
+            await _require_execution_address_reads(custodian, address_sources, consumer)
             artifact = await prepare_registry_composition_address_artifact(
                 custodian,
                 request_id=UUID(str(request_id)),
@@ -625,7 +703,14 @@ def _address_preparer(config, consumer, pool, identity, role, *, sessions=None):
                 address_sources=address_sources,
                 source_manifest=source_manifest,
                 expected_head=expected_head,
-                custody=RegistryAddressArtifactCustody(identity["custody_owner_role"], runtime_roles, schema),
+                custody=RegistryAddressArtifactCustody(
+                    identity["custody_owner_role"],
+                    runtime_roles,
+                    schema,
+                    address_reader_roles=tuple(sorted(set(consumer.loader_roles + consumer.reader_roles)))
+                    if address_sources.compact
+                    else None,
+                ),
                 office_authority=office_authority,
             )
             if await _custody_identity(custodian, schema, role) != identity:
@@ -649,7 +734,13 @@ async def _custody_runtime(config, stack, consumer, execution_connection, *, bac
     _verify_custody_config(config, consumer)
     schema = consumer.control_schema
     identity = await _custody_identity(execution_connection, schema, consumer.execution_role)
-    await _q_reach_closed(execution_connection, identity, _custody_runtime_roles(config, identity, consumer))
+    await _q_reach_closed(
+        execution_connection,
+        identity,
+        _custody_runtime_roles(config, identity, consumer),
+    )
+    if config.ptg is not None:
+        return _ptg_custody_runtime(config, stack, consumer, identity, backend_verifier=backend_verifier)
     pool = await asyncpg.create_pool(
         **_pool_options(config.custody_url, 1, config.sql_limits, backend_verifier=backend_verifier)
     )
@@ -688,7 +779,17 @@ async def _custody_runtime(config, stack, consumer, execution_connection, *, bac
     return _with_address_preparation(config, stack, consumer, pool, identity, seal_candidate, backend_verifier)
 
 
-def _with_address_preparation(config, stack, consumer, pool, identity, seal_candidate, backend_verifier):
+def _with_address_preparation(
+    config,
+    stack,
+    consumer,
+    pool,
+    identity,
+    seal_candidate,
+    backend_verifier,
+    *,
+    sessions=None,
+):
     """Keep supported source consumers on the same committed preparation route."""
     from process.registry_cms_source_consumer import RegistryCMSSourceConsumerConfig
     from process.registry_ptg_source_consumer import RegistryPTGSourceConsumerConfig
@@ -698,16 +799,18 @@ def _with_address_preparation(config, stack, consumer, pool, identity, seal_cand
         RegistryCMSSourceConsumerConfig,
         RegistryPTGSourceConsumerConfig,
     }:
-        sessions = (
-            _bounded_sessions(config, stack, config.custody_url, backend_verifier=backend_verifier)
-            if consumer.composition_runtime is not None
-            else None
-        )
+        if sessions is None and consumer.composition_runtime is not None:
+            sessions = _worker_sessions(config, stack, config.custody_url, backend_verifier=backend_verifier)
         return replace(
             consumer,
             seal_candidate=seal_candidate,
             prepare_address_sources=_address_preparer(
-                config, consumer, pool, identity, config.custody_url.username, sessions=sessions
+                config,
+                consumer,
+                pool,
+                identity,
+                config.custody_url.username,
+                sessions=sessions,
             ),
         )
     return replace(consumer, seal_candidate=seal_candidate)
@@ -715,7 +818,11 @@ def _with_address_preparation(config, stack, consumer, pool, identity, seal_cand
 
 async def _qualified_worker_runtime(config, stack, qualification, connection):
     """Apply one observer proof to both execution factories and the custody pool."""
-    consumer = _ptg_runtime(config, stack, backend_verifier=qualification.verifier(config.consumer.execution_role))
+    consumer = _ptg_runtime(
+        config,
+        stack,
+        backend_verifier=qualification.verifier(config.consumer.execution_role),
+    )
     return await _custody_runtime(
         config,
         stack,
@@ -727,14 +834,174 @@ async def _qualified_worker_runtime(config, stack, qualification, connection):
     )
 
 
-async def run_registry_publication_worker(config):
+def _ptg_custody_runtime(config, stack, consumer, identity, *, backend_verifier=None):
+    """Own an independent operator session, never the producer execution factory."""
+    from process.network_candidate_custody import (
+        seal_network_candidate_custody_in_session,
+        verify_network_candidate_custody,
+    )
+    from process.registry_company_approval_fence import (
+        registry_company_approval_transaction,
+    )
+
+    sessions = _worker_sessions(config, stack, config.custody_url, backend_verifier=backend_verifier)
+    schema, role = consumer.control_schema, config.custody_url.username
+
+    async def seal_candidate(copy_target, *, pre_enrolled_only=False):
+        """Seal through the genuine independent native office-capable session."""
+        async with registry_company_approval_transaction(sessions, control_schema=schema) as session:
+            custodian = (await (await session.connection()).get_raw_connection()).driver_connection
+
+            async def is_authorized(connection, target):
+                """Recheck this exact custodian connection and candidate before transfer."""
+                return (
+                    connection is custodian
+                    and target == copy_target
+                    and await _custody_identity(connection, schema, role) == identity
+                )
+
+            sealed = await seal_network_candidate_custody_in_session(
+                session,
+                copy_target,
+                control_schema=schema,
+                runtime_roles=_custody_runtime_roles(config, identity, consumer),
+                authorize=is_authorized,
+                office_store=config.ptg.store,
+                office_read_budget=config.ptg.read_budget,
+                pre_enrolled_only=pre_enrolled_only,
+            )
+        async with sessions() as session, session.begin():
+            await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            await session.execute(text("SET TRANSACTION READ ONLY"))
+            custodian = (await (await session.connection()).get_raw_connection()).driver_connection
+            verified = await verify_network_candidate_custody(
+                custodian, copy_target, control_schema=schema, required=True
+            )
+        if verified != sealed:
+            raise ValueError("registry_candidate_custody_connection_invalid")
+
+    return _with_address_preparation(
+        config,
+        stack,
+        consumer,
+        None,
+        identity,
+        seal_candidate,
+        backend_verifier,
+        sessions=sessions,
+    )
+
+
+def validate_membership_refresh_worker_params(params):
+    """Admit one exact request selector; neither the operation label nor UUID grants authority."""
+    if (
+        type(params) is not dict
+        or set(params) != {"request_id", "operation"}
+        or params["operation"] != "refresh_memberships"
+        or type(params["request_id"]) is not str
+    ):
+        raise ValueError("registry_membership_refresh_worker_params_invalid")
+    try:
+        identity = UUID(params["request_id"])
+    except ValueError:
+        raise ValueError("registry_membership_refresh_worker_params_invalid") from None
+    if not identity.int or str(identity) != params["request_id"]:
+        raise ValueError("registry_membership_refresh_worker_params_invalid")
+    return identity
+
+
+async def _membership_refresh_config(config, cleanup, request_id):
+    """Install only the fixed server-owned native runtime, never a job-selected factory."""
+    from process.registry_membership_refresh_contract import (
+        RegistryMembershipRefreshUnavailable,
+    )
+    from process.registry_membership_refresh_execution import (
+        RegistryMembershipRefreshRuntime,
+    )
+    from process.registry_membership_refresh_runtime import (
+        membership_refresh_worker_runtime,
+    )
+
+    if type(request_id) is not UUID or not request_id.int:
+        raise ValueError("registry_membership_refresh_worker_params_invalid")
+    runtime = await membership_refresh_worker_runtime(config, cleanup)
+    if type(runtime) is not RegistryMembershipRefreshRuntime:
+        raise RegistryMembershipRefreshUnavailable("registry_membership_refresh_runtime_unavailable")
+    consumer = replace(
+        config.consumer,
+        only_request_id=request_id,
+        membership_refresh_only=True,
+        membership_refresh_runtime=runtime,
+    )
+    return replace(config, consumer=consumer)
+
+
+async def _require_membership_refresh_request(connection, consumer, request_id):
+    """Read the actual protected queue identity before the exact family-filtered claim."""
+    from process.registry_membership_refresh_contract import (
+        RegistryMembershipRefreshUnavailable,
+    )
+    from process.registry_membership_refresh_queue import (
+        validated_membership_refresh_request_record,
+    )
+    from process.registry_source_observation_store import _namespace
+
+    if consumer.only_request_id != request_id or consumer.membership_refresh_only is not True:
+        raise RegistryMembershipRefreshUnavailable("registry_membership_refresh_request_unavailable")
+    record = await connection.fetchrow(
+        f"SELECT * FROM {_namespace(consumer.control_schema)}.registry_publication_request WHERE request_id=$1",
+        request_id,
+    )
+    if record is None or record["request_id"] != request_id:
+        raise RegistryMembershipRefreshUnavailable("registry_membership_refresh_request_unavailable")
+    validated_membership_refresh_request_record(record)
+
+
+async def control_start(ctx, task):
+    """Use the ordinary single-job lifecycle with exact pins and owned cancellation cleanup."""
+    from process.control_cancel import ImportCancelledError, raise_if_cancelled
+    from process.registry_cms_source_worker import _watch_control_cancel
+
+    if (
+        type(task) is not dict
+        or set(task) != {"run_id", "request_id", "operation"}
+        or type(task["run_id"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}", task["run_id"]) is None
+    ):
+        raise ValueError("registry_membership_refresh_worker_params_invalid")
+    request_id = validate_membership_refresh_worker_params({name: task[name] for name in ("request_id", "operation")})
+    config = parse_registry_publication_worker_config(os.environ.get(CONFIG_ENV))
+    await raise_if_cancelled(ctx, task)
+    work = asyncio.create_task(run_registry_publication_worker(config, membership_refresh_request_id=request_id))
+    watcher = asyncio.create_task(_watch_control_cancel(ctx, task))
+    try:
+        await asyncio.wait((work, watcher), return_when=asyncio.FIRST_COMPLETED)
+        if work.done():
+            return await work
+        await watcher
+    except asyncio.CancelledError, ImportCancelledError:
+        raise
+    except Exception:
+        raise RuntimeError("registry_membership_refresh_worker_failed") from None
+    finally:
+        for owned in (work, watcher):
+            if not owned.done():
+                owned.cancel()
+        await asyncio.gather(work, watcher, return_exceptions=True)
+
+
+async def run_registry_publication_worker(config, *, membership_refresh_request_id=None):
     """Own both bounded pools and authority client through success, failure or cancellation."""
     if type(config) is not RegistryPublicationWorkerConfig:
         _invalid()
     async with AsyncExitStack() as stack:
-        authorize = await stack.enter_async_context(
-            RegistryPublicationAuthorityClient(config.app_origin, config.service_token)
-        )
+        if membership_refresh_request_id is None:
+            authorize = await stack.enter_async_context(
+                RegistryPublicationAuthorityClient(config.app_origin, config.service_token)
+            )
+        else:
+            config = await _membership_refresh_config(config, stack, membership_refresh_request_id)
+            authorize = config.consumer.membership_refresh_runtime.authorize
         plan_metadata_client = RegistryBenefitPlanMetadataClient.from_config(os.environ)
         if plan_metadata_client is not None:
             await stack.enter_async_context(plan_metadata_client)
@@ -745,7 +1012,12 @@ async def run_registry_publication_worker(config):
             qualification = await _worker_backend_qualification(config, connection, config.consumer.lifecycle_role)
         execution_verifier = qualification.verifier(config.consumer.execution_role)
         execution = await asyncpg.create_pool(
-            **_pool_options(config.execution_url, 1, config.sql_limits, backend_verifier=execution_verifier)
+            **_pool_options(
+                config.execution_url,
+                1,
+                config.sql_limits,
+                backend_verifier=execution_verifier,
+            )
         )
         stack.push_async_callback(_close_pool, execution)
         execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
@@ -754,6 +1026,9 @@ async def run_registry_publication_worker(config):
             if consumer.composition_runtime is not None:
                 await consumer.composition_runtime.qualify()
         async with asyncio.timeout(config.operation_seconds):
+            if membership_refresh_request_id is not None:
+                async with lifecycle.acquire() as connection:
+                    await _require_membership_refresh_request(connection, consumer, membership_refresh_request_id)
             result_by_name = await consume_registry_publication_once(
                 lifecycle_pool=lifecycle,
                 execution_pool=execution,
@@ -766,7 +1041,10 @@ async def run_registry_publication_worker(config):
 
 
 def _error(code):
-    print(json.dumps({"state": "error", "code": code}, separators=(",", ":")), file=sys.stderr)
+    print(
+        json.dumps({"state": "error", "code": code}, separators=(",", ":")),
+        file=sys.stderr,
+    )
 
 
 def run_command():
@@ -798,8 +1076,63 @@ class _WorkerCommand(click.Command):
 
 
 @click.command(
-    name="registry-publication-worker", cls=_WorkerCommand, help="Consume one durable publication request and exit."
+    name="registry-publication-worker",
+    cls=_WorkerCommand,
+    help="Consume one durable publication request and exit.",
 )
 def registry_publication_worker_command():
     """Run the environment-configured worker once through the existing process group."""
     raise click.exceptions.Exit(run_command())
+
+
+def _worker_database_urls(configured_by_name, consumer):
+    urls = []
+    for name in ("lifecycle_dsn", "execution_dsn"):
+        dsn = configured_by_name[name]
+        if type(dsn) is not str or not 0 < len(dsn) <= 4096:
+            _invalid()
+        urls.append(_database_url(dsn))
+    lifecycle, execution = urls
+    identity = lambda url: (
+        url.host.lower(),
+        url.port or 5432,
+        url.database,
+        dict(url.query),
+    )
+    if (
+        identity(lifecycle) != identity(execution)
+        or lifecycle.username != consumer.lifecycle_role
+        or execution.username != consumer.execution_role
+    ):
+        _invalid()
+    return lifecycle, execution
+
+
+async def _require_execution_address_reads(custodian, address_sources, consumer):
+    for input_pin in (address_sources.base_source, address_sources.npi_source):
+        if input_pin is not None and not await custodian.fetchval(
+            "SELECT has_schema_privilege($1::name,to_regnamespace($2)::oid,'USAGE') "
+            "AND has_table_privilege($1::name,to_regclass($3)::oid,'SELECT')",
+            consumer.execution_role,
+            input_pin.schema_name,
+            f"{_identifier(input_pin.schema_name)}.{_identifier(input_pin.table_name)}",
+        ):
+            raise ValueError("registry_composition_execution_input_reader_unavailable")
+
+
+async def _registered_address_sources(custodian, request_scope, address_sources, schema):
+    from process.registry_composition_resume import resolve_registered_compact_format
+
+    request_id, approved_revision, expected_head = request_scope
+    registered_compact = await resolve_registered_compact_format(
+        custodian,
+        UUID(str(request_id)),
+        approved_revision,
+        expected_head,
+        control_schema=schema,
+    )
+    if registered_compact is True and not address_sources.compact:
+        raise ValueError("registry_composition_registered_compact_format_required")
+    if registered_compact is False and address_sources.compact:
+        address_sources = replace(address_sources, compact=False)
+    return address_sources

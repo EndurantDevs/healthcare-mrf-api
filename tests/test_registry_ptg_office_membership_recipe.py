@@ -180,9 +180,15 @@ async def test_office_binding_dispatch_uses_selected_tuple_and_real_copy(monkeyp
     from process import registry_ptg_office_bindings as bindings
     from process.network_address_projection import PinnedAddressSource
     from process.network_membership_copy import MembershipCopyTarget
+    from process.network_serving_read import PinnedNetworkServingManifest
     from process.registry_retained_site_adoption import RetainedSiteAdoption
+    from process.registry_source_office_origin import ResolvedSourceOfficeOrigin, source_office_pin_document
 
     driver, verified, approved = _owner()
+    verified = replace(
+        verified,
+        serving=PinnedNetworkServingManifest(3, str(UUID(int=9)), "retained_fixture", 1, {}, 4, "d" * 64, 12),
+    )
     adoption = RetainedSiteAdoption("npi", "1234567893", str(UUID(int=8)), "e" * 64, "npi", "1234567893", "f" * 64)
     batch = offices.PTGOfficeMembershipBatch(
         verified.pin, approved, verified, 1, 1, 0, 0, b"[]", "1" * 64, 1, (adoption,)
@@ -195,7 +201,15 @@ async def test_office_binding_dispatch_uses_selected_tuple_and_real_copy(monkeyp
     transaction.__aexit__ = AsyncMock(return_value=False)
     driver.transaction = lambda: transaction
     monkeypatch.setattr(bindings, "read_ptg_office_membership_batch", AsyncMock(return_value=batch))
-    monkeypatch.setattr(bindings, "_source_identity", AsyncMock(return_value=(1, 2, 3, "a" * 64)))
+    monkeypatch.setattr(
+        bindings,
+        "resolve_source_office_origin",
+        AsyncMock(
+            return_value=ResolvedSourceOfficeOrigin(
+                (1, 2, 3, "a" * 64), '"address_fixture".entity_address_unified', (), None
+            )
+        ),
+    )
     monkeypatch.setattr(bindings, "_candidate", AsyncMock())
     address = PinnedAddressSource("address_fixture", "entity_address_unified", "b" * 64)
     copy_target = MembershipCopyTarget(
@@ -204,6 +218,7 @@ async def test_office_binding_dispatch_uses_selected_tuple_and_real_copy(monkeyp
     pin = await bindings.pin_ptg_office_address_source(
         driver, batch, address, runtime_roles=("reader_fixture",), control_schema="control_fixture"
     )
+    assert "origin_manifest_sha256" not in source_office_pin_document(pin)
     receipt = await bindings.copy_ptg_office_bindings(
         driver, batch, copy_target, pin, runtime_roles=("reader_fixture",), control_schema="control_fixture"
     )

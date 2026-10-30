@@ -22,6 +22,12 @@ pytestmark = pytest.mark.asyncio
 COORDINATES = RegistryNetworkSourceCoordinates(
     "ptg", "synthetic-source", "synthetic_dataset", "dataset-one", "producer-one", "edition-one"
 )
+PRODUCT_COORDINATES = replace(
+    COORDINATES,
+    source_system="fhir",
+    producer_id="registry-retained-normalized-fhir-v1",
+    edition_id="11111111-1111-4111-8111-111111111111",
+)
 
 
 def _binding(network_id, index=1, **changes):
@@ -83,6 +89,135 @@ async def _network_ids(connection, schema, source):
         source.approved_revision,
         *COORDINATES.sql_parameters,
     )
+
+
+async def test_exact_approved_binding_query_excludes_inherited_records(serving_schema):
+    connection, schema, _engine = serving_schema
+    _actor, network, _bindings, source = await _setup(serving_schema)
+    baseline = await _network_ids(connection, schema, source)
+    assert baseline == [network["record_id"]]
+    parent, child = f'"{schema}".registry_approved_record', f'"{schema}".unapproved_child_records'
+    await connection.execute(f"CREATE TABLE {child} (LIKE {parent} INCLUDING CONSTRAINTS)")
+    try:
+        await connection.execute(
+            f"INSERT INTO {child} SELECT approved_revision,record_kind,$2,record_revision,custom_revision,record_json "
+            f"FROM ONLY {parent} WHERE approved_revision=$1 AND record_kind='network_binding'",
+            source.approved_revision,
+            str(uuid4()),
+        )
+        await connection.execute(f"ALTER TABLE {child} INHERIT {parent}")
+        assert await _network_ids(connection, schema, source) == baseline
+        assert (
+            await connection.fetchval(
+                f"SELECT count(*) FROM {parent} WHERE approved_revision=$1 AND record_kind='network_binding'",
+                source.approved_revision,
+            )
+            == 2
+        )
+    finally:
+        await connection.execute(f"DROP TABLE {child}")
+
+
+async def _setup_products(fixture):
+    connection, schema, engine = fixture
+    actor = _actor()
+    networks = [await _draft(engine, schema, _create("network"), actor) for _ in range(2)]
+    bindings = [
+        _binding(
+            network["record_id"],
+            index,
+            **dict(
+                zip(
+                    ("source_system", "source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id"),
+                    PRODUCT_COORDINATES.sql_parameters,
+                    strict=True,
+                )
+            ),
+            source_key="InsurancePlan/plan-one",
+            source_scope_json={
+                "insurance_plan_id": "plan-one",
+                "capture_sha256": "a" * 64,
+                "product_network_id": network["record_id"],
+            },
+        )
+        for index, network in enumerate(networks)
+    ]
+    receipt = await _apply(connection, schema, actor, bindings)
+    await _approve(connection, schema, await _command(connection, schema, *networks, *receipt["records"]), actor)
+    return await _pin(connection, schema)
+
+
+async def test_two_reviewed_products_can_select_one_exact_plan(serving_schema):
+    connection, schema, _ = serving_schema
+    source = await _setup_products(serving_schema)
+    assert await _count(connection, schema, source, PRODUCT_COORDINATES) == 2
+    keys = await connection.fetchval(
+        f"SELECT count(DISTINCT record_json->>'binding_key') FROM \"{schema}\".registry_approved_record "
+        "WHERE record_kind='network_binding' AND approved_revision=$1",
+        source.approved_revision,
+    )
+    assert keys == 2
+    for field in ("source_id", "dataset_schema", "dataset_id", "producer_id", "edition_id"):
+        changed = replace(PRODUCT_COORDINATES, **{field: "other"})
+        assert await _count(connection, schema, source, changed) == 0
+
+
+@pytest.mark.parametrize(
+    "damage", ["target", "key", "capture", "plan", "extra", "cms", "producer", "duplicate", "organization", "closed"]
+)
+async def test_product_approved_scope_refuses_widening_or_changed_evidence(serving_schema, damage):
+    connection, schema, _ = serving_schema
+    await _setup_products(serving_schema)
+    stored = await connection.fetchrow(
+        f"SELECT * FROM \"{schema}\".registry_approved_record WHERE record_kind='network_binding' ORDER BY record_key LIMIT 1"
+    )
+    binding_by_field = json.loads(stored["record_json"])
+    scope_by_field = binding_by_field["source_scope_json"]
+    coordinates = PRODUCT_COORDINATES
+    if damage in {"duplicate", "organization", "closed"}:
+        binding_by_field.update(binding_id=str(uuid4()), binding_key="d" * 64)
+        if damage == "organization":
+            binding_by_field.update(
+                source_key="organization-one",
+                source_scope_json={"organization_id": "organization-one", "capture_sha256": "a" * 64},
+            )
+        else:
+            scope_by_field["insurance_plan_id"] = "plan-two"
+            binding_by_field.update(source_key="InsurancePlan/plan-two", archived=damage == "closed")
+        await connection.execute(
+            f'INSERT INTO "{schema}".registry_approved_record VALUES($1,$2,$3,$4,$5,$6::jsonb)',
+            stored["approved_revision"],
+            stored["record_kind"],
+            binding_by_field["binding_id"],
+            stored["record_revision"],
+            stored["custom_revision"],
+            json.dumps(binding_by_field),
+        )
+    else:
+        changes_by_field = {
+            "target": {"product_network_id": binding_by_field["network_id"] + 1},
+            "capture": {"capture_sha256": "A" * 64},
+            "plan": {"insurance_plan_id": "plan_one"},
+            "extra": {"extra": True},
+        }
+        scope_by_field.update(changes_by_field.get(damage, {}))
+        if damage == "key":
+            binding_by_field["source_key"] = "representative-org"
+        if damage in {"cms", "producer"}:
+            field = "source_id" if damage == "cms" else "producer_id"
+            binding_by_field[field] = "cms-npd" if damage == "cms" else "other-producer"
+            coordinates = replace(coordinates, **{field: binding_by_field[field]})
+        await connection.execute(
+            f'UPDATE "{schema}".registry_approved_record SET record_json=$1::jsonb WHERE record_key=$2',
+            json.dumps(binding_by_field),
+            stored["record_key"],
+        )
+    approved_source = await _pin(connection, schema)
+    if damage == "closed":
+        assert await _count(connection, schema, approved_source, coordinates) == 2
+    else:
+        with pytest.raises(ApprovedNetworkSourceBindingError, match="registry_approved_source_binding_invalid"):
+            await _count(connection, schema, approved_source, coordinates)
 
 
 @pytest.mark.parametrize(

@@ -226,15 +226,18 @@ def retained_tiger_children_sql() -> str:
     )"""
 
 
-def projection_state_available_sql(schema_name: str) -> str:
+def projection_state_available_sql(schema_name: str, *, api_read=False) -> str:
     """Require the active projection to match every published dependency."""
 
     schema_name = _sql_identifier(schema_name, field_name="address schema")
+    if type(api_read) is not bool:
+        raise ValueError("geo projection API read mode is invalid")
     live_table = f"{schema_name}.entity_address_unified"
+    state_relation = ("ONLY " if api_read else "") + f"{schema_name}.{GEO_ASSURANCE_STATE_TABLE}"
     signature, binding_matches = projection_stored_bindings_sql(schema_name, "active_dependency_bindings")
     return f"""EXISTS (
         SELECT 1
-          FROM {schema_name}.{GEO_ASSURANCE_STATE_TABLE} AS geo_assurance_state
+          FROM {state_relation} AS geo_assurance_state
          WHERE geo_assurance_state.singleton IS TRUE
            AND geo_assurance_state.active_geo_assurance_version = {GEO_ASSURANCE_VERSION}
            AND geo_assurance_state.active_table_oid = to_regclass('{live_table}')::oid

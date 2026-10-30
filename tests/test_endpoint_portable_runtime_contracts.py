@@ -96,11 +96,14 @@ def test_zip_radius_cache_fails_closed_when_disabled_or_expired(monkeypatch):
 async def test_pricing_helpers_reject_non_queryable_inputs():
     """Return bounded empty results for invalid ZIP, code, and payload inputs."""
 
-    assert await pricing._zip_radius_rows(
-        object(),
-        zip5="",
-        radius_miles=10.0,
-    ) == []
+    assert (
+        await pricing._zip_radius_rows(
+            object(),
+            zip5="",
+            radius_miles=10.0,
+        )
+        == []
+    )
     assert pricing._is_broad_office_visit_cpt("CPT", "not-a-code") is False
     assert (
         pricing._annotate_ptg2_query_payload(
@@ -130,9 +133,7 @@ async def test_table_columns_filters_rows_and_populates_cache(monkeypatch):
 
     pricing._PRICING_TABLE_COLUMNS_CACHE.clear()
     monkeypatch.setattr(pricing, "ENABLE_PRICING_SCHEMA_CACHE", True)
-    session = _QueueSession(
-        [_Result(rows=[("npi",), (), (None,), ("state",)])]
-    )
+    session = _QueueSession([_Result(rows=[("npi",), (), (None,), ("state",)])])
 
     assert await pricing._table_columns(session, "portable_table") == {
         "npi",
@@ -149,9 +150,7 @@ async def test_unified_address_source_requires_complete_schema(monkeypatch):
         pricing.ADDRESS_SERVING_SOURCE_ENV,
         pricing.ADDRESS_SERVING_SOURCE_UNIFIED,
     )
-    incomplete_columns = (
-        set(pricing.GROUP_PLAN_UNIFIED_BASE_ADDRESS_COLUMNS) - {"npi"}
-    )
+    incomplete_columns = set(pricing.GROUP_PLAN_UNIFIED_BASE_ADDRESS_COLUMNS) - {"npi"}
     monkeypatch.setattr(
         pricing,
         "_table_columns",
@@ -175,9 +174,7 @@ async def test_unified_address_source_reports_optional_capabilities(monkeypatch)
         pricing.ADDRESS_SERVING_SOURCE_UNIFIED,
     )
     complete_columns = set(pricing.GROUP_PLAN_UNIFIED_BASE_ADDRESS_COLUMNS)
-    complete_columns.update(
-        {"group_plan_array", "ptg_plan_array", "location_key"}
-    )
+    complete_columns.update({"group_plan_array", "ptg_plan_array", "location_key"})
     monkeypatch.setattr(
         pricing,
         "_table_columns",
@@ -219,9 +216,7 @@ def test_group_plan_specialty_options_include_subspecialties_and_nonprimary():
     assert "group_specialty_nucc.classification" in sql
     assert "group_specialty_nucc.specialization" not in sql
     assert "healthcare_provider_primary_taxonomy_switch" not in sql
-    assert parameters_by_name == {
-        "group_specialty_classification": "Synthetic Classification"
-    }
+    assert parameters_by_name == {"group_specialty_classification": "Synthetic Classification"}
 
 
 @pytest.mark.asyncio
@@ -287,9 +282,7 @@ async def test_terminology_query_applies_fuzzy_scope_and_public_shape(
 async def test_rx_crosswalk_preserves_internal_and_external_matches():
     """Combine direct internal codes with every resolved external code."""
 
-    session = _QueueSession(
-        [_Result(rows=[("RX-002",), {"to_code": "RX-003"}])]
-    )
+    session = _QueueSession([_Result(rows=[("RX-002",), {"to_code": "RX-003"}])])
     matches = await pricing._internal_rx_codes_from_terminology(
         session,
         [
@@ -312,26 +305,21 @@ async def test_npi_classification_queries_cover_connection_and_mapping_rows(
 
     npi_endpoint._CLASSIFICATION_TAXONOMY_CODES_CACHE.clear()
     npi_endpoint._CLASSIFICATION_NPI_CACHE.clear()
-    connection = _NpiConnection(
-        [[("0000000000",)], [_MappingRow("1234567890")]]
-    )
+    monkeypatch.setattr(npi_endpoint, "_npi_canonical_publication_identity", AsyncMock(return_value=None))
+    connection = _NpiConnection([[("0000000000",)], [_MappingRow("1234567890")]])
     monkeypatch.setattr(
         npi_endpoint.db,
         "acquire",
         lambda: _AcquireContext(connection),
     )
 
-    assert await npi_endpoint._get_taxonomy_codes_for_classification(
-        "Synthetic specialty"
-    ) == ["0000000000"]
+    assert await npi_endpoint._get_taxonomy_codes_for_classification("Synthetic specialty") == ["0000000000"]
     monkeypatch.setattr(
         npi_endpoint,
         "_get_taxonomy_codes_for_classification",
         AsyncMock(return_value=["0000000000"]),
     )
-    assert await npi_endpoint._get_classification_npi_list(
-        "Synthetic specialty"
-    ) == [1234567890]
+    assert await npi_endpoint._get_classification_npi_list("Synthetic specialty") == [1234567890]
 
 
 @pytest.mark.asyncio
@@ -340,9 +328,7 @@ async def test_npi_table_availability_caches_resolved_presence(monkeypatch):
 
     npi_endpoint._TABLE_EXISTS_CACHE.clear()
     monkeypatch.setattr(npi_endpoint, "ENABLE_NPI_SCHEMA_CACHE", True)
-    execute_statement = AsyncMock(
-        return_value=_Result(rows=[("mrf.synthetic_table",)])
-    )
+    execute_statement = AsyncMock(return_value=_Result(rows=[("mrf.synthetic_table",)]))
     monkeypatch.setattr(npi_endpoint, "_execute_stmt", execute_statement)
 
     assert await npi_endpoint._is_table_available(

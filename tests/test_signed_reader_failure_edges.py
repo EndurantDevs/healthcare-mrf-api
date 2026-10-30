@@ -10,10 +10,25 @@ from uuid import UUID
 import pytest
 
 from api import custom_import_read_http as transport
+from api import reference_family_reads
 from api import signed_request_reader as boundary
 from tests.signed_request_reader_support import cold_caller, install_reader_factory
 from tests.test_api_reader_sessions import ReaderSession
 from tests.test_reader_failure_diagnostics import CORE_ID, REQUEST_ID, _database_failure, _logged
+
+
+@pytest.mark.parametrize("resource", ["providers", "search"])
+async def test_signed_provider_entry_uses_guarded_claims_reader(monkeypatch, resource):
+    session = ReaderSession()
+    install_reader_factory(monkeypatch, session)
+    request = SimpleNamespace(path="/api/v1/extensions/custom-import/" + resource, headers={})
+    async with boundary.signed_request_reader(request, cold_caller()) as reader:
+        assert reader is session
+        if resource == "providers":
+            reference_family_reads.pin_claims_reader.assert_awaited_once_with(session, api_read=True)
+        else:
+            reference_family_reads.pin_claims_reader.assert_not_awaited()
+    assert session.closed and session.committed
 
 
 @pytest.mark.parametrize("address,port", [(None, None), ("not-an-ip-address", 5432)])

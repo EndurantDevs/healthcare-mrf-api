@@ -8,10 +8,11 @@ from api.network_address_scope import (
     scoped_address_parameters,
     scoped_address_relation_sql,
 )
+from api.network_read_execution import bounded_network_read_rows
 from api.plan_pricing_em_distance import _card_item, _progressive_page_rows, _projection_response
 from api.plan_pricing_projection_contract import SCHEMA, PlanPricingProjectionUnavailable
 from api.plan_release_serving import annotate_plan_release_response
-from api.provider_service_source_policy import _bounded_rows, admitted_plan_release_bindings
+from api.provider_service_source_policy import admitted_plan_release_bindings
 
 _PAGE_SQL = """
 WITH center AS MATERIALIZED (
@@ -37,7 +38,7 @@ WITH center AS MATERIALIZED (
    AND addr.lat IS NOT NULL AND addr.long IS NOT NULL
    AND addr.lat BETWEEN -90 AND 90 AND addr.long BETWEEN -180 AND 180
    AND public.ST_DWithin({geography},center.point,:radius_meters)
-   AND EXISTS (SELECT 1 FROM {rates_relation} rate WHERE rate.npi=addr.npi
+   AND EXISTS (SELECT 1 FROM ONLY {rates_relation} rate WHERE rate.npi=addr.npi
      AND rate.code_index=:code_index AND rate.binding_ordinal=ANY(CAST(:allowed_binding_ordinals AS integer[])))
    AND EXISTS (SELECT 1 FROM (SELECT 1) reference {reference_joins} WHERE {identity})
    AND EXISTS (SELECT 1 FROM {zcta_relation} held_zcta
@@ -61,6 +62,8 @@ SELECT page.*,counts.candidate_count,counts.unique_count,true AS projection_read
 
 def _page_sql(inputs, rates_relation):
     """Filter admitted source ordinals and held office assurance before KNN limiting."""
+    from process.network_em_provider_inputs import em_provider_geo_reads_sql
+
     scope = current_network_address_scope()
     if scope is None:
         raise PlanPricingProjectionUnavailable("managed E&M requires a retained network scope")
@@ -83,15 +86,15 @@ def _page_sql(inputs, rates_relation):
     # Match the retained serving heap's GiST expression exactly.
     geography = "public.Geography(public.ST_MakePoint((addr.long)::double precision,(addr.lat)::double precision))"
     return _PAGE_SQL.format(
-        zip_relation=inputs.relation("geo_zip_lookup"),
-        zcta_relation=inputs.relation("tiger.zcta5"),
+        zip_relation="ONLY " + inputs.relation("geo_zip_lookup"),
+        zcta_relation="ONLY " + inputs.relation("tiger.zcta5"),
         address=address,
         rates_relation=rates_relation,
         geography=geography,
-        reference_joins=reference_joins,
+        reference_joins=em_provider_geo_reads_sql(reference_joins, inputs, SCHEMA),
         identity=identity,
         point=point,
-        evidence=evidence,
+        evidence=em_provider_geo_reads_sql(evidence, inputs, SCHEMA),
     )
 
 
@@ -106,35 +109,37 @@ def _completion_sql(inputs, rates_relation):
  provider.entity_type_code,provider.provider_credential_text AS credential,
  primary_tax.taxonomy_code,primary_tax.primary_specialty,classification.classification,
  prices.minimum_rates,prices.maximum_rates,prices.rate_counts
- FROM unnest($1::bigint[]) requested(npi) LEFT JOIN {inputs.relation("npi")} provider USING(npi)
+ FROM unnest($1::bigint[]) requested(npi) LEFT JOIN ONLY {inputs.relation("npi")} provider USING(npi)
  LEFT JOIN LATERAL (
   SELECT nt.healthcare_provider_taxonomy_code AS taxonomy_code,
    coalesce(nucc.display_name,nucc.classification) AS primary_specialty
-  FROM {taxonomy} nt LEFT JOIN {vocabulary} nucc ON nucc.code=nt.healthcare_provider_taxonomy_code
+  FROM ONLY {taxonomy} nt LEFT JOIN ONLY {vocabulary} nucc ON nucc.code=nt.healthcare_provider_taxonomy_code
   WHERE nt.npi=requested.npi ORDER BY {order} LIMIT 1
  ) primary_tax ON true
  LEFT JOIN LATERAL (
   SELECT nullif(nucc.classification,'') AS classification
-  FROM {taxonomy} nt JOIN {vocabulary} nucc ON nucc.code=nt.healthcare_provider_taxonomy_code
+  FROM ONLY {taxonomy} nt JOIN ONLY {vocabulary} nucc ON nucc.code=nt.healthcare_provider_taxonomy_code
   WHERE nt.npi=requested.npi AND nullif(nucc.classification,'') IS NOT NULL ORDER BY {order} LIMIT 1
  ) classification ON true
  LEFT JOIN LATERAL (
   SELECT ({_rate_array_sql("MIN", "minimum_rate", "numeric")})::text[] AS minimum_rates,
    ({_rate_array_sql("MAX", "maximum_rate", "numeric")})::text[] AS maximum_rates,
    {_rate_array_sql("SUM", "rate_count", "bigint")} AS rate_counts
-  FROM {rates_relation} rate WHERE rate.npi=requested.npi
+  FROM ONLY {rates_relation} rate WHERE rate.npi=requested.npi
    AND rate.code_index=$3::smallint AND rate.binding_ordinal=ANY($2::integer[])
  ) prices ON true"""
 
 
-async def _complete_page(driver, inputs, rates_relation, page_rows, ordinals, code_index):
+async def _complete_page(session, inputs, rates_relation, page_rows, ordinals, code_index):
     npis = sorted({int(row["npi"]) for row in page_rows if row.get("npi") is not None})
     if not npis:
         return []
     if len(npis) > 101:
         raise PlanPricingProjectionUnavailable("managed E&M completion exceeds its page bound")
     try:
-        rows = await _bounded_rows(driver, _completion_sql(inputs, rates_relation), npis, list(ordinals), code_index)
+        rows = await bounded_network_read_rows(
+            session, _completion_sql(inputs, rates_relation), npis, list(ordinals), code_index
+        )
         by_npi = {int(row["npi"]): row for row in rows}
         if len(by_npi) != len(rows) or set(by_npi) != set(npis):
             raise ValueError("managed E&M completion identity differs")
@@ -150,16 +155,14 @@ async def _complete_page(driver, inputs, rates_relation, page_rows, ordinals, co
 async def search_managed_em_distance(session, selection, args, pagination, zip5, latitude, longitude, code_index):
     """Complete a bounded admitted page while retaining full immutable release identity."""
     from api.plan_pricing_em_attribution import ATTRIBUTION_CONTRACT, resolve_em_attribution
-    from process.network_em_provider_inputs import resolve_em_provider_inputs
+    from process.network_em_provider_inputs import resolve_em_provider_inputs_in_session
 
     scope = current_network_address_scope()
     if scope is None:
         raise PlanPricingProjectionUnavailable("managed E&M requires a retained network scope")
     admitted = await admitted_plan_release_bindings(session, selection)
-    artifact = await resolve_em_attribution(session, selection)
-    connection = await session.connection()
-    driver = (await connection.get_raw_connection()).driver_connection
-    inputs = await resolve_em_provider_inputs(driver, scope.manifest)
+    artifact = await resolve_em_attribution(session, selection, api_read=True)
+    inputs = await resolve_em_provider_inputs_in_session(session, scope.manifest)
     ordinals = tuple(binding.binding_ordinal for binding in admitted)
     if not ordinals:
         page_rows, exact, boundary, unique_count = [], True, False, 0
@@ -179,7 +182,7 @@ async def search_managed_em_distance(session, selection, args, pagination, zip5,
         if page_window is None:
             raise PlanPricingProjectionUnavailable("managed E&M page is unavailable")
         page_rows, exact, boundary, unique_count = page_window
-    cards = await _complete_page(driver, inputs, artifact.rates_relation, page_rows, ordinals, code_index)
+    cards = await _complete_page(session, inputs, artifact.rates_relation, page_rows, ordinals, code_index)
     has_more = len(cards) > int(pagination.limit) or (not exact and not boundary)
     cards = cards[: int(pagination.limit)]
     total = unique_count if exact else max(unique_count, int(pagination.offset) + len(cards) + int(has_more))

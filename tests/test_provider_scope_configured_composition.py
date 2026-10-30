@@ -15,6 +15,7 @@ from api.network_address_scope import network_address_read_scope, scoped_address
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests import test_custom_import_provider_geo_sql as geo_fixture
 from tests import test_custom_import_provider_list as list_fixture
+from tests.network_read_execution_support import with_read_identity_receipts
 
 _CANDIDATE = "00000000-0000-0000-0000-000000000001"
 _MANIFEST = PinnedNetworkServingManifest(
@@ -104,7 +105,7 @@ async def test_native_scoped_list_uses_the_existing_request_session(monkeypatch)
         calls.append((statement, parameters))
         return Result()
 
-    session = SimpleNamespace(execute=execute)
+    session = with_read_identity_receipts(SimpleNamespace(execute=execute))
     database = SimpleNamespace(acquire=lambda: (_ for _ in ()).throw(AssertionError("unscoped pool acquired")))
     with network_address_read_scope(_MANIFEST, (42,)):
         async with provider_list_sql._provider_list_connection(database, None, session) as connection:
@@ -149,10 +150,10 @@ async def test_scoped_geo_handler_binds_one_pinned_source_before_count_and_page(
     cursor_calls = []
 
     class Proxy(geo_fixture._RecordingGeoProxy):
-        async def all(self, statement, **parameters):
+        def _rows(self, statement, parameters):
             sql = str(statement)
             if imported:
-                return await super().all(statement, **parameters)
+                return super()._rows(statement, parameters)
             self._session.calls.append((sql, dict(parameters)))
             if "COUNT" in sql.upper():
                 return [SimpleNamespace(_mapping={"total_count": 3})]
@@ -166,7 +167,7 @@ async def test_scoped_geo_handler_binds_one_pinned_source_before_count_and_page(
         cursor_calls.append(kwargs)
         return None
 
-    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", Proxy)
+    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", Proxy)
     monkeypatch.setattr(npi, "_plan_release_npi_scope", geo_fixture._empty_plan_scope)
     monkeypatch.setattr(npi.db, "acquire", lambda: (_ for _ in ()).throw(AssertionError("unscoped pool acquired")))
     args = RequestParameters({"lat": ["0"], "long": ["0"], "include_total": ["true"], "limit": ["2"]})

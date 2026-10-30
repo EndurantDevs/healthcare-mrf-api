@@ -5,6 +5,8 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 import asyncpg
 
@@ -14,6 +16,14 @@ from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
+)
+from process.registry_fhir_catalog_publication import (
+    FHIRCatalogPublicationRuntime,
+    complete_queued_fhir_catalog_publication,
+)
+from process.registry_membership_refresh_execution import (
+    RegistryMembershipRefreshRuntime,
+    complete_queued_membership_refresh,
 )
 from process.registry_publication_execution import (
     _command_actor,
@@ -38,6 +48,9 @@ from process.registry_publication_queue import (
 from process.registry_publication_worker_permissions import verify_registry_publication_worker_permissions
 from process.registry_source_observation_store import _namespace
 
+if TYPE_CHECKING:
+    from process.registry_fhir_catalog_publication import FHIRCatalogPublicationRuntime
+
 _LEASE_SECONDS = 300
 _HEARTBEAT_SECONDS = 30
 
@@ -59,8 +72,35 @@ class RegistryPublicationConsumerConfig:
     prepare_address_sources: Callable[..., Awaitable[RegistryCompositionAddressSources]] | None = field(
         default=None, repr=False
     )
+    metadata_runtime: "FHIRCatalogPublicationRuntime | None" = field(default=None, repr=False)
+    metadata_only: bool = False
+    only_request_id: UUID | None = None
+    membership_refresh_runtime: RegistryMembershipRefreshRuntime | None = field(default=None, repr=False)
+    membership_refresh_only: bool = False
 
     def __post_init__(self):
+        if (
+            type(self.membership_refresh_only) is not bool
+            or self.membership_refresh_only
+            and (self.membership_refresh_runtime is None or self.only_request_id is None or self.metadata_only)
+        ):
+            raise ValueError("registry_publication_consumer_config_invalid")
+        if self.membership_refresh_runtime is not None and (
+            type(self.membership_refresh_runtime) is not RegistryMembershipRefreshRuntime
+            or self.only_request_id is None
+        ):
+            raise ValueError("registry_publication_consumer_config_invalid")
+        if type(self.metadata_only) is not bool or self.metadata_only and self.metadata_runtime is None:
+            raise ValueError("registry_publication_consumer_config_invalid")
+        if self.only_request_id is not None and (
+            type(self.only_request_id) is not UUID or not self.only_request_id.int
+        ):
+            raise ValueError("registry_publication_consumer_config_invalid")
+        if self.metadata_runtime is not None:
+            from process.registry_fhir_catalog_publication import FHIRCatalogPublicationRuntime
+
+            if type(self.metadata_runtime) is not FHIRCatalogPublicationRuntime:
+                raise ValueError("registry_publication_consumer_config_invalid")
         if self.seal_candidate is not None and not callable(self.seal_candidate):
             raise ValueError("registry_publication_consumer_config_invalid")
         if self.prepare_address_sources is not None and not callable(self.prepare_address_sources):
@@ -117,6 +157,10 @@ async def _verify_lifecycle(connection, config):
 
 async def _verify_execution(connection, config):
     async with connection.transaction(readonly=True):
+        if config.metadata_only:
+            from process.registry_fhir_catalog_permissions import verify_fhir_catalog_publication_permissions
+
+            return await verify_fhir_catalog_publication_permissions(connection, config, role=config.execution_role)
         await verify_registry_publication_worker_permissions(
             connection, **config.permission_roles, control_schema=config.control_schema, role=config.execution_role
         )
@@ -130,6 +174,10 @@ async def _claim(lifecycle_pool, config):
             operation_family="publication",
             lease_seconds=_LEASE_SECONDS,
             control_schema=config.control_schema,
+            allow_metadata=config.metadata_runtime is not None,
+            metadata_only=config.metadata_only,
+            request_id=config.only_request_id,
+            membership_refresh_only=config.membership_refresh_only,
         )
 
 
@@ -277,8 +325,31 @@ async def _prepared_address_sources(
     return sources
 
 
+async def _execute_catalog_request(connection, config, request_record):
+    """Keep the catalog owner's frozen operation and authority boundary."""
+    from process.registry_fhir_catalog_publication import complete_queued_fhir_catalog_publication
+
+    if config.metadata_runtime is None:
+        raise ValueError("registry_fhir_catalog_runtime_unavailable")
+    return await complete_queued_fhir_catalog_publication(
+        connection,
+        request_record["request_id"],
+        request_record["lease_id"],
+        authorize_metadata=config.metadata_runtime.authorize_metadata,
+        verify_sources=config.metadata_runtime.verify_sources,
+        control_schema=config.control_schema,
+        source_fence=config.metadata_runtime.source_fence,
+    )
+
+
 async def _execute_publication_request(
-    execution_pool, config, request_record, authorize, initial_address_sources, plan_metadata_client=None
+    execution_pool,
+    config,
+    request_record,
+    authorize,
+    initial_address_sources,
+    plan_metadata_client=None,
+    authorize_commit=None,
 ):
     async with execution_pool.acquire() as connection:
         try:
@@ -287,6 +358,19 @@ async def _execute_publication_request(
             raise RuntimeError("registry_publication_consumer_unavailable") from None
         command_by_name = _document(request_record["command_json"])
         operation = command_by_name.get("operation")
+        if operation == "refresh_memberships":
+            if config.membership_refresh_runtime is None or not callable(authorize_commit):
+                raise ValueError("registry_membership_refresh_runtime_unavailable")
+            return await complete_queued_membership_refresh(
+                connection,
+                request_record,
+                runtime=config.membership_refresh_runtime,
+                writer_context=config,
+                authorize=authorize,
+                authorize_commit=authorize_commit,
+            )
+        if operation == "publish_fhir_catalog":
+            return await _execute_catalog_request(connection, config, request_record)
         options_by_name = dict(authorize=authorize, control_schema=config.control_schema)
         if operation is None:
             return await _ordinary_publication(
@@ -318,6 +402,15 @@ async def _execute_publication_request(
         return await complete(connection, request_record["request_id"], request_record["lease_id"], **options_by_name)
 
 
+async def _lease_authority(authorize, stopped, request_by_name):
+    if stopped.is_set():
+        raise RegistryApprovalConflict("registry_queue_lease_conflict")
+    receipt = await authorize(**request_by_name)
+    if stopped.is_set():
+        raise RegistryApprovalConflict("registry_queue_lease_conflict")
+    return receipt
+
+
 async def _run_with_heartbeat(
     lifecycle_pool,
     execution_pool,
@@ -331,16 +424,25 @@ async def _run_with_heartbeat(
 
     async def fresh_authorize(**request_by_name):
         """Refuse authority if lease maintenance stopped during the HTTP request."""
-        if stopped.is_set():
-            raise RegistryApprovalConflict("registry_queue_lease_conflict")
-        receipt = await authorize(**request_by_name)
-        if stopped.is_set():
-            raise RegistryApprovalConflict("registry_queue_lease_conflict")
-        return receipt
+        return await _lease_authority(authorize, stopped, request_by_name)
+
+    async def fresh_commit_authorize(**request_by_name):
+        """Final grant checks use the same live lease fence without reentering Core."""
+        if config.membership_refresh_runtime is None:
+            raise ValueError("registry_membership_refresh_runtime_unavailable")
+        return await _lease_authority(
+            config.membership_refresh_runtime.authorize.authorize_commit, stopped, request_by_name
+        )
 
     work = asyncio.create_task(
         _execute_publication_request(
-            execution_pool, config, request_record, fresh_authorize, initial_address_sources, plan_metadata_client
+            execution_pool,
+            config,
+            request_record,
+            fresh_authorize,
+            initial_address_sources,
+            plan_metadata_client,
+            fresh_commit_authorize,
         )
     )
     heartbeat = asyncio.create_task(_heartbeat(lifecycle_pool, config, request_record))
@@ -405,6 +507,9 @@ async def consume_registry_publication_once(
     if request_record is None:
         return None
     try:
+        command = _document(request_record["command_json"])
+        if command.get("operation") == "refresh_memberships":
+            authorize = config.membership_refresh_runtime.authorize
         result_by_name = await _run_with_heartbeat(
             lifecycle_pool,
             execution_pool,

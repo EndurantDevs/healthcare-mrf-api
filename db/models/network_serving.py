@@ -20,6 +20,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from db.connection import Base
 from db.registry_schema import registry_schema
+from db.registry_source_inventory_schema import source_recipe_storage_check
 
 __all__ = (
     "NetworkMembershipCandidate",
@@ -53,8 +54,7 @@ class NetworkMembershipCandidate(Base):
         ),
         CheckConstraint("jsonb_typeof(source_generations) = 'object'", name="network_candidate_sources"),
         CheckConstraint(
-            "jsonb_typeof(source_recipes_json)='array' AND jsonb_array_length(source_recipes_json)<=100 "
-            "AND octet_length(source_recipes_json::text)<=1048576",
+            source_recipe_storage_check(),
             name="network_candidate_source_recipes",
         ),
         CheckConstraint(
@@ -153,11 +153,16 @@ class NetworkServingControl(Base):
     __table_args__ = (
         CheckConstraint("id = 1", name="network_serving_singleton"),
         CheckConstraint("generation_id IS NULL OR generation_id > 0", name="network_serving_generation"),
+        CheckConstraint(
+            "metadata_generation IS NULL OR metadata_generation ~ '^[0-9a-f]{64}$'",
+            name="network_serving_metadata_generation",
+        ),
         {"schema": _SCHEMA},
     )
 
     id = Column(Integer, primary_key=True, autoincrement=False)
     generation_id = Column(BigInteger, ForeignKey(f"{_SCHEMA}.network_serving_manifest.generation_id"))
+    metadata_generation = Column(String(64))
 
 
 class NetworkCandidateCustody(Base):

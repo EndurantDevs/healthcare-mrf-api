@@ -44,7 +44,7 @@ def boundary(monkeypatch):
     )
 
     @asynccontextmanager
-    async def snapshot(database, schema, *, include_detail):
+    async def snapshot(database, schema, *, include_detail=True):
         assert database is provider.db and include_detail is True
         state.snapshots.append(schema)
         state.active = True
@@ -75,6 +75,7 @@ def boundary(monkeypatch):
         return state.document
 
     monkeypatch.setattr(collection, "provider_profile_read_snapshot", snapshot)
+    monkeypatch.setattr(collection, "provider_geo_read_snapshot", snapshot)
     monkeypatch.setattr(detail, "registry_schema", lambda: "sample_registry")
     monkeypatch.setattr(detail, "_pin", AsyncMock(return_value=manifest))
     monkeypatch.setattr(catalog, "registry_catalog_read_snapshot", catalog_snapshot, raising=False)

@@ -397,13 +397,16 @@ def validate_registry_cms_source_event(params):
             _invalid()
 
 
-async def _watch_control_cancel(ctx, task):
+async def watch_registry_control_cancel(ctx, task):
     """Observe the existing control cancellation flag while the consumer owns its work."""
     from process.control_cancel import raise_if_cancelled
 
     while True:
         await raise_if_cancelled(ctx, task)
         await asyncio.sleep(1)
+
+
+_watch_control_cancel = watch_registry_control_cancel
 
 
 async def control_start(ctx, task):

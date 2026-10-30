@@ -2,7 +2,8 @@
 """Native provider HTTP reads through approved composition and protected reader roles."""
 
 import asyncio
-from contextlib import aclosing
+import json
+from contextlib import aclosing, asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4, uuid5
 
@@ -11,6 +12,7 @@ from sanic import Blueprint, Sanic, response
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from api import network_provider_read as native_providers
 from api.endpoint import network_providers as providers
 from api.network_address_scope import current_network_address_scope
 from process.network_address_projection import PinnedAddressSource
@@ -168,6 +170,113 @@ async def test_manual_provider_without_npi_has_only_approved_selected_office(pro
         assert await connection.scalar(text("SELECT current_setting('transaction_read_only')")) == "off"
 
 
+@asynccontextmanager
+async def _provider_child_relations(context, network_id):
+    fixture = context.fixture
+    provider_id, location_id, location_key = str(uuid4()), str(uuid4()), uuid4().hex * 2
+    identity_by_field = dict(provider_system="manual", provider_id=provider_id, location_id=location_id)
+    changes_by_table = {
+        "network_membership": dict(**identity_by_field, network_id=network_id, evidence_id="unsealed-child"),
+        "provider_location_binding": dict(
+            **identity_by_field, location_key=location_key, entity_type="manual", entity_id=provider_id
+        ),
+        "entity_address_unified": dict(
+            location_key=location_key,
+            entity_type="manual",
+            entity_id=provider_id,
+            entity_name="Unsealed child provider",
+            npi=None,
+            canonical_network_ids=[network_id],
+        ),
+    }
+    child_relations = []
+    try:
+        for table, changes in changes_by_table.items():
+            parent = f'"{context.current_schema}"."{table}"'
+            child = f'"{fixture.source_schema}"."provider_child_{table}"'
+            await fixture.connection.execute(f"CREATE TABLE {child} (LIKE {parent} INCLUDING CONSTRAINTS)")
+            child_relations.append((child, parent))
+            await fixture.connection.execute(
+                f"INSERT INTO {child} SELECT (jsonb_populate_record(NULL::{parent},to_jsonb(row)||$1::jsonb)).* "
+                f"FROM ONLY {parent} row LIMIT 1",
+                json.dumps(changes),
+            )
+        yield child_relations, provider_id
+    finally:
+        for child, _ in reversed(child_relations):
+            await fixture.connection.execute(f"DROP TABLE {child}")
+
+
+async def _assert_inherited_provider_leak(connection, manifest, network_id, provider_id, original_guard):
+    addresses, address_arguments = native_providers._provider_addresses(manifest, (network_id,))
+    inherited_query = (
+        native_providers._PROVIDERS_SQL.format(namespace=f'"{manifest.schema_name}"', addresses=addresses)
+        .replace("FROM ONLY ", "FROM ")
+        .replace("JOIN ONLY ", "JOIN ")
+    )
+    inherited = await connection.fetchrow(
+        inherited_query,
+        "{" + str(network_id) + "}",
+        None,
+        None,
+        50,
+        0,
+        native_providers.MAX_LOCATIONS,
+        native_providers.MAX_RESPONSE_BYTES,
+        manifest.generation_id,
+        None,
+        None,
+        None,
+        None,
+        *address_arguments,
+    )
+    await original_guard(
+        connection,
+        native_providers._provider_read_relations(manifest),
+        expected_backend_pid=connection.get_server_pid(),
+    )
+    assert provider_id in json.dumps(native_providers._result(inherited))
+
+
+async def test_raw_provider_read_excludes_children_attached_after_metadata(provider_app, monkeypatch):
+    context = provider_app
+    fixture = context.fixture
+    network_id = context.seed.network["record_id"]
+    _, baseline = await context.app.asgi_client.get(_PATH + f"?network_ids={network_id}", headers=_AUTH)
+    assert baseline.status == 200 and baseline.json["total_count"] == 1
+    async with _provider_child_relations(context, network_id) as (child_relations, provider_id):
+        original_resolver = native_providers.resolve_network_serving_manifest
+        original_guard = native_providers.verify_consumed_network_relations
+        attached, guarded = [], []
+
+        async def attach_after_metadata(connection, **arguments):
+            manifest = await original_resolver(connection, **arguments)
+            assert manifest.compact_layout is None
+            for child, parent in child_relations:
+                await fixture.connection.execute(f"ALTER TABLE {child} INHERIT {parent}")
+                attached.append(child)
+            await _assert_inherited_provider_leak(connection, manifest, network_id, provider_id, original_guard)
+            return manifest
+
+        async def guard(connection, relations, **arguments):
+            await original_guard(connection, relations, **arguments)
+            guarded.append((connection.get_server_pid(), len(relations)))
+
+        monkeypatch.setattr(native_providers, "resolve_network_serving_manifest", attach_after_metadata)
+        monkeypatch.setattr(native_providers, "verify_consumed_network_relations", guard)
+        _, selected = await context.app.asgi_client.get(_PATH + f"?network_ids={network_id}", headers=_AUTH)
+        assert attached == [child for child, _ in child_relations]
+        assert selected.status == 200 and selected.json == baseline.json
+        assert provider_id not in selected.text
+        assert len(guarded) == 1 and guarded[0][1] == 3
+        assert (
+            await fixture.connection.fetchval(
+                f'SELECT count(*) FROM "{context.current_schema}".network_membership WHERE network_id=$1', network_id
+            )
+            == 2
+        )
+
+
 async def test_current_and_retained_generations_keep_exact_identity_namespaces(provider_app):
     context = provider_app
     both_networks = f"{context.source_network_id},{context.seed.network['record_id']}"
@@ -301,7 +410,7 @@ async def test_native_catalog_lock_timeout_is_bounded_and_releases_transaction(p
     assert recovered.status == 200
 
 
-@pytest.mark.parametrize("damage", ["orphan_binding", "unbound_address", "duplicate_office_binding"])
+@pytest.mark.parametrize("damage", ["orphan_binding", "unbound_address", "conflicting_office_binding"])
 async def test_integrity_outside_the_requested_page_still_refuses(provider_app, damage):
     context = provider_app
     networks = f"{context.source_network_id},{context.seed.network['record_id']}"
@@ -311,7 +420,7 @@ async def test_integrity_outside_the_requested_page_still_refuses(provider_app, 
     assert original.json["providers"][0]["provider_system"] == "manual"
     namespace = f'"{context.current_schema}"'
     new_key = uuid4().hex + uuid4().hex
-    if damage != "duplicate_office_binding":
+    if damage != "conflicting_office_binding":
         await context.fixture.connection.execute(
             f"""INSERT INTO {namespace}.entity_address_unified
             SELECT (jsonb_populate_record(NULL::{namespace}.entity_address_unified,
@@ -322,11 +431,11 @@ async def test_integrity_outside_the_requested_page_still_refuses(provider_app, 
     if damage != "unbound_address":
         await context.fixture.connection.execute(
             f"""INSERT INTO {namespace}.provider_location_binding
-            SELECT provider_system,provider_id,$1::uuid,
+            SELECT provider_system,CASE WHEN $2::boolean THEN '1000000491' ELSE provider_id END,$1::uuid,
               CASE WHEN $2::boolean THEN location_key ELSE $3::text END,entity_type,entity_id
             FROM {namespace}.provider_location_binding WHERE provider_system='npi'""",
             uuid4(),
-            damage == "duplicate_office_binding",
+            damage == "conflicting_office_binding",
             new_key,
         )
     _, unavailable = await context.app.asgi_client.get(path, headers=_AUTH)
@@ -334,6 +443,25 @@ async def test_integrity_outside_the_requested_page_still_refuses(provider_app, 
     assert unavailable.json == {"error": {"code": "network_provider_unavailable"}}
     assert unavailable.headers["Cache-Control"] == "private, no-store"
     assert "X-Network-Generation" not in unavailable.headers
+
+
+async def test_coherent_source_office_alias_preserves_the_provider_page(provider_app):
+    context = provider_app
+    path = _PATH + f"?network_ids={context.source_network_id}"
+    _, original = await context.app.asgi_client.get(path, headers=_AUTH)
+    assert original.status == 200 and original.json["total_count"] == 1
+    namespace = f'"{context.current_schema}"'
+    assert (
+        await context.fixture.connection.execute(
+            f"""INSERT INTO {namespace}.provider_location_binding
+        SELECT provider_system,provider_id,$1::uuid,location_key,entity_type,entity_id
+        FROM {namespace}.provider_location_binding WHERE provider_system='npi'""",
+            uuid4(),
+        )
+        == "INSERT 0 1"
+    )
+    _, aliased = await context.app.asgi_client.get(path, headers=_AUTH)
+    assert aliased.status == 200 and aliased.json == original.json
 
 
 @pytest.fixture

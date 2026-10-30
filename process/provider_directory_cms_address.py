@@ -51,8 +51,12 @@ _MODULES = (
     "process.provider_directory_cms_archive",
     "process.provider_directory_cms_desired_fence",
     "process.entity_address_unified",
+    "process.entity_address_rows_native",
+    "process.entity_address_rows_preparation",
     "process.entity_address_candidate_preparation",
     "process.entity_address_preparation_admission",
+    "process.provider_directory_cms_preparation",
+    "process.provider_directory_cms_inventory",
     "process.entity_address_source_preparation",
     "process.entity_address_prepared_doctors",
     "process.cms_doctors_preparation",
@@ -134,6 +138,9 @@ def _mapping_digest(*, registry_source=False) -> str:
         if source_path is None or not source_path.endswith(".py"):
             raise RuntimeError("cms_address_mapper_source_unavailable")
         hashes_by_module[name] = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+    hashes_by_module["native_entity_address_rows"] = importlib.import_module(
+        "process.entity_address_rows_native"
+    ).native_preparation_identity()
     return hashlib.sha256(_DOMAIN + _json(hashes_by_module).encode("ascii")).hexdigest()
 
 

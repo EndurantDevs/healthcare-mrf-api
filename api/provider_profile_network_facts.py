@@ -8,12 +8,14 @@ from uuid import UUID
 
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read, network_read_name_inventory
 from api.provider_directory_cms_network_scope import CMSNetworkScope, _mapped_networks, _membership_pairs
 from api.provider_directory_entities_contract import DirectoryReadError
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 from process.network_approved_source_bindings import APPROVED_NETWORK_BINDINGS_SQL
 from process.network_cms_registry_source_pair import resolve_committed_registry_cms_source_pair
+from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, _source_witness_fields
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_network_catalog_read import _exclusions
@@ -149,7 +151,7 @@ async def pin_cms_profile_scope(
         raise ValueError("profile_network_scope_invalid")
     connection = await session.connection()
     driver = (await connection.get_raw_connection()).driver_connection
-    recipes = await resolve_retained_registry_source_recipes(driver, manifest)
+    recipes = await resolve_retained_registry_source_recipes(driver, manifest, api_read=True)
     matches = [
         recipe
         for recipe in recipes
@@ -158,7 +160,7 @@ async def pin_cms_profile_scope(
     if len(matches) != 1 or matches[0].source_pin.retained_epoch is None:
         raise DirectoryReadError(503)
     recipe = matches[0]
-    await resolve_committed_registry_cms_source_pair(session, recipe)
+    await resolve_committed_registry_cms_source_pair(session, recipe, api_read=True)
     pin = recipe.source_pin
     parameters_by_name = dict(
         zip(
@@ -185,10 +187,43 @@ async def pin_cms_profile_scope(
         pin,
         {},
         excluded_network_ids,
+        await _profile_read_relations(driver, manifest, pin),
     )
     scope_sql = re.sub(r"\$(\d+)", lambda match: ":scope_" + match[1], scope.bindings_sql)
-    scope = CMSNetworkScope(manifest, scope_sql, parameters_by_name, scope.source_schema, pin, {}, excluded_network_ids)
+    scope = CMSNetworkScope(
+        manifest,
+        scope_sql,
+        parameters_by_name,
+        scope.source_schema,
+        pin,
+        {},
+        excluded_network_ids,
+        scope.read_relations,
+    )
     return scope
+
+
+async def _profile_read_relations(driver, manifest, pin):
+    """Bind only independently authenticated source, candidate and approved control names."""
+    from process.network_approved_membership_source import pin_api_retained_approved_membership_source
+    from process.network_fhir_membership_source import _require_pinned_source
+
+    epoch = await _require_pinned_source(driver, pin, api_read=True)
+    _approved, approved_relation = await pin_api_retained_approved_membership_source(driver, manifest)
+    return (
+        *(CompactAddressRelation(epoch.schema_name, name, oid) for name, oid in epoch.relation_oids),
+        *manifest.candidate_relation_pins,
+        approved_relation,
+    )
+
+
+async def execute_cms_profile_read(session, scope, statement, parameters):
+    """Verify the complete fixed-name scope before any scalar or resource is decoded."""
+    if type(scope) is not CMSNetworkScope or not scope.read_relations:
+        raise DirectoryReadError(503)
+    driver = (await (await session.connection()).get_raw_connection()).driver_connection
+    with network_read_name_inventory(driver, scope.read_relations):
+        return await execute_network_read(session, statement, parameters)
 
 
 async def read_cms_profile_plan_inputs(
@@ -205,7 +240,7 @@ async def read_cms_profile_plan_inputs(
     )
     pin = scope.source_pin
     parameters_by_name = scope.parameters_by_name
-    document = (await session.execute(text(_query(scope)), parameters_by_name)).scalar_one()
+    document = (await execute_cms_profile_read(session, scope, text(_query(scope)), parameters_by_name)).scalar_one()
     return CMSProfilePlanInputs(
         pin.source_id,
         pin.endpoint_id,

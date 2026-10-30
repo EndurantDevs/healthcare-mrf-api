@@ -27,6 +27,7 @@ from typing import (
     Sequence,
 )
 
+from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
 from api import ptg2_geo_projection as geo_projection
@@ -38,6 +39,7 @@ from api.code_systems import (
 )
 from api.endpoint.pagination import PaginationParams
 from api.network_address_scope import current_network_address_scope
+from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
 from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_pricing_projection import (
     PlanPricingProjectionUnavailable,
@@ -82,6 +84,7 @@ from api.plan_release_serving import (
     resolve_plan_release_serving,
 )
 from api.provider_demographic_filters import provider_sex_exists_sql
+from api.provider_profile_snapshot import provider_read_savepoint
 from api.provider_service_source_policy import admitted_plan_release_bindings
 from api.provider_specialty_filters import (
     provider_specialty_taxonomy_exists_sql,
@@ -188,6 +191,18 @@ from api.ptg2_serving_utils import (
     _price_filter_clauses,
     _row_mapping,
     _uuid_to_hex,
+)
+from api.ptg2_serving_utils import (
+    has_location_filter as _has_location_filter,
+)
+from api.ptg2_serving_utils import (
+    optional_bool_payload as _optional_bool_payload,
+)
+from api.ptg2_serving_utils import (
+    request_local_provider_payload as _request_local_provider_payload,
+)
+from api.ptg2_serving_utils import (
+    sanitize_address_contact_payload as _sanitize_address_contact_payload,
 )
 from api.ptg2_shared_blocks import (
     PTG2_V3_GRAPH_GROUP_TO_NPI,
@@ -395,10 +410,13 @@ async def _is_relation_available(session: Any, table_name: str) -> bool:
     """Probe optional reference-data relations, never snapshot serving layouts."""
 
     try:
-        result = await session.execute(
+        result = await execute_network_read(
+            session,
             text("SELECT to_regclass(:table_name)"),
             {"table_name": table_name},
         )
+    except ServiceUnavailable:
+        raise
     except Exception:
         return False
     return bool(result.scalar())
@@ -688,21 +706,6 @@ def _is_truthy_payload(value: Any) -> bool:
         return bool(value)
     normalized = str(value or "").strip().lower()
     return normalized in {"1", "true", "t", "yes", "y"}
-
-
-def _optional_bool_payload(value: Any) -> bool | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return bool(value)
-    normalized = str(value or "").strip().lower()
-    if normalized in {"1", "true", "t", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "f", "no", "n"}:
-        return False
-    return None
 
 
 def _coerce_int_payload(value: Any) -> int | None:
@@ -1622,6 +1625,8 @@ async def _ptg2_table_columns(session, table_name: str) -> frozenset[str]:
             if column_name:
                 column_names.add(str(column_name))
         return frozenset(column_names)
+    except ServiceUnavailable:
+        raise
     except Exception:
         return frozenset()
 
@@ -1634,8 +1639,8 @@ async def _has_table_columns(session, table_name: str, required_columns: set[str
 async def _optional_ptg2_query(session, statement, parameters_by_name):
     """Roll back optional failures only to a savepoint, preserving read fences."""
 
-    async with session.begin_nested():
-        return await session.execute(statement, parameters_by_name)
+    async with provider_read_savepoint(session):
+        return await execute_network_read(session, statement, parameters_by_name)
 
 
 def _ptg2_row_address_key(row: dict[str, Any]) -> str | None:
@@ -1733,6 +1738,8 @@ async def _provider_directory_corroboration_by_key(
                 "plan_id": plan_id,
             },
         )
+    except ServiceUnavailable:
+        raise
     except Exception:
         return None
     return {
@@ -2197,6 +2204,7 @@ def _shared_v3_code_scope_sql(
     plan_market_type: str = "",
     code_alias: str = "code_metadata",
     scope_alias: str = "logical_scope",
+    api_source_session=None,
 ) -> tuple[str, list[str], dict[str, Any], str]:
     """Join physical code metadata to this snapshot's logical plan mappings."""
 
@@ -2206,6 +2214,16 @@ def _shared_v3_code_scope_sql(
     plan_filters: list[str] = []
     normalized_plan = str(requested_plan or "").strip()
     normalized_market_type = _normalized_plan_market_type(plan_market_type)
+    scope_relation, plan_relation = _shared_v3_snapshot_scope_table(), _shared_plan_scope_table()
+    if api_source_session is not None:
+        from api.ptg2_code_scope import source_read_relation
+
+        scope_relation = source_read_relation(
+            api_source_session, PTG2_SCHEMA, "ptg2_v3_snapshot_scope", default=scope_relation
+        )
+        plan_relation = source_read_relation(
+            api_source_session, PTG2_SCHEMA, "ptg2_v3_snapshot_plan_scope", default=plan_relation
+        )
     if normalized_plan:
         plan_filters.append("plan_scope.plan_id = :plan_id")
         query_params_by_name["plan_id"] = normalized_plan
@@ -2214,12 +2232,12 @@ def _shared_v3_code_scope_sql(
         query_params_by_name["plan_market_type"] = normalized_market_type
     plan_filter_sql = " AND " + " AND ".join(plan_filters) if plan_filters else ""
     join_sql = f"""
-        JOIN {_shared_v3_snapshot_scope_table()} physical_scope
+        JOIN {scope_relation} physical_scope
           ON physical_scope.snapshot_id = :logical_snapshot_id
          AND physical_scope.coverage_scope_id = {code_alias}.coverage_scope_id
         JOIN LATERAL (
             SELECT plan_scope.plan_id, plan_scope.plan_market_type
-              FROM {_shared_plan_scope_table()} plan_scope
+              FROM {plan_relation} plan_scope
              WHERE plan_scope.snapshot_id = :logical_snapshot_id
                {plan_filter_sql}
              ORDER BY plan_scope.plan_id, plan_scope.plan_market_type
@@ -2271,7 +2289,7 @@ async def _provider_set_ids_for_keys(
     serving_tables: PTG2ServingTables,
     provider_set_keys: Iterable[int],
 ) -> dict[int, str]:
-    keys = sorted({int(value) for value in provider_set_keys if value is not None})
+    keys = sorted({int(provider_key) for provider_key in provider_set_keys if provider_key is not None})
     if not keys:
         return {}
     _require_strict_shared_v3(serving_tables)
@@ -2279,7 +2297,8 @@ async def _provider_set_ids_for_keys(
         "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
         "provider_set_keys": keys,
     }
-    result = await session.execute(
+    provider_set_rows = await execute_network_read(
+        session,
         text(
             f"""
             SELECT provider_set_key, provider_set_global_id_128
@@ -2291,9 +2310,12 @@ async def _provider_set_ids_for_keys(
         query_parameters_by_name,
     )
     return {
-        int(data.get("provider_set_key")): _ptg2_manifest_id(data.get("provider_set_global_id_128"))
-        for data in (_row_mapping(row) for row in result)
-        if data.get("provider_set_key") is not None and _ptg2_manifest_id(data.get("provider_set_global_id_128"))
+        int(provider_by_field.get("provider_set_key")): _ptg2_manifest_id(
+            provider_by_field.get("provider_set_global_id_128")
+        )
+        for provider_by_field in (_row_mapping(provider_row) for provider_row in provider_set_rows)
+        if provider_by_field.get("provider_set_key") is not None
+        and _ptg2_manifest_id(provider_by_field.get("provider_set_global_id_128"))
     }
 
 
@@ -2312,7 +2334,8 @@ async def _hydrate_provider_set_network_names(
     )
     if not provider_set_ids:
         return
-    network_metadata_query = await session.execute(
+    network_metadata_query = await execute_network_read(
+        session,
         text(
             f"""
             SELECT encode(provider_set_global_id_128, 'hex') AS provider_set_id,
@@ -2417,7 +2440,8 @@ async def _provider_set_metadata_for_ids(
         "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
         "provider_set_ids": [bytes.fromhex(provider_set_id) for provider_set_id in normalized_ids],
     }
-    query_result = await session.execute(
+    query_result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT provider_set.provider_set_key,
@@ -3676,7 +3700,8 @@ async def _execute_manifest_reverse_code_rows(
 ) -> list[dict[str, Any]]:
     """Execute the fixed reverse-code metadata projection."""
 
-    code_row_result = await session.execute(
+    code_row_result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT code_metadata.code_key,
@@ -4553,7 +4578,8 @@ async def _shared_provider_group_ids_for_keys(
     keys = tuple(sorted({int(provider_group_key) for provider_group_key in provider_group_keys}))
     if not keys:
         return {}
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT provider_group_key, provider_group_global_id_128
@@ -4582,7 +4608,8 @@ async def _shared_provider_group_keys_for_ids(
     ids = tuple(_deduplicate_ptg2_manifest_ids(tuple(provider_group_ids)))
     if not ids:
         return {}
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT provider_group_key, provider_group_global_id_128
@@ -5966,7 +5993,8 @@ async def _shared_rate_code_rows(
 ) -> list[dict[str, Any]]:
     """Read bound code metadata for one shared plan/code scope."""
 
-    code_query_result = await session.execute(
+    code_query_result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT code_metadata.code_key,
@@ -7441,7 +7469,8 @@ async def _version_three_dictionary_query(
 ):
     _require_strict_shared_v3(serving_tables)
     dictionary_table = _shared_v3_price_attr_table(serving_tables)
-    return await session.execute(
+    return await execute_network_read(
+        session,
         text(
             f"""
             SELECT attribute_kind, attribute_key, value
@@ -8030,7 +8059,8 @@ async def _taxonomy_rows_for_npis(
         taxonomy_table,
     ) or not await _is_relation_available(session, vocabulary_table):
         return {}
-    taxonomy_query = await session.execute(
+    taxonomy_query = await execute_network_read(
+        session,
         text(
             f"""
             SELECT
@@ -8334,8 +8364,8 @@ async def _enriched_provider_rows_for_npis(
     # and spend hundreds of milliseconds compiling JIT code for this tiny,
     # bounded provider page. Keep imports independently tunable and disable JIT
     # for the remainder of this request transaction (`SET LOCAL` scope).
-    await session.execute(text("SET LOCAL jit = off"))
-    enrichment_query = await session.execute(enrich_stmt, {"npis": npis})
+    await execute_network_read(session, text("SET LOCAL jit = off"))
+    enrichment_query = await execute_network_read(session, enrich_stmt, {"npis": npis})
     enriched_provider_rows = [_row_mapping(provider_record) for provider_record in enrichment_query]
     return await _overlay_provider_directory_corroboration(
         session,
@@ -9092,7 +9122,8 @@ async def _filter_npis_by_taxonomy(
     )
     if not predicates:
         return candidate_npis[: max(int(limit), 1)]
-    filtered_npi_query = await session.execute(
+    filtered_npi_query = await execute_network_read(
+        session,
         text(
             f"""
             SELECT source_npis.npi
@@ -9885,7 +9916,8 @@ async def _membership_exact_scope_npis(
     )
     predicate_sql = " AND ".join(predicates)
     projection_sql = _membership_scope_projection_sql(args, query_parameters_by_name)
-    exact_scope = await session.execute(
+    exact_scope = await execute_network_read(
+        session,
         text(
             f"""
             SELECT scope_npis.npi
@@ -10750,7 +10782,8 @@ async def _hydrate_address_provenance(
     if use_stored_only and not is_evidence_relation_available:
         return "unavailable"
     if location_requests and is_evidence_relation_available:
-        provenance_result = await session.execute(
+        provenance_result = await execute_network_read(
+            session,
             text(_ADDRESS_PROVENANCE_SQL if candidate_inputs is None else _address_provenance_sql(candidate_inputs)),
             {
                 "location_keys": [request[0] for request in location_requests],
@@ -10991,7 +11024,7 @@ async def _execute_membership_location_sql(
     uses_large_npi_scope = len(candidate_npis) > _MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT
     if offset == 0 and (query_context.knn_order_sql is not None or uses_large_npi_scope):
         prior_planner_settings = await _enable_serial_knn_planning(session)
-    query_result = await session.execute(text(location_sql), query_context.parameter_map)
+    query_result = await execute_network_read(session, text(location_sql), query_context.parameter_map)
     try:
         return [_row_mapping(query_row) for query_row in query_result]
     finally:
@@ -13027,41 +13060,6 @@ def _ranked_provider_expansion_materialization(
         retained_rows,
         providers_by_row_identity,
     )
-
-
-def _request_local_provider_payload(value: Any) -> Any:
-    """Copy nested cached provider evidence into one mutable response item."""
-
-    if isinstance(value, Mapping):
-        return {key: _request_local_provider_payload(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_request_local_provider_payload(item) for item in value]
-    return value
-
-
-def _sanitize_address_contact_payload(address_payload: dict[str, Any]) -> dict[str, Any]:
-    """Convert source-system null sentinels to real JSON null contact values."""
-
-    for field_name in (
-        "telephone",
-        "telephone_number",
-        "phone",
-        "phone_number",
-        "phone_extension",
-        "fax",
-        "fax_number",
-        "fax_number_digits",
-        "fax_extension",
-    ):
-        field_value = address_payload.get(field_name)
-        if isinstance(field_value, str) and field_value.strip().lower() in {
-            "",
-            "null",
-            "none",
-            "undefined",
-        }:
-            address_payload[field_name] = None
-    return address_payload
 
 
 def _request_local_provider_fields(
@@ -17843,18 +17841,23 @@ async def _procedure_details_for_rows(
         clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
         query_parameters_by_name[f"code_system_{idx}"] = code_system
         query_parameters_by_name[f"code_{idx}"] = code
+    catalog_relation = f"{PTG2_SCHEMA}.code_catalog"
+    if has_network_read_inventory(session):
+        catalog_relation = direct_heap_relation_sql(session, PTG2_SCHEMA, "code_catalog")
     try:
         procedure_catalog_query = await _optional_ptg2_query(
             session,
             text(
                 f"""
                 SELECT code_system, code, display_name, short_description
-                FROM {PTG2_SCHEMA}.code_catalog
+                FROM {catalog_relation}
                 WHERE {" OR ".join(clauses)}
                 """
             ),
             query_parameters_by_name,
         )
+    except ServiceUnavailable:
+        raise
     except Exception:
         return {}
     return {
@@ -19826,23 +19829,6 @@ async def search_ptg2_provider_procedures(
     )
 
 
-def _has_location_filter(
-    args: dict[str, Any],
-    *,
-    include_npi: bool = True,
-) -> bool:
-    return bool(
-        args.get("state")
-        or args.get("city")
-        or args.get("zip5")
-        or args.get("zip")
-        or (include_npi and args.get("npi"))
-        or args.get("lat") is not None
-        or args.get("long") is not None
-        or args.get("radius_miles") is not None
-    )
-
-
 def _ptg2_manifest_plan_code_values(args: dict[str, Any]) -> tuple[str, str | None, str] | None:
     requested_plan = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
     requested_system = _normalize_code_system(args.get("code_system") or args.get("reported_code_system"))
@@ -19886,7 +19872,8 @@ async def _has_ptg2_table_plan_code(
         column="code_metadata.reported_code_system",
         code_system=requested_system,
     )
-    exists_result = await session.execute(
+    exists_result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT EXISTS (
@@ -20044,7 +20031,8 @@ async def _is_cached_network_serving_tables_current(
     snapshot_ids = tuple(serving_tables_by_snapshot_id)
     if not snapshot_ids:
         return True
-    validation_result = await session.execute(
+    validation_result = await execute_network_read(
+        session,
         text(_PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL),
         {
             "snapshot_ids": list(snapshot_ids),
@@ -20360,7 +20348,8 @@ async def _factorized_card_candidates(
         return _FactorizedCardCandidateSelection({}, 0, True)
     taxonomy_sql, taxonomy_parameters = _factorized_card_frozen_taxonomy(args)
     candidate_limit = max(_ptg2_manifest_location_match_limit(), target_count)
-    candidate_result = await session.execute(
+    candidate_result = await execute_network_read(
+        session,
         _factorized_card_candidate_query(
             taxonomy_sql,
             **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),
@@ -20520,7 +20509,8 @@ async def _factorized_card_complete_selected_npis(
     if not selected_npis or binding_ordinals == ():
         return []
     taxonomy_sql, taxonomy_parameters = _factorized_card_frozen_taxonomy(args)
-    completion_result = await session.execute(
+    completion_result = await execute_network_read(
+        session,
         _factorized_card_completion_query(
             taxonomy_sql,
             **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),

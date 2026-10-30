@@ -42,6 +42,11 @@ def test_v2_owner_closed_inventory():
 
 async def test_v2_retirement_rechecks_catalog_under_locks_before_any_drop(monkeypatch):
     from process import entity_address_snapshot_preparation as protected
+    from process import network_cms_registry_address_capture as capture
+    from process import network_compact_retention as retention
+
+    monkeypatch.setattr(capture, "native_driver", AsyncMock(return_value=object()))
+    monkeypatch.setattr(retention, "require_network_compact_artifacts_unreferenced", AsyncMock(return_value=True))
 
     owner = _set_owner()
     monkeypatch.setattr(protected, "_publisher_authority", AsyncMock(return_value=31))

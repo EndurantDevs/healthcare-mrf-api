@@ -27,6 +27,22 @@ PAGE_ROWS = 25
 MAX_SELECTION_CHANGES = 100
 
 
+def _normalized_recipes(recipes, inventory):
+    if inventory:
+        from process.registry_source_inventory_preparation import SourceInventoryPreparation
+
+        return SourceInventoryPreparation(recipes).recipes
+    return decode_registry_source_recipes(canonical_registry_source_recipes(recipes))
+
+
+def _recipe_commitment(recipes, inventory):
+    if inventory:
+        from process.registry_source_inventory_preparation import SourceInventoryPreparation
+
+        return SourceInventoryPreparation(recipes).recipe_root.recipes_sha256
+    return canonical_registry_source_recipes(recipes)
+
+
 def office_recipe_selection(value):
     """Absent selectors preserve old bindings; present selectors are closed and canonical."""
     if value is None:
@@ -211,7 +227,15 @@ def _changed_office_bindings(changes, prefix):
 
 
 async def resolve_ptg_office_recipe_selection(
-    connection, recipes, approved_revision, source_manifest, *, control_schema, office_authority=None, staging=None
+    connection,
+    recipes,
+    approved_revision,
+    source_manifest,
+    *,
+    control_schema,
+    office_authority=None,
+    staging=None,
+    inventory=False,
 ):
     """Apply only explicit protected binding deltas to their exact retained recipe identities."""
     namespace = _namespace(control_schema)
@@ -251,7 +275,7 @@ async def resolve_ptg_office_recipe_selection(
         if canonical_registry_source_recipes((recipe,)) not in removed_identities
     }
     recipes_by_identity.update({canonical_registry_source_recipes((recipe,)): recipe for recipe in new})
-    resolved = decode_registry_source_recipes(canonical_registry_source_recipes(tuple(recipes_by_identity.values())))
+    resolved = _normalized_recipes(tuple(recipes_by_identity.values()), inventory)
     from process.registry_ptg_office_selection_replay import refuse_replaced_capture_union
 
     await refuse_replaced_capture_union(connection, namespace, after, new, resolved)
@@ -281,7 +305,7 @@ async def require_staged_binding_office_references(connection, namespace, stagin
 
 
 async def require_selected_ptg_office_recipes(
-    connection, recipes, approved, *, control_schema, office_authority, candidate_recipes=()
+    connection, recipes, approved, *, control_schema, office_authority, candidate_recipes=(), inventory=False
 ):
     """Require current reviewed selection only for new recipes, never retained replay."""
     selected_recipes = [recipe for recipe in recipes if type(recipe.source_pin) is PinnedPTGOfficeMembershipSource]
@@ -317,20 +341,20 @@ async def require_selected_ptg_office_recipes(
         raise ValueError("registry_office_selection_unselected")
     requested_rows = _requested([json.loads(native_record["document"]) for native_record in native_records])
     actual = await _read_references(connection, namespace, requested_rows, office_authority[1])
-    if canonical_registry_source_recipes(actual) != canonical_registry_source_recipes(selected_recipes):
+    if _recipe_commitment(actual, inventory) != _recipe_commitment(selected_recipes, inventory):
         raise ValueError("registry_office_selection_ambiguous")
     from process.registry_ptg_office_selection_replay import refuse_replaced_capture_union
 
     await refuse_replaced_capture_union(connection, namespace, requested_rows, selected_recipes, candidate_recipes)
 
 
-def require_ptg_startup_selection(configured_recipes, resolved_recipes):
+def require_ptg_startup_selection(configured_recipes, resolved_recipes, *, inventory=False):
     """Refuse an explicit startup set that contradicts reviewed office binding changes."""
 
     def offices(recipes):
         """Compare only exact PTG office recipes; other startup families remain explicit."""
-        return canonical_registry_source_recipes(
-            tuple(recipe for recipe in recipes if type(recipe.source_pin) is PinnedPTGOfficeMembershipSource)
+        return _recipe_commitment(
+            tuple(recipe for recipe in recipes if type(recipe.source_pin) is PinnedPTGOfficeMembershipSource), inventory
         )
 
     if offices(configured_recipes) != offices(resolved_recipes):

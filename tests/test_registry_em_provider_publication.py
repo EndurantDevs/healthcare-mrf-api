@@ -20,6 +20,7 @@ from process import network_membership_validation as validation
 from process import network_serving_reactivation as reactivation
 from process import network_serving_read as serving
 from process import registry_candidate_composition as composition
+from process import registry_fhir_serving_preservation as preservation
 from process.network_address_projection import PinnedAddressSource
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_serving_read import PinnedNetworkServingManifest
@@ -74,6 +75,17 @@ def _connection():
         fetchval=AsyncMock(),
         execute=AsyncMock(return_value="UPDATE 1"),
     )
+
+
+def _predecessor_lookup(monkeypatch, candidate):
+    """Keep the unrelated non-FHIR predecessor lookup explicit in custody protocol tests."""
+    predecessor = PinnedNetworkServingManifest(
+        16, candidate["candidate_id"], candidate["schema_name"], 1, {}, 2, "f" * 64, 100
+    )
+    object.__setattr__(predecessor, "_custody_seal_sha256", "c" * 64)
+    resolver = AsyncMock(return_value=predecessor)
+    monkeypatch.setattr(preservation, "resolve_network_serving_manifest", resolver)
+    return resolver
 
 
 async def test_scope_and_actual_validation_update_preserve_exact_receipt(monkeypatch):
@@ -189,6 +201,7 @@ async def test_actual_publication_gate_precedes_insert_or_retained_replay(monkey
     monkeypatch.setattr(publication, "_locked_candidate", AsyncMock(return_value=candidate))
     monkeypatch.setattr(publication, "_publication_readiness", lambda _candidate: ({}, {}, {}, _closure()))
     monkeypatch.setattr(publication, "verify_network_candidate_writer_closure", AsyncMock())
+    resolve_predecessor = _predecessor_lookup(monkeypatch, candidate)
 
     async def native(*args, **kwargs):
         events.append("custody")
@@ -217,6 +230,10 @@ async def test_actual_publication_gate_precedes_insert_or_retained_replay(monkey
             state == "published"
         )
         assert events == ["custody", "replay" if state == "published" else "publish"]
+    if not stale and state == "ready":
+        resolve_predecessor.assert_awaited_once_with(conn, generation_id=16, control_schema="registry")
+    else:
+        resolve_predecessor.assert_not_awaited()
     conn.execute.assert_not_awaited()
 
 
@@ -349,6 +366,14 @@ def _seal():
         "seal_sha256": "c" * 64,
         "receipt": {
             "index_definition_sha256": "d" * 64,
+            "control": {
+                "database_name": "synthetic_registry",
+                "database_oid": 100,
+                "schema_oid": 101,
+                "owner_oid": 104,
+                "candidate_table_oid": 102,
+                "seal_table_oid": 103,
+            },
             "closure": {
                 "owner_role": "final_owner",
                 "loader_roles": [],
@@ -362,13 +387,14 @@ def _seal():
 @pytest.mark.parametrize("state", ["ready", "published"])
 @pytest.mark.parametrize("changed", [False, True])
 async def test_protected_seal_gates_publication_without_final_owner_assumption(monkeypatch, state, changed):
-    candidate, target, _ = _candidate(state)
+    candidate, copy_target, _ = _candidate(state)
     conn = _connection()
     native = AsyncMock(return_value=_seal(), side_effect=ValueError("changed protected seal") if changed else None)
     monkeypatch.setattr(publication, "verify_network_candidate_custody", native)
     monkeypatch.setattr(publication, "_lock_publication_controls", AsyncMock(return_value=(2, 16)))
     monkeypatch.setattr(publication, "_locked_candidate", AsyncMock(return_value=candidate))
     monkeypatch.setattr(publication, "_publication_readiness", lambda _candidate: ({}, {}, {}, _closure()))
+    resolve_predecessor = _predecessor_lookup(monkeypatch, candidate)
     old_native = AsyncMock(side_effect=AssertionError("sealed candidate must not assume final owner"))
     monkeypatch.setattr(publication, "verify_network_candidate_writer_closure", old_native)
     custody = AsyncMock()
@@ -379,15 +405,19 @@ async def test_protected_seal_gates_publication_without_final_owner_assumption(m
     conn.fetchrow.return_value = {} if state == "published" else None
     if changed:
         with pytest.raises(ValueError, match="changed protected seal"):
-            await publication._publish_candidate(conn, target, '"registry"')
+            await publication._publish_candidate(conn, copy_target, '"registry"')
         custody.assert_not_awaited()
         insert.assert_not_awaited()
         conn.fetchrow.assert_not_awaited()
     else:
-        result = await publication._publish_candidate(conn, target, '"registry"')
-        assert result["replayed"] == (state == "published")
+        published_manifest = await publication._publish_candidate(conn, copy_target, '"registry"')
+        assert published_manifest["replayed"] == (state == "published")
         custody.assert_awaited_once_with(conn, candidate, _closure())
-    native.assert_awaited_once_with(conn, target, control_schema="registry", required=False)
+    if not changed and state == "ready":
+        resolve_predecessor.assert_awaited_once_with(conn, generation_id=16, control_schema="registry")
+    else:
+        resolve_predecessor.assert_not_awaited()
+    native.assert_awaited_once_with(conn, copy_target, control_schema="registry", required=False)
     old_native.assert_not_awaited()
     conn.execute.assert_not_awaited()
 
@@ -496,6 +526,7 @@ async def test_replay_retains_legacy_scans_but_sealed_custody_uses_native_proof(
 def _serving_entry(monkeypatch):
     candidate, _, _ = _candidate("published")
     logical = _closure()
+    logical["relation_oids"] = {"entity_address_unified": 111}
     readiness = ({}, {}, {"index_definition_sha256": "d" * 64}, logical)
     retained_by_name = dict(
         generation_id=17,
@@ -530,6 +561,10 @@ async def test_serving_pin_keeps_logical_manifest_and_uses_verified_physical_own
     pinned = await serving.resolve_network_serving_manifest(conn, generation_id=17, control_schema="registry")
     assert pinned.address_table_oid == (222 if sealed else 111)
     assert getattr(pinned, "_custody_seal_sha256", None) == ("c" * 64 if sealed else None)
+    assert pinned.custody_control == (_seal()["receipt"]["control"] if sealed else None)
+    assert [(relation.table_name, relation.table_oid) for relation in pinned.candidate_relation_pins] == [
+        ("entity_address_unified", 222 if sealed else 111)
+    ]
     assert set(asdict(pinned)) == {
         "generation_id",
         "candidate_id",

@@ -5,10 +5,11 @@ import asyncio
 import importlib.util
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -104,31 +105,64 @@ async def custom_db(serving_schema):
 
 
 @asynccontextmanager
-async def _restricted_artifact_context(fixture):
-    """Use genuine E and K logins with E-to-loading and SET-only K-to-custody edges."""
-    from urllib.parse import urlsplit, urlunsplit
-
+async def _restricted_artifact_roles(connection):
+    """Own exact artifact actors before any source admits their metadata access."""
     role_suffix = uuid4().hex
     password = uuid4().hex
     role_by_kind = {
         kind: "artifact_" + kind + "_" + role_suffix for kind in ("loading", "execution", "custodian", "custody")
     }
-    connections = []
+    created_oids_by_role = {}
     try:
         for kind, role in role_by_kind.items():
+            assert await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role) is None
             options = f" LOGIN PASSWORD '{password}'" if kind in {"execution", "custodian"} else " NOLOGIN"
-            await fixture.connection.execute(f'CREATE ROLE "{role}"{options}')
-        database = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
-        await fixture.connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{role_by_kind["loading"]}"')
+            async with connection.transaction():
+                await connection.execute(f'CREATE ROLE "{role}"{options}')
+                created_oids_by_role[role] = await connection.fetchval(
+                    "SELECT oid FROM pg_roles WHERE rolname=$1", role
+                )
         for target_role, member, inherit, set_role in (
             (role_by_kind["loading"], role_by_kind["execution"], "TRUE", "TRUE"),
             (role_by_kind["execution"], role_by_kind["custodian"], "TRUE", "TRUE"),
             (role_by_kind["custody"], role_by_kind["custodian"], "FALSE", "TRUE"),
-            (fixture.roles["reader"], role_by_kind["execution"], "TRUE", "FALSE"),
         ):
-            await fixture.connection.execute(
+            await connection.execute(
                 f'GRANT "{target_role}" TO "{member}" WITH ADMIN FALSE, INHERIT {inherit}, SET {set_role}'
             )
+        yield SimpleNamespace(roles=role_by_kind, password=password, role_oids=created_oids_by_role)
+    finally:
+        for role, oid in reversed(tuple(created_oids_by_role.items())):
+            actual = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+            if actual is not None:
+                assert actual == oid
+                await connection.execute(f'DROP OWNED BY "{role}"')
+                await connection.execute(f'DROP ROLE "{role}"')
+        assert not await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]))", list(created_oids_by_role)
+        )
+
+
+@asynccontextmanager
+async def _restricted_artifact_context(fixture, *, actors=None):
+    """Use genuine E and K logins with E-to-loading and SET-only K-to-custody edges."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    async with AsyncExitStack() as stack:
+        if actors is None:
+            actors = await stack.enter_async_context(_restricted_artifact_roles(fixture.connection))
+        role_by_kind, password = actors.roles, actors.password
+        assert set(role_by_kind) == {"loading", "execution", "custodian", "custody"}
+        assert {
+            role: await fixture.connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+            for role in role_by_kind.values()
+        } == actors.role_oids
+        database = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
+        await fixture.connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{role_by_kind["loading"]}"')
+        await fixture.connection.execute(
+            f'GRANT "{fixture.roles["reader"]}" TO "{role_by_kind["execution"]}" '
+            "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"
+        )
         await fixture.connection.execute(
             f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{role_by_kind["execution"]}"'
         )
@@ -142,26 +176,33 @@ async def _restricted_artifact_context(fixture):
             f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.source_schema}" TO "{role_by_kind["loading"]}"'
         )
         parsed = urlsplit(os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://"))
-        for kind in ("custodian", "execution"):
-            dsn = urlunsplit(
-                (parsed.scheme, role_by_kind[kind] + "@" + parsed.netloc.split("@")[-1], parsed.path, parsed.query, "")
+        connections = []
+        try:
+            for kind in ("custodian", "execution"):
+                dsn = urlunsplit(
+                    (
+                        parsed.scheme,
+                        role_by_kind[kind] + "@" + parsed.netloc.split("@")[-1],
+                        parsed.path,
+                        parsed.query,
+                        "",
+                    )
+                )
+                connections.append(await asyncpg.connect(dsn, password=password))
+            yield SimpleNamespace(
+                base=fixture,
+                roles=role_by_kind,
+                custodian=connections[0],
+                execution=connections[1],
+                runtime_roles=tuple(
+                    sorted((role_by_kind["execution"], role_by_kind["loading"], fixture.roles["reader"]))
+                ),
             )
-            connections.append(await asyncpg.connect(dsn, password=password))
-        yield SimpleNamespace(
-            base=fixture,
-            roles=role_by_kind,
-            custodian=connections[0],
-            execution=connections[1],
-            runtime_roles=tuple(sorted((role_by_kind["execution"], role_by_kind["loading"], fixture.roles["reader"]))),
-        )
-    finally:
-        for connection in connections:
-            await connection.close()
-        for identity in fixture.composition_ids:
-            await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "network_composition_{identity.hex}" CASCADE')
-        for role in reversed(tuple(role_by_kind.values())):
-            await fixture.connection.execute(f'DROP OWNED BY "{role}"')
-            await fixture.connection.execute(f'DROP ROLE "{role}"')
+        finally:
+            for connection in connections:
+                await connection.close()
+            for identity in fixture.composition_ids:
+                await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "network_composition_{identity.hex}" CASCADE')
 
 
 @pytest.fixture
@@ -169,6 +210,24 @@ async def restricted_artifact_db(custom_db):
     """Keep generic retained-source read permissions explicit before native preparation."""
     async with _restricted_artifact_context(custom_db) as fixture:
         yield fixture
+
+
+@pytest.mark.parametrize("observed_oid", [None, 99])
+async def test_precreated_artifact_actor_identity_refuses_before_grants(observed_oid):
+    """A missing or replaced independent actor cannot acquire any fixture rights."""
+    roles_by_kind = {kind: "fixture_" + kind for kind in ("loading", "execution", "custodian", "custody")}
+    oids_by_role = {role: index for index, role in enumerate(roles_by_kind.values(), 1)}
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(
+            side_effect=lambda _sql, role: observed_oid if role == roles_by_kind["custodian"] else oids_by_role[role]
+        ),
+        execute=AsyncMock(),
+    )
+    actors = SimpleNamespace(roles=roles_by_kind, password=uuid4().hex, role_oids=oids_by_role)
+    with pytest.raises(AssertionError):
+        async with _restricted_artifact_context(SimpleNamespace(connection=connection), actors=actors):
+            pytest.fail("Unverified actors cannot enter artifact preparation")
+    connection.execute.assert_not_awaited()
 
 
 @pytest.fixture

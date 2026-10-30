@@ -179,6 +179,45 @@ async def test_missing_exact_retained_recipe_refuses_before_fact_query(monkeypat
     with pytest.raises(DirectoryReadError) as caught:
         await facts.read_cms_profile_plan_inputs(session, manifest, NPI, excluded_network_ids=())
     assert caught.value.status == 503
-    resolver.assert_awaited_once_with(native, manifest)
+    resolver.assert_awaited_once_with(native, manifest, api_read=True)
     pair.assert_not_awaited()
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("refuse", [False, True])
+async def test_profile_payload_guard_precedes_fact_decode(monkeypatch, refuse):
+    from dataclasses import replace
+
+    from sanic.exceptions import ServiceUnavailable
+
+    from process.network_compact_layout import CompactAddressRelation
+    from tests.test_network_read_execution import _session
+
+    session, driver, buffered = _session([])
+    driver.is_in_transaction = lambda: True
+    driver.fetchrow = AsyncMock(return_value={"backend_matches": True, "relation_count": 1, "valid": not refuse})
+    pinned = replace(
+        scope(()), read_relations=(CompactAddressRelation("source", "provider_directory_dataset_resource", 7),)
+    )
+    monkeypatch.setattr(facts, "pin_cms_profile_scope", AsyncMock(return_value=pinned))
+
+    def scalar_one():
+        assert driver.fetchrow.await_count == 1 and not refuse
+        return json.dumps([row()])
+
+    buffered.scalar_one = scalar_one
+    operation = facts.read_cms_profile_plan_inputs(session, object(), NPI, excluded_network_ids=())
+    if refuse:
+        with pytest.raises(ServiceUnavailable):
+            await operation
+        buffered.close.assert_called_once()
+    else:
+        assert (await operation).facts == (row(),)
+
+
+async def test_unbound_profile_source_inventory_refuses_before_query():
+    session = SimpleNamespace(execute=AsyncMock(), connection=AsyncMock())
+    with pytest.raises(DirectoryReadError):
+        await facts.execute_cms_profile_read(session, scope(()), object(), {})
+    session.connection.assert_not_awaited()
     session.execute.assert_not_awaited()

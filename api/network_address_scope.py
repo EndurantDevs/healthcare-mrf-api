@@ -4,7 +4,7 @@
 import hashlib
 import json
 import re
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
@@ -19,7 +19,9 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import visitors
 from sqlalchemy.sql.elements import TextClause
 
+from api.network_read_execution import NetworkReadStatements
 from db.models import EntityAddressUnified
+from process.network_compact_layout import CompactAddressRelation
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 
 _SCOPE = ContextVar("canonical_network_address_scope", default=None)
@@ -34,7 +36,12 @@ class NetworkAddressReadScope:
     excluded_network_ids: tuple[int, ...] | None = None
     address_predicate_sql: str | None = None
     organization_policy: RegistryOrganizationVisibility | None = None
+    read_statements: NetworkReadStatements | None = None
     legacy_checksums: tuple[int, ...] | None = None
+
+
+class _LegacyNetworkScopeMismatch(Forbidden):
+    """The signed legacy subset differs from its authenticated canonical identities."""
 
 
 def current_network_address_scope():
@@ -52,6 +59,7 @@ def _approved_network_clause(network_id, scope):
     return (
         select(1)
         .select_from(network)
+        .with_hint(network, "ONLY", "postgresql")
         .where(
             network.c.approved_revision == scope.manifest.approved_custom_revision,
             network.c.record_kind == "network",
@@ -72,7 +80,7 @@ def _visible_membership_predicate():
 
     return f"""EXISTS (
       SELECT 1 FROM unnest(canonical_network_ids) AS policy_ids(network_id)
-      JOIN "{registry_schema()}".registry_approved_record policy_network
+      JOIN ONLY "{registry_schema()}".registry_approved_record policy_network
         ON policy_network.record_key=policy_ids.network_id::text
       WHERE policy_network.approved_revision=:_network_approved_revision
         AND policy_network.record_kind='network'
@@ -114,9 +122,9 @@ def scoped_address_aca_insurance_predicate():
     revision = scope.manifest.approved_custom_revision
     return f"""EXISTS (
       SELECT 1 FROM unnest(canonical_network_ids) AS policy_ids(network_id)
-      JOIN "{registry_schema()}".registry_approved_record policy_network
+      JOIN ONLY "{registry_schema()}".registry_approved_record policy_network
         ON policy_network.record_key=policy_ids.network_id::text
-      JOIN "{registry_schema()}".registry_approved_record aca_binding
+      JOIN ONLY "{registry_schema()}".registry_approved_record aca_binding
         ON aca_binding.record_json->>'network_id'=policy_ids.network_id::text
       WHERE policy_network.approved_revision={revision}
         AND policy_network.record_kind='network'
@@ -214,6 +222,62 @@ def _validate_network_scope_inputs(
         raise ValueError("network_access_scope_invalid")
     if manifest.schema_name != "network_candidate_" + UUID(manifest.candidate_id).hex:
         raise ValueError("network_address_scope_invalid")
+    if manifest.compact_layout is not None:
+        from process.network_compact_layout import CompactNetworkLayout
+
+        if (
+            type(manifest.compact_layout) is not CompactNetworkLayout
+            or manifest.compact_layout.ref_map.schema_name != manifest.schema_name
+            or manifest.compact_layout.base.table_oid != manifest.address_table_oid
+        ):
+            raise ValueError("network_address_scope_invalid")
+
+
+def _build_address_relation(manifest, network_ids, predicate_sql, read_statements, legacy_checksums):
+    """Build the exact pinned flat or compact relation before installing request scope."""
+    if manifest.compact_layout is not None:
+        from api.network_compact_address import compact_address_selectable
+
+        relation = compact_address_selectable(
+            manifest.compact_layout,
+            network_ids=None if legacy_checksums is not None else network_ids,
+            visible_membership_sql="TRUE"
+            if legacy_checksums is not None
+            else (_visible_membership_predicate() if network_ids is None else None),
+            read_statements=read_statements,
+        )
+        if legacy_checksums is not None:
+            relation = (
+                select(relation)
+                .where(
+                    relation.c.plans_network_array.op("&&")(
+                        bindparam("_legacy_network_checksums", type_=ARRAY(INTEGER))
+                    )
+                )
+                .subquery("entity_address_unified")
+            )
+    else:
+        physical = EntityAddressUnified.__table__.to_metadata(MetaData(), schema=manifest.schema_name)
+        predicate = (
+            text(predicate_sql)
+            if predicate_sql is not None
+            else physical.c.canonical_network_ids.op("&&")(bindparam("_canonical_network_ids", type_=ARRAY(INTEGER)))
+        )
+        if legacy_checksums is not None:
+            predicate = physical.c.plans_network_array.op("&&")(
+                bindparam("_legacy_network_checksums", type_=ARRAY(INTEGER))
+            )
+        marker = read_statements.marker(
+            (CompactAddressRelation(manifest.schema_name, "entity_address_unified", manifest.address_table_oid),)
+        )
+        relation = (
+            select(physical)
+            .with_hint(physical, "ONLY", "postgresql")
+            .prefix_with(marker)
+            .where(predicate)
+            .subquery("entity_address_unified")
+        )
+    return relation
 
 
 @contextmanager
@@ -226,7 +290,7 @@ def network_address_read_scope(
     organization_policy=None,
     legacy_checksums=None,
 ):
-    """Keep SQL and hydration on the same filtered physical address heap."""
+    """Keep SQL and hydration on the same pinned addresses and memberships."""
     _validate_network_scope_inputs(
         manifest, network_ids, access_scope_sha256, excluded_network_ids, organization_policy
     )
@@ -238,18 +302,11 @@ def network_address_read_scope(
         or legacy_checksums != tuple(sorted(set(legacy_checksums)))
     ):
         raise ValueError("network_legacy_scope_invalid")
-    physical = EntityAddressUnified.__table__.to_metadata(MetaData(), schema=manifest.schema_name)
     predicate_sql = _default_address_predicate() if network_ids is None else None
-    predicate = (
-        text(predicate_sql)
-        if predicate_sql is not None
-        else physical.c.canonical_network_ids.op("&&")(bindparam("_canonical_network_ids", type_=ARRAY(INTEGER)))
+    read_statements = NetworkReadStatements(
+        [manifest.manifest_sha256, network_ids, excluded_network_ids, access_scope_sha256, legacy_checksums]
     )
-    if legacy_checksums is not None:
-        predicate = physical.c.plans_network_array.op("&&")(
-            bindparam("_legacy_network_checksums", type_=ARRAY(INTEGER))
-        )
-    relation = select(physical).where(predicate).subquery("entity_address_unified")
+    relation = _build_address_relation(manifest, network_ids, predicate_sql, read_statements, legacy_checksums)
     token = _SCOPE.set(
         NetworkAddressReadScope(
             manifest,
@@ -259,6 +316,7 @@ def network_address_read_scope(
             excluded_network_ids,
             predicate_sql,
             organization_policy,
+            read_statements,
             legacy_checksums,
         )
     )
@@ -268,21 +326,129 @@ def network_address_read_scope(
         _SCOPE.reset(token)
 
 
+@asynccontextmanager
+async def network_address_read_session_scope(
+    session,
+    manifest,
+    network_ids,
+    *,
+    access_scope_sha256=None,
+    excluded_network_ids=None,
+    organization_policy=None,
+    legacy_checksums=None,
+):
+    """Authenticate control pins and guard actual buffered reads on the original Reader."""
+    from api.network_read_execution import _original_read_driver, network_read_name_inventory
+    from process.network_approved_membership_source import pin_api_retained_approved_membership_source
+
+    transaction = session.get_transaction()
+    try:
+        driver, backend_pid = await _original_read_driver(session)
+        _approved, approved_relation = await pin_api_retained_approved_membership_source(driver, manifest)
+        current_driver, current_pid = await _original_read_driver(session)
+        if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
+            raise ServiceUnavailable(
+                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+            )
+    except (ValueError, TypeError, KeyError) as error:
+        raise ServiceUnavailable(
+            "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+        ) from error
+    with network_read_name_inventory(driver, (*manifest.candidate_relation_pins, approved_relation)):
+        with network_address_read_scope(
+            manifest,
+            network_ids,
+            access_scope_sha256=access_scope_sha256,
+            excluded_network_ids=excluded_network_ids,
+            organization_policy=organization_policy,
+            legacy_checksums=legacy_checksums,
+        ) as scope:
+            if legacy_checksums is not None:
+                await _require_legacy_mapping(
+                    session,
+                    driver,
+                    backend_pid,
+                    transaction,
+                    approved_relation,
+                    manifest,
+                    network_ids,
+                    legacy_checksums,
+                )
+            yield scope
+
+
+async def _require_legacy_mapping(
+    session, driver, backend_pid, transaction, approved_relation, manifest, network_ids, legacy_checksums
+):
+    """Verify the actual approved-map read before inspecting its signed subset match."""
+    from api.network_read_execution import _original_read_driver
+    from process.network_address_projection import _identifier
+    from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
+    from process.registry_network_catalog_read import _LEGACY_BATCH_SQL
+
+    try:
+        mapping = await driver.fetchrow(
+            _LEGACY_BATCH_SQL.format(control="ONLY " + _identifier(approved_relation.schema_name)),
+            manifest.approved_custom_revision,
+            tuple(map(str, legacy_checksums)),
+            "checksum_network",
+            (),
+        )
+        await verify_consumed_network_relations(driver, (approved_relation,), expected_backend_pid=backend_pid)
+        current_driver, current_pid = await _original_read_driver(session)
+        if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
+            raise ServiceUnavailable(
+                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+            )
+    except (asyncpg.PostgresError, DBAPIError, NetworkReadIdentityError) as error:
+        raise ServiceUnavailable(
+            "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+        ) from error
+    if mapping is None or mapping["complete"] is not True or mapping["network_ids"] != list(network_ids):
+        raise _LegacyNetworkScopeMismatch(
+            "Legacy network scope does not match its authorized canonical identities.",
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+
 def scoped_address_relation_sql(table_ref):
     """Return a parameterized filtered relation only for the unified table."""
     scope = _SCOPE.get()
     if scope is None or not table_ref.endswith(".entity_address_unified"):
         return table_ref
-    if scope.network_ids is None:
-        return (
-            f'(SELECT * FROM "{scope.manifest.schema_name}".entity_address_unified WHERE {scope.address_predicate_sql})'
+    if scope.manifest.compact_layout is not None:
+        from api.network_compact_address import compact_address_read_relations, compact_address_relation_sql
+
+        relation = compact_address_relation_sql(
+            scope.manifest.compact_layout,
+            network_ids=None if scope.legacy_checksums is not None else scope.network_ids,
+            visible_membership_sql="TRUE"
+            if scope.legacy_checksums is not None
+            else (_visible_membership_predicate() if scope.network_ids is None else None),
         )
-    predicate = (
-        "plans_network_array && CAST(:_legacy_network_checksums AS INTEGER[])"
-        if scope.legacy_checksums is not None
-        else "canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[])"
-    )
-    return f'(SELECT * FROM "{scope.manifest.schema_name}".entity_address_unified WHERE {predicate})'
+        if scope.legacy_checksums is not None:
+            relation = (
+                f"(SELECT * FROM {relation} legacy_office "
+                "WHERE plans_network_array && CAST(:_legacy_network_checksums AS INTEGER[]))"
+            )
+        relations = compact_address_read_relations(scope.manifest.compact_layout)
+    elif scope.network_ids is None:
+        relation = f'(SELECT * FROM ONLY "{scope.manifest.schema_name}".entity_address_unified WHERE {scope.address_predicate_sql})'
+    else:
+        predicate = (
+            "plans_network_array && CAST(:_legacy_network_checksums AS INTEGER[])"
+            if scope.legacy_checksums is not None
+            else "canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[])"
+        )
+        relation = f'(SELECT * FROM ONLY "{scope.manifest.schema_name}".entity_address_unified WHERE {predicate})'
+    if scope.manifest.compact_layout is None:
+        relations = (
+            CompactAddressRelation(
+                scope.manifest.schema_name, "entity_address_unified", scope.manifest.address_table_oid
+            ),
+        )
+    marker = scope.read_statements.marker(relations)
+    return "(" + marker + " " + relation[1:]
 
 
 def is_scoped_address_relation(table_ref):
@@ -314,6 +480,20 @@ def scoped_address_parameters(parameters_by_name):
         )
     ):
         raise ValueError("network_address_reserved_parameter")
+    if scope.manifest.compact_layout is not None:
+        from api.network_compact_address import compact_address_parameters
+
+        physical_parameters = compact_address_parameters(scope.manifest.compact_layout)
+        if any(
+            key.startswith("_compact_")
+            and (
+                key not in physical_parameters
+                or not _is_reserved_parameter_equal(parameter_value, physical_parameters[key])
+            )
+            for key, parameter_value in parameters_by_name.items()
+        ):
+            raise ValueError("network_address_reserved_parameter")
+        parameters_by_name = {**parameters_by_name, **physical_parameters}
     if scope.network_ids is None:
         reserved_by_name = {
             "_network_excluded_ids": list(scope.excluded_network_ids),
@@ -457,9 +637,10 @@ def _request_legacy_checksums(request, args):
     return checksums
 
 
-async def _pin_network_scope(request, args):
+def _network_scope_claim(request, args):
+    """Validate the complete trusted selector before opening a Reader or reading storage."""
     from api.control_auth import require_control_auth
-    from process.network_serving_read import parse_canonical_network_ids, resolve_network_serving_manifest
+    from process.network_serving_read import parse_canonical_network_ids
 
     require_control_auth(request)
     try:
@@ -482,26 +663,18 @@ async def _pin_network_scope(request, args):
                 raise ValueError("network_generation_invalid")
     except ValueError as error:
         raise InvalidUsage("Canonical network selector is invalid.") from error
+    return network_ids, access_scope_sha256, legacy_checksums, generation
+
+
+async def _pin_network_scope(request, args):
+    from process.network_serving_read import resolve_network_serving_manifest
+
+    network_ids, access_scope_sha256, legacy_checksums, generation = _network_scope_claim(request, args)
     session = request.ctx.sa_session
     await session.execute(text("SET LOCAL lock_timeout='1s'"))
     connection = await session.connection()
     driver = (await connection.get_raw_connection()).driver_connection
-    manifest = await resolve_network_serving_manifest(driver, generation_id=generation)
-    await session.execute(text(f'LOCK TABLE "{manifest.schema_name}".entity_address_unified IN ACCESS SHARE MODE'))
-    if legacy_checksums is not None:
-        from db.registry_schema import registry_schema
-        from process.network_address_projection import _identifier
-        from process.registry_network_catalog_read import _LEGACY_BATCH_SQL
-
-        mapping = await driver.fetchrow(
-            _LEGACY_BATCH_SQL.format(control=_identifier(registry_schema())),
-            manifest.approved_custom_revision,
-            tuple(map(str, legacy_checksums)),
-            "checksum_network",
-            (),
-        )
-        if mapping is None or mapping["complete"] is not True or mapping["network_ids"] != list(network_ids):
-            raise Forbidden("Legacy network scope does not match its authorized canonical identities.")
+    manifest = await resolve_network_serving_manifest(driver, generation_id=generation, api_read=True)
     return manifest, network_ids, access_scope_sha256, legacy_checksums
 
 
@@ -529,8 +702,12 @@ def canonical_network_read(handler):
             raise ServiceUnavailable(
                 "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
             ) from error
-        with network_address_read_scope(
-            manifest, network_ids, access_scope_sha256=access_scope_sha256, legacy_checksums=legacy_checksums
+        async with network_address_read_session_scope(
+            request.ctx.sa_session,
+            manifest,
+            network_ids,
+            access_scope_sha256=access_scope_sha256,
+            legacy_checksums=legacy_checksums,
         ):
             pinned_headers_by_name = {
                 "X-Network-Generation": str(manifest.generation_id),

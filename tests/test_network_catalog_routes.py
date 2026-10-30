@@ -13,11 +13,20 @@ from sanic import Blueprint, Sanic
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.endpoint import network_catalog as endpoint
+from api.network_serving_read_context import _SNAPSHOT_SQL
 from process import registry_network_catalog_read as catalog
 from tests.test_registry_network_catalog_read import batch_boundary, legacy_selector, source_coordinates
 
 _AUTH = {"Authorization": "Bearer synthetic-catalog-control-token"}
 _PATH = "/api/v1/registry/serving/catalog"
+_OWNED_READ_EVENTS = [
+    "begin",
+    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    *["connection", "driver"] * 2,
+    "SET LOCAL lock_timeout='1s'",
+    *["connection", "driver"] * 4,
+    ("exit", None),
+]
 
 
 def envelope(query=None, **changes):
@@ -36,17 +45,44 @@ class Session:
         self.driver = driver
         self.events = []
         self.failure = None
+        self.transaction = None
+        self.snapshot_queries = []
+        self.driver.in_transaction = False
+        self.driver.get_server_pid = lambda: 42
+        self.original_fetchrow = driver.fetchrow
+        self.driver.fetchrow = self.fetchrow
+
+    def in_transaction(self):
+        """Expose the fixture's actual owned transaction state."""
+        return self.transaction is not None
+
+    def get_transaction(self):
+        """Keep the transaction object stable across native acquisitions."""
+        return self.transaction
+
+    def get_nested_transaction(self):
+        """The route fixture does not enter a savepoint."""
+        return None
+
+    async def fetchrow(self, sql, *parameters):
+        """Separate native snapshot checks from the existing catalog SQL observations."""
+        if sql == _SNAPSHOT_SQL:
+            self.snapshot_queries.append(sql)
+            return self.driver.isolation, self.driver.read_only, True, 11, 22, "127.0.0.1", 5432, 42
+        return await self.original_fetchrow(sql, *parameters)
 
     def begin(self):
         self.events.append("begin")
         return self
 
     async def __aenter__(self):
+        self.transaction = object()
         self.driver.in_transaction = True
         return self
 
     async def __aexit__(self, kind, _value, _traceback):
         self.events.append(("exit", kind))
+        self.transaction = None
         self.driver.in_transaction = False
 
     async def execute(self, statement):
@@ -137,14 +173,8 @@ async def test_actual_reader_pins_retained_revision_and_policy_before_count_page
         json.dumps(policy_by_field, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()
     assert http_response.headers["X-Network-Access-Scope"] == expected
-    assert context.session.events == [
-        "begin",
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
-        "SET LOCAL lock_timeout='1s'",
-        "connection",
-        "driver",
-        ("exit", None),
-    ]
+    assert context.session.events == _OWNED_READ_EVENTS
+    assert len(context.session.snapshot_queries) == 3
     sql, parameters = context.driver.calls[-1]
     assert parameters == (4, (2, 5), None, "Alias", source_coordinates().sql_parameters, None, 0, 1, 1048576, None)
     assert sql.index("NOT record_key::integer=ANY") < sql.index("filtered AS") < sql.index("OFFSET $7")
@@ -682,14 +712,8 @@ async def test_autocomplete_full_policy_pins_one_transaction_and_keeps_metadata_
     query, exclusions = context.autocomplete_calls[0]
     assert (query.query, query.limit, query.zip_code, query.generation_id, exclusions) == ("É%_", 2, "01234", 9, (84,))
     assert len(context.autocomplete_calls) == 1 and context.driver.calls == []
-    assert context.session.events == [
-        "begin",
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
-        "SET LOCAL lock_timeout='1s'",
-        "connection",
-        "driver",
-        ("exit", None),
-    ]
+    assert context.session.events == _OWNED_READ_EVENTS
+    assert len(context.session.snapshot_queries) == 3
 
 
 @pytest.mark.asyncio

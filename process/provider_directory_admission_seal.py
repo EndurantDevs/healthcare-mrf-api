@@ -9,11 +9,11 @@ revalidated without a PostgreSQL JSONB cast before its receipt is stored.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-import json
 from pathlib import Path
-import re
 from typing import Any
 
 from process.provider_directory_fhir_subset_canonical import (
@@ -29,14 +29,11 @@ from process.uhc_canonical_proof import (
     UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY,
 )
 
-
 ADMISSION_SEAL_CONTRACT = "provider-directory-admission-seal-v1"
 ADMISSION_SEAL_VERSION = 1
 ADMISSION_KIND_GENERIC = "generic"
 ADMISSION_KIND_UHC_CANONICAL = "uhc_canonical"
-ADMISSION_GENERIC_PROOF_SUMMARY_KEY = (
-    "provider_directory_content_proof_admission_summary_v1"
-)
+ADMISSION_GENERIC_PROOF_SUMMARY_KEY = "provider_directory_content_proof_admission_summary_v1"
 ADMISSION_METADATA_SUMMARY_MAX_BYTES = 1024 * 1024
 ADMISSION_RAW_METADATA_MAX_BYTES = 256 * 1024 * 1024
 ADMISSION_RESOURCE_TYPE_MAX_COUNT = 64
@@ -128,9 +125,7 @@ def _require_ascii_canonical_json(json_value: Any) -> None:
         try:
             json_value.encode("ascii")
         except UnicodeEncodeError as error:
-            raise AdmissionSealError(
-                "provider_directory_admission_proof_non_ascii"
-            ) from error
+            raise AdmissionSealError("provider_directory_admission_proof_non_ascii") from error
         return
     if isinstance(json_value, list):
         for item in json_value:
@@ -139,9 +134,7 @@ def _require_ascii_canonical_json(json_value: Any) -> None:
     if isinstance(json_value, Mapping):
         for key, item in json_value.items():
             if type(key) is not str:
-                raise AdmissionSealError(
-                    "provider_directory_admission_proof_shape_invalid"
-                )
+                raise AdmissionSealError("provider_directory_admission_proof_shape_invalid")
             _require_ascii_canonical_json(key)
             _require_ascii_canonical_json(item)
         return
@@ -209,24 +202,16 @@ def _bounded_metadata_summary(metadata: Mapping[str, Any]) -> dict[str, Any]:
     try:
         summary = json.loads(
             json.dumps(
-                {
-                    key: json_value
-                    for key, json_value in metadata.items()
-                    if key not in _PROOF_KEYS
-                },
+                {key: json_value for key, json_value in metadata.items() if key not in _PROOF_KEYS},
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
         )
         encoded = canonical_payload_json(summary).encode("utf-8")
     except (TypeError, ValueError) as error:
-        raise AdmissionSealError(
-            "provider_directory_admission_metadata_summary_invalid"
-        ) from error
+        raise AdmissionSealError("provider_directory_admission_metadata_summary_invalid") from error
     if len(encoded) > ADMISSION_METADATA_SUMMARY_MAX_BYTES:
-        raise AdmissionSealError(
-            "provider_directory_admission_metadata_summary_unbounded"
-        )
+        raise AdmissionSealError("provider_directory_admission_metadata_summary_unbounded")
     return summary
 
 
@@ -257,9 +242,7 @@ def _validated_descriptor_counts(
     finalized_counts: Mapping[str, Any],
 ) -> tuple[int, Mapping[str, int]]:
     if not isinstance(raw_descriptor, Mapping):
-        raise AdmissionSealError(
-            "provider_directory_admission_shard_summary_invalid"
-        )
+        raise AdmissionSealError("provider_directory_admission_shard_summary_invalid")
     descriptor_count = raw_descriptor.get("resource_count")
     descriptor_counts = raw_descriptor.get("resource_counts")
     if (
@@ -276,9 +259,7 @@ def _validated_descriptor_counts(
         )
         or sum(descriptor_counts.values()) != descriptor_count
     ):
-        raise AdmissionSealError(
-            "provider_directory_admission_shard_summary_invalid"
-        )
+        raise AdmissionSealError("provider_directory_admission_shard_summary_invalid")
     return descriptor_count, descriptor_counts
 
 
@@ -296,16 +277,11 @@ def _require_generic_descriptor_coverage(
         or type(resource_count) is not int
         or not isinstance(resource_counts, Mapping)
         or any(
-            type(resource_type) is not str
-            or not resource_type
-            or type(count) is not int
-            or count < 0
+            type(resource_type) is not str or not resource_type or type(count) is not int or count < 0
             for resource_type, count in resource_counts.items()
         )
     ):
-        raise AdmissionSealError(
-            "provider_directory_admission_shard_summary_invalid"
-        )
+        raise AdmissionSealError("provider_directory_admission_shard_summary_invalid")
     observed_count = 0
     observed_counts_by_resource: dict[str, int] = {}
     for raw_descriptor in shards:
@@ -315,29 +291,18 @@ def _require_generic_descriptor_coverage(
         )
         observed_count += descriptor_count
         for resource_type, count in descriptor_counts.items():
-            observed_counts_by_resource[resource_type] = (
-                observed_counts_by_resource.get(resource_type, 0) + count
-            )
-    is_semantic_proof = (
-        proof.get("contract_id") in _SEMANTIC_PROOF_CONTRACT_IDS
-    )
-    if (
-        observed_count < resource_count
-        if is_semantic_proof
-        else observed_count != resource_count
-    ) or any(
+            observed_counts_by_resource[resource_type] = observed_counts_by_resource.get(resource_type, 0) + count
+    is_semantic_proof = proof.get("contract_id") in _SEMANTIC_PROOF_CONTRACT_IDS
+    if (observed_count < resource_count if is_semantic_proof else observed_count != resource_count) or any(
         observed_counts_by_resource.get(resource_type, 0) < finalized_count
         if is_semantic_proof
-        else observed_counts_by_resource.get(resource_type, 0)
-        != finalized_count
+        else observed_counts_by_resource.get(resource_type, 0) != finalized_count
         for resource_type, finalized_count in resource_counts.items()
     ):
-        raise AdmissionSealError(
-            "provider_directory_admission_shard_summary_invalid"
-        )
+        raise AdmissionSealError("provider_directory_admission_shard_summary_invalid")
 
 
-def _receipt(
+def parse_source_admission_receipt(
     metadata_summary: Mapping[str, Any],
     *,
     admission_kind: str,
@@ -345,8 +310,10 @@ def _receipt(
     resource_counts: Any,
     proof_summary: Mapping[str, Any] | None = None,
 ) -> ProviderDirectoryAdmissionSeal:
+    """Validate the admission proof and resource accounting before constructing its typed seal."""
     if (
-        admission_kind not in {
+        admission_kind
+        not in {
             ADMISSION_KIND_GENERIC,
             ADMISSION_KIND_UHC_CANONICAL,
         }
@@ -355,14 +322,10 @@ def _receipt(
     ):
         raise AdmissionSealError("provider_directory_admission_proof_receipt_invalid")
     if ADMISSION_GENERIC_PROOF_SUMMARY_KEY in metadata_summary:
-        raise AdmissionSealError(
-            "provider_directory_admission_reserved_metadata_key"
-        )
+        raise AdmissionSealError("provider_directory_admission_reserved_metadata_key")
     summary_input_by_key = dict(metadata_summary)
     if proof_summary is not None:
-        summary_input_by_key[ADMISSION_GENERIC_PROOF_SUMMARY_KEY] = dict(
-            proof_summary
-        )
+        summary_input_by_key[ADMISSION_GENERIC_PROOF_SUMMARY_KEY] = dict(proof_summary)
     summary = _bounded_metadata_summary(summary_input_by_key)
     resource_types = _normalized_resource_types(resource_counts)
     envelope = _digest_envelope(
@@ -380,6 +343,9 @@ def _receipt(
         proof_sha256=proof_sha256,
         resource_types=resource_types,
     )
+
+
+_receipt = parse_source_admission_receipt
 
 
 def admission_seal_from_validated_metadata(
@@ -410,11 +376,7 @@ def admission_seal_from_validated_metadata(
         admission_kind=admission_kind,
         proof_sha256=proof.get("proof_sha256"),
         resource_counts=proof.get("resource_counts"),
-        proof_summary=(
-            _generic_proof_summary(proof)
-            if admission_kind == ADMISSION_KIND_GENERIC
-            else None
-        ),
+        proof_summary=(_generic_proof_summary(proof) if admission_kind == ADMISSION_KIND_GENERIC else None),
     )
 
 

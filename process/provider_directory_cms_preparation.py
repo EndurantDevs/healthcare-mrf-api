@@ -14,6 +14,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, AsyncIterator
 
+from process.provider_directory_cms_inventory import inventory_transition, measure_inventory, record_external_identity
 from process.provider_directory_cms_native_layout import RetainedNativeSourceLayout
 from process.provider_directory_profile_capacity_attestation import (
     VerifiedDatabaseCapacityLease,
@@ -194,6 +195,16 @@ class NonprofileAdmission:
     _cutover_active: bool = field(default=False, init=False)
     cleanup_preserved: list[tuple[str, str]] = field(default_factory=list, init=False)
     registry_source_job: Any = field(default=None, init=False, repr=False, compare=False)
+    _inventory_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False, compare=False)
+    _inventory_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
+
+    def inventory_transition(self):
+        """Serialize short physical inventory transitions with their exact catalog checks."""
+        return inventory_transition(self)
+
+    def _record_external_identity(self, schema, name, oid):
+        """Retain the captured identity through uncertain DDL commit acknowledgement."""
+        record_external_identity(self, schema, name, oid)
 
     def _assert_lease(self) -> None:
         """Require signature-bound geometry and existing storage reservation checks."""
@@ -267,71 +278,18 @@ class NonprofileAdmission:
 
     async def measure(self, fhir: Any, schema: str, names: tuple[str, ...] = ()) -> tuple[OwnedRelation, ...]:
         """Measure exact owned names, rejecting OID replacement or disappearance."""
-        from process.provider_directory_cms_nonprofile_observation import active_observations
+        async with self.inventory_transition():
+            from process.provider_directory_cms_nonprofile_observation import active_observations
 
-        scope = active_observations(admission=self)
-        if scope is None:
-            return await self._measure(fhir, schema, names)
-        async with scope.observers() as observers:
-            return await self._measure(fhir, schema, names, observers=observers)
+            scope = active_observations(admission=self)
+            if scope is None:
+                return await self._measure(fhir, schema, names)
+            async with scope.observers() as observers:
+                return await self._measure(fhir, schema, names, observers=observers)
 
     async def _measure(self, fhir, schema, names, *, observers=None):
         """Retain the complete original inventory while selecting its native reader."""
-        if not self._started:
-            raise RuntimeError("provider_directory_nonprofile_admission_not_started")
-        for name in names:
-            self._relations.setdefault((schema, name), 0)
-        inventory = sorted(self._relations.items())
-        group_by_executor_id = {}
-        for (relation_schema, name), previous_oid in inventory:
-            database = (
-                None
-                if observers is None
-                else observers.database_for(OwnedRelation(relation_schema, name, previous_oid, 0, "p"))
-            )
-            database = fhir.db if database is None else database
-            group_by_executor_id.setdefault(id(database), (database, []))[1].append((relation_schema, name))
-        measured_by_coordinate = {}
-        for database, coordinates in group_by_executor_id.values():
-            coordinate_by_ref = {fhir._unscoped_qt(*coordinate): coordinate for coordinate in coordinates}
-            if len(coordinate_by_ref) != len(coordinates):
-                raise RuntimeError("provider_directory_nonprofile_relation_changed")
-            catalog_records = await database.all(
-                "SELECT requested.relation_ref, relation.oid::bigint AS oid, "
-                "pg_total_relation_size(relation.oid)::bigint AS total_bytes, "
-                "relation.relpersistence::text AS persistence "
-                "FROM unnest(CAST(:relation_refs AS text[])) AS requested(relation_ref) "
-                "JOIN pg_class AS relation ON relation.oid=to_regclass(requested.relation_ref);",
-                relation_refs=list(coordinate_by_ref),
-            )
-            observed_refs = set()
-            for catalog_record in catalog_records:
-                relation_values = fhir._pagination_checkpoint_row_mapping(catalog_record)
-                relation_ref = relation_values.get("relation_ref")
-                if (
-                    type(relation_ref) is not str
-                    or relation_ref not in coordinate_by_ref
-                    or relation_ref in observed_refs
-                ):
-                    raise RuntimeError("provider_directory_nonprofile_relation_changed")
-                observed_refs.add(relation_ref)
-                measured_by_coordinate[coordinate_by_ref[relation_ref]] = relation_values
-            if observed_refs != coordinate_by_ref.keys():
-                raise RuntimeError("provider_directory_nonprofile_relation_changed")
-        measured_relations = []
-        for (relation_schema, name), previous_oid in inventory:
-            relation_values = measured_by_coordinate[(relation_schema, name)]
-            oid, total_bytes = relation_values.get("oid"), relation_values.get("total_bytes")
-            if type(oid) is not int or oid <= 0 or (previous_oid and previous_oid != oid):
-                raise RuntimeError("provider_directory_nonprofile_relation_changed")
-            if type(total_bytes) is not int or total_bytes < 0 or relation_values.get("persistence") not in {"u", "p"}:
-                raise RuntimeError("provider_directory_nonprofile_relation_storage_invalid")
-            self._relations[(relation_schema, name)] = oid
-            measured = OwnedRelation(relation_schema, name, oid, total_bytes, relation_values["persistence"])
-            if observers is not None:
-                observers.record(measured)
-            measured_relations.append(measured)
-        return tuple(measured_relations)
+        return await measure_inventory(self, fhir, schema, names, observers=observers)
 
     async def before_logging(self, fhir: Any, schema: str, name: str) -> None:
         """Reserve aggregate logging/WAL costs before ALTER SET LOGGED."""
@@ -347,36 +305,37 @@ class NonprofileAdmission:
         self, fhir: Any, schema: str, stages: tuple[tuple[str, str, int], ...], *, input_hash: str
     ) -> None:
         """Account captured native OIDs before logging without taking cleanup ownership."""
-        if (
-            input_hash != self.plan.native_address_input_hash
-            or not input_hash
-            or (
-                tuple(sorted(target_relation for target_relation, _name, _oid in stages))
-                != self.plan.native_address_targets
-                or len({name for _target, name, _oid in stages}) != len(stages)
+        async with self.inventory_transition():
+            if (
+                input_hash != self.plan.native_address_input_hash
+                or not input_hash
+                or (
+                    tuple(sorted(target_relation for target_relation, _name, _oid in stages))
+                    != self.plan.native_address_targets
+                    or len({name for _target, name, _oid in stages}) != len(stages)
+                )
+            ):
+                raise RuntimeError("provider_directory_nonprofile_address_scope_changed")
+            for _target, name, oid in stages:
+                if type(oid) is not int or oid <= 0 or self._relations.get((schema, name), oid) != oid:
+                    raise RuntimeError("provider_directory_nonprofile_address_identity_invalid")
+                self._relations[(schema, name)] = oid
+                self._external_relations.add((schema, name))
+            relations = await self.measure(fhir, schema)
+            stage_names = {name for _target, name, _oid in stages}
+            logging_relations = tuple(
+                (relation.schema, relation.relation)
+                for relation in relations
+                if relation.schema == schema and relation.relation in stage_names and relation.persistence == "u"
             )
-        ):
-            raise RuntimeError("provider_directory_nonprofile_address_scope_changed")
-        for _target, name, oid in stages:
-            if type(oid) is not int or oid <= 0 or self._relations.get((schema, name), oid) != oid:
-                raise RuntimeError("provider_directory_nonprofile_address_identity_invalid")
-            self._relations[(schema, name)] = oid
-            self._external_relations.add((schema, name))
-        relations = await self.measure(fhir, schema)
-        stage_names = {name for _target, name, _oid in stages}
-        logging_relations = tuple(
-            (relation.schema, relation.relation)
-            for relation in relations
-            if relation.schema == schema and relation.relation in stage_names and relation.persistence == "u"
-        )
-        self._logged_relations.update(
-            (relation.schema, relation.relation)
-            for relation in relations
-            if relation.schema == schema and relation.relation in stage_names and relation.persistence == "p"
-        )
-        await self._check(
-            "pre_logging" if logging_relations else "readiness", relations, logging_relations=logging_relations
-        )
+            self._logged_relations.update(
+                (relation.schema, relation.relation)
+                for relation in relations
+                if relation.schema == schema and relation.relation in stage_names and relation.persistence == "p"
+            )
+            await self._check(
+                "pre_logging" if logging_relations else "readiness", relations, logging_relations=logging_relations
+            )
 
     def _record_raw_relation(self, schema: str, name: str, oid: int, raw_relation: RetainedRawRelation | None) -> None:
         """Keep signed raw annotations separate from ordinary native ownership records."""
@@ -406,13 +365,13 @@ class NonprofileAdmission:
         native_relation: RetainedNativeRelation | None = None,
     ) -> None:
         """Capture a native CREATE's original OID while native cleanup retains ownership."""
-        if type(oid) is not int or oid <= 0 or self._relations.get((schema, name), oid) != oid:
-            raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
-        await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
-        self._relations[(schema, name)] = oid
-        self._external_relations.add((schema, name))
-        self._record_raw_relation(schema, name, oid, raw_relation)
-        await self._check("readiness", await self.measure(fhir, schema))
+        async with self.inventory_transition():
+            if type(oid) is not int or oid <= 0 or self._relations.get((schema, name), oid) != oid:
+                raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
+            await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
+            self._record_external_identity(schema, name, oid)
+            self._record_raw_relation(schema, name, oid, raw_relation)
+            await self._check("readiness", await self.measure(fhir, schema))
 
     async def _record_native_relation(self, fhir, schema, name, oid, native_relation, raw_relation):
         """Enroll strict source evidence once; later checks never consult a renamed source heap."""
@@ -490,14 +449,15 @@ class NonprofileAdmission:
 
     async def advance_retained_native_relation(self, fhir, schema, name, phase):
         """Keep each index phase inside its issued native recipe and real budget checks."""
-        coordinate = (schema, name)
-        previous = self._native_relations.get(coordinate)
-        if previous is None or previous.source_input is None:
-            raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
-        annotation = replace(previous, phase=phase)
-        await previous.source_input.advance_relation(previous, annotation)
-        self._native_relations[coordinate] = annotation
-        await self._check("readiness", await self.measure(fhir, schema))
+        async with self.inventory_transition():
+            coordinate = (schema, name)
+            previous = self._native_relations.get(coordinate)
+            if previous is None or previous.source_input is None:
+                raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
+            annotation = replace(previous, phase=phase)
+            await previous.source_input.advance_relation(previous, annotation)
+            self._native_relations[coordinate] = annotation
+            await self._check("readiness", await self.measure(fhir, schema))
 
     def _require_finished_native_relations(self):
         for annotation in self._native_relations.values():
@@ -518,48 +478,51 @@ class NonprofileAdmission:
         require_ready: bool = False,
     ) -> None:
         """Recheck fresh aggregate availability before growth, without inventing its bound."""
-        if (schema, name) not in self._external_relations or self._relations.get((schema, name)) != oid:
-            raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
-        await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
-        self._record_raw_relation(schema, name, oid, raw_relation)
-        if require_ready:
-            await self.assert_ready(fhir, schema)
-        else:
-            await self._check("readiness", await self.measure(fhir, schema))
+        async with self.inventory_transition():
+            if (schema, name) not in self._external_relations or self._relations.get((schema, name)) != oid:
+                raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
+            await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
+            self._record_raw_relation(schema, name, oid, raw_relation)
+            if require_ready:
+                await self.assert_ready(fhir, schema)
+            else:
+                await self._check("readiness", await self.measure(fhir, schema))
 
     async def retire_external_relation(self, fhir: Any, schema: str, name: str, oid: int) -> None:
         """Retire only an exact externally owned OID after native verified removal."""
-        if (schema, name) not in self._external_relations or self._relations.get((schema, name)) != oid:
-            raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
-        actual_oid = await fhir.db.scalar(
-            "SELECT to_regclass(:relation_ref)::oid::bigint;", relation_ref=fhir._unscoped_qt(schema, name)
-        )
-        if actual_oid is not None:
-            raise RuntimeError("provider_directory_nonprofile_relation_changed")
-        del self._relations[(schema, name)]
-        self._external_relations.remove((schema, name))
-        self._raw_relations.pop((schema, name), None)
-        self._native_relations.pop((schema, name), None)
-        self._logged_relations.discard((schema, name))
+        async with self.inventory_transition():
+            if (schema, name) not in self._external_relations or self._relations.get((schema, name)) != oid:
+                raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
+            actual_oid = await fhir.db.scalar(
+                "SELECT to_regclass(:relation_ref)::oid::bigint;", relation_ref=fhir._unscoped_qt(schema, name)
+            )
+            if actual_oid is not None:
+                raise RuntimeError("provider_directory_nonprofile_relation_changed")
+            del self._relations[(schema, name)]
+            self._external_relations.remove((schema, name))
+            self._raw_relations.pop((schema, name), None)
+            self._native_relations.pop((schema, name), None)
+            self._logged_relations.discard((schema, name))
 
     async def rename_external_relation(self, fhir: Any, schema: str, old_name: str, new_name: str, oid: int) -> None:
         """Follow a verified rename of the original OID, never a replacement identity."""
-        if (schema, old_name) in self._raw_relations or (schema, old_name) in self._native_relations:
-            raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
-        if (schema, new_name) in self._relations:
-            raise RuntimeError("provider_directory_nonprofile_external_name_conflict")
-        actual_oid = await fhir.db.scalar(
-            "SELECT to_regclass(:relation_ref)::oid::bigint;", relation_ref=fhir._unscoped_qt(schema, new_name)
-        )
-        if actual_oid != oid:
-            raise RuntimeError("provider_directory_nonprofile_relation_changed")
-        is_logged = (schema, old_name) in self._logged_relations
-        await self.retire_external_relation(fhir, schema, old_name, oid)
-        self._relations[(schema, new_name)] = oid
-        self._external_relations.add((schema, new_name))
-        if is_logged:
-            self._logged_relations.add((schema, new_name))
-        await self._check("readiness", await self.measure(fhir, schema))
+        async with self.inventory_transition():
+            if (schema, old_name) in self._raw_relations or (schema, old_name) in self._native_relations:
+                raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
+            if (schema, new_name) in self._relations:
+                raise RuntimeError("provider_directory_nonprofile_external_name_conflict")
+            actual_oid = await fhir.db.scalar(
+                "SELECT to_regclass(:relation_ref)::oid::bigint;", relation_ref=fhir._unscoped_qt(schema, new_name)
+            )
+            if actual_oid != oid:
+                raise RuntimeError("provider_directory_nonprofile_relation_changed")
+            is_logged = (schema, old_name) in self._logged_relations
+            await self.retire_external_relation(fhir, schema, old_name, oid)
+            self._relations[(schema, new_name)] = oid
+            self._external_relations.add((schema, new_name))
+            if is_logged:
+                self._logged_relations.add((schema, new_name))
+            await self._check("readiness", await self.measure(fhir, schema))
 
     async def assert_ready(self, fhir: Any, schema: str, *, cutover: bool = False) -> None:
         """Revalidate physical identities, reservations and runtime at cutover."""

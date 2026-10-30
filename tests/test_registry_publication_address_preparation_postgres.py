@@ -185,8 +185,8 @@ async def test_fenced_address_preparation_opens_native_repeatable_snapshot(addre
         password=fixture.password,
     )
     async with AsyncExitStack() as stack:
-        sessions = worker._bounded_sessions(settings, stack, url)
-        execution_sessions = worker._bounded_sessions(settings, stack, url.set(username=fixture.config.execution_role))
+        sessions = worker._worker_sessions(settings, stack, url)
+        execution_sessions = worker._worker_sessions(settings, stack, url.set(username=fixture.config.execution_role))
         runtime = RegistryPublicationPTGRuntime(
             execution_sessions,
             RegistryPTGProducerScopeStore(fixture.config.queue_owner_role, fixture.config.api_role, fixture.schema),

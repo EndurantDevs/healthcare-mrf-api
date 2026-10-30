@@ -32,7 +32,10 @@ PLAN = "hpplan_" + "0" * 26
 
 def _database_config():
     database = os.getenv("HLTHPRT_DB_DATABASE", "")
-    if not re.search(r"(?:^|[_-])test(?:[_-]|$)", database, re.I):
+    if not (
+        re.search(r"(?:^|[_-])test(?:[_-]|$)", database, re.I)
+        or re.fullmatch(r"hc_network_registry_[0-9a-f]{32}", database)
+    ):
         pytest.skip("native custody proof requires an explicit test database")
     return {
         "host": os.getenv("HLTHPRT_DB_HOST", "127.0.0.1"),

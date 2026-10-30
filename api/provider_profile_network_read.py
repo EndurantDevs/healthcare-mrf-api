@@ -6,6 +6,7 @@ from datetime import date
 from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read
 from api.provider_directory_entities_contract import DirectoryReadError
 from api.provider_profile_network_contract import bind_managed_profile_generation
 from api.provider_profile_network_facts import pin_cms_profile_scope
@@ -32,7 +33,7 @@ class _RetainedProfileUnavailable(DirectoryReadError):
 
 async def _profile_fhir_recipes(driver, manifest):
     """Authenticate recipes before distinguishing unavailable optional enrichment."""
-    recipes = await resolve_retained_registry_source_recipes(driver, manifest)
+    recipes = await resolve_retained_registry_source_recipes(driver, manifest, api_read=True)
     fhir_recipes = [recipe for recipe in recipes if type(recipe.source_pin) is PinnedFHIRMembershipSource]
     if (
         len(fhir_recipes) == 1
@@ -93,7 +94,7 @@ async def _directory_profile(session, driver, manifest, npi, query, excluded, sc
         profile_as_of=date.fromisoformat(pin.as_of),
     )
     await provider._disable_provider_directory_evidence_jit(session)
-    profile_row = (await session.execute(text(statement), parameters)).mappings().one_or_none()
+    profile_row = (await execute_network_read(session, text(statement), parameters)).mappings().one_or_none()
     if profile_row is None:
         return None
     if profile_row["profile_json"] is None or profile_row["evidence_json"] is None:
@@ -143,6 +144,8 @@ async def read_detail_directory_profile(session, npi, *, include_evidence):
                     [npi], include_evidence=include_evidence, session=session
                 )
             ).get(npi)
+    except ServiceUnavailable:
+        raise
     except Exception as error:
         provider.logger.debug("Provider Directory profile fetch failed for npi=%s: %s", npi, error)
         return None
@@ -157,7 +160,7 @@ async def read_managed_provider_profile(selector, *, excluded_network_ids, acces
     async with provider_profile_read_snapshot(provider.db, schema, include_detail=True) as session:
         connection = await session.connection()
         driver = (await connection.get_raw_connection()).driver_connection
-        manifest = await resolve_network_serving_manifest(driver)
+        manifest = await resolve_network_serving_manifest(driver, api_read=True)
         state_projection = await provider.fetch_provider_profile_projection(int(npi))
         fhir_record = await _directory_profile(session, driver, manifest, npi, query, excluded_network_ids, schema)
         profile = provider._compose_requested_provider_profile(int(npi), state_projection, fhir_record, query)

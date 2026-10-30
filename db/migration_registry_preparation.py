@@ -17,12 +17,14 @@ _REVISIONS = {
     "20261017030000_registry_ptg_office_recipe_selection",
     "20261018011000_network_candidate_custody",
     "20261018040000_registry_aca_source_notifications",
+    "20261028010000_registry_fhir_catalog",
 }
 _TABLES = {
     "registry_ptg_published_plan_scope",
     "registry_network_binding",
     "registry_cms_source_notification",
     "registry_aca_source_notification",
+    "registry_fhir_catalog_snapshot",
 }
 _COLUMNS = """SELECT attname,format_type(atttypid,atttypmod),attnotnull,
  attidentity::text,attgenerated::text,attcollation::bigint,pg_get_expr(d.adbin,d.adrelid)
@@ -120,6 +122,22 @@ def _is_safe_grantee(connection, grantee, owner):
     )
 
 
+def _is_allowed_registry_grant(grant, table):
+    """Keep each prepared relation's table and column privileges closed."""
+    privilege, column = grant["privilege_type"], grant["column_name"]
+    is_allowed = privilege == "SELECT"
+    if table == "registry_network_binding":
+        is_allowed |= privilege == "INSERT" and column in _BINDING_INSERT
+        is_allowed |= privilege == "UPDATE" and column in _BINDING_UPDATE
+    elif table == "registry_ptg_published_plan_scope":
+        is_allowed |= privilege == "INSERT" and column is None
+    elif table in {"network_candidate_custody", "registry_fhir_catalog_snapshot"}:
+        is_allowed = privilege == "SELECT" and column is None
+    else:
+        is_allowed = False
+    return is_allowed
+
+
 def _validate_acl(connection, relation, owner):
     """Preserve bounded existing roles; notification creation starts owner-only."""
     grants = connection.execute(text(_ACL), {"oid": relation["oid"]}).mappings().all()
@@ -136,18 +154,11 @@ def _validate_acl(connection, relation, owner):
     for grant in grants:
         if grant["grantee"] == owner["oid"]:
             continue
-        privilege, column = grant["privilege_type"], grant["column_name"]
-        is_allowed = privilege == "SELECT"
-        if relation["relname"] == "registry_network_binding":
-            is_allowed |= privilege == "INSERT" and column in _BINDING_INSERT
-            is_allowed |= privilege == "UPDATE" and column in _BINDING_UPDATE
-        elif relation["relname"] == "registry_ptg_published_plan_scope":
-            is_allowed |= privilege == "INSERT" and column is None
-        elif relation["relname"] == "network_candidate_custody":
-            is_allowed = privilege == "SELECT" and column is None
-        else:
-            is_allowed = False
-        if not is_allowed or grant["is_grantable"] or grant["grantor"] != owner["oid"]:
+        if (
+            not _is_allowed_registry_grant(grant, relation["relname"])
+            or grant["is_grantable"]
+            or grant["grantor"] != owner["oid"]
+        ):
             raise RuntimeError("Registry preparation privileges differ")
 
 

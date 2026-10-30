@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import MetaData, text
 
 from api import provider_detail_network_metadata as metadata
+from api.endpoint.npi import GEO_SERVICE_LOCATIONS_ENV
 from db.models import NUCCTaxonomy
 from process import registry_network_catalog_read as catalog
 from tests import test_provider_profile_network_facts_postgres as profile_source
@@ -25,11 +26,12 @@ _NPI = "1000000491"
 @pytest.fixture(autouse=True)
 def native_collection_coordinates(monkeypatch):
     """Give the genuine source offices coordinates before their immutable publication."""
+    monkeypatch.setenv(GEO_SERVICE_LOCATIONS_ENV, "true")
     original = profile_source._public_address_contacts
 
     async def prepare_coordinates(connection, source_table):
         await original(connection, source_table)
-        await connection.execute(f"UPDATE {source_table} SET lat=37.5,long=-122.5,type='primary'")
+        await connection.execute(f"UPDATE {source_table} SET lat=37.5,long=-122.5")
 
     monkeypatch.setattr(profile_source, "_public_address_contacts", prepare_coordinates)
 
@@ -49,8 +51,9 @@ async def collection_transport(profile_transport, monkeypatch):
         return await original_pin(*args, **kwargs)
 
     async def observe_custody(*args, **kwargs):
-        custody.append(args)
-        return await original_custody(*args, **kwargs)
+        manifest = await original_custody(*args, **kwargs)
+        custody.append((args, kwargs, manifest))
+        return manifest
 
     monkeypatch.setattr(catalog, "_pin", observe_pin)
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", observe_custody)
@@ -93,9 +96,13 @@ def _reader_evidence(case):
     assert all(identity[5:] == (False, False) for _, identity in context.statements)
     assert len({identity[4] for _, identity in context.statements}) == 1
     assert None not in context.transactions and len(set(context.transactions)) == 1
-    assert len(case.pins) == 1 and len(case.custody) == 2
-    assert case.custody[0] == case.custody[1]
-    assert case.custody[0][0] is case.pins[0][0]
+    assert len(case.pins) == len(case.custody) == 1
+    arguments, options_by_name, manifest = case.custody[0]
+    assert len(arguments) == 1 and arguments[0] is case.pins[0][0]
+    assert options_by_name == {"generation_id": case.pins[0][1], "control_schema": case.pins[0][2]}
+    assert manifest == context.manifest
+    seal = getattr(manifest, "_custody_seal_sha256", None)
+    assert type(seal) is str and len(seal) == 64 and set(seal) <= set("0123456789abcdef")
     assert all(request.ctx.sa_session is case.sentinel for request in case.requests)
 
 
@@ -222,7 +229,7 @@ async def test_native_legacy_collection_reuses_the_exact_accounted_manifest(coll
     data_by_field = _success(case, await _post(case, document), document)
     _assert_offices(context, "batch", data_by_field, "selected")
     assert case.pins[0][1:] == (context.manifest.generation_id, context.fixture.control_schema)
-    assert case.custody[0][0] is case.pins[0][0]
+    assert case.custody[0][0][0] is case.pins[0][0]
 
 
 async def test_native_collection_authority_refusal_precedes_reader(collection_transport):

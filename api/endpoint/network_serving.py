@@ -5,10 +5,10 @@ from urllib.parse import parse_qs
 
 import asyncpg
 from sanic import Blueprint, response
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.control_auth import require_registry_auth
+from api.network_serving_read_context import network_serving_read_context
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 
 blueprint = Blueprint("network_serving", url_prefix="/registry/serving", version=1)
@@ -47,11 +47,7 @@ async def serving_manifest(request):
         return _error(400)
     try:
         session = request.ctx.sa_session
-        async with session.begin():
-            await session.execute(text("SET TRANSACTION READ ONLY"))
-            await session.execute(text("SET LOCAL lock_timeout='1s'"))
-            connection = await session.connection()
-            driver = (await connection.get_raw_connection()).driver_connection
+        async with network_serving_read_context(session) as driver:
             manifest = await resolve_network_serving_manifest(driver, generation_id=generation_id)
         identity_by_name = {
             field: getattr(manifest, field)

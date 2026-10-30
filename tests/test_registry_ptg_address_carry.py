@@ -21,6 +21,7 @@ from process.registry_retained_site_adoption import (
     RetainedSiteAdoptionError,
     RetainedSiteAdoptionReceipt,
 )
+from process.registry_source_recipe_composition import SourceRecipeReadContext
 from tests.test_registry_ptg_office_membership_recipe import _recipe
 
 
@@ -82,6 +83,8 @@ def test_empty_carry_preserves_exact_v2_encoding_and_generation():
     old = asdict(receipt)
     old.pop("ptg_carry_sha256")
     old.pop("aca_carry_sha256")
+    old.pop("source_aliases")
+    old.pop("fhir_carry_sha256")
     expected_by_field = {"component": "network_custom_address_source", "revision": 2, **old}
     assert receipt.as_dict() == expected_by_field
     assert custom._from_document(json.dumps(expected_by_field)) == receipt
@@ -146,6 +149,15 @@ async def test_exact_recipe_custody_shared_budget_and_selected_rows(monkeypatch)
     connection, approved, authority = object(), object(), object()
     result = await carry.prepare_ptg_address_carry(connection, (recipe,), approved, "control_fixture", authority)
     assert (result.pages, result.rows) == (1, 1)
+    encoded = carry._canonical(_receipt().as_dict())
+    selection_sha = hashlib.sha256(len(encoded).to_bytes(8, "big") + encoded).hexdigest()
+    assert result.origin_references == ((3, "d" * 64, 11, 12, 13, 14, 1, selection_sha),)
+    from process.registry_source_recipe_store import canonical_registry_source_recipes
+
+    legacy_digest = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode())
+    legacy_digest.update(len(encoded).to_bytes(8, "big") + encoded)
+    legacy_digest.update(carry._canonical({"pages": 1, "rows": 1}))
+    assert result.sha256 == legacy_digest.hexdigest()
     assert not hasattr(result, "receipts")
     assert len(result.sha256) == 64
     custody.assert_awaited_once_with(connection, recipe, approved, "control_fixture", authority)
@@ -234,7 +246,7 @@ async def test_set_copy_allows_identical_overlap_and_preserves_legacy_path(exact
     connection = copy_connection
     await copy_approved_site_rows(connection, (_receipt(),), "target_fixture", exact_rows=exact)
     assert connection.execute.await_count == 2
-    assert connection.fetchval.await_count == int(exact)
+    assert connection.fetchval.await_count == 2 * int(exact)
     assert connection.fetch.await_count == 1
     address_sql = connection.execute.await_args_list[0].args[0]
     assert '("location_key","checksum","canonical_network_ids")' in address_sql
@@ -260,7 +272,8 @@ async def test_streaming_copy_and_replay_share_identity_without_retaining_pages(
     )
     assert (result.pages, result.rows, copy.await_count) == (100, 100, 100)
     assert all(
-        call.args[1] == (_receipt(),) and call.kwargs == {"exact_rows": True, "reproject_network_ids": True}
+        call.args[1] == (_receipt(),)
+        and call.kwargs == {"exact_rows": True, "reproject_network_ids": True, "control_schema": "control_fixture"}
         for call in copy.await_args_list
     )
     _pages(monkeypatch)
@@ -294,10 +307,11 @@ async def test_existing_artifact_replay_rechecks_carry_before_returning(monkeypa
 @pytest.mark.asyncio
 async def test_composer_passes_full_resolved_recipes_and_same_office_authority(monkeypatch):
     from process import registry_candidate_composition as candidate
+    from process import registry_composition_addresses as addresses
 
     artifact = _artifact()
     prepare = AsyncMock(return_value=artifact)
-    monkeypatch.setattr(candidate, "prepare_recipe_address_source", prepare)
+    monkeypatch.setattr(addresses, "prepare_recipe_address_source", prepare)
     source = candidate.RegistryCompositionAddressSources(artifact.base_source)
     approved = SimpleNamespace(approved_revision=4, generation_id="a" * 64, total_rows=1)
     writer_by_role = {
@@ -307,7 +321,14 @@ async def test_composer_passes_full_resolved_recipes_and_same_office_authority(m
     }
     recipes, authority = (_recipe(),), object()
     actual, summary = await candidate._composition_artifact(
-        object(), source, UUID(int=10), approved, writer_by_role, "control_fixture", authority, recipes
+        object(),
+        source,
+        UUID(int=10),
+        approved,
+        writer_by_role,
+        "control_fixture",
+        SourceRecipeReadContext(office_authority=authority),
+        (recipes, None, 1),
     )
     assert actual is artifact and summary is None
     assert prepare.await_args.args[3] == (recipes, authority)
@@ -339,7 +360,7 @@ async def test_network_array_reprojection_keeps_full_retained_proof_and_immutabl
     await copy_approved_site_rows(
         connection, (_receipt(),), "target_fixture", exact_rows=True, reproject_network_ids=True
     )
-    sql = connection.fetchval.await_args.args[0]
+    sql = connection.fetchval.await_args_list[0].args[0]
     assert 'LEFT JOIN "retained_fixture".entity_address_unified retained' in sql
     assert "retained.location_key IS NULL" in sql
     assert "to_jsonb(retained)::text" in sql
@@ -382,3 +403,43 @@ async def test_network_array_reprojection_requires_exact_row_validation():
         await copy_approved_site_rows(connection, (_receipt(),), "target_fixture", reproject_network_ids=True)
     connection.fetchval.assert_not_awaited()
     connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "export", "import", "bytes", "count"])
+async def test_compact_address_copy_bounds_and_native_accounting(monkeypatch, fault):
+    from process import network_approved_site_source as sites
+
+    copy_bytes = b"x" * 21
+    monkeypatch.setattr(sites, "MAX_COPY_BYTES", 21)
+
+    async def export(_query, *_arguments, output, **copy_options):
+        assert copy_options == {"format": "binary"}
+        await output(copy_bytes + (b"x" if fault == "bytes" else b""))
+        return "COPY 0" if fault == "export" else "COPY 1"
+
+    async def load(table, *, schema_name, columns, source, **copy_options):
+        assert (table, schema_name, columns, copy_options) == (
+            "entity_address_unified",
+            "target_fixture",
+            ("location_key",),
+            {"format": "binary"},
+        )
+        assert source.read() == copy_bytes
+        return "COPY 0" if fault == "import" else "COPY 1"
+
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=2 if fault == "count" else 1),
+        copy_from_query=AsyncMock(side_effect=export),
+        copy_to_table=AsyncMock(side_effect=load),
+    )
+    operation = sites._copy_compact_addresses(
+        connection, _receipt(), "target_fixture", ('"location_key"',), "SELECT addresses", ("selection",)
+    )
+    if fault:
+        with pytest.raises(RetainedSiteAdoptionError, match="COPY"):
+            await operation
+    else:
+        await operation
+    if fault in {"export", "bytes", "count"}:
+        connection.copy_to_table.assert_not_awaited()

@@ -360,7 +360,7 @@ def collector_read(monkeypatch):
         "registry_schema": lambda: "control_fixture",
         "resolve_network_serving_manifest": state.manifest_read,
         "pin_retained_approved_membership_source": state.pin,
-        "verify_registry_source_recipes": state.recipes,
+        "verify_source_recipe_metadata": state.recipes,
         "_verify_bundle": state.bundle,
         "verify_registry_source_selection_receipt": state.selection,
         "append_pricing_binding_metadata": state.pricing,

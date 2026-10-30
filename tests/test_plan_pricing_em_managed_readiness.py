@@ -34,13 +34,14 @@ def held(monkeypatch):
         calls.append("admission")
         return ()
 
-    async def attributed(actual_session, actual_selection):
+    async def attributed(actual_session, actual_selection, *, api_read):
         assert actual_session is session and actual_selection is selection
+        assert api_read is True
         calls.append("attribution")
         return object()
 
-    async def providers(actual_driver, manifest):
-        assert actual_driver is driver and manifest is scope.manifest
+    async def providers(actual_session, manifest):
+        assert actual_session is session and manifest is scope.manifest
         calls.append("provider inputs")
         return object()
 
@@ -50,7 +51,7 @@ def held(monkeypatch):
     inputs = AsyncMock(side_effect=providers)
     monkeypatch.setattr(provider_service_source_policy, "admitted_plan_release_bindings", admission)
     monkeypatch.setattr(plan_pricing_em_attribution, "resolve_em_attribution", attribution)
-    monkeypatch.setattr(network_em_provider_inputs, "resolve_em_provider_inputs", inputs)
+    monkeypatch.setattr(network_em_provider_inputs, "resolve_em_provider_inputs_in_session", inputs)
     return SimpleNamespace(
         session=session, selection=selection, calls=calls, admission=admission, attribution=attribution, inputs=inputs
     )

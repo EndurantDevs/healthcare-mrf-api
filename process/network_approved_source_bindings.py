@@ -15,6 +15,7 @@ from process.network_approved_membership_source import (
     pin_approved_membership_source,
     pin_retained_approved_membership_source,
 )
+from process.network_read_identity import NetworkReadIdentityError
 from process.registry_source_observation_store import _TRIM_CHARACTERS, _namespace
 
 
@@ -76,13 +77,13 @@ class RegistryNetworkSourceCoordinates:
 APPROVED_NETWORK_BINDINGS_SQL = """approved_network_bindings AS MATERIALIZED (
   SELECT binding.record_key,binding.record_revision,binding.custom_revision,binding.record_json,
     parsed.network_id,network.record_key AS approved_network_key
-  FROM {namespace}.registry_approved_record binding
+  FROM ONLY {namespace}.registry_approved_record binding
   CROSS JOIN LATERAL (SELECT CASE
     WHEN jsonb_typeof(binding.record_json->'network_id')='number'
       AND binding.record_json->>'network_id' ~ '^[1-9][0-9]{{0,9}}$'
     THEN CASE WHEN (binding.record_json->>'network_id')::numeric<=2147483647
       THEN (binding.record_json->>'network_id')::integer END END AS network_id) parsed
-  LEFT JOIN {namespace}.registry_approved_record network
+  LEFT JOIN ONLY {namespace}.registry_approved_record network
     ON network.approved_revision=$1 AND network.record_kind='network'
       AND network.record_key=parsed.network_id::text
       AND network.record_json->'archived'='false'::jsonb
@@ -96,7 +97,7 @@ APPROVED_NETWORK_BINDINGS_SQL = """approved_network_bindings AS MATERIALIZED (
 )"""
 
 _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
-  SELECT binding.* FROM {namespace}.registry_approved_record binding
+  SELECT binding.* FROM ONLY {namespace}.registry_approved_record binding
   WHERE approved_revision=$1 AND record_kind='network_binding'
     AND record_json->>'source_system'=$2 AND record_json->>'source_id'=$3
     AND record_json->>'dataset_schema'=$4 AND record_json->>'dataset_id'=$5
@@ -168,7 +169,17 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
       AND jsonb_typeof(scope->'organization_id')='string'
       AND scope->>'organization_id' ~ '^[A-Za-z0-9.-]{{1,64}}$'
       AND jsonb_typeof(scope->'capture_sha256')='string'
-      AND scope->>'capture_sha256' ~ '^[0-9a-f]{{64}}$')
+      AND scope->>'capture_sha256' ~ '^[0-9a-f]{{64}}$') OR (
+      $6='registry-retained-normalized-fhir-v1' AND $3<>'cms-npd'
+      AND (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
+        =ARRAY['capture_sha256','insurance_plan_id','product_network_id']::text[]
+      AND jsonb_typeof(scope->'insurance_plan_id')='string'
+      AND scope->>'insurance_plan_id' ~ '^[A-Za-z0-9.-]{{1,64}}$'
+      AND jsonb_typeof(scope->'capture_sha256')='string'
+      AND scope->>'capture_sha256' ~ '^[0-9a-f]{{64}}$'
+      AND jsonb_typeof(scope->'product_network_id')='number'
+      AND scope->>'product_network_id'=record_json->>'network_id'
+      AND record_json->>'source_key'='InsurancePlan/'||(scope->>'insurance_plan_id'))
     WHEN 'aca' THEN
       (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
         =ARRAY['checksum_network','issuer_id','plan_id','plan_year','state']::text[]
@@ -195,6 +206,11 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
 ), duplicate_digests AS (
   SELECT record_json->>'binding_key' FROM approved_network_bindings
   GROUP BY record_json->>'binding_key' HAVING count(*)>1
+), product_conflicts AS (
+  SELECT network_id FROM approved_network_bindings WHERE $2='fhir' GROUP BY network_id
+  HAVING count(*) FILTER (WHERE record_json->'source_scope_json' ? 'insurance_plan_id')>1
+    OR bool_or(record_json->'source_scope_json' ? 'insurance_plan_id')
+      AND bool_or(record_json->'source_scope_json' ? 'organization_id')
 )
 SELECT count(*)::bigint AS binding_count,
   count(*) FILTER (WHERE record_json->'source_scope_json' ? 'review_type')::bigint AS published_count,
@@ -204,6 +220,7 @@ SELECT count(*)::bigint AS binding_count,
     END AS published_json,
   EXISTS(SELECT 1 FROM malformed) OR EXISTS(SELECT 1 FROM invalid_scopes) OR EXISTS(SELECT 1 FROM duplicate_keys)
     OR EXISTS(SELECT 1 FROM duplicate_scopes) OR EXISTS(SELECT 1 FROM duplicate_digests)
+    OR EXISTS(SELECT 1 FROM product_conflicts)
     OR COALESCE(bool_or(network_id IS NULL OR approved_network_key IS NULL),false) AS invalid
 FROM approved_network_bindings"""
 
@@ -234,6 +251,7 @@ async def require_retained_approved_network_source_bindings(
     *,
     control_schema=None,
     published_plan_store=None,
+    read_identity=None,
 ):
     """Validate one exact retained map after the caller verifies its serving manifest.
 
@@ -248,16 +266,18 @@ async def require_retained_approved_network_source_bindings(
         control_schema=control_schema,
         published_plan_store=published_plan_store,
         retained=True,
+        **({"read_identity": read_identity} if read_identity is not None else {}),
     )
 
 
 async def _require_network_source_bindings(
-    connection, approved_source, coordinates, *, control_schema, published_plan_store, retained
+    connection, approved_source, coordinates, *, control_schema, published_plan_store, retained, read_identity=None
 ):
     """Share complete validation; only the exact approved-map pin policy differs."""
     if (
         type(approved_source) is not ApprovedMembershipSource
         or type(coordinates) is not RegistryNetworkSourceCoordinates
+        or (read_identity is not None and not retained)
     ):
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_invalid")
     try:
@@ -266,6 +286,7 @@ async def _require_network_source_bindings(
             connection,
             approved_revision=approved_source.approved_revision,
             control_schema=control_schema,
+            **({"read_identity": read_identity} if read_identity is not None else {}),
         )
         if current != approved_source:
             raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_pin_changed")
@@ -279,7 +300,11 @@ async def _require_network_source_bindings(
             *coordinates.sql_parameters,
             _TRIM_CHARACTERS,
         )
-    except (asyncpg.PostgresError, ApprovedMembershipSourceError) as error:
+        if read_identity is not None:
+            from process.network_approved_membership_source import _verify_approved_consumption
+
+            await _verify_approved_consumption(connection, namespace, read_identity)
+    except (asyncpg.PostgresError, ApprovedMembershipSourceError, NetworkReadIdentityError) as error:
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_unavailable") from error
     if checks is None or checks["invalid"]:
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_invalid")

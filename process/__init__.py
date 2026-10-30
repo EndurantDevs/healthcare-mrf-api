@@ -20,10 +20,14 @@ except ImportError:
 _ASYNCIO_RUN = asyncio.run
 
 
-def _run(coro):
+def run_import(coro):
+    """Run an import coroutine with the supported event loop, preserving patched asyncio runners."""
     if uvloop is not None and asyncio.run is _ASYNCIO_RUN:
         return uvloop.run(coro)
     return asyncio.run(coro)
+
+
+_run = run_import
 
 
 async def _ptg_candidate_audit_startup(ctx):
@@ -2288,6 +2292,30 @@ class RegistrySourceCheck:
     queue_read_limit = 1
     queue_name = "arq:RegistrySourceCheck"
     job_timeout = 600
+    max_tries = 1
+    burst = True
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
+from process.registry_fhir_catalog_worker import (
+    fhir_catalog_sync_shutdown,
+    fhir_catalog_sync_startup,
+    registry_fhir_catalog_sync_command,
+)
+
+process_group.add_command(registry_fhir_catalog_sync_command, name="registry-fhir-catalog-sync")
+
+
+class RegistryFHIRCatalogSync:
+    functions = [control_single_job_start]
+    on_startup = fhir_catalog_sync_startup
+    on_shutdown = fhir_catalog_sync_shutdown
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:RegistryFHIRCatalogSync"
+    job_timeout = 4200
     max_tries = 1
     burst = True
     redis_settings = build_redis_settings()

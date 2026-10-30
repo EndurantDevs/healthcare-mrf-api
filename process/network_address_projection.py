@@ -115,7 +115,8 @@ async def _projection_columns(connection, address_table):
     return ",".join(expressions)
 
 
-async def _copy_projection_rows(connection, schema_name, projected_query):
+async def copy_network_address_projection_rows(connection, schema_name, projected_query):
+    """Copy a stable location-key query with bounded adaptive native COPY pages."""
     # Import at the call site: bootstrap sources reuse the pinned source DTO above.
     from process.network_bootstrap_sources import (
         _COPY_BATCH_BYTES,
@@ -158,6 +159,9 @@ async def _copy_projection_rows(connection, schema_name, projected_query):
             raise NetworkAddressProjectionError(str(error)) from error
         copied_rows += count
         last_key = bounds["last_key"]
+
+
+_copy_projection_rows = copy_network_address_projection_rows
 
 
 async def _build_projection(connection, schema_name, projection_table, address_table, membership_table, binding_table):

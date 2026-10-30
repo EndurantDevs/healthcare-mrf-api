@@ -17,6 +17,7 @@ pub mod custom_import_source;
 pub mod custom_import_source_columns;
 pub mod custom_import_source_payload;
 pub mod dedupe;
+pub mod entity_address_rows;
 pub mod fhir_network_identity;
 pub mod hashing;
 pub mod hospital_mrf;
@@ -44,6 +45,7 @@ pub mod registry_ptg_graph_python;
 pub mod registry_ptg_graph_witness;
 pub mod registry_required_target_review;
 pub mod registry_target_ledger;
+pub mod retained_fhir_capture;
 pub mod shared_graph;
 pub mod tax_identity;
 pub mod tax_identity_sidecar_bundle;
@@ -121,6 +123,8 @@ mod python_api {
     include!("python_custom_import_graph.rs");
     include!("python_custom_import_graph_projection.rs");
     include!("python_registry.rs");
+    include!("python_entity_address_rows.rs");
+    include!("python_retained_fhir_capture.rs");
 
     #[pyfunction]
     fn encode_network_membership_batch(
@@ -674,6 +678,9 @@ mod python_api {
         m.add_function(wrap_pyfunction!(canonicalize_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_location_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_contact_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(prepare_entity_address_rows, m)?)?;
+        m.add_function(wrap_pyfunction!(entity_address_rows_version, m)?)?;
+        m.add_function(wrap_pyfunction!(encode_retained_fhir_capture_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;
         m.add_function(wrap_pyfunction!(intersect_sorted_u32_py, m)?)?;
         m.add_function(wrap_pyfunction!(decode_u32_le_py, m)?)?;

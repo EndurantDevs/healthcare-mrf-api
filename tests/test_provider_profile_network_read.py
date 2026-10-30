@@ -42,7 +42,8 @@ def profile_read(monkeypatch):
         finally:
             events.append("exit")
 
-    async def pin(connection):
+    async def pin(connection, *, api_read):
+        assert api_read is True
         assert connection is driver
         events.append("manifest")
         return manifest()
@@ -235,7 +236,9 @@ async def test_directory_profile_disables_jit_once_before_scoped_aggregation(mon
     async def execute(statement, parameters=None):
         sql = str(statement)
         statements.append(sql)
-        if parameters is not None:
+        if sql == "SET LOCAL jit = off":
+            assert parameters in (None, {})
+        else:
             assert statements[0] == "SET LOCAL jit = off"
             assert sql.startswith("WITH projection AS MATERIALIZED")
             assert parameters["profile_npi"] == 1000000491

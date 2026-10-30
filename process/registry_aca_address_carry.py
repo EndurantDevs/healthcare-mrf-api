@@ -6,7 +6,9 @@ import json
 from dataclasses import dataclass
 from uuid import UUID
 
+from process.network_address_artifact import _locked_table
 from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_compact_layout import CompactAddressRelation
 from process.network_initial_source_office_bindings import _canonical_bindings, _canonical_source, _office_records
 from process.network_legacy_membership_source import ACAMembershipBatch, PinnedACAMembershipSource, _require_archive
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS
@@ -201,9 +203,43 @@ async def _bindings(connection, target_schema, encoded, *, writing):
         raise ValueError("registry_aca_address_carry_binding_conflict")
 
 
-async def _page(connection, batch, target_schema, *, writing):
+async def _copy_existing_offices(connection, batch, target_schema, existing_source):
+    """Keep selected native base rows, including enrichment, before constructing missing carriers."""
+    if type(existing_source) is not CompactAddressRelation or not connection.is_in_transaction():
+        raise ValueError("registry_aca_address_carry_existing_source_invalid")
+    physical = await _locked_table(connection, existing_source.schema_name, existing_source.table_oid)
+    if CompactAddressRelation(physical["schema_name"], physical["relname"], physical["oid"]) != existing_source:
+        raise ValueError("registry_aca_address_carry_existing_source_invalid")
+    source_relation = _identifier(existing_source.schema_name) + "." + _identifier(existing_source.table_name)
+    target_relation = _identifier(target_schema) + ".entity_address_unified"
+    summary = await connection.fetchrow(
+        f"""WITH pairs AS MATERIALIZED (
+          SELECT DISTINCT provider_id::bigint AS npi,location_id FROM jsonb_to_recordset($1::jsonb)
+          AS member(network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text)
+        ), selected AS MATERIALIZED (
+          SELECT address.* FROM pairs CROSS JOIN LATERAL (
+            SELECT address.* FROM {source_relation} address WHERE address.npi=pairs.npi
+              AND address.entity_type='npi' AND address.entity_id=pairs.npi::text
+              AND address.address_key=pairs.location_id OFFSET 0
+          ) address
+        ), bounds AS MATERIALIZED (
+          SELECT count(*)<=5000 AND coalesce(sum(octet_length(to_jsonb(selected)::text)),0)<=8388608 AS bounded
+          FROM selected
+        ), copied AS (
+          INSERT INTO {target_relation} SELECT selected.* FROM selected CROSS JOIN bounds WHERE bounds.bounded
+          ON CONFLICT(location_key) DO NOTHING RETURNING 1
+        ) SELECT bounded,(SELECT count(*) FROM copied) AS copied_rows FROM bounds""",
+        batch.input_bytes.decode(),
+    )
+    if summary["bounded"] is not True:
+        raise ValueError("registry_aca_address_carry_existing_source_bound")
+
+
+async def _page(connection, batch, target_schema, *, writing, existing_source=None):
     documents = await _source_documents(connection, batch)
     if writing:
+        if existing_source is not None:
+            await _copy_existing_offices(connection, batch, target_schema, existing_source)
         await connection.execute(_INSERT_SQL.format(target=_identifier(target_schema)), _canonical(documents).decode())
     records = await _office_records(
         connection, batch, PinnedAddressSource(target_schema, "entity_address_unified", "aca-carry")
@@ -225,8 +261,16 @@ async def _page(connection, batch, target_schema, *, writing):
 
 
 async def _stream_recipe(
-    connection, recipe, approved, control_schema, target_schema, writing, digest, aca_reads_by_oid=None
+    connection,
+    recipe,
+    approved,
+    control_schema,
+    destination,
+    digest,
+    aca_reads_by_oid=None,
 ):
+    """Stream validated ACA pages into the same destination and ordered carry digest."""
+    target_schema, writing, existing_source = destination
     from process.registry_source_recipe_composition import _read_recipe_page, _require_recipe_custody
 
     verified = await _require_recipe_custody(
@@ -240,32 +284,7 @@ async def _stream_recipe(
         batch, next_cursor, limit = await _read_recipe_page(
             connection, recipe, approved, cursor, control_schema, limit, verified
         )
-        if (
-            type(batch) is not ACAMembershipBatch
-            or batch.source != recipe.source_pin
-            or batch.approved_source != approved
-            or batch.binding_coordinates != recipe.binding_coordinates
-            or batch.approved_only is not True
-            or any(
-                type(count) is not int or count < 0
-                for count in (
-                    batch.source_rows,
-                    batch.membership_rows,
-                    batch.accepted_source_rows,
-                    batch.omitted_source_rows,
-                )
-            )
-            or not 0 <= batch.source_rows <= limit <= 1000
-            or batch.membership_rows > MAX_ROWS
-            or batch.unresolved_rows
-            or batch.unresolved_source_rows
-            or batch.complete_raw_facts is not True
-            or hashlib.sha256(batch.input_bytes).hexdigest() != batch.input_sha256
-            or len(batch.input_bytes) > MAX_INPUT_BYTES
-            or batch.source_rows != batch.accepted_source_rows + batch.omitted_source_rows
-            or (generation is not None and generation != batch.generation_id)
-        ):
-            raise ValueError("registry_aca_address_carry_accounting_invalid")
+        _require_carry_batch(batch, recipe, approved, limit, generation)
         generation = batch.generation_id
         if not batch.source_rows:
             if batch.membership_rows or batch.input_bytes != b"[]":
@@ -273,7 +292,8 @@ async def _stream_recipe(
             return pages, office_rows
         if next_cursor is None or next_cursor == cursor:
             raise ValueError("registry_aca_address_carry_cursor_invalid")
-        document, row_count = await _page(connection, batch, target_schema, writing=writing)
+        source_options = {} if existing_source is None else {"existing_source": existing_source}
+        document, row_count = await _page(connection, batch, target_schema, writing=writing, **source_options)
         encoded = _canonical(document)
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
@@ -282,7 +302,17 @@ async def _stream_recipe(
         cursor = next_cursor
 
 
-async def prepare_aca_address_carry(connection, recipes, approved, control_schema, target_schema, *, writing=False):
+async def prepare_aca_address_carry(
+    connection,
+    recipes,
+    approved,
+    control_schema,
+    target_schema,
+    *,
+    writing=False,
+    existing_source=None,
+    inventory=False,
+):
     """Read immutable source pages; only the explicit pre-freeze path adds offices.
 
     The caller owns the repeatable transaction and native candidate custody.
@@ -294,20 +324,67 @@ async def prepare_aca_address_carry(connection, recipes, approved, control_schem
     from process.registry_source_recipe_store import canonical_registry_source_recipes, decode_registry_source_recipes
 
     _identifier(target_schema)
-    canonical = canonical_registry_source_recipes(recipes)
-    recipes = decode_registry_source_recipes(canonical)
+    if type(inventory) is not bool:
+        raise ValueError("registry_aca_address_carry_inventory_invalid")
+    if inventory:
+        from process.registry_source_inventory_preparation import SourceInventoryPreparation
+
+        recipes = SourceInventoryPreparation(recipes).recipes
+    else:
+        canonical = canonical_registry_source_recipes(recipes)
+        recipes = decode_registry_source_recipes(canonical)
     selected_recipes = tuple(recipe for recipe in recipes if type(recipe.source_pin) is PinnedACAMembershipSource)
     if not selected_recipes:
         return RegistryACAAddressCarry()
-    digest = hashlib.sha256(canonical_registry_source_recipes(selected_recipes).encode())
+    if inventory:
+        from process.registry_source_recipe_store import _source_inventory_recipe_digest
+
+        digest = _source_inventory_recipe_digest(selected_recipes)
+    else:
+        digest = hashlib.sha256(canonical_registry_source_recipes(selected_recipes).encode())
     digest.update(_canonical({"approved_generation": approved.generation_id}))
     pages = office_rows = 0
     aca_reads_by_oid = {}
     for recipe in selected_recipes:
         page_count, row_count = await _stream_recipe(
-            connection, recipe, approved, control_schema, target_schema, writing, digest, aca_reads_by_oid
+            connection,
+            recipe,
+            approved,
+            control_schema,
+            (target_schema, writing, existing_source),
+            digest,
+            aca_reads_by_oid,
         )
         pages += page_count
         office_rows += row_count
     digest.update(_canonical({"pages": pages, "rows": office_rows}))
     return RegistryACAAddressCarry(digest.hexdigest(), pages, office_rows)
+
+
+def _require_carry_batch(batch, recipe, approved, limit, generation):
+    if (
+        type(batch) is not ACAMembershipBatch
+        or batch.source != recipe.source_pin
+        or batch.approved_source != approved
+        or batch.binding_coordinates != recipe.binding_coordinates
+        or batch.approved_only is not True
+        or any(
+            type(count) is not int or count < 0
+            for count in (
+                batch.source_rows,
+                batch.membership_rows,
+                batch.accepted_source_rows,
+                batch.omitted_source_rows,
+            )
+        )
+        or not 0 <= batch.source_rows <= limit <= 1000
+        or batch.membership_rows > MAX_ROWS
+        or batch.unresolved_rows
+        or batch.unresolved_source_rows
+        or batch.complete_raw_facts is not True
+        or hashlib.sha256(batch.input_bytes).hexdigest() != batch.input_sha256
+        or len(batch.input_bytes) > MAX_INPUT_BYTES
+        or batch.source_rows != batch.accepted_source_rows + batch.omitted_source_rows
+        or (generation is not None and generation != batch.generation_id)
+    ):
+        raise ValueError("registry_aca_address_carry_accounting_invalid")

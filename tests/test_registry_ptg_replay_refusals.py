@@ -89,7 +89,10 @@ async def test_durable_ptg_replay_refuses_changed_identity_without_publication(m
     publication = AsyncMock(wraps=consumer.prepare_and_publish_network_candidate)
     monkeypatch.setattr(consumer, "prepare_and_publish_network_candidate", publication)
 
-    with pytest.raises(ValueError, match="registry_ptg_source_consumer_invalid"):
+    refusal = (
+        "registry_source_inventory_metadata_invalid" if fault == "recipe" else "registry_ptg_source_consumer_invalid"
+    )
+    with pytest.raises(ValueError, match=refusal):
         await consumer._replay(connection, event_by_name, selected, config())
 
     publication.assert_not_awaited()

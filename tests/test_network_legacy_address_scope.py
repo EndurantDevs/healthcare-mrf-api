@@ -15,6 +15,7 @@ from api import network_address_scope as scope
 from db.models import EntityAddressUnified
 from process import network_serving_read
 from process.network_serving_read import PinnedNetworkServingManifest
+from tests.network_read_execution_support import mock_approved_control_metadata, with_read_identity_receipts
 
 MANIFEST = PinnedNetworkServingManifest(
     7,
@@ -35,9 +36,14 @@ def request(checksums=None, *, query="network_ids=42&network_generation=7", auth
     if checksums is not None:
         headers["X-Network-Legacy-Checksums"] = checksums
     driver = SimpleNamespace(fetchrow=AsyncMock(return_value={"complete": True, "network_ids": [42]}))
-    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
-    session = SimpleNamespace(execute=AsyncMock(), connection=AsyncMock(return_value=connection))
+    session = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()), driver=driver)
+    driver.native = session.connection.return_value.get_raw_connection.return_value.driver_connection
     return SimpleNamespace(headers=headers, query_string=query, ctx=SimpleNamespace(sa_session=session)), driver
+
+
+@pytest.fixture(autouse=True)
+def approved_metadata(monkeypatch):
+    mock_approved_control_metadata(monkeypatch)
 
 
 def test_legacy_predicate_keeps_authorization_but_does_not_require_canonical_office_coverage():
@@ -120,7 +126,7 @@ async def test_verified_header_is_exact_pinned_scope_and_acknowledged(monkeypatc
     assert result.headers.get("X-Network-Legacy-Checksums") == checksums
     assert result.headers["X-Network-Generation"] == "7"
     assert scope.current_network_address_scope() is None
-    pin.assert_awaited_once_with(driver, generation_id=7)
+    pin.assert_awaited_once_with(driver.native, generation_id=7, api_read=True)
     assert driver.fetchrow.await_count == int(checksums is not None)
 
 
@@ -145,7 +151,7 @@ async def test_nested_batch_read_reuses_the_outer_legacy_scope(monkeypatch):
     result = await batch(incoming)
     assert result.headers["X-Network-Generation"] == "7"
     assert result.headers["X-Network-Legacy-Checksums"] == "42"
-    pin.assert_awaited_once_with(driver, generation_id=7)
+    pin.assert_awaited_once_with(driver.native, generation_id=7, api_read=True)
     assert driver.fetchrow.await_count == 1
     assert scope.current_network_address_scope() is None
 

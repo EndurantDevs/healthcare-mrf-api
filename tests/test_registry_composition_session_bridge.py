@@ -120,8 +120,8 @@ def _bridge_owner(monkeypatch, failure=None):
 def _preparation(monkeypatch, driver, events, failure=None):
     """Keep socket-free source and command stages aligned with the preparation contract."""
     approved = SimpleNamespace(approved_revision=3, generation_id="a" * 64, total_rows=0)
-    artifact = SimpleNamespace(address_source=object(), generation_sha256="b" * 64)
-    stage = SimpleNamespace(table_name="synthetic_stage", office_matches=None)
+    artifact = SimpleNamespace(address_source=object(), generation_sha256="b" * 64, runtime_roles=())
+    stage = composition.RegistrySourceRecipeStage("synthetic_stage", 0, 0, "c" * 64)
     commands = SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals")
     retention_by_name = {
         "component": "registry_source_retention",
@@ -159,9 +159,14 @@ def _preparation(monkeypatch, driver, events, failure=None):
         return driver.candidate_record
 
     monkeypatch.setattr(composition, "pin_approved_membership_source", pin)
-    monkeypatch.setattr(composition, "_composition_sources_with_reads", AsyncMock(return_value=({}, 0, (), stage)))
+    monkeypatch.setattr(composition, "resolve_registered_source_inventory", AsyncMock(return_value=None))
+    monkeypatch.setattr(composition, "resolve_registered_office_summary_revision", AsyncMock(return_value=None))
+    monkeypatch.setattr(composition, "require_registered_composition_target", AsyncMock())
+    monkeypatch.setattr(
+        composition, "_prepare_composition_sources_for_format", AsyncMock(return_value=(({}, 0, (), stage), None))
+    )
     monkeypatch.setattr(composition, "_composition_retention", AsyncMock(return_value=(commands, retention_by_name)))
-    monkeypatch.setattr(composition, "_composition_artifact_with_reads", AsyncMock(return_value=(artifact, None)))
+    monkeypatch.setattr(composition, "_composition_artifact", AsyncMock(return_value=(artifact, None)))
     monkeypatch.setattr(composition, "create_network_candidate", create)
     monkeypatch.setattr(composition, "_bindings", AsyncMock())
     monkeypatch.setattr(composition, "_record_source_receipts", AsyncMock())
@@ -232,7 +237,7 @@ async def test_copy_error_keeps_priority_over_stage_cleanup(monkeypatch, failure
         target,
         object(),
         "open",
-        SimpleNamespace(table_name="synthetic_stage"),
+        composition.RegistrySourceRecipeStage("synthetic_stage", 0, 0, "c" * 64),
         SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals"),
         _arguments()["writer_roles"],
     )
@@ -262,7 +267,7 @@ async def test_raw_caller_keeps_original_owned_preparation_and_completion(monkey
         copy_target,
         object(),
         "sealed",
-        SimpleNamespace(table_name="synthetic_stage"),
+        composition.RegistrySourceRecipeStage("synthetic_stage", 0, 0, "c" * 64),
         SimpleNamespace(add_table="synthetic_adds", remove_table="synthetic_removals"),
         _arguments()["writer_roles"],
     )
@@ -331,7 +336,7 @@ async def test_terminal_composition_uses_verified_custody_without_resealing(monk
         copy_target,
         object(),
         state,
-        SimpleNamespace(table_name="source_stage"),
+        composition.RegistrySourceRecipeStage("source_stage", 0, 0, "c" * 64),
         SimpleNamespace(add_table="adds", remove_table="removes"),
         _arguments()["writer_roles"],
     )
@@ -375,7 +380,7 @@ async def test_terminal_legacy_replay_uses_real_missing_custody_boundary(monkeyp
         fetchrow=AsyncMock(side_effect=[_candidate_record(copy_target, state), None]),
         execute=AsyncMock(),
     )
-    source_stage = SimpleNamespace(table_name="source_stage")
+    source_stage = composition.RegistrySourceRecipeStage("source_stage", 0, 0, "c" * 64)
     commands = SimpleNamespace(add_table="adds", remove_table="removes")
     prepared = (copy_target, object(), state, source_stage, commands, _arguments()["writer_roles"])
     seal, legacy = AsyncMock(), AsyncMock()

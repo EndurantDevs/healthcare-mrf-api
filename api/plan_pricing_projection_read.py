@@ -124,12 +124,14 @@ def _projection_radius(args: Mapping[str, Any], zip5: str) -> float:
 def _center_query(
     args: Mapping[str, Any],
     zip5: str,
+    *,
+    api_read=False,
 ) -> tuple[str, dict[str, Any]]:
     if zip5:
         return (
             f"""
             SELECT latitude, longitude
-              FROM {table("geo_zip_lookup")}
+              FROM {("ONLY " if api_read else "") + table("geo_zip_lookup")}
              WHERE zip_code = :zip5
             """,
             {"zip5": zip5},
@@ -151,14 +153,14 @@ def _center_query(
     )
 
 
-def _radius_cells_sql(center_sql: str) -> str:
+def _radius_cells_sql(center_sql: str, *, api_read=False) -> str:
     return f"""
         WITH center AS MATERIALIZED ({center_sql})
         SELECT cells.zip_code
           FROM center
           CROSS JOIN LATERAL (
               SELECT zip_code
-                FROM {table("geo_zip_lookup")} candidate
+                FROM {("ONLY " if api_read else "") + table("geo_zip_lookup")} candidate
                WHERE candidate.latitude BETWEEN center.latitude - :radius / 69.0
                          AND center.latitude + :radius / 69.0
                  AND candidate.longitude BETWEEN center.longitude - :radius / (
@@ -196,9 +198,14 @@ async def geo_cells(
     args: Mapping[str, Any],
     *,
     result_type: str,
+    api_read=False,
 ) -> list[str]:
     """Resolve exact or radius-bounded ZIP cells without inventing matches."""
 
+    from api.ptg2_code_scope import is_source_api_reader
+
+    if type(api_read) is not bool or api_read and not is_source_api_reader(session):
+        raise PlanPricingProjectionUnavailable("geo cell API read mode is invalid")
     zip5 = str(args.get("zip5") or args.get("zip") or "").strip()
     city = str(args.get("city") or "").strip().lower()
     state = str(args.get("state") or "").strip().upper()
@@ -209,9 +216,10 @@ async def geo_cells(
         raise PlanPricingProjectionUnsupported("card projection requires a valid ZIP5")
     if zip5 and radius <= 0:
         return [zip5]
-    center_sql, center_parameters_by_name = _center_query(args, zip5)
+    options = {"api_read": True} if api_read else {}
+    center_sql, center_parameters_by_name = _center_query(args, zip5, **options)
     cell_result = await session.execute(
-        text(_radius_cells_sql(center_sql)),
+        text(_radius_cells_sql(center_sql, **options)),
         {
             **center_parameters_by_name,
             "radius": radius,
@@ -411,13 +419,19 @@ def _page_response(
 
 async def _projection_page_response(session, request, args, pagination, contributing_bindings, selection):
     """Keep attributed reads and full-pack fallback within the same policy decision."""
+    capability = current_code_projection()
+    options_by_name = {}
+    if capability is not None and getattr(capability, "api_read", False):
+        from api.plan_pricing_code_build import _CodeAPISetup
+
+        session = _CodeAPISetup(session)
+        options_by_name["api_read"] = True
     try:
-        selected_geo_cells = await geo_cells(session, args, result_type=request.result_type)
+        selected_geo_cells = await geo_cells(session, args, result_type=request.result_type, **options_by_name)
     except PlanPricingProjectionUnsupported:
         if contributing_bindings is None and request.result_type == "rate_aggregates":
             return None
         raise
-    capability = current_code_projection()
     if capability is not None and "scope" in capability.identity:
         if sorted(set(selected_geo_cells)) != capability.identity["scope"]["geo_cells"]:
             raise PlanPricingProjectionUnavailable("the complete ZIP aggregate scope changed")

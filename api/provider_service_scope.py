@@ -11,6 +11,7 @@ from sqlalchemy import Float, String, and_, case, cast, column, func, literal, o
 
 from api.custom_import_provider_service_sql import ProviderServiceImportQuery
 from api.network_address_scope import current_network_address_scope, scoped_address_parameters
+from api.network_read_execution import execute_network_read
 
 
 def _canonical_network_procedure_clause(
@@ -75,7 +76,8 @@ def _reject_resolver_only_procedure_search_params(args) -> None:
 
 async def _canonical_procedure_zip_anchor(session, zip5):
     """Use the same first-ZIP ZCTA point as the nearby selected-office query."""
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text("select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"),
         {"zip_code": zip5},
     )
@@ -231,7 +233,7 @@ async def _canonical_procedure_locations(session, provider_items, location_filte
     locations = _procedure_office_rows(
         scope, [provider_item["npi"] for provider_item in provider_items], location_filter
     )
-    office_records = (await session.execute(_procedure_office_query(scope, locations))).scalar()
+    office_records = (await execute_network_read(session, _procedure_office_query(scope, locations))).scalar()
     if not isinstance(office_records, list):
         raise ServiceUnavailable("Complete selected-office evidence is unavailable.")
     by_npi = {}
