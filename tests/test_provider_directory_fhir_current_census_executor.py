@@ -426,7 +426,8 @@ async def test_census_source_fetch_uses_pinned_no_redirect_transport(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_direct_retry_enables_terminal_census_checkpoint_restart(monkeypatch):
+@pytest.mark.parametrize("allow_reset", [False, True])
+async def test_direct_retry_enables_terminal_census_checkpoint_restart(monkeypatch, allow_reset):
     context = importer.PaginationCheckpointContext(
         canonical_api_base=BASE,
         source_scope_hash="a" * 64,
@@ -435,6 +436,7 @@ async def test_direct_retry_enables_terminal_census_checkpoint_restart(monkeypat
         acquisition_root_run_id="root-run",
         retry_of_run_id="failed-run",
         dataset_id="dataset-1",
+        allow_retained_pagination_reset=allow_reset,
     )
     load_checkpoint = AsyncMock(side_effect=RuntimeError("stop-after-checkpoint-options"))
     monkeypatch.setattr(
@@ -458,7 +460,7 @@ async def test_direct_retry_enables_terminal_census_checkpoint_restart(monkeypat
             pagination_checkpoint=context,
         )
 
-    assert load_checkpoint.await_args.kwargs == {"allow_terminal_census_restart": True}
+    assert load_checkpoint.await_args.kwargs == {"allow_terminal_census_restart": allow_reset}
 
 
 @pytest.mark.asyncio

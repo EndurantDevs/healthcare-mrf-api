@@ -160,7 +160,7 @@ async def fence_checkpoint_dataset_parents(publisher, dataset_ids, root_run_ids)
     parents = await publisher.connection.fetch(
         f"SELECT dataset_id,status,acquisition_root_run_id FROM {storage_relation(publisher.policy.schema, HEADER)} "
         "WHERE dataset_id=ANY($1::varchar[]) OR acquisition_root_run_id=ANY($2::varchar[]) "
-        'ORDER BY dataset_id COLLATE "C" FOR SHARE',
+        'ORDER BY dataset_id COLLATE "C" FOR KEY SHARE',
         dataset_ids,
         root_run_ids,
     )

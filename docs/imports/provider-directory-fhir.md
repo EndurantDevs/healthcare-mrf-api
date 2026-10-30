@@ -1412,11 +1412,12 @@ checkpoint resumes on the sequential path.
 
 Resource-cursor concurrency is opt-in. Set
 `HLTHPRT_PROVIDER_DIRECTORY_RESOURCE_SCAN_CONCURRENCY=2` (or pass
-`resource_scan_concurrency=2`). Accepted values are `1` through `3`; the default
+`resource_scan_concurrency=2`). Accepted values are `1` through `8`; the default
 request value remains `1`. Optional source metadata
 `provider_directory_resource_scan_concurrency` may lower the requested cap.
-The effective value is limited to two writers for isolated Source storage;
-ordinary storage requires one spare database connection. No new source
+Isolated Source storage retains its existing two-connection write pool while
+resource downloads overlap; ordinary storage requires one spare database
+connection. No new source
 enrollment or catalog edit is required to use the existing request option.
 
 The importer falls back to `1` unless the scan is anonymous, keepalive-backed,
@@ -1428,6 +1429,14 @@ parallel REST acquisition. Dependency-ready collections start largest first,
 using the previous published snapshot's resource counts as estimates. Unknown
 sizes keep their existing relative order; the role collection remains a serial
 tail. Counts influence scheduling only, never completion or validation.
+
+Request concurrency starts at the configured transport allowance. A throttling
+or unavailable response (`429`, `503`, `504`), or a transport timeout, halves
+that origin's allowance down to one, without resetting or restarting any
+resource cursor. Valid `Retry-After` deadlines delay subsequent requests.
+Already active requests finish before the lower allowance admits another send.
+The reduced allowance lasts for the transport's lifetime. Source aliases on the
+same origin share it; other origins retain their own allowance.
 
 Each collection retains its own sequential server-issued cursor. For sources
 already qualified for complete last-updated partitions, up to two independent
@@ -1444,6 +1453,15 @@ still govern concurrent imports. Progress records requested/effective resource
 concurrency. Set the value back to `1` for subsequent workers to restore serial
 acquisition; do not restart active imports just to change this setting.
 Checkpoint identities and formats remain unchanged.
+
+Set `allow_retained_pagination_reset=false` to preserve downloaded pages when a
+continuation would require restarting its collection. The importer refuses that
+restart and retains the existing checkpoint. The retry endpoint inherits the
+setting and cannot enable resets for the same acquisition root. Direct create
+requests reusing that parent or root must also explicitly keep the value false;
+omission or true is refused. Fresh requests without this field keep their
+previous behavior. This setting does not renew vendor cursors or establish
+collection completeness.
 
 If resource rows were imported before canonical resource storage was enabled,
 populate the canonical resource and source-edge tables from existing

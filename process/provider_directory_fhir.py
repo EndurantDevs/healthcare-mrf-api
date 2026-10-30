@@ -450,6 +450,9 @@ from process.provider_directory_time_partition import (
     parse_utc_instant,
     run_partition_passes,
 )
+from process.provider_directory_time_partition import (
+    mark_partition_page_fetched as _mark_partition_page_fetched,
+)
 from process.provider_directory_validated_publication_contract import (
     AUTOMATIC_GENERIC_ADMISSION_PUBLICATION_POLICY,
     AUTOMATIC_GENERIC_BOOTSTRAP_PUBLICATION_POLICY,
@@ -48876,6 +48879,7 @@ def _should_restart_expired_pagination_checkpoint(
     has_restart_attempted: bool,
     is_current_version_census: bool = False,
     allow_current_version_census_restart: bool = False,
+    allow_retained_pagination_reset: bool = True,
 ) -> bool:
     """Re-enumerate one unusable resumed collection without accepting partial data."""
     is_cigna_outcome = (
@@ -48887,7 +48891,8 @@ def _should_restart_expired_pagination_checkpoint(
         status_code == 403 and _is_humana_continuation_token_url(request_url)
     )
     return bool(
-        (not is_current_version_census or allow_current_version_census_restart)
+        allow_retained_pagination_reset
+        and (not is_current_version_census or allow_current_version_census_restart)
         and resume_state
         and resume_state.resumed
         and not has_restart_attempted
@@ -48897,24 +48902,11 @@ def _should_restart_expired_pagination_checkpoint(
     )
 
 
-def _can_restart_terminal_census_checkpoint(
-    checkpoint: dict[str, Any],
-    context: PaginationCheckpointContext,
-) -> bool:
-    """Allow one direct retry to replace a terminally drifted resource slice."""
+def _can_restart_terminal_census_checkpoint(checkpoint: dict[str, Any], context: PaginationCheckpointContext) -> bool:
+    """Apply the shared terminal-census retry contract through the existing facade."""
+    from process.provider_directory_fhir_census_contract import can_restart_terminal_census_checkpoint
 
-    completeness = _json_object(checkpoint.get("completeness_json"))
-    return bool(
-        context.retry_of_run_id
-        and context.lineage_verified
-        and context.dataset_id
-        and _has_matching_pagination_checkpoint_identity(checkpoint, context)
-        and checkpoint.get("state") == PAGINATION_CHECKPOINT_ACTIVE
-        and not _clean_text(checkpoint.get("next_url"))
-        and int(checkpoint.get("pages_processed") or 0) > 0
-        and int(checkpoint.get("rows_processed") or 0) > 0
-        and completeness.get("failure") == "census_drift"
-    )
+    return can_restart_terminal_census_checkpoint(sys.modules[__name__], checkpoint, context)
 
 
 async def _mark_partition_fetch_error(
@@ -48924,11 +48916,6 @@ async def _mark_partition_fetch_error(
     async with state.state_lock:
         state.partition_error_count += 1
         state.error_message = f"partition_errors_{state.partition_error_count}_last_{current_error}"
-
-
-async def _mark_partition_page_fetched(state: PartitionFetchState) -> None:
-    async with state.state_lock:
-        state.page_count += 1
 
 
 async def _consume_partition_entries(
@@ -53626,7 +53613,7 @@ async def _fetch_resource_rows(
                 checkpoint_context,
                 resource_type,
                 checkpoint_start_url,
-                allow_terminal_census_restart=True,
+                allow_terminal_census_restart=checkpoint_context.allow_retained_pagination_reset,
             )
         else:
             resume_state = await _load_or_initialize_pagination_checkpoint(
@@ -54102,6 +54089,7 @@ async def _fetch_resource_rows(
                         request_url=url,
                         resume_state=resume_state,
                         has_restart_attempted=has_restart_attempted,
+                        allow_retained_pagination_reset=checkpoint_context.allow_retained_pagination_reset,
                         is_current_version_census=(is_current_version_census_enabled),
                         allow_current_version_census_restart=bool(
                             checkpoint_context.retry_of_run_id
@@ -57815,7 +57803,6 @@ def _effective_resource_scan_concurrency(
     requested = min(
         _validated_resource_scan_concurrency(options.requested_concurrency),
         _source_resource_scan_concurrency(source_record),
-        2 if is_source_storage_required() else MAX_RESOURCE_SCAN_CONCURRENCY,
     )
     source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     checkpoint_context = source_record.get("_pagination_checkpoint_context")
@@ -58803,6 +58790,7 @@ def _pagination_checkpoint_context(
     retry_of_run_id: str | None,
     pagination_root_run_id: str | None = None,
     restart_expired_current_census_slice: bool = True,
+    allow_retained_pagination_reset: bool = True,
 ) -> PaginationCheckpointContext | None:
     """Build the durable acquisition identity for one checkpointed source group."""
     scope_identity = _pagination_checkpoint_scope_identity(source_record, source_ids)
@@ -58822,6 +58810,7 @@ def _pagination_checkpoint_context(
         retry_of_run_id=retry_of_run_id,
         acquisition_root_run_id=acquisition_root_run_id,
         restart_expired_current_census_slice=restart_expired_current_census_slice,
+        allow_retained_pagination_reset=allow_retained_pagination_reset,
     )
 
 
@@ -66904,6 +66893,7 @@ async def _prepare_resource_import_source_group(
     pagination_root_run_id: str | None,
     is_checkpointing_enabled: bool,
     restart_expired_current_census_slice: bool = True,
+    allow_retained_pagination_reset: bool = True,
 ) -> tuple[list[dict[str, Any]], EndpointDatasetCandidate | None]:
     checkpoint_context = _resource_group_pagination_checkpoint_context(
         source_records,
@@ -66912,6 +66902,7 @@ async def _prepare_resource_import_source_group(
         pagination_root_run_id=pagination_root_run_id,
         is_checkpointing_enabled=is_checkpointing_enabled,
         restart_expired_current_census_slice=restart_expired_current_census_slice,
+        allow_retained_pagination_reset=allow_retained_pagination_reset,
     )
     dataset_resources = _endpoint_dataset_selected_resources(source_records, resources)
     candidate = await _prepare_endpoint_dataset_candidate(
@@ -66950,6 +66941,7 @@ def _resource_group_pagination_checkpoint_context(
     pagination_root_run_id: str | None,
     is_checkpointing_enabled: bool,
     restart_expired_current_census_slice: bool = True,
+    allow_retained_pagination_reset: bool = True,
 ) -> PaginationCheckpointContext | None:
     if not is_checkpointing_enabled:
         return None
@@ -66965,6 +66957,7 @@ def _resource_group_pagination_checkpoint_context(
         retry_of_run_id=retry_of_run_id,
         pagination_root_run_id=pagination_root_run_id,
         restart_expired_current_census_slice=restart_expired_current_census_slice,
+        allow_retained_pagination_reset=allow_retained_pagination_reset,
     )
 
 
@@ -67908,6 +67901,7 @@ async def _import_resources(
     provider_directory_endpoint_scope: str | None = None,
     require_complete_resources: bool = False,
     restart_expired_current_census_slice: bool = True,
+    allow_retained_pagination_reset: bool = True,
 ) -> dict[str, int]:
     """Import resources into the provider-directory snapshot."""
     from process.provider_directory_generic_source_completion import record_candidate_handoff
@@ -68522,6 +68516,7 @@ async def _import_resources(
             pagination_root_run_id=pagination_root_run_id,
             is_checkpointing_enabled=is_pagination_checkpointing_enabled,
             restart_expired_current_census_slice=restart_expired_current_census_slice,
+            allow_retained_pagination_reset=allow_retained_pagination_reset,
         )
         prepared_source_lists[0] = prepared_source_records
         if _is_finalized_endpoint_dataset_candidate(candidate):
@@ -68579,6 +68574,7 @@ async def _import_resources(
                     pagination_root_run_id=pagination_root_run_id,
                     is_checkpointing_enabled=is_pagination_checkpointing_enabled,
                     restart_expired_current_census_slice=restart_expired_current_census_slice,
+                    allow_retained_pagination_reset=allow_retained_pagination_reset,
                 )
                 async with _pagination_checkpoint_worker_guard(checkpoint_guard_context) as guard_lease:
                     return await run_guarded_group(
@@ -69859,6 +69855,7 @@ async def process_provider_directory_fhir_data(
         "restart_expired_current_census_slice",
         True,
     )
+    allow_retained_pagination_reset = task.get("allow_retained_pagination_reset", True)
     endpoint_scope_input = _clean_text(task.get("provider_directory_endpoint_scope"))
     provider_directory_endpoint_scope = endpoint_scope_input.rstrip("/") if endpoint_scope_input else None
     requested_source_ids, has_explicit_source_scope = _provider_directory_artifact_publication_source_scope(
@@ -70356,6 +70353,7 @@ async def process_provider_directory_fhir_data(
             "retry_of_run_id": retry_of_run_id,
             "provider_directory_pagination_root_run_id": pagination_root_run_id,
             "restart_expired_current_census_slice": (restart_expired_current_census_slice),
+            "allow_retained_pagination_reset": allow_retained_pagination_reset,
             "provider_directory_endpoint_scope": provider_directory_endpoint_scope,
             "credential_config_file_configured": bool(credential_config_file),
             "current_version_census_identity": (census_contract.identity() if census_contract is not None else None),
@@ -70528,6 +70526,7 @@ async def process_provider_directory_fhir_data(
                     provider_directory_endpoint_scope=provider_directory_endpoint_scope,
                     require_complete_resources=(full_refresh and resource_limit <= 0 and page_limit <= 0),
                     restart_expired_current_census_slice=(restart_expired_current_census_slice),
+                    allow_retained_pagination_reset=allow_retained_pagination_reset,
                 )
             if retry_not_before_by_resource:
                 metrics_by_key["provider_directory_retry_not_before_by_resource"] = dict(
@@ -70701,6 +70700,7 @@ class _ProviderDirectoryFhirCommandOptions:
     retry_of_run_id: str | None = None
     provider_directory_pagination_root_run_id: str | None = None
     restart_expired_current_census_slice: bool = True
+    allow_retained_pagination_reset: bool = True
     provider_directory_acquisition_strategy: str | None = None
     provider_directory_census_cutoff: str | None = None
     source_ids: list[str] | tuple[str, ...] | str | None = None
