@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.test_plan_release_serving import PLAN_RELEASE_ID, _binding_row, _Session
+from tests.test_plan_release_serving import (
+    PLAN_RELEASE_ID,
+    _binding_row,
+    _network_binding,
+    _release_selection,
+    _Session,
+)
 from tests.test_pricing_api import make_request, pricing_module
 
 
@@ -121,4 +127,68 @@ async def test_cost_ordered_office_visit_refuses_before_projection_resolution(mo
     assert "plan_pricing_projection_candidate" not in session.calls[1][0]
     assert "plan_pricing_projection_candidate" not in session.calls[2][0]
     resolver.assert_not_awaited()
+    search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_state", ["ready", "absent"])
+async def test_exact_npi_keeps_full_resolution_without_broad_guard_lookup(monkeypatch, binding_state):
+    session = _Session([])
+    selected = _release_selection(_network_binding(0, "ptg2:release-old", "source-a"))
+    resolver = AsyncMock(return_value=selected if binding_state == "ready" else None)
+    guard = AsyncMock(side_effect=AssertionError("exact NPI does not need broad expansion metadata"))
+    monkeypatch.setattr(pricing_module, "resolve_plan_release_serving", resolver)
+    monkeypatch.setattr(pricing_module, "resolve_plan_release_guard_selection", guard)
+    search = _install_search(monkeypatch)
+    if binding_state == "absent":
+        search.return_value = None
+    request = make_request(
+        [],
+        args=_distance_args(
+            code="99213",
+            view="full",
+            npi="1234567890",
+            taxonomy_codes="207Q00000X",
+            limit="1",
+            include_allowed_amounts="false",
+        ),
+    )
+    request.ctx.sa_session = session
+
+    response = await pricing_module.list_providers_by_procedure(request)
+
+    assert response.status == 200
+    guard.assert_not_awaited()
+    resolver.assert_awaited_once_with(session, PLAN_RELEASE_ID, projection_only=False)
+    search.assert_awaited_once()
+    query = search.await_args.args[1]
+    assert query["npi"] == 1234567890
+    assert query["code"] == "99213"
+    assert query["taxonomy_codes"] == "207Q00000X"
+    selection = search.await_args.kwargs["release_selection"]
+    if binding_state == "ready":
+        assert selection is selected
+        assert selection.in_network_bindings[0].plan_market_type == "group"
+    else:
+        assert selection is None
+        body = json.loads(response.body)
+        assert body["query"]["status"] == "no_route"
+        assert body["resolved"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("npi", ["bad", "0", "-1"])
+async def test_invalid_exact_npi_refuses_before_release_resolution(monkeypatch, npi):
+    resolver = AsyncMock()
+    guard = AsyncMock()
+    monkeypatch.setattr(pricing_module, "resolve_plan_release_serving", resolver)
+    monkeypatch.setattr(pricing_module, "resolve_plan_release_guard_selection", guard)
+    search = _install_search(monkeypatch)
+    request = make_request([], args=_distance_args(code="99213", view="full", npi=npi))
+
+    with pytest.raises(pricing_module.InvalidUsage, match="npi"):
+        await pricing_module.list_providers_by_procedure(request)
+
+    resolver.assert_not_awaited()
+    guard.assert_not_awaited()
     search.assert_not_awaited()
