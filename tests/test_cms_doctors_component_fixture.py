@@ -4,6 +4,8 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager, nullcontext
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.engine import make_url
@@ -118,3 +120,47 @@ def test_doctors_modules_register_the_shared_module_template():
         assert module.doctors_component_template is doctors.doctors_component_template
         mark = module.pytestmark
         assert mark.name == "usefixtures" and mark.args == ("doctors_component_template",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase,failure",
+    [("body", None), ("body", RuntimeError), ("body", asyncio.CancelledError), ("cleanup", RuntimeError)],
+)
+async def test_staged_groups_uses_the_owning_component_cleanup(monkeypatch, phase, failure):
+    from process import provider_directory_generic_source_policy as policy
+    from tests import test_cms_doctors_organizations_postgres as groups
+
+    events = []
+    factory = SimpleNamespace(transaction=AsyncMock())
+
+    @asynccontextmanager
+    async def component(_monkeypatch):
+        async with policy.bind_generic_source_transaction_factory(factory):
+            events.append("open")
+            try:
+                yield SimpleNamespace(database=object())
+            finally:
+                events.extend(("readers_closed", "owned_database_removed"))
+                if phase == "cleanup":
+                    raise failure("synthetic interruption")
+
+    staged = SimpleNamespace(ctx={}, schema="synthetic", import_date="synthetic")
+    discard = AsyncMock(side_effect=AssertionError("producer cleanup preceded reader closure"))
+    monkeypatch.setattr(groups, "_component", component)
+    monkeypatch.setattr(groups, "_stage_rows", AsyncMock(return_value=staged))
+    monkeypatch.setattr(groups.identities, "discard_doctors_identities", discard)
+    generator = groups.staged_groups.__wrapped__(monkeypatch)
+    assert await anext(generator) is staged
+    assert policy._FACTORY.get() is factory
+    if failure is None:
+        await generator.aclose()
+    elif phase == "cleanup":
+        with pytest.raises(failure, match="synthetic interruption"):
+            await generator.aclose()
+    else:
+        with pytest.raises(failure, match="synthetic interruption"):
+            await generator.athrow(failure("synthetic interruption"))
+    assert events == ["open", "readers_closed", "owned_database_removed"]
+    assert policy._FACTORY.get() is None
+    discard.assert_not_awaited()

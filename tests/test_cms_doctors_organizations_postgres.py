@@ -125,13 +125,51 @@ async def staged_groups(monkeypatch):
         physical_sites = sites + [sites[0], sites[0], sites[0][:-2] + "02", *sites[1:5], sites[2], ""]
         staged = await _stage_rows(fixture, physical_ids, physical_sites)
         staged.ids, staged.site_ids = ids, sites + [sites[0][:-2] + "02"]
+        # The component closes its readers before removing this case's entire owned database.
+        yield staged
+
+
+@pytest.mark.asyncio
+async def test_owned_component_can_drain_a_reader_before_removing_stages(monkeypatch):
+    from tests import provider_directory_source_postgres_support as source_fixture
+
+    original_cleanup = source_fixture._cleanup_native_source_component
+    reader = None
+    drained_stage_oids = []
+
+    async def cleanup(*args):
         try:
-            yield staged
+            if reader is not None:
+                assert reader.is_in_transaction()
+                assert await reader.fetchval(
+                    "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() "
+                    "AND relation=$1 AND mode='AccessShareLock' AND granted)",
+                    stage_oid,
+                )
+                await reader.execute("ROLLBACK")
+                drained_stage_oids.append(stage_oid)
         finally:
-            await identities.discard_doctors_identities(fixture.database, staged.ctx)
-            async with fixture.database.transaction() as session:
-                inventory = await preparation._stage_inventory(session, staged.schema, staged.import_date)
-            await preparation._drop_owned_stages(staged.schema, inventory)
+            if reader is not None and not reader.is_closed():
+                await reader.close()
+            await original_cleanup(*args)
+
+    monkeypatch.setattr(source_fixture, "_cleanup_native_source_component", cleanup)
+    generator = staged_groups.__wrapped__(monkeypatch)
+    try:
+        staged = await anext(generator)
+        url = staged.fixture.engine.url.set(drivername="postgresql")
+        reader = await asyncpg.connect(url.render_as_string(hide_password=False))
+        await reader.execute("BEGIN")
+        stage_oid = await reader.fetchval(
+            "SELECT to_regclass($1)::oid", f"{staged.schema}.{staged.stage.__tablename__}"
+        )
+        await reader.fetchval(f'SELECT 1 FROM "{staged.schema}"."{staged.stage.__tablename__}" LIMIT 1')
+        await generator.aclose()
+        assert drained_stage_oids == [stage_oid]
+    finally:
+        if reader is not None and not reader.is_closed():
+            await reader.close()
+        await generator.aclose()
 
 
 async def _prepare_groups(staged):
