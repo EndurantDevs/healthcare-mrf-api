@@ -5931,8 +5931,7 @@ def _humana_provider_directory_override(
     should_override = (
         api_base == HUMANA_PROVIDER_DIRECTORY_BASE
         or bool(api_base and api_base.startswith(f"{HUMANA_PROVIDER_DIRECTORY_BASE}/"))
-        or "fhir.humana.com/api" in portal_url
-        or "fhir.humana.com/api" in source_url
+        or any("fhir.humana.com/api" in url for url in (portal_url, source_url))
         or ("humana" in source_detail and "fhir.humana.com" in source_detail)
     )
     if not should_override:
@@ -5941,6 +5940,7 @@ def _humana_provider_directory_override(
         "InsurancePlan",
         "Location",
         "Organization",
+        "OrganizationAffiliation",
         "Practitioner",
         "PractitionerRole",
     ]
@@ -5951,19 +5951,19 @@ def _humana_provider_directory_override(
         "requires_registration": False,
         "auth_type": "none",
         "last_validated_status": "valid",
-        "endpoints": _source_override_endpoint_fields(HUMANA_PROVIDER_DIRECTORY_BASE),
+        "endpoints": {
+            field: f"{endpoint}?_total=none"
+            for field, endpoint in _source_override_endpoint_fields(HUMANA_PROVIDER_DIRECTORY_BASE).items()
+        },
         "metadata": {
             "provider_directory_override": "humana_public_fhir_api",
-            "provider_directory_override_reason": (
-                "Humana publishes a carrier-wide public R4 Provider Directory at "
-                "fhir.humana.com/api; seed rows can retain stale OAuth labels or a single "
-                "state/product label that must not be assigned to the shared graph."
-            ),
+            "provider_directory_override_reason": "Public carrier-wide FHIR; ignore stale OAuth and product labels.",
             "provider_directory_previous_api_base": _clean_text(seed_row_by_field.get("api_base")),
             "provider_directory_confirmed_base": HUMANA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_metadata_url": HUMANA_PROVIDER_DIRECTORY_METADATA_URL,
             "provider_directory_supported_resources": supported_resources,
             "provider_directory_fully_enumerable_resources": supported_resources,
+            "provider_directory_expected_nonempty_resources": supported_resources,
             "provider_directory_coverage_mode": "carrier_directory",
             "provider_directory_directory_scope": "carrier",
             "provider_directory_plan_provenance_neutralized": True,

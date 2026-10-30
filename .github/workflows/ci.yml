@@ -69,7 +69,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -138,7 +138,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -161,7 +161,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -198,7 +198,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -312,7 +312,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -371,7 +371,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -403,7 +403,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -456,7 +456,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -503,7 +503,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -541,7 +541,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -562,7 +562,7 @@ jobs:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'address-canonical-db-tests (metadata only)' || matrix.label }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.shard == 'cms-successor' && 30 || 20 }}
     needs:
     - public-hygiene
     - readability-preflight
@@ -598,7 +598,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -706,11 +706,15 @@ jobs:
       artifact_directory_address: ${{ steps.coverage-output.outputs.artifact_directory_address }}
       artifact_profile_storage: ${{ steps.coverage-output.outputs.artifact_profile_storage }}
       artifact_profile_publication: ${{ steps.coverage-output.outputs.artifact_profile_publication }}
+      artifact_cms_successor: ${{ steps.coverage-output.outputs.artifact_cms_successor }}
     strategy:
       max-parallel: 48
       fail-fast: false
       matrix:
         include:
+        - shard: cms-successor
+          label: Database tests (CMS successor)
+          output: artifact_cms_successor
         - shard: registry-28
           label: Database tests (registry 29)
           output: artifact_registry_28
@@ -896,6 +900,90 @@ jobs:
           output: artifact_core_snapshots
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
+  fhir-catalog-integration:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'FHIR catalog integration (metadata only)' || 'FHIR catalog integration' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - public-hygiene
+    - readability-preflight
+    services:
+      postgres:
+        image: postgis/postgis:18-3.6@sha256:60f6ad1d21ea86a67d47780b9a0d1e1d200500f62b19293fa834d0dea80b8677
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
+        ports:
+        - 5432:5432
+        - 5440:5432
+        options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
+          5s --health-retries 25
+    env:
+      PYTEST_ADDOPTS: ''
+      HLTHPRT_DB_DRIVER: asyncpg
+      HLTHPRT_DB_PORT: '5432'
+      HLTHPRT_DB_USER: postgres
+      HLTHPRT_DB_PASSWORD: postgres
+      HLTHPRT_DB_DATABASE: ptg2_v3_lifecycle_test_ci_runner
+      HLTHPRT_DB_SCHEMA: mrf
+      DB_SCHEMA: mrf
+      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
+      CI_SHARD: fhir-catalog-integration
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: b393742088ead8d22288591ce1d255194fb828a6
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Check catalog integration capability
+      id: catalog-capability
+      run: bash "$CI_ROOT/scripts/healthcare/check" fhir-catalog-capability >> "$GITHUB_OUTPUT"
+    - name: Install PostgreSQL client
+      run: bash "$CI_ROOT/scripts/install_postgres_client"
+      if: steps.catalog-capability.outputs.present == 'true'
+    - name: Download exact-source Rust test binaries
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
+        digest-mismatch: error
+        path: rust-debug-binaries
+      if: steps.catalog-capability.outputs.present == 'true'
+    - name: Run complete validation stage
+      env:
+        HLTHPRT_DB_HOST: 127.0.0.1
+        CI_POSTGRES_SERVICE_ID: ${{ job.services.postgres.id }}
+        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+      if: steps.catalog-capability.outputs.present == 'true'
+    - name: Upload exact-source catalog integration evidence
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: mrf-fhir-catalog-integration-${{ github.run_id }}-${{ github.run_attempt }}
+        path: '${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.xml
+
+          ${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.selection
+
+          ${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.json'
+        retention-days: 1
+        if-no-files-found: error
+      if: steps.catalog-capability.outputs.present == 'true'
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
   measurement:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'Coverage results (metadata only)' || 'Coverage results' }}
@@ -918,6 +1006,7 @@ jobs:
     - security
     - worker-queue-smoke
     - address-canonical-db-tests
+    - fhir-catalog-integration
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (!cancelled()) }}
     steps:
@@ -929,7 +1018,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -985,7 +1074,7 @@ jobs:
           }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source_2
           }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_address
           }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_publication
-          }}
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_cms_successor }}
         digest-mismatch: error
         path: ${{ runner.temp }}/healthcare-coverage-staging
         merge-multiple: false
@@ -1055,7 +1144,7 @@ jobs:
       actions: write
       packages: write
     env:
-      CI_REVISION: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+      CI_REVISION: b393742088ead8d22288591ce1d255194fb828a6
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -1064,7 +1153,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+        ref: b393742088ead8d22288591ce1d255194fb828a6
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1140,7 +1229,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: dc7a9bcb2330de2f422a2550381e4a3529f2d075
+  CI_REVISION: b393742088ead8d22288591ce1d255194fb828a6
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
