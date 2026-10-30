@@ -36,9 +36,7 @@ TYPED_ROOTS = tuple(
     if root not in {"provider_directory_canonical_resource", "provider_directory_source_resource"}
 )
 TYPED_ROOTS = tuple(sorted(TYPED_ROOTS))
-_SOURCE_CATALOG_SQL = OUTPUT_CATALOG_SQL.replace(
-    "WHERE k.conindid=i.indexrelid)", "WHERE k.conindid=i.indexrelid AND k.conrelid=c.oid)", 1
-)
+_SOURCE_CATALOG_SQL = OUTPUT_CATALOG_SQL
 _ACTIVE = ContextVar("provider_directory_artifact_scratch_inputs", default=None)
 _VERIFIED = ContextVar("provider_directory_artifact_scratch_native_transaction", default=None)
 _ISSUED = WeakKeyDictionary()

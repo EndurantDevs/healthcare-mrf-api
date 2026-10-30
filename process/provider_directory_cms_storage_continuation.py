@@ -137,6 +137,24 @@ class VerifiedStorageContinuation:
     request_nonce: str
 
 
+def _lease_purpose(lease):
+    """Read the additional purpose only from the already verified immutable lease."""
+    from process import provider_directory_serving_capacity_contract as ordinary
+
+    request = lease.signing_preflight_guard["healthcare_request"]
+    from process import provider_directory_serving_inverse_capacity_contract as inverse
+
+    if request.get("contract_id") == inverse.HEALTHCARE_REQUEST:
+        inverse.validated_inverse_preflight_request(request)
+        return inverse.PURPOSE
+    if ordinary.ADMISSION_FIELD not in request:
+        return "cms_nonprofile"
+    admission = request[ordinary.ADMISSION_FIELD]
+    if admission.get("admission_purpose") != ordinary.PURPOSE:
+        raise _error("request_invalid")
+    return ordinary.PURPOSE
+
+
 def request_storage_continuation(
     lease: VerifiedDatabaseCapacityLease, *, run_id: str, phase: str, requested_at: datetime.datetime
 ) -> StorageContinuationRequest:
@@ -166,7 +184,7 @@ def request_storage_continuation(
     }
     binding_by_field.update(
         contract_id=STORAGE_CONTINUATION_CONTRACT,
-        admission_purpose="cms_nonprofile",
+        admission_purpose=_lease_purpose(lease),
         original_lease_digest=lease.lease_digest,
         run_id=run_id,
         phase=phase,
@@ -261,6 +279,8 @@ def verify_storage_continuation(
     now: datetime.datetime,
 ) -> VerifiedStorageContinuation:
     """Verify an untrusted continuation without modifying or reissuing a consumed lease."""
+    if request.binding_by_field.get("admission_purpose") != _lease_purpose(lease):
+        raise _error("request_binding_changed")
     if not isinstance(envelope, Mapping) or set(envelope) != {"observation", "signature"}:
         raise _error("envelope_invalid")
     witness = envelope["observation"]

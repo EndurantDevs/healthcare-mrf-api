@@ -51,7 +51,7 @@ async def test_fence_includes_old_and_new_dataset_and_root_coordinates():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["acquisition_abandoned", "acquisition_retired"])
+@pytest.mark.parametrize("status", ["acquisition_abandoned", "acquisition_retired", "publication_acknowledged"])
 async def test_abandoned_parent_found_only_by_root_refuses_before_checkpoint_mutation(status):
     publisher = _publisher(parents=[{"dataset_id": "another-dataset", "status": status}])
     with pytest.raises(GenericCandidateError, match="checkpoint_parent_abandoned"):

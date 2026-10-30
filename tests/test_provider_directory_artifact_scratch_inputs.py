@@ -129,9 +129,7 @@ async def test_oversized_header_refuses_before_payload_transport(size, reason):
 
 
 def test_control_catalog_preserves_native_hooks_fks_owner_and_acl():
-    added = "WHERE k.conindid=i.indexrelid AND k.conrelid=c.oid)"
-    assert scratch._SOURCE_CATALOG_SQL.count(added) == 1
-    assert scratch._SOURCE_CATALOG_SQL.replace(added, "WHERE k.conindid=i.indexrelid)") == scratch.OUTPUT_CATALOG_SQL
+    assert scratch._SOURCE_CATALOG_SQL is scratch.OUTPUT_CATALOG_SQL
 
 
 @pytest.mark.parametrize("change", [None, "projection", "source_fence", "resource_types"])

@@ -2905,6 +2905,10 @@ def _provider_directory_operation(
     from process.provider_directory_serving_recovery import is_recovery_request
 
     if is_recovery_request("provider-directory-fhir", params):
+        from process.provider_directory_serving_inverse_capacity_contract import EXECUTION_FIELD
+
+        if EXECUTION_FIELD in params:
+            return _PROVIDER_DIRECTORY_GLOBAL_PROFILE, frozenset(), None
         return _PROVIDER_DIRECTORY_SCOPED_ARTIFACT, _provider_directory_source_ids(params["source_ids"]), None
     if _is_current_version_census_control(params):
         return _PROVIDER_DIRECTORY_EXCLUSIVE, frozenset(), None
@@ -4921,6 +4925,12 @@ def _retry_child_params(
 
     if OPERATION_PARAM in current_params_by_name:
         is_recovery_request(str(current_run_map.get("importer") or ""), current_params_by_name)
+        from process.provider_directory_serving_inverse_capacity_contract import EXECUTION_FIELD
+
+        if EXECUTION_FIELD in current_params_by_name:
+            from process.provider_directory_serving_inverse_capacity import validated_inverse_retry_params
+
+            return validated_inverse_retry_params(current_params_by_name, retry_params_by_name, run_id)
         if any(
             key not in current_params_by_name or override_value != current_params_by_name[key]
             for key, override_value in retry_params_by_name.items()

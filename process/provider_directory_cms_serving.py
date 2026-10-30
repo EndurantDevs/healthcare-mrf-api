@@ -282,6 +282,16 @@ async def publish_current_attested_profile(
     )
     token = fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(execution)
     try:
+        if getattr(execution, "serving_nonprofile_capacity_attestation", None) is not None:
+            from process.provider_directory_ordinary_serving import publish_current_ordinary_serving
+
+            return await publish_current_ordinary_serving(
+                fhir,
+                execution=execution,
+                run_id=run_id,
+                control_run_id=control_run_id,
+                metrics=metrics,
+            )
         if execution.attestation.desired_cms_dataset is not None or execution.attestation.operation == "purge":
             if fhir.db._transaction_binding() is not None:
                 raise RuntimeError("cms_serving_preparation_requires_own_transaction")

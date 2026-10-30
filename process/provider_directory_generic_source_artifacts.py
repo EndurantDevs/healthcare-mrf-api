@@ -2,7 +2,7 @@
 """Publish ordinary address overlays from one issued immutable REST Source."""
 
 import asyncio
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from uuid import uuid4
@@ -612,6 +612,16 @@ def is_fence_held(directory, fence, executor):
     held = _TERMINAL.get()
     if held is None or executor not in (None, directory.db):
         return False
+    if len(held) == 4:
+        capture, factory, session = _ordinary_terminal_owner(directory, held[0])
+        require_output(
+            held[1] is session
+            and held[2] is capture
+            and held[3] is factory
+            and desired_fence_hash(fence) == held[0].plan.desired_fence_hash,
+            "rest_artifact_terminal_changed",
+        )
+        return True
     admission = current(directory)
     require_output(
         held[0] is admission
@@ -700,6 +710,24 @@ async def lock_address_source_fence(directory, database, schema, context):
 
 
 @asynccontextmanager
+async def _terminal_header(directory, fence, factory):
+    session = _publication_session(directory.db)
+    await directory.db.status(f"SET LOCAL lock_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}'")
+    await directory.db.status(
+        f"SET LOCAL statement_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}'"
+    )
+    await _lock_ordinary_controls(directory, fence, directory.db)
+    owner = nullcontext(directory.db) if factory is None else factory.artifact_fence(directory.db)
+    async with owner as executor:
+        await executor.status(f"SET LOCAL lock_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}'")
+        await executor.status(
+            f"SET LOCAL statement_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}'"
+        )
+        await _verify_header(directory, fence, executor, for_update=True)
+        yield session
+
+
+@asynccontextmanager
 async def terminal_fence(directory):
     """Authenticate Source before commit; keep ordinary-owned locks until settlement."""
     admission = current(directory)
@@ -707,18 +735,7 @@ async def terminal_fence(directory):
         yield
         return
     require_output(_TERMINAL.get() is None, "rest_artifact_terminal_nested")
-    session = _publication_session(directory.db)
-    await directory.db.status(f"SET LOCAL lock_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}'")
-    await directory.db.status(
-        f"SET LOCAL statement_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}'"
-    )
-    await _lock_ordinary_controls(directory, admission.fence, directory.db)
-    async with admission.factory.artifact_fence(directory.db) as executor:
-        await executor.status(f"SET LOCAL lock_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}'")
-        await executor.status(
-            f"SET LOCAL statement_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}'"
-        )
-        await _verify_header(directory, admission.fence, executor, for_update=True)
+    async with _terminal_header(directory, admission.fence, admission.factory) as session:
         await recovery.begin_overlay(directory, admission.recovery)
         token = _TERMINAL.set((admission, session))
         try:
@@ -726,5 +743,60 @@ async def terminal_fence(directory):
             await recovery.finish_overlay(directory, admission.recovery)
             current(directory)
             require_output(_publication_session(directory.db) is session, "rest_artifact_transaction_changed")
+        finally:
+            _TERMINAL.reset(token)
+
+
+def _ordinary_terminal_owner(directory, admission):
+    from process.provider_directory_cms_nonprofile_capacity import _CapacityProducer
+    from process.provider_directory_cms_preparation import NonprofileAdmission, NonprofileAdmissionCheck
+    from process.provider_directory_ordinary_address_admission import require_capture
+
+    require_output(type(admission) is NonprofileAdmission, "rest_artifact_terminal_changed")
+    capture = require_capture(directory, admission.plan, admission.captured_inputs)
+    capture._require_owner(directory)
+    producer = getattr(admission.check_cutover, "__self__", None)
+    binding = directory.db._transaction_binding()
+    require_output(
+        type(producer) is _CapacityProducer
+        and producer.fhir is directory
+        and producer.plan is admission.plan
+        and producer.lease is admission.lease
+        and producer.captured_inputs is capture
+        and producer.execution is capture._execution
+        and admission.check_phase == producer.check_phase
+        and admission.check_cutover == producer.assert_cutover
+        and admission._started
+        and admission._cutover_active
+        and producer._cutover_active
+        and type(producer._cutover_request) is NonprofileAdmissionCheck
+        and producer._cutover_request.phase == "cutover"
+        and producer._cutover_request.lease is admission.lease
+        and producer._cutover_request.plan is admission.plan
+        and producer._cutover_witness is not None
+        and producer._cutover_observation is not None
+        and binding is not None
+        and (producer._cutover_binding is None or producer._cutover_binding is binding)
+        and not capture._fence.promotion_datasets
+        and desired_fence_hash(capture._fence)
+        == desired_fence_hash(producer.fence)
+        == admission.plan.desired_fence_hash,
+        "rest_artifact_terminal_changed",
+    )
+    return capture, capture._factory, _publication_session(directory.db)
+
+
+@asynccontextmanager
+async def ordinary_terminal_fence(directory, admission):
+    """Pin issued ordinary inputs without borrowing the legacy overlay recovery record."""
+    require_output(_TERMINAL.get() is None, "rest_artifact_terminal_nested")
+    capture, factory, session = _ordinary_terminal_owner(directory, admission)
+    async with _terminal_header(directory, capture._fence, factory) as locked_session:
+        require_output(locked_session is session, "rest_artifact_terminal_changed")
+        token = _TERMINAL.set((admission, session, capture, factory))
+        try:
+            is_fence_held(directory, capture._fence, None)
+            yield
+            is_fence_held(directory, capture._fence, None)
         finally:
             _TERMINAL.reset(token)

@@ -43,12 +43,12 @@ from process.provider_directory_profile_capacity_attestation import (
     capacity_lease_consumption_values,
     verify_database_capacity_lease,
 )
+from process.provider_directory_profile_capacity_control_projection import assert_profile_control_metadata_growth
 from process.provider_directory_profile_runtime_observation import (
     assert_capacity_lease_matches_runtime_observation,
     observe_profile_runtime,
 )
 
-_PURPOSE = "cms_nonprofile"
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
 _PHASES = frozenset({"pre_scratch", "pre_logging", "readiness", "cutover"})
@@ -83,6 +83,10 @@ async def resume_profile_capacity(
         raise _error("profile_build_identity_changed")
     with original_profile_input_scope(fhir):
         workload = await fhir._profile_admission_workload(identity, fence, resource_fence, types)
+    assert_profile_control_metadata_growth(
+        admission.geometry, admission.control_wal_projection, workload.control_wal_plan_input
+    )
+    workload = workload._replace(control_wal_plan_input=admission.control_wal_projection.plan_input)
     geometry = fhir._profile_admission_geometry(workload, fhir._profile_admission_inputs(execution, identity, workload))
     if geometry.geometry != admission.geometry or geometry.control_wal_projection != admission.control_wal_projection:
         raise _error("profile_geometry_changed")
@@ -140,10 +144,20 @@ def _error(reason: str) -> RuntimeError:
     return RuntimeError("provider_directory_nonprofile_capacity_" + reason)
 
 
+def _plan_purpose(plan):
+    from process.provider_directory_serving_capacity_plan import plan_purpose
+
+    return plan_purpose(plan)
+
+
 def _validate_plan(plan: NonprofileAdmissionPlan) -> None:
     """Require pinned native inputs, signed phase budgets and bounded temp costs."""
-    if not isinstance(plan, NonprofileAdmissionPlan):
-        raise _error("plan_required")
+    from process.provider_directory_serving_capacity_plan import validate_plan_scope
+
+    try:
+        validate_plan_scope(plan)
+    except ValueError as error:
+        raise _error("plan_required") from error
     hash_fields = (
         plan.selection_proof_id,
         plan.desired_fence_hash,
@@ -370,6 +384,21 @@ class _CapacityProducer:
     _cutover_witness: VerifiedStorageContinuation | None = field(default=None, init=False)
     _cutover_observation: Mapping[str, Any] | None = field(default=None, init=False)
     _cutover_binding: Any = field(default=None, init=False)
+    captured_inputs: Any = field(default=None, repr=False)
+    _ordinary_finished_profile: Any = field(default=None, init=False, repr=False)
+
+    async def _check_captured_inputs(self, *, semantic=True):
+        """Ordinary work carries a server capture; historical CMS work has no such edge."""
+        from process.provider_directory_ordinary_address_admission import recheck_capture, require_capture
+        from process.provider_directory_serving_capacity_plan import OrdinaryServingAdmissionPlan
+
+        if type(self.plan) is OrdinaryServingAdmissionPlan:
+            if semantic:
+                await recheck_capture(self.fhir, self.execution, self.plan, self.captured_inputs)
+            else:
+                require_capture(self.fhir, self.plan, self.captured_inputs)
+        elif self.captured_inputs is not None:
+            raise _error("capture_purpose_changed")
 
     @asynccontextmanager
     async def cutover_operation(self):
@@ -382,6 +411,7 @@ class _CapacityProducer:
         finally:
             self._cutover_active = False
             self._cutover_request = self._cutover_witness = self._cutover_observation = self._cutover_binding = None
+            self._ordinary_finished_profile = None
 
     async def assert_cutover(self, relations: tuple[OwnedRelation, ...] | None) -> None:
         """Recheck the same transaction locally without another authority request."""
@@ -399,9 +429,11 @@ class _CapacityProducer:
         ):
             raise _error("cutover_operation_changed")
         if self._cutover_binding is None:
+            await self._check_captured_inputs()
             self._cutover_binding = binding
         if self._cutover_binding is not binding:
             raise _error("cutover_operation_changed")
+        await self._check_captured_inputs(semantic=False)
         await self._assert_consumption()
         if relations is None:
             await self._assert_wal_budget(request)
@@ -475,6 +507,7 @@ class _CapacityProducer:
     async def _finish_phase(self, request, storage_request, envelope, *, observers=None):
         """Observe the original actors only after authority transport has completed."""
         controls = self.fhir.db if observers is None else observers.controls
+        await self._check_captured_inputs()
         observation = await _database_observation(self.fhir, self.plan)
         now = await self.fhir._profile_capacity_preflight_clock()
         fresh = verify_storage_continuation(
@@ -555,7 +588,7 @@ class _CapacityProducer:
                 self.plan.desired_profile_as_of,
             )
             values_by_field = {
-                "admission_purpose": _PURPOSE,
+                "admission_purpose": _plan_purpose(self.plan),
                 **capacity_lease_consumption_values(self.lease, binding, accepted_at=accepted_at),
             }
             await fhir._consume_provider_directory_profile_capacity_lease(schema=schema, values_by_name=values_by_field)
@@ -620,7 +653,9 @@ class _CapacityProducer:
         )
         database = self.fhir.db if database is None else database
         rows = await database.all(
-            f"SELECT * FROM {table} WHERE run_id=:run_id AND admission_purpose='cms_nonprofile';", run_id=self.run_id
+            f"SELECT * FROM {table} WHERE run_id=:run_id AND admission_purpose=:purpose;",
+            run_id=self.run_id,
+            purpose=_plan_purpose(self.plan),
         )
         identities = [
             self.fhir._provider_directory_profile_capacity_consumption_identity(
@@ -754,23 +789,35 @@ class _CapacityProducer:
             catalog_by_identity.update(captured)
         return catalog_by_identity
 
+    def _checked_relation_policies(self, request):
+        """Keep each measured coordinate in exactly one declared retention purpose."""
+        from process import provider_directory_ordinary_retention_capacity as retention
+
+        raw = self._raw_relation_policies(request)
+        native = self._native_relation_policies(request)
+        ordinary = retention.retained_relations(self, request)
+        if ordinary.keys() & (raw.keys() | native.keys()):
+            raise _error("ordinary_retention_changed")
+        return raw, native, ordinary
+
     async def _assert_physical(
         self, request: NonprofileAdmissionCheck, observation: Mapping[str, Any], *, observers=None
     ) -> None:
         """Measure aggregate native relations and conservative cluster-wide emitted WAL."""
         from process import provider_directory_cms_native_layout as native_layout
+        from process import provider_directory_ordinary_retention_capacity as retention
 
-        data_bytes = sum(relation.total_bytes for relation in request.relations)
+        data_bytes = retention.allocated_data_bytes(self, request)
         if data_bytes > dict(self.plan.reservation_bytes)["data"]:
             raise _error("data_budget_exceeded")
         await self._assert_wal_budget(request, **({} if observers is None else {"controls": observers.controls}))
-        raw_by_coordinate = self._raw_relation_policies(request)
-        native_by_coordinate = self._native_relation_policies(request)
+        raw_by_coordinate, native_by_coordinate, ordinary_by_coordinate = self._checked_relation_policies(request)
         scratch_relations = tuple(
             relation
             for relation in request.relations
             if (relation.schema, relation.relation) not in raw_by_coordinate
             and (relation.schema, relation.relation) not in native_by_coordinate
+            and (relation.schema, relation.relation) not in ordinary_by_coordinate
         )
         # Keep catalog reads on one backend without replacing an existing SOURCE/Ret binding.
         transaction = (
@@ -801,7 +848,12 @@ class _CapacityProducer:
                 identity = (relation.schema, relation.relation, relation.oid)
                 if identity in native_catalogs:
                     arguments["observed_catalog"] = native_catalogs[identity]
-                layout = scratch_layouts.get((relation.schema, relation.relation))
+                ordinary = ordinary_by_coordinate.get((relation.schema, relation.relation))
+                layout = (
+                    await retention.capture_retained_layout(self, relation, ordinary)
+                    if ordinary is not None
+                    else scratch_layouts.get((relation.schema, relation.relation))
+                )
                 if layout is None:
                     layout = await self._capture_relation_layout(relation, raw_state, native_source, **arguments)
                 if layout.relation_oid != relation.oid or layout.effective_tablespace_oids != (
@@ -860,7 +912,12 @@ class _CapacityProducer:
         if self.resumed_profile is not None:
             profile = self.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get()
             if profile is not self.resumed_profile:
-                raise _error("paired_profile_admission_changed")
+                from process.provider_directory_ordinary_address_admission import finished_profile_for_cutover
+                from process.provider_directory_serving_capacity_plan import OrdinaryServingAdmissionPlan
+
+                if profile is not None or type(self.plan) is not OrdinaryServingAdmissionPlan:
+                    raise _error("paired_profile_admission_changed")
+                profile = await finished_profile_for_cutover(self, request)
             await self._assert_active_profile(profile, **({} if controls is None else {"database": controls}))
             if self.cutover_wal_start_bytes is None:
                 await self.fhir._assert_provider_directory_profile_wal_budget(profile)
@@ -977,6 +1034,28 @@ def _quiescence_parameters(
     }
 
 
+async def _require_admission_inputs(fhir, execution, fence, signed_plan, captured_inputs):
+    """Check the original selection and any server capture before lease observation."""
+    from process.provider_directory_serving_capacity_plan import OrdinaryServingAdmissionPlan, require_selection
+
+    try:
+        require_selection(signed_plan, execution.attestation)
+    except ValueError as error:
+        raise _error("selection_changed") from error
+    if type(signed_plan) is OrdinaryServingAdmissionPlan:
+        from process.provider_directory_ordinary_address_admission import recheck_capture
+
+        await recheck_capture(fhir, execution, signed_plan, captured_inputs)
+    elif captured_inputs is not None:
+        raise _error("capture_purpose_changed")
+    if (
+        signed_plan.selection_proof_id != execution.attestation.proof_id
+        or signed_plan.desired_profile_as_of != execution.attestation.desired_profile_as_of
+        or signed_plan.desired_fence_hash != desired_fence_hash(fence)
+    ):
+        raise _error("selection_changed")
+
+
 async def produce_nonprofile_admission(
     fhir: Any,
     execution: Any,
@@ -988,20 +1067,35 @@ async def produce_nonprofile_admission(
     signed_plan: NonprofileAdmissionPlan,
     fresh_storage_envelope: Callable[[StorageContinuationRequest], Awaitable[Mapping[str, Any]]],
 ) -> NonprofileAdmission:
+    """Retain the original CMS producer interface and independently verified pair."""
+    return await _produce_admission(
+        fhir,
+        execution,
+        fence,
+        run_id=run_id,
+        envelopes=(assigned_envelope, profile_envelope),
+        signed_plan=signed_plan,
+        fresh_storage_envelope=fresh_storage_envelope,
+    )
+
+
+async def _produce_admission(
+    fhir: Any,
+    execution: Any,
+    fence: Any,
+    *,
+    run_id: str,
+    envelopes: tuple[Mapping[str, Any], Mapping[str, Any]],
+    signed_plan: NonprofileAdmissionPlan,
+    fresh_storage_envelope: Callable[[StorageContinuationRequest], Awaitable[Mapping[str, Any]]],
+    captured_inputs: Any = None,
+) -> NonprofileAdmission:
     """Produce phase authority from two independently verified existing signed leases."""
+    assigned_envelope, profile_envelope = envelopes
     _validate_plan(signed_plan)
     if not callable(fresh_storage_envelope) or re.fullmatch(r"run_[0-9a-f]{32}", run_id) is None:
         raise _error("authority_transport_required")
-    if (
-        execution.attestation.desired_cms_dataset is None
-        or execution.attestation.operation != "publish"
-        or (
-            signed_plan.selection_proof_id != execution.attestation.proof_id
-            or signed_plan.desired_profile_as_of != execution.attestation.desired_profile_as_of
-            or signed_plan.desired_fence_hash != desired_fence_hash(fence)
-        )
-    ):
-        raise _error("selection_changed")
+    await _require_admission_inputs(fhir, execution, fence, signed_plan, captured_inputs)
     observation = await _database_observation(fhir, signed_plan)
     now = await fhir._profile_capacity_preflight_clock()
     lease = _verify_envelope(assigned_envelope, signed_plan.capacity_geometry_hash, observation, now)
@@ -1021,7 +1115,16 @@ async def produce_nonprofile_admission(
     assert_capacity_lease_matches_runtime_observation(lease, runtime)
     assert_capacity_lease_matches_runtime_observation(profile, runtime)
     producer = _CapacityProducer(
-        fhir, execution, fence, run_id, lease, profile, signed_plan, fresh_storage_envelope, observation["wal_lsn"]
+        fhir,
+        execution,
+        fence,
+        run_id,
+        lease,
+        profile,
+        signed_plan,
+        fresh_storage_envelope,
+        observation["wal_lsn"],
+        captured_inputs=captured_inputs,
     )
     return NonprofileAdmission(
         lease,
@@ -1032,4 +1135,5 @@ async def produce_nonprofile_admission(
         paired_profile_lease=profile,
         cutover_operation=producer.cutover_operation,
         check_cutover=producer.assert_cutover,
+        captured_inputs=captured_inputs,
     )

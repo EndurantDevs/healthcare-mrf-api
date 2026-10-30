@@ -17,6 +17,8 @@ from sqlalchemy import text
 
 from process import provider_directory_profile_capacity_attestation as lease_contract
 from process import provider_directory_profile_initial_contract as initial_contract
+from process import provider_directory_serving_capacity_contract as serving_contract
+from process import provider_directory_serving_inverse_capacity_contract as inverse_contract
 from process.provider_directory_cms_capacity_contract import CMS_ADMISSION_FIELD, CMS_PREFLIGHT_CONTRACT
 from process.provider_directory_profile_capacity_attestation_contract import _SIGNED_BODY_FIELDS
 from process.provider_directory_profile_capacity_preflight_contract import (
@@ -27,6 +29,12 @@ from process.provider_directory_profile_selection_contract import CMS_CAPACITY_E
 
 CONTRACT_ID = "provider-directory-healthcare-capacity-reservation-snapshot.v2"
 PROFILE_CAPACITY_PARAM = "provider_directory_profile_capacity_attestation"
+_CAPACITY_FIELDS = (
+    PROFILE_CAPACITY_PARAM,
+    CMS_CAPACITY_EXECUTION_PARAM,
+    serving_contract.EXECUTION_FIELD,
+    inverse_contract.EXECUTION_FIELD,
+)
 ACTIVE_RUN_STATUSES = ("queued", "starting", "running", "finalizing", "canceling")
 _DATABASE_FIELDS = ("database_system_identifier", "database_oid", "database_name")
 _LEGACY_CONTRACTS = {
@@ -79,8 +87,15 @@ def _envelope_identity(raw: Any) -> dict:
     lease_contract._assert_colocated_volume_accounting(parsed["volumes"])
     lease_contract._parse_capacity_signing_guard_fields(body, parsed)
     envelope = json.loads(lease_contract.canonical_capacity_lease_json(envelope))
+    request = body["signing_preflight_guard"]["healthcare_request"]
     purpose = (
-        "cms_nonprofile" if CMS_ADMISSION_FIELD in body["signing_preflight_guard"]["healthcare_request"] else "profile"
+        inverse_contract.PURPOSE
+        if body["signing_preflight_guard"]["contract_id"] == inverse_contract.SIGNING_GUARD
+        else serving_contract.PURPOSE
+        if serving_contract.ADMISSION_FIELD in request
+        else "cms_nonprofile"
+        if CMS_ADMISSION_FIELD in request
+        else "profile"
     )
     return {
         "reservation_id": body["reservation_id"],
@@ -132,7 +147,7 @@ def _add_reservation(reservations: dict, raw: Any, *, consumption: dict | None =
     )
     identity = candidate["reservation_id"]
     prior = reservations.setdefault(identity, {**candidate, "observations": []})
-    if any(prior[name] != value for name, value in candidate.items()):
+    if any(prior[name] != candidate_value for name, candidate_value in candidate.items()):
         _fail("reservation_identity_conflict")
     for other_id, other in reservations.items():
         if other_id != identity and any(
@@ -140,12 +155,20 @@ def _add_reservation(reservations: dict, raw: Any, *, consumption: dict | None =
             for field in ("attestation_id", "lease_digest", "preflight_receipt_sha256")
         ):
             _fail("reservation_identity_conflict")
-    if not candidate["opaque_legacy"] and candidate["admission_purpose"] == "cms_nonprofile":
-        pair = candidate["envelope"]["lease"]["signing_preflight_guard"]["healthcare_request"][CMS_ADMISSION_FIELD][
+    if not candidate["opaque_legacy"] and candidate["admission_purpose"] in {
+        "cms_nonprofile",
+        serving_contract.PURPOSE,
+    }:
+        is_ordinary = candidate["admission_purpose"] == serving_contract.PURPOSE
+        field = serving_contract.ADMISSION_FIELD if is_ordinary else CMS_ADMISSION_FIELD
+        pair = candidate["envelope"]["lease"]["signing_preflight_guard"]["healthcare_request"][field][
             "paired_profile_lease"
         ]
         paired = _add_reservation(reservations, pair)
-        observation_by_field = {"kind": "paired_profile", "cms_reservation_id": identity}
+        observation_by_field = {
+            "kind": "paired_profile",
+            "serving_reservation_id" if is_ordinary else "cms_reservation_id": identity,
+        }
         if observation_by_field not in paired["observations"]:
             paired["observations"].append(observation_by_field)
     return prior
@@ -180,6 +203,8 @@ def _assert_current_consumption(consumption_by_field: dict, reservation: dict) -
         "canonical_lease_json": lease_contract.canonical_capacity_lease_json(body),
         "signature": reservation["envelope"]["signature"],
     }
+    if reservation["admission_purpose"] == inverse_contract.PURPOSE:
+        expected_by_field.update(_inverse_consumption_fields(consumption_by_field, body))
     if any(consumption_by_field.get(name) != expected_value for name, expected_value in expected_by_field.items()):
         _fail("consumption_identity_changed")
     accepted_at = _timestamp(consumption_by_field["accepted_at"])
@@ -192,6 +217,15 @@ def _assert_current_consumption(consumption_by_field: dict, reservation: dict) -
     for name in ("observed_at", "issued_at", "expires_at", "max_build_deadline"):
         if _timestamp(consumption_by_field[name]) != lease_contract._timestamp(body[name], field=name):
             _fail("consumption_time_changed")
+
+
+def _inverse_consumption_fields(consumption_by_field, body):
+    """Reuse the original inverse binding; historical Profile provenance is not new work."""
+    from process.provider_directory_profile_capacity_consumption import _capacity_consumption_build_fields
+    from process.provider_directory_serving_inverse_capacity import _binding
+
+    geometry = body["signing_preflight_guard"]["healthcare_receipt"]["capacity_geometry"]
+    return _capacity_consumption_build_fields(_binding(consumption_by_field["run_id"], geometry))
 
 
 def _consumption_observation(row: dict, reservation: dict, observed_at: datetime.datetime) -> dict:
@@ -212,7 +246,15 @@ def _consumption_observation(row: dict, reservation: dict, observed_at: datetime
 
 
 def _run_reservation(run_by_field: dict, params: dict, field: str, reservations: dict) -> dict:
-    purpose = "profile" if field == PROFILE_CAPACITY_PARAM else "cms_nonprofile"
+    purpose_by_field = {
+        PROFILE_CAPACITY_PARAM: "profile",
+        CMS_CAPACITY_EXECUTION_PARAM: "cms_nonprofile",
+        serving_contract.EXECUTION_FIELD: serving_contract.PURPOSE,
+        inverse_contract.EXECUTION_FIELD: inverse_contract.PURPOSE,
+    }
+    if field not in purpose_by_field:
+        _fail("run_purpose_changed")
+    purpose = purpose_by_field[field]
     legacy_reservations = [
         reservation_by_field
         for reservation_by_field in reservations.values()
@@ -230,6 +272,9 @@ def _run_reservation(run_by_field: dict, params: dict, field: str, reservations:
     reservation = _add_reservation(reservations, params[field])
     if reservation["admission_purpose"] != purpose:
         _fail("run_purpose_changed")
+    if purpose == inverse_contract.PURPOSE:
+        _assert_inverse_owner(run_by_field, params)
+        return reservation
     request = reservation["envelope"]["lease"]["signing_preflight_guard"]["healthcare_request"]
     execution = request["profile_execution"]
     if any(params.get(name) != expected for name, expected in execution.items() if name != PROFILE_CAPACITY_PARAM):
@@ -237,29 +282,48 @@ def _run_reservation(run_by_field: dict, params: dict, field: str, reservations:
     if run_by_field["node_id"] != execution["provider_directory_profile_selection_attestation"]["node_id"]:
         _fail("run_node_changed")
     if (
-        field == CMS_CAPACITY_EXECUTION_PARAM
-        and params.get(PROFILE_CAPACITY_PARAM) != request[CMS_ADMISSION_FIELD]["paired_profile_lease"]
+        field in {CMS_CAPACITY_EXECUTION_PARAM, serving_contract.EXECUTION_FIELD}
+        and params.get(PROFILE_CAPACITY_PARAM)
+        != request[serving_contract.ADMISSION_FIELD if purpose == serving_contract.PURPOSE else CMS_ADMISSION_FIELD][
+            "paired_profile_lease"
+        ]
     ):
         _fail("run_profile_pair_changed")
     return reservation
 
 
-def _run_observations(rows: list[dict], reservations: dict) -> list[dict]:
+def _assert_inverse_owner(run_by_field, params):
+    """Use the actual closed worker request, without inventing a paired Profile owner."""
+    from process.provider_directory_serving_inverse_capacity import task_execution
+
+    run_id = inverse_contract.run_handle(run_by_field["run_id"])
+    if run_by_field["importer"] != "provider-directory-fhir" or params.get("run_id", run_id) != run_id:
+        _fail("run_execution_changed")
+    execution = task_execution(params).recovery_execution
+    if run_by_field["node_id"] != execution["node_id"]:
+        _fail("run_node_changed")
+
+
+def _run_observations(run_rows: list[dict], reservations: dict) -> list[dict]:
     owners = []
-    for row in rows:
-        params = _json_object(row.get("params") or {})
-        owner = _json_values({name: value for name, value in row.items() if name != "params"})
-        owner["active"] = row["status"] in ACTIVE_RUN_STATUSES
+    for run_by_field in run_rows:
+        params = _json_object(run_by_field.get("params") or {})
+        if CMS_CAPACITY_EXECUTION_PARAM in params and serving_contract.EXECUTION_FIELD in params:
+            _fail("run_purpose_changed")
+        if inverse_contract.EVENT_FIELD in params and inverse_contract.EXECUTION_FIELD not in params:
+            _fail("run_purpose_changed")
+        owner = _json_values({name: field_value for name, field_value in run_by_field.items() if name != "params"})
+        owner["active"] = run_by_field["status"] in ACTIVE_RUN_STATUSES
         owner["reservation_ids"] = []
-        for field in (PROFILE_CAPACITY_PARAM, CMS_CAPACITY_EXECUTION_PARAM):
+        for field in _CAPACITY_FIELDS:
             if field not in params:
                 continue
-            reservation = _run_reservation(row, params, field, reservations)
+            reservation = _run_reservation(run_by_field, params, field, reservations)
             owner["reservation_ids"].append(reservation["reservation_id"])
             observation_by_field = {
                 "kind": "import_run",
-                "run_id": row["run_id"],
-                "status": row["status"],
+                "run_id": run_by_field["run_id"],
+                "status": run_by_field["status"],
                 "active": owner["active"],
             }
             if reservation["opaque_legacy"]:
@@ -272,9 +336,86 @@ def _run_observations(rows: list[dict], reservations: dict) -> list[dict]:
     return owners
 
 
+def _assert_serving_preflight(receipt: dict) -> None:
+    """Check the new purpose's closed values without claiming signature authority."""
+    if receipt.get("contract_id") != serving_contract.PREFLIGHT_RECEIPT:
+        return
+    if receipt.get("request_contract_id") != serving_contract.PREFLIGHT_REQUEST:
+        _fail("preflight_serving_contract_changed")
+    try:
+        serving_contract.validate_geometry(receipt.get("capacity_geometry"))
+    except ValueError:
+        _fail("preflight_serving_contract_changed")
+
+
+def _assert_preflight_metadata(preflight_by_field, receipt):
+    """Keep stored columns and initial materialization bound to the signed receipt."""
+    if receipt["contract_id"] == initial_contract.RECEIPT_CONTRACT and (
+        receipt.get("request_contract_id") != initial_contract.REQUEST_CONTRACT
+        or receipt.get("profile_materialization") != initial_contract.MATERIALIZATION
+        or _json_object(receipt.get("profile_execution_identity")).get("materialization_mode") != "full_swap"
+        or preflight_by_field.get("materialization_mode") != "full_swap"
+    ):
+        _fail("preflight_initial_contract_changed")
+    for field in (
+        "contract_id",
+        "request_contract_id",
+        "request_sha256",
+        "request_nonce",
+        "control_plane_receipt_sha256",
+        "capacity_geometry_hash",
+    ):
+        if preflight_by_field.get(field) != receipt.get(field):
+            _fail("preflight_metadata_changed")
+    for field in ("issued_at", "expires_at"):
+        if _timestamp(preflight_by_field[field]) != lease_contract._timestamp(receipt[field], field=field):
+            _fail("preflight_metadata_changed")
+
+
+def _assert_inverse_preflight(preflight_by_field, receipt):
+    """Preserve the closed inverse receipt and its honest existing provenance columns."""
+    if receipt["contract_id"] != inverse_contract.HEALTHCARE_RECEIPT:
+        return
+    from process import provider_directory_serving_inverse_capacity_signing as inverse_signing
+
+    inverse_contract.exact(receipt, "healthcare_receipt")
+    geometry = inverse_contract.validated_inverse_geometry(
+        receipt["capacity_geometry"],
+        limits=receipt["capacity_limits"],
+        execution=receipt["recovery_execution_identity"],
+    )
+    expected_receipt_by_field = dict(
+        request_contract_id=inverse_contract.HEALTHCARE_REQUEST,
+        capacity_limits_sha256=geometry["limits_sha256"],
+        capacity_geometry_hash=inverse_signing.geometry_sha256(geometry),
+        required_reservation_bytes_by_storage_class=dict(geometry["reservation_bytes"]),
+    )
+    expected_row_by_field = dict(
+        limits_contract_id=inverse_contract.LIMITS,
+        materialization_mode=inverse_contract.PURPOSE,
+        limits_sha256=geometry["limits_sha256"],
+        serving_preflight_sha256=geometry["input_sha256"],
+        quiescence_sha256=receipt["quiescence_sha256"],
+    )
+    provenance = geometry["scope"]["profile_provenance"]
+    for name in (
+        "selection_proof_id",
+        "profile_input_digest",
+        "control_generation",
+        "profile_schema_version",
+        "profile_strategy_version",
+    ):
+        expected_row_by_field[name] = provenance[name]
+    if any(receipt.get(name) != expected for name, expected in expected_receipt_by_field.items()) or any(
+        preflight_by_field.get(name) != expected for name, expected in expected_row_by_field.items()
+    ):
+        _fail("preflight_inverse_contract_changed")
+
+
 def _preflight_observations(
     preflight_rows: list[dict], reservations: dict, observed_at: datetime.datetime
 ) -> list[dict]:
+    """Match stored receipts to original envelopes without inventing missing authority."""
     by_receipt = {
         candidate_reservation["preflight_receipt_sha256"]: candidate_reservation
         for candidate_reservation in reservations.values()
@@ -285,7 +426,11 @@ def _preflight_observations(
         receipt = _json_object(preflight_by_field["receipt_json"])
         contract = receipt.get("contract_id")
         if contract not in {
-            CAPACITY_PREFLIGHT_CONTRACT_ID, CMS_PREFLIGHT_CONTRACT, initial_contract.RECEIPT_CONTRACT
+            CAPACITY_PREFLIGHT_CONTRACT_ID,
+            CMS_PREFLIGHT_CONTRACT,
+            initial_contract.RECEIPT_CONTRACT,
+            serving_contract.PREFLIGHT_RECEIPT,
+            inverse_contract.HEALTHCARE_RECEIPT,
         }:
             _fail("preflight_contract_unsupported")
         digest = preflight_domain_sha256(
@@ -293,26 +438,9 @@ def _preflight_observations(
         )
         if digest != preflight_by_field["receipt_sha256"] or receipt.get("receipt_sha256") != digest:
             _fail("preflight_digest_changed")
-        if contract == initial_contract.RECEIPT_CONTRACT and (
-            receipt.get("request_contract_id") != initial_contract.REQUEST_CONTRACT
-            or receipt.get("profile_materialization") != initial_contract.MATERIALIZATION
-            or _json_object(receipt.get("profile_execution_identity")).get("materialization_mode") != "full_swap"
-            or preflight_by_field.get("materialization_mode") != "full_swap"
-        ):
-            _fail("preflight_initial_contract_changed")
-        for field in (
-            "contract_id",
-            "request_contract_id",
-            "request_sha256",
-            "request_nonce",
-            "control_plane_receipt_sha256",
-            "capacity_geometry_hash",
-        ):
-            if preflight_by_field.get(field) != receipt.get(field):
-                _fail("preflight_metadata_changed")
-        for field in ("issued_at", "expires_at"):
-            if _timestamp(preflight_by_field[field]) != lease_contract._timestamp(receipt[field], field=field):
-                _fail("preflight_metadata_changed")
+        _assert_serving_preflight(receipt)
+        _assert_preflight_metadata(preflight_by_field, receipt)
+        _assert_inverse_preflight(preflight_by_field, receipt)
         reservation = by_receipt.get(digest)
         if (
             reservation is not None
@@ -332,17 +460,21 @@ def _preflight_observations(
 
 
 _RESERVATION_LIMITATIONS = [
-            "original_signed_bytes_are_not_remaining_reservations",
-            "pending_preflight_rows_do_not_store_original_requests_or_envelopes",
-            "expiry_and_terminal_run_status_do_not_prove_physical_release",
-            "profile_stage_catalog_presence_is_not_a_complete_cleanup_receipt",
-            "cms_scratch_ownership_is_not_durable_in_the_capacity_ledger",
-            "legacy_consumptions_are_opaque_unverified_ledger_observations",
-        ]
+    "original_signed_bytes_are_not_remaining_reservations",
+    "pending_preflight_rows_do_not_store_original_requests_or_envelopes",
+    "expiry_and_terminal_run_status_do_not_prove_physical_release",
+    "profile_stage_catalog_presence_is_not_a_complete_cleanup_receipt",
+    "cms_scratch_ownership_is_not_durable_in_the_capacity_ledger",
+    "legacy_consumptions_are_opaque_unverified_ledger_observations",
+]
 
 
 def reservation_projection(
-    metadata: dict, consumptions: list[dict], runs: list[dict], preflights: list[dict], stages: list[dict],
+    metadata: dict,
+    consumptions: list[dict],
+    runs: list[dict],
+    preflights: list[dict],
+    stages: list[dict],
     cleanup_claims: list[dict] = (),
 ) -> dict:
     """Deduplicate original leases; observed lifecycle states never release bytes."""
@@ -399,7 +531,7 @@ def reservation_projection(
 
 
 async def _snapshot_run_rows(session: Any, run_table: str, consumed: str) -> list[dict]:
-    """Read the unchanged owner eligibility through the caller's pinned transaction."""
+    """Read eligible durable owners through the caller's pinned transaction."""
     return [
         dict(run_by_field)
         for run_by_field in (
@@ -409,7 +541,8 @@ async def _snapshot_run_rows(session: Any, run_table: str, consumed: str) -> lis
               FROM {run_table} run
              WHERE EXISTS (SELECT 1 FROM {consumed} consumed WHERE consumed.run_id=run.run_id)
                 OR (importer='provider-directory-fhir' AND status=ANY(CAST(:statuses AS text[])) AND (
-                    params::jsonb ? :profile_param OR params::jsonb ? :cms_param
+                    params::jsonb ? :profile_param OR params::jsonb ? :cms_param OR params::jsonb ? :serving_param
+                    OR params::jsonb ? :inverse_param OR params::jsonb ? :inverse_event_param
                     OR params::jsonb ? 'provider_directory_profile_contract_id'))
              ORDER BY run_id
         """),
@@ -417,6 +550,9 @@ async def _snapshot_run_rows(session: Any, run_table: str, consumed: str) -> lis
                     "statuses": list(ACTIVE_RUN_STATUSES),
                     "profile_param": PROFILE_CAPACITY_PARAM,
                     "cms_param": CMS_CAPACITY_EXECUTION_PARAM,
+                    "serving_param": serving_contract.EXECUTION_FIELD,
+                    "inverse_param": inverse_contract.EXECUTION_FIELD,
+                    "inverse_event_param": inverse_contract.EVENT_FIELD,
                 },
             )
         ).mappings()
@@ -500,9 +636,16 @@ async def capacity_reservation_snapshot(fhir: Any) -> dict:
             ).mappings()
         ]
         stages = await _snapshot_stage_rows(session, checkpoint, schema)
-        cleanup_claims = [dict(database_record) for database_record in (await session.execute(text(
-            f"SELECT * FROM {fhir._unscoped_qt(schema, 'provider_directory_profile_failed_cleanup_claim')} ORDER BY operation_id"
-        ))).mappings()]
+        cleanup_claims = [
+            dict(database_record)
+            for database_record in (
+                await session.execute(
+                    text(
+                        f"SELECT * FROM {fhir._unscoped_qt(schema, 'provider_directory_profile_failed_cleanup_claim')} ORDER BY operation_id"
+                    )
+                )
+            ).mappings()
+        ]
         return reservation_projection(metadata, consumptions, runs, preflights, stages, cleanup_claims)
 
 
@@ -514,6 +657,11 @@ def _cleanup_claim_projection(claims, observed_at):
     for claim in claims:
         envelope = _claim_envelope(claim)
         if claim["expires_at"] > observed_at:
-            unexpired_claims.append({"record": _json_values(claim), "envelope": envelope,
-                           "signature_verification": "required_by_independent_cleanup_authority"})
+            unexpired_claims.append(
+                {
+                    "record": _json_values(claim),
+                    "envelope": envelope,
+                    "signature_verification": "required_by_independent_cleanup_authority",
+                }
+            )
     return unexpired_claims

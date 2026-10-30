@@ -15,7 +15,6 @@ from tests.test_npi_provider_directory_role_evidence_db import (
     _publish_dataset_rows,
 )
 
-
 LOCATION_STATUS_ENDPOINT_ID = "pd-location-status"
 LOCATION_STATUS_SOURCE_ID = "pdfhir_location_status_test"
 LOCATION_STATUS_DATASET_ID = "dataset-location-status"
@@ -25,7 +24,7 @@ LOCATION_STATUS_DATASET_ROWS = [
         LOCATION_STATUS_DATASET_ID,
         LOCATION_STATUS_ENDPOINT_ID,
         LOCATION_STATUS_RUN_ID,
-        {},
+        {"source_ids": [LOCATION_STATUS_SOURCE_ID]},
     )
 ]
 LOCATION_STATUS_ROLE_RECORDS = (
@@ -62,6 +61,17 @@ LOCATION_STATUS_ROLE_RECORDS = (
         "npi": 1000000003,
         "address_key": "00000000-0000-0000-0000-000000000003",
     },
+    {
+        "role_id": "role-normalized-future",
+        "source_record_id": "provider_directory_fhir:practitioner_role:"
+        f"{LOCATION_STATUS_SOURCE_ID}:role-normalized-future:location-normalized-future",
+        "role_run_id": LOCATION_STATUS_RUN_ID,
+        "period_start": None,
+        "period_end": None,
+        "payload": {"active": True, "period_start": "2999-01-01"},
+        "npi": 1000000004,
+        "address_key": "00000000-0000-0000-0000-000000000004",
+    },
 )
 
 
@@ -80,14 +90,8 @@ def _geo_membership_fixture() -> dict[str, object]:
         "run_id": "run_geo_membership_test",
         "npi": 1003968710,
         "address_key": "47ab23c8-74f7-41eb-8ffb-e8b9f6214594",
-        "included_record_id": (
-            "provider_directory_fhir:organization_address:"
-            f"{source_id}:organization-included:0"
-        ),
-        "excluded_record_id": (
-            "provider_directory_fhir:practitioner_role_address:"
-            f"{source_id}:role-excluded:0"
-        ),
+        "included_record_id": (f"provider_directory_fhir:organization_address:{source_id}:organization-included:0"),
+        "excluded_record_id": (f"provider_directory_fhir:practitioner_role_address:{source_id}:role-excluded:0"),
     }
 
 
@@ -127,8 +131,9 @@ async def _insert_current_dataset(session, schema: str, fixture: dict) -> None:
         text(
             f"INSERT INTO {schema}.provider_directory_endpoint_dataset "
             "(dataset_id, endpoint_id, import_run_id, status, is_current, "
-            "resource_count) VALUES "
-            "(:dataset_id, :endpoint_id, :run_id, 'acquiring', false, 1)"
+            "resource_count, publication_metadata_json) VALUES "
+            "(:dataset_id, :endpoint_id, :run_id, 'acquiring', false, 1, "
+            "jsonb_build_object('source_ids', jsonb_build_array(CAST(:source_id AS varchar))))"
         ),
         fixture,
     )
@@ -274,8 +279,8 @@ async def test_geo_evidence_excludes_resource_absent_from_current_dataset():
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_location_status_query_uses_current_typed_row_and_dataset_fallback():
-    """Use current typed rows and immutable payloads for mismatched checkpoints."""
+async def test_location_status_reads_immutable_publication():
+    """Mutable role changes cannot replace the published payload status."""
     _requires_test_database()
     schema = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 
@@ -290,22 +295,20 @@ async def test_location_status_query_uses_current_typed_row_and_dataset_fallback
                 ),
                 {
                     "source_record_ids": [
-                        role_record["source_record_id"]
-                        for role_record in LOCATION_STATUS_ROLE_RECORDS
+                        role_record["source_record_id"] for role_record in LOCATION_STATUS_ROLE_RECORDS
                     ]
                 },
             )
             status_by_record_id = {
-                status_row._mapping["source_record_id"]: status_row._mapping[
-                    "location_status"
-                ]
+                status_row._mapping["source_record_id"]: status_row._mapping["location_status"]
                 for status_row in query_result.all()
             }
 
             assert status_by_record_id == {
-                LOCATION_STATUS_ROLE_RECORDS[0]["source_record_id"]: "inactive",
+                LOCATION_STATUS_ROLE_RECORDS[0]["source_record_id"]: "active",
                 LOCATION_STATUS_ROLE_RECORDS[1]["source_record_id"]: "inactive",
-                LOCATION_STATUS_ROLE_RECORDS[2]["source_record_id"]: "inactive",
+                LOCATION_STATUS_ROLE_RECORDS[2]["source_record_id"]: "active",
+                LOCATION_STATUS_ROLE_RECORDS[3]["source_record_id"]: "inactive",
             }
         finally:
             await fixture_savepoint.rollback()

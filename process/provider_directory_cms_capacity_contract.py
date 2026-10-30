@@ -18,6 +18,7 @@ from process.provider_directory_profile_capacity_preflight_contract import (
     canonical_preflight_json,
     preflight_domain_sha256,
 )
+from process.provider_directory_serving_inverse_capacity_contract import InverseCapacityPreflightRequest
 
 CMS_ADMISSION_REQUEST_CONTRACT = "provider-directory-cms-nonprofile-admission-request.v1"
 CMS_LIMITS_CONTRACT = "provider-directory-cms-nonprofile-limits.v1"
@@ -149,7 +150,10 @@ def validated_registry_source_retention_policy(raw: Any) -> dict[str, Any]:
 
 def require_profile_capacity_request(request: Any) -> None:
     """Prevent the Profile-only producer from signing additional CMS costs."""
-    if request.cms_nonprofile_admission is not None:
+    if (
+        request.cms_nonprofile_admission is not None
+        or getattr(request, "serving_nonprofile_admission", None) is not None
+    ):
         _invalid("native_projection_required")
 
 
@@ -157,12 +161,37 @@ def validated_cms_execution_capacity(
     raw: Any, *, profile_envelope: Any, attestation: Any, generation: int
 ) -> dict[str, Any]:
     """Retain the exact desired-publish pair; admission still verifies signatures and runtime."""
+    return _validated_execution_capacity(
+        raw,
+        profile_envelope=profile_envelope,
+        attestation=attestation,
+        generation=generation,
+        purpose="cms_nonprofile",
+    )
+
+
+def _execution_capacity_contract(purpose, attestation):
+    if purpose == "cms_nonprofile":
+        if attestation.operation != "publish" or attestation.desired_cms_dataset is None:
+            _invalid("execution_desired_publish_required")
+        return CMS_PREFLIGHT_CONTRACT, CMS_PREFLIGHT_REQUEST_CONTRACT, CMS_ADMISSION_FIELD
+    from process import provider_directory_serving_capacity_contract as serving
+
+    if purpose != serving.PURPOSE:
+        _invalid("execution_purpose_invalid")
+    serving.require_ordinary_selection(attestation.payload)
+    return serving.PREFLIGHT_RECEIPT, serving.PREFLIGHT_REQUEST, serving.ADMISSION_FIELD
+
+
+def _validated_execution_capacity(
+    raw: Any, *, profile_envelope: Any, attestation: Any, generation: int, purpose: str
+) -> dict[str, Any]:
+    """Parse either closed additional purpose without granting signature or runtime admission."""
     from process import provider_directory_profile_capacity_attestation as lease
     from process.provider_directory_profile_capacity_attestation_contract import _SIGNED_BODY_FIELDS
     from process.provider_directory_profile_capacity_preflight_contract import validated_capacity_preflight_request
 
-    if attestation.operation != "publish" or attestation.desired_cms_dataset is None:
-        _invalid("execution_desired_publish_required")
+    receipt_contract, request_contract, admission_field = _execution_capacity_contract(purpose, attestation)
     envelope_by_field = dict(
         _exact_mapping(raw, frozenset({"lease", "signature"}), reason="cms_execution_fields_invalid")
     )
@@ -174,18 +203,15 @@ def validated_cms_execution_capacity(
     request_by_field = guard.get("healthcare_request") if isinstance(guard, Mapping) else None
     if (
         not isinstance(receipt, Mapping)
-        or receipt.get("contract_id") != CMS_PREFLIGHT_CONTRACT
-        or (
-            not isinstance(request_by_field, Mapping)
-            or request_by_field.get("contract_id") != CMS_PREFLIGHT_REQUEST_CONTRACT
-        )
+        or receipt.get("contract_id") != receipt_contract
+        or (not isinstance(request_by_field, Mapping) or request_by_field.get("contract_id") != request_contract)
     ):
         _invalid("execution_purpose_invalid")
     request = validated_capacity_preflight_request(request_by_field)
     if (
         request.execution.attestation.payload != attestation.payload
         or request.execution.generation != generation
-        or (request.cms_nonprofile_admission["paired_profile_lease"] != profile_envelope)
+        or (getattr(request, admission_field)["paired_profile_lease"] != profile_envelope)
     ):
         _invalid("execution_pair_changed")
     try:
@@ -200,13 +226,13 @@ def validated_cms_execution_capacity(
     return json.loads(canonical_preflight_json(envelope_by_field))
 
 
-def capacity_preflight_receipt_row_values(
-    request: Any, receipt: Mapping[str, Any], *, issued_at: datetime.datetime
-) -> dict[str, Any]:
-    """Retain the exact matching receipt/request version and immutable row identity."""
+def _receipt_contract_versions(request):
+    """Select the existing exact receipt/request pair without changing any forward schema."""
     from process import provider_directory_profile_initial_contract as initial
+    from process import provider_directory_serving_capacity_contract as ordinary
 
     is_cms = request.cms_nonprofile_admission is not None
+    is_ordinary = getattr(request, "serving_nonprofile_admission", None) is not None
     is_initial = initial.is_initial_request(request)
     receipt_contract = (
         CMS_PREFLIGHT_CONTRACT
@@ -218,6 +244,21 @@ def capacity_preflight_receipt_row_values(
         if is_cms
         else (initial.REQUEST_CONTRACT if is_initial else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID)
     )
+    if is_ordinary:
+        receipt_contract, request_contract = ordinary.PREFLIGHT_RECEIPT, ordinary.PREFLIGHT_REQUEST
+    return receipt_contract, request_contract
+
+
+def capacity_preflight_receipt_row_values(
+    request: Any, receipt: Mapping[str, Any], *, issued_at: datetime.datetime
+) -> dict[str, Any]:
+    """Retain the exact matching receipt/request version and immutable row identity."""
+    if type(request) is InverseCapacityPreflightRequest:
+        from process.provider_directory_serving_inverse_capacity_preflight import receipt_row_values
+
+        return receipt_row_values(request, receipt, issued_at=issued_at)
+
+    receipt_contract, request_contract = _receipt_contract_versions(request)
     if (
         receipt["contract_id"] != receipt_contract
         or receipt["request_contract_id"] != request_contract
@@ -255,14 +296,24 @@ def capacity_preflight_receipt_row_values(
 
 def read_capacity_preflight_receipt(receipt_row: Mapping[str, Any], lease: Any) -> dict[str, Any]:
     """Check stored bytes and CMS metadata against the already verified signed guard."""
+    from process import provider_directory_serving_inverse_capacity_contract as inverse
+
+    if lease.signing_preflight_guard["healthcare_receipt"]["contract_id"] == inverse.HEALTHCARE_RECEIPT:
+        from process.provider_directory_serving_inverse_capacity_preflight import read_inverse_receipt_row
+
+        return read_inverse_receipt_row(receipt_row, lease)
+
     from process import provider_directory_profile_capacity_preflight_contract as base
     from process import provider_directory_profile_initial_contract as initial
     from process.provider_directory_profile_capacity_signing_guard_contract import _HEALTHCARE_RECEIPT_FIELDS
 
     signed_receipt = lease.signing_preflight_guard["healthcare_receipt"]
+    from process import provider_directory_serving_capacity_contract as ordinary
+
     is_cms = signed_receipt["contract_id"] == CMS_PREFLIGHT_CONTRACT
+    is_ordinary = signed_receipt["contract_id"] == ordinary.PREFLIGHT_RECEIPT
     is_initial = signed_receipt["contract_id"] == initial.RECEIPT_CONTRACT
-    fields = _HEALTHCARE_RECEIPT_FIELDS | {"database_binding"} if is_cms else _HEALTHCARE_RECEIPT_FIELDS
+    fields = _HEALTHCARE_RECEIPT_FIELDS | {"database_binding"} if is_cms or is_ordinary else _HEALTHCARE_RECEIPT_FIELDS
     if is_initial:
         fields = fields | {"profile_materialization"}
     raw_receipt = receipt_row.get("receipt_json")
@@ -274,6 +325,8 @@ def read_capacity_preflight_receipt(receipt_row: Mapping[str, Any], lease: Any) 
         if is_cms
         else (initial.RECEIPT_CONTRACT if is_initial else CAPACITY_PREFLIGHT_CONTRACT_ID)
     )
+    if is_ordinary:
+        contract = ordinary.PREFLIGHT_RECEIPT
     digest = preflight_domain_sha256(
         contract, {name: field_value for name, field_value in receipt_by_field.items() if name != "receipt_sha256"}
     )
@@ -283,7 +336,7 @@ def read_capacity_preflight_receipt(receipt_row: Mapping[str, Any], lease: Any) 
         or (digest != lease.nonce or receipt_row.get("receipt_sha256") != digest)
     ):
         _invalid("stored_receipt_changed")
-    if is_cms or is_initial:
+    if is_cms or is_initial or is_ordinary:
         request = base.validated_capacity_preflight_request(lease.signing_preflight_guard["healthcare_request"])
         expected_by_field = capacity_preflight_receipt_row_values(
             request, receipt_by_field, issued_at=base._utc_timestamp(receipt_by_field["issued_at"])

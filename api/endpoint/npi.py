@@ -12,6 +12,7 @@ import math
 import os
 import random
 import re
+import sys
 import time
 import urllib.parse
 import uuid
@@ -60,6 +61,9 @@ from api.provider_directory_dataset_sql import (
     PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
     PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL,
     _provider_directory_current_resource_ctes_sql,
+    _provider_directory_network_catalog_cte_sql,
+    _provider_directory_overlay_dataset_ctes_sql,
+    _scoped_role_evidence_sql,
 )
 from api.provider_geo_sql import (
     ImportedGeoQuery,
@@ -1802,7 +1806,7 @@ def _provider_directory_current_payload_column_sql(column: Any) -> str:
     return f"CAST(resource.payload_json ->> '{column_name}' AS {column_type}) AS {column_name}"
 
 
-def _current_typed_resource_ctes_sql() -> str:
+def _current_typed_resource_ctes_sql(has_dataset_scope: bool = False) -> str:
     """Expose current immutable dataset payloads with typed-table column names."""
     cte_sql_list = []
     for cte_name, resource_type, model in _CURRENT_PROVIDER_DIRECTORY_TYPED_RESOURCE_MODELS:
@@ -1823,6 +1827,8 @@ def _current_typed_resource_ctes_sql() -> str:
     )
             """.strip()
         )
+    if has_dataset_scope:
+        cte_sql_list.append(_provider_directory_network_catalog_cte_sql())
     return ", ".join(cte_sql_list)
 
 
@@ -1840,7 +1846,9 @@ def _provider_directory_current_resource_join_sql(
     """
 
 
-def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -> tuple[str, str, str]:
+def _provider_directory_network_resolution_sql(
+    schema: str, has_catalog: bool, catalog_relation: str | None = None
+) -> tuple[str, str, str]:
     organization_join = (
         "LEFT JOIN current_organizations AS network_organization "
         "ON network_organization.dataset_id = network.dataset_id "
@@ -1851,7 +1859,7 @@ def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -
     if not has_catalog:
         return organization_join, "network_organization.name", "'provider_directory_organization'::varchar"
     catalog_join = (
-        f"LEFT JOIN {schema}.provider_directory_network_catalog AS network_catalog "
+        f"LEFT JOIN {catalog_relation or f'{schema}.provider_directory_network_catalog'} AS network_catalog "
         "ON network_catalog.source_id = network.source_id "
         "AND network_catalog.network_resource_id = network.resource_id"
     )
@@ -1967,7 +1975,7 @@ def _legacy_affiliation_candidates_sql(
     """
 
 
-def _legacy_affiliation_network_sql(schema: str, has_affiliations: bool) -> str:
+def _legacy_affiliation_network_sql(schema: str, has_affiliations: bool, has_dataset_scope: bool = False) -> str:
     if not has_affiliations:
         return """
     legacy_affiliation_networks AS MATERIALIZED (
@@ -1986,6 +1994,9 @@ def _legacy_affiliation_network_sql(schema: str, has_affiliations: bool) -> str:
         "affiliation_network_ref.value",
         "Organization",
     )
+    locator_relation = (
+        "current_affiliations" if has_dataset_scope else f"{schema}.provider_directory_organization_affiliation"
+    )
     return f"""
     legacy_affiliation_networks AS MATERIALIZED (
         SELECT DISTINCT organization_candidate.dataset_id,
@@ -1996,7 +2007,7 @@ def _legacy_affiliation_network_sql(schema: str, has_affiliations: bool) -> str:
                'organization-affiliation-network-derived'::varchar AS plan_provenance,
                'provider_directory_organization_affiliation'::varchar AS evidence_provenance
           FROM affiliation_organization_candidates AS organization_candidate
-          JOIN {schema}.provider_directory_organization_affiliation AS affiliation_locator
+          JOIN {locator_relation} AS affiliation_locator
             ON affiliation_locator.source_id = organization_candidate.source_id
            AND affiliation_locator.participating_organization_ref = organization_candidate.reference
           JOIN current_affiliations AS affiliation
@@ -2016,6 +2027,7 @@ def _provider_directory_affiliation_network_ctes_sql(
     schema: str,
     has_affiliations: bool,
     has_dataset_affiliation_organization: bool,
+    has_dataset_scope: bool = False,
 ) -> str:
     """Build active affiliation networks from dataset relations or legacy locators."""
     if not has_affiliations and not has_dataset_affiliation_organization:
@@ -2035,6 +2047,7 @@ def _provider_directory_affiliation_network_ctes_sql(
     legacy_network_sql = _legacy_affiliation_network_sql(
         schema,
         has_affiliations,
+        has_dataset_scope,
     )
     return f"""
     role_organizations AS MATERIALIZED (
@@ -2088,7 +2101,7 @@ def _missing_catalog_plan_ctes_sql() -> str:
     """
 
 
-def _role_catalog_status_cte_sql(schema: str) -> str:
+def _role_catalog_status_cte_sql(schema: str, catalog_relation: str | None = None) -> str:
     """Require a catalog row for every role network before deriving plans."""
     return f"""
     role_catalog_status AS MATERIALIZED (
@@ -2101,7 +2114,7 @@ def _role_catalog_status_cte_sql(schema: str) -> str:
             ON role_network.dataset_id = role.dataset_id
            AND role_network.source_id = role.source_id
            AND role_network.role_id = role.role_id
-          LEFT JOIN {schema}.provider_directory_network_catalog AS network_catalog
+          LEFT JOIN {catalog_relation or f"{schema}.provider_directory_network_catalog"} AS network_catalog
             ON network_catalog.source_id = role_network.source_id
            AND network_catalog.network_resource_id = role_network.resource_id
       GROUP BY role.dataset_id, role.source_id, role.role_id
@@ -2369,12 +2382,13 @@ def _provider_directory_catalog_plan_ctes_sql(
     has_dataset_network_plan: bool,
     has_dataset_insurance_plan: bool,
     has_dataset_insurance_plan_scalars: bool,
+    catalog_relation: str | None = None,
 ) -> str:
     """Build catalog-gated role plan CTEs without expanding catalog payloads."""
     if not has_catalog:
         return _missing_catalog_plan_ctes_sql()
     return f"""
-    {_role_catalog_status_cte_sql(schema)},
+    {_role_catalog_status_cte_sql(schema, catalog_relation=catalog_relation)},
     {
         _network_derived_role_plans_cte_sql(
             schema,
@@ -2394,18 +2408,17 @@ def _provider_directory_network_plan_ctes_sql(
     has_dataset_affiliation_organization: bool,
     has_dataset_insurance_plan: bool,
     has_dataset_insurance_plan_scalars: bool,
+    catalog_relation: str | None = None,
 ) -> str:
     """Build same-source network intersection CTEs for role plan evidence."""
     role_network_id = _provider_directory_reference_resource_id_sql("role_network_ref.value", "Organization")
-    affiliation_ctes_sql = _provider_directory_affiliation_network_ctes_sql(
-        schema, has_affiliations, has_dataset_affiliation_organization
-    )
     plan_ctes_sql = _provider_directory_catalog_plan_ctes_sql(
         schema,
         has_catalog,
         has_dataset_network_plan,
         has_dataset_insurance_plan,
         has_dataset_insurance_plan_scalars,
+        catalog_relation=catalog_relation,
     )
     return f"""
     direct_role_networks AS MATERIALIZED (
@@ -2419,7 +2432,11 @@ def _provider_directory_network_plan_ctes_sql(
          CROSS JOIN LATERAL jsonb_array_elements_text(
                COALESCE(role.network_refs, '[]'::jsonb)
          ) AS role_network_ref(value)
-    ), {affiliation_ctes_sql}, role_networks AS MATERIALIZED (
+    ), {
+        _provider_directory_affiliation_network_ctes_sql(
+            schema, has_affiliations, has_dataset_affiliation_organization, catalog_relation is not None
+        )
+    }, role_networks AS MATERIALIZED (
         SELECT dataset_id, source_id, role_id, dataset_network_plan_complete,
                reference, resource_id,
                plan_provenance, evidence_provenance
@@ -2694,6 +2711,7 @@ def _provider_directory_role_ctes_sql(
     has_dataset_affiliation_organization: bool,
     has_dataset_insurance_plan: bool,
     has_dataset_insurance_plan_scalars: bool,
+    catalog_relation: str | None = None,
 ) -> str:
     """Compose keyed role, network, capped-plan, and network-evidence CTEs."""
     requested_role_ctes_sql = _provider_directory_requested_role_ctes_sql(schema)
@@ -2705,6 +2723,7 @@ def _provider_directory_role_ctes_sql(
         has_dataset_affiliation_organization,
         has_dataset_insurance_plan,
         has_dataset_insurance_plan_scalars,
+        catalog_relation=catalog_relation,
     )
     plan_cap_ctes_sql = _provider_directory_plan_cap_ctes_sql()
     evidence_network_id = _provider_directory_reference_resource_id_sql(
@@ -2736,10 +2755,11 @@ def _provider_directory_role_ctes_sql(
     """
 
 
-def _provider_directory_evidence_union_sql(schema: str, has_catalog: bool) -> str:
+def _provider_directory_evidence_union_sql(schema: str, has_catalog: bool, catalog_relation: str | None = None) -> str:
     network_joins, network_name, network_provenance = _provider_directory_network_resolution_sql(
         schema,
         has_catalog,
+        catalog_relation=catalog_relation,
     )
     return f"""
         SELECT role.source_id, role.role_id, 'role'::varchar AS evidence_type,
@@ -3282,16 +3302,20 @@ async def _fetch_provider_directory_role_evidence_map(
     role_key_list: Sequence[tuple[str, str]],
     *,
     session: Any = None,
+    source_datasets: Sequence[tuple[str, str]] | None = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     """Fetch bounded role evidence without scanning immutable resource payloads."""
     bounded_keys = list(dict.fromkeys(role_key_list))[:MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS]
     if not bounded_keys:
         return {}
+    if source_datasets is None:
+        raise RuntimeError("provider_directory_evidence_lineage_unavailable")
     if session is None:
         async with db.session() as evidence_session:
             return await _fetch_provider_directory_role_evidence_map(
                 bounded_keys,
                 session=evidence_session,
+                source_datasets=source_datasets,
             )
     table_flags = await _provider_directory_evidence_tables(
         session,
@@ -3315,20 +3339,11 @@ async def _fetch_provider_directory_role_evidence_map(
     schema = _runtime_db_schema()
     await _disable_provider_directory_evidence_jit(session)
     evidence_result = await _execute_stmt(
-        text(
-            _provider_directory_role_evidence_sql(
-                schema,
-                table_flags["provider_directory_network_catalog"],
-                table_flags["provider_directory_organization_affiliation"],
-                table_flags[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE],
-                table_flags[PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE],
-                table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
-                _has_provider_directory_plan_scalars(table_flags),
-                all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
-            )
-        ),
+        text(_scoped_role_evidence_sql(sys.modules[__name__], schema, table_flags)),
         session=session,
         params={
+            "evidence_source_ids": [source_id for source_id, _dataset_id in source_datasets],
+            "evidence_dataset_ids": [dataset_id for _source_id, dataset_id in source_datasets],
             "source_ids": [source_id for source_id, _role_id in bounded_keys],
             "role_ids": [role_id for _source_id, role_id in bounded_keys],
         },
@@ -3609,9 +3624,12 @@ def _affiliation_plan_cap_ctes_sql() -> str:
 def _provider_directory_affiliation_evidence_union_sql(
     schema: str,
     has_catalog: bool,
+    catalog_relation: str | None = None,
 ) -> str:
     """Project affiliation, plan, and current network evidence rows."""
-    network_joins, network_name, _network_provenance = _provider_directory_network_resolution_sql(schema, has_catalog)
+    network_joins, network_name, _network_provenance = _provider_directory_network_resolution_sql(
+        schema, has_catalog, catalog_relation=catalog_relation
+    )
     return f"""
         SELECT affiliation.source_id, affiliation.affiliation_id,
                'affiliation'::varchar AS evidence_type,
@@ -3655,12 +3673,16 @@ def _provider_directory_affiliation_evidence_sql(
     has_dataset_insurance_plan: bool = False,
     has_dataset_insurance_plan_scalars: bool = False,
     has_dataset_readiness_indexes: bool = False,
+    has_dataset_scope: bool = False,
 ) -> str:
     """Resolve exact affiliation network and plan evidence from current resources."""
+    catalog_relation = "pinned_network_catalog" if has_dataset_scope else None
+    has_catalog = has_catalog or has_dataset_scope
     current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(
         schema,
         has_dataset_insurance_plan,
         has_dataset_readiness_indexes,
+        has_dataset_scope=has_dataset_scope,
     )
     affiliation_ctes_sql = _provider_directory_requested_affiliation_ctes_sql(schema)
     plan_resolution_cte_sql = _affiliation_plan_resolution_cte_sql(
@@ -3673,8 +3695,9 @@ def _provider_directory_affiliation_evidence_sql(
     evidence_union_sql = _provider_directory_affiliation_evidence_union_sql(
         schema,
         has_catalog,
+        catalog_relation=catalog_relation,
     )
-    current_typed_resource_ctes_sql = _current_typed_resource_ctes_sql()
+    current_typed_resource_ctes_sql = _current_typed_resource_ctes_sql(has_dataset_scope)
     return f"""
     WITH {current_resource_ctes_sql}, {current_typed_resource_ctes_sql},
          {affiliation_ctes_sql},
@@ -3758,16 +3781,20 @@ async def _fetch_provider_directory_affiliation_evidence_map(
     affiliation_key_list: Sequence[tuple[str, str]],
     *,
     session: Any = None,
+    source_datasets: Sequence[tuple[str, str]] | None = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     """Fetch bounded affiliation evidence through compact serving relations."""
     bounded_keys = list(dict.fromkeys(affiliation_key_list))[:MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS]
     if not bounded_keys:
         return {}
+    if source_datasets is None:
+        raise RuntimeError("provider_directory_evidence_lineage_unavailable")
     if session is None:
         async with db.session() as evidence_session:
             return await _fetch_provider_directory_affiliation_evidence_map(
                 bounded_keys,
                 session=evidence_session,
+                source_datasets=source_datasets,
             )
     table_flags = await _provider_directory_evidence_tables(
         session,
@@ -3796,10 +3823,13 @@ async def _fetch_provider_directory_affiliation_evidence_map(
                 table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
                 _has_provider_directory_plan_scalars(table_flags),
                 all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
+                has_dataset_scope=True,
             )
         ),
         session=session,
         params={
+            "evidence_source_ids": [source_id for source_id, _dataset_id in source_datasets],
+            "evidence_dataset_ids": [dataset_id for _source_id, dataset_id in source_datasets],
             "source_ids": [source_id for source_id, _affiliation_id in bounded_keys],
             "affiliation_ids": [affiliation_id for _source_id, affiliation_id in bounded_keys],
         },
@@ -4191,13 +4221,24 @@ async def _attach_provider_directory_source_details(
     *,
     include_role_evidence: bool = False,
     session: Any = None,
+    profile_generation_id: str | None = None,
+    phone_digits: str | None = None,
 ) -> None:
     source_ids = _provider_directory_source_ids_from_addresses(addresses)
     if not source_ids:
         return
+    from api.provider_directory_evidence_lineage import bind_source_details, resolve_address_evidence
+
+    bindings, role_datasets, affiliation_datasets = await resolve_address_evidence(
+        sys.modules[__name__],
+        addresses,
+        profile_generation_id=profile_generation_id,
+        include_role_evidence=include_role_evidence,
+        phone_digits=phone_digits,
+        session=session,
+    )
     detail_by_id = await _fetch_provider_directory_source_detail_map(source_ids, session=session)
-    if not detail_by_id:
-        return
+    detail_by_id = bind_source_details(detail_by_id, source_ids, bindings)
     role_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] = {}
     affiliation_evidence_map: Mapping[tuple[str, str], Mapping[str, Any]] = {}
     if include_role_evidence:
@@ -4205,11 +4246,13 @@ async def _attach_provider_directory_source_details(
         role_evidence_map = await _fetch_provider_directory_role_evidence_map(
             role_key_list,
             session=session,
+            source_datasets=role_datasets,
         )
         affiliation_key_list = _provider_directory_affiliation_keys_from_addresses(addresses)
         affiliation_evidence_map = await _fetch_provider_directory_affiliation_evidence_map(
             affiliation_key_list,
             session=session,
+            source_datasets=affiliation_datasets,
         )
     for address in addresses:
         if not isinstance(address, dict):
@@ -6761,8 +6804,6 @@ def _match_candidate_column_sql(address_table_sql: str) -> dict[str, str]:
 
 def _current_provider_directory_geo_evidence_sql() -> str:
     """Return exact current-overlay provenance for bounded geo candidates."""
-    source_table = _schema_cache_key("provider_directory_source")
-    dataset_table = _schema_cache_key("provider_directory_endpoint_dataset")
     dataset_resource_table = _schema_cache_key("provider_directory_dataset_resource")
     overlay_table = _schema_cache_key("provider_directory_address_overlay")
     return f"""
@@ -6772,32 +6813,9 @@ def _current_provider_directory_geo_evidence_sql() -> str:
                        CAST(:candidate_npis AS bigint[]),
                        CAST(:candidate_address_keys AS uuid[])
                    ) AS requested(npi, address_key)
-        ), current_endpoint_counts AS MATERIALIZED (
-            SELECT dataset.endpoint_id
-              FROM {dataset_table} AS dataset
-             WHERE dataset.is_current IS TRUE
-          GROUP BY dataset.endpoint_id
-            HAVING COUNT(*) = 1
-        ), current_datasets AS MATERIALIZED (
-            SELECT dataset.endpoint_id, dataset.dataset_id,
-                   COALESCE(
-                       dataset.acquisition_root_run_id, dataset.import_run_id
-                   )::varchar AS run_id
-              FROM {dataset_table} AS dataset
-              JOIN current_endpoint_counts AS current_endpoint
-                ON current_endpoint.endpoint_id = dataset.endpoint_id
-             WHERE dataset.is_current IS TRUE
-               AND dataset.status = 'published'
-               AND dataset.published_at IS NOT NULL
-               AND dataset.superseded_at IS NULL
-               AND COALESCE(
-                       dataset.acquisition_root_run_id, dataset.import_run_id
-                   ) IS NOT NULL
-        ), current_provider_directory_runs AS MATERIALIZED (
-            SELECT source.source_id, dataset.dataset_id, dataset.run_id
-              FROM {source_table} AS source
-              JOIN current_datasets AS dataset
-                ON dataset.endpoint_id = source.endpoint_id
+        ), {_directory_current_dataset_ctes_sql(_runtime_db_schema())}, current_provider_directory_runs AS MATERIALIZED (
+            SELECT dataset.source_id, dataset.dataset_id, dataset.run_id
+              FROM current_datasets AS dataset
         )
         SELECT requested.npi, requested.address_key::text AS address_key,
                ARRAY_AGG(
@@ -7652,6 +7670,7 @@ async def _attach_match_candidate_source_details(
         rows,
         include_sources=bool(params.get("include_sources")),
         include_role_evidence=False,
+        phone_digits=params.get("phone_digits"),
         session=session,
     )
 
@@ -12262,6 +12281,9 @@ async def read_npi_detail(request, npi, *, native_args=None):
                 include_sources=include_sources,
                 include_role_evidence=include_evidence,
                 session=request_session,
+                profile_generation_id=(
+                    profile_record.get("profile", {}).get("generation_id") if profile_record else None
+                ),
             )
         fetch_provider_enrichment = (
             _fetch_provider_enrichment_summary_detail
@@ -13260,39 +13282,18 @@ async def _provider_directory_address_overlay_serving_identity(
 
 
 def _directory_current_dataset_ctes_sql(schema: str) -> str:
-    return f"""
-    current_endpoint_counts AS MATERIALIZED (
-        SELECT dataset.endpoint_id
-          FROM {schema}.provider_directory_endpoint_dataset AS dataset
-         WHERE dataset.is_current IS TRUE
-      GROUP BY dataset.endpoint_id
-        HAVING COUNT(*) = 1
-    ), current_datasets AS MATERIALIZED (
-        SELECT dataset.endpoint_id, dataset.dataset_id,
-               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
-          FROM {schema}.provider_directory_endpoint_dataset AS dataset
-          JOIN current_endpoint_counts AS current_endpoint
-            ON current_endpoint.endpoint_id = dataset.endpoint_id
-         WHERE dataset.is_current IS TRUE
-           AND dataset.status = 'published'
-           AND dataset.published_at IS NOT NULL
-           AND dataset.superseded_at IS NULL
-           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
-    )
-    """
+    return _provider_directory_overlay_dataset_ctes_sql(schema)
 
 
 def _directory_overlay_resource_ctes_sql(schema: str) -> str:
-    """Resolve current overlay resources without parsing unrelated graph metadata."""
+    """Resolve served overlay resources through their exact retained publication."""
     return f"""
     {_directory_current_dataset_ctes_sql(schema)}, current_resources AS NOT MATERIALIZED (
-        SELECT source.source_id, source.canonical_api_base,
+        SELECT dataset.source_id, dataset.canonical_api_base,
                dataset.dataset_id, dataset.run_id,
                resource.resource_type, resource.resource_id,
                resource.payload_json::jsonb AS payload_json
-          FROM {schema}.provider_directory_source AS source
-          JOIN current_datasets AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
+          FROM current_datasets AS dataset
           JOIN {schema}.provider_directory_dataset_resource AS resource
             ON resource.dataset_id = dataset.dataset_id
     )
@@ -13420,8 +13421,8 @@ def _provider_directory_location_status_sql(
     *,
     resource_type_sql: str,
 ) -> str:
-    role_start = f"{payload_sql} -> 'period' ->> 'start'"
-    role_end = f"{payload_sql} -> 'period' ->> 'end'"
+    role_start = f"COALESCE(NULLIF({payload_sql} ->> 'period_start', ''), {payload_sql} -> 'period' ->> 'start')"
+    role_end = f"COALESCE(NULLIF({payload_sql} ->> 'period_end', ''), {payload_sql} -> 'period' ->> 'end')"
     role_start_date = f"""
         CASE
             WHEN pg_input_is_valid(LEFT(COALESCE({role_start}, ''), 10), 'date')
@@ -13536,56 +13537,29 @@ async def _fetch_provider_directory_address_overlay(
 
 def _location_status_query(schema: str, overlay_table_sql: str) -> Any:
     current_dataset_ctes_sql = _directory_current_dataset_ctes_sql(schema)
-    role_table_sql = f"{schema}.{ProviderDirectoryPractitionerRole.__tablename__}"
-    resource_table_sql = f"{schema}.provider_directory_dataset_resource"
     location_status_sql = _provider_directory_location_status_sql(
-        "visible_role.payload_json",
-        resource_type_sql="'PractitionerRole'",
+        "visible_role.payload_json", resource_type_sql="'PractitionerRole'"
     )
-    # Typed rows are mutable; the immutable dataset payload preserves current
-    # publication semantics when a checkpoint run ID differs.
     return text(
         f"""
         WITH {current_dataset_ctes_sql}, matched_overlays AS MATERIALIZED (
-            SELECT overlay.source_record_id,
-                   overlay.source_id,
-                   overlay.resource_id,
-                   overlay.last_seen_run_id
+            SELECT overlay.source_record_id, overlay.source_id,
+                   overlay.resource_id, overlay.last_seen_run_id
               FROM {overlay_table_sql} AS overlay
              WHERE overlay.source_record_id = ANY(:source_record_ids)
                AND overlay.resource_type = 'PractitionerRole'
         ), visible_roles AS NOT MATERIALIZED (
-            SELECT overlay.source_record_id,
-                   CASE
-                       WHEN role.resource_id IS NOT NULL THEN jsonb_build_object(
-                           'active', role.active,
-                           'period', jsonb_build_object(
-                               'start', role.period_start,
-                               'end', role.period_end
-                           )
-                       )
-                       ELSE resource.payload_json::jsonb
-                   END AS payload_json
+            SELECT overlay.source_record_id, resource.payload_json::jsonb AS payload_json
               FROM matched_overlays AS overlay
-              JOIN {schema}.provider_directory_source AS source
-                ON source.source_id = overlay.source_id
               JOIN current_datasets AS dataset
-                ON dataset.endpoint_id = source.endpoint_id
+                ON dataset.source_id = overlay.source_id
                AND dataset.run_id = overlay.last_seen_run_id
-         LEFT JOIN {role_table_sql} AS role
-                ON role.source_id = overlay.source_id
-               AND role.resource_id = overlay.resource_id
-               AND role.last_seen_run_id = dataset.run_id
-         LEFT JOIN {resource_table_sql} AS resource
-                ON role.resource_id IS NULL
-               AND resource.dataset_id = dataset.dataset_id
+              JOIN {schema}.provider_directory_dataset_resource AS resource
+                ON resource.dataset_id = dataset.dataset_id
                AND resource.resource_type = 'PractitionerRole'
                AND resource.resource_id = overlay.resource_id
-             WHERE role.resource_id IS NOT NULL
-                OR resource.resource_id IS NOT NULL
         )
-        SELECT visible_role.source_record_id,
-               {location_status_sql} AS location_status
+        SELECT visible_role.source_record_id, {location_status_sql} AS location_status
           FROM visible_roles AS visible_role
       GROUP BY visible_role.source_record_id;
         """

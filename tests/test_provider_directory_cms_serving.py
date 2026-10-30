@@ -170,6 +170,62 @@ async def test_fresh_desired_route_preserves_context_and_heartbeat(monkeypatch, 
     ordinary.assert_not_awaited()
 
 
+@pytest.mark.parametrize("failure", [False, True])
+async def test_paired_ordinary_worker_uses_common_cut_and_preserves_historical_profile_result(monkeypatch, failure):
+    from process import provider_directory_ordinary_serving as ordinary
+    from process import provider_directory_ordinary_serving_publication as publication
+    from process import provider_directory_ordinary_serving_reuse as reuse
+
+    event_names = []
+    fhir = _fhir(event_names)
+    execution = SimpleNamespace(attestation=object(), serving_nonprofile_capacity_attestation={"pair": "assigned"})
+    result_by_field = {"profile_selection_result": {"generation": 1}}
+    prepared = SimpleNamespace(fence=object(), stages=(object(),), nonprofile_admission=object())
+    expected_by_family = {"profile": {"rows": 1}}
+
+    async def inputs(actual, **options):
+        assert actual is fhir and options["execution"] is execution
+        assert fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get() is execution
+        return prepared, object()
+
+    @asynccontextmanager
+    async def prepare(actual, **options):
+        assert actual is prepared
+        event_names.append("prepare")
+        try:
+            yield prepared, expected_by_family
+        finally:
+            event_names.append("cleanup")
+
+    async def commit(actual, hashes, *, run_id):
+        assert actual is prepared and hashes is expected_by_family
+        assert run_id == "run_" + "a" * 32
+        event_names.append("common-publish")
+        if failure:
+            raise RuntimeError("common_failed")
+        return result_by_field
+
+    monkeypatch.setattr(ordinary, "_current_inputs", inputs)
+    monkeypatch.setattr(ordinary, "_prepare_current", prepare)
+    monkeypatch.setattr(ordinary.preparation, "remaining_build_seconds", AsyncMock(return_value=10))
+    monkeypatch.setattr(reuse, "reuse_current_ordinary_serving", AsyncMock(return_value=None))
+    monkeypatch.setattr(publication, "commit_ordinary_serving", commit)
+    legacy = AsyncMock()
+    monkeypatch.setattr(serving, "_ordinary_profile", legacy)
+    operation = serving.publish_current_attested_profile(
+        fhir, run_id="run_" + "a" * 32, control_run_id="run_" + "a" * 32, execution=execution, metrics={}
+    )
+    if failure:
+        with pytest.raises(RuntimeError, match="common_failed"):
+            await operation
+    else:
+        assert await operation is result_by_field
+    assert event_names == ["heartbeat-paused", "prepare", "common-publish", "cleanup", "heartbeat-restored"]
+    assert fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get() is None
+    fhir._attach_profile_selection_result.assert_not_called()
+    legacy.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_borrowed_transaction_cannot_start_preparation(execution):
     fhir = _fhir([])

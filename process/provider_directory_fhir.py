@@ -104,7 +104,9 @@ from process import provider_directory_profile_initial_contract as profile_initi
 from process import provider_directory_profile_payload_custody as profile_payload_custody
 from process import provider_directory_profile_scope_copy as profile_scope_copy
 from process import provider_directory_profile_target_wal_witness as profile_statement_wal
+from process import provider_directory_public_seeds as public_directory_seeds
 from process import provider_directory_serving_recovery as serving_recovery
+from process import provider_directory_source_catalog_cleanup as source_catalog_cleanup
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
     mark_control_run,
@@ -1173,7 +1175,9 @@ CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
 CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
 )
-REST_PAGE_PREFETCH_PILOT_API_BASES = frozenset({CIGNA_PROVIDER_DIRECTORY_BASE})
+REST_PAGE_PREFETCH_PILOT_API_BASES = frozenset(
+    {CIGNA_PROVIDER_DIRECTORY_BASE, public_directory_seeds.CHRISTUS_PROVIDER_DIRECTORY_BASE}
+)
 CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR = "cigna_expected_nonempty_resource_returned_zero_rows"
 CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS = (15.0, 30.0, 60.0, 120.0)
 CARESOURCE_PROVIDER_DIRECTORY_BASE = (
@@ -1481,6 +1485,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         ARKANSAS_PROVIDER_DIRECTORY_BASE,
         CARESOURCE_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
+        public_directory_seeds.CHRISTUS_PROVIDER_DIRECTORY_BASE,
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
@@ -1572,6 +1577,7 @@ ENDPOINT_DATASET_FAILED = "failed"
 ENDPOINT_DATASET_ACQUISITION_ABANDONED = "acquisition_abandoned"
 ENDPOINT_DATASET_ACQUISITION_RETIRED = "acquisition_retired"
 ENDPOINT_DATASET_VALIDATED = "validated"
+ENDPOINT_DATASET_PUBLICATION_ACKNOWLEDGED = "publication_acknowledged"
 ENDPOINT_DATASET_PUBLISHED = "published"
 ENDPOINT_DATASET_SUPERSEDED = "superseded"
 ENDPOINT_DATASET_VERIFICATION_BASELINE = "verification_baseline"
@@ -1692,6 +1698,7 @@ IMMUTABLE_ENDPOINT_DATASET_STATUSES = (
     ENDPOINT_DATASET_ACQUISITION_ABANDONED,
     ENDPOINT_DATASET_ACQUISITION_RETIRED,
     ENDPOINT_DATASET_VALIDATED,
+    ENDPOINT_DATASET_PUBLICATION_ACKNOWLEDGED,
     ENDPOINT_DATASET_PUBLISHED,
     ENDPOINT_DATASET_SUPERSEDED,
     ENDPOINT_DATASET_VERIFICATION_BASELINE,
@@ -1700,6 +1707,7 @@ IMMUTABLE_ENDPOINT_DATASET_STATUSES = (
 FHIR_CONTINUATION_QUERY_NAMES = frozenset(
     {
         "_continuationtoken",
+        "_cursor",
         "_getpages",
         "_getpagesid",
         "_getpagesoffset",
@@ -26290,53 +26298,11 @@ def _provider_directory_profile_capacity_metric_map(
     }
 
 
-async def _consume_provider_directory_profile_capacity_lease(
-    *,
-    schema: str,
-    values_by_name: Mapping[str, Any],
-) -> None:
-    """Insert once or accept only an exact immutable replay."""
-    values_by_name = {"admission_purpose": "profile", **values_by_name}
-    if values_by_name["admission_purpose"] not in {"profile", "cms_nonprofile"}:
-        raise RuntimeError("provider_directory_capacity_admission_purpose_invalid")
-    field_names = tuple(values_by_name)
-    field_sql = ", ".join(_q(field_name) for field_name in field_names)
-    value_sql = ", ".join(":" + field_name for field_name in field_names)
-    consumption_ref = _unscoped_qt(schema, ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__)
-    inserted_count = _coerce_rowcount(
-        await db.status(
-            f"""
-            INSERT INTO {consumption_ref} ({field_sql})
-            VALUES ({value_sql})
-            ON CONFLICT DO NOTHING;
-            """,
-            **dict(values_by_name),
-        )
-    )
-    if inserted_count == 1:
-        return
-    existing_rows = await db.all(
-        f"""
-        SELECT admission_purpose, attestation_id, reservation_id, lease_digest,
-               capacity_geometry_hash, executable_plan_hash,
-               selection_proof_id, source_vector_hash,
-               source_context_vector_hash, run_id, build_id,
-               profile_as_of, contract_id, key_id, environment_id,
-               attestor_id, attestor_release_digest,
-               public_key_fingerprint, database_system_identifier,
-               database_oid, database_name, tablespace_identity_hash,
-               volume_identity_hash, canonical_lease_json, signature,
-               observed_at, issued_at, accepted_at, expires_at,
-               max_build_deadline, recorded_at
-          FROM {consumption_ref}
-         WHERE attestation_id = :attestation_id
-            OR reservation_id = :reservation_id
-         ORDER BY attestation_id;
-        """,
-        attestation_id=values_by_name["attestation_id"],
-        reservation_id=values_by_name["reservation_id"],
-    )
-    _assert_profile_capacity_consumption_replay(existing_rows, values_by_name)
+async def _consume_provider_directory_profile_capacity_lease(*, schema: str, values_by_name: Mapping[str, Any]) -> None:
+    """Retain the existing shared consumer and exact immutable replay checks."""
+    from process.provider_directory_profile_capacity_consumption import consume_capacity_lease
+
+    await consume_capacity_lease(sys.modules[__name__], schema=schema, values_by_name=values_by_name)
 
 
 def _assert_profile_capacity_consumption_replay(existing_rows, values_by_name) -> None:
@@ -28116,14 +28082,18 @@ async def provider_directory_profile_capacity_authority_projection(
 ) -> dict[str, Any]:
     """Project exact capacity authority without writing or consuming state."""
 
-    if not isinstance(
-        request,
-        ProfileCapacityAuthorityProjectionRequest,
-    ):
+    from process import provider_directory_serving_inverse_capacity_contract as inverse
+
+    if type(request) is inverse.InverseCapacityPreflightRequest:
+        from process import provider_directory_serving_inverse_capacity_preflight as inverse_preflight
+
+        return await inverse_preflight.inverse_capacity_authority_projection(sys.modules[__name__], request)
+
+    if not isinstance(request, ProfileCapacityAuthorityProjectionRequest):
         raise ProviderDirectoryProfileCapacityPreflightError(
             "provider_directory_profile_capacity_preflight_authority_projection_request_invalid"
         )
-    if request.cms_nonprofile_admission is not None:
+    if request.cms_nonprofile_admission is not None or request.serving_nonprofile_admission is not None:
         from process.provider_directory_cms_preflight import capacity_authority_projection
 
         return await capacity_authority_projection(sys.modules[__name__], request)
@@ -28255,6 +28225,13 @@ async def provider_directory_profile_capacity_preflight(
 ) -> dict[str, Any]:
     """Issue one authenticated, replay-fenced Profile signing receipt."""
 
+    from process import provider_directory_serving_inverse_capacity_contract as inverse
+
+    if type(request) is inverse.InverseCapacityPreflightRequest:
+        from process import provider_directory_serving_inverse_capacity_preflight as inverse_preflight
+
+        return await inverse_preflight.inverse_capacity_preflight(sys.modules[__name__], request)
+
     if not isinstance(
         request,
         ProviderDirectoryProfileCapacityPreflightRequest,
@@ -28262,7 +28239,7 @@ async def provider_directory_profile_capacity_preflight(
         raise ProviderDirectoryProfileCapacityPreflightError(
             "provider_directory_profile_capacity_preflight_request_invalid"
         )
-    if request.cms_nonprofile_admission is not None:
+    if request.cms_nonprofile_admission is not None or request.serving_nonprofile_admission is not None:
         from process.provider_directory_cms_preflight import capacity_preflight
 
         return await capacity_preflight(sys.modules[__name__], request)
@@ -29712,46 +29689,10 @@ async def _assert_replay_database(
     geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
     lease: VerifiedDatabaseCapacityLease,
 ) -> None:
-    """Verify the replay still targets the database signed by its lease."""
-    database_identity = await _provider_directory_profile_capacity_database_identity(
-        schema,
-        serving,
-    )
-    geometry_fields = (
-        "database_system_identifier",
-        "database_oid",
-        "database_name",
-        "tablespace_oid",
-        "tablespace_name",
-        "postgres_server_version_num",
-        "postgres_block_size_bytes",
-        "postgres_wal_block_size_bytes",
-        "postgres_wal_segment_size_bytes",
-        "postgres_full_page_writes",
-        "postgres_wal_compression",
-        "postgres_wal_level",
-        "postgres_wal_log_hints",
-        "postgres_data_checksums",
-        "postgres_default_toast_compression",
-        "postgres_checkpoint_timeout_seconds",
-        "postgres_max_wal_size_bytes",
-        "evidence_target_storage_fingerprint",
-        "profile_target_storage_fingerprint",
-        "build_checkpoint_oid",
-        "serving_generation_oid",
-        "delta_receipt_oid",
-        "build_checkpoint_storage_fingerprint",
-        "serving_generation_storage_fingerprint",
-        "delta_receipt_storage_fingerprint",
-    )
-    expected_by_field = {field_name: getattr(geometry, field_name) for field_name in geometry_fields}
-    observed_by_field = {field_name: getattr(database_identity, field_name) for field_name in expected_by_field}
-    if observed_by_field != expected_by_field:
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_replay_database_changed")
-    _assert_provider_directory_profile_capacity_tablespaces(
-        lease,
-        database_identity,
-    )
+    """Verify replay against its original database and exact known metadata evolution."""
+    from process.provider_directory_profile_initial_history import assert_replay_database
+
+    await assert_replay_database(sys.modules[__name__], schema, serving, geometry, lease)
 
 
 def _assert_replay_timeline(
@@ -40197,19 +40138,7 @@ def _provider_directory_blocker_seed_rows(*, source_query: str | None = None) ->
 
 
 def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list[dict[str, Any]]:
-    seed_row_by_field = {
-        "id": "health-partners-plans-provider-directory",
-        "org_name": "Health Partners Plans",
-        "plan_name": "Health Partners Plans Provider Directory",
-        "api_base": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
-        "auth_type": "none",
-        "last_validated_status": "valid",
-        "requires_registration": False,
-        "source": "health-partners-plans-fhir-root",
-        "source_detail": "official Health Partners Plans public Provider Directory FHIR server",
-        "source_url": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
-        "note": "Supplemental Provider Directory source from the Health Partners Plans public FHIR server.",
-    }
+    seed_row_by_field = public_directory_seeds.health_partners_seed(HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE)
     return [seed_row_by_field] if _is_seed_row_query_match(seed_row_by_field, source_query) else []
 
 
@@ -40520,6 +40449,12 @@ def _seed_rows_from_supplemental_catalogs(
     )
     supplemental_rows.extend(remote_rows)
     metrics_by_name["catalogs"].update(remote_metrics_by_catalog)
+    christus_rows = [
+        seed for seed in public_directory_seeds.christus_seed_rows() if _is_seed_row_query_match(seed, source_query)
+    ]
+    supplemental_rows.extend(christus_rows)
+    christus_base = public_directory_seeds.CHRISTUS_PROVIDER_DIRECTORY_BASE
+    metrics_by_name["catalogs"]["christus_health_plan"] = {"source": christus_base, "rows": len(christus_rows)}
     catalog_rows = _health_partners_plans_seed_rows(source_query=source_query)
     supplemental_rows.extend(catalog_rows)
     metrics_by_name["catalogs"]["health_partners_plans"] = {
@@ -40993,13 +40928,14 @@ async def _fetch_json_with_source_session(
         sock_read=timeout,
     )
     started = time.monotonic()
+    preserve_url_bytes = preserve_url_bytes or public_directory_seeds.is_christus_request_url(url)
     request_url = URL(url, encoded=True) if preserve_url_bytes else url
     try:
         async with session.get(
             request_url,
             headers=headers_by_name,
             timeout=request_timeout,
-            allow_redirects=allow_redirects,
+            allow_redirects=allow_redirects and not public_directory_seeds.is_christus_request_url(url),
         ) as response:
             payload_by_field = await _read_source_http_payload(
                 response,
@@ -41039,7 +40975,7 @@ def _fetch_json_sync(
     started = time.monotonic()
     request = urllib.request.Request(fetch_url, headers=headers_by_name)
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+        with public_directory_seeds.open_source_request(request, timeout=timeout, context=_ssl_context()) as response:
             body = _read_response_body_with_deadline(response, timeout=timeout)
             return response.status, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
     except urllib.error.HTTPError as exc:
@@ -42875,17 +42811,7 @@ def _synthetic_position_page_guard_completeness(
 
 
 def _pagination_host_key(url_or_host: str | None) -> str | None:
-    text = _clean_text(url_or_host)
-    if not text:
-        return None
-    parsed = urllib.parse.urlsplit(text if "://" in text else f"https://{text}")
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
-        return None
-    try:
-        port = parsed.port or 443
-    except ValueError:
-        return None
-    return f"{parsed.hostname.lower()}:{port}"
+    return public_directory_seeds.pagination_host_key(_clean_text(url_or_host))
 
 
 def _pagination_allowed_hosts(
@@ -43082,6 +43008,8 @@ def _resolved_fhir_next_url(
     next_url = urllib.parse.urljoin(current_url, next_link)
     api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     parsed_next = urllib.parse.urlsplit(next_url)
+    if api_base == public_directory_seeds.CHRISTUS_PROVIDER_DIRECTORY_BASE:
+        return public_directory_seeds.resolved_christus_next_url(current_url, next_url)
     if api_base in FHIR_OFFSET_PAGINATION_BASES:
         return _resolved_offset_next_url(api_base, current_url, next_url)
     if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
@@ -57621,45 +57549,22 @@ async def _resolve_protected_catalog_source_ids(
     existing_source_ids = {
         source_id
         for source_record in protected_source_records
-        if (source_id := _clean_text(source_record.get("source_id")))
+        if (source_id := _clean_text(_pagination_checkpoint_row_mapping(source_record).get("source_id")))
     }
     missing_source_ids = sorted(set(protected_source_ids) - existing_source_ids)
     return existing_source_ids, missing_source_ids
 
 
-async def _delete_source_catalog_rows_except(
-    retained_source_ids: list[str],
-) -> dict[str, int]:
-    """Delete source-catalog rows not owned by the retained aliases."""
-    query_params_by_name = {"source_ids": retained_source_ids}
-    deleted_row_counts_by_table: dict[str, int] = {}
-    predicate = "NOT (source_id = ANY(CAST(:source_ids AS varchar[])))"
-    for model in SOURCE_CATALOG_STALE_TABLE_MODELS:
-        count = int(
-            await db.status(
-                f"""
-                DELETE FROM {_qt(_schema(), model.__tablename__)}
-                 WHERE {predicate};
-                """,
-                **query_params_by_name,
-            )
-            or 0
-        )
-        if count:
-            deleted_row_counts_by_table[model.__tablename__] = count
-    source_count = int(
-        await db.status(
-            f"""
-            DELETE FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)}
-             WHERE {predicate};
-            """,
-            **query_params_by_name,
-        )
-        or 0
-    )
-    if source_count:
-        deleted_row_counts_by_table[ProviderDirectorySource.__tablename__] = source_count
-    return deleted_row_counts_by_table
+async def _catalog_deletable_source_ids(retained_source_ids: list[str]) -> list[str]:
+    return await source_catalog_cleanup.deletable_source_ids(sys.modules[__name__], retained_source_ids)
+
+
+def _retained_catalog_source_ids_sql() -> str:
+    return source_catalog_cleanup.retained_source_ids_sql(sys.modules[__name__])
+
+
+async def _delete_source_catalog_rows_except(retained_source_ids: list[str]) -> dict[str, int]:
+    return await source_catalog_cleanup.delete_stale_rows(sys.modules[__name__], retained_source_ids)
 
 
 def _selected_resources(resources_input: Any) -> list[str]:

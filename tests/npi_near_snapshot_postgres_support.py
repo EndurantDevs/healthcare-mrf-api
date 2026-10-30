@@ -79,10 +79,52 @@ async def near_database(monkeypatch):
 
 def near_request():
     return SimpleNamespace(
+        path="/api/v1/npi/near/",
+        headers={},
         args={"lat": "41", "long": "-87", "include_total": "1", "limit": "1"},
         ctx=SimpleNamespace(sa_session=None),
         app=SimpleNamespace(),
     )
+
+
+def _middleware_near_reader(database, schema, monkeypatch):
+    """Exercise the real request owner and an authentic empty claims catalog."""
+    from process import reference_family_archive as archive
+
+    monkeypatch.setenv("HLTHPRT_API_READER_ENABLED", "true")
+    relation_oid = archive._relation_oid
+
+    async def relation_in_schema(session, source_schema, name):
+        return await relation_oid(session, schema if source_schema == "mrf" else source_schema, name)
+
+    monkeypatch.setattr(archive, "_relation_oid", relation_in_schema)
+    callbacks_by_kind = {}
+    app = SimpleNamespace(
+        listener=lambda _name: lambda callback: callback,
+        middleware=lambda kind: lambda callback: callbacks_by_kind.setdefault(kind, callback),
+    )
+    database.init_app(app)
+
+    async def read(request):
+        response = None
+        await callbacks_by_kind["request"](request)
+        try:
+            session = current_session()
+            assert session is request.ctx.sa_session and session.info["api_reader_verified"]
+            assert "provider_profile_native_authorities" in session.info and snapshot._SNAPSHOT.get() is not None
+            assert await session.scalar(
+                text(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() "
+                    "AND relation=to_regclass(:table) AND mode='AccessShareLock' AND granted)"
+                ),
+                {"table": f'"{schema}".entity_address_unified'},
+            )
+            response = await npi.get_near_npi(request)
+            return response
+        finally:
+            await callbacks_by_kind["response"](request, response)
+
+    return read
 
 
 async def _publish_address(database, schema, started=None, identity=None):
@@ -177,10 +219,11 @@ def _observe_near_reads(database, schema, monkeypatch):
     return state
 
 
-async def check_near_cutover(monkeypatch):
+async def check_near_cutover(monkeypatch, *, middleware=False):
     async with near_database(monkeypatch) as (database, schema):
         state = _observe_near_reads(database, schema, monkeypatch)
-        reader = asyncio.create_task(npi.get_near_npi(near_request()))
+        read = _middleware_near_reader(database, schema, monkeypatch) if middleware else npi.get_near_npi
+        reader = asyncio.create_task(read(near_request()))
         try:
             await _wait_for_read(reader, state.page_read)
             state.publication = asyncio.create_task(
@@ -199,12 +242,12 @@ async def check_near_cutover(monkeypatch):
         assert len({id(session) for session in state.reader_sessions}) == 1
         assert not state.reader_sessions[0].in_transaction() and snapshot._SNAPSHOT.get() is None
         state.is_pinned_phase = False
-        next_document = json.loads((await npi.get_near_npi(near_request())).body)
+        next_document = json.loads((await read(near_request())).body)
         assert next_document["total_count"] == 2 and [row["first_line"] for row in next_document["items"]] == ["new"]
         assert not database.has_reader_session() and database._transaction_binding() is None
 
 
-async def check_near_cleanup(monkeypatch, *, cancelled):
+async def check_near_cleanup(monkeypatch, *, cancelled, middleware=False):
     async with near_database(monkeypatch) as (database, schema):
         reached, sessions = asyncio.Event(), []
 
@@ -218,7 +261,8 @@ async def check_near_cleanup(monkeypatch, *, cancelled):
             raise AssertionError("The native read must fail")
 
         monkeypatch.setattr(npi, "_project_provider_network_metadata", unavailable_metadata)
-        reader = asyncio.create_task(npi.get_near_npi(near_request()))
+        read = _middleware_near_reader(database, schema, monkeypatch) if middleware else npi.get_near_npi
+        reader = asyncio.create_task(read(near_request()))
         try:
             await _wait_for_read(reader, reached)
             if cancelled:

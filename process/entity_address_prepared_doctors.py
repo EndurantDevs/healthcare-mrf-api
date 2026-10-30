@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import importlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -40,6 +40,7 @@ class PreparedAddressDependencies:
     stage_oids: tuple[tuple[str, str, int], ...]
     dependency_bindings: dict
     archive: PreparedArchiveDelta | None = None
+    ordinary_preparation: object = field(default=None, repr=False, compare=False)
 
 
 def _validate_doctors(database, schema, doctors, overrides_by_target):
@@ -113,7 +114,14 @@ def _validate_archive(schema, archive, overrides_by_target):
 
 
 async def capture_dependencies(
-    database, schema, relation_overrides, *, doctors=None, dependency_bindings=None, archive=None
+    database,
+    schema,
+    relation_overrides,
+    *,
+    doctors=None,
+    dependency_bindings=None,
+    archive=None,
+    ordinary_preparation=None,
 ):
     """Validate the trusted native bundle and copy its complete desired geo binding map."""
     overrides_by_target = dict(relation_overrides)
@@ -121,23 +129,31 @@ async def capture_dependencies(
         raise RuntimeError("entity-address Doctors override requires a prepared family")
     if archive is None and _ADDRESS_ARCHIVE in overrides_by_target:
         raise RuntimeError("entity-address archive override requires a prepared delta")
-    if doctors is None and dependency_bindings is None and archive is None:
+    if doctors is None and dependency_bindings is None and archive is None and ordinary_preparation is None:
         return None
     if doctors is not None:
         _validate_doctors(database, schema, doctors, overrides_by_target)
     if archive is not None:
         _validate_archive(schema, archive, overrides_by_target)
-    tiger_captured = await _captured_tiger_dependencies(database, dependency_bindings)
-    bindings = _validate_bindings(
-        schema,
-        doctors,
-        dependency_bindings,
-        **({"tiger_captured": tiger_captured} if tiger_captured is not None else {}),
-    )
+    if ordinary_preparation is not None:
+        from process.entity_address_ordinary_dependencies import refresh_dependencies
+
+        if doctors is not None or archive is not None:
+            raise RuntimeError("entity-address ordinary inputs cannot include prepared Source families")
+        bindings = await refresh_dependencies(database, schema, dependency_bindings, ordinary_preparation)
+    else:
+        tiger_captured = await _captured_tiger_dependencies(database, dependency_bindings)
+        bindings = _validate_bindings(
+            schema,
+            doctors,
+            dependency_bindings,
+            **({"tiger_captured": tiger_captured} if tiger_captured is not None else {}),
+        )
     captured = PreparedAddressDependencies(
-        schema, doctors, doctors.stage_oids if doctors is not None else (), bindings, archive
+        schema, doctors, doctors.stage_oids if doctors is not None else (), bindings, archive, ordinary_preparation
     )
-    await assert_prepared_dependencies(database, captured)
+    if ordinary_preparation is None:
+        await assert_prepared_dependencies(database, captured)
     return captured
 
 
@@ -150,8 +166,24 @@ async def _assert_bindings(session, schema, bindings):
         raise RuntimeError("entity-address geo dependency binding changed")
 
 
+def _ordinary_preparation(dependencies):
+    issued = getattr(dependencies, "ordinary_preparation", None)
+    if issued is not None and (
+        dependencies.doctors is not None or dependencies.archive is not None or dependencies.stage_oids
+    ):
+        raise RuntimeError("entity-address ordinary inputs cannot include prepared Source families")
+    return issued
+
+
 async def lock_prepared_relations(database, dependencies):
     """Check input names on the same locked backend that executes the source query."""
+    if _ordinary_preparation(dependencies) is not None:
+        from process.entity_address_ordinary_dependencies import lock_dependencies
+
+        await lock_dependencies(
+            database, dependencies.schema, dependencies.dependency_bindings, dependencies.ordinary_preparation
+        )
+        return
     if dependencies.archive is not None:
         await dependencies.archive.lock_read_backend(database)
     if dependencies.doctors is None:
@@ -170,15 +202,22 @@ async def lock_prepared_relations(database, dependencies):
         relations=[relation for relation, _oid in expected_identities],
         binding_oid=binding["relation_oid"],
     )
-    if [(row[0], row[1]) for row in observed_rows] != expected_identities:
+    if [(observed_row[0], observed_row[1]) for observed_row in observed_rows] != expected_identities:
         raise RuntimeError("entity-address prepared Doctors identity changed")
-    if any(row[2] != binding["relfilenode"] for row in observed_rows):
+    if any(observed_row[2] != binding["relfilenode"] for observed_row in observed_rows):
         raise RuntimeError("entity-address geo dependency binding changed")
 
 
 async def assert_prepared_dependencies(database, dependencies):
     """Recheck the incumbent authority and the complete prepared source before dependent reads."""
     if dependencies is None:
+        return
+    if _ordinary_preparation(dependencies) is not None:
+        from process.entity_address_ordinary_dependencies import refresh_dependencies
+
+        await refresh_dependencies(
+            database, dependencies.schema, dependencies.dependency_bindings, dependencies.ordinary_preparation
+        )
         return
     doctors_preparation, archive = _doctors_preparation(), _archive()
     async with database.transaction() as session, archive._bounded_capture(session):
@@ -214,6 +253,17 @@ async def assert_prepared_dependencies(database, dependencies):
 async def assert_applied_dependencies(database, dependencies):
     """Require the prepared source's actual native apply before address's canonical activation."""
     if dependencies is None:
+        return
+    if _ordinary_preparation(dependencies) is not None:
+        from process.entity_address_ordinary_dependencies import refresh_dependencies
+
+        await refresh_dependencies(
+            database,
+            dependencies.schema,
+            dependencies.dependency_bindings,
+            dependencies.ordinary_preparation,
+            applied=True,
+        )
         return
     doctors_preparation, archive = _doctors_preparation(), _archive()
     generation = importlib.import_module("process.reference_family_result_generation")

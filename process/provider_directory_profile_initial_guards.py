@@ -97,6 +97,27 @@ def _receipt_matches_sql(schema):
     ),false)"""
 
 
+def _reactivated_receipt_matches_sql(schema):
+    """Retain the old signed checks and distinguish fresh from authenticated recovery."""
+    target = "preflight.receipt_json::jsonb->'serving_generation_preflight'"
+    signed = "consumed.canonical_lease_json::jsonb->'signing_preflight_guard'->'healthcare_receipt'"
+    predicate = f"""
+          AND {signed}->'serving_generation_preflight'={target}
+          AND ((receipt.singleton_key='global'
+            AND {target}->>'contract_id'='healthporta.provider-directory-profile-initial-target-state.v1')
+          OR (receipt.singleton_key=to_hex(serving.control_generation) AND serving.control_generation>0
+            AND preflight.control_generation=serving.control_generation
+            AND {target}->>'contract_id'='healthporta.provider-directory-profile-initial-target-state.v2'
+            AND {target}->'initial_commit_receipt_absent'='false'::jsonb
+            AND {target}->'serving_singleton_absent'='true'::jsonb
+            AND jsonb_typeof({target}->'recovered_initial_publication')='object'))"""
+    suffix = "\n    ),false)"
+    previous = _receipt_matches_sql(schema)
+    if previous.count(suffix) != 1:
+        raise RuntimeError("provider_directory_profile_initial_receipt_guard_shape_changed")
+    return previous.replace(suffix, predicate + suffix)
+
+
 def _receipt_insert_body(schema):
     return f"""BEGIN
         IF NOT {_qt(schema, "pd_profile_initial_receipt_matches")}(NEW) THEN
@@ -117,6 +138,16 @@ def _serving_insert_body(schema):
     END;"""
 
 
+def validated_serving_guard_body(schema, source):
+    """Authenticate one exact installed revision before retaining its native identity."""
+    from process.provider_directory_profile_initial_inverse_guard import body
+
+    for expected in (_serving_insert_body(schema), body(schema)):
+        if _normalized(source) == _normalized(expected):
+            return expected
+    raise RuntimeError("provider_directory_profile_initial_receipt_guard_shape_changed")
+
+
 def initial_serving_guard_expected(schema):
     """Return the one extra serving guard; schema is an unquoted namespace name."""
     return {"pd_profile_initial_serving_insert": (21, True, _serving_insert_body(schema))}
@@ -124,31 +155,44 @@ def initial_serving_guard_expected(schema):
 
 async def _assert_match_function(database, schema):
     """Do not trust an unchanged trigger whose result-checking function has drifted."""
-    rows = await database.all(
+    function_rows = await database.all(
         """SELECT p.oid::bigint AS function_oid,n.nspname AS function_schema,p.proname AS function_name,
         p.prosrc,p.prosecdef,p.provolatile::text AS provolatile,p.proconfig,p.pronargs,
         p.proargnames,p.prorettype='bool'::regtype AS returns_boolean,p.proargtypes[0]=c.reltype AS receipt_argument,
-        l.lanname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        l.lanname,ARRAY(SELECT pg_get_constraintdef(k.oid,true) FROM pg_constraint k
+          WHERE k.conrelid=c.oid AND k.contype='c' ORDER BY pg_get_constraintdef(k.oid,true)) AS receipt_checks,
+        (SELECT pg_get_expr(d.adbin,d.adrelid,true) FROM pg_attribute a JOIN pg_attrdef d
+          ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+          WHERE a.attrelid=c.oid AND a.attname='singleton_key' AND NOT a.attisdropped) AS receipt_default
+        FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         JOIN pg_language l ON l.oid=p.prolang JOIN pg_class c ON c.relnamespace=n.oid
         WHERE n.nspname=:schema AND p.proname='pd_profile_initial_receipt_matches'
           AND c.relname='provider_directory_profile_initial_receipt'""",
         schema=schema,
     )
-    row = dict(rows[0]._mapping) if len(rows) == 1 else {}
+    if len(function_rows) != 1:
+        raise RuntimeError("provider_directory_profile_initial_receipt_guard_shape_changed")
+    function_by_field = dict(function_rows[0]._mapping)
+    version = receipt_catalog_version(
+        function_by_field.pop("receipt_checks", []), function_by_field.pop("receipt_default", None)
+    )
+    expected = _receipt_matches_sql(schema) if version == 1 else _reactivated_receipt_matches_sql(schema)
     if (
-        row.get("prosecdef") is not False
-        or row.get("provolatile") != "v"
-        or row.get("proconfig") != ["search_path=pg_catalog"]
-        or row.get("pronargs") != 1
-        or row.get("proargnames") != ["receipt"]
-        or row.get("returns_boolean") is not True
-        or row.get("receipt_argument") is not True
-        or row.get("lanname") != "sql"
-        or _normalized(row.get("prosrc", "")) != _normalized(_receipt_matches_sql(schema))
+        function_by_field.get("prosecdef") is not False
+        or function_by_field.get("provolatile") != "v"
+        or function_by_field.get("proconfig") != ["search_path=pg_catalog"]
+        or function_by_field.get("pronargs") != 1
+        or function_by_field.get("proargnames") != ["receipt"]
+        or function_by_field.get("returns_boolean") is not True
+        or function_by_field.get("receipt_argument") is not True
+        or function_by_field.get("lanname") != "sql"
+        or _normalized(function_by_field.get("prosrc", "")) != _normalized(expected)
     ):
         raise RuntimeError("provider_directory_profile_initial_receipt_guard_shape_changed")
-    row["function_source_sha256"] = hashlib.sha256(row.pop("prosrc").encode("utf-8")).hexdigest()
-    return row
+    function_by_field["function_source_sha256"] = hashlib.sha256(
+        function_by_field.pop("prosrc").encode("utf-8")
+    ).hexdigest()
+    return function_by_field
 
 
 async def initial_guard_dependencies(database, schema):
@@ -192,12 +236,45 @@ _RECEIPT_CHECKS = {
 }
 
 
-def _assert_receipt_columns(oid, attributes):
+_REACTIVATED_KEY_CHECK = (
+    "CHECK (singleton_key::text = 'global'::text OR COALESCE(singleton_key::text = "
+    "to_hex(((payload -> 'serving'::text) ->> 'control_generation'::text)::bigint) AND "
+    "(((payload -> 'serving'::text) ->> 'control_generation'::text)::bigint) > 0, false))"
+)
+_LEGACY_KEY_CHECK = "CHECK (singleton_key::text = 'global'::text)"
+_LEGACY_KEY_DEFAULT = "'global'::character varying"
+_REACTIVATED_KEY_DEFAULT = (
+    "COALESCE(NULLIF(current_setting('provider_directory.initial_receipt_key'::text, true), "
+    "''::text), 'global'::text)::character varying"
+)
+_RECEIPT_CHECKS_SQL = """SELECT pg_get_constraintdef(k.oid,true) AS definition,
+    (SELECT pg_get_expr(d.adbin,d.adrelid,true) FROM pg_attribute a JOIN pg_attrdef d
+      ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+      WHERE a.attrelid=c.oid AND a.attname='singleton_key' AND NOT a.attisdropped) AS key_default
+    FROM pg_constraint k
+    JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname=:schema AND c.relname='provider_directory_profile_initial_receipt' AND k.contype='c'
+    ORDER BY pg_get_constraintdef(k.oid,true)"""
+
+
+def receipt_catalog_version(checks, default):
+    """Recognize one complete native CHECK/default pair, never independent alternatives."""
+    if default == _LEGACY_KEY_DEFAULT and len(checks) == len(_RECEIPT_CHECKS) and set(checks) == _RECEIPT_CHECKS:
+        return 1
+    recovered = (_RECEIPT_CHECKS - {_LEGACY_KEY_CHECK}) | {_REACTIVATED_KEY_CHECK}
+    if default == _REACTIVATED_KEY_DEFAULT and len(checks) == len(recovered) and set(checks) == recovered:
+        return 2
+    raise RuntimeError("provider_directory_profile_initial_receipt_storage_shape_changed")
+
+
+def _assert_receipt_columns(oid, attributes, version):
     columns = [entry for entry in attributes if entry["relation_oid"] == oid]
     if len(columns) != len(_RECEIPT_COLUMNS):
         raise RuntimeError("provider_directory_profile_initial_receipt_storage_shape_changed")
     for position, (column, expected) in enumerate(zip(columns, _RECEIPT_COLUMNS, strict=True), 1):
         name, type_oid, typmod, default = expected
+        if version == 2 and name == "singleton_key":
+            default = _REACTIVATED_KEY_DEFAULT
         if (
             (column["attnum"], column["attname"], column["atttypid"], column["atttypmod"], column["default_expression"])
             != (position, name, type_oid, typmod, default)
@@ -245,10 +322,21 @@ def _assert_receipt_indexes(oid, indexes):
 
 def assert_initial_receipt_catalog(oid, attributes, indexes, constraints):
     """Allow only the migration's columns, built-in defaults, checks, and four unique indexes."""
-    _assert_receipt_columns(oid, attributes)
     _assert_receipt_indexes(oid, indexes)
+    checks = [
+        entry["constraint_definition"]
+        for entry in constraints
+        if entry["relation_oid"] == oid and entry["constraint_type"] == "c"
+    ]
+    defaults = [
+        column["default_expression"]
+        for column in attributes
+        if column["relation_oid"] == oid and column["attname"] == "singleton_key"
+    ]
+    version = receipt_catalog_version(checks, defaults[0] if len(defaults) == 1 else None)
+    _assert_receipt_columns(oid, attributes, version)
     expected_constraints = (
-        {("c", definition, False, False, False) for definition in _RECEIPT_CHECKS}
+        {("c", definition, False, False, False) for definition in checks}
         | {("n", "NOT NULL " + column[0], False, False, False) for column in _RECEIPT_COLUMNS}
         | {("p", "PRIMARY KEY (build_id)", False, False, True)}
         | {

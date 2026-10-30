@@ -20,11 +20,11 @@ Live catalog confirmation is not recorded in this public artifact. Configured so
 
 | Category | Count |
 | --- | ---: |
-| Acquisition-configured | 27 |
+| Acquisition-configured | 28 |
 | Externally supported | 0 |
 | Probe-only | 13 |
 | Known not importable | 3 |
-| Total tracked | 43 |
+| Total tracked | 44 |
 
 ### Credentialed Or Registered Access
 
@@ -40,6 +40,7 @@ Live catalog confirmation is not recorded in this public artifact. Configured so
 
 | Source | Configured support | Configured access requirement | Method | Resources | Canonical base | Source IDs | Registration | Reviewed at | Review valid through | Known blocker or limitation |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CHRISTUS Health Plan (`christus-health-plan`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://doctors.christushealthplan.org/fhir/provider-directory | pdfhir_b674847fc79d2b2ea1f4e986 | Not required | 2026-10-27 | 2026-12-11 | Seven public FHIR R4 collections use server-issued next links with pages of up to 100 records. Opaque _cursor continuations support traversal beyond the direct _offset cap; Organization uses issued offsets. Continuation totals may be absent and a final next link may return an empty page. Full reconciliation is required for deletions. Complete acquisition, publication and API readiness require separate verification. |
 | Iowa Medicaid (`iowa-medicaid`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://fite.ia-prd.gw03.abacusinsights.ai/provider-directory | pdfhir_fa3c581c79ffdfa5b73b43b9 | Not required | 2026-10-11 | 2026-11-25 | Acquisition is configured for all eight Plan-Net collections at the CMS-listed R4 base, using stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. Resource population and publication readiness require separate verification. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections, and bounded ID-only searches succeeded. Repeated sampled windows agreed and adjacent sampled windows did not overlap; the samples did not establish exhaustive traversal. Searches omitted totals. |
 | Pennsylvania Medicaid (`pennsylvania-medicaid`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://fite.pa-prd.gw03.abacusinsights.ai/provider-directory | pdfhir_5fd73a1218a9b5b73066d000 | Not required | 2026-10-11 | 2026-11-25 | Acquisition is configured for all eight Plan-Net collections at the CMS-listed R4 base, using stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. Resource population and publication readiness require separate verification. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections, and bounded ID-only searches succeeded. Repeated sampled windows agreed and adjacent sampled windows did not overlap; the samples did not establish exhaustive traversal. Searches omitted totals. |
 | San Bernardino County DBH (`san-bernardino-county-dbh`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://fhir.netsmartcloud.com/payer/provider-directory/v2/eb7b73e0-836a-4041-9c0c-753079b3518f | pdfhir_29c125ae13aeffa0afe0e121 | Not required | 2026-10-11 | 2026-11-25 | Acquisition is configured for all eight resource families at the Netsmart R4 base. It ignores advertised next links and advances a stable _id-sorted _offset page index by one after each full page; short pages terminate traversal and repeated pages fail closed. Bounded source observations (2026-10-10): Anonymous R4 metadata declared all eight configured collections. Bounded ID-only Location searches found that _offset values 0, 1 and 2 returned distinct sampled pages, consistent with the maintained page-index rule. These samples did not establish exhaustive traversal, population adequacy or publication readiness. |
@@ -105,6 +106,7 @@ Verification environment: `not recorded`. Campaign: `provider-directory-canonica
 
 | Source | Proof state | Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at | Terminal run ID | Current observation | Access verification | Terminal checked at | Proof valid through | Rows by resource | Readiness evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CHRISTUS Health Plan (`christus-health-plan`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Iowa Medicaid (`iowa-medicaid`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Pennsylvania Medicaid (`pennsylvania-medicaid`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | San Bernardino County DBH (`san-bernardino-county-dbh`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |

@@ -14,12 +14,13 @@ from db.models import (
     db,
 )
 from process.provider_directory_profile_selection_contract import (
-    PROFILE_EXECUTION_CONTRACT_ID,
-    PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID,
-    PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
+    _ATTESTATION_FIELDS,
     _DESIRED_SELECTION_FIELDS,
-    _validated_desired_selection,
+    _GLOBAL_PROFILE_PARAMS,
+    PROFILE_EXECUTION_CONTRACT_ID,
     PROFILE_SELECTION_ATTESTATION_CONTRACT_ID,
+    PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID,
+    PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID,
     PROFILE_SELECTION_LINEAGE_AUTHORITY,
     PROFILE_SELECTION_REQUEST_CONTRACT_ID,
     PROFILE_SELECTION_RESULT_CONTRACT_ID,
@@ -29,14 +30,13 @@ from process.provider_directory_profile_selection_contract import (
     ProviderDirectoryProfileSelectionDrift,
     ProviderDirectoryProfileSelectionError,
     ProviderDirectoryProfileSelectionStale,
-    _ATTESTATION_FIELDS,
-    _GLOBAL_PROFILE_PARAMS,
     _clean_text,
     _identity_without_authority,
     _positive_integer,
     _proof_id,
     _required_hash,
     _required_text,
+    _validated_desired_selection,
     configured_node_id,
     profile_selection_result,
     stable_hash,
@@ -44,14 +44,13 @@ from process.provider_directory_profile_selection_contract import (
     validated_profile_selection_attestation,
 )
 from process.provider_directory_profile_selection_snapshot import (
-    _ComputedProfileSelection,
     _compute_current_selection,
     _compute_desired_selection,
     _computed_selection_from_rows,
+    _ComputedProfileSelection,
     _row_mapping,
     _table_ref,
 )
-
 
 _AUTHORITY_KEY = "global"
 _REQUEST_FIELDS = {
@@ -65,20 +64,35 @@ _REQUEST_DATASET_FIELDS = {"source_id", "dataset_id"}
 
 
 def _validated_request(request_value: Any) -> dict[str, Any]:
-    if not isinstance(request_value, Mapping) or set(request_value) != (_REQUEST_FIELDS |
-        (_DESIRED_SELECTION_FIELDS if request_value.get("contract_id") == PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID else set())):
-        raise ProviderDirectoryProfileSelectionError(
-            "Profile selection request fields are invalid"
+    if not isinstance(request_value, Mapping) or set(request_value) != (
+        _REQUEST_FIELDS
+        | (
+            _DESIRED_SELECTION_FIELDS
+            if request_value.get("contract_id") == PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID
+            else set()
         )
+    ):
+        raise ProviderDirectoryProfileSelectionError("Profile selection request fields are invalid")
     request_map = dict(request_value)
-    if request_map.get("contract_id") not in {PROFILE_SELECTION_REQUEST_CONTRACT_ID, PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID}:
-        raise ProviderDirectoryProfileSelectionError(
-            "Profile selection request contract is invalid"
-        )
+    if request_map.get("contract_id") not in {
+        PROFILE_SELECTION_REQUEST_CONTRACT_ID,
+        PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID,
+    }:
+        raise ProviderDirectoryProfileSelectionError("Profile selection request contract is invalid")
     datasets = _validated_dataset_collection(request_map.get("datasets"))
+    if (
+        request_map["contract_id"] == PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID
+        and request_map.get("desired_cms_dataset") is None
+        and not datasets
+    ):
+        raise ProviderDirectoryProfileSelectionError("Profile selection dated publish requires current datasets")
     return {
         "contract_id": request_map["contract_id"],
-        **(_validated_desired_selection(request_map) if request_map["contract_id"] == PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID else {}),
+        **(
+            _validated_desired_selection(request_map)
+            if request_map["contract_id"] == PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID
+            else {}
+        ),
         "node_id": _required_text(request_map, "node_id", limit=64),
         "catalog_digest": _required_hash(request_map, "catalog_digest"),
         "selection_fingerprint": _required_hash(
@@ -91,13 +105,8 @@ def _validated_request(request_value: Any) -> dict[str, Any]:
 
 def _validated_dataset_collection(raw_datasets: Any) -> list[dict[str, str]]:
     if not isinstance(raw_datasets, list):
-        raise ProviderDirectoryProfileSelectionError(
-            "Profile selection request datasets are invalid"
-        )
-    datasets = [
-        _validated_dataset_projection(raw_dataset)
-        for raw_dataset in raw_datasets
-    ]
+        raise ProviderDirectoryProfileSelectionError("Profile selection request datasets are invalid")
+    datasets = [_validated_dataset_projection(raw_dataset) for raw_dataset in raw_datasets]
     sorted_datasets = sorted(
         datasets,
         key=lambda dataset_map: (
@@ -105,25 +114,15 @@ def _validated_dataset_collection(raw_datasets: Any) -> list[dict[str, str]]:
             dataset_map["dataset_id"],
         ),
     )
-    dataset_keys = [
-        (dataset_map["source_id"], dataset_map["dataset_id"])
-        for dataset_map in datasets
-    ]
+    dataset_keys = [(dataset_map["source_id"], dataset_map["dataset_id"]) for dataset_map in datasets]
     if datasets != sorted_datasets or len(dataset_keys) != len(set(dataset_keys)):
-        raise ProviderDirectoryProfileSelectionError(
-            "Profile selection request datasets are not unique and sorted"
-        )
+        raise ProviderDirectoryProfileSelectionError("Profile selection request datasets are not unique and sorted")
     return datasets
 
 
 def _validated_dataset_projection(raw_dataset: Any) -> dict[str, str]:
-    if (
-        not isinstance(raw_dataset, Mapping)
-        or set(raw_dataset) != _REQUEST_DATASET_FIELDS
-    ):
-        raise ProviderDirectoryProfileSelectionError(
-            "Profile selection request dataset fields are invalid"
-        )
+    if not isinstance(raw_dataset, Mapping) or set(raw_dataset) != _REQUEST_DATASET_FIELDS:
+        raise ProviderDirectoryProfileSelectionError("Profile selection request dataset fields are invalid")
     dataset_map = dict(raw_dataset)
     return {
         "source_id": _required_text(dataset_map, "source_id", limit=96),
@@ -134,9 +133,11 @@ def _validated_dataset_projection(raw_dataset: Any) -> dict[str, str]:
 def _input_identity_digest(identity_map: Mapping[str, Any]) -> str:
     return stable_hash(
         identity_map,
-        domain=("provider_directory_profile_selection_authority_input.v2"
-                if identity_map["contract_id"] == PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID
-                else "provider_directory_profile_selection_authority_input.v1"),
+        domain=(
+            "provider_directory_profile_selection_authority_input.v2"
+            if identity_map["contract_id"] == PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID
+            else "provider_directory_profile_selection_authority_input.v1"
+        ),
     )
 
 
@@ -174,9 +175,7 @@ async def _latest_registered_observation() -> dict[str, Any] | None:
     if not isinstance(payload_json, Mapping):
         raise RuntimeError("provider_directory_profile_selection_registry_corrupt")
     return {
-        "input_identity_digest": observation_map.get(
-            "input_identity_digest"
-        ),
+        "input_identity_digest": observation_map.get("input_identity_digest"),
         "payload_json": dict(payload_json),
     }
 
@@ -210,10 +209,7 @@ async def _next_authority_revision() -> int:
 async def _lock_selection_authority() -> None:
     """Serialize attestations before REPEATABLE READ freezes its snapshot."""
 
-    await db.status(
-        f"LOCK TABLE {_table_ref(ProviderDirectoryProfileSelectionProof)} "
-        "IN SHARE ROW EXCLUSIVE MODE;"
-    )
+    await db.status(f"LOCK TABLE {_table_ref(ProviderDirectoryProfileSelectionProof)} IN SHARE ROW EXCLUSIVE MODE;")
 
 
 def _attestation_payload(
@@ -242,8 +238,17 @@ def _attestation_payload(
         "operation",
         "pairs",
     )
-    return {name: unordered_attestation_map[name] for name in (*field_order,
-        *(sorted(_DESIRED_SELECTION_FIELDS) if identity_map["contract_id"] == PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID else ())) }
+    return {
+        name: unordered_attestation_map[name]
+        for name in (
+            *field_order,
+            *(
+                sorted(_DESIRED_SELECTION_FIELDS)
+                if identity_map["contract_id"] == PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID
+                else ()
+            ),
+        )
+    }
 
 
 async def _ensure_selection_proof(
@@ -311,14 +316,10 @@ async def _register_selection_proof(
     await _ensure_selection_proof(identity_digest, identity_map)
     latest_observation = await _latest_registered_observation()
     if latest_observation is not None:
-        latest_attestation = validated_profile_selection_attestation(
-            latest_observation["payload_json"]
-        )
+        latest_attestation = validated_profile_selection_attestation(latest_observation["payload_json"])
         if latest_observation["input_identity_digest"] == identity_digest:
             if _identity_without_authority(latest_attestation.payload) != identity_map:
-                raise RuntimeError(
-                    "provider_directory_profile_selection_registry_corrupt"
-                )
+                raise RuntimeError("provider_directory_profile_selection_registry_corrupt")
             return latest_attestation
     authority_revision = await _next_authority_revision()
     attestation_map = _attestation_payload(identity_map, authority_revision)
@@ -334,11 +335,16 @@ def _expected_request(
 ) -> dict[str, Any]:
     identity_map = computed_selection.identity_payload
     return {
-        "contract_id": (PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID
-                        if identity_map["contract_id"] == PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID
-                        else PROFILE_SELECTION_REQUEST_CONTRACT_ID),
-        **({name: identity_map[name] for name in _DESIRED_SELECTION_FIELDS}
-           if identity_map["contract_id"] == PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID else {}),
+        "contract_id": (
+            PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID
+            if identity_map["contract_id"] == PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID
+            else PROFILE_SELECTION_REQUEST_CONTRACT_ID
+        ),
+        **(
+            {name: identity_map[name] for name in _DESIRED_SELECTION_FIELDS}
+            if identity_map["contract_id"] == PROFILE_SELECTION_DESIRED_ATTESTATION_CONTRACT_ID
+            else {}
+        ),
         "node_id": node_id,
         "catalog_digest": identity_map["catalog_digest"],
         "selection_fingerprint": identity_map["selection_fingerprint"],
@@ -347,8 +353,11 @@ def _expected_request(
 
 
 async def current_profile_selection_request(
-    catalog_map: Mapping[str, Any], *, desired_cms_dataset: Mapping[str, Any] | None = None,
-    expected_cms_incumbent: Mapping[str, Any] | None = None, desired_profile_as_of: str | None = None,
+    catalog_map: Mapping[str, Any],
+    *,
+    desired_cms_dataset: Mapping[str, Any] | None = None,
+    expected_cms_incumbent: Mapping[str, Any] | None = None,
+    desired_profile_as_of: str | None = None,
 ) -> dict[str, Any]:
     """Project a header-current proposal for the locked exact attestation."""
 
@@ -356,13 +365,20 @@ async def current_profile_selection_request(
     async with db.transaction():
         await db.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
         if desired_cms_dataset is not None or desired_profile_as_of is not None or expected_cms_incumbent is not None:
-            desired = _validated_desired_selection({"desired_cms_dataset": desired_cms_dataset,
-                "expected_cms_incumbent": expected_cms_incumbent, "desired_profile_as_of": desired_profile_as_of})
-            computed_selection = await _compute_desired_selection(catalog_map, node_id=node_id,
-                lock_selection=False, exact_readiness=False, desired_selection=desired)
+            desired = _validated_desired_selection(
+                {
+                    "desired_cms_dataset": desired_cms_dataset,
+                    "expected_cms_incumbent": expected_cms_incumbent,
+                    "desired_profile_as_of": desired_profile_as_of,
+                }
+            )
+            computed_selection = await _compute_desired_selection(
+                catalog_map, node_id=node_id, lock_selection=False, exact_readiness=False, desired_selection=desired
+            )
         else:
             computed_selection = await _compute_current_selection(
-                catalog_map, node_id=node_id, lock_selection=False, exact_readiness=False)
+                catalog_map, node_id=node_id, lock_selection=False, exact_readiness=False
+            )
     return _expected_request(computed_selection, node_id)
 
 
@@ -378,15 +394,16 @@ async def attest_profile_selection(
         await db.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
         await _lock_selection_authority()
         if request_map["contract_id"] == PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID:
-            computed_selection = await _compute_desired_selection(catalog_map, node_id=node_id,
-                lock_selection=True, desired_selection=_validated_desired_selection(request_map))
-        else:
-            computed_selection = await _compute_current_selection(
-                catalog_map, node_id=node_id, lock_selection=True)
-        if request_map != _expected_request(computed_selection, node_id):
-            raise ProviderDirectoryProfileSelectionDrift(
-                "provider_directory_profile_selection_drift"
+            computed_selection = await _compute_desired_selection(
+                catalog_map,
+                node_id=node_id,
+                lock_selection=True,
+                desired_selection=_validated_desired_selection(request_map),
             )
+        else:
+            computed_selection = await _compute_current_selection(catalog_map, node_id=node_id, lock_selection=True)
+        if request_map != _expected_request(computed_selection, node_id):
+            raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_drift")
         attestation = await _register_selection_proof(computed_selection)
     return dict(attestation.payload)
 
@@ -397,36 +414,35 @@ async def _assert_registered_current_in_transaction(
 ) -> None:
     if attestation.desired_profile_as_of is not None:
         try:
-            computed_selection = await _compute_desired_selection(catalog_map, node_id=configured_node_id(),
-                lock_selection=True, desired_selection=_validated_desired_selection(attestation.payload))
+            computed_selection = await _compute_desired_selection(
+                catalog_map,
+                node_id=configured_node_id(),
+                lock_selection=True,
+                desired_selection=_validated_desired_selection(attestation.payload),
+            )
         except ProviderDirectoryProfileSelectionDrift as exc:
             raise ProviderDirectoryProfileSelectionStale("provider_directory_profile_selection_changed") from exc
     else:
         computed_selection = await _compute_current_selection(
-            catalog_map, node_id=configured_node_id(), lock_selection=True)
+            catalog_map, node_id=configured_node_id(), lock_selection=True
+        )
     identity_map = computed_selection.identity_payload
     if _identity_without_authority(attestation.payload) != identity_map:
-        raise ProviderDirectoryProfileSelectionStale(
-            "provider_directory_profile_selection_changed"
-        )
+        raise ProviderDirectoryProfileSelectionStale("provider_directory_profile_selection_changed")
     identity_digest = _input_identity_digest(identity_map)
     registered_proof = await _registered_proof(identity_digest)
     if registered_proof != {
         "proof_id": attestation.proof_id,
         "identity_json": identity_map,
     }:
-        raise ProviderDirectoryProfileSelectionStale(
-            "provider_directory_profile_selection_proof_not_registered"
-        )
+        raise ProviderDirectoryProfileSelectionStale("provider_directory_profile_selection_proof_not_registered")
     latest_observation = await _latest_registered_observation()
     if (
         latest_observation is None
         or latest_observation["input_identity_digest"] != identity_digest
         or latest_observation["payload_json"] != attestation.payload
     ):
-        raise ProviderDirectoryProfileSelectionStale(
-            "provider_directory_profile_selection_proof_not_registered"
-        )
+        raise ProviderDirectoryProfileSelectionStale("provider_directory_profile_selection_proof_not_registered")
 
 
 async def assert_registered_profile_selection_current(

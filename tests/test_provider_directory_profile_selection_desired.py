@@ -313,3 +313,185 @@ def test_capacity_preflight_binds_desired_proof_and_date(monkeypatch):
     for name in ("selection_proof_id", "selection_fingerprint", "profile_input_digest"):
         assert first_identity[name] != later_identity[name]
     assert request_maps[0].request_sha256 != request_maps[1].request_sha256
+
+
+def _date_only(day="2026-09-29"):
+    return {"desired_profile_as_of": day, "desired_cms_dataset": None, "expected_cms_incumbent": None}
+
+
+def _date_only_rows(*, include_cms=False):
+    catalog, sources, rows, _candidate = _selection_rows(_desired(current=True))
+    if not include_cms:
+        catalog["items"] = [entry for entry in catalog["items"] if entry["source_ids"] != ["cms-npd"]]
+        sources = [source for source in sources if source["source_id"] != "cms-npd"]
+        rows = [row for row in rows if row["endpoint_id"] != "cms-endpoint"]
+    source_id = "pdfhir_synthetic_other"
+    catalog["items"].append({"runnable": True, "profile_enabled": True, "source_ids": [source_id]})
+    sources.append({"source_id": source_id, "endpoint_id": "other-endpoint", "org_name": "Other synthetic payer"})
+    rows.append(
+        _rows(
+            {
+                **_pair("other-current", current=True),
+                "source_id": source_id,
+                "endpoint_id": "other-endpoint",
+                "acquisition_root_run_id": "other-root",
+            }
+        )
+    )
+    return catalog, sources, rows
+
+
+def _date_only_computed(day="2026-09-29", *, include_cms=False):
+    catalog, sources, rows = _date_only_rows(include_cms=include_cms)
+    return snapshot._computed_desired_selection_from_rows(
+        catalog,
+        node_id="synthetic-node",
+        source_rows=sources,
+        dataset_rows=rows,
+        desired_dataset_row=None,
+        desired_selection=_date_only(day),
+    )
+
+
+def _date_only_proof(day="2026-09-29", *, include_cms=False):
+    payload = {**_date_only_computed(day, include_cms=include_cms).identity_payload, "authority_revision": 1}
+    payload["proof_id"] = contract._proof_id(payload)
+    return contract.validated_profile_selection_attestation(payload)
+
+
+@pytest.mark.parametrize("include_cms", [False, True])
+def test_date_only_selection_preserves_the_complete_current_vector(include_cms):
+    catalog, sources, rows = _date_only_rows(include_cms=include_cms)
+    current = snapshot._computed_selection_from_rows(
+        catalog, node_id="synthetic-node", source_rows=sources, dataset_rows=rows
+    )
+    desired = _date_only_computed(include_cms=include_cms)
+    proof = _date_only_proof(include_cms=include_cms)
+    assert contract._validated_desired_selection(_date_only()) == _date_only()
+    assert desired.request_projection == current.request_projection
+    assert desired.identity_payload["pairs"] == current.identity_payload["pairs"]
+    assert len(proof.pairs) == 2 + int(include_cms)
+    assert all(pair["publication_status"] == "published" and pair["is_current"] is True for pair in proof.pairs)
+    assert proof.operation == "publish" and proof.desired_profile_as_of == "2026-09-29"
+    assert proof.desired_cms_dataset is proof.expected_cms_incumbent is None
+    if include_cms:
+        assert next(pair for pair in proof.pairs if pair["source_id"] == "cms-npd") == _pair(
+            "cms-current", current=True
+        )
+
+
+def test_date_only_proof_and_request_bind_date_and_current_pairs():
+    first = _date_only_computed()
+    later = _date_only_computed("2026-09-30")
+    assert first.request_projection == later.request_projection
+    for field in ("selection_fingerprint", "profile_input_digest"):
+        assert first.identity_payload[field] != later.identity_payload[field]
+    assert _date_only_proof().proof_id != _date_only_proof("2026-09-30").proof_id
+    request = selection._expected_request(first, "synthetic-node")
+    assert request["contract_id"] == contract.PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID
+    assert {name: request[name] for name in contract._DESIRED_SELECTION_FIELDS} == _date_only()
+    assert request["datasets"] == list(first.request_projection)
+    assert request["selection_fingerprint"] == contract.desired_selection_fingerprint(
+        "synthetic-node", request["catalog_digest"], request["datasets"], _date_only()
+    )
+
+
+@pytest.mark.parametrize("mutation", ["dataset", "hash", "source_context", "publication_metadata"])
+def test_date_only_input_proof_binds_dataset_context_and_publication_metadata(mutation):
+    catalog, sources, rows = _date_only_rows()
+    baseline = _date_only_computed()
+    if mutation == "dataset":
+        rows[0]["dataset_id"] = "payer-current-next"
+    elif mutation == "hash":
+        rows[0]["dataset_hash"] = "d" * 64
+    elif mutation == "source_context":
+        next(source for source in sources if source["source_id"] == "pdfhir_synthetic_retained")["org_name"] = (
+            "Renamed synthetic payer"
+        )
+    else:
+        rows[0]["publication_metadata_json"]["projection_revision"] = "next"
+    changed = snapshot._computed_desired_selection_from_rows(
+        catalog,
+        node_id="synthetic-node",
+        source_rows=sources,
+        dataset_rows=rows,
+        desired_dataset_row=None,
+        desired_selection=_date_only(),
+    )
+    assert changed.identity_payload["profile_input_digest"] != baseline.identity_payload["profile_input_digest"]
+
+
+@pytest.mark.parametrize("day", [None, "", "2026-9-29", "2026-02-30", " 2026-09-29"])
+def test_date_only_requires_an_explicit_canonical_date(day):
+    with pytest.raises(contract.ProviderDirectoryProfileSelectionError):
+        contract._validated_desired_selection(_date_only(day))
+
+
+@pytest.mark.parametrize("day", [None, "2026-09-29"])
+def test_date_only_cannot_authorize_an_incumbent_without_a_desired_cms_dataset(day):
+    desired_selection_map = {**_date_only(day), "expected_cms_incumbent": _pair("cms-current", current=True)}
+    with pytest.raises(contract.ProviderDirectoryProfileSelectionError):
+        contract._validated_desired_selection(desired_selection_map)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["validated_generic", "duplicate_source", "empty_publish", "empty_purge", "date_drift"]
+)
+def test_date_only_attestation_rejects_noncurrent_or_inconsistent_vectors(mutation):
+    payload = deepcopy(_date_only_proof().payload)
+    if mutation == "validated_generic":
+        payload["pairs"][0].update(publication_status="validated", is_current=False)
+    elif mutation == "duplicate_source":
+        payload["pairs"].insert(1, {**payload["pairs"][0], "dataset_id": "other-current-next"})
+    elif mutation.startswith("empty"):
+        payload.update(pairs=[], operation="purge" if mutation == "empty_purge" else "publish")
+    else:
+        payload["desired_profile_as_of"] = "2026-09-30"
+    if mutation != "date_drift":
+        payload["selection_fingerprint"] = contract.desired_selection_fingerprint(
+            payload["node_id"], payload["catalog_digest"], payload["pairs"], _date_only()
+        )
+    payload["proof_id"] = contract._proof_id(payload)
+    with pytest.raises(contract.ProviderDirectoryProfileSelectionError):
+        contract.validated_profile_selection_attestation(payload)
+
+
+def test_date_only_cannot_construct_a_publish_from_an_empty_current_selection():
+    catalog, sources, _rows = _date_only_rows()
+    with pytest.raises(contract.ProviderDirectoryProfileSelectionError, match="requires current datasets"):
+        snapshot._computed_desired_selection_from_rows(
+            catalog,
+            node_id="synthetic-node",
+            source_rows=sources,
+            dataset_rows=[],
+            desired_dataset_row=None,
+            desired_selection=_date_only(),
+        )
+
+
+def test_date_only_request_cannot_authorize_an_empty_publish():
+    request = selection._expected_request(_date_only_computed(), "synthetic-node")
+    request["datasets"] = []
+    request["selection_fingerprint"] = contract.desired_selection_fingerprint(
+        "synthetic-node", request["catalog_digest"], [], _date_only()
+    )
+    with pytest.raises(contract.ProviderDirectoryProfileSelectionError, match="requires current datasets"):
+        selection._validated_request(request)
+
+
+@pytest.mark.parametrize("mutation", ["catalog_digest", "duplicate_source"])
+def test_date_only_selection_retains_current_catalog_authority_checks(mutation):
+    catalog, sources, rows = _date_only_rows()
+    if mutation == "catalog_digest":
+        catalog["catalog_digest"] = "short"
+    else:
+        sources.append(deepcopy(sources[-1]))
+    with pytest.raises(RuntimeError, match="provider_directory_profile_selection_"):
+        snapshot._computed_desired_selection_from_rows(
+            catalog,
+            node_id="synthetic-node",
+            source_rows=sources,
+            dataset_rows=rows,
+            desired_dataset_row=None,
+            desired_selection=_date_only(),
+        )

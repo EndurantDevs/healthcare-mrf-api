@@ -6,7 +6,6 @@ import pytest
 
 from api.endpoint import npi as npi_module
 
-
 SOURCE_ID = "pdfhir_contra_costa"
 AFFILIATION_ID = "affiliation-21438"
 AFFILIATION_KEY = (SOURCE_ID, AFFILIATION_ID)
@@ -31,10 +30,7 @@ def _affiliation_only_contract():
     address_maps = [
         {
             "source_record_ids": [
-                (
-                    "provider_directory_fhir:organization_affiliation:"
-                    f"{SOURCE_ID}:{AFFILIATION_ID}:location-496899"
-                )
+                (f"provider_directory_fhir:organization_affiliation:{SOURCE_ID}:{AFFILIATION_ID}:location-496899")
             ]
         }
     ]
@@ -153,9 +149,7 @@ def test_affiliation_evidence_mapper_returns_current_network_and_plan_context():
         ),
     ]
 
-    evidence_map = npi_module._map_provider_directory_affiliation_evidence(
-        evidence_rows
-    )[AFFILIATION_KEY]
+    evidence_map = npi_module._map_provider_directory_affiliation_evidence(evidence_rows)[AFFILIATION_KEY]
 
     assert evidence_map["insurance_plans"][0] == {
         "resource_type": "InsurancePlan",
@@ -176,33 +170,28 @@ def test_affiliation_evidence_mapper_returns_current_network_and_plan_context():
 def test_source_record_ids_parse_roles_and_affiliations_separately():
     record_ids = [
         "provider_directory_fhir:practitioner_role:pdfhir_example:role-1:location-1",
-        (
-            "provider_directory_fhir:organization_affiliation:pdfhir_example:"
-            "affiliation-1:location-1"
-        ),
+        ("provider_directory_fhir:organization_affiliation:pdfhir_example:affiliation-1:location-1"),
         "provider_directory_fhir:organization_address:pdfhir_example:org-1:1",
     ]
 
-    assert npi_module._directory_role_keys_from_records(record_ids) == [
-        ("pdfhir_example", "role-1")
-    ]
-    assert npi_module._directory_affiliation_keys_from_records(record_ids) == [
-        ("pdfhir_example", "affiliation-1")
-    ]
+    assert npi_module._directory_role_keys_from_records(record_ids) == [("pdfhir_example", "role-1")]
+    assert npi_module._directory_affiliation_keys_from_records(record_ids) == [("pdfhir_example", "affiliation-1")]
 
 
 @pytest.mark.asyncio
 async def test_affiliation_only_evidence_is_scoped_to_exact_current_id(monkeypatch):
     """Expose current affiliation evidence without inventing PractitionerRole IDs."""
-    address_maps, source_details_by_id, affiliation_evidence_by_key = (
-        _affiliation_only_contract()
-    )
+    address_maps, source_details_by_id, affiliation_evidence_by_key = _affiliation_only_contract()
+    from api import provider_directory_evidence_lineage
+
+    source_datasets = ((SOURCE_ID, "dataset-affiliation"),)
+    binding_by_source = {SOURCE_ID: ("pd_endpoint_contra_costa", "https://directory.contracosta.test/fhir")}
+    resolve_lineage = AsyncMock(return_value=(binding_by_source, (), source_datasets))
+    monkeypatch.setattr(provider_directory_evidence_lineage, "resolve_address_evidence", resolve_lineage)
     fetch_roles = AsyncMock(return_value={})
     fetch_affiliations = AsyncMock(return_value=affiliation_evidence_by_key)
     replacement_map = {
-        "_fetch_provider_directory_source_detail_map": AsyncMock(
-            return_value=source_details_by_id
-        ),
+        "_fetch_provider_directory_source_detail_map": AsyncMock(return_value=source_details_by_id),
         "_fetch_provider_directory_role_evidence_map": fetch_roles,
         "_fetch_provider_directory_affiliation_evidence_map": fetch_affiliations,
     }
@@ -214,14 +203,18 @@ async def test_affiliation_only_evidence_is_scoped_to_exact_current_id(monkeypat
         include_role_evidence=True,
     )
 
-    fetch_roles.assert_awaited_once_with([], session=None)
-    fetch_affiliations.assert_awaited_once_with([AFFILIATION_KEY], session=None)
+    fetch_roles.assert_awaited_once_with([], session=None, source_datasets=())
+    fetch_affiliations.assert_awaited_once_with([AFFILIATION_KEY], session=None, source_datasets=source_datasets)
+    resolve_lineage.assert_awaited_once_with(
+        npi_module,
+        address_maps,
+        profile_generation_id=None,
+        include_role_evidence=True,
+        phone_digits=None,
+        session=None,
+    )
     evidence_map = address_maps[0]["provider_directory_sources"][0]
     assert evidence_map["organization_affiliation_ids"] == [AFFILIATION_ID]
     assert "practitioner_role_ids" not in evidence_map
-    assert [network["resource_id"] for network in evidence_map["networks"]] == [
-        "network-contra-costa"
-    ]
-    assert [plan["resource_id"] for plan in evidence_map["insurance_plans"]] == [
-        "plan-contra-costa"
-    ]
+    assert [network["resource_id"] for network in evidence_map["networks"]] == ["network-contra-costa"]
+    assert [plan["resource_id"] for plan in evidence_map["insurance_plans"]] == ["plan-contra-costa"]

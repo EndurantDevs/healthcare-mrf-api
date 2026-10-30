@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from weakref import WeakSet, ref
 
 from db.plan_release_storage import storage_identifier, storage_relation
+from process import entity_address_ordinary_preparation as ordinary
 from process import provider_directory_generic_source_policy as source
 from process.provider_directory_generic_source_storage import _close_grants
 
@@ -38,6 +39,9 @@ class _SourcePreparation:
 
 def issue_source_preparation(admission, input_hash):
     """A configured factory and the active signed admission, never a mapping, issue this scope."""
+    ordinary_preparation = ordinary.issue(admission, input_hash)
+    if ordinary_preparation is not None:
+        return ordinary_preparation
     if not source.is_source_storage_required():
         return None
     issued = _SourcePreparation(_active_factory(admission, input_hash), admission, input_hash, asyncio.current_task())
@@ -94,6 +98,8 @@ def _issued(issued, *, phases):
 def require_building(scope):
     """Never let a closed candidate reenter a write or preparation operation."""
     issued = scope.source_preparation if scope is not None else None
+    if ordinary.is_ordinary(issued):
+        return ordinary.require_building(scope)
     if issued is None:
         _require(not source.is_source_storage_required())
         return None
@@ -105,6 +111,10 @@ def require_building(scope):
 async def preparation_transaction(database, scope, *, phases=("building",)):
     """Open one same-task Factory transaction; the historical database path stays unchanged."""
     issued = scope.source_preparation if scope is not None else None
+    if ordinary.is_ordinary(issued):
+        async with ordinary.transaction(database, scope, phases) as session:
+            yield session
+        return
     if issued is None:
         _require(not source.is_source_storage_required())
         async with database.transaction() as session:
@@ -147,6 +157,8 @@ async def _close_sequences(connection, policy, oid):
 
 async def register_source_relation(scope, name, oid):
     """Close default grants in the first DDL transaction before any other writer can use them."""
+    if ordinary.is_ordinary(scope.source_preparation):
+        return await ordinary.register(scope, scope.db_schema, name, oid)
     issued = require_building(scope)
     if issued is None:
         return
@@ -167,6 +179,8 @@ async def register_source_relation(scope, name, oid):
 
 def require_owned_relation(scope, name, oid):
     """A mutable scope name cannot authorize an unrelated SOURCE table."""
+    if ordinary.is_ordinary(scope.source_preparation):
+        return ordinary.require_owned(scope, name, oid)
     issued = require_building(scope)
     if issued is not None:
         _require(scope.db_schema == issued.factory.policy.schema and (name, oid) in issued.original_relations)
@@ -174,6 +188,8 @@ def require_owned_relation(scope, name, oid):
 
 def record_source_rename(scope, old_name, new_name, oid):
     """Retain both exact names through an acknowledged native rename or rollback."""
+    if ordinary.is_ordinary(scope.source_preparation):
+        return ordinary.renamed(scope, old_name, new_name, oid)
     issued = require_building(scope)
     if issued is not None:
         _require((old_name, oid) in issued.original_relations)
@@ -235,6 +251,8 @@ async def _freeze_native(database, prepared, scope, issued):
 
 async def freeze_source_generation(database, prepared, scope):
     """Commit the complete native seven-family handoff before Reader or Ret starts."""
+    if ordinary.is_ordinary(scope.source_preparation if scope is not None else None):
+        return await ordinary.freeze(database, prepared, scope)
     issued = require_building(scope)
     if issued is None:
         return
@@ -261,6 +279,8 @@ async def freeze_source_generation(database, prepared, scope):
 
 def require_source_generation(prepared, admission, *, policy=None):
     """A forged PreparedGeneration cannot substitute for the committed issued handoff."""
+    if ordinary.is_ordinary(prepared.source_preparation):
+        return ordinary.require_prepared(prepared, admission)
     issued = _issued(prepared.source_preparation, phases={"prepared"})
     _require(issued.task is asyncio.current_task() and issued.prepared() is prepared and issued.admission is admission)
     _require(policy is None or policy is issued.factory.policy)
@@ -271,6 +291,8 @@ def require_source_generation(prepared, admission, *, policy=None):
 
 def require_source_cleanup(prepared):
     """Authenticate exact issued cleanup without renewing an expired spend reservation."""
+    if ordinary.is_ordinary(prepared.source_preparation):
+        return ordinary.require_cleanup(prepared)
     issued = _original(prepared.source_preparation, phases={"prepared"})
     _require(issued.task is asyncio.current_task() and issued.prepared() is prepared)
     _require(prepared.db_schema == issued.factory.policy.schema)
@@ -281,6 +303,10 @@ def require_source_cleanup(prepared):
 @asynccontextmanager
 async def cleanup_transaction(database, issued, *, relation=None):
     """Cleanup keeps the original Factory and exact caller-owned OIDs after scope teardown."""
+    if ordinary.is_ordinary(issued):
+        async with ordinary.cleanup_transaction(database, issued, relation):
+            yield
+        return
     if issued is None:
         _require(not source.is_source_storage_required())
         async with database.transaction():

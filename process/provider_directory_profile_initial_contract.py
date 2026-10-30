@@ -8,6 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
+from uuid import UUID
 
 from process.provider_directory_profile_capacity_runtime_types import ProviderDirectoryProfileCapacityGeometryInputs
 from process.provider_directory_profile_capacity_types import ProviderDirectoryProfileCapacityGeometry
@@ -22,6 +23,7 @@ CONTROL_RECEIPT_CONTRACT = "healthporta.provider-directory-profile-capacity-cont
 GEOMETRY_CONTRACT = "healthporta.provider-directory-profile-initial-capacity-geometry.v1"
 GEOMETRY_DOMAIN = "provider_directory_profile_initial_capacity_geometry.v1"
 TARGET_CONTRACT = "healthporta.provider-directory-profile-initial-target-state.v1"
+RECOVERED_TARGET_CONTRACT = "healthporta.provider-directory-profile-initial-target-state.v2"
 COMMIT_CONTRACT = "healthporta.provider-directory-profile-initial-receipt.v1"
 CONTROL_WAL_CONTRACT = "healthporta.provider-directory-profile-initial-control-wal.v1"
 FORECAST_CONTRACT = "healthporta.provider-directory-profile-initial-cutover-forecast.v1"
@@ -111,7 +113,8 @@ def result_sha256(result: Mapping[str, Any]) -> str:
 
 def target_state_sha256(payload: Mapping[str, Any]) -> str:
     """Hash the closed target snapshot with its contract domain and NUL separator."""
-    return hashlib.sha256(TARGET_CONTRACT.encode("ascii") + b"\0" + canonical_json(payload).encode("ascii")).hexdigest()
+    domain = RECOVERED_TARGET_CONTRACT if payload.get("contract_id") == RECOVERED_TARGET_CONTRACT else TARGET_CONTRACT
+    return hashlib.sha256(domain.encode("ascii") + b"\0" + canonical_json(payload).encode("ascii")).hexdigest()
 
 
 def _invalid(reason: str) -> None:
@@ -163,6 +166,8 @@ def validated_legacy_result(raw: Any) -> dict[str, Any]:
 
 def validated_target_state(raw: Any) -> dict[str, Any]:
     """Validate an empty target pair or authentic undated historical publication."""
+    if isinstance(raw, Mapping) and raw.get("contract_id") == RECOVERED_TARGET_CONTRACT:
+        return _validated_recovered_target_state(raw)
     if not isinstance(raw, Mapping) or set(raw) != TARGET_FIELDS:
         _invalid("target_fields_invalid")
     target_by_field = dict(raw)
@@ -221,6 +226,8 @@ def is_initial_profile_request(request: Any) -> bool:
     if is_initial_request(request):
         return True
     admission = getattr(request, "cms_nonprofile_admission", None)
+    if admission is None:
+        admission = getattr(request, "serving_nonprofile_admission", None)
     if not isinstance(admission, Mapping):
         return False
     pair = admission.get("paired_profile_lease", {})
@@ -244,3 +251,62 @@ def is_initial_execution_requested(execution: Any) -> bool:
 
 initial_profile_for_request = is_initial_profile_request
 execution_initial_requested = is_initial_execution_requested
+
+
+def validated_recovered_publication(raw):
+    """Bind an inactive immutable initial receipt to one exact terminal inverse event."""
+    fields = {
+        "recovery_id",
+        "recovered_event_sha256",
+        "initial_receipt",
+        "original_target_state_sha256",
+        "initial_targets",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != fields:
+        _invalid("recovered_publication_fields_invalid")
+    publication_by_field = json.loads(canonical_json(raw))
+    try:
+        if (
+            type(publication_by_field["recovery_id"]) is not str
+            or str(UUID(publication_by_field["recovery_id"])) != publication_by_field["recovery_id"]
+        ):
+            _invalid("recovered_publication_identity_invalid")
+    except (ValueError, AttributeError, TypeError) as error:
+        raise ValueError("provider_directory_profile_initial_recovered_publication_identity_invalid") from error
+    for name in ("recovered_event_sha256", "original_target_state_sha256"):
+        if type(publication_by_field[name]) is not str or _HASH.fullmatch(publication_by_field[name]) is None:
+            _invalid("recovered_publication_digest_invalid")
+    receipt = publication_by_field["initial_receipt"]
+    if not isinstance(receipt, dict) or set(receipt) != {"build_id", "generation_id", "run_id", "payload_sha256"}:
+        _invalid("recovered_receipt_fields_invalid")
+    for name, prefix in (("build_id", "pdpb_"), ("generation_id", "pdprofile_"), ("run_id", "run_")):
+        if type(receipt[name]) is not str or re.fullmatch(prefix + r"[0-9a-f]{32}", receipt[name]) is None:
+            _invalid("recovered_receipt_identity_invalid")
+    if type(receipt["payload_sha256"]) is not str or _HASH.fullmatch(receipt["payload_sha256"]) is None:
+        _invalid("recovered_receipt_digest_invalid")
+    original = publication_by_field["initial_targets"]
+    if not isinstance(original, dict) or original.get("contract_id") != TARGET_CONTRACT:
+        _invalid("recovered_original_contract_invalid")
+    original = validated_target_state(original)
+    if target_state_sha256(original) != publication_by_field["original_target_state_sha256"]:
+        _invalid("recovered_original_digest_invalid")
+    return publication_by_field
+
+
+def _validated_recovered_target_state(raw):
+    if (
+        set(raw) != TARGET_FIELDS | {"recovered_initial_publication"}
+        or raw["initial_commit_receipt_absent"] is not False
+    ):
+        _invalid("recovered_target_fields_invalid")
+    target_by_field = dict(raw)
+    reference = validated_recovered_publication(target_by_field.pop("recovered_initial_publication"))
+    current = validated_target_state(
+        {**target_by_field, "contract_id": TARGET_CONTRACT, "initial_commit_receipt_absent": True}
+    )
+    ignored_fields = {"profile_target_bytes", "evidence_target_bytes"}
+    if {key: value for key, value in current.items() if key not in ignored_fields} != {
+        key: value for key, value in reference["initial_targets"].items() if key not in ignored_fields
+    }:
+        _invalid("recovered_target_binding_invalid")
+    return {**target_by_field, "recovered_initial_publication": reference}

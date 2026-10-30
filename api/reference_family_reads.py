@@ -26,7 +26,10 @@ async def pin_claims_reader(session):
             raise RuntimeError("installed claims reader family is incomplete")
         pairs_by_importer[importer] = pairs
     if not pairs_by_importer:
-        await session.rollback()  # Discard only this catalog probe; ordinary requests retain default isolation.
+        if "provider_profile_native_authorities" in session.info:
+            _require_provider_snapshot_owner(session)
+        else:
+            await session.rollback()  # Discard only this probe, never an already-pinned provider snapshot.
         return None  # Ordinary, uninstalled pricing continues through its existing entrypoint.
     pairs = tuple(sorted(pair for family_pairs in pairs_by_importer.values() for pair in family_pairs))
     await _lock_family(
@@ -56,6 +59,19 @@ async def pin_claims_reader(session):
         await _require_dictionary_overlap(session, tuple(pairs_by_importer))
         session.info["snapshot_claims_dictionary_tables"] = _claims_dictionary_overlay(tuple(pairs_by_importer))
     return pairs
+
+
+def _require_provider_snapshot_owner(session):
+    """Retain only this task's already-verified provider snapshot through an empty claims probe."""
+    from api.provider_profile_snapshot import _SNAPSHOT
+    from db.connection import current_session
+
+    if (
+        session.info.get("api_reader_verified") is not True
+        or _SNAPSHOT.get() is None
+        or current_session() is not session
+    ):
+        raise RuntimeError("Provider snapshot owner is unavailable")
 
 
 async def _require_claims_reader_dictionary(session):

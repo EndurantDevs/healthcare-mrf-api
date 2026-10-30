@@ -217,6 +217,43 @@ def revalidate_profile_control_wal_projection(
     return projection
 
 
+def assert_profile_control_metadata_growth(geometry, projection, observed_plan):
+    """Require current metadata costs to fit the original signed operation bounds."""
+    revalidate_profile_control_wal_projection(geometry, projection)
+    _validate_control_wal_plan_input(observed_plan)
+    retained = projection.plan_input
+    original_mutation_by_name = {}
+    for name in (
+        "build_checkpoint_insert",
+        "build_checkpoint_update",
+        "import_run_update",
+        "capacity_consumption_insert",
+    ):
+        original, observed = getattr(retained, name), getattr(observed_plan, name)
+        if (
+            len(observed.main_index_pages) != len(original.main_index_pages)
+            or len(observed.toast_index_pages) != len(original.toast_index_pages)
+            or dataclasses.replace(
+                observed,
+                main_index_pages=original.main_index_pages,
+                toast_index_pages=original.toast_index_pages,
+            )
+            != original
+        ):
+            raise _error("control_metadata_resume_identity_changed")
+        original_mutation_by_name[name] = original
+    if dataclasses.replace(observed_plan, **original_mutation_by_name) != retained:
+        raise _error("control_metadata_resume_identity_changed")
+    funded_bounds = _control_metadata_mutation_bounds(geometry, retained)
+    current_bounds = _control_metadata_mutation_bounds(geometry, observed_plan)
+    if any(
+        observed > funded
+        for current, reserved in zip(current_bounds, funded_bounds, strict=True)
+        for observed, funded in zip(current, reserved, strict=True)
+    ):
+        raise _error("control_metadata_resume_growth_unfunded")
+
+
 def profile_control_wal_projection_payload(
     projection: ProviderDirectoryProfileControlWalProjection,
 ) -> dict[str, Any]:

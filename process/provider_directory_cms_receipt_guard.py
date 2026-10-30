@@ -84,9 +84,17 @@ async def assert_profile_receipt_guards(database, relation_by_field, captured_tr
             RAISE EXCEPTION 'cms_serving_native_truncate_forbidden'; END IF; RETURN NULL; END""",
         ),
     }
-    if await database.scalar("SELECT to_regclass(:relation) IS NOT NULL",
-                             relation=f"{quoted_schema}.provider_directory_profile_initial_receipt") is True:
-        from process.provider_directory_profile_initial_guards import initial_serving_guard_expected, _assert_match_function
+    if (
+        await database.scalar(
+            "SELECT to_regclass(:relation) IS NOT NULL",
+            relation=f"{quoted_schema}.provider_directory_profile_initial_receipt",
+        )
+        is True
+    ):
+        from process.provider_directory_profile_initial_guards import (
+            _assert_match_function,
+            initial_serving_guard_expected,
+        )
 
         expected_by_name.update(initial_serving_guard_expected(schema))
         await _assert_match_function(database, schema)
@@ -133,6 +141,11 @@ async def _assert_guards(database, relation_by_field, expected_by_name, captured
     for guard_row in observed:
         guard_by_field = dict(guard_row._mapping)
         expected = expected_by_name.get(guard_by_field["name"])
+        if expected is not None and guard_by_field["name"] == "pd_profile_initial_serving_insert":
+            from process.provider_directory_profile_initial_guards import validated_serving_guard_body
+
+            body = validated_serving_guard_body(schema, guard_by_field["function_body"])
+            expected = (expected[0], expected[1], body)
         if expected is None or (
             guard_by_field["event_mask"] != expected[0]
             or guard_by_field["enabled"] not in {"O", "A"}

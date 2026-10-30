@@ -232,6 +232,8 @@ def test_reader_path_includes_root_and_post_read_routes(path):
         "/api/v1/geo/",
         "/api/v1/npi/id/1234567890",
         "/api/v1/npi/id/1234567890/",
+        "/api/v1/npi/id/1234567890/profile",
+        "/api/v1/npi/id/1234567890/profile/",
     ],
 )
 def test_reader_path_preserves_other_routes(path):
@@ -740,3 +742,106 @@ async def test_reader_rejects_invalid_temporary_setup_before_connect(monkeypatch
         async with database.reader_session(temporary_setup=object()):
             pytest.fail("invalid setup yielded a Reader")
     database._connect_reader.assert_not_awaited()
+
+
+async def test_snapshot_setup_precedes_verified_reader_and_keeps_read_only_owner(monkeypatch):
+    session = ReaderSession()
+    database = reader_database(monkeypatch, [session])
+
+    async def setup(fresh):
+        assert fresh is session and not session.info and not database.has_reader_session()
+        await fresh.execute("SELECT catalog_probe")
+        await fresh.rollback()
+        await fresh.execute("LOCK TABLE synthetic IN ACCESS SHARE MODE")
+
+    async with database.reader_session(snapshot_setup=setup) as acquired:
+        assert acquired is session and current_session() is session and database.has_reader_session()
+        statements = [str(statement) for statement, _ in session.executed]
+        assert statements[:2] == ["SELECT catalog_probe", "LOCK TABLE synthetic IN ACCESS SHARE MODE"]
+        assert statements[2].startswith("SELECT session_user, current_user")
+        assert "transaction_read_only" in statements[3]
+        assert session.info["api_reader_verified"]
+    assert session.closed and session.committed and session.rolled_back and not session.info
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("setup failed"), asyncio.CancelledError()])
+async def test_snapshot_setup_failure_never_exposes_or_replays_reader(monkeypatch, failure):
+    session = ReaderSession()
+    database = reader_database(monkeypatch, [session])
+
+    async def setup(fresh):
+        await fresh.execute("SELECT catalog_probe")
+        raise failure
+
+    with pytest.raises(type(failure)) as caught:
+        async with database.reader_session(snapshot_setup=setup):
+            pytest.fail("failed setup reached a loader")
+    assert caught.value is failure and session.closed and session.rolled_back and not session.committed
+    assert not database.has_reader_session() and not session.info
+    assert [str(statement) for statement, _ in session.executed] == ["SELECT catalog_probe"]
+
+
+@pytest.mark.parametrize("modes", [("read committed", "on"), ("repeatable read", "off")])
+async def test_snapshot_setup_cannot_change_verified_read_modes(monkeypatch, modes):
+    session = ReaderSession()
+    session.modes = modes
+    database = reader_database(monkeypatch, [session])
+    with pytest.raises(RuntimeError, match="repeatable read and read only"):
+        async with database.reader_session(snapshot_setup=AsyncMock()):
+            pytest.fail("changed mode yielded Reader")
+    assert session.closed and session.rolled_back and not session.info
+
+
+async def test_snapshot_setup_refuses_borrowed_reader_and_other_preparation_modes(monkeypatch):
+    session = ReaderSession()
+    database = reader_database(monkeypatch, [session])
+    setup = AsyncMock()
+    async with database.reader_session():
+        with pytest.raises(RuntimeError, match="fresh Reader"):
+            async with database.reader_session(snapshot_setup=setup):
+                pytest.fail("borrowed Reader accepted setup")
+        setup.assert_not_awaited()
+    for options in ({"temporary_setup": AsyncMock()}, {"prepare_plan_workspace": True, "independent": True}):
+        with pytest.raises(RuntimeError, match="separate ownership"):
+            async with database.reader_session(snapshot_setup=setup, **options):
+                pytest.fail("mixed preparation accepted")
+    with pytest.raises(TypeError, match="async callable"):
+        async with database.reader_session(snapshot_setup=object()):
+            pytest.fail("non-callable setup accepted")
+
+
+async def test_snapshot_setup_cannot_bypass_reader_login_verification(monkeypatch):
+    session = ReaderSession(identity=("reader_test", "writer_test"))
+    database = reader_database(monkeypatch, [session])
+    with pytest.raises(RuntimeError, match="login identity differs"):
+        async with database.reader_session(snapshot_setup=AsyncMock()):
+            pytest.fail("different current user reached a loader")
+    assert session.closed and session.rolled_back and not session.info and not database.has_reader_session()
+
+
+@pytest.mark.parametrize("selector", ["ordinary", "canonical", "invalid", "bound"])
+async def test_nearby_reader_scope_keeps_existing_canonical_selector_owner(monkeypatch, selector):
+    from sanic.exceptions import InvalidUsage
+
+    from api import network_address_scope, provider_profile_snapshot
+
+    database = Database()
+    legacy, provider = object(), object()
+    monkeypatch.setattr(database, "reader_session", lambda: legacy)
+    selected = None if selector in {"ordinary", "bound"} else {"network_ids": "1"}
+    monkeypatch.setattr(
+        network_address_scope, "current_network_address_scope", lambda: object() if selector == "bound" else None
+    )
+
+    def select(*_args):
+        if selector == "invalid":
+            raise InvalidUsage("original selector refusal")
+        return selected
+
+    monkeypatch.setattr(network_address_scope, "_request_selector", select)
+    monkeypatch.setattr(provider_profile_snapshot, "provider_profile_read_snapshot", lambda *_args, **_kwargs: provider)
+    request = SimpleNamespace(path="/api/v1/npi/near/", args={}, headers={})
+    assert database._request_reader_scope(request) is (provider if selector == "ordinary" else legacy)
+    for path in ("/api/v1/pricing", "/api/v1/extensions/custom-import/providers/geo"):
+        request.path = path
+        assert database._request_reader_scope(request) is legacy

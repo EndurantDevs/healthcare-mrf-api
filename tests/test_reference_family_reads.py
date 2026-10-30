@@ -353,7 +353,11 @@ async def test_request_entrypoint_binds_pinning_only_to_real_pricing_consumers(m
 
     pin = AsyncMock()
     monkeypatch.setattr(reference_family_reads, "pin_claims_reader", pin)
-    request = SimpleNamespace(path=path, ctx=SimpleNamespace())
+    request = SimpleNamespace(
+        path=path,
+        args={"network_ids": "1"} if path == "/api/v1/npi/near/" else {},
+        ctx=SimpleNamespace(),
+    )
     try:
         await callbacks["request"](request)
         assert request.ctx.sa_session is session
@@ -398,3 +402,24 @@ async def test_writer_rollout_does_not_attempt_reader_pinning(monkeypatch, path)
     finally:
         await callbacks["response"](request, SimpleNamespace(status=200))
     session.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("damage", [None, "login", "context", "session"])
+async def test_empty_claims_probe_preserves_only_verified_owned_provider_snapshot(monkeypatch, damage):
+    from api import provider_profile_snapshot as snapshot
+    from db import connection
+
+    session, _pairs = _reader(monkeypatch, missing=True)
+    session.info.update(provider_profile_native_authorities={}, api_reader_verified=damage != "login")
+    monkeypatch.setattr(connection, "current_session", lambda: object() if damage == "session" else session)
+    token = snapshot._SNAPSHOT.set(None if damage == "context" else {})
+    try:
+        if damage is None:
+            assert await pin_claims_reader(session) is None
+        else:
+            with pytest.raises(RuntimeError, match="Provider snapshot owner"):
+                await pin_claims_reader(session)
+    finally:
+        snapshot._SNAPSHOT.reset(token)
+    session.rollback.assert_not_awaited()
+    session.execute.assert_not_awaited()

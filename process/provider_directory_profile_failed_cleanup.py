@@ -1100,15 +1100,15 @@ async def _require_supported_drop_catalogs(fhir, relation_oids):
         fail("drop_catalog_shape_unsupported")
 
 
-async def _stage_dependency_manifest(fhir, schema, stage):
-    """Permit only bounded automatic/internal DROP closures; normal dependencies refuse."""
+async def _stage_dependency_closure(fhir, oid):
+    """Observe the bounded native closure before operation-specific catalog accounting."""
     database_records = await fhir.db.all(
         """WITH RECURSIVE closure(classid,objid,objsubid) AS (
         SELECT 'pg_class'::regclass::oid,CAST(:oid AS oid),0
         UNION SELECT d.classid,d.objid,d.objsubid FROM pg_depend d JOIN closure c
         ON (d.refclassid,d.refobjid)=(c.classid,c.objid) AND (c.objsubid=0 OR d.refobjsubid=c.objsubid)
         WHERE d.deptype IN ('a','i')) SELECT classid::bigint,objid::bigint,objsubid FROM closure ORDER BY classid,objid,objsubid""",
-        oid=stage["oid"],
+        oid=oid,
     )
     objects = [list(database_record) for database_record in database_records]
     if not 1 <= len(objects) <= 128:
@@ -1124,7 +1124,7 @@ async def _stage_dependency_manifest(fhir, schema, stage):
         AND NOT EXISTS(SELECT 1 FROM closure own WHERE (own.classid,own.objid)=(d.classid,d.objid)))
         OR EXISTS(SELECT 1 FROM pg_depend d JOIN closure c ON (d.classid,d.objid)=(c.classid,c.objid) WHERE d.deptype='e')
         OR EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D')""",
-        oid=stage["oid"],
+        oid=oid,
     )
     if normal:
         fail("drop_external_dependency")
@@ -1134,9 +1134,15 @@ async def _stage_dependency_manifest(fhir, schema, stage):
     )
     if not 1 <= relation_count <= 32:
         fail("drop_dependency_bound_unsupported")
+    await _require_supported_drop_catalogs(fhir, [entry[1] for entry in objects if entry[0] == 1259])
+    return objects, relation_count
+
+
+async def _stage_dependency_manifest(fhir, schema, stage):
+    """Permit only bounded automatic/internal DROP closures; normal dependencies refuse."""
+    objects, relation_count = await _stage_dependency_closure(fhir, stage["oid"])
     relation_oids = [entry[1] for entry in objects if entry[0] == 1259]
     object_oids = [entry[1] for entry in objects]
-    await _require_supported_drop_catalogs(fhir, relation_oids)
     catalog_deletions = await _catalog_deletion_manifest(fhir, relation_oids, object_oids)
     catalog_rows = sum(entry["deleted_rows"] for entry in catalog_deletions)
     if catalog_rows > 8192:

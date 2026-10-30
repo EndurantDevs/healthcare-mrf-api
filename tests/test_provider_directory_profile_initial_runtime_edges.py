@@ -242,7 +242,10 @@ def _current_serving(case, receipt):
 @pytest.mark.parametrize(
     "existing,observations", [("serving", []), ("common_history", [True, True]), ("receipt", [False, True])]
 )
-async def test_existing_publication_blocks_initial_target_capture(initial_case, existing, observations):
+async def test_existing_publication_blocks_initial_target_capture(monkeypatch, initial_case, existing, observations):
+    from process import provider_directory_serving_recovery as recovery
+
+    monkeypatch.setattr(recovery, "recovered_initial_targets", AsyncMock(return_value=None), raising=False)
     case = initial_case
     if existing == "serving":
         fhir._provider_directory_profile_serving_state.return_value = object()
@@ -828,8 +831,9 @@ async def test_replay_selection_and_database_identity_must_still_match(initial_c
         tablespaces = Mock()
         monkeypatch.setattr(fhir, "_assert_provider_directory_profile_capacity_tablespaces", tablespaces)
         with pytest.raises(RuntimeError, match="replay_database_changed"):
-            initial._assert_replay_database(
+            await initial._assert_replay_database(
                 fhir,
+                "synthetic",
                 replace(case.geometry, database_oid=case.geometry.database_oid + 1),
                 case.geometry,
                 case.admission.lease,

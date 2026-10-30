@@ -247,21 +247,30 @@ async def _discard(directory, operation, prepared_stages):
                 await stages.discard_output_stage(capability, stage)
 
 
-async def backfill_resource_id_npis(directory, db_schema=None, *, run_id=None, source_ids=None, seen_table=None):
-    """Publish both exact NPI replacements together; value filters confer no authority."""
-    from process.provider_directory_artifact_bundle_preparation import apply_prepared_output_bundle
+async def _prepared_npi_backfill(directory, db_schema, run_id, source_ids, seen_table):
+    """Use only existing issued preparation scopes before considering canonical publication."""
     from process.provider_directory_artifact_scratch_inputs import prepared_scratch_enrichment
     from process.provider_directory_generic_source_artifacts import prepared_npi_backfill
+    from process.provider_directory_ordinary_scratch_npi import backfill_ordinary_scratch_npis
 
     prepared = await prepared_npi_backfill(
         directory, db_schema, run_id=run_id, source_ids=source_ids, seen_table=seen_table
     )
     if prepared is not None:
         return prepared
-
     prepared = await prepared_scratch_enrichment(
         directory, "npi", db_schema=db_schema, run_id=run_id, source_ids=source_ids, seen_table=seen_table
     )
+    if prepared is not None:
+        return prepared
+    return await backfill_ordinary_scratch_npis(directory, db_schema, run_id, source_ids, seen_table)
+
+
+async def backfill_resource_id_npis(directory, db_schema=None, *, run_id=None, source_ids=None, seen_table=None):
+    """Publish both exact NPI replacements together; value filters confer no authority."""
+    from process.provider_directory_artifact_bundle_preparation import apply_prepared_output_bundle
+
+    prepared = await _prepared_npi_backfill(directory, db_schema, run_id, source_ids, seen_table)
     if prepared is not None:
         return prepared
     selector = _selector(directory, db_schema, run_id, source_ids, seen_table)

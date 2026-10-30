@@ -59,11 +59,31 @@ async def semantic_source_template():
 
 
 @asynccontextmanager
-async def _semantic_database(monkeypatch):
+async def _semantic_database(monkeypatch, *, resource_json_type="jsonb"):
     """Use the genuine Source Factory, Publisher, Owner, and native migrations."""
+    assert resource_json_type in {"json", "jsonb"}
+
+    async def prepare_inputs(component):
+        await provision_native_outputs(component)
+        if resource_json_type == "json":
+            # Match the current resource model before Source custody or candidates exist.
+            relation = importer._unscoped_qt(component.policy.schema, "provider_directory_dataset_resource")
+            async with component.admin_engine.begin() as connection:
+                assert await connection.scalar(text(f"SELECT count(*) FROM {relation}")) == 0
+                await connection.execute(
+                    text(f"ALTER TABLE {relation} ALTER COLUMN payload_json TYPE json USING payload_json::json")
+                )
+                assert await connection.scalar(
+                    text(
+                        "SELECT atttypid='pg_catalog.json'::regtype AND attnotnull FROM pg_attribute "
+                        "WHERE attrelid=to_regclass(:relation) AND attname='payload_json' AND NOT attisdropped"
+                    ),
+                    {"relation": relation},
+                )
+
     async with source_component_database(
         monkeypatch,
-        before_provision=provision_native_outputs,
+        before_provision=prepare_inputs,
         migration_prefixes=rehydration_migrations(),
     ) as component:
         database, schema = component.database, component.policy.schema

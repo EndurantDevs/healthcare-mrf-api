@@ -165,11 +165,122 @@ async def preflight_publication_dependencies(database, schema_name, ctx):
             return
 
 
+async def capture_selected_publication_bindings(session, schema_name, *, node_id=None):
+    """Read the existing protected source selection on the caller's actual transaction."""
+    from process.tiger_held_inputs import selected_captured_inventories, selected_tiger_inventory
+
+    schema = projection._sql_identifier(schema_name, field_name="address schema")
+    node_options_dict = {} if node_id is None else {"node_id": node_id}
+    captured = await selected_captured_inventories(session, **node_options_dict)
+    inventory = captured.get("tiger") or await selected_tiger_inventory(session, **node_options_dict)
+    if inventory is None:
+        if await session.scalar(
+            text("""SELECT EXISTS(SELECT 1 FROM pg_inherits
+            WHERE inhparent IN (to_regclass('tiger.zip_state'),to_regclass('tiger.zcta5')))""")
+        ):
+            raise RuntimeError(
+                "entity-address inherited TIGER publication requires protected captured inputs; "
+                "capture and select a protected TIGER source before retrying"
+            )
+        if not captured:
+            return None
+    by_name = {relation["relation_name"]: relation for family in captured.values() for relation in family["relations"]}
+    if inventory is not None:
+        by_name.update({relation["relation_name"]: relation for relation in inventory["relations"]})
+    return by_name, await capture_publication_dependency_bindings(session, schema, by_name)
+
+
+async def capture_publication_dependency_bindings(session, schema_name, selected_relations):
+    """Resolve only the same six fixed canonical or already-authenticated selected inputs."""
+    schema = projection._sql_identifier(schema_name, field_name="address schema")
+    by_name = selected_relations
+    bindings_by_name = {}
+    for namespace, table in projection._PROJECTION_DEPENDENCIES:
+        canonical = f"{namespace or schema}.{table}"
+        physical_schema = by_name[table]["schema_name"] if table in by_name else namespace or schema
+        relation = (
+            (
+                await session.execute(
+                    text("""SELECT oid::bigint AS relation_oid,
+            pg_relation_filenode(oid)::bigint AS relfilenode FROM pg_class WHERE oid=to_regclass(:name)"""),
+                    {"name": f'"{physical_schema}"."{table}"'},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if relation is None:
+            raise RuntimeError("entity-address publication dependency is missing")
+        bindings_by_name[canonical] = {"schema_name": physical_schema, "table_name": table, **dict(relation)}
+    return projection.validate_projection_dependency_bindings(schema, bindings_by_name)
+
+
+async def capture_inference_inputs(session, schema_name, selected_relations):
+    """Observe the existing inference prerequisites and the NUCC generation actually used."""
+    schema = projection._sql_identifier(schema_name, field_name="address schema")
+    prerequisites_by_name = {}
+    for name in ("npi", "npi_address", "npi_taxonomy", "nucc_taxonomy"):
+        namespace = selected_relations.get(name, {}).get("schema_name", schema)
+        observed = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT c.oid::bigint AS relation_oid,c.relkind::text AS kind,"
+                        "pg_relation_filenode(c.oid)::bigint AS relfilenode,"
+                        "c.relowner=(SELECT nspowner FROM pg_namespace WHERE nspname='hp_snapshot_retention') "
+                        "AS protected_owner FROM pg_class c WHERE c.oid=to_regclass(:name)"
+                    ),
+                    {"name": f'"{namespace}"."{name}"'},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        prerequisites_by_name[name] = None if observed is None else {"schema": namespace, **dict(observed)}
+        if name in selected_relations:
+            expected = selected_relations[name]
+            if observed is None or any(observed[key] != expected[key] for key in ("relation_oid", "relfilenode")):
+                raise RuntimeError("entity-address inference selected input changed")
+    nucc = (
+        await _capture_nucc_generation(session, prerequisites_by_name["nucc_taxonomy"])
+        if all(prerequisites_by_name.values())
+        else None
+    )
+    return {"prerequisites": prerequisites_by_name, "nucc": nucc}
+
+
+async def _capture_nucc_generation(session, relation):
+    """Reuse native or historical NUCC custody; no registration or new reader authority."""
+    from process import reference_family_result_generation as reference
+
+    if relation["kind"] == "p":
+        from process.provider_directory_cms_native_inputs import capture_protected_nucc_input
+
+        observed = await capture_protected_nucc_input(session, schema=relation["schema"])
+        if observed["physical"]["parent_oid"] != relation["relation_oid"]:
+            raise RuntimeError("entity-address inference NUCC input changed")
+        return observed
+    if relation["kind"] != "r":
+        raise RuntimeError("entity-address inference NUCC input changed")
+    authority = await reference.read_reference_family_result_generation_authority(
+        session, importer_id="nucc", schema_name=relation["schema"]
+    )
+    if authority.serving_generation is None or authority.relation_oids != (relation["relation_oid"],):
+        raise RuntimeError("entity-address inference NUCC generation changed")
+    if relation["protected_owner"]:
+        await reference.require_nucc_native_predecessor_storage(
+            session, schema_name=relation["schema"], expected_relation_oid=relation["relation_oid"]
+        )
+    else:
+        await reference.capture_reference_family_serving_generation(
+            session, importer_id="nucc", schema_name=relation["schema"]
+        )
+    return {"generation": authority.as_dict()}
+
+
 @asynccontextmanager
 async def selected_publication_dependencies(database, schema_name, *, control_context=None):
     """Hold complete protected input families through the ordinary native finalizer."""
-    from process.tiger_held_inputs import selected_captured_inventories, selected_tiger_inventory
-
     schema = projection._sql_identifier(schema_name, field_name="address schema")
     async with database.session_factory() as session, session.begin():
         node_options_dict = {}
@@ -177,44 +288,11 @@ async def selected_publication_dependencies(database, schema_name, *, control_co
             from process.entity_address_native_publication import controlled_dependency_node
 
             node_options_dict["node_id"] = await controlled_dependency_node(session, schema, control_context)
-        captured = await selected_captured_inventories(session, **node_options_dict)
-        inventory = captured.get("tiger") or await selected_tiger_inventory(session, **node_options_dict)
-        if inventory is None:
-            if await session.scalar(
-                text("""SELECT EXISTS(SELECT 1 FROM pg_inherits
-                WHERE inhparent IN (to_regclass('tiger.zip_state'),to_regclass('tiger.zcta5')))""")
-            ):
-                raise RuntimeError(
-                    "entity-address inherited TIGER publication requires protected captured inputs; "
-                    "capture and select a protected TIGER source before retrying"
-                )
-            if not captured:
-                yield None
-                return
-        by_name = {
-            relation["relation_name"]: relation for family in captured.values() for relation in family["relations"]
-        }
-        if inventory is not None:
-            by_name.update({relation["relation_name"]: relation for relation in inventory["relations"]})
-        bindings_by_name = {}
-        for namespace, table in projection._PROJECTION_DEPENDENCIES:
-            canonical = f"{namespace or schema}.{table}"
-            physical_schema = by_name[table]["schema_name"] if table in by_name else namespace or schema
-            relation = (
-                (
-                    await session.execute(
-                        text("""SELECT oid::bigint AS relation_oid,
-                pg_relation_filenode(oid)::bigint AS relfilenode FROM pg_class WHERE oid=to_regclass(:name)"""),
-                        {"name": f'"{physical_schema}"."{table}"'},
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if relation is None:
-                raise RuntimeError("entity-address publication dependency is missing")
-            bindings_by_name[canonical] = {"schema_name": physical_schema, "table_name": table, **dict(relation)}
-        bindings = projection.validate_projection_dependency_bindings(schema, bindings_by_name)
+        selected = await capture_selected_publication_bindings(session, schema, **node_options_dict)
+        if selected is None:
+            yield None
+            return
+        by_name, bindings = selected
         await session.execute(text(projection.projection_dependency_lock_sql(schema, dependency_bindings=bindings)))
         if not await session.scalar(
             text("SELECT " + projection.projection_dependency_bindings_match_sql(schema, bindings))

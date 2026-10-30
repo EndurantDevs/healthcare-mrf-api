@@ -34,9 +34,7 @@ TARGETS = ("provider_directory_canonical_resource", "provider_directory_source_r
 CONTROLS = ("provider_directory_api_endpoint", "provider_directory_source")
 CONTROL_KEYS = {CONTROLS[0]: "endpoint_id", CONTROLS[1]: "source_id"}
 # Control keys can also be referenced by native FKs; report their own constraint.
-CONTROL_CATALOG_SQL = OUTPUT_CATALOG_SQL.replace(
-    "WHERE k.conindid=i.indexrelid)", "WHERE k.conindid=i.indexrelid AND k.conrelid=c.oid)", 1
-)
+CONTROL_CATALOG_SQL = OUTPUT_CATALOG_SQL
 TYPED_INPUTS = {
     "InsurancePlan": "provider_directory_insurance_plan",
     "Practitioner": "provider_directory_practitioner",

@@ -20,10 +20,8 @@ from tests.provider_directory_profile_capacity_v2_migration_support import (
     load_capacity_v2_migration as _load_capacity_v2_migration,
 )
 
-
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions/20260730110000_provider_directory_profile_delta.py"
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260730110000_provider_directory_profile_delta.py"
 )
 
 
@@ -40,9 +38,7 @@ class _OperationsRecorder:
         self.created_table = (table_name, elements, options)
 
     def create_index(self, index_name, table_name, columns, **options):
-        self.created_indexes.append(
-            (index_name, table_name, tuple(columns), options)
-        )
+        self.created_indexes.append((index_name, table_name, tuple(columns), options))
 
     def execute(self, statement):
         self.statements.append(str(statement))
@@ -57,9 +53,7 @@ class _OperationsRecorder:
         condition,
         **options,
     ):
-        self.created_checks.append(
-            (constraint_name, table_name, str(condition), options)
-        )
+        self.created_checks.append((constraint_name, table_name, str(condition), options))
 
     def drop_constraint(
         self,
@@ -67,9 +61,7 @@ class _OperationsRecorder:
         table_name,
         **options,
     ):
-        self.dropped_constraints.append(
-            (constraint_name, table_name, options)
-        )
+        self.dropped_constraints.append((constraint_name, table_name, options))
 
 
 def _load_migration():
@@ -102,9 +94,7 @@ def test_capacity_v2_migration_replaces_only_the_guarded_constraint(
     assert statements.count("RENAME CONSTRAINT") == 1
     assert "provider_directory_capacity_lease_constraint_drift" in statements
     assert "IN ACCESS EXCLUSIVE MODE NOWAIT" in statements
-    assert statements.index("LOCK TABLE") < statements.index(
-        "ADD CONSTRAINT"
-    )
+    assert statements.index("LOCK TABLE") < statements.index("ADD CONSTRAINT")
     assert "UPDATE " not in statements
     assert "DELETE " not in statements
     assert "TRUNCATE " not in statements
@@ -122,12 +112,8 @@ def test_capacity_v2_downgrade_refuses_consumed_v2_history(monkeypatch):
     assert "WHERE contract_id =" in statements
     assert "LOCK TABLE" in statements
     assert "IN ACCESS EXCLUSIVE MODE NOWAIT" in statements
-    assert statements.index("LOCK TABLE") < statements.index(
-        "v2_history_exists"
-    )
-    assert statements.index("v2_history_exists") < statements.index(
-        "ADD CONSTRAINT"
-    )
+    assert statements.index("LOCK TABLE") < statements.index("v2_history_exists")
+    assert statements.index("v2_history_exists") < statements.index("ADD CONSTRAINT")
 
 
 def test_delta_migration_supports_legacy_schema_name(monkeypatch):
@@ -149,46 +135,28 @@ def test_delta_migration_rejects_conflicting_database_schemas(monkeypatch):
 
 def _assert_consumption_columns_match_model(elements) -> None:
     """Compare initial ledger columns before the later purpose migration."""
-    migration_columns_by_name = {
-        element.name: element
-        for element in elements
-        if isinstance(element, sa.Column)
-    }
+    migration_columns_by_name = {element.name: element for element in elements if isinstance(element, sa.Column)}
     model_columns_by_name = {
-        column.name: column
-        for column in (
-            ProviderDirectoryProfileCapacityLeaseConsumption.__table__.columns
-        )
+        column.name: column for column in (ProviderDirectoryProfileCapacityLeaseConsumption.__table__.columns)
     }
-    assert set(migration_columns_by_name) == set(model_columns_by_name) - {
-        "admission_purpose"
-    }
-    assert all(
-        column.nullable is False
-        for column in migration_columns_by_name.values()
-    )
+    assert set(migration_columns_by_name) == set(model_columns_by_name) - {"admission_purpose"}
+    assert all(column.nullable is False for column in migration_columns_by_name.values())
     for column_name, migration_column in migration_columns_by_name.items():
         model_column = model_columns_by_name[column_name]
         assert type(migration_column.type) is type(model_column.type)
-        assert getattr(migration_column.type, "length", None) == getattr(
-            model_column.type, "length", None
-        )
-        assert getattr(migration_column.type, "timezone", None) == getattr(
-            model_column.type, "timezone", None
-        )
+        assert getattr(migration_column.type, "length", None) == getattr(model_column.type, "length", None)
+        assert getattr(migration_column.type, "timezone", None) == getattr(model_column.type, "timezone", None)
 
 
 def _assert_consumption_unique_keys(elements) -> None:
     """Require immutable attestation, reservation, and run identities."""
     assert any(
-        isinstance(element, sa.PrimaryKeyConstraint)
-        and tuple(element._pending_colargs) == ("attestation_id",)
+        isinstance(element, sa.PrimaryKeyConstraint) and tuple(element._pending_colargs) == ("attestation_id",)
         for element in elements
     )
     for column_name in ("reservation_id", "run_id"):
         assert any(
-            isinstance(element, sa.UniqueConstraint)
-            and tuple(element._pending_colargs) == (column_name,)
+            isinstance(element, sa.UniqueConstraint) and tuple(element._pending_colargs) == (column_name,)
             for element in elements
         )
 
@@ -204,9 +172,7 @@ def test_initial_capacity_consumption_migration_matches_model_and_unique_keys(
     migration._create_capacity_lease_consumption_table("profile_test")
 
     table_name, elements, options = recorder.created_table
-    assert table_name == (
-        "provider_directory_profile_capacity_lease_consumption"
-    )
+    assert table_name == ("provider_directory_profile_capacity_lease_consumption")
     assert options == {"schema": "profile_test"}
     _assert_consumption_columns_match_model(elements)
     _assert_consumption_unique_keys(elements)
@@ -237,7 +203,7 @@ def test_capacity_consumption_model_has_purpose_scoped_run_identity():
         str(constraint.sqltext)
         for constraint in table.constraints
         if constraint.name == "pd_profile_capacity_consumption_purpose_check"
-    } == {"admission_purpose IN ('profile','cms_nonprofile')"}
+    } == {"admission_purpose IN ('profile','cms_nonprofile','serving_nonprofile','serving_inverse')"}
 
 
 @pytest.mark.parametrize(
@@ -261,16 +227,10 @@ def test_delta_migration_columns_match_models(builder_name, model):
     getattr(migration, builder_name)("profile_test")
 
     table_name, elements, options = recorder.created_table
-    migration_columns = {
-        element.name
-        for element in elements
-        if isinstance(element, sa.Column)
-    }
+    migration_columns = {element.name for element in elements if isinstance(element, sa.Column)}
     assert table_name == model.__tablename__
     assert options == {"schema": "profile_test"}
-    assert migration_columns == {
-        column.name for column in model.__table__.columns
-    }
+    assert migration_columns == {column.name for column in model.__table__.columns}
 
 
 def test_checkpoint_upgrade_adds_forecast_contract_without_preexisting_drop():
@@ -280,9 +240,7 @@ def test_checkpoint_upgrade_adds_forecast_contract_without_preexisting_drop():
 
     migration._add_checkpoint_columns("profile_test")
 
-    added_columns = {
-        column.name for _table_name, column, _options in recorder.added_columns
-    }
+    added_columns = {column.name for _table_name, column, _options in recorder.added_columns}
     assert {
         "cutover_forecast_status",
         "cutover_forecast_hash",
@@ -311,10 +269,7 @@ def test_capacity_consumption_is_always_immutable_and_private():
     migration._create_capacity_lease_consumption_table("private_profile")
 
     statements = "\n".join(recorder.statements)
-    assert (
-        "provider_directory_profile_capacity_consumption_immutable"
-        in statements
-    )
+    assert "provider_directory_profile_capacity_consumption_immutable" in statements
     assert "BEFORE UPDATE OR DELETE" in statements
     assert "BEFORE TRUNCATE" in statements
     assert statements.count("ENABLE ALWAYS TRIGGER") == 2
@@ -326,9 +281,7 @@ def test_capacity_consumption_is_always_immutable_and_private():
 def test_capacity_consumption_constraints_bind_full_build_and_lease_identity():
     table = ProviderDirectoryProfileCapacityLeaseConsumption.__table__
     constraints = "\n".join(
-        str(constraint.sqltext)
-        for constraint in table.constraints
-        if isinstance(constraint, sa.CheckConstraint)
+        str(constraint.sqltext) for constraint in table.constraints if isinstance(constraint, sa.CheckConstraint)
     )
 
     for field_name in (
@@ -369,20 +322,9 @@ def test_capacity_consumption_constraints_bind_full_build_and_lease_identity():
 def _profile_geometry_column_sets_by_table() -> dict[str, set[str]]:
     """Return checkpoint, serving, and receipt columns keyed by table role."""
     return {
-        "checkpoint": {
-        column.name
-        for column in ProviderDirectoryProfileBuildCheckpoint.__table__.columns
-        },
-        "serving": {
-            column.name
-            for column in (
-                ProviderDirectoryProfileServingGeneration.__table__.columns
-            )
-        },
-        "receipt": {
-            column.name
-            for column in ProviderDirectoryProfileDeltaReceipt.__table__.columns
-        },
+        "checkpoint": {column.name for column in ProviderDirectoryProfileBuildCheckpoint.__table__.columns},
+        "serving": {column.name for column in (ProviderDirectoryProfileServingGeneration.__table__.columns)},
+        "receipt": {column.name for column in ProviderDirectoryProfileDeltaReceipt.__table__.columns},
     }
 
 
@@ -477,16 +419,12 @@ def test_capacity_geometry_chain_is_schema_bound_end_to_end():
 
     checkpoint_constraints = "\n".join(
         str(constraint.sqltext)
-        for constraint in (
-            ProviderDirectoryProfileBuildCheckpoint.__table__.constraints
-        )
+        for constraint in (ProviderDirectoryProfileBuildCheckpoint.__table__.constraints)
         if isinstance(constraint, sa.CheckConstraint)
     )
     receipt_constraints = "\n".join(
         str(constraint.sqltext)
-        for constraint in (
-            ProviderDirectoryProfileDeltaReceipt.__table__.constraints
-        )
+        for constraint in (ProviderDirectoryProfileDeltaReceipt.__table__.constraints)
         if isinstance(constraint, sa.CheckConstraint)
     )
     assert "cutover_forecast_status" in checkpoint_constraints
@@ -496,12 +434,7 @@ def test_capacity_geometry_chain_is_schema_bound_end_to_end():
 
 
 def test_capacity_consumption_model_retains_only_closed_redacted_evidence():
-    column_names = {
-        column.name
-        for column in (
-            ProviderDirectoryProfileCapacityLeaseConsumption.__table__.columns
-        )
-    }
+    column_names = {column.name for column in (ProviderDirectoryProfileCapacityLeaseConsumption.__table__.columns)}
 
     assert "canonical_lease_json" in column_names
     assert "signature" in column_names

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING
 
+from process import entity_address_affected_patch as affected_patch
 from process import entity_address_preparation_admission as admitted
 from process import entity_address_prepared_doctors as prepared_doctors
 from process import entity_address_source_preparation as source_preparation
@@ -60,6 +61,7 @@ class PreparedEntityAddressGeneration:
     committed: bool = False
     native_dependencies: prepared_doctors.PreparedAddressDependencies | None = None
     source_preparation: object = field(default=None, repr=False, compare=False)
+    affected_patch: object = field(default=None, repr=False, compare=False)
 
     @property
     def native_receipt(self) -> dict | None:
@@ -182,7 +184,7 @@ def has_prepared_doctors() -> bool:
 async def lock_prepared_doctors(database) -> None:
     """Bind each executing backend to the exact immutable source heaps it may read."""
     dependencies = _NATIVE_DEPENDENCIES.get()
-    if dependencies is not None and (dependencies.doctors is not None or dependencies.archive is not None):
+    if dependencies is not None:
         await prepared_doctors.lock_prepared_relations(database, dependencies)
 
 
@@ -313,6 +315,12 @@ def _pins_sql(inputs: ProviderDirectoryAddressPreparationInput) -> str:
 
 
 def _desired_datasets_sql(db_schema: str) -> str:
+    retained_clause = (
+        "OR (dataset.status='superseded' AND dataset.is_current IS FALSE AND dataset.published_at IS NOT NULL AND dataset.superseded_at >= dataset.published_at)"
+        if affected_patch.is_active()
+        else ""
+    )
+    not_superseded = "" if affected_patch.is_active() else "AND dataset.superseded_at IS NULL"
     return f"""SELECT pin.source_id, dataset.endpoint_id, dataset.dataset_id,
         dataset.acquisition_root_run_id AS run_id,
         COALESCE(dataset.published_at, dataset.validated_at) AS published_at
@@ -321,9 +329,9 @@ def _desired_datasets_sql(db_schema: str) -> str:
         ON dataset.dataset_id = pin.dataset_id AND dataset.endpoint_id = pin.endpoint_id
        AND dataset.dataset_hash = pin.dataset_hash
        AND dataset.acquisition_root_run_id = pin.run_id
-     WHERE dataset.validated_at IS NOT NULL AND dataset.superseded_at IS NULL
+     WHERE dataset.validated_at IS NOT NULL {not_superseded}
        AND ((dataset.status = 'validated' AND dataset.is_current IS FALSE AND dataset.published_at IS NULL)
-         OR (dataset.status = 'published' AND dataset.is_current IS TRUE AND dataset.published_at IS NOT NULL))
+         OR (dataset.status = 'published' AND dataset.is_current IS TRUE AND dataset.published_at IS NOT NULL) {retained_clause})
        AND (dataset.publication_metadata_json::jsonb -> 'source_ids') @> jsonb_build_array(pin.source_id)"""
 
 
@@ -357,6 +365,7 @@ def desired_overlay_ctes(db_schema: str, *, source_ids=None, run_id=None, affect
     """Use exact desired rows without changing the public current-dataset selector."""
     native, inputs = _native(), _SOURCE_QUERY.get() or current()
     overlay_ref = f"({inputs.overlay.statement_sql})" if has_source_query() else f"{db_schema}.{inputs.overlay_table}"
+    overlay_ref = affected_patch.logical_overlay_sql(native, db_schema, inputs) or overlay_ref
     source_filter = f"WHERE source_id = ANY({native._string_array_literal(list(source_ids))})" if source_ids else ""
     run_filter = f"AND overlay.last_seen_run_id = {native._sql_literal(run_id)}" if run_id else ""
     affected_filter = (
@@ -364,6 +373,7 @@ def desired_overlay_ctes(db_schema: str, *, source_ids=None, run_id=None, affect
         if affected_group_table
         else ""
     )
+    dataset_source_join = "AND dataset.source_id = overlay.source_id" if affected_patch.is_active() else ""
     return f"""WITH {_pins_cte(inputs)}, desired_datasets AS MATERIALIZED (
         {_desired_datasets_sql(db_schema)}
     ), requested_sources AS MATERIALIZED (
@@ -372,13 +382,13 @@ def desired_overlay_ctes(db_schema: str, *, source_ids=None, run_id=None, affect
         SELECT pin.source_id, pin.endpoint_id FROM desired_dataset_pins pin
          WHERE pin.endpoint_id IN (SELECT endpoint_id FROM requested_sources)
     ), current_datasets AS MATERIALIZED (
-        SELECT DISTINCT endpoint_id, dataset_id, run_id, published_at FROM desired_datasets
+        SELECT DISTINCT source_id, endpoint_id, dataset_id, run_id, published_at FROM desired_datasets
     ), current_overlay AS MATERIALIZED (
         SELECT overlay.*, dataset.dataset_id, dataset.run_id AS dataset_run_id,
                dataset.published_at AS dataset_published_at
           FROM {overlay_ref} AS overlay
           JOIN endpoint_aliases alias ON alias.source_id = overlay.source_id
-          JOIN current_datasets dataset ON dataset.endpoint_id = alias.endpoint_id
+          JOIN current_datasets dataset ON dataset.endpoint_id = alias.endpoint_id {dataset_source_join}
          WHERE overlay.last_seen_run_id = dataset.run_id {run_filter} {affected_filter}
            AND EXISTS (SELECT 1 FROM {db_schema}.provider_directory_dataset_resource resource
                 WHERE resource.dataset_id = dataset.dataset_id
@@ -410,6 +420,7 @@ async def capture_overlay_fence(db_schema: str, context: dict) -> None:
     )
     context["provider_directory_overlay_alias_generation"] = inputs.address_alias_generation
     context["provider_directory_overlay_relation_oid"] = inputs.overlay_relation_oid
+    await affected_patch.capture_incumbent(native, db_schema)
 
 
 def scope_index_sql(statement: str) -> str:
@@ -480,14 +491,18 @@ async def _register_admitted_stages(ctx):
         raise RuntimeError("entity-address admitted build has no owned stages")
     context = ctx.get("context") or {}
     stage_cls = native.make_class(native.EntityAddressUnified, ctx["import_date"])
-    support_classes = {} if context.get("serving_only_refresh") else native._support_stage_classes(ctx["import_date"])
+    support_classes = (
+        {}
+        if context.get("serving_only_refresh") and not affected_patch.is_active()
+        else native._support_stage_classes(ctx["import_date"])
+    )
     plan = _cutover_plan(scope.db_schema, stage_cls, support_classes, context)
     scope.stage_oids = await _capture_stage_oids(scope.db_schema, plan[0])
     if len(scope.stage_oids) != len(plan[0]):
         raise RuntimeError("entity-address prepared stage is missing")
-    if set(scope.owned_oids) != {name for _target, name, _oid in scope.stage_oids} or any(
-        scope.owned_oids.get(name) != oid for _target, name, oid in scope.stage_oids
-    ):
+    if (
+        not affected_patch.is_active() and set(scope.owned_oids) != {name for _target, name, _oid in scope.stage_oids}
+    ) or any(scope.owned_oids.get(name) != oid for _target, name, oid in scope.stage_oids):
         raise RuntimeError("entity-address prepared stage was not created by this build")
     fhir = importlib.import_module("process.provider_directory_fhir")
     await scope.admission.register_address_stages(
@@ -528,6 +543,11 @@ async def prepare_finalized_generation(db_schema, stage_cls, support_stage_class
         context.get("incumbent_provider_directory_overlay_fence"),
         native_dependencies=_NATIVE_DEPENDENCIES.get(),
     )
+    if affected_patch.is_active():
+        prepared.affected_patch = await affected_patch.finalize(native, db_schema, stage_cls.__tablename__, context)
+        prepared.swaps = []
+        prepared.relation_names = [stage for _logical, stage, _oid in prepared.affected_patch.owned_relations]
+        prepared.required_names = list(prepared.relation_names)
     await source_preparation.freeze_source_generation(native.db, prepared, scope)
     return prepared
 
@@ -563,7 +583,7 @@ async def prepare_provider_directory_entity_address(
     scope = admitted._admitted_preparation(admission, native_input_hash)
     task_options_by_name = {**task, "publish": True, "skip_publish": False}
     if scope is not None:
-        admitted.assert_full_recipe(ctx, task_options_by_name)
+        admitted.assert_full_recipe(ctx, task_options_by_name, scope)
         if preparation_input.semantic_as_of != scope.admission.plan.desired_profile_as_of:
             raise RuntimeError("entity-address semantic date differs from its admission")
     if doctors is not None and scope is None:
@@ -573,6 +593,7 @@ async def prepare_provider_directory_entity_address(
     token = _PREPARATION.set(preparation_input)
     admission_token = admitted._ADMISSION.set(scope)
     dependency_token = _NATIVE_DEPENDENCIES.set(dependencies)
+    affected_token = affected_patch.enter(scope)
     try:
         await native.process_entity_address_unified_data(ctx, task_options_by_name)
         await _register_admitted_stages(ctx)
@@ -587,15 +608,20 @@ async def prepare_provider_directory_entity_address(
                 ) from error
         raise
     finally:
+        affected_patch.exit_scope(affected_token)
         _NATIVE_DEPENDENCIES.reset(dependency_token)
         admitted._ADMISSION.reset(admission_token)
         _PREPARATION.reset(token)
 
 
 async def _capture_dependencies(inputs, scope, doctors, dependency_bindings, archive):
-    """Authenticate native desired inputs on SOURCE before the first candidate DDL."""
+    """Authenticate native desired inputs on the original admitted backend before candidate DDL."""
     native = _native()
     options_by_name = dict(doctors=doctors, dependency_bindings=dependency_bindings, archive=archive)
+    from process.entity_address_ordinary_preparation import is_ordinary
+
+    if scope is not None and is_ordinary(scope.source_preparation):
+        options_by_name["ordinary_preparation"] = scope.source_preparation
     if scope is not None and scope.source_preparation is not None:
         async with source_preparation.preparation_transaction(native.db, scope):
             return await prepared_doctors.capture_dependencies(
@@ -607,7 +633,7 @@ async def _capture_dependencies(inputs, scope, doctors, dependency_bindings, arc
 
 
 async def _finish_preparation(ctx, scope, dependencies):
-    """Keep final dependency reads on the issued SOURCE session after native closure."""
+    """Keep final dependency reads on the original issued backend after native closure."""
     native = _native()
     prepared = await native.publish_entity_address_unified_generation(ctx, prepare_only=True)
     if not isinstance(prepared, PreparedEntityAddressGeneration):
@@ -622,6 +648,15 @@ async def _finish_preparation(ctx, scope, dependencies):
 
 async def _assert_prepared_stages(prepared):
     native = _native()
+    if prepared.affected_patch is not None:
+        from process.entity_address_ordinary_preparation import assert_relations
+
+        descriptor = affected_patch.require_descriptor(prepared)
+        await assert_relations(native.db, descriptor)
+        suffix = descriptor.stage_table.removeprefix("entity_address_unified_")
+        for model in (native.EntityAddressUnified, *native.SUPPORT_TABLE_MODELS):
+            await _require_stage_indexes(prepared.db_schema, native.make_class(model, suffix))
+        return
     for swap, (_target, stage, expected_oid) in zip(prepared.swaps, prepared.stage_oids, strict=True):
         actual_oid = await native.db.scalar(
             "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:relation) AND relpersistence='p'",
@@ -638,6 +673,8 @@ async def publish_prepared_entity_address_generation(prepared, *, callbacks=None
     native.require_caller_owned_cutover_transaction(native.db)
     if prepared.committed:
         raise RuntimeError("entity-address prepared generation is already committed")
+    if prepared.affected_patch is not None:
+        return await affected_patch.publish(native, prepared, callbacks)
 
     async def verify_locked_stages():
         """Check prepared identities after native locks and before the first swap."""
@@ -672,12 +709,13 @@ async def cleanup_prepared_entity_address_generation(prepared):
     native = _native()
     if native.db._transaction_binding() is not None:
         raise RuntimeError("entity-address stage cleanup requires the outer transaction to finish")
-    if prepared.committed:
+    if prepared.committed and prepared.affected_patch is None:
         return
     source_input = prepared.source_preparation
     if source_input is not None:
         source_preparation.require_source_cleanup(prepared)
-    await _drain_owned_stages(prepared.db_schema, prepared.stage_oids, source_input=source_input)
+    cleanup_oids = source_input.cleanup_oids if prepared.affected_patch is not None else prepared.stage_oids
+    await _drain_owned_stages(prepared.db_schema, cleanup_oids, source_input=source_input)
 
 
 async def _drain_owned_stages(db_schema, stage_oids, *, source_input=None):

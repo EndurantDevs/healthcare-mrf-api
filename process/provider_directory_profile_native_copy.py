@@ -23,9 +23,7 @@ from process.provider_directory_projection_stage import _copy_driver
 
 _ISSUED = WeakKeyDictionary()
 _ATTEMPTED = WeakValueDictionary()
-_TARGET_CATALOG_SQL = OUTPUT_CATALOG_SQL.replace(
-    "WHERE k.conindid=i.indexrelid)", "WHERE k.conindid=i.indexrelid AND k.conrelid=c.oid)", 1
-)
+_TARGET_CATALOG_SQL = OUTPUT_CATALOG_SQL
 
 
 def _require(condition):
