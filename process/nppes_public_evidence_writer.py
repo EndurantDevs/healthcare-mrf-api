@@ -189,12 +189,25 @@ async def _admit(
     candidate = await storage.prepare_nppes_evidence_publication(
         database, candidate, prepared, cancel_check=cancel_check
     )
-    async with source_policy.source_transaction(database):
-        await _candidate_catalog(database, schema)
-        state = await storage.publish_nppes_evidence_candidate(database, candidate, prepared, cancel_check=cancel_check)
+    state = await _publish_candidate(database, schema, candidate, prepared, cancel_check)
     if state not in {"inserted", "already_present"}:
         raise writer_error()
     return _receipt(prepared, state)
+
+
+async def _publish_candidate(database, schema, candidate, prepared, cancel_check):
+    from process.nppes_isolated_catalog import issued_isolated_nppes_catalog
+
+    if issued_isolated_nppes_catalog() is not None:
+        await _candidate_catalog(database, schema)
+        state = await storage.publish_nppes_evidence_candidate(database, candidate, prepared, cancel_check=cancel_check)
+    else:
+        async with source_policy.source_transaction(database):
+            await _candidate_catalog(database, schema)
+            state = await storage.publish_nppes_evidence_candidate(
+                database, candidate, prepared, cancel_check=cancel_check
+            )
+    return state
 
 
 async def _flush_candidate(database, candidate, buffers, *, cancel_check, progress):

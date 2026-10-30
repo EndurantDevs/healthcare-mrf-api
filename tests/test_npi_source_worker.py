@@ -40,6 +40,29 @@ def admitted(monkeypatch):
     return request
 
 
+def test_specific_image_preserves_reference_fallback_and_other_importers(monkeypatch):
+    from api import reference_source_worker
+
+    reference_image = "example/reference-worker@sha256:" + "d" * 64
+    monkeypatch.setenv(source.REFERENCE_IMAGE_ENV, reference_image)
+    monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    assert source.admit_npi_source_worker_launch(_recorded()).image == reference_image
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    assert source.admit_npi_source_worker_launch(_recorded()).image == IMAGE
+    assert reference_source_worker.IMAGE_ENV == source.REFERENCE_IMAGE_ENV
+    assert reference_source_worker.os.getenv(reference_source_worker.IMAGE_ENV) == reference_image
+    monkeypatch.setenv(source.IMAGE_ENV, "")
+    with pytest.raises(ValueError, match="admission_unavailable"):
+        source.admit_npi_source_worker_launch(_recorded())
+
+
+def test_existing_job_refuses_a_new_specific_image(admitted, mounted_job, monkeypatch):
+    monkeypatch.setenv(source.IMAGE_ENV, "example/replacement@sha256:" + "e" * 64)
+    replacement = source.admit_npi_source_worker_launch(_recorded())
+    assert replacement.image != admitted.npi_source_launch.image
+    assert not source.is_npi_source_job_matching(mounted_job, replacement)
+
+
 @pytest.fixture
 def mounted_job(admitted, monkeypatch):
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_PVC_NAME", "synthetic-work")
@@ -192,6 +215,7 @@ async def test_locked_ensure_admits_the_actual_registered_job(monkeypatch, with_
 @pytest.mark.asyncio
 async def test_missing_image_refuses_before_launch(monkeypatch):
     monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.delenv(source.REFERENCE_IMAGE_ENV, raising=False)
     request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="npi")
     workers._bind_admitted_job(request, _recorded())
     assert (await workers._admit_source_worker_launches(request, _recorded()))["status"] == "failed"

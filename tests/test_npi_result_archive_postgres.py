@@ -700,6 +700,56 @@ async def test_ordinary_publication_generation_is_transactional() -> None:
 
 
 @pytest.mark.asyncio
+async def test_owned_publication_binds_iso_import_date_and_rolls_back_generation() -> None:
+    """Keep the owned publication's portable date compatible with native asyncpg."""
+    from api.npi_native_cache_identity import npi_native_cache_identity
+    from process import npi_owned_publication as owned
+
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    schema_name = "npi_owned_counter_" + uuid4().hex
+    driver = None
+    try:
+        async with engine.begin() as connection:
+            await _create_family(connection, schema_name, populated=True)
+        driver = await asyncpg.connect(_asyncpg_database_url())
+        receipt = await _publication_receipt(driver, schema_name)
+        assert type(receipt.import_date) is str
+        async with engine.connect() as connection:
+            transaction = await connection.begin()
+            previous = await generation.read_npi_result_generation_authority(connection, schema_name=schema_name)
+            advanced = await owned._publish_generation(
+                connection, archive.NpiIncumbent(schema_name, ()), previous, receipt
+            )
+            assert advanced.local_generation == previous.local_generation + 1
+            assert advanced.relation_oids == receipt.relation_oids
+            assert advanced.canonical_provenance.import_date.isoformat() == receipt.import_date
+
+            async def execute(statement, *, session=None, params=None):
+                """Read through the same actual native transaction used for publication."""
+                return await connection.execute(statement, params or {})
+
+            expected_key = f"native:{advanced.local_lineage_id}:{advanced.local_generation}:{receipt.publication_ref}"
+            assert await npi_native_cache_identity(execute, schema_name) == expected_key
+            async with connection.begin_nested() as savepoint:
+                await connection.execute(text(f'ALTER TABLE "{schema_name}".npi RENAME TO previous_npi'))
+                await connection.execute(text(f'CREATE TABLE "{schema_name}".npi (npi bigint)'))
+                assert await npi_native_cache_identity(execute, schema_name) is None
+                await savepoint.rollback()
+            await transaction.rollback()
+        async with engine.connect() as connection:
+            assert (
+                await generation.read_npi_result_generation_authority(connection, schema_name=schema_name) == previous
+            )
+    finally:
+        if driver is not None:
+            await driver.close()
+        try:
+            await _drop_schemas(engine, {schema_name})
+        finally:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_result_generation_migration_accepts_an_empty_schema() -> None:
     """Directory-only schemas retain state without pretending to own NPI tables."""
 
@@ -1771,3 +1821,70 @@ async def test_model_restore_matches_ordinary_staging_publication_route(
             )
         finally:
             await engine.dispose()
+
+
+# Keep these native cases in the database lane that owns this archive fixture.
+from tests.npi_alias_native_support import (
+    test_native_alias_export_reauthenticates_closed_seven_heap_output as test_native_alias_export_reauthenticates_closed_seven_heap_output,
+)
+from tests.npi_alias_native_support import (
+    test_native_cancel_rolls_back_and_retry_reuses_sealed_observation as test_native_cancel_rolls_back_and_retry_reuses_sealed_observation,
+)
+from tests.npi_alias_native_support import (
+    test_native_invalid_issued_alias_refuses_without_partial_address_output as test_native_invalid_issued_alias_refuses_without_partial_address_output,
+)
+from tests.npi_alias_native_support import (
+    test_native_projection_and_attachment_observe_effective_target_without_touching_strict_source as test_native_projection_and_attachment_observe_effective_target_without_touching_strict_source,
+)
+from tests.npi_alias_native_support import (
+    test_native_retains_genuine_strict_redirect_closure as test_native_retains_genuine_strict_redirect_closure,
+)
+from tests.npi_alias_native_support import (
+    test_native_true_noop_keeps_timestamp_and_formatter as test_native_true_noop_keeps_timestamp_and_formatter,
+)
+from tests.npi_alias_native_support import (
+    test_native_witness_replay_rejects_retargeted_alias_and_expired_session as test_native_witness_replay_rejects_retargeted_alias_and_expired_session,
+)
+from tests.npi_alias_native_support import (
+    test_native_witness_restores_only_with_fresh_local_authority as test_native_witness_restores_only_with_fresh_local_authority,
+)
+from tests.npi_alias_native_support import (
+    test_native_witnessed_alias_preserves_strict_incumbent_or_absence as test_native_witnessed_alias_preserves_strict_incumbent_or_absence,
+)
+from tests.npi_alias_native_support import (
+    test_native_zip_restore_requires_one_pinned_state_checked_match as test_native_zip_restore_requires_one_pinned_state_checked_match,
+)
+from tests.npi_batch_native_support import (
+    test_native_borrowed_copy_retains_outer_rollback as test_native_borrowed_copy_retains_outer_rollback,
+)
+from tests.npi_batch_native_support import (
+    test_native_failed_window_preserves_caller_transaction as test_native_failed_window_preserves_caller_transaction,
+)
+from tests.npi_batch_native_support import (
+    test_native_repeated_cancel_drains_cleanup as test_native_repeated_cancel_drains_cleanup,
+)
+from tests.npi_batch_native_support import (
+    test_native_weekly_delete_keeps_family_type_scope as test_native_weekly_delete_keeps_family_type_scope,
+)
+
+# Keep bounded parser and native cleanup proof in the archive database lane.
+from tests.npi_batch_native_support import (
+    test_native_window_keeps_checksum_collision_parity as test_native_window_keeps_checksum_collision_parity,
+)
+from tests.npi_batch_native_support import (
+    test_native_windows_keep_rewrite_and_identifier_winners as test_native_windows_keep_rewrite_and_identifier_winners,
+)
+from tests.npi_batch_resource_support import (
+    test_native_maximum_parser_expansion_matches_complete_legacy_rows as test_native_maximum_parser_expansion_matches_complete_legacy_rows,
+)
+from tests.npi_owned_publication_postgres_support import (
+    test_native_catalog_proof_rejects_drift as test_native_catalog_proof_rejects_drift,
+)
+
+# Collect isolated native proof in the existing database lane with its required DSN.
+from tests.npi_owned_publication_postgres_support import (
+    test_native_output_custody as test_native_output_custody,
+)
+from tests.npi_owned_publication_postgres_support import (
+    test_native_output_rejects_incomplete_canonical_closure as test_native_output_rejects_incomplete_canonical_closure,
+)
