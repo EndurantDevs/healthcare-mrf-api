@@ -13,8 +13,21 @@ from api import provider_list_sql
 from api.endpoint import npi as npi_module
 from api.network_address_scope import network_address_read_scope
 from process.network_serving_read import PinnedNetworkServingManifest
+from tests.network_read_execution_support import with_read_identity_receipts
 from tests.npi_location_hydration_support import unified_location_mapping
 from tests.test_npi_facility_providers_api import FakeSession, _facility_query_results
+
+
+def _guarded_query_session(query):
+    """Buffer semantic SQL rows while retaining the original transaction guard."""
+    session = with_read_identity_receipts(SimpleNamespace())
+
+    async def execute(statement, parameters):
+        rows = await query(statement, **parameters)
+        return SimpleNamespace(all=lambda: rows)
+
+    session.execute = execute
+    return session
 
 
 @pytest.mark.asyncio
@@ -26,7 +39,6 @@ async def test_general_geo_page_and_count_bind_retained_offices(monkeypatch, ent
     manifest = PinnedNetworkServingManifest(
         12, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "c" * 64, 1
     )
-    session = object()
     statements = []
     location_by_field = {
         **unified_location_mapping(),
@@ -42,7 +54,7 @@ async def test_general_geo_page_and_count_bind_retained_offices(monkeypatch, ent
     async def query(statement, **parameters):
         sql = str(statement)
         statements.append((sql, parameters))
-        assert f'FROM "{manifest.schema_name}".entity_address_unified' in sql
+        assert f'FROM ONLY "{manifest.schema_name}".entity_address_unified' in sql
         assert "WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[])" in sql
         assert parameters["_canonical_network_ids"] == [42]
         assert parameters["entity_type_code"] == int(entity_type_code)
@@ -55,8 +67,9 @@ async def test_general_geo_page_and_count_bind_retained_offices(monkeypatch, ent
         assert "a.location_key ASC" in sql
         return [] if empty_result or len(statements) > 1 else [SimpleNamespace(_mapping=location_by_field)]
 
-    proxy = Mock(return_value=SimpleNamespace(all=query))
-    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", proxy)
+    session = _guarded_query_session(query)
+    proxy = Mock(wraps=provider_list_sql.NetworkReadConnectionProxy)
+    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", proxy)
     monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned query"))))
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
     request = SimpleNamespace(
@@ -122,3 +135,85 @@ async def test_facility_relationships_preserve_legacy_request(monkeypatch):
     response_by_field = json.loads((await npi_module.get_facility_connected_providers(request)).body)
     assert response_by_field["total_providers"] == 2
     assert len(response_by_field["providers"]) == 2 and len(session.calls) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count_rows,expected", [([], 0), ([(7,)], 7)])
+async def test_canonical_geo_count_handles_empty_and_positional_results(monkeypatch, count_rows, expected):
+    from tests.test_network_read_execution import _manifest
+
+    statements = []
+
+    async def query(statement, **parameters):
+        statements.append(str(statement))
+        assert parameters["_canonical_network_ids"] == [42]
+        assert "COUNT(DISTINCT (a.npi, a.address_key))" in str(statement)
+        assert "LIMIT" not in str(statement)
+        return count_rows
+
+    session = _guarded_query_session(query)
+    monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned read"))))
+    monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
+    metadata = AsyncMock(side_effect=AssertionError("count cannot hydrate provider data"))
+    monkeypatch.setattr(npi_module, "_project_provider_network_metadata", metadata)
+    request = SimpleNamespace(
+        args={"lat": "41", "long": "-87", "count_only": "1"},
+        ctx=SimpleNamespace(sa_session=session),
+        app=SimpleNamespace(),
+    )
+    with network_address_read_scope(_manifest(), (42,)):
+        assert json.loads((await npi_module.get_near_npi(request)).body) == {"rows": expected}
+    assert len(statements) == 1
+    metadata.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed",
+    [SimpleNamespace(_mapping={"address_key": "a" * 64}), SimpleNamespace(_mapping={"npi": 1000000004}), (1,)],
+)
+async def test_canonical_geo_never_invents_provider_or_office_identity(monkeypatch, malformed):
+    from tests.test_network_read_execution import _manifest
+
+    async def query(statement, **parameters):
+        assert parameters["_canonical_network_ids"] == [42]
+        if "COUNT(DISTINCT" in str(statement):
+            return [(0,)]
+        return [malformed]
+
+    session = _guarded_query_session(query)
+    monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned read"))))
+    monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
+    request = SimpleNamespace(
+        args={"lat": "41", "long": "-87", "limit": "1", "include_total": "1"},
+        ctx=SimpleNamespace(sa_session=session),
+        app=SimpleNamespace(),
+    )
+    with network_address_read_scope(_manifest(), (42,)):
+        document = json.loads((await npi_module.get_near_npi(request)).body)
+    assert document["items"] == [] and document["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_geo_cursor_from_another_pinned_network_generation_refuses_before_read(monkeypatch):
+    from tests.test_network_read_execution import _manifest
+
+    original = _manifest()
+    successor = _manifest()
+    object.__setattr__(successor, "generation_id", 2)
+    object.__setattr__(successor, "manifest_sha256", "b" * 64)
+    arguments_by_name = {"lat": "41", "long": "-87", "limit": "1"}
+    with network_address_read_scope(original, (42,)):
+        cursor = npi_module._encode_nearby_cursor(
+            npi_module._nearby_cursor_scope(arguments_by_name),
+            100,
+            1000000004,
+            "00000000-0000-0000-0000-000000000001",
+        )
+    query = AsyncMock(side_effect=AssertionError("stale cursor reached storage"))
+    monkeypatch.setattr(npi_module, "_execute_stmt", query)
+    monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
+    request = SimpleNamespace(args={**arguments_by_name, "cursor": cursor}, app=SimpleNamespace())
+    with network_address_read_scope(successor, (42,)), pytest.raises(InvalidUsage, match="cursor"):
+        await npi_module.get_near_npi(request)
+    query.assert_not_awaited()

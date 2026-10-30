@@ -260,8 +260,11 @@ async def test_final_fence_uses_flat_notice_while_rechecking_original_anchor(mon
     copy_target = SimpleNamespace(candidate_id=str(UUID(int=8)))
     runtime = object.__new__(RegistryPublicationPTGRuntime)
     monkeypatch.setattr(consumer, "_selection", AsyncMock(return_value=(1, approved, pin, (combined,))))
-    monkeypatch.setattr(RegistryPublicationPTGRuntime, "compose", AsyncMock(return_value=(copy_target, object())))
-    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    address_source = object()
+    compose = AsyncMock(return_value=(copy_target, address_source))
+    monkeypatch.setattr(RegistryPublicationPTGRuntime, "compose", compose)
+    prepare = AsyncMock()
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
     monkeypatch.setattr(consumer, "_checkpoint", AsyncMock(return_value=({}, {})))
     notice = AsyncMock(return_value=fresh)
     monkeypatch.setattr(consumer, "_notice", notice)
@@ -279,9 +282,12 @@ async def test_final_fence_uses_flat_notice_while_rechecking_original_anchor(mon
     monkeypatch.setattr(consumer, "current_aca_source_fence", fence)
     connection = SimpleNamespace(transaction=transaction, execute=AsyncMock(return_value="UPDATE 1"))
     event_by_name = {"event_id": str(UUID(int=9)), "header": {}}
-    assert await consumer._attempt(
-        connection, None, None, {}, event_by_name, fresh, config(composition_runtime=runtime)
-    ) == {"state": "completed"}
+    settings = config(composition_runtime=runtime)
+    assert await consumer._attempt(connection, None, None, {}, event_by_name, fresh, settings) == {"state": "completed"}
+    prepare.assert_awaited_once_with(connection, copy_target, address_source, settings)
+    assert compose.await_args.kwargs["source_manifest"] is pin
+    assert compose.await_args.kwargs["address_sources"].replacement_source_recipes == (combined,)
+    notice.assert_awaited_once_with(None, None, {}, event_by_name["header"])
     assert bindings.await_args.args[2] == old.binding_coordinates
     assert native.await_args.args[1] == combined.source_pin
     publish.assert_awaited_once_with(connection, copy_target, control_schema="registry_control")

@@ -40,6 +40,16 @@ from process.registry_record_store import (
     search_registry_companies,
     search_registry_groups,
 )
+from process.registry_refresh_anchor_contract import (
+    MAX_BYTES as REFRESH_ANCHOR_MAX_BYTES,
+)
+from process.registry_refresh_anchor_contract import (
+    RegistryRefreshAnchorMismatch,
+    RegistryRefreshAnchorStale,
+    RegistryRefreshAnchorUnavailable,
+    validated_anchor_request,
+)
+from process.registry_refresh_anchor_service import RegistryRefreshAnchorService
 from process.registry_source_site_catalog import (
     RegistrySourceSiteCatalogUnavailable,
     read_registry_source_sites,
@@ -567,4 +577,26 @@ async def read_source_binding_page(request):
     except ValueError, TypeError:
         return _error(400)
     except SQLAlchemyError, asyncpg.PostgresError, RegistryAddressUnavailable:
+        return _error(503)
+
+
+@blueprint.post("/approved-refresh-anchors")
+async def approved_refresh_anchors(request):
+    """Resolve only current approved native anchors through installed source readers."""
+    require_registry_auth(request)
+    try:
+        if request.query_string:
+            raise ValueError("registry_refresh_query_invalid")
+        document = validated_anchor_request(_body(request, maximum=REFRESH_ANCHOR_MAX_BYTES))
+        service = getattr(request.app.ctx, "registry_refresh_anchor_service", None)
+        if type(service) is not RegistryRefreshAnchorService:
+            raise RegistryRefreshAnchorUnavailable("registry_refresh_service_unconfigured")
+        return response.json(await service.verify(document), headers=_HEADERS)
+    except RegistryRefreshAnchorStale:
+        return _error(409)
+    except RegistryRefreshAnchorMismatch:
+        return _error(403)
+    except ValueError, TypeError, UnicodeError:
+        return _error(400)
+    except RegistryRefreshAnchorUnavailable, SQLAlchemyError, asyncpg.PostgresError:
         return _error(503)

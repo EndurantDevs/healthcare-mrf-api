@@ -4,9 +4,12 @@
 import hashlib
 import json
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from process import registry_cms_source_notifications as notifications
 from process.network_registry_cms_source_attempt import RegistryCMSSourceAttempt
 from process.registry_cms_source_notifications import (
     RegistryCMSSourceNotification,
@@ -143,3 +146,59 @@ async def test_rc_preflight_is_publisher_only_and_never_widens_committed_reader(
     else:
         with pytest.raises(ValueError, match="source_notification_invalid"):
             await store._connection(object(), writing=False)
+
+
+def test_notification_digest_alone_cannot_accept_noncanonical_or_changed_envelope():
+    from tests.test_network_cms_registry_source_pair import _retained_pair
+
+    notification = RegistryCMSSourceNotification(_attempt(), _retained_pair())
+    assert decode_registry_cms_source_notification(notification.canonical_json, notification.sha256) == notification
+    changed_by_field = {**notification.as_dict(), "source_schema": "other_source"}
+    for document in (json.dumps(notification.as_dict(), indent=2), notifications._json(changed_by_field)):
+        with pytest.raises(ValueError, match="source_notification_invalid"):
+            decode_registry_cms_source_notification(document, hashlib.sha256(document.encode()).hexdigest())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["identity", "missing", "row_identity", "retained_pair"])
+async def test_notification_reader_refuses_missing_or_inconsistent_committed_evidence(monkeypatch, fault):
+    from tests.test_network_cms_registry_source_pair import _retained_pair, _witness_pair
+
+    notification = RegistryCMSSourceNotification(_attempt(), _retained_pair())
+    row_by_field = dict(zip(notifications.INSERT_COLUMNS, notifications._row_values(notification), strict=True))
+    if fault == "row_identity":
+        row_by_field["publication_xid"] = "999"
+    driver = SimpleNamespace(fetchrow=AsyncMock(return_value=None if fault == "missing" else row_by_field))
+    reader = notifications.RegistryCMSSourceNotificationReader("control", "protected_owner", "publisher", ("reader",))
+    connect = AsyncMock(return_value=driver)
+    resolved = AsyncMock(return_value=SimpleNamespace(pair=_witness_pair()))
+    monkeypatch.setattr(notifications.RegistryCMSSourceNotificationReader, "_connection", connect)
+    monkeypatch.setattr(notifications, "resolve_committed_registry_cms_source_pair", resolved)
+    with pytest.raises(ValueError, match="source_notification_invalid"):
+        await reader.read(
+            object(),
+            source_schema=notification.pair.proof.source_pin.schema_name,
+            receipt_id="not-a-digest" if fault == "identity" else notification.pair.proof.serving_receipt_id,
+        )
+    assert connect.await_count == int(fault != "identity")
+    assert resolved.await_count == int(fault == "retained_pair")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["coordinates", "count", "empty_bytes", "oversized_bytes"])
+async def test_matching_notification_headers_are_typed_and_bounded_before_read(monkeypatch, fault):
+    from tests.test_network_cms_registry_source_pair import _retained_pair
+
+    coordinates = _retained_pair().proof.binding_coordinates
+    headers = [{"receipt_id": "a" * 64, "raw_byte_count": 1}] * (101 if fault == "count" else 1)
+    if fault == "empty_bytes":
+        headers[0] = {**headers[0], "raw_byte_count": 0}
+    elif fault == "oversized_bytes":
+        headers[0] = {**headers[0], "raw_byte_count": notifications.MAX_NOTIFICATION_BYTES + 1}
+    driver = SimpleNamespace(fetch=AsyncMock(return_value=headers))
+    connect = AsyncMock(return_value=driver)
+    monkeypatch.setattr(notifications.RegistryCMSSourceNotificationReader, "_connection", connect)
+    reader = notifications.RegistryCMSSourceNotificationReader("control", "protected_owner", "publisher", ("reader",))
+    with pytest.raises(ValueError, match="source_notification_invalid"):
+        await reader.matching_headers(object(), {} if fault == "coordinates" else coordinates)
+    assert driver.fetch.await_count == int(fault != "coordinates")

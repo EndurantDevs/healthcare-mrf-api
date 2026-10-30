@@ -3,6 +3,7 @@
 
 import asyncio
 import hashlib
+import importlib
 import json
 import re
 from dataclasses import dataclass, replace
@@ -31,6 +32,11 @@ from process.network_fhir_retained_capture_contract import (
     require,
     validate_capture,
 )
+from process.network_fhir_retained_native import (
+    RetainedFhirNativeError,
+    postgres_micros,
+    prepare_retained_fhir_batch,
+)
 from process.network_fhir_source_epoch import (
     _CONTENT_SETTINGS,
     _borrowed_epoch_settings,
@@ -38,6 +44,7 @@ from process.network_fhir_source_epoch import (
     _set_content_settings,
 )
 from process.network_fhir_source_epoch_pin import _columns, _virtual_xid
+from process.network_generic_source_published_snapshot import published_generic_binding, require_native_generic_snapshot
 from process.network_membership_writer_closure import _check_roles, _protected_owner, _transfer_and_grant
 from process.provider_directory_admission_seal import (
     ADMISSION_GENERIC_PROOF_SUMMARY_KEY,
@@ -141,7 +148,7 @@ class _ReaderCopy:
     async def copy_to_table(self, *arguments, **options):
         """Import only into the caller-owned candidate transaction."""
         await self.verify()
-        return await self.writer.copy_to_table(*arguments, **options)
+        return await drain_operation(self.writer.copy_to_table(*arguments, **options), preserve_cancellation=True)
 
 
 async def _reader_export(reader, *arguments, **options):
@@ -223,10 +230,11 @@ async def _origin_header(reader, origin):
         f"FROM {header} WHERE dataset_id=$1",
         origin.dataset_id,
     )
-    _require_header_fields(header, origin)
+    binding = _require_header_fields(header, origin)
     if origin.admission_profile == SEMANTIC_PROFILE:
         await _validate_admitted_proof(reader, origin)
     await _origin_resource(reader, origin)
+    return binding
 
 
 def _require_header_fields(header, origin):
@@ -249,9 +257,15 @@ def _require_header_fields(header, origin):
         )
     )
     require(header["status"] in {"published", "superseded"} and header["published_at"] is not None)
-    require(header["candidate_storage_json"] is None and header["completion_proof_required_version"] is None)
+    binding = published_generic_binding(
+        header,
+        dataset_id=origin.dataset_id,
+        endpoint_id=origin.endpoint_id,
+        root_run_id=origin.root_run_id,
+        source_id=origin.source_id,
+    )
     if origin.admission_profile == LEGACY_PROFILE:
-        require(header["hash_contract"] is None and header["admission_absent"] is True)
+        require(binding is None and header["hash_contract"] is None and header["admission_absent"] is True)
     else:
         _require_admitted_header(header, origin)
     require(
@@ -260,6 +274,7 @@ def _require_header_fields(header, origin):
     )
     summary = json.loads(header["summary"]) if type(header["summary"]) is str else header["summary"]
     _require_summary(summary, origin)
+    return binding
 
 
 def _require_summary(summary, origin):
@@ -784,12 +799,17 @@ def _derived_records(origin, release_id, resource_rows, observed_at):
                 yield TABLES[4], plan_evidence_row
 
 
-async def _copy_derived_batch(writer, schema, table, records):
+async def _copy_derived_batch(writer, schema, table, records, verify=None):
     """Require exact native COPY accounting for every bounded derived batch."""
-    require(await writer.copy_records_to_table(table, schema_name=schema, records=records) == f"COPY {len(records)}")
+    if verify is not None:
+        await verify()
+    copied = await drain_operation(
+        writer.copy_records_to_table(table, schema_name=schema, records=records), preserve_cancellation=True
+    )
+    require(copied == f"COPY {len(records)}")
 
 
-async def _derived(writer, schema, origin, release_id, resource_rows, observed_at):
+async def _derived(writer, schema, origin, release_id, resource_rows, observed_at, *, verify=None):
     """COPY expanded evidence within the existing per-batch row and byte bounds."""
     batches_by_table = {table: [] for table in TABLES[2:]}
     bytes_by_table = dict.fromkeys(batches_by_table, 0)
@@ -799,13 +819,13 @@ async def _derived(writer, schema, origin, release_id, resource_rows, observed_a
         if batches_by_table[table] and (
             len(batches_by_table[table]) == _DERIVED_BATCH_ROWS or bytes_by_table[table] + size > _DERIVED_BATCH_BYTES
         ):
-            await _copy_derived_batch(writer, schema, table, batches_by_table[table])
+            await _copy_derived_batch(writer, schema, table, batches_by_table[table], verify)
             batches_by_table[table], bytes_by_table[table] = [], 0
         batches_by_table[table].append(record)
         bytes_by_table[table] += size
     for table, records in batches_by_table.items():
         if records:
-            await _copy_derived_batch(writer, schema, table, records)
+            await _copy_derived_batch(writer, schema, table, records, verify)
 
 
 def _fold_rows(resource_rows, origin, hash_by_family, counts, root, total):
@@ -858,8 +878,88 @@ def _require_roots(origin, hash_by_family, counts, root):
     require({kind: value.hexdigest() for kind, value in hash_by_family.items()} == dict(origin.resource_hashes))
 
 
+def _native_payload_encoder(input_bytes):
+    """Retry only explicit resource bounds; semantic failures remain terminal."""
+    try:
+        encoder = importlib.import_module("ptg2_address_canon").encode_retained_fhir_capture_batch
+    except ImportError, AttributeError:
+        require(False)
+    try:
+        return encoder(input_bytes)
+    except ValueError as error:
+        try:
+            failure_by_field = json.loads(str(error))
+        except ValueError, TypeError:
+            failure_by_field = None
+        code = failure_by_field.get("code") if type(failure_by_field) is dict else None
+        if code in {"input_limit", "output_limit", "row_limit", "collection_limit"}:
+            raise _CopyBatchTooLarge() from None
+        require(False)
+
+
+def _validate_reference_rows(resource_rows, origin):
+    """Validate scratch commitments without advancing the accepted capture roots."""
+    hash_by_family = {kind: hashlib.sha256() for kind, _ in origin.resource_counts}
+    _fold_rows(resource_rows, origin, hash_by_family, dict.fromkeys(hash_by_family, 0), hashlib.sha256(), 0)
+
+
+def _prepare_native_resources(resource_rows, origin, release_id, observed_at, derive):
+    """Reuse the unchanged reference only for rows outside exact native semantics."""
+    context_by_field = {
+        "source_id": origin.source_id,
+        "release_id": release_id,
+        "observed_at_pg_micros": postgres_micros(observed_at) if derive else 0,
+        "hash_contract": SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+        if origin.admission_profile == SEMANTIC_PROFILE
+        else LEGACY_RESOURCE_HASH_CONTRACT,
+        "resource_types": [kind for kind, _ in origin.resource_counts],
+        "derive": derive,
+    }
+    try:
+        return prepare_retained_fhir_batch(
+            resource_rows,
+            context_by_field,
+            native_encoder=_native_payload_encoder,
+            reference_validator=lambda rows: _validate_reference_rows(rows, origin),
+            reference_records=lambda rows: _derived_records(origin, release_id, rows, observed_at),
+            location_id=registry_location_id,
+        )
+    except RetainedFhirNativeError as error:
+        if str(error) in {"input_limit", "output_limit", "row_limit"}:
+            raise _CopyBatchTooLarge() from None
+        require(False)
+
+
+def _fold_prepared(prepared, hash_by_family, counts, root, total):
+    """Append already validated bytes in original dataset and family order."""
+    require(set(prepared.families) == set(hash_by_family))
+    if prepared.row_count:
+        if total:
+            root.update(b"\n")
+        root.update(prepared.root_bytes)
+    for kind, (encoded, count) in prepared.families.items():
+        if count:
+            if counts[kind]:
+                hash_by_family[kind].update(b"\n")
+            hash_by_family[kind].update(encoded)
+            counts[kind] += count
+    return total + prepared.row_count
+
+
+async def _copy_prepared(pair, schema, prepared):
+    """Drain each bounded binary import and require exact native COPY accounting."""
+    for table, batches in zip(TABLES[2:], prepared.copy_batches):
+        for encoded, count in batches:
+            await pair.verify()
+            copied = await drain_operation(
+                pair.writer.copy_to_table(table, schema_name=schema, source=memoryview(encoded), format="binary"),
+                preserve_cancellation=True,
+            )
+            require(copied == f"COPY {count}")
+
+
 async def _verify_resources(connection, schema, origin):
-    """Revalidate every copied payload/root after closing target writers."""
+    """Revalidate every copied payload/root independently after closing target writers."""
     hash_by_family = {kind: hashlib.sha256() for kind, _ in origin.resource_counts}
     counts, root, total, after, limit = dict.fromkeys(hash_by_family, 0), hashlib.sha256(), 0, None, 1000
     while True:
@@ -871,8 +971,19 @@ async def _verify_resources(connection, schema, origin):
             limit = max(1, limit // 2)
             continue
         rows = await connection.fetch(query, *arguments)
-        require(len(rows) == bounds["count"])
-        total = _fold_rows(rows, origin, hash_by_family, counts, root, total)
+        require(len(rows) == bounds["count"] and all(row["dataset_id"] == origin.dataset_id for row in rows))
+        try:
+            prepared = await drain_operation(
+                asyncio.to_thread(_prepare_native_resources, rows, origin, "retained-verification", None, False),
+                preserve_cancellation=True,
+            )
+        except _CopyBatchTooLarge:
+            if len(rows) > 1:
+                limit = max(1, len(rows) // 2)
+                continue
+            total = _fold_rows(rows, origin, hash_by_family, counts, root, total)
+        else:
+            total = _fold_prepared(prepared, hash_by_family, counts, root, total)
         after = rows[-1]["resource_type"], rows[-1]["resource_id"]
     _require_roots(origin, hash_by_family, counts, root)
 
@@ -892,12 +1003,37 @@ async def _copy_resources(pair, origin, schema, release_id):
             require(limit > 1)
             limit = max(1, limit // 2)
             continue
-        rows = await pair.reader.fetch(query, *arguments)
-        require(len(rows) == bounds["count"] and all(row["dataset_id"] == origin.dataset_id for row in rows))
-        total = _fold_rows(rows, origin, hash_by_family, counts, root, total)
-        await _copy_native_batch(pair, query, arguments, schema, TABLES[1], len(rows))
-        await _derived(pair.writer, schema, origin, release_id, rows, observed_at)
-        after = rows[-1]["resource_type"], rows[-1]["resource_id"]
+        resource_rows = await pair.reader.fetch(query, *arguments)
+        require(
+            len(resource_rows) == bounds["count"]
+            and all(resource_row["dataset_id"] == origin.dataset_id for resource_row in resource_rows)
+        )
+        try:
+            prepared = await drain_operation(
+                asyncio.to_thread(_prepare_native_resources, resource_rows, origin, release_id, observed_at, True),
+                preserve_cancellation=True,
+            )
+        except _CopyBatchTooLarge:
+            if len(resource_rows) > 1:
+                limit = max(1, len(resource_rows) // 2)
+                continue
+            await drain_operation(
+                asyncio.to_thread(_validate_reference_rows, resource_rows, origin), preserve_cancellation=True
+            )
+            prepared = None
+        try:
+            await _copy_native_batch(pair, query, arguments, schema, TABLES[1], len(resource_rows))
+        except _CopyBatchTooLarge:
+            require(len(resource_rows) > 1)
+            limit = max(1, len(resource_rows) // 2)
+            continue
+        if prepared is None:
+            await _derived(pair.writer, schema, origin, release_id, resource_rows, observed_at, verify=pair.verify)
+            total = _fold_rows(resource_rows, origin, hash_by_family, counts, root, total)
+        else:
+            await _copy_prepared(pair, schema, prepared)
+            total = _fold_prepared(prepared, hash_by_family, counts, root, total)
+        after = resource_rows[-1]["resource_type"], resource_rows[-1]["resource_id"]
     _require_roots(origin, hash_by_family, counts, root)
 
 
@@ -1010,7 +1146,9 @@ async def _seal_capture(writer, origin, schema, capture_id, owner_role, runtime_
     return capture
 
 
-async def capture_retained_fhir_source(reader, writer, origin, *, capture_id, owner_role, runtime_roles):
+async def capture_retained_fhir_source(
+    reader, writer, origin, *, capture_id, owner_role, runtime_roles, source_policy=None
+):
     """Freeze a genuine Reader's complete supported snapshot in a distinct registry domain."""
     require(type(origin) is RetainedFHIRInput and type(capture_id) is UUID and capture_id.int)
     require(
@@ -1031,10 +1169,16 @@ async def capture_retained_fhir_source(reader, writer, origin, *, capture_id, ow
     )
     await _check_roles(writer, {"owner_role": owner_role, "loader_roles": [], "reader_roles": list(runtime_roles)})
     await _same_database(writer, reader)
-    await _origin_header(reader, origin)
-    await _origin_guard(reader, origin)
+    binding = await _origin_header(reader, origin)
+    if binding is None:
+        await _origin_guard(reader, origin)
+        source_family = None
+    else:
+        source_family = await require_native_generic_snapshot(reader, writer, origin, source_policy, binding)
     schema = "registry_fhir_capture_" + capture_id.hex
-    original_role = await writer.fetchval("SELECT quote_ident(current_user)")
+    original_role = await writer.fetchval(
+        "SELECT CASE WHEN current_setting('role')='none' THEN 'NONE' ELSE quote_ident(current_user) END"
+    )
     pair = _ReaderCopy(reader, writer)
     pair.virtual_xid = await _virtual_xid(reader)
     try:
@@ -1044,6 +1188,12 @@ async def capture_retained_fhir_source(reader, writer, origin, *, capture_id, ow
             await writer.execute(f"SET LOCAL ROLE {original_role}")
             capture = await _seal_capture(writer, origin, schema, capture_id, owner_role, runtime_roles)
             await pair.verify()
+            if binding is not None:
+                await writer.execute(f"SET LOCAL ROLE {original_role}")
+                require(
+                    await require_native_generic_snapshot(reader, writer, origin, source_policy, binding)
+                    == source_family
+                )
             return capture
     finally:
         if writer.is_in_transaction():

@@ -4,6 +4,7 @@
 import json
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -36,6 +37,67 @@ from tests.test_registry_publication_execution_postgres import _authority
 pytestmark = pytest.mark.asyncio
 
 
+@dataclass(frozen=True)
+class WorkerExecutionIdentity:
+    role: str
+    role_password: str = field(repr=False)
+    oid: int
+
+
+async def _remove_worker_execution_identity(connection, actor):
+    actual = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", actor.role)
+    if actual is None:
+        return
+    assert actual == actor.oid, "worker_execution_identity_changed"
+    await connection.execute(f'DROP OWNED BY "{actor.role}"')
+    await connection.execute(f'DROP ROLE "{actor.role}"')
+    assert await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", actor.role) is None
+
+
+@asynccontextmanager
+async def _worker_execution_identity(connection):
+    """Own one original LOGIN across Source closure and the later worker fixture."""
+    role = "wp_execution_" + uuid4().hex
+    password = uuid4().hex
+    actor = None
+
+    async def cleanup():
+        if actor is not None:
+            await _remove_worker_execution_identity(connection, actor)
+
+    async with AsyncExitStack() as stack:
+        stack.push_async_callback(cleanup)
+        async with connection.transaction():
+            assert await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role) is None
+            await connection.execute(
+                f'CREATE ROLE "{role}" LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE '
+                f"NOREPLICATION NOBYPASSRLS PASSWORD '{password}'"
+            )
+            oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", role)
+            assert type(oid) is int and oid > 0
+            actor = WorkerExecutionIdentity(role, password, oid)
+        yield actor
+
+
+async def _adopt_worker_execution_identity(connection, actor):
+    """Verify the original native principal and password before changing worker custody."""
+    if actor is None:
+        return
+    assert type(actor) is WorkerExecutionIdentity and type(actor.oid) is int and actor.oid > 0
+    assert (
+        await connection.fetchval(
+            "SELECT oid=$2::oid AND rolcanlogin AND rolinherit AND NOT rolsuper AND NOT rolcreatedb "
+            "AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_roles WHERE rolname=$1",
+            actor.role,
+            actor.oid,
+        )
+        is True
+    ), "worker_execution_identity_changed"
+    login = SimpleNamespace(roles_by_kind={"execution": actor.role}, role_password=actor.role_password)
+    async with _login(login, "execution") as original:
+        assert await original.fetchval("SELECT current_user::regrole::oid=$1::oid", actor.oid) is True
+
+
 @pytest.fixture
 async def worker_permissions(custom_db):
     fixture = custom_db
@@ -45,15 +107,21 @@ async def worker_permissions(custom_db):
 
 
 @asynccontextmanager
-async def _worker_roles(fixture, seed):
+async def _worker_roles(fixture, seed, *, execution_actor=None):
     """Reuse the direct-login contract with either approved or initial fixture state."""
     roles_by_kind = {
         kind: "wp_" + kind + "_" + uuid4().hex for kind in ("queue", "physical", "api", "lifecycle", "execution")
     }
     role_password = uuid4().hex
+    if execution_actor is not None:
+        await _adopt_worker_execution_identity(fixture.connection, execution_actor)
+        roles_by_kind["execution"] = execution_actor.role
+        role_password = execution_actor.role_password
     created_roles = []
     try:
         for kind, role in roles_by_kind.items():
+            if kind == "execution" and execution_actor is not None:
+                continue
             assert not await fixture.connection.fetchval("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", role)
             created_roles.append(role)
             await fixture.connection.execute(
@@ -115,6 +183,41 @@ async def test_fixture_dsn_preserves_supported_connection_parts(monkeypatch, sch
     suffix = "synthetic:password@localhost:5432/example?application_name=synthetic"
     monkeypatch.setenv("NETWORK_REGISTRY_TEST_DSN", scheme + "://" + suffix)
     assert _fixture_dsn() == ("postgres" if scheme == "postgres" else "postgresql") + "://" + suffix
+
+
+@pytest.mark.parametrize("actual", [None, False], ids=["missing", "replaced-oid"])
+async def test_precreated_execution_identity_refuses_changed_native_role(monkeypatch, actual):
+    """Pure I/O-boundary regression: refusal precedes login, grants and worker ownership changes."""
+    actor = WorkerExecutionIdentity("wp_execution_" + "a" * 32, "synthetic-password", 41)
+    assert actor.role_password not in repr(actor)
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=actual), execute=AsyncMock())
+    login = AsyncMock(side_effect=AssertionError("changed role reached login"))
+    monkeypatch.setitem(globals(), "_login", login)
+    with pytest.raises(AssertionError, match="worker_execution_identity_changed"):
+        await _adopt_worker_execution_identity(connection, actor)
+    connection.fetchval.assert_awaited_once()
+    assert connection.fetchval.await_args.args[1:] == (actor.role, actor.oid)
+    connection.execute.assert_not_awaited()
+    login.assert_not_called()
+
+
+async def test_default_execution_identity_needs_no_query_or_login(monkeypatch):
+    """The optional identity boundary leaves the default worker setup untouched."""
+    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=AssertionError("unexpected identity query")))
+    login = AsyncMock(side_effect=AssertionError("unexpected identity login"))
+    monkeypatch.setitem(globals(), "_login", login)
+    assert await _adopt_worker_execution_identity(connection, None) is None
+    connection.fetchval.assert_not_awaited()
+    login.assert_not_called()
+
+
+async def test_execution_identity_cleanup_never_drops_a_replacement():
+    """A replaced role name cannot authorize DROP OWNED or DROP ROLE."""
+    actor = WorkerExecutionIdentity("wp_execution_" + "a" * 32, "synthetic-password", 41)
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=42), execute=AsyncMock())
+    with pytest.raises(AssertionError, match="worker_execution_identity_changed"):
+        await _remove_worker_execution_identity(connection, actor)
+    connection.execute.assert_not_awaited()
 
 
 @asynccontextmanager
@@ -453,13 +556,12 @@ async def _native_qualified_candidate(
     from process.network_approved_membership_source import pin_approved_membership_source
     from process.network_membership_candidate_lifecycle import create_network_candidate, seal_network_candidate
     from process.network_membership_copy import MembershipCopyTarget
-    from process.registry_candidate_composition import _bindings
+    from process.registry_candidate_composition import _bindings, _stage_source
     from process.registry_membership_composition_stage import (
         build_registry_source_retention,
         materialize_registry_composition,
         stage_approved_membership_commands,
     )
-    from process.registry_source_recipe_composition import stage_registry_source_recipes
     from process.registry_source_retention import retain_registry_source_memberships
 
     schema = fixture.fixture.control_schema
@@ -474,9 +576,7 @@ async def _native_qualified_candidate(
         artifact = await _native_candidate_addresses(
             fixture, connection, approved, request_id, runtime_roles, prepared_address_artifact
         )
-        source_stage = await stage_registry_source_recipes(
-            connection, (), approved, request_id=request_id, control_schema=schema
-        )
+        source_stage = await _stage_source(connection, None, request_id, 0, schema)
         commands = await stage_approved_membership_commands(connection, approved, request_id, control_schema=schema)
         retention = await build_registry_source_retention(connection, source_stage, commands)
         await create_network_candidate(
@@ -587,7 +687,12 @@ async def test_split_ptg_metadata_owner_publishes_and_retains_sealed_generations
     )
     await custody_split._assert_handoff(fixture)
     await custody_split._assert_custodian(fixture)
-    await custody_split._publish_successor(fixture)
+    async with AsyncExitStack() as stack:
+        consumer = publication_worker._ptg_runtime(fixture.config, stack)
+        assert consumer.composition_runtime is not None
+        await consumer.composition_runtime.qualify()
+        fixture.config = replace(fixture.config, consumer=consumer)
+        await custody_split._publish_successor(fixture)
     assert await custody_split._protected(fixture) == fixture.protected
 
 
@@ -697,13 +802,13 @@ async def _reconnect_native_pool(pool):
     return before, after
 
 
-async def _reconnect_native_ptg(runtime):
-    async with runtime.sessions() as session:
+async def _reconnect_native_sessions(sessions):
+    async with sessions() as session:
         connection = await session.connection()
         raw = await connection.get_raw_connection()
         before = raw.driver_connection.get_server_pid()
         await connection.invalidate()
-    async with runtime.sessions() as session:
+    async with sessions() as session:
         connection = await session.connection()
         raw = await connection.get_raw_connection()
         after = raw.driver_connection.get_server_pid()
@@ -713,13 +818,20 @@ async def _reconnect_native_ptg(runtime):
 
 def _observe_native_backends(monkeypatch, observer_roles):
     original_pool = publication_worker.asyncpg.create_pool
+    original_sessions = publication_worker._worker_sessions
     original_qualify = publication_worker._qualify_fresh_backends
-    pools_by_role, verified_by_role = {}, {}
+    pools_by_role, sessions_by_role, verified_by_role = {}, {}, {}
 
     async def create_pool(**options):
         pool = await original_pool(**options)
         pools_by_role[options["user"]] = pool
         return pool
+
+    def worker_sessions(config, stack, url, *, backend_verifier=None):
+        sessions = original_sessions(config, stack, url, backend_verifier=backend_verifier)
+        assert url.username not in sessions_by_role
+        sessions_by_role[url.username] = sessions
+        return sessions
 
     async def qualify(connection, **options):
         assert set(pools_by_role) == set(observer_roles)
@@ -735,19 +847,43 @@ def _observe_native_backends(monkeypatch, observer_roles):
         return SimpleNamespace(verifier=verifier)
 
     monkeypatch.setattr(publication_worker.asyncpg, "create_pool", create_pool)
+    monkeypatch.setattr(publication_worker, "_worker_sessions", worker_sessions)
     monkeypatch.setattr(publication_worker, "_qualify_fresh_backends", qualify)
-    return SimpleNamespace(pools_by_role=pools_by_role, verified_by_role=verified_by_role)
+    return SimpleNamespace(
+        pools_by_role=pools_by_role, sessions_by_role=sessions_by_role, verified_by_role=verified_by_role
+    )
 
 
 async def _check_native_reconnections(observed, config, consumer, execution_connection=None):
-    for role in (config.consumer.execution_role, config.custody_url.username):
-        if role == config.consumer.execution_role and execution_connection is not None:
-            assert execution_connection.get_server_pid() in observed.verified_by_role[role]
-            continue
-        pids = await _reconnect_native_pool(observed.pools_by_role[role])
+    execution_role, custody_role = config.consumer.execution_role, config.custody_url.username
+    if execution_connection is not None:
+        assert execution_connection.get_server_pid() in observed.verified_by_role[execution_role]
+    else:
+        pids = await _reconnect_native_pool(observed.pools_by_role[execution_role])
+        assert set(pids) <= observed.verified_by_role[execution_role]
+    assert set(observed.sessions_by_role) == {execution_role, custody_role}
+    assert consumer.composition_runtime.sessions is observed.sessions_by_role[execution_role]
+    for role, sessions in observed.sessions_by_role.items():
+        pids = await _reconnect_native_sessions(sessions)
         assert set(pids) <= observed.verified_by_role[role]
-    pids = await _reconnect_native_ptg(consumer.composition_runtime)
-    assert set(pids) <= observed.verified_by_role[config.consumer.execution_role]
+
+
+async def test_backend_observer_preserves_session_factory_and_verifier(monkeypatch):
+    """The passive observer forwards the real factory's inputs and result unchanged."""
+    config, stack, factory, backend_verifier = object(), object(), object(), object()
+    url = SimpleNamespace(username="fixture_custodian")
+    recorded_calls = []
+
+    def sessions(actual_config, actual_stack, actual_url, *, backend_verifier):
+        recorded_calls.append((actual_config, actual_stack, actual_url, backend_verifier))
+        return factory
+
+    monkeypatch.setattr(publication_worker, "_worker_sessions", sessions)
+    observed = _observe_native_backends(monkeypatch, ())
+    assert publication_worker._worker_sessions(config, stack, url, backend_verifier=backend_verifier) is factory
+    assert recorded_calls == [(config, stack, url, backend_verifier)]
+    assert observed.sessions_by_role == {url.username: factory}
+    assert observed.pools_by_role == observed.verified_by_role == {}
 
 
 async def test_fresh_worker_connections_and_reconnects(split_db, monkeypatch):

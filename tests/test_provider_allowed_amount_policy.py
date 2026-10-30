@@ -121,28 +121,16 @@ async def test_allowed_admission_preserves_cancellation(policy_fixture):
     policy_fixture.ready.assert_not_awaited()
 
 
-class HeldInputs:
-    def relation(self, role):
-        return '"held_inputs"."' + role + '"'
+def HeldInputs():
+    """Use the typed synthetic shape; this fixture establishes no native authority."""
+    from process.network_em_provider_inputs import _ROLES, EMProviderInputRelation, EMProviderInputs
 
-    def geo_bindings(self, schema):
-        roles = (
-            "npi_address",
-            "mrf_address",
-            "doctor_clinician_address",
-            "geo_zip_lookup",
-            "tiger.zip_state",
-            "tiger.zcta5",
+    return EMProviderInputs(
+        tuple(
+            EMProviderInputRelation(role, "held_inputs", role.replace(".", "_"), "example_generation", i + 1, i + 21)
+            for i, role in enumerate(_ROLES)
         )
-        return {
-            role if role.startswith("tiger.") else schema + "." + role: {
-                "schema_name": "held_inputs",
-                "table_name": role.replace(".", "_"),
-                "relation_oid": i + 1,
-                "relfilenode": i + 21,
-            }
-            for i, role in enumerate(roles)
-        }
+    )
 
 
 @pytest.fixture

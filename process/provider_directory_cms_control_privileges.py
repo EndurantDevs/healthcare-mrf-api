@@ -393,6 +393,54 @@ READ_COLUMN_GRANTS = {
     "address_alias_state_v1": ("singleton", "generation"),
 }
 
+ORIGIN_METADATA_COLUMNS = (
+    "receipt_id",
+    "payload",
+    "publication_xid",
+    "profile_generation_id",
+    "registry_source_pair_json",
+)
+
+
+def cms_origin_metadata_read_roles(policy, roles):
+    """Keep explicit origin recipients separate from the admitted SOURCE role tuple."""
+    if type(policy) is not GenericSourcePolicy:
+        raise ValueError("cms_origin_metadata_read_policy_required")
+    if type(roles) is not tuple or any(type(role) is not str for role in roles) or len(set(roles)) != len(roles):
+        raise ValueError("cms_origin_metadata_read_roles_required")
+    for role in roles:
+        storage_identifier(role)
+    if set(roles) & {policy.owner_role, policy.publisher_role, *policy.runtime_roles, *policy.control_runtime_roles}:
+        raise ValueError("cms_origin_metadata_read_source_overlap")
+    return tuple(sorted(roles))
+
+
+def cms_origin_metadata_read_oids(policy, role_graph, roles):
+    """Resolve declared existing identities without inferring recipients from ACLs."""
+    roles = cms_origin_metadata_read_roles(policy, roles)
+    selected_roles = [entry for entry in role_graph["roles"] if entry["rolname"] in roles]
+    if len(selected_roles) != len(roles) or {entry["rolname"] for entry in selected_roles} != set(roles):
+        raise ValueError("cms_origin_metadata_read_roles_changed")
+    if any(
+        entry[key]
+        for entry in selected_roles
+        for key in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
+    ):
+        raise ValueError("cms_origin_metadata_read_authority_changed")
+    by_name = {entry["rolname"]: int(entry["oid"]) for entry in selected_roles}
+    return tuple(by_name[role] for role in roles)
+
+
+async def grant_cms_origin_metadata_read_privileges(connection, policy, *, metadata_read_roles):
+    """Apply only the fixed receipt projection inside the attested original-admin read cut."""
+    roles = cms_origin_metadata_read_roles(policy, metadata_read_roles)
+    if not roles:
+        raise ValueError("cms_origin_metadata_read_roles_required")
+    columns = ",".join(storage_identifier(column) for column in ORIGIN_METADATA_COLUMNS)
+    table = storage_relation(policy.schema, "provider_directory_cms_serving_receipt")
+    for role in roles:
+        await connection.execute(f"GRANT SELECT({columns}) ON {table} TO {storage_identifier(role)}")
+
 
 def cms_control_read_roles(policy):
     """Use the caller's admitted SOURCE policy, never observed ACL beneficiaries."""

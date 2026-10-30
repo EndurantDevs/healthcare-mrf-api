@@ -1232,7 +1232,7 @@ async def test_imported_geo_requires_exact_count_receipt(monkeypatch):
         return rows
 
     monkeypatch.setattr(geo_fixture._RecordingGeoProxy, "all", rows_without_total)
-    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", geo_fixture._RecordingGeoProxy)
+    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", geo_fixture._RecordingGeoProxy)
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", geo_fixture._legacy_address_table)
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", geo_fixture._empty_plan_scope)
     with pytest.raises(RuntimeError, match="geo count is required"):

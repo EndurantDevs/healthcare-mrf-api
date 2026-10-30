@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 import re
-from typing import Any
+from decimal import Decimal
+from typing import Any, Mapping
 from uuid import UUID
 
 from api.ptg2_response import (
@@ -124,3 +124,72 @@ def _price_filter_clauses(
         )
 
     return clauses, query_values_by_field
+
+
+def optional_bool_payload(value: Any) -> bool | None:
+    """Normalize serving booleans; return None for absent or unknown text."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n"}:
+        return False
+    return None
+
+
+def request_local_provider_payload(value: Any) -> Any:
+    """Copy nested cached provider evidence into one mutable response item."""
+
+    if isinstance(value, Mapping):
+        return {key: request_local_provider_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [request_local_provider_payload(item) for item in value]
+    return value
+
+
+def sanitize_address_contact_payload(address_payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert source-system null sentinels to real JSON null contact values."""
+
+    for field_name in (
+        "telephone",
+        "telephone_number",
+        "phone",
+        "phone_number",
+        "phone_extension",
+        "fax",
+        "fax_number",
+        "fax_number_digits",
+        "fax_extension",
+    ):
+        field_value = address_payload.get(field_name)
+        if isinstance(field_value, str) and field_value.strip().lower() in {
+            "",
+            "null",
+            "none",
+            "undefined",
+        }:
+            address_payload[field_name] = None
+    return address_payload
+
+
+def has_location_filter(
+    args: dict[str, Any],
+    *,
+    include_npi: bool = True,
+) -> bool:
+    """Detect location selectors while preserving zero-valued coordinates and radii."""
+    return bool(
+        args.get("state")
+        or args.get("city")
+        or args.get("zip5")
+        or args.get("zip")
+        or (include_npi and args.get("npi"))
+        or args.get("lat") is not None
+        or args.get("long") is not None
+        or args.get("radius_miles") is not None
+    )

@@ -56,6 +56,23 @@ def test_cms_aggregate_preserves_extractor_lineage_and_full_accounting():
     assert preview.PREVIEW_DEADLINE_SECONDS == 2.5
 
 
+@pytest.mark.parametrize("source_kind", ("validation", "aca", "fhir"))
+def test_prospective_bindings_keep_only_on_physical_control_heaps(source_kind):
+    namespace, staging = '"synthetic_registry"', '"synthetic_selection"'
+    if source_kind == "validation":
+        sql = preview._binding_validation_sql(namespace, staging)
+    else:
+        recipe = _recipe()
+        if source_kind == "aca":
+            recipe.source_pin = None
+        sql = preview._impact_sql(recipe, namespace, staging, "synthetic_registry")
+    assert "FROM prospective binding" in sql
+    assert "LEFT JOIN prospective network" in sql
+    assert "ONLY prospective" not in sql
+    assert 'FROM ONLY "synthetic_registry".registry_approved_record previous' in sql
+    assert 'JOIN ONLY "synthetic_registry".registry_record_history history' in sql
+
+
 @pytest.mark.parametrize("change", ["duplicate", "missing", "already_inline"])
 def test_cms_resolved_shape_drift_refuses_aggregation(monkeypatch, change):
     recipe = _recipe()

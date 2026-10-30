@@ -27,7 +27,6 @@ from process.network_legacy_membership_source import (
     with_aca_successor,
 )
 from process.network_membership_copy import MembershipCopyTarget
-from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import NetworkPublicationError, publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.reference_family_archive import _lock_family, _lock_source_family, reference_family_spec
@@ -42,8 +41,11 @@ from process.registry_aca_source_recipe import (
 )
 from process.registry_candidate_composition import RegistryCompositionAddressSources, _target
 from process.registry_cms_source_consumer import _canonical_session
+from process.registry_publication_execution import prepare_registry_candidate_for_context, source_worker_address_sources
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_source_recipe_store import (
+    MAX_SOURCE_RECIPE_BYTES,
+    MAX_SOURCE_RECIPES,
     RECIPE_DIGEST_KEY,
     RegistrySourceMembershipRecipe,
     canonical_registry_source_recipes,
@@ -490,9 +492,56 @@ async def _verify_selected_recipes(connection, approved, recipes, accepted, conf
         await _require_archive(connection, recipe.source_pin)
 
 
-async def _replay_recipes(connection, candidate_by_name, recipe, config):
+def _recipe_attempt_commitment(recipes, *, inventory=False, root=None):
+    if inventory and root is None:
+        from process.registry_source_inventory_preparation import SourceInventoryPreparation
+
+        preparation = SourceInventoryPreparation(recipes)
+        recipes, root = preparation.recipes, preparation.recipe_root
+    if root is not None and (root.entry_count > MAX_SOURCE_RECIPES or root.recipe_bytes > MAX_SOURCE_RECIPE_BYTES):
+        return "registry-aca-source-inventory/v1", root.entry_count, root.recipes_sha256
+    return canonical_registry_source_recipes(recipes)
+
+
+def _candidate_target(candidate_by_name):
+    return MembershipCopyTarget(
+        *(
+            str(candidate_by_name[field])
+            for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
+        )
+    )
+
+
+async def _replay_inventory(connection, candidate_by_name, target, config):
+    from db.registry_source_inventory_schema import INVENTORY_TABLE
+    from process.registry_source_inventory_reference import verify_source_recipe_metadata
+    from process.registry_source_inventory_store import _load_locked_source_inventory
+    from process.registry_source_recipe_store import _decode_document, _decode_source_inventory_recipes
+
+    if type(_decode_document(candidate_by_name["source_recipes_json"])) is not dict:
+        return None
+    metadata = verify_source_recipe_metadata(candidate_by_name)
+    sealed = await _verify_source_custody(connection, target, config)
+    reference, entries = await _load_locked_source_inventory(
+        connection,
+        target,
+        candidate_by_name,
+        expected_table_oid=sealed["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE],
+        control_schema=config.control_schema,
+    )
+    recipes = _decode_source_inventory_recipes(entries)
+    if reference != metadata.inventory or len(recipes) != metadata.recipe_count:
+        _invalid()
+    return reference.root, recipes
+
+
+async def _replay_recipes(connection, candidate_by_name, recipe, config, *, inventory_recipes=None):
     """Prove the stored successor and current original approval before replay publication."""
-    recipes = decode_registry_source_recipes(candidate_by_name["source_recipes_json"])
+    recipes = (
+        decode_registry_source_recipes(candidate_by_name["source_recipes_json"])
+        if inventory_recipes is None
+        else inventory_recipes
+    )
     if config.initial_batch or config.global_epoch:
         if config.initial_batch and candidate_by_name["expected_head"] != 0:
             _invalid()
@@ -539,41 +588,50 @@ async def _replay(connection, event, recipe, config):
         attempt = UUID(checkpoint_by_name.pop("attempt_id"))
         if checkpoint_by_name != event:
             _invalid()
-        recipes = await _replay_recipes(connection, candidate_by_name, recipe, config)
+        copy_target = _candidate_target(candidate_by_name)
+        inventory = await _replay_inventory(connection, candidate_by_name, copy_target, config)
+        recipes = await _replay_recipes(
+            connection,
+            candidate_by_name,
+            recipe,
+            config,
+            **({"inventory_recipes": inventory[1]} if inventory is not None else {}),
+        )
         generations = (
             json.loads(candidate_by_name["source_generations"])
             if type(candidate_by_name["source_generations"]) is str
             else candidate_by_name["source_generations"]
         )
-        copy_target = MembershipCopyTarget(
-            *(
-                str(candidate_by_name[field])
-                for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
-            )
+        _require_replay_target(
+            candidate_by_name, event, attempt, generations, recipes, None if inventory is None else inventory[0]
         )
-        if attempt != uuid5(
-            UUID(event["event_id"]),
-            _json(
-                (
-                    generations.get("retained_network_source"),
-                    generations["custom_membership"],
-                    canonical_registry_source_recipes(recipes),
-                )
-            ),
-        ):
-            _invalid()
-        if copy_target != _target(
-            attempt,
-            candidate_by_name["approved_custom_revision"],
-            candidate_by_name["expected_head"],
-            {key: generation_value for key, generation_value in generations.items() if key != RECIPE_DIGEST_KEY},
-        ):
-            _invalid()
-        await _verify_source_custody(connection, copy_target, config)
+        if inventory is None:
+            await _verify_source_custody(connection, copy_target, config)
         # Keep Source custody until the control transaction commits or rolls back.
         await fences.enter_async_context(current_aca_source_fence(recipe, config))
         await publish_network_candidate(connection, copy_target, control_schema=config.control_schema)
     return {"state": "replayed"}
+
+
+def _require_replay_target(candidate_by_name, event, attempt, generations, recipes, root):
+    if attempt != uuid5(
+        UUID(event["event_id"]),
+        _json(
+            (
+                generations.get("retained_network_source"),
+                generations["custom_membership"],
+                _recipe_attempt_commitment(recipes, root=root),
+            )
+        ),
+    ):
+        _invalid()
+    if _candidate_target(candidate_by_name) != _target(
+        attempt,
+        candidate_by_name["approved_custom_revision"],
+        candidate_by_name["expected_head"],
+        {key: generation_value for key, generation_value in generations.items() if key != RECIPE_DIGEST_KEY},
+    ):
+        _invalid()
 
 
 async def _verify_source_custody(connection, target, config):
@@ -583,6 +641,7 @@ async def _verify_source_custody(connection, target, config):
     )
     if not set(config.source_authority_roles) <= set(sealed["receipt"]["runtime_roles"]):
         _invalid()
+    return sealed
 
 
 async def _checkpoint(connection, target, event, attempt, config):
@@ -620,15 +679,14 @@ async def _attempt(connection, pool, store, identity, event, recipe, config):
         return selection
     revision, approved, pin, recipes = selection
     base = None if pin is None else pin.manifest_sha256
-    attempt = uuid5(
-        UUID(event["event_id"]), _json((base, approved.generation_id, canonical_registry_source_recipes(recipes)))
-    )
     addresses = (
         config.initial_address_sources
         if pin is None
-        else RegistryCompositionAddressSources(
-            PinnedAddressSource(pin.schema_name, "entity_address_unified", pin.manifest_sha256)
-        )
+        else await source_worker_address_sources(connection, pin, config.control_schema)
+    )
+    attempt = uuid5(
+        UUID(event["event_id"]),
+        _json((base, approved.generation_id, _recipe_attempt_commitment(recipes, inventory=addresses.compact))),
     )
     addresses = replace(
         addresses, **{("initial_source_recipes" if pin is None else "replacement_source_recipes"): recipes}
@@ -643,9 +701,7 @@ async def _attempt(connection, pool, store, identity, event, recipe, config):
         writer_roles=config.writer_roles,
         control_schema=config.control_schema,
     )
-    await prepare_network_candidate(
-        connection, copy_target, address_source, **config.writer_roles, control_schema=config.control_schema
-    )
+    await prepare_registry_candidate_for_context(connection, copy_target, address_source, config)
     checkpoint, assertion = await _checkpoint(connection, copy_target, event, attempt, config)
     if await _notice(pool, store, identity, event["header"]) != recipe:
         _invalid()

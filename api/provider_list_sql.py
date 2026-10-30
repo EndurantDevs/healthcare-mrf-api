@@ -19,6 +19,7 @@ from api.network_address_scope import (
     is_scoped_address_relation,
     scoped_address_parameters,
 )
+from api.network_read_execution import NetworkReadConnectionProxy
 from db.connection import ConnectionProxy
 from db.models import EntityAddressUnified
 from process.custom_import.read_core import _local_statement_timeout
@@ -287,7 +288,7 @@ async def _provider_list_connection(
         if import_context is not None:
             raise RuntimeError("custom-import provider query requires a request session")
         raise RuntimeError("canonical provider query requires a request session")
-    yield ConnectionProxy(database, request_session, None)
+    yield NetworkReadConnectionProxy(database, request_session, None)
 
 
 async def _provider_list_count(connection, query, parameters, session, *, deadline=None):

@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261025020000_company_affiliation_join"
+CURRENT_HEAD = "20261029010000_registry_source_inventory"
 _ORIGIN_UPGRADE_REVISIONS = [
     REVISION,
     "20261013010000_registry_custom_history_events",
@@ -60,6 +60,9 @@ _ORIGIN_UPGRADE_REVISIONS = [
     "20261025010000_company_affiliation_states",
     "20261024050000_provider_directory_first_retirement_owner_lineage",
     "20261023100000_provider_directory_serving_recovery",
+    "20261025020000_company_affiliation_join",
+    "20261028010000_registry_fhir_catalog",
+    "20261028020000_registry_membership_refresh",
     CURRENT_HEAD,
 ]
 
@@ -187,6 +190,12 @@ def test_origin_migration_extends_the_sole_existing_head():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     assert script.get_heads() == [CURRENT_HEAD]
+    assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
+        "20261028020000_registry_membership_refresh"
+    )
+    assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (
+        "20261028010000_registry_fhir_catalog"
+    )
     _assert_custom_import_manual_acceptance_lineage(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision

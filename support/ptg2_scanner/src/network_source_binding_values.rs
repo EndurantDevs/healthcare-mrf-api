@@ -145,6 +145,14 @@ struct RetainedFhirScope {
     capture_sha256: String,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedFhirProductScope {
+    insurance_plan_id: String,
+    capture_sha256: String,
+    product_network_id: i32,
+}
+
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct ValidatedSourceBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -273,17 +281,30 @@ fn published_plan_scope(scope: PublishedPlanScope) -> Option<serde_json::Value> 
     serde_json::to_value(scope).ok()
 }
 
-fn fhir_scope(raw: &str, producer: &str, source: &str) -> Option<serde_json::Value> {
-    if producer == "registry-retained-normalized-fhir-v1"
-        && source != "cms-npd"
+fn fhir_scope(raw: &str, input: &BindingInput) -> Option<serde_json::Value> {
+    if input.producer_id == "registry-retained-normalized-fhir-v1"
+        && input.source_id != "cms-npd"
+        && let Ok(scope) = serde_json::from_str::<RetainedFhirProductScope>(raw)
+    {
+        if !valid_fhir_id(&scope.insurance_plan_id)
+            || scope.capture_sha256.len() != 64
+            || !scope
+                .capture_sha256
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || scope.product_network_id != input.network_id
+            || input.source_key != format!("InsurancePlan/{}", scope.insurance_plan_id)
+            || input.operation == "rebind" && input.expected_network_id != Some(input.network_id)
+        {
+            return None;
+        }
+        return serde_json::to_value(scope).ok();
+    }
+    if input.producer_id == "registry-retained-normalized-fhir-v1"
+        && input.source_id != "cms-npd"
         && let Ok(scope) = serde_json::from_str::<RetainedFhirScope>(raw)
     {
-        if scope.organization_id.is_empty()
-            || scope.organization_id.len() > 64
-            || !scope
-                .organization_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        if !valid_fhir_id(&scope.organization_id)
             || scope.capture_sha256.len() != 64
             || !scope
                 .capture_sha256
@@ -295,18 +316,21 @@ fn fhir_scope(raw: &str, producer: &str, source: &str) -> Option<serde_json::Val
         return serde_json::to_value(scope).ok();
     }
     let scope: FhirScope = serde_json::from_str(raw).ok()?;
-    if scope.organization_id.is_empty()
-        || scope.organization_id.len() > 64
-        || !scope
-            .organization_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+    if !valid_fhir_id(&scope.organization_id)
         || !canonical_uuid(&scope.legacy_uuid)
         || !valid_text(&scope.alias_scope, 512)
     {
         return None;
     }
     serde_json::to_value(scope).ok()
+}
+
+fn valid_fhir_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
 }
 
 fn validate_fields(input: &BindingInput, index: usize) -> Result<(), SourceBindingError> {
@@ -391,11 +415,7 @@ pub(crate) fn validate_row(
     let scope = match input.source_system.as_str() {
         "aca" => aca_scope(input.source_scope_json.get()),
         "ptg" => ptg_scope(input.source_scope_json.get()),
-        "fhir" => fhir_scope(
-            input.source_scope_json.get(),
-            &input.producer_id,
-            &input.source_id,
-        ),
+        "fhir" => fhir_scope(input.source_scope_json.get(), &input),
         _ => None,
     }
     .ok_or_else(|| failure("invalid_scope", Some(index), Some("source_scope_json")))?;
@@ -482,6 +502,34 @@ fn copy_row(row: &ValidatedSourceBinding, output: &mut Vec<u8>) {
     }
 }
 
+fn validate_product_targets(rows: &[ValidatedSourceBinding]) -> Result<(), SourceBindingError> {
+    let mut products = BTreeSet::new();
+    let mut organizations = BTreeSet::new();
+    for (index, row) in rows.iter().enumerate() {
+        if row.source_system != "fhir" || row.operation == "close" {
+            continue;
+        }
+        let key = (
+            &row.source_id,
+            &row.dataset_schema,
+            &row.dataset_id,
+            &row.producer_id,
+            &row.edition_id,
+            row.network_id,
+        );
+        let conflict = if row.source_scope_json.get("insurance_plan_id").is_some() {
+            !products.insert(key) || organizations.contains(&key)
+        } else {
+            organizations.insert(key);
+            products.contains(&key)
+        };
+        if conflict {
+            return Err(failure("duplicate_product_scope", Some(index), None));
+        }
+    }
+    Ok(())
+}
+
 /// Validate the entire batch before exposing any row or binary COPY output.
 pub fn encode_network_source_binding_batch(
     input: &[u8],
@@ -504,6 +552,7 @@ pub fn encode_network_source_binding_batch(
         }
         rows.push(row);
     }
+    validate_product_targets(&rows)?;
     let mut copy_bytes = COPY_HEADER.to_vec();
     for (index, row) in rows.iter().enumerate() {
         copy_row(row, &mut copy_bytes);

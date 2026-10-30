@@ -51,6 +51,7 @@ from tests.ptg2_v3_shared_schema_migrations import (
     HOLD_MIGRATION_PATH,
     MIGRATION_PATH,
 )
+from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
 
 
 @pytest.mark.parametrize(
@@ -119,11 +120,12 @@ def test_v3_followup_migration_repairs_attestation_snapshot_index(monkeypatch):
 
 
 def test_repository_has_single_alembic_head():
+    """Require one inventory head while preserving every historical parent edge."""
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261025020000_company_affiliation_join"]
+    _assert_source_inventory_migration_head(script)
     assert (
         script.get_revision("20261019150000_registry_source_check_idempotency").down_revision
         == "20261019140000_plan_pricing_attribution_idempotency"

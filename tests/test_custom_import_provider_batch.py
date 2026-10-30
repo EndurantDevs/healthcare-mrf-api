@@ -24,6 +24,7 @@ from process.custom_import.read_core import PreparedNpiEntityRelation, ReadField
 from tests import test_custom_import_read_http as fixtures
 from tests.test_custom_import_provider_http import _Session
 from tests.test_custom_import_provider_list import _configure_imported_page_dependencies, _TransactionConnection
+from tests.test_custom_import_provider_list import _Session as _PageSession
 from tests.test_npi_batch import _ranked_batch_addresses
 
 
@@ -155,6 +156,14 @@ def _configure_filtered_native_batch(monkeypatch, session, reader):
 
     connection = BatchConnection()
     session.all = connection.all
+    original_execute = session.execute
+
+    async def execute(statement, parameters=None):
+        if any(marker in str(statement) for marker in ("page_npis AS", "SELECT COUNT(DISTINCT", "SELECT taxonomy.*")):
+            return await _PageSession.execute(session, statement, parameters)
+        return await original_execute(statement, parameters)
+
+    session.execute = execute
     session.proxy_databases, session.proxy_inputs = [], []
     _configure_imported_page_dependencies(monkeypatch)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))

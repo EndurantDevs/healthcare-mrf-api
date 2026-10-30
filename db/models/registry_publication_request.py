@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Durable publication requests carry session hashes, never browser credentials."""
+"""Durable requests retain human session hashes or the exact refresh service identity."""
 
 from sqlalchemy import TIMESTAMP, CheckConstraint, Column, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -21,6 +21,13 @@ class RegistryPublicationRequest(Base):
             name="registry_request_digests",
         ),
         CheckConstraint(
+            "CASE WHEN command_json->>'operation'='refresh_memberships' THEN "
+            "session_token_sha256 IS NULL AND actor_json="
+            '\'{"kind":"service","service_id":"registry-membership-refresh"}\'::jsonb '
+            "ELSE session_token_sha256 IS NOT NULL AND actor_json->>'kind' IS DISTINCT FROM 'service' END",
+            name="registry_request_session_actor",
+        ),
+        CheckConstraint(
             "jsonb_typeof(actor_json)='object' AND jsonb_typeof(command_json)='object' AND (result_json IS NULL OR jsonb_typeof(result_json)='object')",
             name="registry_request_json",
         ),
@@ -34,7 +41,7 @@ class RegistryPublicationRequest(Base):
     )
     request_id = Column(UUID(as_uuid=True), primary_key=True)
     actor_key = Column(String(64), nullable=False)
-    session_token_sha256 = Column(String(64), nullable=False)
+    session_token_sha256 = Column(String(64), nullable=True)
     actor_json = Column(JSONB, nullable=False)
     command_json = Column(JSONB, nullable=False)
     idempotency_key = Column(String(128), nullable=False)

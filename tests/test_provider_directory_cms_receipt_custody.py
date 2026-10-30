@@ -2,6 +2,7 @@
 """One-table ownership closure retains exact reads and the existing legacy append surface."""
 
 import ast
+import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
@@ -18,6 +19,41 @@ from process import provider_directory_cms_receipt_policy as receipt_policy
 from tests.test_provider_directory_cms_callable_custody import catalog as catalog
 
 MIGRATION_ROLE = "source_migrator"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "roles,protected,expected_roles",
+    [
+        ((), None, ()),
+        (("executor", "preparer"), False, ()),
+        (("executor", "preparer"), True, ("executor", "preparer")),
+        (("executor", "preparer"), None, None),
+    ],
+)
+async def test_component_receipt_adoption_preserves_explicit_readers(monkeypatch, roles, protected, expected_roles):
+    """Check fixture ordering only; native privilege and custody proofs remain separate."""
+    from tests import nppes_candidate_postgres_support as fixture
+
+    driver = SimpleNamespace(fetchval=AsyncMock(return_value=protected))
+    policy = SimpleNamespace(schema="fixture_source")
+    provision = AsyncMock()
+    monkeypatch.setattr(fixture, "provision_cms_serving_receipt_custody", provision)
+    if expected_roles is None:
+        with pytest.raises(AssertionError):
+            await fixture._provision_component_receipt(driver, policy, MIGRATION_ROLE, roles)
+        provision.assert_not_awaited()
+    else:
+        await fixture._provision_component_receipt(driver, policy, MIGRATION_ROLE, roles)
+        provision.assert_awaited_once_with(
+            driver,
+            policy,
+            migration_role=MIGRATION_ROLE,
+            verify_role_profile=fixture.verify_native_source_profile,
+            metadata_read_roles=expected_roles,
+        )
+    if not roles:
+        driver.fetchval.assert_not_awaited()
 
 
 def test_shared_catalog_accepts_builtin_checkpoint_timestamp_index_only():
@@ -342,7 +378,7 @@ def _execute_receipt(sql, native_catalog, lock_state):
             [n, 17 if grantee == 19 else grantee, 17 if grantor == 19 else grantor, right, x]
             for n, grantee, grantor, right, x in native_catalog["column_acl"]
         ]
-    if sql.startswith("GRANT SELECT"):
+    if sql.startswith("GRANT SELECT,"):
         native_catalog["table_acl"].extend([[19, 17, right, False] for right in ("SELECT", "MAINTAIN")])
     if sql.startswith("GRANT INSERT"):
         native_catalog["column_acl"].extend([[n, 19, 17, "INSERT", False] for n in (1, 2)])
@@ -386,6 +422,289 @@ async def receipt_catalog(catalog):
     catalog.driver.execute = AsyncMock(side_effect=lambda sql: _execute_receipt(sql, native_catalog, lock_state))
     catalog.rows_receipt = native_catalog
     return catalog
+
+
+METADATA_READ_ROLES = ("independent_executor", "independent_preparer")
+
+
+async def _metadata_reader_fixture(case):
+    """Model existing identities/schema USAGE, before any receipt read grant."""
+    for oid, name in zip((22, 23), METADATA_READ_ROLES, strict=True):
+        case.graph["roles"].append(
+            dict(
+                oid=str(oid),
+                rolname=name,
+                rolcanlogin=True,
+                rolinherit=True,
+                rolsuper=False,
+                rolcreatedb=False,
+                rolcreaterole=False,
+                rolreplication=False,
+                rolbypassrls=False,
+            )
+        )
+        case.rows_receipt["access"].append(
+            dict(
+                role=oid,
+                superuser=False,
+                builtin=False,
+                owner_reach=False,
+                owner_usage=False,
+                owner_set=False,
+                builder_reach=False,
+                table=[],
+                columns=[[n, []] for n in range(1, 10)],
+            )
+        )
+    case.metadata = _metadata_reader_observation(case.policy.schema)
+    case.graph["memberships"].append(
+        dict(member="23", roleid="22", grantor="10", admin_option=False, inherit_option=True, set_option=True)
+    )
+    original_fetchval = case.driver.fetchval.side_effect
+    case.driver.fetchval.side_effect = lambda sql, *args: (
+        deepcopy(case.metadata) if sql == custody._METADATA_READERS_SQL else original_fetchval(sql, *args)
+    )
+    original_fetch = case.driver.fetch.side_effect
+    case.driver.fetch.side_effect = lambda sql, *args: (
+        deepcopy(case.metadata["role_access"]) if sql == custody.ROLE_SQL else original_fetch(sql, *args)
+    )
+    original_execute = case.driver.execute.side_effect
+
+    case.driver.execute.side_effect = lambda sql: _execute_metadata_grants(case, sql, original_execute)
+    await custody.provision_cms_serving_receipt_custody(
+        case.driver, case.policy, migration_role=MIGRATION_ROLE, verify_role_profile=AsyncMock()
+    )
+    case.driver.execute.reset_mock()
+    return case
+
+
+def _metadata_reader_observation(schema):
+    return dict(
+        namespace=dict(oid="42", nspname=schema, nspowner="17", nspacl=["existing_usage"]),
+        access=[dict(role=oid, usage=True, create=False, source_reach=False) for oid in (22, 23)],
+        beneficiaries=[[23, 22]],
+        role_access=[
+            dict(
+                rolname=name,
+                oid=oid,
+                namespace_usage=True,
+                namespace_owner_protected=True,
+                elevated=False,
+                namespace_create=False,
+                namespace_owner_reachable=False,
+                owner_set=False,
+                publisher_set=False,
+            )
+            for oid, name in zip((22, 23), METADATA_READ_ROLES, strict=True)
+        ],
+    )
+
+
+def _execute_metadata_grants(case, sql, original_execute):
+    if not sql.startswith("GRANT SELECT("):
+        return original_execute(sql)
+    role = 22 if sql.endswith('"independent_executor"') else 23
+    for attribute in case.rows_receipt["attributes"]:
+        if attribute["attname"] not in custody.ORIGIN_METADATA_COLUMNS:
+            continue
+        column = attribute["attnum"]
+        acl_fields = [column, role, 17, "SELECT", False]
+        if acl_fields not in case.rows_receipt["column_acl"]:
+            case.rows_receipt["column_acl"].append(acl_fields)
+        attribute["attacl"] = sorted(str(entry) for entry in case.rows_receipt["column_acl"] if entry[0] == column)
+        access = next(entry for entry in case.rows_receipt["access"] if entry["role"] == role)
+        access["columns"][column - 1][1] = ["SELECT"]
+
+
+async def _capture_metadata(case):
+    return await custody.capture_cms_serving_receipt_custody(
+        case.driver, case.policy, migration_role=MIGRATION_ROLE, metadata_read_roles=METADATA_READ_ROLES
+    )
+
+
+async def _grant_metadata(case, verify=None):
+    return await custody.provision_cms_origin_metadata_readers(
+        case.driver,
+        case.policy,
+        migration_role=MIGRATION_ROLE,
+        metadata_read_roles=METADATA_READ_ROLES,
+        verify_role_profile=verify or AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_origin_metadata_cut_preserves_declared_identities_and_complete_custody(receipt_catalog):
+    case = await _metadata_reader_fixture(receipt_catalog)
+    before = await _capture_metadata(case)
+    verify = AsyncMock()
+    after = await _grant_metadata(case, verify)
+    custody.require_cms_serving_receipt_read_delta(before, after, case.policy, metadata_read_roles=METADATA_READ_ROLES)
+    assert after["metadata_readers"] == before["metadata_readers"]
+    assert after["metadata_readers"]["roles"] == [["independent_executor", 22], ["independent_preparer", 23]]
+    assert json.loads(json.dumps(after["metadata_readers"])) == after["metadata_readers"]
+    assert len([edge for edge in after["catalog"]["column_acl"] if edge[1] in {22, 23}]) == 10
+    assert verify.await_count == 2
+    assert [call.args[0].split()[0] for call in case.driver.execute.await_args_list] == ["LOCK", "GRANT", "GRANT"]
+    assert await _grant_metadata(case) == after
+    assert (
+        await custody.provision_cms_serving_receipt_custody(
+            case.driver,
+            case.policy,
+            migration_role=MIGRATION_ROLE,
+            metadata_read_roles=METADATA_READ_ROLES,
+            verify_role_profile=AsyncMock(),
+        )
+        == after
+    )
+    with pytest.raises(ValueError, match="column_acl_changed"):
+        await custody.capture_cms_serving_receipt_custody(case.driver, case.policy, migration_role=MIGRATION_ROLE)
+
+
+@pytest.mark.asyncio
+async def test_origin_metadata_declaration_cannot_accompany_legacy_adoption(receipt_catalog):
+    case = receipt_catalog
+    before = deepcopy(case.rows_receipt)
+    with pytest.raises(ValueError, match="metadata_reader_protected_receipt_required"):
+        await custody.provision_cms_serving_receipt_custody(
+            case.driver,
+            case.policy,
+            migration_role=MIGRATION_ROLE,
+            metadata_read_roles=METADATA_READ_ROLES,
+            verify_role_profile=AsyncMock(),
+        )
+    assert case.rows_receipt == before
+    assert not any(call.args[0].startswith(("GRANT", "ALTER")) for call in case.driver.execute.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "actor",
+    [
+        ("independent_executor", "independent_executor", False),
+        ("source_publisher", "source_publisher", False),
+        ("native_admin", "source_owner", True),
+    ],
+)
+async def test_origin_metadata_cut_requires_original_independent_admin(receipt_catalog, actor):
+    case = await _metadata_reader_fixture(receipt_catalog)
+    case.driver.fetchrow.return_value.update(session=actor[0], current=actor[1], native_admin=actor[2])
+    verify = AsyncMock()
+    with pytest.raises(ValueError, match="independent_admin_required"):
+        await _grant_metadata(case, verify)
+    verify.assert_not_awaited()
+    case.driver.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing_usage",
+        "create",
+        "source_reach",
+        "undeclared_beneficiary",
+        "superuser",
+        "missing_role",
+        "set_namespace_owner",
+        "set_create_role",
+        "set_elevated_role",
+    ],
+)
+async def test_origin_metadata_preexisting_authority_refused_before_grant(receipt_catalog, change):
+    case = await _metadata_reader_fixture(receipt_catalog)
+    match change:
+        case "missing_usage":
+            case.metadata["access"][0]["usage"] = False
+        case "create" | "source_reach":
+            case.metadata["access"][0][change] = True
+        case "undeclared_beneficiary":
+            case.metadata["beneficiaries"].append([24, 22])
+        case "superuser":
+            case.graph["roles"][-1]["rolsuper"] = True
+        case "missing_role":
+            case.graph["roles"].pop()
+        case _:
+            role_by_field = {**case.graph["roles"][-1], "oid": "24", "rolname": "reachable_authority"}
+            role_by_field["rolcreaterole"] = change == "set_elevated_role"
+            case.graph["roles"].append(role_by_field)
+            case.graph["memberships"].append(
+                dict(member="22", roleid="24", grantor="10", admin_option=False, inherit_option=False, set_option=True)
+            )
+            key = {
+                "set_namespace_owner": "namespace_owner_reachable",
+                "set_create_role": "namespace_create",
+                "set_elevated_role": "elevated",
+            }[change]
+            case.metadata["role_access"][0][key] = True
+    with pytest.raises(ValueError, match="metadata_read"):
+        await _grant_metadata(case)
+    assert not any(call.args[0].startswith("GRANT") for call in case.driver.execute.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "table",
+        "column",
+        "grant_option",
+        "grantor",
+        "write",
+        "undeclared",
+        "owner",
+        "schema",
+        "role_graph",
+        "declaration",
+        "effective_beneficiary",
+    ],
+)
+async def test_origin_metadata_delta_closes_every_other_privilege_and_identity(receipt_catalog, change):
+    case = await _metadata_reader_fixture(receipt_catalog)
+    before = await _capture_metadata(case)
+    after = await _grant_metadata(case)
+    edge = next(entry for entry in after["catalog"]["column_acl"] if entry[1] == 22)
+    mutations_by_field = {
+        "column": (0, 4),
+        "grant_option": (4, True),
+        "grantor": (2, 19),
+        "write": (3, "INSERT"),
+        "undeclared": (1, 24),
+    }
+    if change in mutations_by_field:
+        position, changed_field = mutations_by_field[change]
+        edge[position] = changed_field
+    else:
+        _mutate_metadata_identity(after, change)
+    with pytest.raises(ValueError, match="read_.*changed"):
+        custody.require_cms_serving_receipt_read_delta(
+            before, after, case.policy, metadata_read_roles=METADATA_READ_ROLES
+        )
+
+
+def _mutate_metadata_identity(after, change):
+    match change:
+        case "table":
+            after["catalog"]["table_acl"].append([22, 17, "SELECT", False])
+        case "owner":
+            after["catalog"]["classes"][0]["relowner"] = "22"
+        case "schema":
+            after["metadata_readers"]["namespace"]["nspacl"].append("new_usage")
+        case "role_graph":
+            after["functions"]["role_graph"]["memberships"].append({"member": 22, "roleid": 20})
+        case "declaration":
+            after["metadata_readers"]["roles"][0][1] = 24
+        case _:
+            next(entry for entry in after["catalog"]["access"] if entry["role"] == 20)["columns"][0][1] = ["SELECT"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("late_profile_failure"), asyncio.CancelledError()])
+async def test_origin_metadata_failure_and_cancellation_restore_exact_preimage(receipt_catalog, failure):
+    case = await _metadata_reader_fixture(receipt_catalog)
+    before = await _capture_metadata(case)
+    with pytest.raises(type(failure)):
+        await _grant_metadata(case, AsyncMock(side_effect=[None, failure]))
+    assert await _capture_metadata(case) == before
 
 
 @pytest.mark.asyncio

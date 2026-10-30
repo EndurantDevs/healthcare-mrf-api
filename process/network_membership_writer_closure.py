@@ -20,13 +20,14 @@ class NetworkWriterClosureError(ValueError):
     """Candidate ownership, native identity or privileges are not closed."""
 
 
-def _is_protected_owner(role_row: Any) -> bool:
+def is_protected_writer_owner(role_row: Any) -> bool:
     """Accept a native role mapping without imposing membership or INHERIT policy."""
     flags = ("rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
     return role_row is not None and all(role_row[flag] is False for flag in flags)
 
 
-_protected_owner = _is_protected_owner
+_is_protected_owner = is_protected_writer_owner
+_protected_owner = is_protected_writer_owner
 
 
 _NATIVE_RUNTIME_ROLE_UNSAFE_SQL = """r.oid IS NULL OR r.rolsuper OR r.rolcreaterole
@@ -78,7 +79,8 @@ SELECT (SELECT schema_oid IS NOT NULL AND owner_oid IS NOT NULL AND cardinality(
 """
 
 
-def _role_names(owner_role: str, loader_roles: tuple[str, ...], reader_roles: tuple[str, ...]) -> dict:
+def writer_role_names(owner_role: str, loader_roles: tuple[str, ...], reader_roles: tuple[str, ...]) -> dict:
+    """Validate bounded role names and keep the protected owner separate from runtime identities."""
     _identifier(owner_role)
     for role_names in (loader_roles, reader_roles):
         if type(role_names) is not tuple or len(role_names) > 32:
@@ -95,7 +97,11 @@ def _role_names(owner_role: str, loader_roles: tuple[str, ...], reader_roles: tu
     }
 
 
-async def _check_roles(connection: Any, roles: dict) -> None:
+_role_names = writer_role_names
+
+
+async def verify_writer_roles(connection: Any, roles: dict) -> None:
+    """Require a protected owner and runtime roles unable to bypass its custody."""
     owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", roles["owner_role"])
     if not _protected_owner(owner):
         raise NetworkWriterClosureError("Owner must be an existing protected native role")
@@ -111,6 +117,9 @@ async def _check_roles(connection: Any, roles: dict) -> None:
         raise NetworkWriterClosureError("Runtime role can bypass protected ownership")
     if not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", roles["owner_role"]):
         raise NetworkWriterClosureError("Publisher must be able to assume the protected owner")
+
+
+_check_roles = verify_writer_roles
 
 
 async def _catalog(connection: Any, copy_target: MembershipCopyTarget, candidate: dict) -> dict:
@@ -129,9 +138,17 @@ async def _catalog(connection: Any, copy_target: MembershipCopyTarget, candidate
     required_tables = {"network_membership", "provider_location_binding"}
     if verify_registry_source_retention(candidate) is not None:
         required_tables.add(SOURCE_TABLE)
-    if not required_tables <= heap_oid_by_name.keys() or heap_oid_by_name.keys() - required_tables - {
-        "entity_address_unified"
-    }:
+    from process.registry_source_contribution_store import CONTRIBUTION_TABLE, verify_registry_source_contributions
+
+    if verify_registry_source_contributions(candidate) is not None:
+        required_tables.add(CONTRIBUTION_TABLE)
+    from process.registry_source_inventory_reference import source_inventory_heaps
+
+    required_tables.update(source_inventory_heaps(candidate))
+    from process.network_compact_readiness import compact_serving_heaps, is_compact_candidate
+
+    serving_tables = compact_serving_heaps(candidate) if is_compact_candidate(candidate) else {"entity_address_unified"}
+    if not required_tables <= heap_oid_by_name.keys() or heap_oid_by_name.keys() - required_tables - serving_tables:
         raise NetworkWriterClosureError("Candidate must contain only registered membership heaps")
     if len(relations) > 128 or any(
         relation["relkind"] not in (b"r", b"i") or relation["relpersistence"] != b"p" for relation in relations
@@ -151,7 +168,8 @@ async def _catalog(connection: Any, copy_target: MembershipCopyTarget, candidate
     }
 
 
-def _receipt(target: MembershipCopyTarget, roles: dict, catalog: dict) -> dict:
+def writer_closure_receipt(target: MembershipCopyTarget, roles: dict, catalog: dict) -> dict:
+    """Bind candidate scope, configured roles and physical relation identities in one receipt."""
     indexes = [row for row in catalog["relations"] if row["relkind"] == b"i"]
     return {
         "component": "network_candidate_writer_closure",
@@ -168,6 +186,9 @@ def _receipt(target: MembershipCopyTarget, roles: dict, catalog: dict) -> dict:
     }
 
 
+_receipt = writer_closure_receipt
+
+
 def _retained(candidate: dict) -> dict | None:
     validation = candidate["validation_json"]
     if isinstance(validation, str):
@@ -182,7 +203,8 @@ def _retained(candidate: dict) -> dict | None:
     return retained
 
 
-def _check_identity(current: dict, retained: dict | None, *, extending: bool) -> None:
+def verify_writer_closure_identity(current: dict, retained: dict | None, *, extending: bool) -> None:
+    """Reject retained ownership or physical identity drift outside an explicitly allowed extension."""
     if retained is None:
         return
     if (
@@ -198,10 +220,31 @@ def _check_identity(current: dict, retained: dict | None, *, extending: bool) ->
     if type(previous_heaps) is not dict:
         raise NetworkWriterClosureError("Retained candidate heap identities are invalid")
     raw_heaps = {"network_membership", "provider_location_binding"}
+    from process.registry_source_contribution_store import CONTRIBUTION_TABLE
+
+    if CONTRIBUTION_TABLE in current["relation_oids"]:
+        raw_heaps.add(CONTRIBUTION_TABLE)
+    from process.network_provider_only_projection import TABLE_NAME
+    from process.registry_source_inventory_store import INVENTORY_TABLE
+
+    inventory_heaps = {INVENTORY_TABLE, TABLE_NAME}
+    if inventory_heaps <= set(current["relation_oids"]):
+        raw_heaps.update(inventory_heaps)
     allow_growth = (
         extending
-        and set(previous_heaps) in (raw_heaps, raw_heaps | {SOURCE_TABLE})
-        and set(current["relation_oids"]) == set(previous_heaps) | {"entity_address_unified"}
+        and set(previous_heaps)
+        in (
+            raw_heaps,
+            raw_heaps | {SOURCE_TABLE},
+            raw_heaps | {"entity_address_unified"},
+            raw_heaps | {SOURCE_TABLE, "entity_address_unified"},
+        )
+        and set(current["relation_oids"]) - set(previous_heaps)
+        in (
+            {"entity_address_unified"},
+            {"network_slice_ref", "network_office_edge"},
+            {"network_slice_ref", "network_office_edge", "entity_address_unified"},
+        )
     )
     for key in ("relation_oids", "index_oids", "index_table_oids"):
         previous = retained.get(key)
@@ -213,6 +256,9 @@ def _check_identity(current: dict, retained: dict | None, *, extending: bool) ->
             raise NetworkWriterClosureError("Retained candidate object identity changed")
         if not allow_growth and current[key] != previous:
             raise NetworkWriterClosureError("Closed candidate object set changed")
+
+
+_check_identity = verify_writer_closure_identity
 
 
 async def _lock_catalog(connection: Any, target: MembershipCopyTarget, roles: dict, candidate: dict) -> dict:
@@ -292,7 +338,8 @@ async def _remove_default_grants(connection: Any, namespace: str, catalog: dict)
         )
 
 
-async def _check_closed(connection: Any, roles: dict, catalog: dict, *, retained: dict | None = None) -> None:
+async def verify_writer_closure(connection: Any, roles: dict, catalog: dict, *, retained: dict | None = None) -> None:
+    """Require protected ownership and closed runtime writes for the selected candidate relations."""
     owner_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", roles["owner_role"])
     relations = catalog["relations"]
     if retained is not None:
@@ -312,6 +359,9 @@ async def _check_closed(connection: Any, roles: dict, catalog: dict, *, retained
     )
     if is_closed is not True:
         raise NetworkWriterClosureError("Candidate native ACLs or effective runtime roles are not closed")
+
+
+_check_closed = verify_writer_closure
 
 
 async def _remove_grants(connection: Any, namespace: str, catalog: dict, owner_oid: int) -> None:
@@ -353,7 +403,9 @@ async def _transfer_ownership(connection, target, roles, catalog, owner_oid):
             await connection.execute(f"ALTER TABLE {namespace}.{_identifier(table_name)} OWNER TO {owner}")
 
 
-async def _transfer_and_grant(connection: Any, target: MembershipCopyTarget, roles: dict, catalog: dict) -> None:
+async def transfer_and_grant_writer_closure(
+    connection: Any, target: MembershipCopyTarget, roles: dict, catalog: dict
+) -> None:
     """Close an already owned catalog or perform the original guarded transfer."""
     namespace = _identifier(target.schema_name)
     owner = _identifier(roles["owner_role"])
@@ -377,6 +429,9 @@ async def _transfer_and_grant(connection: Any, target: MembershipCopyTarget, rol
     await connection.execute(f"SET LOCAL ROLE {publisher}")
 
 
+_transfer_and_grant = transfer_and_grant_writer_closure
+
+
 async def _candidate_context(
     connection: Any, target: MembershipCopyTarget, roles: dict, control_schema: str | None
 ) -> tuple:
@@ -385,8 +440,13 @@ async def _candidate_context(
         raise NetworkWriterClosureError("Writer closure requires a sealed candidate")
     await _check_roles(connection, roles)
     catalog = await _lock_catalog(connection, target, roles, candidate)
-    if candidate["state"] in ("ready", "published") and "entity_address_unified" not in catalog["heaps"]:
-        raise NetworkWriterClosureError("Ready candidate requires its projected address heap")
+    from process.network_compact_readiness import compact_serving_heaps, is_compact_candidate
+
+    required_serving = (
+        compact_serving_heaps(candidate) if is_compact_candidate(candidate) else {"entity_address_unified"}
+    )
+    if candidate["state"] in ("ready", "published") and not required_serving <= catalog["heaps"].keys():
+        raise NetworkWriterClosureError("Ready candidate requires its exact serving heaps")
     return candidate, catalog
 
 

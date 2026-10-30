@@ -13,6 +13,7 @@ from sqlalchemy import types
 from sqlalchemy.dialects import postgresql
 
 from db.models.registry_aca_source_notification import RegistryACASourceNotification
+from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
 from process.network_membership_writer_closure import _NATIVE_WRITER_PRIVILEGES_SQL
 from process.registry_management_permissions import _MODELS, _PTG_TABLES, _TABLES
 
@@ -88,7 +89,7 @@ def _native_type(column_type):
 
 
 def registry_execution_columns():
-    """Compile models plus the four existing receipt migrations' native columns."""
+    """Compile exact registry models and canonical non-ORM native column contracts."""
     expected_by_table = {
         model.__tablename__: tuple(
             (column.name, *_native_type(column.type), not column.nullable) for column in model.__table__.columns
@@ -123,12 +124,35 @@ def registry_execution_columns():
             ("created_at", "1184"),
         )
     )
+    expected_by_table["registry_fhir_catalog_snapshot"] = _catalog_snapshot_columns()
     _require(
         set(expected_by_table)
         == set(_TABLES) | {"registry_cms_source_notification", "registry_aca_source_notification"},
         "model_roster",
     )
     return expected_by_table
+
+
+def _catalog_snapshot_columns():
+    """Bind the canonical non-ORM snapshot definition to its complete native column contract."""
+    columns_by_name = {
+        "metadata_generation": ("25", -1, True),
+        "schema_name": ("1043", 67, True),
+        "custody_json": ("3802", -1, True),
+        "network_generation": ("20", -1, False),
+        "manifest_sha256": ("25", -1, False),
+        "metadata_approved_revision": ("20", -1, True),
+        "membership_mapping_sha256": ("25", -1, True),
+        "mapping_sha256": ("25", -1, True),
+        "standing_grant_sha256": ("25", -1, True),
+        "source_vector_json": ("3802", -1, True),
+        "projector_version": ("25", -1, True),
+        "as_of": ("1082", -1, True),
+        "accounting_json": ("3802", -1, True),
+        "published_at": ("1184", -1, False),
+    }
+    _require(tuple(columns_by_name) == SNAPSHOT_COLUMNS, "model_catalog_columns")
+    return tuple((name, *column) for name, column in columns_by_name.items())
 
 
 def _foreign_keys():

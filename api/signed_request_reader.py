@@ -131,7 +131,7 @@ async def signed_request_reader(request, ordinary_session, *, plan_workspace=Fal
                 if request.path.startswith("/api/v1/extensions/custom-import/providers"):
                     from api.reference_family_reads import pin_claims_reader
 
-                    await pin_claims_reader(session)
+                    await pin_claims_reader(session, api_read=True)
                 yield session
     except BaseException as failure:
         if type(_static_attribute(failure, "_api_reader_diagnostic")) is not dict:

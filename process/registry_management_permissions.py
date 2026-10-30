@@ -37,6 +37,7 @@ from db.models.registry_network_binding import RegistryNetworkBinding, RegistryN
 from db.models.registry_publication_request import RegistryPublicationRequest
 from db.models.registry_revision import RegistryRecordHistory, RegistryRevisionControl
 from db.models.registry_site_binding import RegistrySiteBinding
+from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
 from process.network_address_projection import _identifier
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_membership_writer_closure import _NATIVE_RUNTIME_ROLE_UNSAFE_SQL, _protected_owner
@@ -80,7 +81,9 @@ _MODELS = _HEAD_MODELS + (
     RegistryCompanyLinkBatch,
     RegistryNetworkBindingBatch,
 )
-_TABLES = {model.__tablename__: tuple(model.__table__.columns.keys()) for model in _MODELS}
+REGISTRY_TABLES = {model.__tablename__: tuple(model.__table__.columns.keys()) for model in _MODELS}
+
+_TABLES = REGISTRY_TABLES
 _PTG_TABLES = {
     "registry_ptg_producer_scope": (
         "scope_id",
@@ -111,6 +114,7 @@ _PTG_TABLES = {
     "registry_ptg_office_hold": ("capture_id", "approval_sha256", "hold_sha256", "hold_json", "created_at"),
 }
 _TABLES.update(_PTG_TABLES)
+_TABLES["registry_fhir_catalog_snapshot"] = SNAPSHOT_COLUMNS
 _INSERT_COLUMNS = {
     model.__tablename__: tuple(column for column in model.__table__.columns.keys() if column != "created_at")
     for model in _HEAD_MODELS
@@ -294,7 +298,9 @@ async def _ptg_readers(connection, schema_oid, owner_role, api_role):
     )
 
 
-async def _verify_table_privileges(connection, tables, api_role, *, office_recipe_pending=False):
+async def _verify_table_privileges(
+    connection, tables, api_role, *, office_recipe_pending=False, catalog_snapshot_pending=False
+):
     """Require the exact API column policy and read-only retained tables."""
     for table in tables:
         for privilege, permitted in (("INSERT", _INSERT_COLUMNS), ("UPDATE", _UPDATE_COLUMNS), ("REFERENCES", {})):
@@ -313,7 +319,12 @@ async def _verify_table_privileges(connection, tables, api_role, *, office_recip
                     "Effective registry column privileges differ from the draft policy"
                 )
         if not await connection.fetchval("SELECT has_table_privilege($1,$2::oid,'SELECT')", api_role, table["oid"]):
-            raise RegistryManagementPermissionError("Registry metadata reads are unavailable")
+            if not catalog_snapshot_pending or table["relname"] != "registry_fhir_catalog_snapshot":
+                raise RegistryManagementPermissionError("Registry metadata reads are unavailable")
+            if await connection.fetchval(
+                "SELECT has_any_column_privilege($1,$2::oid,'SELECT')", api_role, table["oid"]
+            ):
+                raise RegistryManagementPermissionError("Pending catalog reads must be completely absent")
         if await connection.fetchval(
             "SELECT has_table_privilege($1,$2::oid,'DELETE,TRUNCATE,TRIGGER,MAINTAIN')", api_role, table["oid"]
         ):
@@ -408,7 +419,9 @@ async def _custody_ledger_owner(connection, namespace, tables, owner_role, *, al
     return control["rolname"]
 
 
-async def _verify(connection, namespace, api_role, owner_role, *, office_recipe_pending=False):
+async def _verify(
+    connection, namespace, api_role, owner_role, *, office_recipe_pending=False, catalog_snapshot_pending=False
+):
     """Compare native ownership and effective privileges to the explicit draft policy."""
     schema = await _roles(connection, namespace, api_role, owner_role)
     if not await connection.fetchval("SELECT has_schema_privilege($1,$2::oid,'USAGE')", api_role, schema["oid"]):
@@ -432,7 +445,13 @@ async def _verify(connection, namespace, api_role, owner_role, *, office_recipe_
         raise RegistryManagementPermissionError("Registry object ownership is not protected")
     await _check_direct_grants(connection, schema["oid"], api_role)
     await _reject_inherited_grants(connection, schema["oid"], api_role)
-    await _verify_table_privileges(connection, tables, api_role, office_recipe_pending=office_recipe_pending)
+    await _verify_table_privileges(
+        connection,
+        tables,
+        api_role,
+        office_recipe_pending=office_recipe_pending,
+        catalog_snapshot_pending=catalog_snapshot_pending,
+    )
     for sequence in sequences:
         is_permitted = sequence["relname"] == "network_registry_identity_network_id_seq"
         if await connection.fetchval(
@@ -453,9 +472,19 @@ async def _verify(connection, namespace, api_role, owner_role, *, office_recipe_
     }
 
 
-async def verify_registry_management_permissions(connection, *, api_role, owner_role, control_schema=None):
+async def verify_registry_management_permissions(
+    connection, *, api_role, owner_role, control_schema=None, catalog_snapshot_pending=False
+):
     """Read exact native owners, ACLs and effective column privileges without DDL."""
-    return await _verify(connection, _control_namespace(control_schema)[1:-1], api_role, owner_role)
+    if type(catalog_snapshot_pending) is not bool:
+        raise RegistryManagementPermissionError("Pending catalog policy must be explicit")
+    return await _verify(
+        connection,
+        _control_namespace(control_schema)[1:-1],
+        api_role,
+        owner_role,
+        catalog_snapshot_pending=catalog_snapshot_pending,
+    )
 
 
 async def install_registry_office_recipe_permissions(connection, *, api_role, owner_role, control_schema=None):

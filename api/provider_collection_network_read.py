@@ -17,7 +17,7 @@ from api.provider_collection_network_contract import (
     parse_managed_collection_query,
 )
 from api.provider_detail_network_read import managed_provider_network_read_scope
-from api.provider_profile_snapshot import provider_profile_read_snapshot
+from api.provider_profile_snapshot import provider_geo_read_snapshot, provider_profile_read_snapshot
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import (
     MAX_RESPONSE_BYTES,
@@ -182,6 +182,12 @@ def _bounded_result(manifest, document):
     return result_by_field
 
 
+def _collection_read_snapshot(database, schema, kind):
+    if kind == "geo":
+        return provider_geo_read_snapshot(database, schema)
+    return provider_profile_read_snapshot(database, schema, include_detail=True)
+
+
 async def read_managed_provider_collection(
     request, query, *, excluded_network_ids, access_scope_sha256, organization_policy=None, client_id=None
 ):
@@ -213,7 +219,7 @@ async def read_managed_provider_collection(
 
                 await stack.enter_async_context(provider.db.reader_session(temporary_setup=prepare_plan_query_tables))
             session = await stack.enter_async_context(
-                provider_profile_read_snapshot(provider.db, provider._runtime_db_schema(), include_detail=True)
+                _collection_read_snapshot(provider.db, provider._runtime_db_schema(), query.kind)
             )
             async with managed_provider_network_read_scope(
                 session,

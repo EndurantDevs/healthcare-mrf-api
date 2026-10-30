@@ -64,7 +64,12 @@ class RegistryCMSRetentionRequest:
 
     def __post_init__(self):
         RegistrySourceMembershipRecipe(self.source_pin, self.binding_coordinates)
-        if self.source_pin.source_id != "cms-npd" or self.source_pin.retained_epoch is not None:
+        if (
+            self.source_pin.source_id != "cms-npd"
+            or self.source_pin.retained_epoch is not None
+            or self.source_pin.retained_successor is not None
+            or self.source_pin.retained_capture is not None
+        ):
             raise ValueError("registry_cms_retention_request_invalid")
         for digest in (self.selection_proof_id, self.expected_admission_sha256, self.expected_metadata_sha256):
             if (
@@ -119,8 +124,11 @@ class PreparedRegistryCMSSourcePair:
         """Persist closed prepublication evidence, with no receipt or commit claim."""
         from process.registry_source_recipe_store import canonical_registry_source_recipes
 
+        request_document = asdict(self.request)
+        request_document["source_pin"].pop("retained_successor")
+        request_document["source_pin"].pop("retained_capture")
         document_dict = {
-            "request": asdict(self.request),
+            "request": request_document,
             "recipe": json.loads(canonical_registry_source_recipes((self.recipe,)))[0],
             "address_ownership": self.address_ownership.as_dict(),
             "address_receipt": self.address_receipt.as_dict(),

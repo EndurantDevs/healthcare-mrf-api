@@ -52,6 +52,40 @@ _MODELS = dict(
 _MAX_RECEIPT_BYTES = 32768
 _RELATION_FIELDS = {"role", "schema_name", "table_name", "generation_id", "relation_oid", "relfilenode"}
 _CUSTODY_FIELDS = {"schema_oid", "owner_oid", "owner_role", "shape_sha256", "keys_sha256"}
+_LEGACY_CONTROL_SQL = """SELECT c.oid::bigint AS table_oid,pg_catalog.pg_backend_pid() AS backend_pid,
+ current_user=session_user AND pg_catalog.current_setting('role')='none' AND r.rolcanlogin
+ AND NOT (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls) AS reader,
+ NOT EXISTS(SELECT FROM pg_catalog.unnest(ARRAY[n.nspowner,c.relowner]) owner(oid)
+   WHERE pg_catalog.pg_has_role(r.oid,owner.oid,'MEMBER') OR pg_catalog.pg_has_role(r.oid,owner.oid,'USAGE')
+   OR pg_catalog.pg_has_role(r.oid,owner.oid,'SET')) AS owners_closed,
+ NOT pg_catalog.pg_has_role(r.oid,'pg_write_all_data','MEMBER')
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_roles elevated
+   WHERE (elevated.rolsuper OR elevated.rolcreatedb OR elevated.rolcreaterole
+     OR elevated.rolreplication OR elevated.rolbypassrls)
+   AND (pg_catalog.pg_has_role(r.oid,elevated.oid,'MEMBER')
+     OR pg_catalog.pg_has_role(r.oid,elevated.oid,'SET'))) AS elevated_closed,
+ pg_catalog.has_schema_privilege(r.oid,n.oid,'USAGE')
+ AND NOT pg_catalog.has_schema_privilege(r.oid,n.oid,'CREATE') AS schema_read_only,
+ pg_catalog.has_table_privilege(r.oid,c.oid,'SELECT')
+ AND NOT pg_catalog.has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+ AS table_read_only,
+ NOT pg_catalog.has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES') AS columns_read_only,
+ c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity
+ AND NOT c.relforcerowsecurity AND c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) AS heap,
+ (SELECT pg_catalog.bool_and(coalesce(a.atttypid=expected.type_oid AND a.atttypmod=expected.typmod
+     AND NOT a.attisdropped AND a.attgenerated='' AND a.attidentity='',false))
+  FROM (VALUES ('candidate_id','pg_catalog.uuid'::pg_catalog.regtype,-1),
+    ('schema_name','pg_catalog.varchar'::pg_catalog.regtype,68),
+    ('state','pg_catalog.varchar'::pg_catalog.regtype,20),
+    ('source_generations','pg_catalog.jsonb'::pg_catalog.regtype,-1),
+    ('validation_json','pg_catalog.jsonb'::pg_catalog.regtype,-1)) expected(name,type_oid,typmod)
+  LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attname=expected.name AND a.attnum>0)
+ AS columns_valid
+ FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid
+ JOIN pg_catalog.pg_roles r ON r.rolname=current_user
+ WHERE n.nspname=$1 AND c.relname='network_membership_candidate'"""
 
 
 def _fail():
@@ -127,6 +161,19 @@ class EMProviderInputs:
                 key: getattr(item, key) for key in ("schema_name", "table_name", "relation_oid", "relfilenode")
             }
         return validate_projection_dependency_bindings(schema_name, bindings_by_name)
+
+
+def em_provider_geo_reads_sql(sql, inputs, schema_name):
+    """Restrict fixed shared geo fragments to the verified native input heaps."""
+    if type(sql) is not str or type(inputs) is not EMProviderInputs:
+        _fail()
+    inputs.__post_init__()
+    for binding in inputs.geo_bindings(schema_name).values():
+        relation = f"{_identifier(binding['schema_name'])}.{_identifier(binding['table_name'])}"
+        # shortcut: shared emitters use uppercase FROM/JOIN and a trailing space; update when their SQL layout changes.
+        sql = sql.replace(f"FROM {relation} ", f"FROM ONLY {relation} ")
+        sql = sql.replace(f"JOIN {relation} ", f"JOIN ONLY {relation} ")
+    return sql
 
 
 def _runtime_roles(roles):
@@ -378,7 +425,91 @@ async def record_em_provider_inputs(connection, copy_target, receipt, control_sc
     return receipt
 
 
-async def resolve_em_provider_inputs(connection, manifest, control_schema=None):
+async def _legacy_em_control_pins(connection, control_schema, backend_pid):
+    """Pin current legacy header identity after independent serving acceptance, without seal authority."""
+    from process.network_address_artifact import _require_api_read_context
+    from process.network_compact_layout import CompactAddressRelation
+
+    _identifier(control_schema)
+    if type(backend_pid) is not int or not 0 < backend_pid <= 2147483647:
+        _fail()
+    await _require_api_read_context(connection, True)
+    catalog = await connection.fetchrow(_LEGACY_CONTROL_SQL, control_schema)
+    if (
+        catalog is None
+        or type(catalog["backend_pid"]) is not int
+        or catalog["backend_pid"] != backend_pid
+        or any(
+            catalog[field] is not True
+            for field in (
+                "reader",
+                "owners_closed",
+                "elevated_closed",
+                "schema_read_only",
+                "table_read_only",
+                "columns_read_only",
+                "heap",
+                "columns_valid",
+            )
+        )
+    ):
+        _fail()
+    _oid(catalog["table_oid"])
+    return (CompactAddressRelation(control_schema, "network_membership_candidate", catalog["table_oid"]),)
+
+
+async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=None):
+    """Guard the accepted sealed or legacy candidate header before reading its retained recipe."""
+    from process.network_candidate_custody import read_network_control_relation_pins
+    from process.network_read_identity import verify_consumed_network_relations
+
+    try:
+        if type(manifest) is not PinnedNetworkServingManifest:
+            _fail()
+        backend_pid = connection.get_server_pid()
+        await _require_transaction(connection)
+        namespace = _control_namespace(control_schema)
+        retained = await resolve_network_serving_manifest(
+            connection, generation_id=manifest.generation_id, control_schema=namespace[1:-1], api_read=True
+        )
+        if type(retained) is not PinnedNetworkServingManifest or retained != manifest:
+            _fail()
+        control = retained.custody_control
+        if control is None:
+            if retained.compact_layout is not None:
+                _fail()
+            pins = await _legacy_em_control_pins(connection, namespace[1:-1], backend_pid)
+        elif type(control) is dict:
+            pins = await read_network_control_relation_pins(
+                connection,
+                ("network_membership_candidate",),
+                control_schema=namespace[1:-1],
+                expected_candidate_table_oid=control["candidate_table_oid"],
+            )
+        else:
+            _fail()
+        candidate_header = await connection.fetchrow(
+            f"SELECT source_generations,validation_json FROM ONLY {namespace}.network_membership_candidate "
+            "WHERE candidate_id=$1 AND schema_name=$2 AND state='published'",
+            UUID(manifest.candidate_id),
+            manifest.schema_name,
+        )
+        await verify_consumed_network_relations(connection, pins, expected_backend_pid=backend_pid)
+        if candidate_header is None or _object(candidate_header["source_generations"]) != manifest.source_generations:
+            _fail()
+        receipt = _object(candidate_header["validation_json"]).get("em_provider_inputs")
+        inputs = _receipt(receipt)
+        if manifest.source_generations.get("em_provider_inputs") != receipt["receipt_sha256"]:
+            _fail()
+        current = await prepare_em_provider_inputs(connection, inputs, runtime_roles=tuple(receipt["runtime_roles"]))
+        if current != receipt:
+            _fail()
+        return inputs
+    except Exception:
+        raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None
+
+
+async def _resolve_em_provider_inputs_legacy(connection, manifest, control_schema=None):
     """Revalidate an exact retained manifest and its protected native recipe, read-only."""
     try:
         if type(manifest) is not PinnedNetworkServingManifest:
@@ -406,6 +537,57 @@ async def resolve_em_provider_inputs(connection, manifest, control_schema=None):
             _fail()
         return inputs
     except ValueError, TypeError, KeyError, asyncpg.PostgresError:
+        raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None
+
+
+async def resolve_em_provider_inputs(connection, manifest, control_schema=None, *, api_read=False):
+    """Revalidate an exact retained manifest and its protected native recipe, read-only."""
+    if type(api_read) is not bool:
+        raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable")
+    if api_read:
+        return await _resolve_em_provider_inputs_api(connection, manifest, control_schema)
+    return await _resolve_em_provider_inputs_legacy(connection, manifest, control_schema)
+
+
+async def resolve_em_provider_inputs_in_session(session, manifest, control_schema=None):
+    """Verify the complete retained recipe and bind its nine native inputs to this API transaction."""
+    from api.network_read_execution import _original_read_driver, install_network_read_inventory
+    from process.network_compact_layout import CompactAddressRelation
+
+    try:
+        transaction = session.get_transaction()
+        if transaction is None:
+            _fail()
+        connection, backend_pid = await _original_read_driver(session)
+        if session.get_transaction() is not transaction or connection.is_in_transaction() is not True:
+            _fail()
+        inputs = await resolve_em_provider_inputs(connection, manifest, control_schema, api_read=True)
+        current_driver, current_pid = await _original_read_driver(session)
+        if (
+            current_driver is not connection
+            or current_pid != backend_pid
+            or session.get_transaction() is not transaction
+            or connection.is_in_transaction() is not True
+            or type(inputs) is not EMProviderInputs
+        ):
+            _fail()
+        await install_network_read_inventory(
+            session,
+            tuple(
+                CompactAddressRelation(relation.schema_name, relation.table_name, relation.relation_oid)
+                for relation in inputs.relations
+            ),
+        )
+        current_driver, current_pid = await _original_read_driver(session)
+        if (
+            current_driver is not connection
+            or current_pid != backend_pid
+            or session.get_transaction() is not transaction
+            or connection.is_in_transaction() is not True
+        ):
+            _fail()
+        return inputs
+    except Exception:
         raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None
 
 

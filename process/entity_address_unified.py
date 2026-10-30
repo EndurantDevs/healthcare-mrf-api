@@ -39,6 +39,8 @@ from db.models.entity_address_unified import ENTITY_ADDRESS_UNIFIED_SERVING_STAG
 from process import entity_address_candidate_preparation as candidate_preparation
 from process import entity_address_preparation_admission as preparation_admission
 from process import entity_address_result_generation as result_generation
+from process import entity_address_rows_native as row_preparation
+from process import entity_address_rows_preparation as prepared_rows
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_serving_recovery as serving_recovery
 from process.control_lifecycle import mark_control_run
@@ -730,6 +732,20 @@ async def _run_sql_phase(
             source="entity-address-unified-sql-progress",
         )
     return rowcount
+
+
+async def _run_prepared_source_phase(
+    db_schema, source_select, build_sql, phase_options, *, include_base_address_version=True
+):
+    """Share the preparation transaction and progress adapter across both SQL builders."""
+    return await prepared_rows.run_prepared_source_phase(
+        importlib.import_module(__name__),
+        db_schema,
+        source_select,
+        build_sql,
+        phase_options,
+        include_base_address_version=include_base_address_version,
+    )
 
 
 def _row_mapping(row) -> dict:
@@ -6688,9 +6704,13 @@ def _insert_raw_base_rows_cte_sql(source_select: str) -> str:
     ),"""
 
 
-def _insert_raw_sanitized_cte_sql() -> str:
+def _insert_raw_sanitized_cte_sql(*, native_prepared: bool = False) -> str:
     """Build the raw value-sanitization CTE."""
 
+    expression_by_field = row_preparation.sanitized_value_expressions(
+        importlib.import_module(__name__), native_prepared=native_prepared
+    )
+    prepared_columns = row_preparation.prepared_component_projection_sql() if native_prepared else ""
     return f"""
     sanitized AS (
         SELECT
@@ -6700,9 +6720,9 @@ def _insert_raw_sanitized_cte_sql() -> str:
             inferred_npi,
             inference_confidence,
             inference_method,
-            NULLIF(TRIM(entity_name), '')::varchar AS entity_name,
-            NULLIF(TRIM(entity_subtype), '')::varchar AS entity_subtype,
-            COALESCE(NULLIF(TRIM(type), ''), 'primary')::varchar AS type,
+            {expression_by_field["entity_name"]}::varchar AS entity_name,
+            {expression_by_field["entity_subtype"]}::varchar AS entity_subtype,
+            {expression_by_field["type"]}::varchar AS type,
             COALESCE(taxonomy_array, ARRAY[0]::int[])::int[] AS taxonomy_array,
             COALESCE(plans_network_array, ARRAY[0]::int[])::int[] AS plans_network_array,
             COALESCE(procedures_array, ARRAY[0]::int[])::int[] AS procedures_array,
@@ -6712,46 +6732,36 @@ def _insert_raw_sanitized_cte_sql() -> str:
             COALESCE(ptg_plan_array, ARRAY[]::varchar[])::varchar[] AS ptg_plan_array,
             COALESCE(ptg_source_array, ARRAY[]::varchar[])::varchar[] AS ptg_source_array,
             COALESCE(group_plan_array, ARRAY[]::varchar[])::varchar[] AS group_plan_array,
-            NULLIF(TRIM(base_address_version), '')::varchar AS base_address_version,
-            NULLIF(TRIM(first_line), '')::varchar AS first_line,
-            NULLIF(TRIM(second_line), '')::varchar AS second_line,
-            NULLIF(TRIM(city_name), '')::varchar AS city_name,
-            NULLIF(TRIM(state_name), '')::varchar AS state_name,
-            NULLIF(TRIM(postal_code), '')::varchar AS postal_code,
-            COALESCE(NULLIF(TRIM(country_code), ''), 'US')::varchar AS country_code,
-            {_nullish_text_expr("telephone_number")}::varchar AS telephone_number,
-            {_nullish_text_expr("fax_number")}::varchar AS fax_number,
-            {_canonical_contact_number_expr("telephone_number", "country_code")}::varchar AS phone_number,
-            {_contact_extension_expr("telephone_number")}::varchar AS phone_extension,
-            {_canonical_contact_number_expr("fax_number", "country_code")}::varchar AS fax_number_digits,
-            {_contact_extension_expr("fax_number")}::varchar AS fax_extension,
+            {expression_by_field["base_address_version"]}::varchar AS base_address_version,
+            {expression_by_field["first_line"]}::varchar AS first_line,
+            {expression_by_field["second_line"]}::varchar AS second_line,
+            {expression_by_field["city_name"]}::varchar AS city_name,
+            {expression_by_field["state_name"]}::varchar AS state_name,
+            {expression_by_field["postal_code"]}::varchar AS postal_code,
+            {expression_by_field["country_code"]}::varchar AS country_code,
+            {expression_by_field["telephone_number"]}::varchar AS telephone_number,
+            {expression_by_field["fax_number"]}::varchar AS fax_number,
+            {expression_by_field["phone_number"]}::varchar AS phone_number,
+            {expression_by_field["phone_extension"]}::varchar AS phone_extension,
+            {expression_by_field["fax_number_digits"]}::varchar AS fax_number_digits,
+            {expression_by_field["fax_extension"]}::varchar AS fax_extension,
             lat::numeric AS lat,
             long::numeric AS long,
             date_added::date AS date_added,
-            NULLIF(TRIM(place_id), '')::varchar AS place_id,
+            {expression_by_field["place_id"]}::varchar AS place_id,
             {_source_priority_expr("address_source")}::int AS source_priority,
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
-            address_key::uuid AS address_key
+            address_key::uuid AS address_key{prepared_columns}
           FROM base_rows
     ),"""
 
 
-def _insert_raw_normalized_cte_sql() -> str:
+def _insert_raw_normalized_cte_sql(*, native_prepared: bool = False) -> str:
     """Build the normalized raw row and checksum CTE."""
 
-    checksum = _address_checksum_expr(
-        {
-            "first_line": _alnum_norm_expr("first_line"),
-            "second_line": _alnum_norm_expr("second_line"),
-            "city_name": _alnum_norm_expr("city_name"),
-            "state_name": _state_norm_expr("state_name"),
-            "postal_code": _zip5_norm_expr("postal_code"),
-            "country_code": _state_norm_expr("country_code"),
-            "telephone_number": _phone_norm_expr("telephone_number"),
-        }
-    )
+    checksum = _direct_materialize_checksum_sql(native_prepared=native_prepared)
     return f"""
     normalized AS (
         SELECT
@@ -6859,6 +6869,7 @@ def _insert_raw_from_source_sql(
     source_select: str,
     *,
     is_address_canon_available: bool = True,
+    native_prepared: bool = False,
 ) -> str:
     """Build SQL that normalizes one source query into the raw stage."""
 
@@ -6867,8 +6878,8 @@ def _insert_raw_from_source_sql(
         (
             _insert_raw_header_sql(db_schema, raw_table),
             _insert_raw_base_rows_cte_sql(source_select),
-            _insert_raw_sanitized_cte_sql(),
-            _insert_raw_normalized_cte_sql(),
+            _insert_raw_sanitized_cte_sql(native_prepared=native_prepared),
+            _insert_raw_normalized_cte_sql(native_prepared=native_prepared),
             _insert_raw_select_sql(),
         )
     )
@@ -7341,41 +7352,14 @@ def _materialize_from_raw_sql(
     return sql
 
 
-def _direct_materialize_location_key_sql() -> str:
-    """Build the direct-materialization location key expression."""
-
-    return _location_key_expr(
-        {
-            "entity_type": "entity_type",
-            "entity_id": "entity_id",
-            "npi": "npi",
-            "inferred_npi": "inferred_npi",
-            "address_role_id": _address_role_id_expr("type"),
-            "row_origin": "'base'",
-            "address_key": "address_key",
-            "source_id": _source_id_expr("address_source"),
-            "source_record_id": "source_record_id",
-            "zip5": _zip5_norm_expr("postal_code"),
-            "state_code": _state_norm_expr("state_name"),
-            "city_norm": _alnum_norm_expr("city_name"),
-        }
-    )
+def _direct_materialize_location_key_sql(*, native_prepared: bool = False) -> str:
+    """Build the shared SQL identity using prepared components when available."""
+    return row_preparation.direct_location_key_sql(importlib.import_module(__name__), native_prepared=native_prepared)
 
 
-def _direct_materialize_checksum_sql() -> str:
-    """Build the direct-materialization address checksum expression."""
-
-    return _address_checksum_expr(
-        {
-            "first_line": _alnum_norm_expr("first_line"),
-            "second_line": _alnum_norm_expr("second_line"),
-            "city_name": _alnum_norm_expr("city_name"),
-            "state_name": _state_norm_expr("state_name"),
-            "postal_code": _zip5_norm_expr("postal_code"),
-            "country_code": _state_norm_expr("country_code"),
-            "telephone_number": _phone_norm_expr("telephone_number"),
-        }
-    )
+def _direct_materialize_checksum_sql(*, native_prepared: bool = False) -> str:
+    """Build the shared SQL identity using prepared components when available."""
+    return row_preparation.address_checksum_sql(importlib.import_module(__name__), native_prepared=native_prepared)
 
 
 def _direct_materialize_header_sql(
@@ -7433,9 +7417,13 @@ def _direct_materialize_header_sql(
     ),"""
 
 
-def _direct_materialize_sanitized_cte_sql() -> str:
+def _direct_materialize_sanitized_cte_sql(*, native_prepared: bool = False) -> str:
     """Build direct source value sanitization."""
 
+    expression_by_field = row_preparation.sanitized_value_expressions(
+        importlib.import_module(__name__), native_prepared=native_prepared
+    )
+    prepared_columns = row_preparation.prepared_component_projection_sql() if native_prepared else ""
     return f"""
     sanitized AS (
         SELECT
@@ -7445,82 +7433,41 @@ def _direct_materialize_sanitized_cte_sql() -> str:
             inferred_npi,
             inference_confidence,
             inference_method,
-            NULLIF(TRIM(entity_name), '')::varchar AS entity_name,
-            NULLIF(TRIM(entity_subtype), '')::varchar AS entity_subtype,
-            COALESCE(NULLIF(TRIM(type), ''), 'primary')::varchar AS type,
+            {expression_by_field["entity_name"]}::varchar AS entity_name,
+            {expression_by_field["entity_subtype"]}::varchar AS entity_subtype,
+            {expression_by_field["type"]}::varchar AS type,
             COALESCE(taxonomy_array, ARRAY[0]::int[])::int[] AS taxonomy_array,
             COALESCE(plans_network_array, ARRAY[0]::int[])::int[] AS plans_network_array,
             COALESCE(procedures_array, ARRAY[0]::int[])::int[] AS procedures_array,
             COALESCE(medications_array, ARRAY[0]::int[])::int[] AS medications_array,
-            NULLIF(TRIM(first_line), '')::varchar AS first_line,
-            NULLIF(TRIM(second_line), '')::varchar AS second_line,
-            NULLIF(TRIM(city_name), '')::varchar AS city_name,
-            NULLIF(TRIM(state_name), '')::varchar AS state_name,
-            NULLIF(TRIM(postal_code), '')::varchar AS postal_code,
-            COALESCE(NULLIF(TRIM(country_code), ''), 'US')::varchar AS country_code,
-            {_nullish_text_expr("telephone_number")}::varchar AS telephone_number,
-            {_nullish_text_expr("fax_number")}::varchar AS fax_number,
-            {_canonical_contact_number_expr("telephone_number", "country_code")}::varchar AS phone_number,
-            {_contact_extension_expr("telephone_number")}::varchar AS phone_extension,
-            {_canonical_contact_number_expr("fax_number", "country_code")}::varchar AS fax_number_digits,
-            {_contact_extension_expr("fax_number")}::varchar AS fax_extension,
+            {expression_by_field["first_line"]}::varchar AS first_line,
+            {expression_by_field["second_line"]}::varchar AS second_line,
+            {expression_by_field["city_name"]}::varchar AS city_name,
+            {expression_by_field["state_name"]}::varchar AS state_name,
+            {expression_by_field["postal_code"]}::varchar AS postal_code,
+            {expression_by_field["country_code"]}::varchar AS country_code,
+            {expression_by_field["telephone_number"]}::varchar AS telephone_number,
+            {expression_by_field["fax_number"]}::varchar AS fax_number,
+            {expression_by_field["phone_number"]}::varchar AS phone_number,
+            {expression_by_field["phone_extension"]}::varchar AS phone_extension,
+            {expression_by_field["fax_number_digits"]}::varchar AS fax_number_digits,
+            {expression_by_field["fax_extension"]}::varchar AS fax_extension,
             lat::numeric AS lat,
             long::numeric AS long,
             date_added::date AS date_added,
-            NULLIF(TRIM(place_id), '')::varchar AS place_id,
+            {expression_by_field["place_id"]}::varchar AS place_id,
             {_source_priority_expr("address_source")}::int AS source_priority,
             address_source::varchar AS address_source,
             source_record_id::varchar AS source_record_id,
             updated_at::timestamp AS updated_at,
-            address_key::uuid AS address_key
+            address_key::uuid AS address_key{prepared_columns}
           FROM base_rows
     ),"""
 
 
-def _direct_materialize_normalized_cte_sql() -> str:
-    """Build direct normalized location and checksum fields."""
-
-    return f"""
-    normalized AS (
-        SELECT
-            entity_type,
-            entity_id,
-            npi,
-            inferred_npi,
-            inference_confidence,
-            inference_method,
-            entity_name,
-            entity_subtype,
-            type,
-            taxonomy_array,
-            plans_network_array,
-            procedures_array,
-            medications_array,
-            first_line,
-            second_line,
-            city_name,
-            state_name,
-            postal_code,
-            country_code,
-            telephone_number,
-            fax_number,
-            phone_number,
-            phone_extension,
-            fax_number_digits,
-            fax_extension,
-            lat,
-            long,
-            date_added,
-            place_id,
-            source_priority,
-            address_source,
-            source_record_id,
-            updated_at,
-            address_key,
-            {_direct_materialize_location_key_sql()} AS location_key,
-            {_direct_materialize_checksum_sql()} AS checksum
-          FROM sanitized
-    ),"""
+def _direct_materialize_normalized_cte_sql(*, native_prepared: bool = False) -> str:
+    """Build direct identity fields from the shared prepared components."""
+    return row_preparation.direct_normalized_cte_sql(importlib.import_module(__name__), native_prepared=native_prepared)
 
 
 def _direct_materialize_aggregated_cte_sql(
@@ -7634,6 +7581,7 @@ def _materialize_sql(
     source_selects: Iterable[str],
     *,
     is_address_canon_available: bool = True,
+    native_prepared: bool = False,
 ) -> str:
     """Build direct source-to-stage materialization SQL."""
 
@@ -7641,8 +7589,8 @@ def _materialize_sql(
     return "".join(
         (
             _direct_materialize_header_sql(db_schema, stage_table, selects_sql),
-            _direct_materialize_sanitized_cte_sql(),
-            _direct_materialize_normalized_cte_sql(),
+            _direct_materialize_sanitized_cte_sql(native_prepared=native_prepared),
+            _direct_materialize_normalized_cte_sql(native_prepared=native_prepared),
             _direct_materialize_aggregated_cte_sql(
                 _dedupe_key_expr(is_address_canon_available),
                 _source_record_ids_select_sql(),
@@ -12339,21 +12287,26 @@ async def process_entity_address_unified_data(ctx, task=None):
             async def _load_source(select_sql: str) -> None:
                 # Progress is held in source_progress_map to avoid nonlocal state.
                 async with sem:
-                    await _run_sql_phase(
-                        _insert_raw_from_source_sql(
+                    await _run_prepared_source_phase(
+                        db_schema,
+                        select_sql,
+                        lambda prepared_select, **options: _insert_raw_from_source_sql(
                             db_schema,
                             raw_table,
-                            select_sql,
+                            prepared_select,
                             is_address_canon_available=is_address_canon_available,
+                            **options,
                         ),
-                        context=context,
-                        run_id=run_id,
-                        phase="entity-address-unified loading sources",
-                        unit="sources",
-                        done=source_progress_map["loaded_sources"],
-                        total=len(source_selects),
-                        message="loading source shard",
-                        emit_start=True,
+                        dict(
+                            context=context,
+                            run_id=run_id,
+                            phase="entity-address-unified loading sources",
+                            unit="sources",
+                            done=source_progress_map["loaded_sources"],
+                            total=len(source_selects),
+                            message="loading source shard",
+                            emit_start=True,
+                        ),
                     )
                 if run_id:
                     async with source_progress_lock:
@@ -12657,22 +12610,28 @@ async def process_entity_address_unified_data(ctx, task=None):
                 message="materializing sources",
             )
         await preparation_admission.stage_status(f"TRUNCATE TABLE {db_schema}.{stage_table};")
-        await _run_sql_phase(
-            _materialize_sql(
+        await _run_prepared_source_phase(
+            db_schema,
+            "\nUNION ALL\n".join(select.strip() for select in source_selects),
+            lambda prepared_select, **options: _materialize_sql(
                 db_schema,
                 stage_table,
-                source_selects,
+                [prepared_select],
                 is_address_canon_available=is_address_canon_available,
+                **options,
             ),
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified materializing",
-            unit="sources",
-            done=0,
-            total=len(source_selects),
-            message="materializing sources",
-            emit_start=True,
-            emit_done=True,
+            dict(
+                context=context,
+                run_id=run_id,
+                phase="entity-address-unified materializing",
+                unit="sources",
+                done=0,
+                total=len(source_selects),
+                message="materializing sources",
+                emit_start=True,
+                emit_done=True,
+            ),
+            include_base_address_version=False,
         )
         await preparation_admission.stage_status(
             f"""

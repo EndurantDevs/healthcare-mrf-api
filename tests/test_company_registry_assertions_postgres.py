@@ -52,6 +52,7 @@ from tests.test_result_archive_published_authority_postgres import _is_guarded_t
 
 pytestmark = pytest.mark.asyncio
 _ACTOR = RegistryActor("platform_admin", UUID(int=100), "example-client")
+_AFFILIATION_MIGRATION = "20261025010000_company_affiliation_states.py"
 _MIGRATIONS = (
     "20261007010000_managed_network_registry.py",
     "20261007020000_registry_revision_history.py",
@@ -79,7 +80,8 @@ _MIGRATIONS = (
     "20261012010000_company_registry_name_origin.py",
     "20261013010000_registry_custom_history_events.py",
     "20261018011000_network_candidate_custody.py",
-    "20261025010000_company_affiliation_states.py",
+    _AFFILIATION_MIGRATION,
+    "20261028010000_registry_fhir_catalog.py",
 )
 
 
@@ -266,7 +268,11 @@ async def assertion_db(tmp_path, monkeypatch, request):
     url = _guarded_url()
     journal, document_by_field = _registration(tmp_path)
     resources_by_kind = {}
-    migrations = _MIGRATIONS[:-1] if getattr(request, "param", None) == "before-affiliation" else _MIGRATIONS
+    migrations = (
+        tuple(migration for migration in _MIGRATIONS if migration != _AFFILIATION_MIGRATION)
+        if getattr(request, "param", None) == "before-affiliation"
+        else _MIGRATIONS
+    )
     try:
         yield await _prepare_database(url, monkeypatch, journal, document_by_field, resources_by_kind, migrations)
     finally:
@@ -1523,7 +1529,7 @@ async def _run_affiliation_upgrade(fixture, monkeypatch, *, fail_after=None):
         try:
             with monkeypatch.context() as replacement:
                 replacement.setattr(op, "execute", execute_statement)
-                await _migrate(engine, replacement, fixture.schema, (_MIGRATIONS[-1],))
+                await _migrate(engine, replacement, fixture.schema, (_AFFILIATION_MIGRATION,))
         finally:
             async with engine.connect() as connection:
                 assert (await connection.execute(settings_query)).one() == settings_before

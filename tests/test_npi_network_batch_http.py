@@ -12,6 +12,7 @@ from sanic import Sanic
 from api import network_address_scope
 from api.endpoint import npi
 from process import network_serving_read
+from tests.network_read_execution_support import mock_approved_control_metadata, with_read_identity_receipts
 from tests.npi_location_hydration_support import unified_location_mapping
 
 
@@ -23,9 +24,9 @@ def native_network_batch(monkeypatch):
     manifest = network_serving_read.PinnedNetworkServingManifest(
         12, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "c" * 64, 1
     )
-    driver = object()
-    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
-    session = SimpleNamespace(execute=AsyncMock(), connection=AsyncMock(return_value=connection))
+    session = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()))
+    driver = session.connection.return_value.get_raw_connection.return_value.driver_connection
+    mock_approved_control_metadata(monkeypatch)
     resolve = AsyncMock(return_value=manifest)
     monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", resolve)
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-batch-token")
@@ -92,7 +93,7 @@ async def test_retained_batch_never_ranks_or_pages_a_live_outside_office(native_
     assert provider_by_field["address_pagination"]["total"] == 1
     context.overlay.assert_not_awaited()
     assert context.hydration.await_args.kwargs["session"] is context.session
-    context.resolve.assert_awaited_once_with(context.driver, generation_id=12)
+    context.resolve.assert_awaited_once_with(context.driver, generation_id=12, api_read=True)
     assert network_address_scope.current_network_address_scope() is None
 
 

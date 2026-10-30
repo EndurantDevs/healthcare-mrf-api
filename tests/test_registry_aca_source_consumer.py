@@ -105,7 +105,7 @@ async def test_seal_failure_or_cancel_prevents_source_fence_and_publish(monkeypa
         "_selection",
         AsyncMock(return_value=(1, SimpleNamespace(generation_id="approved"), pinned, (accepted_recipe,))),
     )
-    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", AsyncMock())
     seal = AsyncMock(side_effect=failure)
     connection = SimpleNamespace(
         transaction=transaction, fetchval=AsyncMock(return_value=None), execute=AsyncMock(return_value="UPDATE 1")
@@ -156,7 +156,7 @@ async def test_completed_source_proof_remains_held_until_final_publication_commi
         AsyncMock(return_value=(1, SimpleNamespace(generation_id="approved"), pinned, (accepted_recipe,))),
     )
     monkeypatch.setattr(RegistryPublicationPTGRuntime, "compose", AsyncMock(return_value=(copy_target, object())))
-    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", AsyncMock())
     monkeypatch.setattr(consumer, "_checkpoint", AsyncMock(return_value=({}, {})))
     monkeypatch.setattr(consumer, "_notice", AsyncMock(return_value=accepted_recipe))
     monkeypatch.setattr(consumer, "current_aca_source_fence", fence)
@@ -245,7 +245,7 @@ async def _publication_case(monkeypatch):
     monkeypatch.setattr(RegistryPublicationPTGRuntime, "compose", compose)
     monkeypatch.setattr(consumer, "_canonical_session", AsyncMock())
     monkeypatch.setattr(consumer, "_notice", AsyncMock(return_value=accepted_recipe))
-    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", AsyncMock())
     approved = SimpleNamespace(generation_id="b" * 64, approved_revision=1)
     pinned = SimpleNamespace(generation_id=3, manifest_sha256="a" * 64, schema_name="old_candidate")
     monkeypatch.setattr(consumer, "_selection", AsyncMock(return_value=(1, approved, pinned, (accepted_recipe,))))
@@ -765,7 +765,8 @@ async def test_batch_attempt_composes_complete_set_and_refuses_partial_final_eve
     compose = AsyncMock(return_value=(copy_target, object()))
     monkeypatch.setattr(RegistryPublicationPTGRuntime, "compose", compose)
     monkeypatch.setattr(consumer, "_selection", AsyncMock(return_value=(1, approved, None, recipes)))
-    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    prepare = AsyncMock()
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
     monkeypatch.setattr(consumer, "_checkpoint", AsyncMock(return_value=({}, {})))
     monkeypatch.setattr(consumer, "_notice", AsyncMock(return_value=recipes[:1] if changed_event else recipes))
     monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock(return_value=approved))
@@ -798,6 +799,7 @@ async def test_batch_attempt_composes_complete_set_and_refuses_partial_final_eve
         publish.assert_awaited_once()
         assert bindings.await_count == len(recipes)
     composed = compose.await_args.kwargs
+    prepare.assert_awaited_once_with(connection, copy_target, compose.return_value[1], settings)
     assert composed["expected_head"] == 0 and composed["source_manifest"] is None
     assert composed["address_sources"].initial_source_recipes == recipes
 

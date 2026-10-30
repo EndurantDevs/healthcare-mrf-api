@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager
 from types import SimpleNamespace
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -16,11 +16,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.endpoint import npi
 from api.network_address_scope import current_network_address_scope, network_address_read_scope
+from api.network_read_execution import NetworkReadConnectionProxy
 from api.provider_profile_snapshot import provider_optional_read
-from db.connection import ConnectionProxy
 from db.models import NPIData, NPIDataTaxonomy, NUCCTaxonomy
 from process.entity_address_cutover_contract import postgres_sqlstate
 from process.network_address_projection import PinnedAddressSource
+from process.network_approved_membership_source import pin_approved_membership_source
+from process.network_candidate_custody import _Q_REACH_SQL
 from process.network_membership_candidate_lifecycle import (
     admit_network_membership_batch,
     create_network_candidate,
@@ -155,11 +157,17 @@ async def _admit(fixture, office, expected_head):
     )
     fixture.additional_schemas.append(copy_target.schema_name)
     content = _membership_input(fixture, office)
-    async with fixture.connection.transaction():
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        approved = await pin_approved_membership_source(
+            fixture.connection, approved_revision=fixture.approved_revision, control_schema=fixture.control_schema
+        )
         await create_network_candidate(
             fixture.connection,
             copy_target,
-            source_generations={"unified_address": fixture.address_source.generation_id},
+            source_generations={
+                "unified_address": fixture.address_source.generation_id,
+                "custom_membership": approved.generation_id,
+            },
             approved_custom_revision=fixture.approved_revision,
             expected_head=expected_head,
             expected_rows=2,
@@ -201,9 +209,67 @@ async def _publish(fixture, copy_target):
 
 def _http_context(fixture, reader_engine):
     """Use the genuine handler and assert public office fields directly."""
+    reader_engine.update_execution_options(isolation_level="REPEATABLE READ", postgresql_readonly=True)
     app = _canonical_read_app(reader_engine, [])
     app.add_route(npi.get_near_npi, "/api/v1/npi/near/", methods=["GET"])
     return SimpleNamespace(app=app, fixture=fixture, reader_engine=reader_engine)
+
+
+async def _nearby_control_identity(connection, schema):
+    """Capture exact native owners and normalized grants for the fixture's fixed control cells."""
+    acl = (
+        "(SELECT jsonb_agg(jsonb_build_array(a.grantor,a.grantee,a.privilege_type,a.is_grantable) "
+        "ORDER BY a.grantor,a.grantee,a.privilege_type,a.is_grantable) "
+        "FROM aclexplode(coalesce({cell},acldefault('{kind}',{owner}))) a)"
+    )
+    namespace = await connection.fetchrow(
+        "SELECT oid,nspowner,quote_ident(pg_get_userbyid(nspowner)) AS owner,"
+        + acl.format(cell="nspacl", kind="n", owner="nspowner")
+        + " AS acl FROM pg_namespace WHERE nspname=$1",
+        schema,
+    )
+    tables = await connection.fetch(
+        "SELECT oid,relname,relowner,"
+        + acl.format(cell="relacl", kind="r", owner="relowner")
+        + " AS acl FROM pg_class WHERE relnamespace=$1 AND relname=ANY($2::text[]) ORDER BY relname",
+        namespace["oid"],
+        ["network_membership_candidate", "network_candidate_custody", "registry_approved_record"],
+    )
+    assert len(tables) == 3 and all(table["relowner"] == namespace["nspowner"] for table in tables)
+    return namespace, tables
+
+
+@asynccontextmanager
+async def _nearby_control_owner(fixture):
+    """Use a distinct closed metadata owner; restore every original owner/grant before cleanup."""
+    connection, schema = fixture.connection, fixture.control_schema
+    before = await _nearby_control_identity(connection, schema)
+    owner = "nearby_control_" + uuid4().hex
+    ledger = f'"{schema}".network_candidate_custody'
+    publisher = fixture.writer_roles["publisher"]
+    has_created_owner = False
+    try:
+        assert not await connection.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", owner)
+        await connection.execute(f'CREATE ROLE "{owner}" NOLOGIN')
+        has_created_owner = True
+        await connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO "{owner}"')
+        for table in before[1]:
+            await connection.execute(f'ALTER TABLE "{schema}"."{table["relname"]}" OWNER TO "{owner}"')
+        await connection.execute(f'REVOKE ALL ON {ledger} FROM "{publisher}"')
+        await connection.execute(f'GRANT SELECT ON {ledger} TO "{publisher}"')
+        owner_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", owner)
+        assert await connection.fetchval(_Q_REACH_SQL, sorted(fixture.writer_roles.values()), owner_oid) is True
+        yield
+    finally:
+        await connection.execute("RESET ROLE")
+        if has_created_owner:
+            for table in before[1]:
+                await connection.execute(f'ALTER TABLE "{schema}"."{table["relname"]}" OWNER TO {before[0]["owner"]}')
+            await connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO {before[0]["owner"]}')
+            await connection.execute(f'GRANT ALL ON {ledger} TO "{publisher}"')
+            assert await _nearby_control_identity(connection, schema) == before
+            await connection.execute(f'DROP ROLE "{owner}"')
+        assert not await connection.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", owner)
 
 
 @pytest.fixture
@@ -241,7 +307,7 @@ async def admitted_nearby_app(serving_schema, monkeypatch):
         fixture.approved_revision = approval["approved_revision"]
         assert fixture.approved_revision > network["custom_revision"] > 0
         fixture.copy_target = await _admit(fixture, "a", 0)
-        async with _candidate_writer_roles(fixture, freeze=False):
+        async with _candidate_writer_roles(fixture, freeze=False), _nearby_control_owner(fixture):
             for name in ("npi", "npi_taxonomy", "nucc_taxonomy"):
                 await connection.execute(f'GRANT SELECT ON "mrf"."{name}" TO "{fixture.writer_roles["reader"]}"')
             await connection.execute(f'GRANT USAGE ON SCHEMA "mrf" TO "{fixture.writer_roles["reader"]}"')
@@ -423,7 +489,7 @@ async def test_optional_read_error_preserves_native_membership_reader(admitted_n
 def _observe_provider_reads(monkeypatch, fixture):
     """Observe successful native reads and hold only the first completed count."""
     counted, release, observed, stages = asyncio.Event(), asyncio.Event(), {}, []
-    original_count, original_all = npi._provider_list_count, ConnectionProxy.all
+    original_count, original_all = npi._provider_list_count, NetworkReadConnectionProxy.all
 
     async def hold_completed_count(connection, statement, parameters, session, *, deadline=None):
         total = await original_count(connection, statement, parameters, session, deadline=deadline)
@@ -454,7 +520,7 @@ def _observe_provider_reads(monkeypatch, fixture):
         return rows
 
     monkeypatch.setattr(npi, "_provider_list_count", hold_completed_count)
-    monkeypatch.setattr(ConnectionProxy, "all", observe_native_rows)
+    monkeypatch.setattr(NetworkReadConnectionProxy, "all", observe_native_rows)
     return SimpleNamespace(counted=counted, release=release, result=observed, stages=stages)
 
 

@@ -786,7 +786,7 @@ async def test_additive_migration_preserves_existing_data_and_exact_model_column
 async def test_derived_history_insert_grant_keeps_38_tables_and_denies_mutation(permissions_db):
     fixture = permissions_db
     installed = await _install(fixture)
-    assert len(installed["table_oids"]) == 39
+    assert len(installed["table_oids"]) == 40
     table = f'"{fixture.schema}".registry_record_history'
     role = fixture.roles_by_kind["api"]
     assert await fixture.connection.fetchval("SELECT has_column_privilege($1,$2,'event_json','INSERT')", role, table)
@@ -982,7 +982,7 @@ async def test_installed_legacy_grants_migrate_and_reconcile_without_expanding_c
         await connection.execute(statement)
     assert not await connection.fetchval("SELECT has_column_privilege($1,$2,'event_json','INSERT')", api_role, table)
     reconciled = await _install(fixture)
-    assert reconciled["table_oids"] == installed["table_oids"] and len(reconciled["table_oids"]) == 39
+    assert reconciled["table_oids"] == installed["table_oids"] and len(reconciled["table_oids"]) == 40
     assert await connection.fetchval("SELECT has_column_privilege($1,$2,'event_json','INSERT')", api_role, table)
     assert not await connection.fetchval("SELECT has_column_privilege($1,$2,'event_json','UPDATE')", api_role, table)
 

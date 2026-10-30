@@ -793,6 +793,7 @@ def profile_evidence_select_sql(
     *,
     npi: int,
     resource_type_refs: dict[str, str] | None = None,
+    static_resource_rows: bool = False,
     **values_by_name: object,
 ) -> str:
     """Select one NPI's normalized evidence; bind the same NPI as ``profile_npi``.
@@ -835,7 +836,40 @@ def profile_evidence_select_sql(
         SERVICE_NPI_SCOPE_SQL=f"\n               AND service.npi = {bound_npi}",
         FACT_NPI_SCOPE_SQL=f"\n               AND npi = {bound_npi}",
     )
-    return _render_sql_template("provider_directory_profile_evidence.sql", bindings)
+    return _render_profile_evidence(bindings, static_resource_rows=static_resource_rows)
+
+
+def _render_profile_evidence(bindings_by_token, *, static_resource_rows=False):
+    """Keep producer row types unchanged; API payload rows use built-in declarations."""
+    if type(static_resource_rows) is not bool:
+        raise ValueError("invalid profile resource row mode")
+    bindings_by_token = dict(bindings_by_token)
+    for resource in ("practitioner", "role", "organization", "affiliation", "service", "endpoint"):
+        prefix = resource.upper()
+        reference = bindings_by_token.pop(prefix + "_TYPE_REF")
+        if static_resource_rows:
+            from process.provider_directory_profile_records import profile_resource_record_columns
+
+            columns = profile_resource_record_columns(resource)
+            projection = "projected_resource.*"
+            join = (
+                "CROSS JOIN LATERAL jsonb_to_record(resource.payload_json::jsonb "
+                "|| jsonb_build_object('source_id', dataset_source_context.source_id)) "
+                f"AS projected_resource({columns})\n             "
+            )
+        else:
+            projection = (
+                "(\n                       jsonb_populate_record(\n"
+                f"                           NULL::{reference},\n"
+                "                           resource.payload_json::jsonb\n"
+                "                           || jsonb_build_object(\n"
+                "                               'source_id', dataset_source_context.source_id\n"
+                "                           )\n                       )\n                   ).*"
+            )
+            join = ""
+        bindings_by_token[prefix + "_RECORD_PROJECTION_SQL"] = projection
+        bindings_by_token[prefix + "_RECORD_JOIN_SQL"] = join
+    return _render_sql_template("provider_directory_profile_evidence.sql", bindings_by_token)
 
 
 def _assert_profile_read_npi(npi: int) -> None:
@@ -857,17 +891,14 @@ def profile_evidence_npi_inventory_sql(
             raise ValueError("invalid profile resource row type")
         bindings[token] = reference
     bindings.update(WRITE_PREFIX_SQL="", RESULT_SQL="SELECT DISTINCT npi FROM normalized_facts", CONFLICT_SQL="")
-    return _render_sql_template("provider_directory_profile_evidence.sql", bindings)
+    return _render_profile_evidence(bindings)
 
 
 def profile_evidence_insert_sql(**values_by_name: object) -> str:
     """Build immutable source evidence from scoped typed FHIR resources."""
     request = _ProfileEvidenceSqlRequest(**values_by_name)
     _validate_profile_evidence_request(request)
-    return _render_sql_template(
-        "provider_directory_profile_evidence.sql",
-        _profile_evidence_template_bindings(request),
-    )
+    return _render_profile_evidence(_profile_evidence_template_bindings(request))
 
 
 def _profile_evidence_public_signature() -> Signature:

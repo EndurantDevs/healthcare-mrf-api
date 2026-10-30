@@ -15,11 +15,12 @@ import pytest_asyncio
 from process import registry_imported_selection_preview as imported_preview
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.registry_approval_preview import preview_registry_approval
-from process.registry_approval_store import RegistryApprovalConflict
+from process.registry_approval_store import RegistryApprovalConflict, _stage_selection
 from process.registry_candidate_composition import compose_registry_membership_candidate
 from process.registry_imported_selection_preview import RegistryImportedSelectionUnavailable
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests import cms_registry_recipe_postgres_support as cms_recipes
+from tests import test_network_approved_source_bindings_postgres as binding_tests
 from tests import test_network_initial_source_office_bindings_postgres as office_tests
 from tests import test_registry_source_recipe_composition_postgres as recipe_tests
 from tests.test_network_custom_address_source_postgres import custom_db
@@ -84,6 +85,42 @@ async def _assert_staging_removed(connection):
         )
         == 0
     )
+
+
+@pytest.mark.parametrize("select_history", [False, True], ids=["previous", "history"])
+async def test_prospective_binding_validation_excludes_inherited_controls(serving_schema, select_history):
+    connection, schema, _engine = serving_schema
+    _actor, _network, bindings, approved_source = await binding_tests._setup(serving_schema)
+    namespace = f'"{schema}"'
+    selected_records = (
+        [{"record_kind": "network_binding", "record_id": bindings[0]["binding_id"], "revision": 1}]
+        if select_history
+        else []
+    )
+    async with connection.transaction():
+        staging = await _stage_selection(connection, json.dumps(selected_records))
+        for table in ("registry_approved_record", "registry_record_history"):
+            parent, child = f"{namespace}.{table}", f"{namespace}.preview_{table}"
+            await connection.execute(f"CREATE TABLE {child} (LIKE {parent} INCLUDING CONSTRAINTS)")
+            await connection.execute(
+                f"INSERT INTO {child} SELECT * FROM ONLY {parent} WHERE record_kind='network_binding'"
+            )
+            await connection.execute(f"ALTER TABLE {child} INHERIT {parent}")
+            assert await connection.fetchval(f"SELECT count(*) FROM {parent} WHERE record_kind='network_binding'") == 2
+        sql = imported_preview._binding_validation_sql(namespace, staging)
+        for source_id, expected_count in ((binding_tests.COORDINATES.source_id, 1), ("unrelated-source", 0)):
+            parameters = (
+                approved_source.approved_revision,
+                *replace(binding_tests.COORDINATES, source_id=source_id).sql_parameters,
+                imported_preview._TRIM_CHARACTERS,
+            )
+            assert dict(await connection.fetchrow(sql, *parameters)) == {
+                "binding_count": expected_count,
+                "published_count": 0,
+                "published_json": None,
+                "invalid": False,
+            }
+    await _assert_staging_removed(connection)
 
 
 async def test_preview_selects_only_requested_pending_records(serving_schema):

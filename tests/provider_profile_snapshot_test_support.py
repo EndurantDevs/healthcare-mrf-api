@@ -18,3 +18,4 @@ def stub_provider_profile_snapshot(monkeypatch):
         yield None
 
     monkeypatch.setattr(npi, "provider_profile_read_snapshot", snapshot)
+    monkeypatch.setattr(npi, "provider_geo_read_snapshot", snapshot)

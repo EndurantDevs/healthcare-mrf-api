@@ -50,6 +50,23 @@ def _control_catalog():
     )
 
 
+def _operator_identity():
+    """Return the fixed non-elevated synthetic operator identity."""
+    return dict(
+        session="operator",
+        current="operator",
+        backend=20,
+        xid="21",
+        role_oid=22,
+        rolcanlogin=True,
+        rolsuper=False,
+        rolcreatedb=False,
+        rolcreaterole=False,
+        rolreplication=False,
+        rolbypassrls=False,
+    )
+
+
 class Connection:
     def __init__(self):
         """Create mutable synthetic custody state with closed native defaults."""
@@ -57,19 +74,7 @@ class Connection:
         self.calls = []
         self.isolation = "repeatable read"
         self.control = _control_catalog()
-        self.actor = dict(
-            session="operator",
-            current="operator",
-            backend=20,
-            xid="21",
-            role_oid=22,
-            rolcanlogin=True,
-            rolsuper=False,
-            rolcreatedb=False,
-            rolcreaterole=False,
-            rolreplication=False,
-            rolbypassrls=False,
-        )
+        self.actor = _operator_identity()
         self.candidate = {key: getattr(TARGET, key) for key in custody._STABLE[:5]}
         self.candidate.update(
             schema_revision=1,
@@ -88,6 +93,11 @@ class Connection:
             state="ready",
         )
         self.catalog = _candidate_catalog()
+        self.candidate["validation_json"]["writer_closure"] = custody._receipt(
+            TARGET,
+            {"owner_role": "loading_owner", "loader_roles": [], "reader_roles": ["execution", "reader"]},
+            self.catalog,
+        )
         self.seal = None
         self.exists = True
         self.can_set = True
@@ -252,6 +262,34 @@ async def seal(connection, authorize=is_authorized, **options):
         authorize=authorize,
         **options,
     )
+
+
+@pytest.mark.parametrize("field", ["schema_oid", "relation_oids", "index_oids", "index_table_oids"])
+async def test_initial_seal_refuses_prepared_identity_drift_before_independent_source_proof(boundary, field):
+    from process.network_membership_writer_closure import NetworkWriterClosureError
+
+    retained = boundary.candidate["validation_json"]["writer_closure"]
+    if field == "schema_oid":
+        retained[field] += 1
+    elif field == "relation_oids":
+        retained[field]["network_membership"] += 1
+    else:
+        retained[field]["unexpected_index"] = 40
+    with pytest.raises(NetworkWriterClosureError, match="changed"):
+        await seal(boundary)
+    assert boundary.proofs == 0 and boundary.seal is None
+
+
+async def test_ordinary_seal_refuses_ptg_even_without_contribution_metadata(boundary):
+    from process.registry_source_recipe_store import canonical_registry_source_recipes, registry_source_recipes_sha256
+    from tests.test_registry_publication_worker import _configured_recipe
+
+    recipes = canonical_registry_source_recipes((_configured_recipe("ptg"),))
+    boundary.candidate["source_recipes_json"] = recipes
+    boundary.candidate["source_generations"]["registry_source_recipes"] = registry_source_recipes_sha256(recipes)
+    with pytest.raises(custody.NetworkCandidateCustodyError):
+        await seal(boundary)
+    assert boundary.seal is None and boundary.proofs == 0
 
 
 async def test_q_census_uses_control_owner_without_changing_candidate_census(boundary):
@@ -523,6 +561,20 @@ async def test_lost_seal_commit_is_recovered_by_exact_replay(boundary):
     assert result["seal_sha256"] == boundary.seal["seal_sha256"] and boundary.proofs == 1
 
 
+def _mock_final_source_proofs(monkeypatch, calls):
+    from process import network_source_contribution_custody as source_custody
+    from process import registry_source_office_custody as office_custody
+
+    async def contributions(*_arguments, **_options):
+        calls.append("source")
+
+    async def offices(*_arguments, **_options):
+        calls.append("offices")
+
+    monkeypatch.setattr(source_custody, "verify_independent_source_contributions", contributions)
+    monkeypatch.setattr(office_custody, "verify_independent_initial_source_offices", offices)
+
+
 @pytest.mark.parametrize("failure", ["relationships", "retention", "provider", "index"])
 async def test_final_custodian_uses_full_existing_verification_and_propagates_failure(boundary, monkeypatch, failure):
     boundary.candidate["validation_json"]["address_source"] = {
@@ -536,6 +588,7 @@ async def test_final_custodian_uses_full_existing_verification_and_propagates_fa
         lambda candidate: (None, None, {"index_definition_sha256": "b" * 64}, {}),
     )
     calls = []
+    _mock_final_source_proofs(monkeypatch, calls)
 
     async def matching(*args):
         calls.append("relationships")
@@ -565,6 +618,7 @@ async def test_final_custodian_uses_full_existing_verification_and_propagates_fa
         await FINAL_PROOF(boundary, TARGET, boundary.candidate, "control")
     assert calls[0] == "retention"
     if failure != "retention":
+        assert calls[1:3] == ["source", "offices"]
         assert "relationships" in calls
 
 

@@ -125,7 +125,8 @@ def _configuration(configured):
     return configuration_by_field, reader, approver, authority, publisher
 
 
-def _database_url(dsn):
+def parse_registry_database_url(dsn):
+    """Validate a PostgreSQL connection URL and normalize it to the supported async driver."""
     if any(character.isspace() or not character.isprintable() for character in dsn):
         raise _invalid()
     url = make_url(dsn)
@@ -142,6 +143,9 @@ def _database_url(dsn):
         raise _invalid()
     _identifier(url.username)
     return url.set(drivername="postgresql+asyncpg")
+
+
+_database_url = parse_registry_database_url
 
 
 def _publisher_url(configured, reader):

@@ -20,6 +20,7 @@ from process import cms_doctors_immutable as immutable
 from process import cms_doctors_preparation as preparation
 from process import reference_family_result_generation as generation
 from process import reference_source_generation as revisions
+from tests.network_read_execution_support import with_read_identity_receipts
 from tests.test_cms_doctors_organizations import _unit_source_transaction
 from tests.test_provider_profile_cms import CMS_GENERATION, NPI, _credential_row, _education_row
 
@@ -52,6 +53,22 @@ def _mock_doctors_owner(monkeypatch):
     monkeypatch.setattr(immutable, "require_doctors_storage", AsyncMock(return_value=tuple(zip(RELATIONS, OIDS))))
 
 
+def _reader_and_writer_session(state_by_field):
+    """Keep native receipt identity stable while semantic authority changes after publication."""
+    session = SimpleNamespace(info={}, execute=AsyncMock(), scalar=AsyncMock(return_value=True))
+    session.in_transaction = lambda: bool(state_by_field.get("reader") or state_by_field.get("binding"))
+    with_read_identity_receipts(session)
+
+    async def execute(statement, _parameters=None):
+        if "SELECT EXISTS" in str(statement) and generation.TABLE_NAME in str(statement):
+            assert state_by_field.get("reader") is True
+            return SimpleNamespace(scalar=lambda: session.scalar.return_value)
+        return session.execute.return_value
+
+    session.execute.side_effect = execute
+    return session
+
+
 @pytest.fixture
 def runtime(monkeypatch):
     """Keep Reader refusal proof and publication state under distinct mocked owners."""
@@ -67,7 +84,7 @@ def runtime(monkeypatch):
             "relation_oids": list(OIDS),
         },
     }
-    session = SimpleNamespace(info={}, execute=AsyncMock(), scalar=AsyncMock(return_value=True))
+    session = _reader_and_writer_session(state_by_field)
     database = SimpleNamespace(status=AsyncMock(), scalar=AsyncMock(return_value="installed"))
     database._transaction_binding = lambda: state_by_field.get("binding")
     database.has_reader_session = lambda: state_by_field.get("reader", False)
@@ -107,7 +124,7 @@ def runtime(monkeypatch):
     oid_by_relation.update(
         {f"mrf.{generation.TABLE_NAME}": 22000, f"mrf.{snapshot.address_generation.TABLE_NAME}": None}
     )
-    monkeypatch.setattr(snapshot, "_lock_serving_relations", AsyncMock(return_value=oid_by_relation))
+    monkeypatch.setattr(snapshot, "_inventory_serving_relations", AsyncMock(return_value=oid_by_relation))
     monkeypatch.setattr(snapshot, "_requires_cms_receipt", AsyncMock(return_value=False))
     monkeypatch.setattr(generation, "_first", first)
     monkeypatch.setattr(generation, "current_reference_family_relation_oids", AsyncMock(return_value=OIDS))

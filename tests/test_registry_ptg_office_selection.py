@@ -2,6 +2,7 @@
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -170,10 +171,13 @@ async def test_current_selected_pair_passes_and_approved_drift_refuses(monkeypat
 @pytest.mark.parametrize("retained", [False, True])
 async def test_actual_composer_checks_only_new_recipe_adoption(monkeypatch, retained):
     from process import registry_candidate_composition as composition
+    from process import registry_publication_queue as queue
 
     _, _, recipe = _pair()
     manifest = SimpleNamespace(source_generations={"registry_source_recipes": "a" * 64}) if retained else None
     monkeypatch.setattr(composition, "_retained_source", AsyncMock(return_value=({}, 0)))
+    monkeypatch.setattr(composition, "_prepare_preservation", AsyncMock(return_value=None))
+    monkeypatch.setattr(queue, "require_registry_source_rollback_composition", AsyncMock(return_value=None))
     monkeypatch.setattr(
         composition, "resolve_retained_registry_source_recipes", AsyncMock(return_value=(recipe,) if retained else ())
     )
@@ -436,7 +440,7 @@ async def test_default_composer_consumes_shared_selection_without_startup_recipe
     assert count == 1 and recipes == (recipe,) and actual_stage is stage
     assert generations == {"registry_source_membership": "a" * 64}
     assert staged.await_args.args[1:3] == ((recipe,), approved)
-    assert staged.await_args.kwargs["office_authority"] is authority
+    assert staged.await_args.kwargs["read_context"].office_authority is authority
     selected.assert_awaited_once()
 
 
@@ -471,6 +475,7 @@ async def test_composer_refuses_startup_conflict_before_staging(monkeypatch):
 @pytest.mark.asyncio
 async def test_historical_source_rollback_retains_requested_recipes_instead_of_latest_binding(monkeypatch):
     from process import registry_candidate_composition as composition
+    from process import registry_publication_queue as queue
     from process.network_approved_membership_source import ApprovedMembershipSource
     from process.registry_membership_composition_stage import RegistryMembershipCommandStage
     from process.registry_source_recipe_composition import RegistrySourceRecipeStage
@@ -487,6 +492,9 @@ async def test_historical_source_rollback_retains_requested_recipes_instead_of_l
         fetchrow=AsyncMock(return_value=dict(source_rows=2, suppressed_source_rows=1, add_rows=1, remove_rows=1)),
     )
     monkeypatch.setattr(composition, "_retained_source", AsyncMock(return_value=({}, 2)))
+    monkeypatch.setattr(composition, "_prepare_preservation", AsyncMock(return_value=None))
+    rollback = AsyncMock(return_value={"operation": "prepare_source_rollback"})
+    monkeypatch.setattr(queue, "require_registry_source_rollback_composition", rollback)
     monkeypatch.setattr(composition, "resolve_retained_registry_source_recipes", AsyncMock(return_value=(recipe,)))
     resolver = AsyncMock(side_effect=AssertionError("historical source must not be replaced"))
     monkeypatch.setattr(selection, "resolve_ptg_office_recipe_selection", resolver)
@@ -505,6 +513,7 @@ async def test_historical_source_rollback_retains_requested_recipes_instead_of_l
         expected_head=2,
     )
     assert count == 2 and recipes == (recipe,) and staged.await_args.args[1] == (recipe,)
+    rollback.assert_awaited_once_with(driver, request, manifest, 9, 2, control_schema="control")
     resolver.assert_not_called()
     commands, retention = await composition._composition_retention(
         driver, current_approved, request, source_stage, "control"
@@ -522,3 +531,38 @@ async def test_historical_source_rollback_retains_requested_recipes_instead_of_l
     assert (
         retained_stage.table_name in sql and current_commands.add_table in sql and current_commands.remove_table in sql
     )
+
+
+def test_source_stage_keeps_mapping_and_carry_accounting_distinct():
+    from process import registry_candidate_composition as composition
+    from process.registry_source_recipe_composition import OFFICE_MAPPING_KEY, _source_stage_result
+
+    matches = object()
+    stage = replace(
+        _source_stage_result(
+            "source_page",
+            "a" * 64,
+            SimpleNamespace(generation_id="b" * 64),
+            ["c" * 64],
+            {
+                "membership_rows": 2,
+                "omitted_rows": 1,
+                "raw_source_rows": 3,
+                "accepted_raw_source_rows": 2,
+                "omitted_raw_source_rows": 1,
+                "provider_only_rows": 0,
+            },
+            (),
+            (None, 2, 0),
+        ),
+        office_matches=matches,
+        raw_source_generations=("d" * 64,),
+    )
+    assert stage.office_matches is matches and stage.raw_source_generations == ("d" * 64,)
+    assert stage.selected_stage is None and stage.preservation is None
+    generations_by_source = {OFFICE_MAPPING_KEY: "stale"}
+    composition._bind_composition_stage(generations_by_source, stage, introduced=False, changed=False, inventory=False)
+    assert generations_by_source == {
+        "registry_source_membership": stage.generation_sha256,
+        "initial_source_recipe_0": "d" * 64,
+    }

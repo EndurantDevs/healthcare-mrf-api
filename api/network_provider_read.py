@@ -12,6 +12,8 @@ import asyncpg
 
 from api.network_address_scope import NetworkAddressReadScope
 from process.network_address_projection import _identifier
+from process.network_compact_layout import CompactAddressRelation
+from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.network_serving_read import (
     NetworkServingReadUnavailable,
     PinnedNetworkServingManifest,
@@ -45,40 +47,39 @@ class NetworkProviderNotFound(LookupError):
 
 _PROVIDERS_SQL = """WITH selected_addresses AS NOT MATERIALIZED (
   SELECT location_key,entity_type,entity_id,entity_name,npi,first_line,second_line,city_name,state_name,
-    postal_code,country_code,lat,long FROM {namespace}.entity_address_unified
+    postal_code,country_code,lat,long FROM {addresses}
   WHERE canonical_network_ids && $1::text::integer[]
 ), selected_memberships AS MATERIALIZED (
-  SELECT DISTINCT provider_system,provider_id,location_id FROM {namespace}.network_membership
+  SELECT DISTINCT provider_system,provider_id,location_id FROM ONLY {namespace}.network_membership
   WHERE network_id=ANY($1::text::integer[])
     AND ($2::text IS NULL OR (provider_system,provider_id)=($2,$3))
 ), selected AS MATERIALIZED (
   SELECT member.*,binding.location_key,address.location_key AS matched_key,address.entity_name,address.npi,
     address.first_line,address.second_line,address.city_name,address.state_name,address.postal_code,
     address.country_code,address.lat,address.long
-  FROM selected_memberships member LEFT JOIN {namespace}.provider_location_binding binding
+  FROM selected_memberships member LEFT JOIN ONLY {namespace}.provider_location_binding binding
     ON (binding.provider_system,binding.provider_id,binding.location_id)
       =(member.provider_system,member.provider_id,member.location_id)
   LEFT JOIN selected_addresses address ON (address.location_key,address.entity_type,address.entity_id)
     =(binding.location_key,binding.entity_type,binding.entity_id)
 ), selected_bindings AS MATERIALIZED (
-  SELECT binding.* FROM selected_addresses address JOIN {namespace}.provider_location_binding binding
+  SELECT binding.* FROM selected_addresses address JOIN ONLY {namespace}.provider_location_binding binding
     ON address.location_key=binding.location_key
   WHERE $2::text IS NULL OR (binding.provider_system,binding.provider_id)=($2,$3)
     OR EXISTS(SELECT 1 FROM selected WHERE selected.location_key=address.location_key)
 ), integrity AS (
   SELECT count(*)=count(DISTINCT (provider_system,provider_id,location_id))
-    AND count(*)=count(DISTINCT location_key)
     AND coalesce(bool_and(matched_key IS NOT NULL AND provider_system IN ('npi','manual','provider_directory')
       AND location_id<>'00000000-0000-0000-0000-000000000000'::uuid
       AND location_key ~ '^[0-9a-f]{{64}}$'),true)
-    AND (SELECT count(*)=count(DISTINCT location_key) FROM selected_bindings)
-    AND NOT EXISTS(SELECT provider_system,provider_id,location_id FROM selected_bindings
-      EXCEPT SELECT provider_system,provider_id,location_id FROM selected_memberships
-      WHERE provider_system IS NOT NULL AND provider_id IS NOT NULL AND location_id IS NOT NULL)
+    AND (SELECT count(*)=count(DISTINCT (provider_system,provider_id,location_id)) FROM selected_bindings)
+    AND NOT EXISTS(SELECT FROM selected_bindings GROUP BY location_key
+      HAVING count(DISTINCT (provider_system,provider_id,entity_type,entity_id))>1
+        OR (bool_or(provider_system='manual') AND count(*)>1))
     AND ($2::text IS NOT NULL OR NOT EXISTS(
       SELECT location_key,entity_type,entity_id FROM selected_addresses
-      EXCEPT SELECT location_key,entity_type,entity_id FROM selected_bindings
-      WHERE location_key IS NOT NULL AND entity_type IS NOT NULL AND entity_id IS NOT NULL)) AS valid
+      EXCEPT SELECT location_key,provider_system,provider_id FROM selected
+      WHERE matched_key IS NOT NULL)) AS valid
   FROM selected
 ), eligible AS MATERIALIZED (
   SELECT * FROM selected
@@ -88,10 +89,13 @@ _PROVIDERS_SQL = """WITH selected_addresses AS NOT MATERIALIZED (
         ST_DWithin(Geography(ST_MakePoint(long::double precision,lat::double precision)),
           Geography(ST_MakePoint($11::double precision,$10::double precision)),$12::double precision*1609.34)
       ELSE false END)
+), offices AS MATERIALIZED (
+  SELECT DISTINCT ON(provider_system,provider_id,location_key) * FROM eligible
+  ORDER BY provider_system,provider_id,location_key,location_id
 ), identities AS MATERIALIZED (
   SELECT provider_system,provider_id,min(entity_name) AS display_name,min(npi) AS npi,
     count(*) AS location_count,count(DISTINCT entity_name)<=1 AND count(DISTINCT npi)<=1 AS consistent
-  FROM eligible GROUP BY provider_system,provider_id
+  FROM offices GROUP BY provider_system,provider_id
 ), page AS MATERIALIZED (
   SELECT * FROM identities ORDER BY provider_system COLLATE "C",provider_id COLLATE "C" LIMIT $4 OFFSET $5
 ), locations AS MATERIALIZED (
@@ -99,7 +103,7 @@ _PROVIDERS_SQL = """WITH selected_addresses AS NOT MATERIALIZED (
     jsonb_build_object('location_id',selected.location_id::text,'location_key',selected.location_key,
       'first_line',first_line,'second_line',second_line,'city_name',city_name,'state_name',state_name,
       'postal_code',postal_code,'country_code',country_code,'lat',lat,'long',long) AS document
-  FROM eligible selected JOIN page USING(provider_system,provider_id) WHERE page.consistent AND page.location_count<=$6
+  FROM offices selected JOIN page USING(provider_system,provider_id) WHERE page.consistent AND page.location_count<=$6
 ), bounds AS (
   SELECT coalesce(bool_and(consistent AND location_count<=$6),true) AS valid,
     coalesce(sum(octet_length(provider_id)+octet_length(coalesce(display_name,''))+256),0)
@@ -255,12 +259,15 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
         ):
             raise NetworkProviderReadError("Canonical providers require a caller-owned repeatable transaction")
         current = await resolve_network_serving_manifest(
-            connection, generation_id=scope.manifest.generation_id, control_schema=control_schema
+            connection, generation_id=scope.manifest.generation_id, control_schema=control_schema, api_read=True
         )
         if current != scope.manifest:
             raise NetworkProviderReadUnavailable("Canonical provider generation differs from the pinned scope")
+        addresses, address_arguments = _provider_addresses(current, scope.network_ids)
+        relations = _provider_read_relations(current)
+        backend_pid = connection.get_server_pid()
         receipt = await connection.fetchrow(
-            _PROVIDERS_SQL.format(namespace=_identifier(current.schema_name)),
+            _PROVIDERS_SQL.format(namespace=_identifier(current.schema_name), addresses=addresses),
             "{" + ",".join(str(network_id) for network_id in scope.network_ids) + "}",
             *selector,
             limit,
@@ -269,12 +276,54 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
             MAX_RESPONSE_BYTES,
             current.generation_id,
             *office_filters,
+            *address_arguments,
         )
+        await verify_consumed_network_relations(connection, relations, expected_backend_pid=backend_pid)
         return _result(receipt)
     except NetworkProviderReadError:
         raise
-    except NetworkServingReadUnavailable, asyncpg.PostgresError, ValueError, TypeError, KeyError:
+    except (
+        NetworkServingReadUnavailable,
+        NetworkReadIdentityError,
+        asyncpg.PostgresError,
+        ValueError,
+        TypeError,
+        KeyError,
+    ):
         raise NetworkProviderReadUnavailable("Canonical providers are unavailable") from None
+
+
+def _candidate_relations(manifest, names):
+    """Select exact candidate pins from the resolver's authenticated native closure."""
+    pins = manifest.candidate_relation_pins
+    if type(pins) is not tuple or any(type(pin) is not CompactAddressRelation for pin in pins):
+        raise NetworkProviderReadUnavailable("Pinned provider physical relations are unavailable")
+    selected_pins = []
+    for name in names:
+        matches = [pin for pin in pins if pin.schema_name == manifest.schema_name and pin.table_name == name]
+        if len(matches) != 1:
+            raise NetworkProviderReadUnavailable("Pinned provider physical relations are unavailable")
+        selected_pins.append(matches[0])
+    return tuple(selected_pins)
+
+
+def _provider_read_relations(manifest):
+    relations = _candidate_relations(manifest, ("network_membership", "provider_location_binding"))
+    if manifest.compact_layout is None:
+        return relations + (
+            CompactAddressRelation(manifest.schema_name, "entity_address_unified", manifest.address_table_oid),
+        )
+    from api.network_compact_address import compact_address_read_relations
+
+    return relations + compact_address_read_relations(manifest.compact_layout)
+
+
+def _provider_addresses(manifest, network_ids):
+    if manifest.compact_layout is None:
+        return "ONLY " + _identifier(manifest.schema_name) + ".entity_address_unified", ()
+    from api.network_compact_address import compact_address_native_sql
+
+    return compact_address_native_sql(manifest.compact_layout, first_parameter=13, network_ids=network_ids)
 
 
 async def read_network_provider_page(
@@ -286,7 +335,7 @@ async def read_network_provider_page(
     control_schema=None,
     office_filters=None,
 ) -> dict:
-    """Count and page exact provider identities with three reads and no live-head fallback.
+    """Count and page exact provider identities with bounded bulk reads and no live-head fallback.
 
     The caller owns a repeatable-read or serializable transaction. Every returned
     office belongs to the selected network in the exact eligible closed manifest.

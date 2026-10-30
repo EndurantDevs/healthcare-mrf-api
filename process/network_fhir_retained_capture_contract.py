@@ -24,6 +24,9 @@ REFUSAL = "provider_directory_admission_shard_validation_invalid:provider direct
 _SITE_DOMAIN = uuid5(NAMESPACE_URL, "urn:managed-network-registry:retained-fhir-location:v1")
 
 
+GENERIC_UNVERIFIED_NETWORK = "generic_unverified_unapproved_network"
+
+
 class RetainedFHIRCaptureError(ValueError):
     """A retained normalized capture or its native custody is unavailable."""
 

@@ -232,16 +232,13 @@ def _profile_statement_parts(npi, type_refs_by_resource, published_at):
     evidence_sql = profile.profile_evidence_select_sql(
         npi=npi,
         resource_type_refs=type_refs_by_resource,
+        static_resource_rows=True,
         source_ref="scoped_source",
         dataset_resource_ref="scoped_resources",
         affiliation_organization_ref="scoped_affiliation_edges",
         **relation_refs_by_name,
     )
-    typed_ctes = ",\n".join(
-        f"scoped_{name} AS MATERIALIZED (SELECT (jsonb_populate_record(NULL::{type_refs_by_resource[name]}, payload_json)).* "
-        f"FROM scoped_resources WHERE resource_type='{resource_type}')"
-        for resource_type, name in _RESOURCE_TYPES.items()
-    )
+    typed_ctes = _static_resource_ctes()
     provider_id = profile.fhir_reference_resource_id_sql(
         "payload_json->>'participating_organization_ref'", "Organization"
     )
@@ -279,6 +276,18 @@ def _profile_statement_parts(npi, type_refs_by_resource, published_at):
         aggregate_sql=aggregate_sql,
         output=output,
         evidence_sql=evidence_sql,
+    )
+
+
+def _static_resource_ctes():
+    """Decode verified payloads without depending on mutable table composite types."""
+    from process.provider_directory_profile_records import profile_resource_record_columns
+
+    return ",\n".join(
+        f"scoped_{name} AS MATERIALIZED (SELECT projected_resource.* FROM scoped_resources "
+        f"CROSS JOIN LATERAL jsonb_to_record(payload_json) AS projected_resource({profile_resource_record_columns(name)}) "
+        f"WHERE resource_type='{resource_type}')"
+        for resource_type, name in _RESOURCE_TYPES.items()
     )
 
 

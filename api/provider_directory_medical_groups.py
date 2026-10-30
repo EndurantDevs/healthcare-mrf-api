@@ -4,11 +4,14 @@
 import os
 import re
 import unicodedata
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import UUID
 
+from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read, network_read_name_inventory
 from api.provider_directory_entities_contract import (
     DirectoryReadError,
     directory_cursor_key,
@@ -16,12 +19,15 @@ from api.provider_directory_entities_contract import (
     opaque_directory_key,
     read_directory_cursor,
 )
+from process.network_compact_layout import CompactAddressRelation
 from process.provider_directory_profile import is_valid_npi
 
 _SOURCE = "cms-doctors"
 _TABLES = ("doctor_clinician_address", "cms_doctor_education", "cms_doctor_group_site")
 _BINDING = "provider_directory_cms_doctors_group_binding"
 _SITE_BINDING = "provider_directory_cms_doctors_site_binding"
+_AUTHORITY = "reference_family_result_generation"
+_READ_TABLES = (*_TABLES, _BINDING, _SITE_BINDING, _AUTHORITY)
 
 
 def _schema_name():
@@ -50,18 +56,79 @@ def _generation_key(key, authority, relation_oids):
     return opaque_directory_key(key, "gen_", _SOURCE, identities, generations, published_at.isoformat(), relation_oids)
 
 
-async def _accepted_generation(session, schema, key):
-    """Fence relation replacement before observing the source ledger and table OIDs."""
-    qualified_tables = [f'{schema}."{name}"' for name in (*_TABLES, _BINDING, _SITE_BINDING)]
-    await session.execute(text(f"LOCK TABLE {', '.join(qualified_tables)} IN ACCESS SHARE MODE"))
+async def _read_inventory(session, schema):
+    """Capture fixed names only; accepted generation authority is checked separately."""
+    if session.in_transaction() is not True:
+        raise DirectoryReadError(503)
+    modes = (
+        await execute_network_read(
+            session, text("SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')")
+        )
+    ).one()
+    if tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
+        raise DirectoryReadError(503)
+    try:
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        backend_pid = driver.get_server_pid()
+        if driver.is_in_transaction() is not True or type(backend_pid) is not int or not 0 < backend_pid <= 2147483647:
+            raise DirectoryReadError(503)
+    except Exception as error:
+        raise DirectoryReadError(503) from error
+    catalog = await execute_network_read(
+        session,
+        text("""SELECT requested.name,c.oid::bigint,
+      c.relkind::text,c.relpersistence::text,c.relrowsecurity,c.relforcerowsecurity,c.relispartition,
+      c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap') AS heap,
+      EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
+      EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) AS rules
+      FROM unnest(CAST(:names AS text[])) WITH ORDINALITY requested(name,ordinal)
+      LEFT JOIN pg_catalog.pg_namespace n ON n.nspname=:schema
+      LEFT JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=requested.name
+      ORDER BY requested.ordinal"""),
+        {"names": list(_READ_TABLES), "schema": schema[1:-1]},
+    )
+    relations = []
+    catalog_records = catalog.mappings().all()
+    if tuple(catalog_record["name"] for catalog_record in catalog_records) != _READ_TABLES:
+        raise DirectoryReadError(503)
+    for catalog_record in catalog_records:
+        if (
+            type(catalog_record["oid"]) is not int
+            or not 0 < catalog_record["oid"] < 2**32
+            or catalog_record["relkind"] != "r"
+            or catalog_record["relpersistence"] != "p"
+            or catalog_record["heap"] is not True
+            or any(
+                catalog_record[field]
+                for field in ("relrowsecurity", "relforcerowsecurity", "relispartition", "inherited", "rules")
+            )
+        ):
+            raise DirectoryReadError(503)
+        relations.append(CompactAddressRelation(schema[1:-1], catalog_record["name"], catalog_record["oid"]))
+    return driver, tuple(relations)
+
+
+@asynccontextmanager
+async def _guarded_tables(session, schema):
+    try:
+        driver, relations = await _read_inventory(session, schema)
+        with network_read_name_inventory(driver, relations):
+            yield relations
+    except ServiceUnavailable as error:
+        raise DirectoryReadError(503) from error
+
+
+async def _accepted_generation(session, schema, key, relations):
+    """Read real publication authority under the complete fixed-name guard."""
     authority = (
         (
-            await session.execute(
+            await execute_network_read(
+                session,
                 text(
                     f"SELECT local_lineage_id, local_generation, origin_lineage_id, origin_generation, "
-                    f"published_at, relation_oids FROM {schema}.reference_family_result_generation "
+                    f"published_at, relation_oids FROM {schema}.{_AUTHORITY} "
                     "WHERE importer_id = 'cms-doctors'"
-                )
+                ),
             )
         )
         .mappings()
@@ -69,16 +136,7 @@ async def _accepted_generation(session, schema, key):
     )
     if authority is None:
         raise DirectoryReadError(503)
-    relation_oids = []
-    for qualified_name in qualified_tables:
-        relation_oids.append(
-            int(
-                (
-                    await session.execute(text("SELECT CAST(CAST(:name AS regclass) AS oid)"), {"name": qualified_name})
-                ).scalar_one()
-            )
-        )
-    return _generation_key(key, authority, relation_oids)
+    return _generation_key(key, authority, [relation.table_oid for relation in relations[:5]])
 
 
 def _evidence(key, row, resource_type="CMSDoctorsGroup"):
@@ -138,7 +196,8 @@ def _relationship(key, row, kind):
 
 async def _entity_rows(session, schema, query, position):
     """Seek stable UUIDs and aggregate only the selected bounded page of exact PACs."""
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text(f"""
         WITH page AS (
             SELECT b.organization_id, b.org_pac_id FROM {schema}.{_BINDING} b
@@ -166,7 +225,8 @@ async def _entity_rows(session, schema, query, position):
 
 
 async def _site_rows(session, schema, query, position):
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text(f"""
         WITH page AS (
             SELECT b.site_id, b.adrs_id FROM {schema}.{_SITE_BINDING} b
@@ -194,7 +254,8 @@ async def _site_rows(session, schema, query, position):
 
 
 async def _relationship_rows(session, schema, query, position):
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text(f"""
         SELECT g.row_number, g.generation_id, g.observed_at, g.npi, s.site_id
         FROM {schema}.cms_doctor_group_site g
@@ -210,7 +271,8 @@ async def _relationship_rows(session, schema, query, position):
 
 
 async def _site_relationship_rows(session, schema, query, position):
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text(f"""
         SELECT g.row_number, g.generation_id, g.observed_at, g.npi, b.organization_id
         FROM {schema}.cms_doctor_group_site g
@@ -227,7 +289,8 @@ async def _site_relationship_rows(session, schema, query, position):
 
 async def _require_group(session, schema, entity_id):
     has_group = (
-        await session.execute(
+        await execute_network_read(
+            session,
             text(f"""
         SELECT EXISTS (
             SELECT 1 FROM {schema}.{_BINDING} b
@@ -244,7 +307,8 @@ async def _require_group(session, schema, entity_id):
 
 async def _require_site(session, schema, entity_id):
     has_site = (
-        await session.execute(
+        await execute_network_read(
+            session,
             text(f"""
         SELECT EXISTS (
             SELECT 1 FROM {schema}.{_SITE_BINDING} b
@@ -295,15 +359,16 @@ async def read_medical_groups(session, query):
     key = directory_cursor_key()
     schema = _schema_name()
     async with session.begin():
-        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        await session.execute(text("SET LOCAL statement_timeout = '2s'"))
-        await session.execute(text("SET LOCAL lock_timeout = '250ms'"))
-        await session.execute(text("SET LOCAL work_mem = '4MB'"))
-        generation_id = await _accepted_generation(session, schema, key)
-        if query.generation_id is not None and query.generation_id != generation_id:
-            raise DirectoryReadError(409)
-        await _require_complete_bindings(session, schema)
-        return await _read_page(session, schema, key, query, generation_id)
+        await execute_network_read(session, text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        await execute_network_read(session, text("SET LOCAL statement_timeout = '2s'"))
+        await execute_network_read(session, text("SET LOCAL lock_timeout = '250ms'"))
+        await execute_network_read(session, text("SET LOCAL work_mem = '4MB'"))
+        async with _guarded_tables(session, schema) as relations:
+            generation_id = await _accepted_generation(session, schema, key, relations)
+            if query.generation_id is not None and query.generation_id != generation_id:
+                raise DirectoryReadError(409)
+            await _require_complete_bindings(session, schema)
+            return await _read_page(session, schema, key, query, generation_id)
 
 
 async def read_medical_groups_snapshot(session, query):
@@ -316,32 +381,34 @@ async def read_medical_groups_snapshot(session, query):
     ):
         raise DirectoryReadError(503)
     key, schema = directory_cursor_key(), _schema_name()
-    generation_id = await _accepted_generation(session, schema, key)
-    if query.excluded_network_ids is not None:
-        from api.network_address_scope import current_network_address_scope
+    async with _guarded_tables(session, schema) as relations:
+        generation_id = await _accepted_generation(session, schema, key, relations)
+        if query.excluded_network_ids is not None:
+            from api.network_address_scope import current_network_address_scope
 
-        scope = current_network_address_scope()
-        if scope is None or scope.manifest is not query.network_manifest:
-            raise DirectoryReadError(503)
-        generation_id = opaque_directory_key(
-            key,
-            "gen_",
-            generation_id,
-            scope.manifest.generation_id,
-            scope.manifest.approved_custom_revision,
-            scope.manifest.manifest_sha256,
-            query.access_scope_sha256,
-        )
-    if query.generation_id is not None and query.generation_id != generation_id:
-        raise DirectoryReadError(409)
-    await _require_complete_bindings(session, schema)
-    return await _read_page(session, schema, key, query, generation_id)
+            scope = current_network_address_scope()
+            if scope is None or scope.manifest is not query.network_manifest:
+                raise DirectoryReadError(503)
+            generation_id = opaque_directory_key(
+                key,
+                "gen_",
+                generation_id,
+                scope.manifest.generation_id,
+                scope.manifest.approved_custom_revision,
+                scope.manifest.manifest_sha256,
+                query.access_scope_sha256,
+            )
+        if query.generation_id is not None and query.generation_id != generation_id:
+            raise DirectoryReadError(409)
+        await _require_complete_bindings(session, schema)
+        return await _read_page(session, schema, key, query, generation_id)
 
 
 async def _require_complete_bindings(session, schema):
     """Do not silently omit accepted groups whose durable identities are missing."""
     has_missing_binding = (
-        await session.execute(
+        await execute_network_read(
+            session,
             text(f"""
         SELECT EXISTS (
             SELECT 1 FROM {schema}.cms_doctor_group_site g
@@ -350,7 +417,7 @@ async def _require_complete_bindings(session, schema):
             WHERE (nullif(btrim(g.org_pac_id), '') IS NOT NULL AND b.organization_id IS NULL)
                OR (nullif(btrim(g.adrs_id), '') IS NOT NULL AND s.site_id IS NULL)
         )
-    """)
+    """),
         )
     ).scalar_one()
     if has_missing_binding:

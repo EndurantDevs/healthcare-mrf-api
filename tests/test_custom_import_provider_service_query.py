@@ -36,7 +36,8 @@ class _Session:
         self._results = list(results)
         self.statements = []
 
-    async def execute(self, statement):
+    async def execute(self, statement, parameters=None):
+        assert parameters in (None, {})
         self.statements.append(statement)
         return self._results.pop(0)
 

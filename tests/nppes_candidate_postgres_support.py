@@ -25,7 +25,10 @@ from process.provider_directory_cms_control_custody import (
     capture_cms_control_custody,
     require_cms_control_adoption_delta,
 )
-from process.provider_directory_cms_receipt_custody import provision_cms_serving_receipt_custody
+from process.provider_directory_cms_receipt_custody import (
+    provision_cms_origin_metadata_readers,
+    provision_cms_serving_receipt_custody,
+)
 from process.provider_directory_profile_initial_custody import provision_initial_callable_custody
 from process.provider_directory_source_acquisition_custody import lock_source_control_family
 from process.provider_directory_source_callable_custody import capture_source_callable_custody
@@ -319,7 +322,28 @@ async def loading_family(connection, schema, admission_ref):
     return {root: proof["name"] for root, proof in binding["tables"].items()}
 
 
-async def _enroll_native_custody(component, namespace, migrator, *, native_inputs=False):
+async def _provision_component_receipt(driver, policy, migrator, metadata_read_roles):
+    """Protect an unprotected receipt before declaring independent metadata recipients."""
+    receipt_read_roles = metadata_read_roles
+    if metadata_read_roles:
+        protected = await driver.fetchval(
+            "SELECT relrowsecurity FROM pg_class WHERE oid=to_regclass($1)",
+            f'"{policy.schema}".provider_directory_cms_serving_receipt',
+        )
+        assert type(protected) is bool
+        if not protected:
+            receipt_read_roles = ()
+    await provision_cms_serving_receipt_custody(
+        driver,
+        policy,
+        migration_role=migrator,
+        verify_role_profile=verify_native_source_profile,
+        metadata_read_roles=receipt_read_roles,
+    )
+
+
+async def _enroll_native_custody(component, namespace, migrator, *, native_inputs=False, metadata_read_roles=()):
+    """Preserve Source custody before granting explicitly declared metadata access."""
     policy = component.policy
     async with component.admin_engine.begin() as connection:
         await connection.execute(
@@ -339,9 +363,7 @@ async def _enroll_native_custody(component, namespace, migrator, *, native_input
         await connection.execute(text("SELECT current_user=session_user"))
         driver = (await connection.get_raw_connection()).driver_connection
         await provision_cms_callable_custody(driver, policy, verify_role_profile=verify_native_source_profile)
-        await provision_cms_serving_receipt_custody(
-            driver, policy, migration_role=migrator, verify_role_profile=verify_native_source_profile
-        )
+        await _provision_component_receipt(driver, policy, migrator, metadata_read_roles)
         await provision_initial_callable_custody(driver, policy, verify_role_profile=verify_native_source_profile)
         await provision_source_namespace_custody(
             driver, policy, namespace_owner_role=namespace, verify_role_profile=verify_native_source_profile
@@ -357,6 +379,14 @@ async def _enroll_native_custody(component, namespace, migrator, *, native_input
         require_cms_control_adoption_delta(before, after, expected_checks)
         await adopt_nppes_control_custody(driver, policy.schema, policy, **arguments_by_key)
         await attest_nppes_control_custody(driver, policy.schema, policy, **arguments_by_key)
+        if metadata_read_roles:
+            await provision_cms_origin_metadata_readers(
+                driver,
+                policy,
+                migration_role=migrator,
+                metadata_read_roles=metadata_read_roles,
+                verify_role_profile=verify_native_source_profile,
+            )
     component.factory.migration_role = migrator
     component.factory.namespace_owner_role = namespace
     if native_inputs:

@@ -24,6 +24,7 @@ from api.billing_search_import_contract import (
 )
 from api.custom_import_provider_service_sql import ProviderServiceImportQuery
 from api.custom_import_provider_sql import CompiledNpiEntityRelation, compile_npi_entity_relation
+from api.network_read_execution import execute_network_read
 from api.ptg2_billing_search_contract import BillingSearchProviderCandidate, serving_unavailable
 from process.custom_import.read_contracts import PinnedReadTarget
 from process.custom_import.read_core import PreparedNpiEntityRelation
@@ -296,7 +297,7 @@ async def compose_billing_candidates(session, candidates, query, *, endpoint_acc
 
     query = validate_billing_import_query(query, endpoint_access_state_sha256=endpoint_access_state_sha256)
     candidates = _validated_candidates(candidates)
-    result = await session.execute(_candidate_statement(candidates, query))
+    result = await execute_network_read(session, _candidate_statement(candidates, query))
     ordinals = tuple(result.scalars().all())
     if (
         any(type(ordinal) is not int or not 1 <= ordinal <= len(candidates) for ordinal in ordinals)

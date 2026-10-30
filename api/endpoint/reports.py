@@ -25,6 +25,7 @@ from api.network_address_scope import (
     scoped_address_parameters,
     scoped_address_relation_sql,
 )
+from api.network_read_execution import execute_network_read
 from db.models import (
     EntityAddressUnified,
     NPIDataOtherIdentifier,
@@ -804,7 +805,7 @@ async def _query_chain_summary(
         include_states=include_states,
         address_table_sql=address_table_sql,
     )
-    result = await session.execute(text(sql), scoped_address_parameters(params))
+    result = await execute_network_read(session, text(sql), scoped_address_parameters(params))
     row = result.mappings().first() or {}
     summary = _ensure_json_dict(row.get("summary"))
     histogram_entries = [item for item in _ensure_json_list(row.get("histogram")) if isinstance(item, dict)]
@@ -1086,9 +1087,9 @@ async def _query_pharmacy_state_stats(session) -> tuple[list[dict[str, Any]], bo
         address_table_sql=address_table_sql,
     )
     result = (
-        await session.execute(text(sql), scoped_address_parameters({}))
+        await execute_network_read(session, text(sql), scoped_address_parameters({}))
         if current_network_address_scope() is not None
-        else await session.execute(text(sql))
+        else await execute_network_read(session, text(sql))
     )
     rows = []
     for row in result.mappings().all():
@@ -1663,10 +1664,10 @@ async def _build_market_summary_query_sql(session, query: _MarketSummaryQuery):
 
 async def _load_market_summary_rows(session, query: _MarketSummaryQuery):
     count_sql, data_sql, parameter_map = await _build_market_summary_query_sql(session, query)
-    market_rows = (await session.execute(text(data_sql), parameter_map)).mappings().all()
+    market_rows = (await execute_network_read(session, text(data_sql), parameter_map)).mappings().all()
     total = _coerce_int(market_rows[0].get("total_count")) if market_rows else 0
     if not market_rows and query.offset > 0:
-        total = _coerce_int((await session.execute(text(count_sql), parameter_map)).scalar())
+        total = _coerce_int((await execute_network_read(session, text(count_sql), parameter_map)).scalar())
     return total, market_rows
 
 
@@ -1883,7 +1884,9 @@ WHERE {_report_address_type_clause("a")}
 LIMIT 1;
 """
     pharmacy_row = (
-        (await session.execute(text(sql), scoped_address_parameters({"npi": npi, "as_of": as_of}))).mappings().first()
+        (await execute_network_read(session, text(sql), scoped_address_parameters({"npi": npi, "as_of": as_of})))
+        .mappings()
+        .first()
     )
     if not pharmacy_row:
         return None

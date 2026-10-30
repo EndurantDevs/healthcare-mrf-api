@@ -11,6 +11,7 @@ from sqlalchemy.dialects import postgresql
 
 from api import network_address_scope as scope_module
 from process.network_serving_read import PinnedNetworkServingManifest
+from tests.network_read_execution_support import mock_approved_control_metadata
 from tests.test_pricing_api import FakeResult, make_request, pricing_module
 from tests.test_pricing_procedure_fast_path import _resolve_single_internal_code
 
@@ -28,6 +29,7 @@ MANIFEST = PinnedNetworkServingManifest(
 
 @pytest.fixture
 def canonical_pin(monkeypatch):
+    mock_approved_control_metadata(monkeypatch)
     pin = AsyncMock(return_value=(MANIFEST, (42, 88), "a" * 64, None))
     monkeypatch.setattr(scope_module, "_pin_network_scope", pin)
     monkeypatch.setattr(
@@ -414,3 +416,89 @@ def test_managed_native_plan_lane_uses_its_source_and_office_readers(selector):
                 pricing_module.provider_procedure_table.c.npi,
                 managed_native=True,
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["current", "legacy", "missing", "transient"])
+async def test_plan_snapshot_selection_keeps_current_pairs_or_exact_legacy_fallback(monkeypatch, mode):
+    session, plan = object(), {"source_key": " Example-Source "}
+    pairs = [("source-a", "snapshot-a"), ("source-b", "snapshot-b")]
+    current = AsyncMock(return_value=pairs if mode == "current" else [])
+    if mode == "transient":
+        current.side_effect = RuntimeError("optional current-pair lookup unavailable")
+    fallback = AsyncMock(return_value=None if mode == "missing" else "legacy-snapshot")
+    monkeypatch.setattr(pricing_module, "current_network_snapshots_for_plan", current)
+    monkeypatch.setattr(pricing_module, "current_source_snapshot_id_for_plan", fallback)
+    result = await pricing_module._current_source_snapshot_pairs_for_plan(session, plan)
+    assert result == (
+        pairs if mode == "current" else [] if mode == "missing" else [("example-source", "legacy-snapshot")]
+    )
+    current.assert_awaited_once_with(session, plan)
+    if mode == "current":
+        fallback.assert_not_awaited()
+    else:
+        fallback.assert_awaited_once_with(session, plan)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ServiceUnavailable, asyncio.CancelledError])
+async def test_snapshot_identity_refusal_and_cancellation_cannot_become_legacy_fallback(monkeypatch, error_type):
+    error = error_type("current snapshot unavailable")
+    monkeypatch.setattr(pricing_module, "current_network_snapshots_for_plan", AsyncMock(side_effect=error))
+    fallback = AsyncMock()
+    monkeypatch.setattr(pricing_module, "current_source_snapshot_id_for_plan", fallback)
+    with pytest.raises(error_type) as caught:
+        await pricing_module._current_source_snapshot_pairs_for_plan(object(), {"source_key": "source-a"})
+    assert caught.value is error
+    fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_allowed_snapshot_selection_ignores_incomplete_rows_and_deduplicates_exact_pairs():
+    from tests.test_pricing_api import FakeSession
+
+    session = FakeSession(
+        [
+            FakeResult(
+                rows=[
+                    {"source_key": " Source-A ", "snapshot_id": "one"},
+                    {"source_key": "source-a", "snapshot_id": "one"},
+                    {"source_key": None, "snapshot_id": "unbound"},
+                    {"source_key": "source-b", "snapshot_id": ""},
+                    {"source_key": "source-b", "snapshot_id": "two"},
+                ]
+            )
+        ]
+    )
+    assert await pricing_module._current_allowed_amount_snapshots_for_plan(
+        session, {"source_key": " Source-A ", "market_type": " ACA "}, plan_id="plan-one"
+    ) == [{"source_key": "source-a", "snapshot_id": "one"}, {"source_key": "source-b", "snapshot_id": "two"}]
+    (statement, parameters), _ = session.executions[0]
+    assert "current" in str(statement) and parameters["requested_source_key"] == "source-a"
+    assert parameters["market_type"] == "aca"
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ([], False),
+        ({"items": [{"npi": 1000000004}]}, False),
+        ({"items": [], "pagination": {"total": 2}}, False),
+        ({"items": [], "pagination": {"total": 0}}, True),
+        ({"items": [], "pagination": {"total": "unknown"}}, True),
+        ({"pagination": {"total": None}}, False),
+    ],
+)
+def test_pricing_fallback_requires_an_actual_empty_priced_result(payload, expected):
+    assert pricing_module._has_no_ptg2_priced_items(payload) is expected
+
+
+def test_plan_pricing_annotation_does_not_overwrite_existing_query_contract():
+    malformed_by_field = {"query": []}
+    pricing_module._annotate_ptg2_query_payload(
+        malformed_by_field, plan_id_type="external", year=2026, has_plan_scope=True
+    )
+    assert malformed_by_field == {"query": []}
+    payload = {"query": {"plan_id_type": "existing", "ignored_params": ["year"], "year_semantics": "existing"}}
+    pricing_module._annotate_ptg2_query_payload(payload, plan_id_type="external", year=2026, has_plan_scope=True)
+    assert payload == {"query": {"plan_id_type": "existing", "ignored_params": ["year"], "year_semantics": "existing"}}

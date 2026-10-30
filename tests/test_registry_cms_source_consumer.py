@@ -95,7 +95,7 @@ async def test_source_attempt_commits_independent_address_preparation_before_com
     composed = AsyncMock(side_effect=compose)
     ready = AsyncMock()
     monkeypatch.setattr(consumer, "compose_registry_membership_candidate", composed)
-    monkeypatch.setattr(consumer, "prepare_network_candidate", ready)
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", ready)
     config = replace(_config(), prepare_address_sources=prepare)
     operation = consumer._prepare_source_candidate(object(), notice, config, attempt, 4, pin, (notice.pair.recipe,))
     if outcome == "complete":
@@ -381,7 +381,7 @@ async def test_periodic_attempt_uses_competitor_slot_and_latest_map_from_same_sn
 
     composer = AsyncMock(side_effect=compose)
     monkeypatch.setattr(consumer, "compose_registry_membership_candidate", composer)
-    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", AsyncMock())
     monkeypatch.setattr(consumer, "publish_network_candidate", AsyncMock(return_value={"published": "C"}))
     outcome = await consumer._attempt(connection, notice, consumer._event(notice, config), config, "endpoint-one")
     saved = connection.checkpoints[0]
@@ -579,7 +579,7 @@ async def test_sealed_attempt_binds_provisional_assertion_and_commits_checkpoint
         "compose_registry_membership_candidate",
         AsyncMock(return_value=(copy_target, notice.pair.address_source)),
     )
-    monkeypatch.setattr(consumer, "prepare_network_candidate", AsyncMock())
+    monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", AsyncMock())
 
     publisher, seal, source_recheck = _cms_checkpoint_callbacks(
         monkeypatch, connection, expected_by_name, outcome, copy_target, phases

@@ -23,7 +23,7 @@ from process.network_candidate_custody import SOURCE_EVENT_ASSERTION
 from process.network_cms_registry_source_pair import _publication
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_membership_copy import MembershipCopyTarget
-from process.network_membership_pipeline import prepare_and_publish_network_candidate, prepare_network_candidate
+from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_membership_publication import NetworkPublicationError, publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
@@ -32,8 +32,11 @@ from process.registry_candidate_composition import (
     compose_registry_membership_candidate,
 )
 from process.registry_cms_source_notifications import RegistryCMSSourceNotificationStore
+from process.registry_publication_execution import prepare_registry_candidate_for_context
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_source_recipe_store import (
+    MAX_SOURCE_RECIPE_BYTES,
+    MAX_SOURCE_RECIPES,
     RECIPE_DIGEST_KEY,
     canonical_registry_source_recipes,
     decode_registry_source_recipes,
@@ -165,7 +168,37 @@ async def _current_source(sessions, notice):
         await _publication(session, notice.pair.proof, current=True)
 
 
-def _replay_target(candidate_by_name, event):
+def _recipe_attempt_commitment(recipes, *, inventory=False, root=None):
+    if inventory and root is None:
+        from process.registry_source_inventory_preparation import SourceInventoryPreparation
+
+        preparation = SourceInventoryPreparation(recipes)
+        recipes, root = preparation.recipes, preparation.recipe_root
+    if root is not None and (root.entry_count > MAX_SOURCE_RECIPES or root.recipe_bytes > MAX_SOURCE_RECIPE_BYTES):
+        return "registry-cms-source-inventory/v1", root.entry_count, root.recipes_sha256
+    return canonical_registry_source_recipes(recipes)
+
+
+def _replay_payload(candidate_by_name, inventory_recipes):
+    recipes = (
+        json.loads(candidate_by_name["source_recipes_json"])
+        if type(candidate_by_name["source_recipes_json"]) is str
+        else candidate_by_name["source_recipes_json"]
+    )
+    root = None
+    if type(recipes) is dict:
+        from process.registry_source_inventory_reference import verify_source_recipe_metadata
+
+        metadata = verify_source_recipe_metadata(candidate_by_name)
+        root, decoded = metadata.inventory.root, inventory_recipes
+        if decoded is None or len(decoded) != metadata.recipe_count:
+            raise _invalid()
+    else:
+        decoded = decode_registry_source_recipes(_json(recipes))
+    return decoded, root
+
+
+def _replay_target(candidate_by_name, event, *, inventory_recipes=None):
     report = (
         json.loads(candidate_by_name["validation_json"])
         if type(candidate_by_name["validation_json"]) is str
@@ -175,12 +208,7 @@ def _replay_target(candidate_by_name, event):
     attempt_id = UUID(checkpoint_by_name.pop("attempt_id"))
     if checkpoint_by_name != event:
         raise _invalid()
-    recipes = (
-        json.loads(candidate_by_name["source_recipes_json"])
-        if type(candidate_by_name["source_recipes_json"]) is str
-        else candidate_by_name["source_recipes_json"]
-    )
-    decoded = decode_registry_source_recipes(_json(recipes))
+    decoded, root = _replay_payload(candidate_by_name, inventory_recipes)
     if not any(
         hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest() == event["recipe_sha256"]
         for recipe in decoded
@@ -204,7 +232,7 @@ def _replay_target(candidate_by_name, event):
             (
                 base_manifest,
                 generations["custom_membership"],
-                canonical_registry_source_recipes(decoded),
+                _recipe_attempt_commitment(decoded, root=root),
             )
         ),
     )
@@ -249,7 +277,9 @@ async def _replay(connection, event, config, candidate_records=None):
         raise _invalid()
     if not candidate_records:
         return None
-    copy_target, address_source = _replay_target(dict(candidate_records[0]), event)
+    copy_target, address_source = await _authenticated_replay_target(
+        connection, dict(candidate_records[0]), event, config
+    )
     manifest = await prepare_and_publish_network_candidate(
         connection,
         copy_target,
@@ -258,6 +288,32 @@ async def _replay(connection, event, config, candidate_records=None):
         control_schema=config.control_schema,
     )
     return {"state": "replayed", "event_id": event["event_id"], "manifest": manifest}
+
+
+async def _authenticated_replay_target(connection, candidate_by_name, event, config):
+    from process.registry_source_inventory_reference import verify_source_recipe_metadata
+    from process.registry_source_recipe_store import _decode_document, _retained_inventory_recipes
+
+    if type(_decode_document(candidate_by_name["source_recipes_json"])) is not dict:
+        return _replay_target(candidate_by_name, event)
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        rows = await connection.fetch(
+            f"SELECT * FROM {_identifier(config.control_schema)}.network_membership_candidate "
+            "WHERE candidate_id=$1 AND state='published' AND validation_json->$2->>'event_id'=$3 LIMIT 2",
+            UUID(str(candidate_by_name["candidate_id"])),
+            _CHECKPOINT,
+            event["event_id"],
+        )
+        if len(rows) != 1 or str(rows[0]["candidate_id"]) != str(candidate_by_name["candidate_id"]):
+            raise _invalid()
+        actual_by_name = dict(rows[0])
+        if (
+            actual_by_name.get("state") != "published"
+            or verify_source_recipe_metadata(actual_by_name).inventory is None
+        ):
+            raise _invalid()
+        recipes = await _retained_inventory_recipes(connection, actual_by_name, config.control_schema)
+        return _replay_target(actual_by_name, event, inventory_recipes=recipes)
 
 
 async def _attempt_sources(connection, notice, event, config, source_endpoint_id):
@@ -332,6 +388,7 @@ async def _prepare_source_candidate(connection, notice, config, attempt_id, revi
     """Compose and commit READY using the current dynamically selected composer."""
     address_sources = RegistryCompositionAddressSources(
         notice.pair.address_source,
+        compact=pin is not None and getattr(pin, "compact_layout", None) is not None,
         **{("initial_source_recipes" if pin is None else "replacement_source_recipes"): recipes},
     )
     if config.prepare_address_sources is not None:
@@ -357,9 +414,7 @@ async def _prepare_source_candidate(connection, notice, config, attempt_id, revi
         writer_roles=config.writer_roles,
         control_schema=config.control_schema,
     )
-    await prepare_network_candidate(
-        connection, copy_target, addresses, **config.writer_roles, control_schema=config.control_schema
-    )
+    await prepare_registry_candidate_for_context(connection, copy_target, addresses, config)
     return copy_target
 
 
@@ -388,7 +443,9 @@ async def _attempt(connection, notice, event, config, source_endpoint_id=None, *
             (
                 None if pin is None else pin.manifest_sha256,
                 approved.generation_id,
-                canonical_registry_source_recipes(recipes),
+                _recipe_attempt_commitment(
+                    recipes, inventory=pin is not None and getattr(pin, "compact_layout", None) is not None
+                ),
             )
         ),
     )
@@ -468,7 +525,7 @@ async def _periodic_config(connection, notice, config, endpoint_id):
         if previous is not None and _source_family(previous) != _source_family(config.coordinates):
             raise _invalid()
         resolved = replace(config, coordinates=coordinates, replaced_coordinates=previous)
-        _replay_target(candidate_by_name, _event(notice, resolved))
+        await _authenticated_replay_target(connection, candidate_by_name, _event(notice, resolved), resolved)
         return resolved, candidate_records
     async with connection.transaction(isolation="repeatable_read", readonly=True):
         head = await connection.fetchval(

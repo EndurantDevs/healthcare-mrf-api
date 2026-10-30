@@ -89,7 +89,7 @@ class StatementAdapter:
     async def execute(self, **params: Any):
         """Execute the wrapped statement with bound parameters."""
         async with self._db._execution_session() as session:
-            return await session.execute(self._stmt, params)
+            return await _execute_buffered_reader_statement(session, self._stmt, params)
 
     async def all(self, **params: Any):
         """Return every row produced by the wrapped statement."""
@@ -157,19 +157,19 @@ class ConnectionProxy:
     async def all(self, stmt: Any, **params: Any):
         """Execute a statement and return all rows on this connection."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
-        result = await self._connection.execute(stmt, params)
+        result = await _execute_buffered_reader_statement(self._connection, stmt, params)
         return result.all()
 
     async def first(self, stmt: Any, **params: Any):
         """Execute a statement and return its first row."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
-        result = await self._connection.execute(stmt, params)
+        result = await _execute_buffered_reader_statement(self._connection, stmt, params)
         return result.first()
 
     async def scalar(self, stmt: Any, **params: Any):
         """Execute a statement and return its first scalar value."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
-        result = await self._connection.execute(stmt, params)
+        result = await _execute_buffered_reader_statement(self._connection, stmt, params)
         return result.scalar()
 
     async def status(self, stmt: Any, **params: Any):
@@ -189,6 +189,15 @@ class ConnectionProxy:
 
 
 _SESSION: contextvars.ContextVar[Optional[AsyncSession]] = contextvars.ContextVar("db_session")
+
+
+async def _execute_buffered_reader_statement(session, statement, parameters):
+    """Guard active fixed-name inventories on the original buffered execution seam."""
+    from api.network_read_execution import execute_network_read, has_network_read_inventory
+
+    if has_network_read_inventory(session):
+        return await execute_network_read(session, statement, parameters)
+    return await session.execute(statement, parameters)
 
 
 @dataclass(frozen=True)
@@ -441,7 +450,7 @@ class Database:
         """Execute a statement in the current or a short-lived session."""
         stmt = sa_text(stmt) if isinstance(stmt, str) else stmt
         async with self._execution_session() as session:
-            return await session.execute(stmt, params)
+            return await _execute_buffered_reader_statement(session, stmt, params)
 
     async def all(self, stmt: Any, **params: Any):
         """Execute a statement and return all rows."""
@@ -699,6 +708,7 @@ class Database:
                 session.info.pop("api_reader_verified", None)
                 session.info.pop("api_reader_identity", None)
                 session.info.pop("native_plan_workspace", None)
+                session.info.pop("api_network_read_inventory", None)
 
     async def bind_request_reader(self, request):
         """Replace only this request's unused ordinary session with a genuine Reader."""
@@ -723,7 +733,7 @@ class Database:
         from api.reference_family_reads import pin_claims_reader
 
         try:
-            await pin_claims_reader(session)
+            await pin_claims_reader(session, api_read=True)
         except BaseException:
             await self._close_request_session(request, success=False)
             raise
@@ -959,7 +969,7 @@ class Database:
                 from api.reference_family_reads import pin_claims_reader
 
                 try:
-                    await pin_claims_reader(session)
+                    await pin_claims_reader(session, api_read=True)
                 except (RuntimeError, SQLAlchemyError) as failure:
                     from api.custom_import_read_http import _log_failure
                     from api.signed_request_reader import _remember_reader_failure

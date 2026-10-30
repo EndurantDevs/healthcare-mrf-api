@@ -496,6 +496,46 @@ def _expected_read_columns():
     }
 
 
+@pytest.mark.asyncio
+async def test_origin_metadata_fragment_has_only_five_columns_and_explicit_recipients():
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+
+    policy = GenericSourcePolicy("control_schema", "control_owner", "control_publisher", ("control_reader",))
+    connection = SimpleNamespace(execute=AsyncMock())
+    await privileges.grant_cms_origin_metadata_read_privileges(
+        connection, policy, metadata_read_roles=("independent_preparer", "independent_executor")
+    )
+    assert [call.args[0] for call in connection.execute.await_args_list] == [
+        'GRANT SELECT("receipt_id","payload","publication_xid","profile_generation_id","registry_source_pair_json") '
+        'ON "control_schema"."provider_directory_cms_serving_receipt" TO "' + role + '"'
+        for role in ("independent_executor", "independent_preparer")
+    ]
+    assert privileges.cms_control_read_roles(policy) == ("control_publisher", "control_reader")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "roles",
+    [
+        (),
+        ["independent_executor"],
+        ("independent_executor", "independent_executor"),
+        ("control_owner",),
+        ("control_publisher",),
+        ("control_reader",),
+        ("bad-role",),
+    ],
+)
+async def test_origin_metadata_fragment_refuses_implicit_or_source_recipients_before_sql(roles):
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+
+    policy = GenericSourcePolicy("control_schema", "control_owner", "control_publisher", ("control_reader",))
+    connection = SimpleNamespace(execute=AsyncMock())
+    with pytest.raises(ValueError):
+        await privileges.grant_cms_origin_metadata_read_privileges(connection, policy, metadata_read_roles=roles)
+    connection.execute.assert_not_awaited()
+
+
 def _compiled_current_read_closure():
     from process import provider_directory_cms_callable_custody as custody
     from tests.test_provider_directory_cms_callable_custody import _migration_functions

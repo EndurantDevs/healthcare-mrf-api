@@ -78,6 +78,9 @@ async def _locked_candidate(connection: Any, copy_target: MembershipCopyTarget, 
         raise MembershipCandidateError("Candidate relation does not match its registered scope")
     try:
         verify_registry_source_retention(candidate_record)
+        from process.registry_source_contribution_store import verify_registry_source_contributions
+
+        verify_registry_source_contributions(candidate_record)
     except RegistrySourceRetentionError as error:
         raise MembershipCandidateError(str(error)) from None
     return dict(candidate_record)
@@ -97,7 +100,9 @@ async def require_candidate_authority(connection: Any, copy_target: MembershipCo
     return copy_target
 
 
-async def _create_raw_membership(connection: Any, copy_target: MembershipCopyTarget, retention=None) -> None:
+async def _create_raw_membership(
+    connection: Any, copy_target: MembershipCopyTarget, retention=None, contributions=None
+) -> None:
     namespace = f'"{copy_target.schema_name}"'
     await connection.execute(f"CREATE SCHEMA {namespace}")
     await connection.execute(
@@ -113,6 +118,14 @@ async def _create_raw_membership(connection: Any, copy_target: MembershipCopyTar
         await connection.execute(
             f"CREATE TABLE {namespace}.{SOURCE_TABLE} (LIKE {namespace}.network_membership INCLUDING CONSTRAINTS)"
         )
+    if contributions is not None:
+        await connection.execute(f"""CREATE TABLE {namespace}.network_source_contribution(
+          recipe_sha256 text NOT NULL CHECK(recipe_sha256 ~ '^[0-9a-f]{{64}}$'),
+          ordinal bigint NOT NULL CHECK(ordinal>0),fact_json jsonb NOT NULL,
+          PRIMARY KEY(recipe_sha256,ordinal))""")
+        await connection.execute(f"""CREATE INDEX source_provider_only_idx ON {namespace}.network_source_contribution
+          (recipe_sha256,(fact_json->>'source_key'),(fact_json->>'provider_system'),(fact_json->>'provider_id'))
+          WHERE fact_json->'location_id'='null'::jsonb AND fact_json->'omission_reason'='null'::jsonb""")
 
 
 async def _insert_candidate(
@@ -138,7 +151,13 @@ async def _insert_candidate(
     )
 
 
-def _candidate_source_metadata(source_generations, source_recipes):
+def _candidate_source_metadata(source_generations, source_recipes, source_inventory=None):
+    from process.registry_source_inventory_reference import (
+        INVENTORY_DIGEST_KEY,
+        SourceInventoryReference,
+        encode_source_inventory_reference,
+        verify_source_recipe_metadata,
+    )
     from process.registry_source_recipe_store import (
         RECIPE_DIGEST_KEY,
         canonical_registry_source_recipes,
@@ -146,16 +165,33 @@ def _candidate_source_metadata(source_generations, source_recipes):
     )
 
     try:
-        canonical_recipes = canonical_registry_source_recipes(source_recipes)
+        if source_inventory is None:
+            canonical_recipes = canonical_registry_source_recipes(source_recipes)
+            digest = registry_source_recipes_sha256(canonical_recipes) if source_recipes else None
+        else:
+            if type(source_inventory) is not SourceInventoryReference or source_recipes != ():
+                raise ValueError("Source recipe formats cannot be combined")
+            canonical_recipes = encode_source_inventory_reference(source_inventory)
+            digest = source_inventory.root.recipes_sha256 if source_inventory.root.entry_count else None
         generations = json.loads(_source_json(source_generations))
-        digest = registry_source_recipes_sha256(canonical_recipes) if source_recipes else None
+        if source_inventory is not None:
+            if (
+                generations.get(INVENTORY_DIGEST_KEY, source_inventory.root.entries_sha256)
+                != source_inventory.root.entries_sha256
+            ):
+                raise ValueError("Source inventory digest differs")
+            generations[INVENTORY_DIGEST_KEY] = source_inventory.root.entries_sha256
+        elif INVENTORY_DIGEST_KEY in generations:
+            raise ValueError("Source inventory reference is missing")
         if RECIPE_DIGEST_KEY in generations and generations[RECIPE_DIGEST_KEY] != digest:
             raise ValueError("Source recipe digest differs")
         if digest is not None:
             generations[RECIPE_DIGEST_KEY] = digest
         elif RECIPE_DIGEST_KEY in generations:
             raise ValueError("Empty recipes cannot declare a digest")
-        return _source_json(generations), canonical_recipes
+        source_json = _source_json(generations)
+        verify_source_recipe_metadata({"source_generations": source_json, "source_recipes_json": canonical_recipes})
+        return source_json, canonical_recipes
     except ValueError, TypeError:
         raise MembershipCandidateError("Candidate source recipes are invalid") from None
 
@@ -181,16 +217,52 @@ def _retention_metadata(metadata, source_retention):
     return metadata
 
 
+def _contribution_metadata(metadata, contributions):
+    from process.registry_source_contribution_store import (
+        SUMMARY_KEY,
+        registry_source_contribution_sha256,
+        validate_registry_source_contribution_receipt,
+        verify_registry_source_contributions,
+    )
+    from process.registry_source_inventory_reference import verify_source_recipe_metadata
+
+    generations = json.loads(metadata["source_generations"])
+    inventory = verify_source_recipe_metadata(metadata).inventory
+    inventory_root = None if inventory is None else inventory.root
+    if contributions is not None:
+        receipt = validate_registry_source_contribution_receipt(contributions, inventory_root=inventory_root)
+        digest = registry_source_contribution_sha256(receipt, inventory_root=inventory_root)
+        if SUMMARY_KEY in generations and generations[SUMMARY_KEY] != digest:
+            raise MembershipCandidateError("Source contribution digest differs")
+        generations[SUMMARY_KEY] = digest
+        metadata["source_generations"] = _source_json(generations)
+        report = json.loads(metadata["validation_json"]) if metadata["validation_json"] else {}
+        metadata["validation_json"] = json.dumps({**report, SUMMARY_KEY: receipt}, sort_keys=True)
+    verify_registry_source_contributions(metadata)
+    return metadata
+
+
 def _verify_candidate_metadata(candidate, metadata):
+    from process.registry_source_contribution_store import verify_registry_source_contributions
+    from process.registry_source_inventory_reference import (
+        encode_source_inventory_reference,
+        verify_source_recipe_metadata,
+    )
     from process.registry_source_recipe_store import canonical_registry_source_recipes, verify_registry_source_recipes
 
     try:
-        stored_recipes = canonical_registry_source_recipes(verify_registry_source_recipes(candidate))
+        recipe_metadata = verify_source_recipe_metadata(candidate)
+        stored_recipes = (
+            canonical_registry_source_recipes(verify_registry_source_recipes(candidate))
+            if recipe_metadata.inventory is None
+            else encode_source_inventory_reference(recipe_metadata.inventory)
+        )
         stored_sources = candidate["source_generations"]
         if type(stored_sources) is str:
             stored_sources = json.loads(stored_sources)
         if (
             verify_registry_source_retention(candidate) != verify_registry_source_retention(metadata)
+            or verify_registry_source_contributions(candidate) != verify_registry_source_contributions(metadata)
             or stored_recipes != metadata["source_recipes_json"]
             or _source_json(stored_sources) != metadata["source_generations"]
             or any(
@@ -214,14 +286,17 @@ async def create_network_candidate(
     control_schema: str | None = None,
     **source_options,
 ) -> dict:
-    """Create or exactly replay a candidate; optional source recipes/retention default empty/None."""
-    if set(source_options) - {"source_recipes", "source_retention"}:
+    """Register exact source metadata; referenced inventory payload is written separately while open."""
+    if set(source_options) - {"source_recipes", "source_inventory", "source_retention", "source_contributions"}:
         raise MembershipCandidateError("Candidate source options are invalid")
     source_recipes = source_options.get("source_recipes", ())
     source_retention = source_options.get("source_retention")
+    contributions = source_options.get("source_contributions")
     _require_transaction(connection, copy_target)
     namespace = _control_namespace(control_schema)
-    source_json, recipe_json = _candidate_source_metadata(source_generations, source_recipes)
+    source_json, recipe_json = _candidate_source_metadata(
+        source_generations, source_recipes, source_options.get("source_inventory")
+    )
     metadata = {
         "source_generations": source_json,
         "source_recipes_json": recipe_json,
@@ -230,12 +305,13 @@ async def create_network_candidate(
         "expected_rows": _nonnegative_bigint(expected_rows),
     }
     metadata = _retention_metadata(metadata, source_retention)
+    metadata = _contribution_metadata(metadata, contributions)
     async with connection.transaction():
         inserted = await _insert_candidate(connection, copy_target, namespace, metadata)
         candidate_record = await _locked_candidate(connection, copy_target, namespace)
         _verify_candidate_metadata(candidate_record, metadata)
         if inserted:
-            await _create_raw_membership(connection, copy_target, source_retention)
+            await _create_raw_membership(connection, copy_target, source_retention, contributions)
         elif not await connection.fetchval(
             "SELECT to_regclass($1) IS NOT NULL", f'"{copy_target.schema_name}".network_membership'
         ):
@@ -244,6 +320,10 @@ async def create_network_candidate(
             "SELECT to_regclass($1) IS NOT NULL", f'"{copy_target.schema_name}".{SOURCE_TABLE}'
         ):
             raise MembershipCandidateError("Registered source relation is missing")
+        if contributions is not None and not await connection.fetchval(
+            "SELECT to_regclass($1) IS NOT NULL", f'"{copy_target.schema_name}".network_source_contribution'
+        ):
+            raise MembershipCandidateError("Registered source contribution is missing")
     return candidate_record
 
 
@@ -380,18 +460,35 @@ async def seal_network_candidate(
     control_schema: str | None = None,
     source_stage=None,
     command_stage=None,
+    inventory_entries=None,
 ) -> dict:
     """Close new writes only after receipts, counter, expectation and raw rows agree."""
     _require_transaction(connection, copy_target)
     namespace = _control_namespace(control_schema)
     async with connection.transaction():
         candidate_record = await _locked_candidate(connection, copy_target, namespace)
+        from process.registry_source_inventory_store import _registered_inventory_entries
+
+        if inventory_entries is None:
+            inventory_entries = await _registered_inventory_entries(
+                connection, copy_target, candidate_record, control_schema=namespace[1:-1]
+            )
         if candidate_record["state"] == "rejected":
             raise MembershipCandidateError("Rejected candidates cannot be sealed")
         retention = await _seal_membership_accounting(connection, copy_target, candidate_record, namespace)
         try:
             await verify_registry_source_retention_rows(
                 connection, copy_target, candidate_record, source_stage=source_stage
+            )
+            from process.registry_source_contribution_store import verify_registry_source_contributions_rows
+
+            await verify_registry_source_contributions_rows(
+                connection,
+                copy_target,
+                candidate_record,
+                source_stage=source_stage,
+                control_schema=namespace[1:-1],
+                **({"inventory_entries": inventory_entries} if inventory_entries is not None else {}),
             )
             if retention is not None and candidate_record["state"] == "open":
                 if command_stage is None:

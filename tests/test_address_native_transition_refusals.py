@@ -1072,7 +1072,12 @@ def _retirement_session(owner, rows, queries, fault):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["early_pin", "late_pin", "catalog", "namespace", "table_drop", "schema_drop"])
-async def test_retirement_failure_preserves_exact_cleanup_fences(fault):
+async def test_retirement_failure_preserves_exact_cleanup_fences(fault, monkeypatch):
+    from process import network_cms_registry_address_capture as capture
+    from process import network_compact_retention as retention
+
+    monkeypatch.setattr(capture, "native_driver", AsyncMock(return_value=object()))
+    monkeypatch.setattr(retention, "require_network_compact_artifacts_unreferenced", AsyncMock(return_value=True))
     owner, proof = _retirement_proof()
     queries = []
     session = _retirement_session(owner, _retired_catalog(owner, proof), queries, fault)

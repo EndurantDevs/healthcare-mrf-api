@@ -18,6 +18,7 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from db.models.registry_aca_source_notification import RegistryACASourceNotification
+from db.registry_fhir_catalog import SNAPSHOT_COLUMNS, table_sql
 from process import registry_execution_catalog as catalog
 from process.registry_management_permissions import _MODELS
 from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
@@ -38,6 +39,65 @@ async def test_control_namespace_cannot_alias_protected_storage(namespace):
             "reader",
             protected_control_schema="source_control",
         )
+
+
+async def test_fixed_model_roster_includes_complete_catalog_snapshot():
+    columns_by_table = catalog.registry_execution_columns()
+    assert len(columns_by_table) == 42
+    assert set(columns_by_table) == set(catalog._TABLES) | {
+        "registry_cms_source_notification",
+        "registry_aca_source_notification",
+    }
+    snapshot = columns_by_table["registry_fhir_catalog_snapshot"]
+    assert tuple(column[0] for column in snapshot) == SNAPSHOT_COLUMNS
+    assert snapshot[0] == ("metadata_generation", "25", -1, True)
+    assert snapshot[1] == ("schema_name", "1043", 67, True)
+    assert {name for name, _oid, _modifier, required in snapshot if not required} == {
+        "network_generation",
+        "manifest_sha256",
+        "published_at",
+    }
+
+
+@pytest.mark.parametrize("change", ("missing_model", "missing_table", "extra_table", "missing_column", "extra_column"))
+async def test_fixed_model_roster_refuses_missing_extra_or_column_drift(monkeypatch, change):
+    if change == "missing_model":
+        monkeypatch.setattr(catalog, "_MODELS", catalog._MODELS[:-1])
+    elif change in {"missing_table", "extra_table"}:
+        tables_by_name = dict(catalog._TABLES)
+        if change == "missing_table":
+            tables_by_name.pop("registry_fhir_catalog_snapshot")
+        else:
+            tables_by_name["unexpected_control_table"] = ("id",)
+        monkeypatch.setattr(catalog, "_TABLES", tables_by_name)
+    else:
+        columns = SNAPSHOT_COLUMNS[:-1] if change == "missing_column" else (*SNAPSHOT_COLUMNS, "unexpected")
+        monkeypatch.setattr(catalog, "SNAPSHOT_COLUMNS", columns)
+    with pytest.raises(catalog.RegistryExecutionCatalogError, match="model_(?:roster|catalog_columns)$"):
+        catalog.registry_execution_columns()
+
+
+async def test_storage_plan_provisions_the_complete_certified_roster():
+    """Inspect canonical creation statements without opening a database or issuing privileges."""
+    statements, model_tables = [], set()
+
+    async def record(statement):
+        statements.append(str(statement))
+
+    async def model_plan(create_all):
+        model_tables.update(table.name for table in create_all.__self__.tables.values())
+
+    connection = SimpleNamespace(execute=record, exec_driver_sql=record, run_sync=model_plan)
+    await _storage(connection, "registry_plan", {"queue": "queue_owner", "custody": "custody_owner"})
+    created_tables = {
+        statement.split("(", 1)[0].rsplit(".", 1)[1].strip().strip('"')
+        for statement in statements
+        if statement.startswith("CREATE TABLE ")
+    }
+    assert model_tables | created_tables == set(catalog.registry_execution_columns())
+    for statement in table_sql('"registry_plan"', "registry_fhir_catalog_snapshot"):
+        assert statements.count(statement) == 1
+    assert statements.count('ALTER TABLE "registry_plan"."registry_fhir_catalog_snapshot" OWNER TO "queue_owner"') == 1
 
 
 def _migration(filename):
@@ -67,6 +127,8 @@ async def _storage(connection, schema, roles_by_kind):
     ):
         for statement in _migration(filename)._ddl(schema):
             await connection.exec_driver_sql(statement)
+    for statement in table_sql(f'"{schema}"', "registry_fhir_catalog_snapshot"):
+        await connection.exec_driver_sql(statement)
     for table in catalog.registry_execution_columns():
         owner = roles_by_kind["custody"] if table == "network_candidate_custody" else roles_by_kind["queue"]
         await connection.execute(text(f'ALTER TABLE "{schema}"."{table}" OWNER TO "{owner}"'))
@@ -180,7 +242,7 @@ async def test_fixed_models_extensions_and_twenty_native_ri_hooks(native_catalog
     }
     assert _verify(native_catalog, observed)["contract"] == catalog.CONTRACT
     assert len(observed["triggers"]) == 20
-    assert len(catalog.registry_execution_columns()) == 41
+    assert len(catalog.registry_execution_columns()) == 42
     assert not any(native_row["prosecdef"] for native_row in observed["functions"])
 
 

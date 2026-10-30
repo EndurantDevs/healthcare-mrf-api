@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read
 from api.ptg2_billing_entity_refs import (
     PTG2BillingAssociationDataError,
     encode_billing_entity_ref,
@@ -17,12 +18,9 @@ from process.ptg_parts.db_tables import _quote_ident
 from process.tin_npi_connector_security import TinTokenPolicyDescriptor
 from process.tin_npi_connector_support import TinNpiConnectorError
 
-
 _PROVIDER_GROUP_REF_BYTES = 16
 _MAX_PROVIDER_GROUPS = 2048
-_TAX_IDENTITY_STATES = frozenset(
-    {"matched_ein", "missing", "malformed", "unsupported_type"}
-)
+_TAX_IDENTITY_STATES = frozenset({"matched_ein", "missing", "malformed", "unsupported_type"})
 
 
 def _normalized_provider_group_refs(
@@ -33,13 +31,9 @@ def _normalized_provider_group_refs(
         raise PTG2BillingAssociationDataError(
             "exact billing association scope contains an invalid provider-group reference"
         )
-    normalized_refs = tuple(
-        dict.fromkeys(provider_group_ref.strip().lower() for provider_group_ref in raw_refs)
-    )
+    normalized_refs = tuple(dict.fromkeys(provider_group_ref.strip().lower() for provider_group_ref in raw_refs))
     if len(normalized_refs) > _MAX_PROVIDER_GROUPS:
-        raise PTG2BillingAssociationDataError(
-            "exact billing association scope exceeds its provider-group limit"
-        )
+        raise PTG2BillingAssociationDataError("exact billing association scope exceeds its provider-group limit")
     if any(
         len(provider_group_ref) != _PROVIDER_GROUP_REF_BYTES * 2
         or any(character not in "0123456789abcdef" for character in provider_group_ref)
@@ -65,9 +59,7 @@ def _sidecar_tables(schema_name: str) -> tuple[str, str, str, str]:
 
 
 def _billing_association_query(schema_name: str):
-    manifest, legacy_layout, group_identity, tax_identity = _sidecar_tables(
-        schema_name
-    )
+    manifest, legacy_layout, group_identity, tax_identity = _sidecar_tables(schema_name)
     return text(
         f"""
         WITH requested(provider_group_ref) AS (
@@ -123,9 +115,7 @@ def _active_association(
 ) -> dict[str, Any]:
     tax_identity_status = association_record.get("tax_identity_state")
     if tax_identity_status not in _TAX_IDENTITY_STATES:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing association sidecar is incomplete"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing association sidecar is incomplete")
     association_by_field: dict[str, Any] = {
         "provider_group_ref": provider_group_ref,
         "tax_identity_status": tax_identity_status,
@@ -134,18 +124,12 @@ def _active_association(
     raw_hmac = association_record.get("tin_hmac_sha256")
     if tax_identity_status != "matched_ein":
         if raw_id is not None or raw_hmac is not None:
-            raise PTG2BillingAssociationDataError(
-                "sealed billing association sidecar has an invalid unresolved token"
-            )
+            raise PTG2BillingAssociationDataError("sealed billing association sidecar has an invalid unresolved token")
         return association_by_field
     if raw_id is None or raw_hmac is None:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing association sidecar is missing a matched token"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing association sidecar is missing a matched token")
     if type(raw_id) is not bytes or type(raw_hmac) is not bytes:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing association sidecar has an invalid matched token"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing association sidecar has an invalid matched token")
     association_by_field.update(
         {
             "tin_type": "ein",
@@ -163,25 +147,16 @@ def _sidecar_state(sidecar_record: Mapping[str, Any]) -> str:
     manifest_count = sidecar_record.get("manifest_count")
     legacy_count = sidecar_record.get("legacy_count")
     if type(manifest_count) is not int or type(legacy_count) is not int:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing association sidecar state is invalid"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing association sidecar state is invalid")
     if manifest_count == 1 and legacy_count in {0, 1}:
         if (
-            sidecar_record.get("contract")
-            != "ptg2_provider_group_tax_identity_v1"
-            or sidecar_record.get("normalization_contract")
-            != "ein_ascii_digits_or_2_7_hyphen_v1"
-            or sidecar_record.get("hmac_contract")
-            != "hmac_sha256_ptg_tin_v1"
+            sidecar_record.get("contract") != "ptg2_provider_group_tax_identity_v1"
+            or sidecar_record.get("normalization_contract") != "ein_ascii_digits_or_2_7_hyphen_v1"
+            or sidecar_record.get("hmac_contract") != "hmac_sha256_ptg_tin_v1"
         ):
-            raise PTG2BillingAssociationDataError(
-                "sealed billing association sidecar contract is invalid"
-            )
+            raise PTG2BillingAssociationDataError("sealed billing association sidecar contract is invalid")
         try:
-            descriptor_digest = sidecar_record.get(
-                "token_policy_descriptor_sha256"
-            )
+            descriptor_digest = sidecar_record.get("token_policy_descriptor_sha256")
             if type(descriptor_digest) is not bytes:
                 raise TypeError("token policy digest must be bytes")
             TinTokenPolicyDescriptor(
@@ -189,26 +164,18 @@ def _sidecar_state(sidecar_record: Mapping[str, Any]) -> str:
                 token_policy_descriptor_sha256=descriptor_digest.hex(),
             )
         except (TypeError, ValueError, TinNpiConnectorError) as exc:
-            raise PTG2BillingAssociationDataError(
-                "sealed billing association token policy is invalid"
-            ) from exc
+            raise PTG2BillingAssociationDataError("sealed billing association token policy is invalid") from exc
         return "active"
     if (manifest_count, legacy_count) == (0, 1):
         return "legacy"
-    raise PTG2BillingAssociationDataError(
-        "sealed billing association sidecar state is invalid"
-    )
+    raise PTG2BillingAssociationDataError("sealed billing association sidecar state is invalid")
 
 
 def _returned_provider_group_ref(
     association_record: Mapping[str, Any],
 ) -> str:
     raw_provider_group_ref = association_record.get("provider_group_ref")
-    return (
-        raw_provider_group_ref.lower()
-        if type(raw_provider_group_ref) is str
-        else ""
-    )
+    return raw_provider_group_ref.lower() if type(raw_provider_group_ref) is str else ""
 
 
 async def load_provider_group_billing_associations(
@@ -221,41 +188,27 @@ async def load_provider_group_billing_associations(
     """Read every requested exact provider-group association in one query."""
 
     if type(snapshot_key) is not int or not 1 <= snapshot_key < 2**63:
-        raise PTG2BillingAssociationDataError(
-            "billing association snapshot key is invalid"
-        )
+        raise PTG2BillingAssociationDataError("billing association snapshot key is invalid")
     normalized_refs = _normalized_provider_group_refs(provider_group_refs)
     if not normalized_refs:
         return {}
-    query_result = await session.execute(
+    query_result = await execute_network_read(
+        session,
         _billing_association_query(schema_name),
         {
             "snapshot_key": snapshot_key,
-            "provider_group_refs": [
-                bytes.fromhex(provider_group_ref)
-                for provider_group_ref in normalized_refs
-            ],
+            "provider_group_refs": [bytes.fromhex(provider_group_ref) for provider_group_ref in normalized_refs],
         },
     )
-    association_records = [
-        dict(association_record)
-        for association_record in query_result.mappings()
-    ]
+    association_records = [dict(association_record) for association_record in query_result.mappings()]
     if len(association_records) != len(normalized_refs):
-        raise PTG2BillingAssociationDataError(
-            "sealed billing association sidecar returned incomplete rows"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing association sidecar returned incomplete rows")
     association_by_group: dict[str, dict[str, Any]] = {}
     requested_refs = frozenset(normalized_refs)
     for association_record in association_records:
         provider_group_ref = _returned_provider_group_ref(association_record)
-        if (
-            provider_group_ref not in requested_refs
-            or provider_group_ref in association_by_group
-        ):
-            raise PTG2BillingAssociationDataError(
-                "sealed billing association sidecar returned invalid group rows"
-            )
+        if provider_group_ref not in requested_refs or provider_group_ref in association_by_group:
+            raise PTG2BillingAssociationDataError("sealed billing association sidecar returned invalid group rows")
         state = _sidecar_state(association_record)
         association_by_group[provider_group_ref] = (
             _legacy_association(provider_group_ref)

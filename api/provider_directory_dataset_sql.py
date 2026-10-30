@@ -167,3 +167,83 @@ def _provider_directory_current_resource_ctes_sql(
         affiliation_ready_sql=affiliation_ready_sql,
         current_plan_resources_sql=_provider_directory_current_plan_resources_sql(schema, has_dataset_insurance_plan),
     )
+
+
+def provider_directory_current_resource_join_sql(
+    resource_alias: str,
+    resource_type: str,
+    current_alias: str,
+) -> str:
+    """Join current resources by source, resource type, ID and last-seen run."""
+    return f"""
+          JOIN current_resources AS {current_alias}
+            ON {current_alias}.source_id = {resource_alias}.source_id
+           AND {current_alias}.resource_type = '{resource_type}'
+           AND {current_alias}.resource_id = {resource_alias}.resource_id
+           AND {resource_alias}.last_seen_run_id = {current_alias}.run_id
+    """
+
+
+def provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -> tuple[str, str, str]:
+    """Build network-name joins and provenance for catalog-aware and legacy readers."""
+    organization_join = (
+        "LEFT JOIN current_organizations AS network_organization "
+        "ON network_organization.dataset_id = network.dataset_id "
+        "AND network_organization.source_id = network.source_id "
+        "AND network_organization.resource_id = network.resource_id "
+        "AND network_organization.active IS DISTINCT FROM false"
+    )
+    if not has_catalog:
+        return organization_join, "network_organization.name", "'provider_directory_organization'::varchar"
+    catalog_join = (
+        f"LEFT JOIN {schema}.provider_directory_network_catalog AS network_catalog "
+        "ON network_catalog.source_id = network.source_id "
+        "AND network_catalog.network_resource_id = network.resource_id"
+    )
+    network_name = "COALESCE(network_catalog.provider_directory_network_name, network_organization.name)"
+    provenance = (
+        "CASE WHEN network_catalog.provider_directory_network_name IS NOT NULL "
+        "THEN 'provider_directory_network_catalog'::varchar "
+        "ELSE 'provider_directory_organization'::varchar END"
+    )
+    return f"{catalog_join} {organization_join}", network_name, provenance
+
+
+def legacy_affiliation_candidates_sql(
+    has_affiliations: bool,
+    has_dataset_affiliation_organization: bool,
+) -> str:
+    """Keep legacy affiliation candidates where dataset relations do not cover them."""
+    if not has_affiliations:
+        return """
+    affiliation_organization_candidates AS MATERIALIZED (
+        SELECT role_organization.dataset_id, role_organization.source_id,
+               role_organization.role_id,
+               role_organization.dataset_network_plan_complete,
+               NULL::varchar AS reference
+          FROM role_organizations AS role_organization
+         WHERE false
+    )
+        """
+    relation_fallback_filter = (
+        "AND NOT role_organization.dataset_affiliation_organization_complete"
+        if has_dataset_affiliation_organization
+        else ""
+    )
+    return f"""
+    affiliation_organization_candidates AS MATERIALIZED (
+        SELECT DISTINCT role_organization.dataset_id,
+               role_organization.source_id, role_organization.role_id,
+               role_organization.dataset_network_plan_complete,
+               organization_candidate.reference
+          FROM role_organizations AS role_organization
+         CROSS JOIN LATERAL (
+               VALUES
+                   (role_organization.organization_ref::varchar),
+                   (role_organization.organization_resource_id::varchar),
+                   (('Organization/' || role_organization.organization_resource_id)::varchar)
+         ) AS organization_candidate(reference)
+         WHERE NULLIF(BTRIM(organization_candidate.reference), '') IS NOT NULL
+           {relation_fallback_filter}
+    )
+    """

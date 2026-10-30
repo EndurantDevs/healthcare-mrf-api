@@ -575,7 +575,7 @@ async def _source_post(held, document, *, status=200, headers=None):
     if status == 403:
         assert not observed and not held.calls[calls:]
     else:
-        assert held.calls[calls:] == ["pin", "custody", "custody"]
+        assert held.calls[calls:] == ["pin", "custody"]
         identities = [identity for _statement, identity in observed]
         assert identities and len({identity[4] for identity in identities}) == 1
         assert all(identity[:4] == (held.role, held.role, "on", "repeatable read") for identity in identities)
@@ -925,7 +925,7 @@ async def test_native_reader_prepares_plan_temporary_tables_before_verified_snap
                     )
                     == 0
                 )
-        assert calls == ["pin", "custody", "custody"] * 3
+        assert calls == ["pin", "custody"] * 3
         assert database.engine is None and not held.writer_statements
     finally:
         await database.disconnect()

@@ -18,6 +18,7 @@ from api.code_systems import (
     normalize_code_system,
 )
 from api.endpoint.pagination import parse_pagination
+from api.network_read_execution import execute_network_read
 from api.reference_family_reads import claims_dictionary_tables
 from db.models import CodeCatalog, CodeCrosswalk, CodeSynonym
 
@@ -138,7 +139,7 @@ async def list_codes(request):
     count_query, query = _build_code_catalog_queries(
         code_system, query_text, source_name, code_catalog_table=code_catalog_table
     )
-    count_result = await session.execute(count_query)
+    count_result = await execute_network_read(session, count_query)
     total = int(count_result.scalar() or 0)
 
     order_column_by_name = {
@@ -153,7 +154,7 @@ async def list_codes(request):
     query = query.order_by(order_column.desc() if order == "desc" else order_column.asc())
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    code_result = await session.execute(query)
+    code_result = await execute_network_read(session, query)
     code_items = [_json_safe_row(_row_to_dict(code_row)) for code_row in code_result]
 
     return response.json(
@@ -195,7 +196,7 @@ async def get_code(request, code_system: str, code: str):
             func.upper(code_catalog_table.c.code) == normalized_code,
         )
     )
-    result = await session.execute(query)
+    result = await execute_network_read(session, query)
     row = result.first()
     if row is None:
         raise sanic.exceptions.NotFound("Code not found")
@@ -231,8 +232,8 @@ async def get_related_codes(request, code_system: str, code: str):
         forward_query = forward_query.where(func.upper(code_crosswalk_table.c.to_system).notin_(("SNOMEDCT_US",)))
         reverse_query = reverse_query.where(func.upper(code_crosswalk_table.c.from_system).notin_(("SNOMEDCT_US",)))
 
-    forward_result = await session.execute(forward_query)
-    reverse_result = await session.execute(reverse_query)
+    forward_result = await execute_network_read(session, forward_query)
+    reverse_result = await execute_network_read(session, reverse_query)
 
     forward_items = [_json_safe_row(_row_to_dict(crosswalk_row)) for crosswalk_row in forward_result]
     reverse_items = [_json_safe_row(_row_to_dict(crosswalk_row)) for crosswalk_row in reverse_result]

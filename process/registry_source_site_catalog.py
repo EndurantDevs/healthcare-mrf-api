@@ -35,13 +35,12 @@ class RegistrySourceSiteCatalogUnavailable(RuntimeError):
 _SITES_SQL = """WITH bindings AS MATERIALIZED (
   SELECT binding.*,address.location_key AS matched_key
   FROM {namespace}.provider_location_binding binding
-  LEFT JOIN {namespace}.entity_address_unified address
+  LEFT JOIN {addresses} address
     ON (address.location_key,address.entity_type,address.entity_id)
       =(binding.location_key,binding.entity_type,binding.entity_id)
   WHERE binding.provider_system=$1 AND binding.provider_id=$2
 ), integrity AS (
   SELECT count(*)=count(DISTINCT location_id)
-    AND count(*)=count(DISTINCT location_key)
     AND coalesce(bool_and(matched_key IS NOT NULL AND location_id<>'00000000-0000-0000-0000-000000000000'::uuid
       AND location_key ~ '^[0-9a-f]{{64}}$'),true) AS valid FROM bindings
 ), page AS MATERIALIZED (
@@ -54,7 +53,7 @@ _SITES_SQL = """WITH bindings AS MATERIALIZED (
     'display',jsonb_build_object('entity_name',address.entity_name,'first_line',address.first_line,
       'second_line',address.second_line,'city_name',address.city_name,'state_name',address.state_name,
       'postal_code',address.postal_code,'country_code',address.country_code)) AS document
-  FROM page JOIN {namespace}.entity_address_unified address
+  FROM page JOIN {addresses} address
     ON (address.location_key,address.entity_type,address.entity_id)
       =(page.location_key,page.entity_type,page.entity_id)
   ORDER BY page.location_id,page.location_key LIMIT ($3-1)
@@ -134,17 +133,27 @@ async def read_registry_source_sites(
         pinned_manifest = await resolve_network_serving_manifest(
             connection, generation_id=generation_id, control_schema=control_schema
         )
+        addresses, address_arguments = _source_addresses(pinned_manifest)
         receipt = await connection.fetchrow(
-            _SITES_SQL.format(namespace=_identifier(pinned_manifest.schema_name)),
+            _SITES_SQL.format(namespace=_identifier(pinned_manifest.schema_name), addresses=addresses),
             provider_system,
             provider_id,
             limit + 1,
             offset,
             pinned_manifest.generation_id,
             MAX_RESPONSE_BYTES,
+            *address_arguments,
         )
         return _verified_result(receipt)
     except RegistrySourceSiteCatalogError:
         raise
     except NetworkServingReadUnavailable, asyncpg.PostgresError, ValueError, TypeError, KeyError:
         raise RegistrySourceSiteCatalogUnavailable("Retained source offices are unavailable") from None
+
+
+def _source_addresses(manifest):
+    if manifest.compact_layout is None:
+        return _identifier(manifest.schema_name) + ".entity_address_unified", ()
+    from api.network_compact_address import compact_address_native_sql
+
+    return compact_address_native_sql(manifest.compact_layout, first_parameter=7, visible_membership_sql="TRUE")

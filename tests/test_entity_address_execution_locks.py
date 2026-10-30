@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Fresh set-based lock metadata retains complete executing-backend identity checks."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -39,10 +40,12 @@ def _damage(rows, damage):
 async def test_owned_lock_uses_one_fresh_census_after_each_backend_lock(monkeypatch, count):
     """Both small and multirow owned inventories issue one metadata query on every call."""
     scope = SimpleNamespace(
-        db_schema="synthetic", owned_oids={f"stage_{index:03}": index + 41 for index in range(count)}
+        db_schema="synthetic",
+        owned_oids={f"stage_{index:03}": index + 41 for index in range(count)},
+        admission=SimpleNamespace(inventory_transition=nullcontext),
     )
-    rows = [(f"synthetic.{name}", oid) for name, oid in sorted(scope.owned_oids.items())]
-    database = _database(rows)
+    relation_rows = [(f"synthetic.{name}", oid) for name, oid in sorted(scope.owned_oids.items())]
+    database = _database(relation_rows)
     prepared_lock, building, ownership = AsyncMock(), Mock(), Mock()
     monkeypatch.setattr(
         admitted,
@@ -57,9 +60,9 @@ async def test_owned_lock_uses_one_fresh_census_after_each_backend_lock(monkeypa
             await admitted.lock_owned_relations(database)
             assert database.status.await_count == database.all.await_count == attempt
         assert database.status.await_args.args == (
-            "LOCK TABLE " + ", ".join(name for name, _oid in rows) + " IN ACCESS SHARE MODE NOWAIT",
+            "LOCK TABLE " + ", ".join(name for name, _oid in relation_rows) + " IN ACCESS SHARE MODE NOWAIT",
         )
-        assert database.all.await_args.kwargs == {"relations": [name for name, _oid in rows]}
+        assert database.all.await_args.kwargs == {"relations": [name for name, _oid in relation_rows]}
         assert ownership.call_count == 2 * count and building.call_count == prepared_lock.await_count == 2
         database.scalar.assert_not_awaited()
     finally:
@@ -70,7 +73,11 @@ async def test_owned_lock_uses_one_fresh_census_after_each_backend_lock(monkeypa
 @pytest.mark.parametrize("damage", ("missing-row", "extra-row", "duplicate", "reordered", "missing-oid", "replacement"))
 async def test_owned_lock_rejects_incomplete_or_changed_multirow_census(monkeypatch, damage):
     """No absent, duplicate or replaced heap can disappear while building the observed map."""
-    scope = SimpleNamespace(db_schema="synthetic", owned_oids={"a": 41, "b": 42, "c": 43})
+    scope = SimpleNamespace(
+        db_schema="synthetic",
+        owned_oids={"a": 41, "b": 42, "c": 43},
+        admission=SimpleNamespace(inventory_transition=nullcontext),
+    )
     database = _database(_damage([(f"synthetic.{name}", oid) for name, oid in scope.owned_oids.items()], damage))
     monkeypatch.setattr(
         admitted,

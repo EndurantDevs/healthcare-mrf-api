@@ -316,9 +316,15 @@ async def _canonical_enum_oid(session):
 
 async def require_native_read_catalog(session, oids, *, allowed_type_oids=(), executable_roles=None):
     """Reuse the common native execution boundary before privileged SOURCE payload reads."""
+    _native_execution_subjects(executable_roles)
+    await _require_native_read_structure(session, oids, allowed_type_oids)
+    for oid in oids:
+        await _require_native_expression_owners(session, oid, executable_roles=executable_roles)
+
+
+async def _require_native_read_structure(session, oids, allowed_type_oids):
     from process import entity_address_native_publication as native
 
-    _native_execution_subjects(executable_roles)
     if not oids or any(type(oid) is not int or oid <= 0 for oid in oids):
         raise RuntimeError("native SOURCE catalog is incomplete")
     safe = await session.scalar(
@@ -339,8 +345,56 @@ async def require_native_read_catalog(session, oids, *, allowed_type_oids=(), ex
         allowed_type_oids=allowed_type_oids,
         allowed_extensions=("postgis", "intarray", "btree_gin", "btree_gist", "pg_trgm"),
     )
-    for oid in oids:
-        await _require_native_expression_owners(session, oid, executable_roles=executable_roles)
+
+
+async def require_native_read_catalog_subjects(session, oids, subjects):
+    """Check the address artifact's two heaps against all bounded execution subjects."""
+    from db.plan_release_storage import storage_identifier
+
+    if (
+        type(subjects) is not tuple
+        or not 1 <= len(subjects) <= 33
+        or any(type(role) is not str for role in subjects)
+        or len(set(subjects)) != len(subjects)
+        or len(oids) != 2
+    ):
+        raise RuntimeError("native SOURCE executable roles are invalid")
+    for role in subjects:
+        storage_identifier(role)
+    await _require_native_read_structure(session, oids, ())
+    safe = await session.scalar(
+        text(
+            "WITH objects(classid,objid) AS (SELECT 'pg_class'::regclass,indexrelid "
+            "FROM pg_catalog.pg_index WHERE indrelid=ANY(CAST(:oids AS oid[])) UNION ALL "
+            "SELECT 'pg_attrdef'::regclass,oid FROM pg_catalog.pg_attrdef WHERE adrelid=ANY(CAST(:oids AS oid[])) UNION ALL "
+            "SELECT 'pg_constraint'::regclass,oid FROM pg_catalog.pg_constraint WHERE conrelid=ANY(CAST(:oids AS oid[]))), "
+            "referenced AS (SELECT d.refclassid,d.refobjid FROM objects x JOIN pg_catalog.pg_depend d "
+            "ON (d.classid,d.objid)=(x.classid,x.objid)), "
+            "families AS (SELECT c.opcowner,f.opfowner,f.oid FROM pg_catalog.pg_index i,LATERAL unnest(i.indclass) cls(oid) "
+            "JOIN pg_catalog.pg_opclass c ON c.oid=cls.oid JOIN pg_catalog.pg_opfamily f ON f.oid=c.opcfamily "
+            "WHERE i.indrelid=ANY(CAST(:oids AS oid[]))), "
+            "owners(oid) AS (SELECT p.proowner FROM referenced d JOIN pg_catalog.pg_proc p "
+            "ON d.refclassid='pg_proc'::regclass AND p.oid=d.refobjid UNION "
+            "SELECT o.oprowner FROM referenced d JOIN pg_catalog.pg_operator o "
+            "ON d.refclassid='pg_operator'::regclass AND o.oid=d.refobjid UNION "
+            "SELECT p.proowner FROM referenced d JOIN pg_catalog.pg_operator o "
+            "ON d.refclassid='pg_operator'::regclass AND o.oid=d.refobjid JOIN pg_catalog.pg_proc p ON p.oid=o.oprcode UNION "
+            "SELECT opcowner FROM families UNION SELECT opfowner FROM families UNION "
+            "SELECT p.proowner FROM families f JOIN pg_catalog.pg_amproc a ON a.amprocfamily=f.oid "
+            "JOIN pg_catalog.pg_proc p ON p.oid=a.amproc UNION "
+            "SELECT o.oprowner FROM families f JOIN pg_catalog.pg_amop a ON a.amopfamily=f.oid "
+            "JOIN pg_catalog.pg_operator o ON o.oid=a.amopopr UNION "
+            "SELECT p.proowner FROM families f JOIN pg_catalog.pg_amop a ON a.amopfamily=f.oid "
+            "JOIN pg_catalog.pg_operator o ON o.oid=a.amopopr JOIN pg_catalog.pg_proc p ON p.oid=o.oprcode), "
+            "subjects AS (SELECT r.oid FROM unnest(CAST(:subjects AS text[])) requested(name) "
+            "LEFT JOIN pg_catalog.pg_roles r ON r.rolname=requested.name) "
+            "SELECT (SELECT count(*)=cardinality(CAST(:subjects AS text[])) AND bool_and(oid IS NOT NULL) FROM subjects) "
+            "AND NOT EXISTS(SELECT 1 FROM subjects s CROSS JOIN owners o WHERE pg_catalog.pg_has_role(s.oid,o.oid,'MEMBER'))"
+        ),
+        {"oids": list(oids), "subjects": list(subjects)},
+    )
+    if safe is not True:
+        raise RuntimeError("canonical source executable ownership is unsupported")
 
 
 def _native_execution_subjects(executable_roles):
