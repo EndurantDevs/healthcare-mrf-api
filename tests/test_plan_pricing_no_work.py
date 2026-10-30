@@ -3,18 +3,22 @@
 
 from copy import deepcopy
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from db.models import ImportRun
 from process.plan_pricing_admission import PricingAdmission
 from process.plan_pricing_control import DELIVERY_FIELD, pricing_control_digest, projection_admission_key
+from process.plan_pricing_control_catalog import NATIVE_RUN_COLUMNS
 from process.plan_pricing_no_work import (
     RETRY_INDEX,
     RETRY_PREDICATE,
     _expected_runs,
     _require_terminal_run,
     native_run_coordinates,
+    require_native_control_shape,
 )
 
 
@@ -105,3 +109,28 @@ def test_runtime_model_keeps_nonunique_complete_retry_census_index():
     assert matching_specs[0]["index_elements"] == ("retry_of_run_id", "run_id")
     assert matching_specs[0]["where"] == RETRY_PREDICATE
     assert not matching_specs[0].get("unique", False)
+
+
+def test_native_column_contract_matches_the_complete_runtime_model():
+    assert NATIVE_RUN_COLUMNS == tuple(ImportRun.__table__.columns.keys())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ("missing", "extra", "reordered", "substituted"))
+async def test_native_column_contract_refuses_changed_runtime_shape(damage):
+    names = list(ImportRun.__table__.columns.keys())
+    if damage == "missing":
+        names.pop()
+    elif damage == "extra":
+        names.append("unexpected")
+    elif damage == "reordered":
+        names[0], names[1] = names[1], names[0]
+    else:
+        names[-1] = "unexpected"
+    connection = SimpleNamespace(
+        fetch=AsyncMock(return_value=[{"attname": name} for name in names]),
+        fetchrow=AsyncMock(),
+    )
+    with pytest.raises(ValueError, match="native_run_columns_changed"):
+        await require_native_control_shape(connection)
+    connection.fetchrow.assert_not_awaited()

@@ -14,7 +14,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database
-from process.ptg_parts import ptg2_lifecycle_lock as lifecycle
 from process.ptg_parts import ptg2_plan_catalog as catalog
 from process.ptg_parts import ptg2_plan_catalog_outbox as outbox
 from tests.test_ptg_wave_recovery_storage_postgres import (
@@ -23,11 +22,8 @@ from tests.test_ptg_wave_recovery_storage_postgres import (
     _quote,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = ROOT / "alembic" / "versions" / (
-    "20260810140000_ptg2_plan_catalog_outbox.py"
-)
+MIGRATION_PATH = ROOT / "alembic" / "versions" / ("20260810140000_ptg2_plan_catalog_outbox.py")
 _CREATED_AT = datetime.datetime(2026, 8, 10, tzinfo=datetime.UTC).replace(tzinfo=None)
 
 
@@ -107,20 +103,27 @@ async def _enqueue_source(sessions, schema: str, source_number: int) -> str:
 
 async def _create_plan_catalog_tables(engine, schema: str) -> None:
     statements = (
-        (f"CREATE TABLE {schema}.ptg2_plan ("
+        (
+            f"CREATE TABLE {schema}.ptg2_plan ("
             "plan_hash varchar(64) PRIMARY KEY, hash_prefix varchar(16), "
             "plan_id varchar(64), plan_id_type varchar(32), plan_name text, "
             "plan_market_type varchar(32), issuer_name text, "
             "plan_sponsor_name text, canonical_payload json, "
-            "created_at timestamp without time zone)"),
-        (f"CREATE TABLE {schema}.ptg2_plan_alias ("
+            "created_at timestamp without time zone)"
+        ),
+        (
+            f"CREATE TABLE {schema}.ptg2_plan_alias ("
             "alias_hash varchar(64) PRIMARY KEY, plan_hash varchar(64), "
             "alias_type varchar(32), alias_value text, "
-            "created_at timestamp without time zone)"),
-        (f"CREATE TABLE {schema}.ptg2_plan_month ("
+            "created_at timestamp without time zone)"
+        ),
+        (
+            f"CREATE TABLE {schema}.ptg2_plan_month ("
             "plan_month_id text PRIMARY KEY, snapshot_id text, "
-            "plan_hash varchar(64), import_month date)"),
-        (f"CREATE TABLE {schema}.ptg2_plan_catalog_outbox ("
+            "plan_hash varchar(64), import_month date)"
+        ),
+        (
+            f"CREATE TABLE {schema}.ptg2_plan_catalog_outbox ("
             "request_id varchar(64) PRIMARY KEY, snapshot_id varchar(96) NOT NULL, "
             "chunk_index integer NOT NULL, chunk_count integer NOT NULL, "
             "payload_sha256 varchar(64) NOT NULL, "
@@ -133,7 +136,8 @@ async def _create_plan_catalog_tables(engine, schema: str) -> None:
             "terminal_error_code varchar(64), terminal_at timestamptz, "
             "created_at timestamptz NOT NULL DEFAULT now(), "
             "updated_at timestamptz NOT NULL DEFAULT now(), "
-            "UNIQUE (snapshot_id, chunk_index))"),
+            "UNIQUE (snapshot_id, chunk_index))"
+        ),
     )
     async with engine.begin() as connection:
         await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
@@ -172,15 +176,9 @@ async def _assert_contended_catalog_drains_defer(
     schema: str,
     local_db,
 ) -> None:
-    request_ids = await asyncio.gather(
-        *(_enqueue_source(sessions, schema, number) for number in range(1, 24))
-    )
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_plan_month"
-    ) == 23
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox"
-    ) == 23
+    request_ids = await asyncio.gather(*(_enqueue_source(sessions, schema, number) for number in range(1, 24)))
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_plan_month") == 23
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox") == 23
     started = time.monotonic()
     drains = await asyncio.gather(
         *(
@@ -193,20 +191,14 @@ async def _assert_contended_catalog_drains_defer(
     )
     assert time.monotonic() - started < 2
     assert sum(drain_result.deferred for drain_result in drains) == 23
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox"
-    ) == 23
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox") == 23
 
 
 async def _assert_catalog_replay(schema: str, local_db) -> None:
     replay = await outbox.drain_immutable_plan_catalog_outbox(max_requests=64)
     assert replay.persisted == 23
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox"
-    ) == 0
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_plan_alias"
-    ) == 1
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox") == 0
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_plan_alias") == 1
 
 
 async def _assert_catalog_crash_gap_replay(
@@ -215,18 +207,18 @@ async def _assert_catalog_crash_gap_replay(
     local_db,
 ) -> None:
     crash_request = await _enqueue_source(sessions, schema, 24)
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox "
-        f"WHERE request_id = '{crash_request}'"
-    ) == 1
+    assert (
+        await local_db.scalar(
+            f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox WHERE request_id = '{crash_request}'"
+        )
+        == 1
+    )
     crash_replay = await outbox.drain_immutable_plan_catalog_outbox(
         max_requests=1,
         request_id=crash_request,
     )
     assert crash_replay.persisted == 1
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox"
-    ) == 0
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox") == 0
 
 
 async def _assert_conflicting_catalog_rejected(plan_row: dict) -> None:
@@ -261,7 +253,6 @@ async def test_held_shared_plan_insert_does_not_block_twenty_three_sources(
     monkeypatch.setattr(outbox, "db", local_db)
     monkeypatch.setattr(catalog, "resolve_ptg2_schema", lambda: schema_name)
     monkeypatch.setattr(outbox, "resolve_ptg2_schema", lambda: schema_name)
-    monkeypatch.setattr(lifecycle, "db", local_db)
     monkeypatch.setattr(outbox, "_OUTBOX_RETRY_SECONDS", 0)
 
     await _create_plan_catalog_tables(engine, schema)
@@ -308,9 +299,7 @@ def test_plan_catalog_outbox_migration_is_source_local_and_replayable(
     assert "payload_bytes BETWEEN 1 AND 524288" in sql
     assert "terminal_error_code" in sql
     migration.downgrade()
-    assert "refusing to downgrade pending, leased, or poisoned" in "\n".join(
-        statements
-    )
+    assert "refusing to downgrade pending, leased, or poisoned" in "\n".join(statements)
 
 
 async def _enqueue_catalog(
@@ -348,14 +337,9 @@ async def _prepare_large_catalog(sessions, schema: str, local_db):
             plans=[_numbered_plan_row(ordinal)],
             aliases=[_numbered_alias_row(ordinal)],
         )
-    bounds = await local_db.all(
-        f"SELECT plan_count, alias_count, payload_bytes "
-        f"FROM {schema}.ptg2_plan_catalog_outbox"
-    )
+    bounds = await local_db.all(f"SELECT plan_count, alias_count, payload_bytes FROM {schema}.ptg2_plan_catalog_outbox")
     assert all(
-        0 <= int(bound_row[0]) <= 16
-        and 0 <= int(bound_row[1]) <= 128
-        and 1 <= int(bound_row[2]) <= 512 * 1024
+        0 <= int(bound_row[0]) <= 16 and 0 <= int(bound_row[1]) <= 128 and 1 <= int(bound_row[2]) <= 512 * 1024
         for bound_row in bounds
     )
     return huge_plans
@@ -380,17 +364,11 @@ async def _assert_fair_catalog_drain(
         7,
         1,
     )
-    assert await local_db.scalar(
-        f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox"
-    ) == 3
+    assert await local_db.scalar(f"SELECT COUNT(*) FROM {schema}.ptg2_plan_catalog_outbox") == 3
     await holder_transaction.commit()
     await holder.close()
-    assert (
-        await outbox.drain_immutable_plan_catalog_outbox(max_requests=8)
-    ).persisted == 2
-    assert (
-        await outbox.drain_immutable_plan_catalog_outbox(max_requests=8)
-    ).persisted == 1
+    assert (await outbox.drain_immutable_plan_catalog_outbox(max_requests=8)).persisted == 2
+    assert (await outbox.drain_immutable_plan_catalog_outbox(max_requests=8)).persisted == 1
 
 
 async def _assert_catalog_lease_fence(engine, sessions, schema: str) -> None:
@@ -458,10 +436,12 @@ async def _assert_poison_does_not_block_peer(
     )
     poison_drain = await outbox.drain_immutable_plan_catalog_outbox(max_requests=2)
     assert (poison_drain.poisoned, poison_drain.persisted) == (1, 1)
-    assert await local_db.scalar(
-        f"SELECT terminal_error_code FROM {schema}.ptg2_plan_catalog_outbox "
-        "WHERE snapshot_id = 'poison-first'"
-    ) == "immutable_conflict"
+    assert (
+        await local_db.scalar(
+            f"SELECT terminal_error_code FROM {schema}.ptg2_plan_catalog_outbox WHERE snapshot_id = 'poison-first'"
+        )
+        == "immutable_conflict"
+    )
 
 
 @pytest.mark.asyncio
@@ -486,7 +466,6 @@ async def test_large_oldest_catalog_is_chunked_fair_and_token_fenced(monkeypatch
     monkeypatch.setattr(outbox, "db", local_db)
     monkeypatch.setattr(catalog, "resolve_ptg2_schema", lambda: schema_name)
     monkeypatch.setattr(outbox, "resolve_ptg2_schema", lambda: schema_name)
-    monkeypatch.setattr(lifecycle, "db", local_db)
     monkeypatch.setattr(outbox, "_OUTBOX_RETRY_SECONDS", 0)
     await _create_plan_catalog_tables(engine, schema)
 

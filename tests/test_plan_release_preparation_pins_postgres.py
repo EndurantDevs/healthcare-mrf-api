@@ -3,15 +3,18 @@
 
 import asyncio
 import json
+from dataclasses import replace
 
 import asyncpg
 import pytest
 
-from process.plan_release_preparation_pin_contract import PreparationPinInputs
+from process.plan_pricing_control import pricing_control_digest
+from process.plan_release_preparation_pin_contract import PlanReleasePublication, PreparationPinInputs, digest
 from process.plan_release_preparation_pins import publish_prepared_plan_release, retain_preparation_pins
 from process.ptg_parts.ptg2_source_snapshot_gc import _CURRENT_SNAPSHOT_IDS_SQL
-from tests.plan_release_preparation_pin_postgres_support import prepare_pin_case, seal_native_publication
-from tests.plan_release_storage_postgres_support import NEW_REVISION, OLD_REVISION, storage_case
+from tests.plan_release_preparation_pin_postgres_support import prepare_pin_case, seal_native_publication, settle
+from tests.plan_release_storage_postgres_support import NEW_REVISION, OLD_REVISION, PLAN, RELEASE, storage_case
+from tests.test_plan_release_preparation_pin_contract import binding_input_inventory
 
 
 @pytest.mark.asyncio
@@ -102,6 +105,93 @@ async def retain_case(prepared):
         authority=prepared.authority,
         **prepared.case.profile,
     )
+
+
+async def prepare_distinct_digest_publication(case):
+    """Keep native fixture custody separate from the managed aggregate commitment."""
+    prepared = await prepare_pin_case(case)
+    inventory = binding_input_inventory(prepared.scope, PLAN)
+    prepared.scope = replace(
+        prepared.scope, binding_inputs_digest=pricing_control_digest(inventory["binding_input_seal"])
+    )
+    admin = await case.connect()
+    await admin.execute(
+        f"UPDATE {prepared.tables['preparation']} SET scope=$1::jsonb,inventory=inventory || $2::jsonb",
+        json.dumps(prepared.scope.payload()),
+        json.dumps(inventory),
+    )
+    receipt = await retain_case(prepared)
+    await settle(prepared, {NEW_REVISION: "ready"})
+    publication = PlanReleasePublication(
+        NEW_REVISION,
+        RELEASE,
+        PLAN,
+        None,
+        "2026-10",
+        prepared.binding_heap.row_count,
+        prepared.binding_heap.payload_digest,
+        {"binding_payload_digest": prepared.binding_heap.payload_digest},
+    ).validate()
+    await admin.execute(
+        f"UPDATE {prepared.tables['preparation']} SET inventory=jsonb_set(inventory,'{{publication_digest}}',$1::jsonb)",
+        json.dumps(digest(publication.payload())),
+    )
+    return prepared, receipt, publication
+
+
+@pytest.mark.asyncio
+async def test_native_publication_preserves_distinct_physical_and_managed_digests():
+    async with storage_case(provisioned=True) as case:
+        prepared, receipt, publication = await prepare_distinct_digest_publication(case)
+        assert publication.binding_set_digest != receipt.scope.binding_inputs_digest
+        assert digest(publication.payload()) != receipt.scope.binding_inputs_digest
+        await publish_prepared_case(prepared, receipt, publication)
+        admin = await case.connect()
+        header = await admin.fetchrow(
+            f"SELECT * FROM {case.relation('plan_release_serving_revision')} WHERE is_current"
+        )
+        assert header["serving_revision_id"] == NEW_REVISION
+        assert header["binding_set_digest"] == prepared.binding_heap.payload_digest
+        inventory = json.loads(await admin.fetchval(f"SELECT inventory FROM {prepared.tables['preparation']}"))
+        assert inventory["publication_digest"] == digest(publication.payload())
+        assert inventory["registered"] == json.loads(json.dumps(receipt.payload()))
+        assert receipt.scope.binding_inputs_digest == pricing_control_digest(inventory["binding_input_seal"])
+        assert await admin.fetchval("SELECT relispartition FROM pg_class WHERE oid=$1", receipt.heap.oid)
+        assert await admin.fetchval("SELECT relispartition FROM pg_class WHERE oid=$1", prepared.binding_heap.oid)
+        assert await admin.fetchval(f"SELECT status FROM {prepared.tables['preparation']}") == "published"
+        assert await prepared.publisher.fetchval("SELECT current_user=session_user")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize("damage", ["physical", "scope"])
+async def test_native_publication_rolls_back_changed_digest_domain(phase, damage):
+    async with storage_case(provisioned=True) as case:
+        prepared, receipt, publication = await prepare_distinct_digest_publication(case)
+        admin = await case.connect()
+        header = case.relation("plan_release_serving_revision")
+        headers_before = await admin.fetch(f"SELECT * FROM {header} ORDER BY serving_revision_id")
+        preparation_before = await admin.fetchrow(f"SELECT * FROM {prepared.tables['preparation']}")
+
+        async def changed_commitment(connection, scope, **options):
+            witness = await prepared.authority(connection, scope, **options)
+            if options["action"] != "publish" or options["phase"] != phase:
+                return witness
+            if damage == "physical":
+                changed_header = replace(publication, binding_set_digest=digest({"binding": "changed"}))
+                return replace(witness, publication_digest=digest(changed_header.payload()))
+            seal = binding_input_inventory(scope, PLAN)["binding_input_seal"]
+            changed_scope = replace(scope, binding_inputs_digest=pricing_control_digest({**seal, "revision_count": 2}))
+            return replace(witness, scope=changed_scope)
+
+        error = "publication_authority_changed" if damage == "physical" else "authority_scope_changed"
+        with pytest.raises(ValueError, match=error):
+            await publish_prepared_case(prepared, receipt, publication, authority=changed_commitment)
+        assert await admin.fetch(f"SELECT * FROM {header} ORDER BY serving_revision_id") == headers_before
+        assert await admin.fetchrow(f"SELECT * FROM {prepared.tables['preparation']}") == preparation_before
+        assert not await admin.fetchval("SELECT relispartition FROM pg_class WHERE oid=$1", prepared.binding_heap.oid)
+        assert await admin.fetchval("SELECT relispartition FROM pg_class WHERE oid=$1", receipt.heap.oid)
+        assert await prepared.publisher.fetchval("SELECT current_user=session_user")
 
 
 @pytest.mark.asyncio

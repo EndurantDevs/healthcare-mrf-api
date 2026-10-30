@@ -7,6 +7,32 @@ from process.plan_pricing_control_policy import pricing_control_schema
 from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import _document
 
+NATIVE_RUN_COLUMNS = (
+    "run_id",
+    "engine",
+    "node_id",
+    "importer",
+    "family",
+    "status",
+    "phase_detail",
+    "params",
+    "idempotency_key",
+    "triggered_by",
+    "schedule_id",
+    "subscription_id",
+    "source_file_import_id",
+    "created_at",
+    "started_at",
+    "finished_at",
+    "heartbeat_at",
+    "progress",
+    "metrics",
+    "error",
+    "snapshot_id",
+    "import_id",
+    "retry_of_run_id",
+)
+
 CONTROL_SHAPES = {
     "catalog_release_preparation": {
         "columns": [
@@ -63,19 +89,10 @@ CONTROL_SHAPES = {
             "AND "
             "(jsonb_typeof(inventory) "
             "= 'object'::text)))",
-            "catalog_release_preparation_status_check": "CHECK "
-            "(((status)::text = "
-            "ANY "
-            "((ARRAY['preparing'::character "
-            "varying, "
-            "'admitting'::character "
-            "varying, "
-            "'sealed'::character "
-            "varying, "
-            "'published'::character "
-            "varying, "
-            "'abandoned'::character "
-            "varying])::text[])))",
+            "catalog_release_preparation_status_check": "CHECK (((status)::text = ANY "
+            "(ARRAY[('preparing'::character varying)::text, ('admitting'::character varying)::text, "
+            "('sealed'::character varying)::text, ('published'::character varying)::text, "
+            "('abandoned'::character varying)::text])))",
         },
         "indexes": [
             [["final_generation_id"], False, True],
@@ -121,32 +138,13 @@ CONTROL_SHAPES = {
             "~ "
             "'^[0-9a-f]{64}$'::text)))",
             "catalog_release_admission_request_check": "CHECK ((jsonb_typeof(request) = 'object'::text))",
-            "catalog_release_admission_run_check": "CHECK "
-            "((((status)::text "
-            "= ANY "
-            "((ARRAY['reserved'::character "
-            "varying, "
-            "'dispatching'::character "
-            "varying, "
-            "'failed'::character "
-            "varying])::text[])) "
-            "OR (engine_run_id "
-            "IS NOT NULL)))",
-            "catalog_release_admission_status_check": "CHECK "
-            "(((status)::text "
-            "= ANY "
-            "((ARRAY['reserved'::character "
-            "varying, "
-            "'dispatching'::character "
-            "varying, "
-            "'accepted'::character "
-            "varying, "
-            "'ready'::character "
-            "varying, "
-            "'unavailable'::character "
-            "varying, "
-            "'failed'::character "
-            "varying])::text[])))",
+            "catalog_release_admission_run_check": "CHECK ((((status)::text = ANY "
+            "(ARRAY[('reserved'::character varying)::text, ('dispatching'::character varying)::text, "
+            "('failed'::character varying)::text])) OR (engine_run_id IS NOT NULL)))",
+            "catalog_release_admission_status_check": "CHECK (((status)::text = ANY "
+            "(ARRAY[('reserved'::character varying)::text, ('dispatching'::character varying)::text, "
+            "('accepted'::character varying)::text, ('ready'::character varying)::text, "
+            "('unavailable'::character varying)::text, ('failed'::character varying)::text])))",
         },
         "indexes": [
             [["admission_key"], False, True],

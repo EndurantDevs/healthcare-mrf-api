@@ -12,6 +12,7 @@ import pytest
 
 from process import plan_release_preparation_pin_retirement as history
 from process import plan_release_preparation_pins as pins
+from process.plan_pricing_control import pricing_control_digest
 from process.plan_release_preparation_pin_contract import (
     PlanReleaseHistoryAuthority,
     PlanReleasePublication,
@@ -33,6 +34,32 @@ def scope():
     return PreparationPinScope(
         UUID(int=1), "a" * 64, "b" * 64, "c" * 64, "d" * 64, (("e" * 64, REVISION),), ("synthetic_source",)
     ).validate()
+
+
+def binding_input_inventory(identity, plan):
+    """Build the managed aggregate seal independently of a physical publication."""
+    cohort_by_field = {
+        "revisions": list(identity.revision_ids),
+        "plans": [plan],
+        "source_keys": list(identity.source_keys),
+    }
+    inputs_by_key = {
+        pricing_control_digest(cohort_by_field): {
+            "identity": cohort_by_field,
+            "admission_inputs": True,
+            "scope_digest": identity.scope_digest,
+            "outcome_receipt_digest": identity.outcome_receipt_digest,
+        }
+    }
+    return {
+        "binding_inputs": inputs_by_key,
+        "binding_input_seal": {
+            "scope_digest": identity.scope_digest,
+            "outcome_receipt_digest": identity.outcome_receipt_digest,
+            "cohorts_digest": pricing_control_digest(inputs_by_key),
+            "revision_count": len(identity.revision_ids),
+        },
+    }
 
 
 def heap():
@@ -167,11 +194,17 @@ def test_publication_payload_preserves_and_copies_exact_manifest():
 
 def publication_case(monkeypatch):
     header = publication()
+    inventory = binding_input_inventory(scope(), header.healthporta_plan_id)
+    identity = replace(scope(), binding_inputs_digest=pricing_control_digest(inventory["binding_input_seal"]))
     binding = replace(heap(), name="binding_cohort", oid=7)
     inputs = pins.PreparationPinInputs(binding, heap())
-    receipt = PreparationPinReceipt(scope(), heap(), 4, 5, (REVISION,)).validate()
+    receipt = PreparationPinReceipt(identity, heap(), 4, 5, (REVISION,)).validate()
     before = replace(
-        witness(), registered_receipt=receipt, binding_heap=binding, publication_digest=digest(header.payload())
+        witness(),
+        scope=identity,
+        registered_receipt=receipt,
+        binding_heap=binding,
+        publication_digest=digest(header.payload()),
     )
     after = replace(before, preparation_status="published", writers_closed=True)
     events = []
@@ -199,9 +232,15 @@ def publication_case(monkeypatch):
     monkeypatch.setattr(
         pins, "_original_publisher_identity", AsyncMock(return_value=(2, 3, "4", "publisher", "publisher"))
     )
-    monkeypatch.setattr(pins, "_authorize", AsyncMock(side_effect=(before, after)))
     return SimpleNamespace(
-        header=header, inputs=inputs, receipt=receipt, connection=connection, events=events, before=before, after=after
+        header=header,
+        inputs=inputs,
+        receipt=receipt,
+        connection=connection,
+        events=events,
+        before=before,
+        after=after,
+        authority=AsyncMock(side_effect=(before, after)),
     )
 
 
@@ -216,13 +255,16 @@ async def publish_case(case):
         owner_role="storage_owner",
         publisher_role="publisher",
         reader_roles=("reader",),
-        authority=AsyncMock(),
+        authority=case.authority,
     )
 
 
 @pytest.mark.asyncio
 async def test_publication_authorizes_exact_header_before_and_after_native_cut(monkeypatch):
     case = publication_case(monkeypatch)
+    assert case.header.binding_set_digest != case.receipt.scope.binding_inputs_digest
+    assert case.before.publication_digest == digest(case.header.payload())
+    assert case.before.publication_digest != case.receipt.scope.binding_inputs_digest
     await publish_case(case)
     assert case.events == ["savepoint", "release"]
     pins._publish_native_binding.assert_awaited_once()
@@ -240,10 +282,35 @@ async def test_publication_refuses_unbound_header_or_custody_before_writes(monke
         "state": {"preparation_status": "published"},
         "count": {"binding_heap": replace(case.inputs.binding_heap, row_count=2)},
     }
-    pins._authorize.side_effect = (replace(case.before, **changes_by_damage[damage]),)
+    case.authority.side_effect = (replace(case.before, **changes_by_damage[damage]),)
     with pytest.raises(ValueError):
         await publish_case(case)
     pins._publish_native_binding.assert_not_awaited()
+    assert case.events == ["savepoint", "rollback"]
+    pins._publisher.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before", "after"])
+@pytest.mark.parametrize("damage", ["physical", "scope"])
+async def test_publication_refuses_changed_commitment_in_either_digest_domain(monkeypatch, phase, damage):
+    case = publication_case(monkeypatch)
+    observed = case.before if phase == "before" else case.after
+    if damage == "physical":
+        changed_header = replace(case.header, binding_set_digest=digest({"binding": "changed"}))
+        changed = replace(observed, publication_digest=digest(changed_header.payload()))
+        error = "publication_authority_changed"
+    else:
+        seal = binding_input_inventory(case.receipt.scope, case.header.healthporta_plan_id)["binding_input_seal"]
+        changed_scope = replace(
+            case.receipt.scope, binding_inputs_digest=pricing_control_digest({**seal, "revision_count": 2})
+        )
+        changed = replace(observed, scope=changed_scope)
+        error = "authority_scope_changed"
+    case.authority.side_effect = (changed,) if phase == "before" else (case.before, changed)
+    with pytest.raises(ValueError, match=error):
+        await publish_case(case)
+    assert pins._publish_native_binding.await_count == (phase == "after")
     assert case.events == ["savepoint", "rollback"]
     pins._publisher.assert_awaited_once()
 

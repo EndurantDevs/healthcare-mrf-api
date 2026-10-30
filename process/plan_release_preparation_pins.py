@@ -270,9 +270,9 @@ async def _original_publisher_identity(connection, roles):
 
 
 def _publication_witness(witness, publication, inputs, receipt, *, published):
+    # The physical header and managed aggregate input seal have separate commitments.
     require(
-        witness.publication_digest == digest(publication.payload())
-        and publication.binding_set_digest == receipt.scope.binding_inputs_digest,
+        witness.publication_digest == digest(publication.payload()),
         "publication_authority_changed",
     )
     require(
