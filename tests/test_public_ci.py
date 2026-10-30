@@ -405,15 +405,16 @@ def test_public_test_matrices_preserve_independent_database_shards():
     assert {job_id for job_id, job in jobs.items() if "strategy" in job} == set(MATRIX_ROWS_BY_JOB)
     for job_id, rows in MATRIX_ROWS_BY_JOB.items():
         job = jobs[job_id]
-        strategy = dict(job["strategy"])
         if job_id == "address-canonical-db-tests":
             # Database lanes are capped and listed longest-first; the pinned rows stay order-free.
-            assert strategy.pop("max-parallel") == 48
-            assert sorted(strategy["matrix"]["include"], key=lambda row: row["shard"]) == sorted(
+            assert set(job["strategy"]) == {"max-parallel", "fail-fast", "matrix"}
+            assert job["strategy"]["max-parallel"] == 48
+            assert job["strategy"]["fail-fast"] is False
+            assert sorted(job["strategy"]["matrix"]["include"], key=lambda row: row["shard"]) == sorted(
                 rows, key=lambda row: row["shard"]
             )
-            strategy["matrix"] = {"include": rows}
-        assert strategy == {"fail-fast": job_id == "python-tests", "matrix": {"include": rows}}
+        else:
+            assert job["strategy"] == {"fail-fast": job_id == "python-tests", "matrix": {"include": rows}}
         assert job["env"]["CI_SHARD"] == "${{ matrix.shard }}"
         stage = next(step for step in job["steps"] if step.get("name") == "Run complete validation stage")
         mode = "python-main" if job_id == "python-tests" else "postgres"
