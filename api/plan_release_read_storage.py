@@ -6,6 +6,7 @@ from datetime import datetime
 
 from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.network_read_execution import install_network_read_inventory
 from db.plan_release_storage import BINDING_TABLE, LEGACY_BINDING_TABLE, PIN_TABLE, REVISION_TABLE, storage_relation
@@ -253,13 +254,51 @@ async def is_retained_session_read(session, schema, *, api_read=False):
 
     async def fetch(sql, *parameters):
         """Execute the fixed catalog queries through this exact ORM connection."""
+        is_catalog = sql == CATALOG_SQL
         sql = re.sub(r"\$(\d+)", lambda match: ":p" + match[1], sql)
         # SQLAlchemy named binds need an explicit CAST rather than PostgreSQL's :: suffix.
         sql = re.sub(r"(:p\d+)::([a-z]+(?:\[\])?)", r"CAST(\1 AS \2)", sql)
-        rows = await session.execute(text(sql), {"p" + str(index): value for index, value in enumerate(parameters, 1)})
+        parameter_map = {"p" + str(index): value for index, value in enumerate(parameters, 1)}
+        if is_catalog:
+            return await _catalog_session_rows(session, text(sql), parameter_map)
+        rows = await session.execute(text(sql), parameter_map)
         return [dict(row._mapping) for row in rows]
 
     return await is_retained_binding_read(fetch, schema)
+
+
+async def _catalog_session_rows(session, statement, parameters):
+    """Avoid catalog JIT while preserving the caller's settings and read locks."""
+    # A connection savepoint does not flush pending ORM writes or replace an
+    # existing session savepoint. Release on success retains catalog read locks.
+    connection = await session.connection() if isinstance(session, AsyncSession) else session
+    savepoint = await connection.begin_nested()
+    try:
+        previous_jit = await connection.scalar(text("SHOW jit"))
+        setting = await connection.execute(text("SET LOCAL jit = off"))
+        setting.close()
+        catalog_result = await connection.execute(statement, parameters)
+        try:
+            catalog_rows = [dict(catalog_row._mapping) for catalog_row in catalog_result]
+        finally:
+            catalog_result.close()
+        restored = await connection.scalar(
+            text("SELECT set_config('jit', :previous_jit, true)"), {"previous_jit": previous_jit}
+        )
+        if restored != previous_jit:
+            raise RuntimeError("Catalog JIT setting was not restored")
+        await savepoint.commit()
+        return catalog_rows
+    except BaseException as failure:
+        try:
+            await savepoint.rollback()
+        except BaseException as rollback_failure:
+            failure.add_note("Catalog savepoint cleanup failed: " + type(rollback_failure).__name__)
+            try:
+                await connection.invalidate()
+            except BaseException as invalidation_failure:
+                failure.add_note("Catalog connection invalidation failed: " + type(invalidation_failure).__name__)
+        raise
 
 
 _API_SNAPSHOT_SQL = """SELECT pg_catalog.pg_backend_pid() AS backend_pid,

@@ -554,8 +554,7 @@ class Database:
                 await session.rollback()
             raise
         finally:
-            await session.close()
-            _SESSION.reset(token)
+            await self._close_session_and_reset_token(session, token)
 
     def _transaction_binding(self, *, borrowed_only: bool = False) -> Optional[_TransactionBinding]:
         binding = next(
@@ -775,6 +774,15 @@ class Database:
             except BaseException as rollback_failure:
                 failure.add_note("Reader rollback failed: " + type(rollback_failure).__name__)
 
+    @staticmethod
+    async def _close_session_and_reset_token(session, token):
+        """Release task ownership even when closing the session fails."""
+        try:
+            await session.close()
+        finally:
+            if token is not None:
+                _SESSION.reset(token)
+
     async def _close_request_session(self, request, *, success):
         """Release the request owner even when pinning or response handling fails."""
         session = getattr(request.ctx, "sa_session", None)
@@ -793,13 +801,12 @@ class Database:
                 if scope is not None:
                     await scope.__aexit__(*sys.exc_info())
                 else:
-                    await session.close()
-                    if token is not None:
-                        _SESSION.reset(token)
+                    await self._close_session_and_reset_token(session, token)
             finally:
                 request.ctx.sa_session = None
                 request.ctx.session = None
                 request.ctx._sa_reader_scope = None
+                request.ctx._sa_session_token = None
 
     @asynccontextmanager
     async def bind_existing_session(self, session: AsyncSession) -> AsyncIterator[AsyncSession]:

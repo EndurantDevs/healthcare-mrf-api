@@ -20,9 +20,7 @@ def _install_distance_reads(monkeypatch, exact_npis):
     replacement_by_name = {
         "_shared_rate_code_scope_rows": AsyncMock(return_value=[{"code_key": 7}]),
         "_membership_exact_scope_npis": exact_npi_reader,
-        "load_v4_graph_root": AsyncMock(
-            return_value=SimpleNamespace(representation="pattern_v1")
-        ),
+        "load_v4_graph_root": AsyncMock(return_value=SimpleNamespace(representation="pattern_v1")),
         "_membership_location_rows": location_reader,
         "_graph_location_probe_batch_size": lambda *_args, **_kwargs: 1,
         "_ptg2_manifest_location_match_limit": lambda: 10,
@@ -52,13 +50,9 @@ async def _distance_candidates(args):
 async def test_distance_uses_bounded_exact_npi_scope(monkeypatch):
     _, location_reader, _ = _install_distance_reads(monkeypatch, (1, 2, 3))
 
-    candidates = await _distance_candidates(
-        {"code": "73721", "code_system": "CPT"}
-    )
+    candidates = await _distance_candidates({"code": "73721", "code_system": "CPT"})
 
-    assert candidates == serving._GraphLocationCandidates(
-        [], {}, taxonomy_filtered=True
-    )
+    assert candidates == serving._GraphLocationCandidates([], {}, taxonomy_filtered=True)
     assert location_reader.await_args.kwargs["candidate_npis"] == (1, 2, 3)
     assert location_reader.await_args.kwargs["coarse_taxonomy_knn"] is False
 
@@ -75,9 +69,7 @@ async def test_distance_skips_graph_reads_for_empty_exact_scope(monkeypatch):
         }
     )
 
-    assert candidates == serving._GraphLocationCandidates(
-        [], {}, taxonomy_filtered=True
-    )
+    assert candidates == serving._GraphLocationCandidates([], {}, taxonomy_filtered=True)
     graph_root.assert_not_awaited()
 
 
@@ -122,19 +114,14 @@ async def test_distance_keeps_knn_for_unbounded_or_unfiltered_scope(
     expected_scope_reads,
     expected_coarse_knn,
 ):
-    exact_npi_reader, location_reader, _ = _install_distance_reads(
-        monkeypatch, exact_npis
-    )
+    exact_npi_reader, location_reader, _ = _install_distance_reads(monkeypatch, exact_npis)
     monkeypatch.setattr(serving, "_MEMBERSHIP_EXACT_NPI_SCOPE_LIMIT", 2)
 
     await _distance_candidates(args)
 
     assert exact_npi_reader.await_count == expected_scope_reads
     assert location_reader.await_args.kwargs["candidate_npis"] is None
-    assert (
-        location_reader.await_args.kwargs["coarse_taxonomy_knn"]
-        is expected_coarse_knn
-    )
+    assert location_reader.await_args.kwargs["coarse_taxonomy_knn"] is expected_coarse_knn
 
 
 @pytest.mark.asyncio
@@ -156,22 +143,18 @@ async def test_exact_scope_cap_is_authoritative(
     monkeypatch.setenv("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED", "1")
     exact_npis = tuple(range(1, scope_size + 1))
     exact_npi_reader = AsyncMock(return_value=exact_npis)
-    monkeypatch.setattr(
-        serving, "_membership_exact_scope_npis", exact_npi_reader
-    )
+    monkeypatch.setattr(serving, "_membership_exact_scope_npis", exact_npi_reader)
 
-    candidate_npis, coarse_taxonomy_knn = (
-        await serving._bounded_exact_distance_npis(
-            object(),
-            _local_distance_tables(),
-            {
-                "classification": "Internal Medicine",
-                "code": "99203",
-                "code_system": "CPT",
-            },
-            max_candidates,
-            1,
-        )
+    candidate_npis, coarse_taxonomy_knn = await serving._bounded_exact_distance_npis(
+        object(),
+        _local_distance_tables(),
+        {
+            "classification": "Internal Medicine",
+            "code": "99203",
+            "code_system": "CPT",
+        },
+        max_candidates,
+        1,
     )
 
     assert candidate_npis == (None if expected_coarse_knn else exact_npis)
@@ -181,13 +164,9 @@ async def test_exact_scope_cap_is_authoritative(
 
 @pytest.mark.asyncio
 async def test_projection_disabled_keeps_exact_knn_prefilter(monkeypatch):
-    monkeypatch.delenv(
-        "HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED", raising=False
-    )
+    monkeypatch.delenv("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED", raising=False)
     exact_npi_reader = AsyncMock()
-    monkeypatch.setattr(
-        serving, "_membership_exact_scope_npis", exact_npi_reader
-    )
+    monkeypatch.setattr(serving, "_membership_exact_scope_npis", exact_npi_reader)
 
     scope = await serving._bounded_exact_distance_npis(
         object(),
@@ -212,9 +191,7 @@ async def test_projection_disabled_keeps_exact_knn_prefilter(monkeypatch):
 @pytest.mark.asyncio
 async def test_exhaustive_arm_keeps_canonical_knn_prefilter(monkeypatch):
     monkeypatch.setattr(serving, "_MEMBERSHIP_EXACT_NPI_SCOPE_LIMIT", 200)
-    _, location_reader, _ = _install_distance_reads(
-        monkeypatch, tuple(range(1, 202))
-    )
+    _, location_reader, _ = _install_distance_reads(monkeypatch, tuple(range(1, 202)))
 
     monkeypatch.setattr(
         serving,
@@ -278,10 +255,10 @@ async def test_overflow_knn_projects_before_limit_and_filters_exactly_after(
 
     assert query is not None
     rendered_sql = serving._membership_location_sql(query, limit=10, offset=0)
-    raw_prefix, exact_suffix = rendered_sql.split(
-        "nearest_addresses AS MATERIALIZED (", 1
-    )
+    raw_prefix, exact_suffix = rendered_sql.split("nearest_addresses AS MATERIALIZED (", 1)
     assert raw_prefix.count("scope_provider.search_taxonomy_codes") == 6
+    assert raw_prefix.count("scope_provider.npi = addr.npi") == 3
+    assert raw_prefix.count(":membership_scope_inferred_taxonomy_codes AS varchar[])) OFFSET 0)") == 3
     assert "membership_scope_specialty_classification" in raw_prefix
     assert "membership_scope_inferred_taxonomy_codes" in raw_prefix
     assert "membership_location_specialty_nt" not in raw_prefix
