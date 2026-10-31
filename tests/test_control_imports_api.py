@@ -4740,9 +4740,9 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (40, 26, 28)
+    ) == (41, 27, 29)
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 26
+    assert len(runnable_items) == 27
     assert all(entry["profile_enabled"] for entry in runnable_items)
     assert all(entry["supported_resources"] == entry["resources"] for entry in runnable_items)
     assert len(nonrunnable_items) == 14
@@ -4777,6 +4777,7 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         "aetna-commercial-medicare",
         "alohr",
         "caresource",
+        "christus-health-plan",
         "molina",
     }
 

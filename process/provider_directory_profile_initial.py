@@ -29,7 +29,7 @@ def targets(identity):
 
 async def capture_targets(fhir, schema):
     """Observe existing physical targets and authentic history without creating serving state."""
-    await _assert_no_publication(fhir, schema)
+    recovered = await _assert_no_publication(fhir, schema)
     evidence_ref = fhir._unscoped_qt(schema, fhir.profile_artifact.PROFILE_EVIDENCE_TABLE)
     profile_ref = fhir._unscoped_qt(schema, fhir.profile_artifact.PROFILE_TABLE)
     profile_oid, evidence_oid = await fhir._locked_profile_adoption_target_oids(schema, profile_ref, evidence_ref)
@@ -37,8 +37,12 @@ async def capture_targets(fhir, schema):
         await fhir._provider_directory_profile_relation_storage_fingerprint(oid, expected_persistence="p")
         for oid in (evidence_oid, profile_oid)
     ]
-    history_by_field_name, evidence_rows, profile_rows = await _capture_legacy_history(
-        fhir, schema, profile_ref, evidence_ref
+    from process import provider_directory_profile_initial_recovery as recovery
+
+    history_by_field_name, evidence_rows, profile_rows = (
+        await _capture_legacy_history(fhir, schema, profile_ref, evidence_ref)
+        if recovered is None
+        else await recovery.capture_original_history(fhir, schema, profile_ref, evidence_ref, recovered)
     )
     target_payload = contract.validated_target_state(
         {
@@ -61,13 +65,15 @@ async def capture_targets(fhir, schema):
             "historical_publication": history_by_field_name,
         }
     )
+    if recovered is not None:
+        target_payload = recovery.recovered_target_state(target_payload, recovered)
     return contract.InitialTargets(
         evidence_target_oid=evidence_oid, profile_target_oid=profile_oid, payload=target_payload
     )
 
 
 async def _assert_no_publication(fhir, schema):
-    """Check bounded singleton and receipt absence without scanning incumbent facts."""
+    """Require no active publication; retained initial history needs an exact terminal inverse."""
     if await fhir._provider_directory_profile_serving_state(schema) is not None:
         raise RuntimeError("provider_directory_profile_initial_serving_exists")
     common_ref = fhir._unscoped_qt(schema, "provider_directory_cms_serving_receipt")
@@ -77,7 +83,10 @@ async def _assert_no_publication(fhir, schema):
         raise RuntimeError("provider_directory_profile_initial_common_history_exists")
     receipt_ref = fhir._unscoped_qt(schema, contract.RECEIPT_TABLE)
     if await fhir.db.scalar(f"SELECT EXISTS (SELECT 1 FROM {receipt_ref})"):
-        raise RuntimeError("provider_directory_profile_initial_receipt_exists")
+        from process.provider_directory_profile_initial_recovery import require_recovered_targets
+
+        return await require_recovered_targets(fhir, schema)
+    return None
 
 
 async def admission_identity(fhir, fence, initial_targets):
@@ -308,7 +317,10 @@ async def begin_cutover(fhir, cutover, stages):
         return
     build, admission = cutover["build"], cutover["admission"]
     await fhir._profile_capacity_remaining_ms(admission)
-    await _assert_no_publication(fhir, build.schema)
+    recovered = await _assert_no_publication(fhir, build.schema)
+    from process.provider_directory_profile_initial_recovery import assert_recovered_binding
+
+    assert_recovered_binding(admission.admitted_identity.initial_targets.payload, recovered)
     for role, name in (
         ("evidence", fhir.profile_artifact.PROFILE_EVIDENCE_TABLE),
         ("profile", fhir.profile_artifact.PROFILE_TABLE),
@@ -401,22 +413,51 @@ async def finish_cutover(fhir, cutover, fence):
         )
         if fhir._coerce_rowcount(inserted) != 1:
             raise RuntimeError("provider_directory_profile_initial_serving_insert_missing")
-        await fhir.db.status(
-            f"""INSERT INTO {fhir._unscoped_qt(build.schema, contract.RECEIPT_TABLE)}
-            (build_id,attestation_id,generation_id,run_id,contract_id,payload,payload_sha256,committed_at)
-            SELECT :build,:attestation,:generation,:run,:contract,payload,
-                   encode(sha256(convert_to(payload::text,'UTF8')),'hex'),now()
-            FROM (SELECT CAST(:payload AS jsonb) AS payload) row""",
-            build=admission.build_id,
-            attestation=admission.lease.attestation_id,
-            generation=build.generation_id,
-            run=admission.run_id,
-            contract=contract.COMMIT_CONTRACT,
-            payload=contract.canonical_json(receipt_by_field),
-        )
+        await _insert_receipt(fhir, admission, build, serving, receipt_by_field)
     async with fhir._profile_capacity_mutation_window(None):
         await fhir._delete_provider_directory_profile_build_checkpoint(build.schema, admission.build_id)
     await fhir._validate_profile_delta_total_wal(admission, SimpleNamespace(metadata_projection=projection))
+
+
+def _receipt_insert_sql(relation, key):
+    statement = f"""INSERT INTO {relation}
+            (build_id,attestation_id,generation_id,run_id,contract_id,payload,payload_sha256,committed_at)
+            SELECT :build,:attestation,:generation,:run,:contract,payload,
+                   encode(sha256(convert_to(payload::text,'UTF8')),'hex'),now()
+            FROM (SELECT CAST(:payload AS jsonb) AS payload) row"""
+    if key != "global":
+        # The volatile CTE must supply its row before the INSERT evaluates the native default.
+        statement = (
+            """WITH receipt_key AS MATERIALIZED (
+            SELECT pg_catalog.set_config('provider_directory.initial_receipt_key',:receipt_key,true) AS value)
+            """
+            + statement
+            + " CROSS JOIN receipt_key WHERE receipt_key.value=:receipt_key"
+        )
+    return statement
+
+
+async def _insert_receipt(fhir, admission, build, serving, receipt_by_field):
+    key = _receipt_key(admission.admitted_identity.initial_targets.payload, serving["control_generation"])
+    await fhir.db.status(
+        _receipt_insert_sql(fhir._unscoped_qt(build.schema, contract.RECEIPT_TABLE), key),
+        build=admission.build_id,
+        attestation=admission.lease.attestation_id,
+        generation=build.generation_id,
+        run=admission.run_id,
+        contract=contract.COMMIT_CONTRACT,
+        payload=contract.canonical_json(receipt_by_field),
+        **({"receipt_key": key} if key != "global" else {}),
+    )
+
+
+def _receipt_key(targets, generation):
+    target = contract.validated_target_state(targets)
+    if target["contract_id"] == contract.TARGET_CONTRACT:
+        return "global"
+    if type(generation) is not int or not 0 < generation < 2**63:
+        raise RuntimeError("provider_directory_profile_initial_generation_invalid")
+    return format(generation, "x")
 
 
 @asynccontextmanager
@@ -527,8 +568,16 @@ async def _committed_receipt(fhir, schema, build_id):
     if (
         not isinstance(geometry, contract.InitialCapacityGeometry)
         or layout.relation_oid != geometry.initial_receipt_oid
-        or layout.exact_fingerprint != geometry.initial_receipt_storage_fingerprint
         or layout.effective_tablespace_oids != (geometry.tablespace_oid,)
+    ):
+        raise RuntimeError("provider_directory_profile_initial_receipt_storage_changed")
+    from process.provider_directory_profile_initial_history import is_historical_fingerprint
+
+    if layout.exact_fingerprint != geometry.initial_receipt_storage_fingerprint and not (
+        receipt_by_field.get("singleton_key") == "global"
+        and await is_historical_fingerprint(
+            fhir, schema, contract.RECEIPT_TABLE, layout.relation_oid, geometry.initial_receipt_storage_fingerprint
+        )
     ):
         raise RuntimeError("provider_directory_profile_initial_receipt_storage_changed")
     _assert_receipt_payload(fhir, receipt_by_field, receipt_payload, geometry)
@@ -703,9 +752,7 @@ async def committed_replay(fhir, schema, consumption_ref, run_id, execution, fen
     await fhir._replay_control_run(schema, run_id)
     receipt_rows = await fhir.db.all(
         f"SELECT build_id FROM {fhir._unscoped_qt(schema, contract.RECEIPT_TABLE)} "
-        "WHERE payload->'serving'->>'selection_proof_id'=:proof "
-        "OR payload->'serving'->>'control_generation'=:generation",
-        proof=execution.attestation.proof_id,
+        "WHERE payload->'serving'->>'control_generation'=:generation",
         generation=str(execution.generation),
     )
     if not receipt_rows:
@@ -725,7 +772,7 @@ async def committed_replay(fhir, schema, consumption_ref, run_id, execution, fen
     database = await fhir._provider_directory_profile_capacity_database_identity(schema, serving)
     # Initial admission bound the old physical targets. Their replacements are bound by
     # the immutable transaction receipt; every unchanged database/metadata field still matches.
-    _assert_replay_database(fhir, database, geometry, lease, consumption, lease_by_field)
+    await _assert_replay_database(fhir, schema, database, geometry, lease, consumption, lease_by_field)
     if (
         is_current
         and fence is not None
@@ -913,9 +960,9 @@ def _initial_forecast_fields():
     }
 
 
-def _assert_replay_database(fhir, database, geometry, lease, consumption, lease_by_field):
+async def _assert_replay_database(fhir, schema, database, geometry, lease, consumption, lease_by_field):
     """Check unchanged database identity and the original consumed authority timeline."""
-    for name in (
+    fields = (
         "database_system_identifier",
         "database_oid",
         "database_name",
@@ -943,9 +990,13 @@ def _assert_replay_database(fhir, database, geometry, lease, consumption, lease_
         "delta_receipt_storage_fingerprint",
         "import_run_storage_fingerprint",
         "capacity_consumption_storage_fingerprint",
-    ):
-        if getattr(database, name) != getattr(geometry, name):
-            raise RuntimeError("provider_directory_profile_initial_replay_database_changed")
+    )
+    from process.provider_directory_profile_initial_history import is_historical_metadata
+
+    observed_by_field = {name: getattr(database, name) for name in fields}
+    expected_by_field = {name: getattr(geometry, name) for name in fields}
+    if not await is_historical_metadata(fhir, schema, observed_by_field, expected_by_field):
+        raise RuntimeError("provider_directory_profile_initial_replay_database_changed")
     fhir._assert_provider_directory_profile_capacity_tablespaces(lease, database)
     fhir._assert_replay_timeline(consumption, lease_by_field, lease)
 

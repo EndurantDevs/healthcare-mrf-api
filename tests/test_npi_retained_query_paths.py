@@ -546,7 +546,9 @@ async def test_unavailable_affiliation_evidence_skips_query(monkeypatch):
 
     assert (
         await npi_module._fetch_provider_directory_affiliation_evidence_map(
-            [("example-source", "example-affiliation")], session=session
+            [("example-source", "example-affiliation")],
+            session=session,
+            source_datasets=(("example-source", "dataset-example"),),
         )
         == {}
     )
@@ -893,7 +895,7 @@ async def test_canonical_all_binds_count_and_late_hydration_on_pinned_session(mo
             assert "provider_directory_address_overlay" not in sql
         if "COUNT(DISTINCT ft.npi)" in sql:
             return [("Pharmacy", 1)]
-        if "COUNT(DISTINCT" in sql:
+        if "SELECT COUNT(DISTINCT" in sql:
             return [(1,)]
         if "c.location_key = ANY" in sql:
             return [SimpleNamespace(_mapping=hydrated_by_field)]

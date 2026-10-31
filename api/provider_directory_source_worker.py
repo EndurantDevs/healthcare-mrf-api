@@ -154,6 +154,86 @@ def admit_fhir_source_worker_launch(admitted_run):
     )
 
 
+async def is_ordinary_serving_job(admitted_run):
+    """Select ordinary code only from a closed, signed persisted serving command."""
+    if admitted_run.get("importer") != _IMPORTER:
+        return False
+    from process import provider_directory_serving_capacity_contract as serving
+    from process import provider_directory_serving_inverse_capacity_contract as inverse
+
+    params = admitted_run.get("params")
+    if type(params) is not dict or not {serving.EXECUTION_FIELD, inverse.EXECUTION_FIELD}.intersection(params):
+        return False
+    run_id = inverse.run_handle(admitted_run.get("run_id"))
+    metrics = admitted_run.get("metrics")
+    if (
+        type(metrics) is not dict
+        or metrics.get("queue") != _QUEUE
+        or metrics.get("function") != _FUNCTION
+        or metrics.get("job_id") != "provider_directory_start_" + run_id
+        or {"run_id", "test_mode"}.intersection(params)
+    ):
+        raise ValueError("ordinary_fhir_worker_admission_unavailable")
+    directory = import_module("process.provider_directory_fhir")
+    if inverse.EXECUTION_FIELD in params:
+        await _verified_inverse_job(directory, params)
+    else:
+        await _verified_profile_job(directory, params)
+    return True
+
+
+async def _verified_profile_job(directory, params):
+    """Reuse both current ordinary capacity signatures without consuming their authority."""
+    from process import provider_directory_profile_selection_contract as selection
+    from process import provider_directory_serving_capacity_contract as serving
+    from process.provider_directory_ordinary_serving import _verified_request
+
+    required = set(selection._GLOBAL_PROFILE_PARAMS) | {
+        "provider_directory_profile_generation",
+        "provider_directory_profile_selection_attestation",
+        "provider_directory_profile_capacity_attestation",
+        serving.EXECUTION_FIELD,
+    }
+    if set(params) != required or any(
+        type(params.get(key)) is not type(value) for key, value in selection._GLOBAL_PROFILE_PARAMS.items()
+    ):
+        raise ValueError("ordinary_fhir_worker_admission_unavailable")
+    await _verified_request(directory, selection.validated_profile_execution(params))
+
+
+async def _verified_inverse_job(directory, params):
+    """Verify the standalone inverse signature and exact operation before routing."""
+    from process import provider_directory_serving_inverse_capacity as capacity
+    from process import provider_directory_serving_inverse_capacity_contract as inverse
+    from process.provider_directory_profile_capacity_attestation import verify_database_capacity_lease
+    from process.provider_directory_profile_capacity_runtime import configured_capacity_lease_trust
+    from process.provider_directory_profile_selection_contract import configured_node_id
+    from process.provider_directory_serving_inverse_capacity_signing import geometry_sha256
+
+    request = capacity.task_execution(params)
+    if request.recovery_execution["node_id"] != configured_node_id():
+        raise ValueError("ordinary_fhir_worker_admission_unavailable")
+    envelope = params[inverse.EXECUTION_FIELD]
+    geometry = inverse.validated_inverse_geometry(
+        envelope["lease"]["signing_preflight_guard"]["healthcare_receipt"]["capacity_geometry"],
+        limits=request.limits_payload,
+        execution=request.recovery_execution,
+    )
+    trust = configured_capacity_lease_trust()
+    lease = verify_database_capacity_lease(
+        envelope,
+        trust=trust,
+        now=await directory._profile_capacity_preflight_clock(),
+        expected_capacity_geometry_hash=geometry_sha256(geometry),
+        **{
+            "expected_" + key: getattr(trust, key)
+            for key in ("database_system_identifier", "database_oid", "database_name")
+        },
+    )
+    if lease.signing_preflight_guard["healthcare_request"] != request.request_payload:
+        raise ValueError("ordinary_fhir_worker_admission_unavailable")
+
+
 def _lineage_by_id(lineage_rows):
     """Normalize the bounded native rows before checking the retry chain."""
     return {

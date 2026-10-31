@@ -351,14 +351,35 @@ async def read_direct_detail_response(request, npi):
         return http_response
 
 
-async def attach_provider_source_details(addresses, *, include_sources, include_role_evidence=False, session=None):
+async def attach_provider_source_details(
+    addresses,
+    *,
+    include_sources,
+    include_role_evidence=False,
+    session=None,
+    profile_generation_id=None,
+    phone_digits=None,
+):
     """Use approved snapshot associations for managed responses and retain legacy source reads."""
     if current_network_address_scope() is not None:
         return
     from api.endpoint import npi
 
-    await npi._attach_provider_directory_source_details(
-        addresses, include_role_evidence=include_role_evidence, session=session
-    )
+    try:
+        await npi._attach_provider_directory_source_details(
+            addresses,
+            include_role_evidence=include_role_evidence,
+            session=session,
+            profile_generation_id=profile_generation_id,
+            phone_digits=phone_digits,
+        )
+    except RuntimeError as error:
+        if str(error).startswith(("provider_directory_evidence_", "provider_directory_profile_lineage_")):
+            from sanic.exceptions import ServiceUnavailable
+
+            raise ServiceUnavailable(
+                "Provider directory evidence is unavailable.", headers={"Cache-Control": "private, no-store"}
+            ) from error
+        raise
     if include_sources:
         await npi._attach_mrf_source_details(addresses, session=session)

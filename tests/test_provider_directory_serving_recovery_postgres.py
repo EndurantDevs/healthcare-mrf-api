@@ -353,6 +353,67 @@ async def test_native_metadata_refuses_ambiguous_receipt_tips(monkeypatch):
                 await receipts.metadata(case.database, case.schema)
 
 
+async def _readonly_reference_ledger(case, *, populated):
+    table = receipts.qualified(case.schema, "reference_family_result_generation")
+    async with case.administrator.begin() as connection:
+        await connection.execute(
+            text(
+                f"CREATE TABLE {table} (importer_id text PRIMARY KEY, local_lineage_id uuid, "
+                "local_generation bigint, origin_lineage_id uuid, origin_generation bigint, "
+                "published_at timestamptz, relation_oids bigint[])"
+            )
+        )
+        await connection.execute(text(f'GRANT SELECT, MAINTAIN ON {table} TO "{case.role}"'))
+        if populated:
+            await connection.execute(
+                text(f"INSERT INTO {table} (importer_id,local_generation) VALUES ('cms-doctors',1)")
+            )
+    return table
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["update", "insert"])
+async def test_native_metadata_share_fence_needs_no_reference_update(monkeypatch, operation):
+    async with ordinary_serving_case(monkeypatch) as case:
+        table = await _readonly_reference_ledger(case, populated=operation == "update")
+        async with case.database.transaction():
+            privileges = await case.database.first(
+                "SELECT has_table_privilege(current_user,:name,'SELECT'), "
+                "has_table_privilege(current_user,:name,'MAINTAIN'), "
+                "has_any_column_privilege(current_user,:name,'UPDATE'), "
+                "(SELECT relowner<>current_user::regrole FROM pg_class WHERE oid=to_regclass(:name))",
+                name=table,
+            )
+            assert tuple(privileges) == (True, True, False, True)
+        with pytest.raises(DBAPIError) as denied:
+            async with case.database.transaction():
+                await case.database.all(f"SELECT 1 FROM {table} WHERE importer_id='cms-doctors' FOR SHARE NOWAIT")
+        assert postgres_sqlstate(denied.value) == "42501"
+        statement = (
+            f"UPDATE {table} SET local_generation=2 WHERE importer_id='cms-doctors'"
+            if operation == "update"
+            else f"INSERT INTO {table} (importer_id,local_generation) VALUES ('cms-doctors',2)"
+        )
+        async with case.database.transaction():
+            await receipts.lock_metadata(case.database, case.schema)
+            assert await case.database.scalar(
+                "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() "
+                "AND relation=to_regclass(:name) AND mode='ShareLock' AND granted)",
+                name=table,
+            )
+            with pytest.raises(DBAPIError) as blocked:
+                async with case.administrator.begin() as writer:
+                    await writer.execute(text("SET LOCAL lock_timeout='100ms'"))
+                    await writer.execute(text(statement))
+            assert postgres_sqlstate(blocked.value) == "55P03"
+            assert await case.database.scalar(f"SELECT local_generation FROM {table}") == (
+                1 if operation == "update" else None
+            )
+        async with case.administrator.begin() as writer:
+            await writer.execute(text(statement))
+        assert await case.database.scalar(f"SELECT local_generation FROM {table}") == 2
+
+
 async def _wait_for_lock(database, relation_oid):
     async with asyncio.timeout(3):
         while not await database.scalar(
@@ -362,6 +423,103 @@ async def _wait_for_lock(database, relation_oid):
             relation_oid=relation_oid,
         ):
             await asyncio.sleep(0.01)
+
+
+async def _receipt_settings(database):
+    from process.entity_address_snapshot_destination import _RECEIPT_SETTING_NAMES
+
+    return {name: await database.scalar("SELECT current_setting(:name)", name=name) for name in _RECEIPT_SETTING_NAMES}
+
+
+async def _set_receipt_caller_settings(case, *, alternate=False):
+    caller_settings_by_name = {
+        "TimeZone": "America/New_York" if alternate else "Europe/Prague",
+        "DateStyle": "SQL, DMY" if alternate else "Postgres, MDY",
+        "IntervalStyle": "sql_standard" if alternate else "postgres",
+        "extra_float_digits": "0" if alternate else "-1",
+        "bytea_output": "hex" if alternate else "escape",
+        "work_mem": "80MB" if alternate else "96MB",
+        "search_path": f'"{case.schema}", pg_catalog' if alternate else "pg_catalog, pg_temp",
+    }
+    for name, value in caller_settings_by_name.items():
+        await case.database.scalar("SELECT set_config(:name,:value,true)", name=name, value=value)
+    return await _receipt_settings(case.database)
+
+
+async def _receipt_sample(case):
+    name = "receipt_type_sample"
+    table = receipts.qualified(case.schema, name)
+    await case.database.status(
+        f"CREATE TABLE {table} (id bigint PRIMARY KEY, occurred_at timestamptz NOT NULL, "
+        "duration interval NOT NULL CHECK(duration < interval '5 minutes'), observed_on date, "
+        "payload bytea, ratio double precision)"
+    )
+    await case.database.status(
+        f"INSERT INTO {table} VALUES (1,'2026-10-30T12:34:56+00',interval '90 seconds',"
+        "DATE '2026-10-30',decode('00ff','hex'),1.23456789012345)"
+    )
+    oid = await case.database.scalar("SELECT to_regclass(:name)::oid::bigint", name=table)
+    return name, oid
+
+
+async def _receipt_fingerprint(case, oid):
+    layout = await case.directory._provider_directory_profile_relation_storage_fingerprint(
+        oid, expected_persistence="p"
+    )
+    return layout.exact_fingerprint
+
+
+@pytest.mark.asyncio
+async def test_native_receipts_restore_settings_and_preserve_canonical_values(monkeypatch):
+    async with ordinary_serving_case(monkeypatch) as case:
+        name, oid = await _receipt_sample(case)
+        canonical_results = []
+        async with case.database.transaction():
+            for alternate in (False, True):
+                original = await _set_receipt_caller_settings(case, alternate=alternate)
+                fingerprint = await _receipt_fingerprint(case, oid)
+                values = []
+                for operation in (
+                    lambda: receipts.catalog(case.database, case.schema, (name,)),
+                    lambda: receipts.relation(case.database, case.schema, name),
+                    lambda: receipts.metadata(case.database, case.schema),
+                    lambda: receipts.state(case.database, case.schema),
+                ):
+                    values.append(await operation())
+                    assert await _receipt_settings(case.database) == original
+                    assert await _receipt_fingerprint(case, oid) == fingerprint
+                canonical_results.append(values)
+        assert canonical_results[0] == canonical_results[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["python", "sql", "cancellation"])
+async def test_native_receipt_failure_restores_borrowed_settings(monkeypatch, failure):
+    from process import entity_address_snapshot_receipt as snapshot
+
+    async with ordinary_serving_case(monkeypatch) as case:
+        name, oid = await _receipt_sample(case)
+        original_hash = snapshot._row_identity
+        expected_error = {"python": ValueError, "sql": DBAPIError, "cancellation": asyncio.CancelledError}[failure]
+
+        async def interrupted(session, schema, relation):
+            await original_hash(session, schema, relation)
+            if failure == "sql":
+                await session.execute(text("SELECT 1/0"))
+            raise expected_error("interrupted receipt")
+
+        async with case.database.transaction():
+            original = await _set_receipt_caller_settings(case)
+            fingerprint = await _receipt_fingerprint(case, oid)
+            with monkeypatch.context() as fault:
+                fault.setattr(snapshot, "_row_identity", interrupted)
+                with pytest.raises(expected_error):
+                    await receipts.relation(case.database, case.schema, name)
+            assert await case.database.scalar("SELECT 1") == 1
+            assert await _receipt_settings(case.database) == original
+            assert await _receipt_fingerprint(case, oid) == fingerprint
+            assert (await receipts.relation(case.database, case.schema, name))["rows"] == 1
+            assert await _receipt_settings(case.database) == original
 
 
 async def _copy_again(case, name):

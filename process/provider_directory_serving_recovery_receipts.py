@@ -5,6 +5,7 @@ import asyncio
 import copy
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from sqlalchemy import text
@@ -86,41 +87,55 @@ def _require_heap(native, owner):
         require(grant[1] == owner or grant[3:] == ["SELECT", False], "native_acl_changed")
 
 
+@asynccontextmanager
+async def normalized_receipt_scope(database, session, schema):
+    """Canonicalize receipt reads and restore the original transaction's exact GUCs."""
+    from process.entity_address_snapshot_destination import _preserve_receipt_settings
+    from process.entity_address_snapshot_receipt import _normalize_receipt_session
+
+    binding = database._transaction_binding()
+    require(binding is not None and binding.session is session, "receipt_transaction_changed")
+    async with _preserve_receipt_settings(database=database):
+        await _normalize_receipt_session(session, schema)
+        yield
+
+
 async def catalog(database, schema, names):
     """Capture stable native catalog fields, excluding vacuum and planner statistics."""
-    from process.entity_address_snapshot_receipt import _normalize_receipt_session
     from process.mrf_address_publication import require_native_read_catalog
 
     session, driver, actor = await ordinary(database)
-    await _normalize_receipt_session(session, schema)
-    rows = await driver.fetch(OUTPUT_CATALOG_SQL, schema, list(names), actor["owner"], [])
-    require(len(rows) == len(names), "relation_missing")
-    await require_native_read_catalog(session, tuple(row["oid"] for row in rows))
-    catalog_by_name = {}
-    for row in rows:
-        native_by_field = {
-            key: decoded(row[key]) if key in {"topology", "columns", "constraints", "indexes", "acl"} else row[key]
-            for key in row.keys()
-            if key not in {"acl_closed", "readers_closed", "readers_select"}
-        }
-        _require_heap(native_by_field, actor["owner"])
-        catalog_by_name[native_by_field["relname"]] = native_by_field
-    return catalog_by_name
+    async with normalized_receipt_scope(database, session, schema):
+        rows = await driver.fetch(OUTPUT_CATALOG_SQL, schema, list(names), actor["owner"], [])
+        require(len(rows) == len(names), "relation_missing")
+        await require_native_read_catalog(session, tuple(row["oid"] for row in rows))
+        catalog_by_name = {}
+        for row in rows:
+            native_by_field = {
+                key: decoded(row[key]) if key in {"topology", "columns", "constraints", "indexes", "acl"} else row[key]
+                for key in row.keys()
+                if key not in {"acl_closed", "readers_closed", "readers_select"}
+            }
+            _require_heap(native_by_field, actor["owner"])
+            catalog_by_name[native_by_field["relname"]] = native_by_field
+        return catalog_by_name
 
 
 async def relation(database, schema, name, *, content=True):
     """Bind a complete canonical row multiset to one real native heap and indexes."""
     session, _driver, _actor = await ordinary(database)
-    from process.entity_address_snapshot_receipt import _normalize_receipt_session, _row_identity
+    from process.entity_address_snapshot_receipt import _row_identity
 
-    await _normalize_receipt_session(session, schema)
     native = (await catalog(database, schema, (name,)))[name]
     receipt_by_field = {"native": native}
     if content:
         from process.entity_address_cutover_contract import preserve_transaction_sql_settings
         from process.entity_address_unified import _sql_literal
 
-        async with preserve_transaction_sql_settings(database, ["statement_timeout"], _sql_literal):
+        async with (
+            normalized_receipt_scope(database, session, schema),
+            preserve_transaction_sql_settings(database, ["statement_timeout"], _sql_literal),
+        ):
             await database.status(f"SET LOCAL statement_timeout='{PREPARATION_SECONDS * 1000}ms'")
             count, row_digest = await _row_identity(session, schema, name)
         receipt_by_field.update(rows=count, data_sha256=row_digest)
@@ -279,54 +294,53 @@ async def _optional_json(driver, schema, table, selection, predicate):
 
 async def metadata(database, schema):
     """Capture serving authorities without treating mutable build candidates as active state."""
-    _session, driver, _actor = await ordinary(database)
-    selections = (
-        ("address", generations.TABLE_NAME, "to_jsonb(state)", "singleton"),
-        ("alias", "address_alias_state_v1", "to_jsonb(state)", "singleton"),
-        (
-            "overlay_alias",
-            "address_alias_artifact_state_v1",
-            "to_jsonb(state)",
-            "artifact_name='provider_directory_address_overlay'",
-        ),
-        ("profile", "provider_directory_profile_serving_generation", "to_jsonb(state)", "singleton_key='global'"),
-        ("doctors", "reference_family_result_generation", "to_jsonb(state)", "importer_id='cms-doctors'"),
-        (
-            "geo",
-            "entity_address_geo_assurance_state",
-            "jsonb_build_object('version',active_geo_assurance_version,"
-            "'table_oid',active_table_oid::bigint,'signature',active_relation_signature,'bindings',active_dependency_bindings)",
-            "singleton",
-        ),
-    )
-    metadata_by_field = {}
-    for key, table, selection, predicate in selections:
-        metadata_by_field[key] = await _optional_json(driver, schema, table, selection, predicate)
-    metadata_by_field["relations"] = list(await generations._current_relation_oids(database, schema))
-    table = qualified(schema, "provider_directory_cms_serving_receipt")
-    if await driver.fetchval("SELECT to_regclass($1)::oid", table) is None:
-        metadata_by_field["common_receipt"] = None
-    else:
-        receipt_rows = await driver.fetch(
-            f"SELECT receipt_id,payload FROM {table} receipt WHERE NOT EXISTS "
-            f"(SELECT FROM {table} successor WHERE successor.predecessor_receipt_id=receipt.receipt_id)"
+    session, driver, _actor = await ordinary(database)
+    async with normalized_receipt_scope(database, session, schema):
+        selections = (
+            ("address", generations.TABLE_NAME, "to_jsonb(state)", "singleton"),
+            ("alias", "address_alias_state_v1", "to_jsonb(state)", "singleton"),
+            (
+                "overlay_alias",
+                "address_alias_artifact_state_v1",
+                "to_jsonb(state)",
+                "artifact_name='provider_directory_address_overlay'",
+            ),
+            ("profile", "provider_directory_profile_serving_generation", "to_jsonb(state)", "singleton_key='global'"),
+            ("doctors", "reference_family_result_generation", "to_jsonb(state)", "importer_id='cms-doctors'"),
+            (
+                "geo",
+                "entity_address_geo_assurance_state",
+                "jsonb_build_object('version',active_geo_assurance_version,"
+                "'table_oid',active_table_oid::bigint,'signature',active_relation_signature,'bindings',active_dependency_bindings)",
+                "singleton",
+            ),
         )
-        require(len(receipt_rows) <= 1, "common_history_changed")
-        metadata_by_field["common_receipt"] = (
-            {"receipt_id": receipt_rows[0]["receipt_id"], "payload": decoded(receipt_rows[0]["payload"])}
-            if receipt_rows
-            else None
+        metadata_by_field = {}
+        for key, table, selection, predicate in selections:
+            metadata_by_field[key] = await _optional_json(driver, schema, table, selection, predicate)
+        metadata_by_field["relations"] = list(await generations._current_relation_oids(database, schema))
+        table = qualified(schema, "provider_directory_cms_serving_receipt")
+        if await driver.fetchval("SELECT to_regclass($1)::oid", table) is None:
+            metadata_by_field["common_receipt"] = None
+        else:
+            receipt_rows = await driver.fetch(
+                f"SELECT receipt_id,payload FROM {table} receipt WHERE NOT EXISTS "
+                f"(SELECT FROM {table} successor WHERE successor.predecessor_receipt_id=receipt.receipt_id)"
+            )
+            require(len(receipt_rows) <= 1, "common_history_changed")
+            metadata_by_field["common_receipt"] = (
+                {"receipt_id": receipt_rows[0]["receipt_id"], "payload": decoded(receipt_rows[0]["payload"])}
+                if receipt_rows
+                else None
+            )
+        require(
+            metadata_by_field["address"] is not None and metadata_by_field["alias"] is not None, "authority_missing"
         )
-    require(metadata_by_field["address"] is not None and metadata_by_field["alias"] is not None, "authority_missing")
-    return metadata_by_field
+        return metadata_by_field
 
 
 async def state(database, schema):
     """Capture complete content and native authority only while readers remain admitted."""
-    session, _driver, _actor = await ordinary(database)
-    from process.entity_address_snapshot_receipt import _normalize_receipt_session
-
-    await _normalize_receipt_session(session, schema)
     roots_by_name = {}
     for root in ROOTS:
         roots_by_name[root] = await relation(database, schema, root)
@@ -334,7 +348,7 @@ async def state(database, schema):
 
 
 async def lock_metadata(database, schema):
-    """Pin fixed serving authorities using their existing narrow native writer rights."""
+    """Pin fixed authorities without requiring UPDATE on read-only reference ledgers."""
     _session, driver, _actor = await ordinary(database)
     await driver.execute(
         "LOCK TABLE "
@@ -349,7 +363,7 @@ async def lock_metadata(database, schema):
         name = qualified(schema, table)
         if await driver.fetchval("SELECT to_regclass($1)::oid", name) is not None:
             await driver.execute(f"LOCK TABLE {name} IN SHARE MODE NOWAIT")
-            await driver.fetch(f"SELECT 1 FROM {name} WHERE {predicate} FOR SHARE NOWAIT")
+            await driver.fetch(f"SELECT 1 FROM {name} WHERE {predicate}")
     await generations._locked_authority(database, schema)
     for table, predicate in (
         ("address_alias_artifact_state_v1", "artifact_name='provider_directory_address_overlay'"),
@@ -362,16 +376,18 @@ async def lock_metadata(database, schema):
         await driver.execute(f"LOCK TABLE {name} IN SHARE MODE NOWAIT")
 
 
-async def lock(database, schema, names, *, mode="ACCESS EXCLUSIVE"):
+async def lock(database, schema, names, *, mode="ACCESS EXCLUSIVE", wait=False):
     """Lock a fixed or previously authenticated native set in deterministic order."""
     require(mode in {"SHARE", "ACCESS EXCLUSIVE"}, "lock_mode_invalid")
+    require(type(wait) is bool and (not wait or mode == "ACCESS EXCLUSIVE"), "lock_wait_invalid")
     _session, driver, _actor = await ordinary(database)
     await driver.execute(
         "LOCK TABLE "
         + ",".join(qualified(schema, name) for name in sorted(set(names)))
         + " IN "
         + mode
-        + " MODE NOWAIT"
+        + " MODE"
+        + ("" if wait else " NOWAIT")
     )
 
 

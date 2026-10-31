@@ -156,6 +156,7 @@ class NonprofileAdmissionCheck:
     logging_relations: tuple[tuple[str, str], ...] = ()
     raw_relations: tuple[RetainedRawRelation, ...] = ()
     native_relations: tuple[RetainedNativeRelation, ...] = ()
+    ordinary_relations: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,7 @@ class NonprofileAdmission:
     _external_relations: set[tuple[str, str]] = field(default_factory=set, init=False)
     _raw_relations: dict[tuple[str, str], RetainedRawRelation] = field(default_factory=dict, init=False)
     _native_relations: dict[tuple[str, str], RetainedNativeRelation] = field(default_factory=dict, init=False)
+    _ordinary_relations: dict[tuple[str, str], Any] = field(default_factory=dict, init=False)
     _started: bool = field(default=False, init=False)
     profile_admission: Any = field(default=None, init=False)
     pause_profile: Callable[..., Awaitable[Any]] | None = field(default=None, repr=False)
@@ -194,6 +196,8 @@ class NonprofileAdmission:
     _cutover_active: bool = field(default=False, init=False)
     cleanup_preserved: list[tuple[str, str]] = field(default_factory=list, init=False)
     registry_source_job: Any = field(default=None, init=False, repr=False, compare=False)
+    captured_inputs: Any = field(default=None, repr=False, compare=False)
+    _ordinary_artifact_scope: Any = field(default=None, init=False, repr=False, compare=False)
 
     def _assert_lease(self) -> None:
         """Require signature-bound geometry and existing storage reservation checks."""
@@ -220,7 +224,9 @@ class NonprofileAdmission:
     ) -> None:
         """Recheck runtime, consumed ownership and aggregate physical costs."""
         self._assert_lease()
-        if sum(relation.total_bytes for relation in relations) > dict(self.plan.reservation_bytes)["data"]:
+        from process.provider_directory_ordinary_retention_capacity import measured_data_ceiling
+
+        if sum(relation.total_bytes for relation in relations) > measured_data_ceiling(self.plan):
             raise RuntimeError("provider_directory_nonprofile_data_budget_exceeded")
         expected = NonprofileAdmissionReceipt(
             phase,
@@ -239,6 +245,7 @@ class NonprofileAdmission:
                 logging_relations,
                 tuple(self._raw_relations.values()),
                 tuple(self._native_relations.values()),
+                tuple(self._ordinary_relations.values()),
             )
         )
         if not isinstance(receipt, NonprofileAdmissionReceipt) or receipt != expected:
@@ -404,10 +411,14 @@ class NonprofileAdmission:
         *,
         raw_relation: RetainedRawRelation | None = None,
         native_relation: RetainedNativeRelation | None = None,
+        ordinary_relation: Any = None,
     ) -> None:
         """Capture a native CREATE's original OID while native cleanup retains ownership."""
         if type(oid) is not int or oid <= 0 or self._relations.get((schema, name), oid) != oid:
             raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
+        from process.provider_directory_ordinary_retention_capacity import record_annotation
+
+        record_annotation(self, fhir, ordinary_relation, (schema, name, oid), raw_relation, native_relation)
         await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
         self._relations[(schema, name)] = oid
         self._external_relations.add((schema, name))
@@ -540,11 +551,15 @@ class NonprofileAdmission:
         self._external_relations.remove((schema, name))
         self._raw_relations.pop((schema, name), None)
         self._native_relations.pop((schema, name), None)
+        self._ordinary_relations.pop((schema, name), None)
         self._logged_relations.discard((schema, name))
 
     async def rename_external_relation(self, fhir: Any, schema: str, old_name: str, new_name: str, oid: int) -> None:
         """Follow a verified rename of the original OID, never a replacement identity."""
-        if (schema, old_name) in self._raw_relations or (schema, old_name) in self._native_relations:
+        if any(
+            (schema, old_name) in relations
+            for relations in (self._raw_relations, self._native_relations, self._ordinary_relations)
+        ):
             raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
         if (schema, new_name) in self._relations:
             raise RuntimeError("provider_directory_nonprofile_external_name_conflict")
@@ -795,6 +810,7 @@ async def _full_scope(fhir: Any, fence: Any, types: frozenset[str], projection: 
     """Keep full typed inputs alive without entering the Profile recovery guard."""
     from process.provider_directory_artifact_scratch_scope import prepared_scratch_scope
     from process.provider_directory_generic_source_policy import is_source_storage_required
+    from process.provider_directory_ordinary_scratch_npi import ordinary_scratch_scope
 
     if is_source_storage_required():
         async with prepared_scratch_scope(fhir, admission, fence, types, projection) as overrides:
@@ -808,22 +824,26 @@ async def _full_scope(fhir: Any, fence: Any, types: frozenset[str], projection: 
         for base_name, name in sorted(plan.relation_by_table.items()):
             plan.created_tables.append(name)
             await _create_owned_layout(fhir, admission, schema, plan.model_by_table_name[base_name], name)
-        await fhir._materialize_artifact_scope_payload(
-            schema,
-            plan,
-            fence,
-            fence,
-            types,
-            projection,
-            admission.plan.batch_size,
-            admission.plan.worker_count,
-        )
+        with fhir._artifact_scope_tokens(fence, fence, {}, {}):
+            await fhir._materialize_artifact_scope_payload(
+                schema,
+                plan,
+                fence,
+                fence,
+                types,
+                projection,
+                admission.plan.batch_size,
+                admission.plan.worker_count,
+            )
         for base_name, name in sorted(plan.relation_by_table.items()):
             await _index_owned_layout(fhir, admission, schema, plan.model_by_table_name[base_name], name)
         await admission.measure(fhir, schema, tuple(plan.relation_by_table.values()))
         await admission.assert_ready(fhir, schema)
         oid_by_base = {base: admission._relations[(schema, name)] for base, name in plan.relation_by_table.items()}
-        with fhir._artifact_scope_tokens(fence, fence, plan.relation_by_table, oid_by_base):
+        with (
+            fhir._artifact_scope_tokens(fence, fence, plan.relation_by_table, oid_by_base),
+            ordinary_scratch_scope(fhir, admission, fence, plan.relation_by_table, oid_by_base),
+        ):
             yield dict(plan.relation_by_table)
     except BaseException as error:
         try:
@@ -869,6 +889,7 @@ class PreparedServingArtifacts:
     address: Any = None
     source_session_factory: Callable[[], Any] | None = field(default=None, repr=False, compare=False)
     registry_source_pair: Any = field(default=None, init=False, repr=False, compare=False)
+    retained_generation: Any = None
 
     @property
     def stages(self) -> tuple[Any, ...]:

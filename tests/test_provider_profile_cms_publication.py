@@ -29,9 +29,11 @@ OIDS = (21001, 21002, 21003)
 
 
 @asynccontextmanager
-async def _reader_scope(session, state_by_field):
+async def _reader_scope(session, state_by_field, *, snapshot_setup=None):
     """Model the explicit Reader owner separately from mocked publication transactions."""
     assert state_by_field.get("binding") is None
+    if snapshot_setup is not None:
+        await snapshot_setup(session)
     state_by_field["reader"] = True
     session.info["api_reader_verified"] = True
     try:
@@ -95,7 +97,7 @@ def runtime(monkeypatch):
 
     _mock_doctors_owner(monkeypatch)
     database.transaction, database.all = transaction, rows
-    database.reader_session = lambda: _reader_scope(session, state_by_field)
+    database.reader_session = lambda **options: _reader_scope(session, state_by_field, **options)
     monkeypatch.setattr(cms, "db", database)
     monkeypatch.setattr(npi, "db", database)
     monkeypatch.setattr(native, "db", database)

@@ -129,5 +129,11 @@ async def ordinary_serving_case(monkeypatch):
             parent_run_id=selected.evidence_run_id,
         )
         yield SimpleNamespace(
-            database=database, schema=schema, directory=directory, pin=pin_by_field, fence=fence, role=role
+            database=database,
+            schema=schema,
+            directory=directory,
+            pin=pin_by_field,
+            fence=fence,
+            role=role,
+            administrator=administrator,
         )

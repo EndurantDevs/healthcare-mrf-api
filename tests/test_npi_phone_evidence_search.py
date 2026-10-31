@@ -29,7 +29,7 @@ def _provider_directory_phone_match_query():
     )
 
 
-def test_match_candidate_phone_lookup_includes_current_provider_directory_evidence():
+def test_match_candidate_phone_lookup_includes_retained_provider_directory_evidence():
     """Phone search must bound unique providers without dropping service rows."""
     query, query_params = _provider_directory_phone_match_query()
     sql = str(query)
@@ -44,8 +44,12 @@ def test_match_candidate_phone_lookup_includes_current_provider_directory_eviden
     assert "phone_candidates AS MATERIALIZED" in sql
     assert "phone_provider_directory_evidence AS MATERIALIZED" in sql
     assert "provider_directory_address_overlay AS overlay" in sql
-    assert "dataset.is_current IS TRUE" in sql
+    assert "published_root_counts AS MATERIALIZED" in sql
+    assert "retained_datasets AS MATERIALIZED" in sql
+    assert "JOIN mrf.provider_directory_source" not in sql
     assert "dataset.status = 'published'" in sql
+    assert "dataset.status = 'superseded'" in sql
+    assert "dataset.superseded_at >= dataset.published_at" in sql
     assert "dataset.published_at IS NOT NULL" in sql
     assert "dataset.superseded_at IS NULL" in sql
     assert "current_run.run_id = overlay.last_seen_run_id" in sql
@@ -105,15 +109,10 @@ async def test_phone_match_attaches_every_current_directory_source(monkeypatch):
     cigna_source = "pdfhir_cigna"
     contra_source = "pdfhir_contra"
     candidate_dict = {
-        "source_record_ids": [
-            f"provider_directory_fhir:organization_address:{cigna_source}:org-1:1"
-        ],
+        "source_record_ids": [f"provider_directory_fhir:organization_address:{cigna_source}:org-1:1"],
         "phone_source_record_ids": [
             f"provider_directory_fhir:organization_address:{cigna_source}:org-1:1",
-            (
-                "provider_directory_fhir:organization_affiliation:"
-                f"{contra_source}:affiliation-1:org-2"
-            ),
+            (f"provider_directory_fhir:organization_affiliation:{contra_source}:affiliation-1:org-2"),
         ],
     }
     source_details_by_id = {
@@ -128,6 +127,14 @@ async def test_phone_match_attaches_every_current_directory_source(monkeypatch):
             "canonical_api_base": "https://contra.example/fhir",
         },
     }
+    from api import provider_directory_evidence_lineage
+
+    binding_by_source = {
+        source_id: (details["endpoint_id"], details["canonical_api_base"])
+        for source_id, details in source_details_by_id.items()
+    }
+    resolve_lineage = AsyncMock(return_value=(binding_by_source, (), ()))
+    monkeypatch.setattr(provider_directory_evidence_lineage, "resolve_address_evidence", resolve_lineage)
     fetch_details = AsyncMock(return_value=source_details_by_id)
     monkeypatch.setattr(
         npi_module,
@@ -142,9 +149,7 @@ async def test_phone_match_attaches_every_current_directory_source(monkeypatch):
         session=None,
     )
     attached_source_ids = {
-        source_id
-        for endpoint in candidate_dict["provider_directory_sources"]
-        for source_id in endpoint["source_ids"]
+        source_id for endpoint in candidate_dict["provider_directory_sources"] for source_id in endpoint["source_ids"]
     }
     assert attached_source_ids == {cigna_source, contra_source}
 
@@ -170,4 +175,16 @@ async def test_match_candidate_source_details_stay_compact(monkeypatch):
         candidate_rows,
         include_role_evidence=False,
         session="request-session",
+        profile_generation_id=None,
+        phone_digits=None,
     )
+
+
+def test_phone_selector_uses_actual_unscoped_query_schema():
+    from api.provider_list_sql import _address_phone_candidates_cte
+
+    sql = _address_phone_candidates_cte("example_schema.entity_address_unified")
+    assert "example_schema.provider_directory_endpoint_dataset" in sql
+    assert "example_schema.provider_directory_address_overlay" in sql
+    assert "example_schema.provider_directory_dataset_resource" in sql
+    assert "mrf.provider_directory_" not in sql

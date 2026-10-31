@@ -332,7 +332,8 @@ class PreparationFakeFHIR:
     def _artifact_scope_tokens(self, full_fence, resource_fence, overrides, oids):
         assert set(overrides.values()) <= self.indexed_names
         token = self.scope_relations.set(overrides)
-        self.events.append("full-enter")
+        if overrides:
+            self.events.append("full-enter")
         try:
             yield
         finally:

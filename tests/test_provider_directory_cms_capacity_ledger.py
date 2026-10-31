@@ -172,11 +172,27 @@ async def test_cutover_wal_observation_includes_retained_admission_offset(monkey
 def _resume_fixture():
     """Build a frozen admission while preserving its one original tracker."""
     identity = SimpleNamespace(serving_state="existing", initial_targets=None)
-    geometry, tracker = SimpleNamespace(reservation_bytes_by_storage_class={"wal": 1000}), SimpleNamespace()
+    geometry, projection = _resume_geometry(False)
+    tracker = SimpleNamespace()
     admission = fhir._ProviderDirectoryProfileCapacityAdmission(
-        geometry, "projection", "lease", "database", "pdpb_" + "a" * 32, "run_" + "b" * 32, "0/10", tracker, identity
+        geometry, projection, "lease", "database", "pdpb_" + "a" * 32, "run_" + "b" * 32, "0/10", tracker, identity
     )
     return admission, identity
+
+
+def _resume_workload(admission, database_identity=None):
+    """Keep the real immutable control plan inside the existing workload carrier."""
+    return fhir._ProfileAdmissionWorkload(
+        limits=None,
+        limits_payload={},
+        limits_sha256="",
+        artifact_projection=None,
+        database_pool_size=5,
+        artifact_worker_count=1,
+        database_identity=database_identity,
+        batch_plan=None,
+        control_wal_plan_input=admission.control_wal_projection.plan_input,
+    )
 
 
 def _resume_backend(admission, identity):
@@ -194,10 +210,10 @@ def _resume_backend(admission, identity):
         RESOURCE_MODELS=fhir.RESOURCE_MODELS,
         _provider_directory_artifact_relation_scope=fhir._provider_directory_artifact_relation_scope,
         _profile_admission_identity=AsyncMock(return_value=identity),
-        _profile_admission_workload=AsyncMock(return_value="workload"),
+        _profile_admission_workload=AsyncMock(return_value=_resume_workload(admission)),
         _profile_admission_inputs=lambda *args: "inputs",
         _profile_admission_geometry=lambda *args: SimpleNamespace(
-            geometry=admission.geometry, control_wal_projection="projection"
+            geometry=admission.geometry, control_wal_projection=admission.control_wal_projection
         ),
         assert_profile_selection_current_in_transaction=AsyncMock(),
         _provider_directory_profile_selection_catalog=lambda: {},
@@ -244,12 +260,12 @@ async def test_resume_retains_identity_tracker_and_measured_wal(monkeypatch):
         await capacity.resume_profile_capacity(fake, paused, execution, "fence", "delta", frozenset({"Practitioner"}))
     fake._profile_admission_identity.return_value = identity
     fake._profile_admission_geometry = lambda *args: SimpleNamespace(
-        geometry="changed", control_wal_projection="projection"
+        geometry="changed", control_wal_projection=admission.control_wal_projection
     )
     with pytest.raises(RuntimeError, match="profile_geometry_changed"):
         await capacity.resume_profile_capacity(fake, paused, execution, "fence", "delta", frozenset({"Practitioner"}))
     fake._profile_admission_geometry = lambda *args: SimpleNamespace(
-        geometry=admission.geometry, control_wal_projection="projection"
+        geometry=admission.geometry, control_wal_projection=admission.control_wal_projection
     )
     fake._provider_directory_profile_capacity_acceptance_time.side_effect = RuntimeError("deadline_reached")
     with pytest.raises(RuntimeError, match="deadline_reached"):
@@ -338,7 +354,7 @@ async def _admitted_resume_fixture(monkeypatch, initial_mode):
     )
     database_identity = SimpleNamespace(wal_lsn="0/10")
     template, _ = _resume_fixture()
-    template = replace(template, geometry=geometry)
+    template = replace(template, geometry=geometry, control_wal_projection=projection)
     backend = _resume_backend(template, source_identity)
     backend._provider_directory_profile_serving_state.return_value = source_identity.serving_state
     for name, boundary in vars(backend).items():
@@ -352,7 +368,7 @@ async def _admitted_resume_fixture(monkeypatch, initial_mode):
     monkeypatch.setattr(
         fhir,
         "_profile_admission_workload",
-        AsyncMock(return_value=SimpleNamespace(database_identity=database_identity)),
+        AsyncMock(return_value=_resume_workload(template, database_identity)),
     )
     monkeypatch.setattr(
         fhir,
