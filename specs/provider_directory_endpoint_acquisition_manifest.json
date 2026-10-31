@@ -27,6 +27,7 @@
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Accepts official public cursor continuations with checkpoints. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections and bounded searches succeeded. A bounded advertised-cursor follow succeeded without overlapping the first sampled page. Exhaustive traversal, population adequacy, terminal acquisition and publication readiness remained unverified."},
       "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition retains durable pagination checkpoints and fails closed with pagination_resume_required when a complete traversal cannot resume. Terminal endpoint-wide proof and downstream publication require separate verification."},
       "michigan": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-19", "method": "rest", "limitation": "Acquisition is configured for Location, Organization, OrganizationAffiliation, Practitioner, and PractitionerRole using exact advertised cursor replay and durable checkpoints. Synthetic _getpagesoffset continuation is not equivalent and remains prohibited. Bounded source review (2026-10-19): The official CMS directory still lists the legacy InteropStation MDHHS base. Anonymous metadata at the configured base returned HTTP 200 with an active FHIR 4.0.1 CapabilityStatement advertising all five configured collections. This metadata observation does not establish equivalence with the legacy catalog entry, exhaustive collection traversal, terminal acquisition, publication or API readiness. Complete source-coverage proof remains required before publication."},
+      "christus-health-plan": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-31", "method": "rest", "limitation": "Seven public FHIR R4 collections use server-issued next links with pages of up to 100 records. Opaque _cursor continuations support traversal beyond the direct _offset cap; Organization uses issued offsets. Continuation totals may be absent and a final next link may return an empty page. Full reconciliation is required for deletions. Complete acquisition, publication and API readiness require separate verification."},
       "cigna": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Sequential REST pagination preserves Plan-Net network extensions and supports configured _count=100 and _count=75 searches. Bulk/export is disabled in the maintained source configuration. Expected nonempty initial searches retry transient HTTP-200 empty search sets with cooldowns. Bounded source observations (2026-10-10): Anonymous R4 metadata listed all eight configured collections. Bounded reads succeeded, including 75- and 100-row Practitioner pages; Endpoint search was empty. No Bulk/export operation was advertised in the reviewed metadata. Complete traversal and publication readiness remained unverified."},
       "caresource": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Collections use same-origin opaque _page/_searchId continuations. Full-refresh acquisition durably records a pre-scan _summary=count census, checkpoints every opaque next link without the generic page ceiling, and permits terminal completion only when processed and unique candidate resource IDs equal unchanged post-scan census. Any cursor loss, duplicate/count mismatch, or census drift fails closed. No product membership is inferred from the catalog row. Bounded source observations (2026-10-10): Official documentation and anonymous R4 metadata identified the eight configured collections. Bounded census requests and one same-origin cursor follow succeeded. The bounded review did not establish a complete acquisition or publication readiness."},
       "aetna-commercial-medicare": {"support_level": "acquisition-configured", "access_requirement": "oauth2-client-credentials", "requires_registration": true, "reviewed_at": "2026-10-11", "method": "bulk", "limitation": "OAuth2 client credentials and Bulk; Endpoint is excluded from configured acquisition. Credentialed transport aliases do not establish another carrier directory. Bounded source observations (2026-10-10): R4 metadata listed the seven configured collections and export/exportstatus. Official token-generation instructions required registration and client credentials, and an anonymous collection read returned HTTP 401. Credentialed export, terminal acquisition and publication proof remained unverified."},
@@ -241,6 +242,27 @@
       "launch_mode": "create",
       "resource_profile": "M5",
       "resources": ["Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
+    },
+    {
+      "entry_id": "christus-health-plan",
+      "display_name": "CHRISTUS Health Plan",
+      "owner_id": "christus-health-plan",
+      "source_ids": [
+        "pdfhir_b674847fc79d2b2ea1f4e986"
+      ],
+      "canonical_base": "https://doctors.christushealthplan.org/fhir/provider-directory",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "A7",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ]
     },
     {
       "entry_id": "cigna",
