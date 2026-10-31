@@ -10,6 +10,7 @@ from db.migration_provider_directory_dataset_candidates import TABLES, candidate
 from db.plan_release_storage import storage_relation
 from process import provider_directory_output_snapshot_custody as custody
 from process.plan_release_storage_custody import storage_roles
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_output_snapshot_catalog import (
     OUTPUT_CATALOG_SQL,
     OUTPUT_ROOTS,
@@ -276,7 +277,7 @@ async def _plan(capability):
             and hook["nspname"] == capability.policy.schema
             and hook["prosrc"] == expected_body
             and not hook["prosecdef"]
-            and hook["proconfig"] == ["search_path=pg_catalog"]
+            and hook["proconfig"] in approved_cms_routine_settings(["search_path=pg_catalog"])
             and hook["pronargs"] == 0
             and hook["trigger_result"]
             and hook["lanname"] == "plpgsql"

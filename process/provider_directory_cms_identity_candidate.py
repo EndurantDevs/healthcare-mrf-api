@@ -182,7 +182,21 @@ class _EntityObservations:
 
 async def _entity_observations(connection, policy, receipts, source_id, resource_type, release_id, resource_ids):
     """Four indexed header reads, independent of the number of requested keys."""
-    relations = _relations(policy, receipts)
+    return await read_entity_observations(
+        connection,
+        _relations(policy, receipts),
+        _canonical_schema(policy),
+        source_id,
+        resource_type,
+        release_id,
+        resource_ids,
+    )
+
+
+async def read_entity_observations(
+    connection, relations, canonical_schema, source_id, resource_type, release_id, resource_ids
+):
+    """Read qualified private and canonical coordinates; callers authenticate them."""
     results = []
     for root, is_stage in (
         (CMS_IDENTITY_TABLES[0], True),
@@ -190,7 +204,7 @@ async def _entity_observations(connection, policy, receipts, source_id, resource
         (CMS_IDENTITY_TABLES[1], True),
         (CMS_IDENTITY_TABLES[1], False),
     ):
-        relation = relations[root] if is_stage else storage_relation(policy.schema, root)
+        relation = relations[root] if is_stage else storage_relation(canonical_schema, root)
         fields = (
             "resource_id,organization_id,site_id,created_at"
             if root == CMS_IDENTITY_TABLES[0]
@@ -248,6 +262,17 @@ async def stage_entity_batch(session, source_id, release_id, resource_type, payl
     observations = await _entity_observations(
         publisher.connection, publisher.policy, receipts, source_id, resource_type, release_id, list(payloads)
     )
+    ids, binding_rows, evidence_rows = build_entity_batch_rows(
+        source_id, release_id, resource_type, payloads, observations
+    )
+    for root, copy_rows in ((CMS_IDENTITY_TABLES[0], binding_rows), (CMS_IDENTITY_TABLES[1], evidence_rows)):
+        if copy_rows:
+            await copy_identity_rows(publisher, receipts[root]["name"], CMS_IDENTITY_COLUMNS[root], copy_rows)
+    return ids
+
+
+def build_entity_batch_rows(source_id, release_id, resource_type, payloads, observations):
+    """Preserve accepted UUIDs and timestamps, refusing conflicting release facts."""
     ids, binding_rows, evidence_rows = {}, [], []
     now = datetime.now(timezone.utc)
     id_column = "organization_id" if resource_type == "Organization" else "site_id"
@@ -287,10 +312,7 @@ async def stage_entity_batch(session, source_id, release_id, resource_type, payl
                     source_id, resource_type, resource_id, release_id, payload_hash, resource_payload, timestamp
                 )
             )
-    for root, copy_rows in ((CMS_IDENTITY_TABLES[0], binding_rows), (CMS_IDENTITY_TABLES[1], evidence_rows)):
-        if copy_rows:
-            await copy_identity_rows(publisher, receipts[root]["name"], CMS_IDENTITY_COLUMNS[root], copy_rows)
-    return ids
+    return ids, binding_rows, evidence_rows
 
 
 def _copy_value_bytes(cell):
@@ -309,30 +331,34 @@ def _copy_value_bytes(cell):
 async def copy_identity_rows(publisher, name, columns, records):
     """Native typed COPY with complete framing/UUID/timestamp byte accounting."""
     _require(publisher is bound_publisher(), "publisher_changed")
-    source_copy_session()
+    return await copy_identity_rows_native(
+        publisher.connection, source_copy_session(), publisher.policy.schema, name, columns, records
+    )
+
+
+async def copy_identity_rows_native(connection, session, schema, name, columns, records):
+    """COPY bounded rows on caller-qualified coordinates and the original session."""
     batch, size, total = [], 21, 0
     for copy_row in records:
         _require(type(copy_row) is tuple and len(copy_row) == len(columns), "copy_record_invalid")
         row_size = 2 + sum(4 + _copy_value_bytes(cell) for cell in copy_row)
         _require(21 + row_size <= COPY_MAX_BYTES, "copy_record_too_large")
         if batch and (len(batch) == COPY_MAX_ROWS or size + row_size > COPY_MAX_BYTES):
-            total += await _copy_batch(publisher, name, columns, batch)
+            total += await _copy_batch(connection, session, schema, name, columns, batch)
             batch, size = [], 21
         batch.append(copy_row)
         size += row_size
     if batch:
-        total += await _copy_batch(publisher, name, columns, batch)
+        total += await _copy_batch(connection, session, schema, name, columns, batch)
     return total
 
 
-async def _copy_batch(publisher, name, columns, records):
+async def _copy_batch(connection, session, schema, name, columns, records):
     try:
-        status = await publisher.connection.copy_records_to_table(
-            name, schema_name=publisher.policy.schema, columns=columns, records=records
-        )
+        status = await connection.copy_records_to_table(name, schema_name=schema, columns=columns, records=records)
     except asyncio.CancelledError, TimeoutError:
-        await close_interrupted_copy(publisher.connection)
-        await invalidate_copy_owner(source_copy_session(), publisher.connection)
+        await close_interrupted_copy(connection)
+        await invalidate_copy_owner(session, connection)
         raise
     _require(status == f"COPY {len(records)}", "copy_incomplete")
     return len(records)
@@ -355,6 +381,19 @@ def _relations(policy, receipts):
     return {root: storage_relation(policy.schema, name) for root, name in _names(receipts).items()}
 
 
+def _canonical_schema(policy):
+    """Keep accepted identity observations outside the issued private namespace."""
+    publisher = bound_publisher()
+    _require(publisher.policy is policy, "publisher_changed")
+    binding = getattr(publisher, "storage_binding", None)
+    if binding is None:
+        return policy.schema
+    from process.provider_directory_source_storage_binding import require_storage_schema
+
+    require_storage_schema(publisher, binding.catalog_schema)
+    return binding.catalog_schema
+
+
 def _same_coordinates(root):
     return " AND ".join(
         f"candidate.{storage_identifier(column)} IS NOT DISTINCT FROM incumbent.{storage_identifier(column)}"
@@ -363,13 +402,18 @@ def _same_coordinates(root):
 
 
 async def _global_replay(connection, policy, receipts, *, complete=False):
-    for root, relation in _relations(policy, receipts).items():
+    await verify_identity_replay(connection, _relations(policy, receipts), _canonical_schema(policy), complete=complete)
+
+
+async def verify_identity_replay(connection, relations, canonical_schema, *, complete=False):
+    """Compare every accepted key using explicit, caller-qualified coordinates."""
+    for root, relation in relations.items():
         keys = ",".join(storage_identifier(column) for column in CMS_IDENTITY_KEYS[root])
         join = "LEFT JOIN" if complete else "JOIN"
         missing = "incumbent.source_id IS NULL OR " if complete else ""
         changed = await connection.fetchval(
             f"SELECT EXISTS(SELECT FROM {relation} candidate {join} "
-            f"{storage_relation(policy.schema, root)} incumbent USING ({keys}) WHERE {missing}NOT ({_same_coordinates(root)}))"
+            f"{storage_relation(canonical_schema, root)} incumbent USING ({keys}) WHERE {missing}NOT ({_same_coordinates(root)}))"
         )
         if changed:
             raise CMSIdentityReprepareRequired("provider_directory_cms_identity_whole_candidate_reprepare_required")
@@ -461,6 +505,12 @@ async def _complete_source_facts(connection, policy, identity, receipts):
     )
     witness = storage_relation(policy.schema, binding["tables"]["provider_directory_cms_npd_resource_witness"]["name"])
     relations = _relations(policy, receipts)
+    await verify_identity_source_facts(connection, relations, identity, witness)
+    await _canonical_authority(connection, policy, receipts)
+
+
+async def verify_identity_source_facts(connection, relations, identity, witness):
+    """Compare the full private entity/network evidence against frozen raw facts."""
     entities = relations[CMS_IDENTITY_TABLES[0]]
     evidence_relation = relations[CMS_IDENTITY_TABLES[1]]
     networks = relations[CMS_IDENTITY_TABLES[2]]
@@ -485,11 +535,14 @@ async def _complete_source_facts(connection, policy, identity, receipts):
         await connection.fetchval(query, identity["dataset_id"], _identity(identity)) is False,
         "network_evidence_incomplete",
     )
-    await _canonical_authority(connection, policy, receipts)
 
 
 async def _canonical_authority(connection, policy, receipts):
-    relations = _relations(policy, receipts)
+    await verify_canonical_identity_authority(connection, _relations(policy, receipts), _canonical_schema(policy))
+
+
+async def verify_canonical_identity_authority(connection, relations, canonical_schema):
+    """Refuse opaque UUID reuse across accepted keys on explicit coordinates."""
     for table, column, root in (
         ("provider_directory_organization_identity", "organization_id", CMS_IDENTITY_TABLES[0]),
         ("provider_directory_site_identity", "site_id", CMS_IDENTITY_TABLES[0]),
@@ -499,19 +552,19 @@ async def _canonical_authority(connection, policy, receipts):
         field = storage_identifier(column)
         invalid = await connection.fetchval(
             f"SELECT EXISTS(SELECT FROM {relations[root]} candidate "
-            f"LEFT JOIN {storage_relation(policy.schema, table)} canonical ON canonical.{field}=candidate.{field} "
-            f"LEFT JOIN {storage_relation(policy.schema, root)} incumbent USING({keys}) "
+            f"LEFT JOIN {storage_relation(canonical_schema, table)} canonical ON canonical.{field}=candidate.{field} "
+            f"LEFT JOIN {storage_relation(canonical_schema, root)} incumbent USING({keys}) "
             f"WHERE candidate.{field} IS NOT NULL AND ((canonical.{field} IS NOT NULL "
             f"AND incumbent.{field} IS DISTINCT FROM candidate.{field}) "
             f"OR (incumbent.{field} IS NOT NULL AND canonical.{field} IS NULL))) OR EXISTS("
             f"SELECT candidate.{field} FROM {relations[root]} candidate "
-            f"LEFT JOIN {storage_relation(policy.schema, root)} incumbent USING({keys}) "
+            f"LEFT JOIN {storage_relation(canonical_schema, root)} incumbent USING({keys}) "
             f"WHERE candidate.{field} IS NOT NULL GROUP BY candidate.{field} "
             f"HAVING count(*)>1 AND bool_or(incumbent.{field} IS DISTINCT FROM candidate.{field}))"
         )
         if invalid:
             # A committed winner can appear after the preceding read-committed replay check.
-            await _global_replay(connection, policy, receipts)
+            await verify_identity_replay(connection, relations, canonical_schema)
         _require(invalid is False, "canonical_identity_reuse_forbidden")
 
 
@@ -532,6 +585,12 @@ async def finish_identity_stages(publisher, identity, receipts):
     await _source_coordinates(connection, policy, identity, receipts)
     await _global_replay(connection, policy, receipts)
     relations = _relations(policy, receipts)
+    await verify_identity_relationships(connection, relations)
+    await _complete_source_facts(connection, policy, identity, receipts)
+
+
+async def verify_identity_relationships(connection, relations):
+    """Check every private evidence/map edge without an ambient Source context."""
     binding_relation = relations[CMS_IDENTITY_TABLES[0]]
     evidence_relation = relations[CMS_IDENTITY_TABLES[1]]
     network_relation = relations[CMS_IDENTITY_TABLES[2]]
@@ -547,18 +606,22 @@ async def finish_identity_stages(publisher, identity, receipts):
         "WHERE n.network_id IS NULL OR e.resource_id IS NULL)"
     )
     _require(invalid is False, "relationships_changed")
-    await _complete_source_facts(connection, policy, identity, receipts)
 
 
 async def _publish_canonical_ids(connection, policy, relations, table, column, root):
+    """Keep Source coordinate authentication for existing callers."""
+    await _publish_canonical_ids_native(connection, _canonical_schema(policy), relations, table, column, root)
+
+
+async def _publish_canonical_ids_native(connection, canonical_schema, relations, table, column, root):
     """A new source key must win its native canonical UUID insert in this statement."""
     field = storage_identifier(column)
     keys = ",".join(storage_identifier(key) for key in CMS_IDENTITY_KEYS[root])
     conflict = await connection.fetchval(
         f"WITH needed AS MATERIALIZED (SELECT DISTINCT candidate.{field},candidate.created_at "
-        f"FROM {relations[root]} candidate LEFT JOIN {storage_relation(policy.schema, root)} incumbent "
+        f"FROM {relations[root]} candidate LEFT JOIN {storage_relation(canonical_schema, root)} incumbent "
         f"USING({keys}) WHERE candidate.{field} IS NOT NULL AND incumbent.source_id IS NULL), "
-        f"inserted AS (INSERT INTO {storage_relation(policy.schema, table)} ({field},created_at) "
+        f"inserted AS (INSERT INTO {storage_relation(canonical_schema, table)} ({field},created_at) "
         f"SELECT {field},created_at FROM needed ORDER BY {field} ON CONFLICT ({field}) DO NOTHING RETURNING {field}) "
         # Every needed id must have been inserted; counting avoids a statistics-free join of two CTEs.
         f"SELECT (SELECT count(DISTINCT {field}) FROM needed)<>(SELECT count(*) FROM inserted)"
@@ -567,35 +630,47 @@ async def _publish_canonical_ids(connection, policy, relations, table, column, r
         raise CMSIdentityReprepareRequired("provider_directory_cms_identity_whole_candidate_reprepare_required")
 
 
+async def publish_identity_relations(connection, relations, canonical_schema):
+    """Merge four qualified private maps and their three UUID roots set-wise.
+
+    This data operation grants no authority. Its caller authenticates the exact
+    relations, original writer and custody/fence, and owns rollback and commit.
+    """
+    _require(connection.is_in_transaction() is True, "transaction_required")
+    _require(set(relations) == set(CMS_IDENTITY_TABLES), "stages_changed")
+    await verify_identity_replay(connection, relations, canonical_schema)
+    await verify_canonical_identity_authority(connection, relations, canonical_schema)
+    for table, column, root in (
+        ("provider_directory_organization_identity", "organization_id", CMS_IDENTITY_TABLES[0]),
+        ("provider_directory_site_identity", "site_id", CMS_IDENTITY_TABLES[0]),
+        ("provider_directory_insurance_network_identity", "network_id", CMS_IDENTITY_TABLES[2]),
+    ):
+        await _publish_canonical_ids_native(connection, canonical_schema, relations, table, column, root)
+    for root, relation in relations.items():
+        fields = ",".join(storage_identifier(column) for column in CMS_IDENTITY_COLUMNS[root])
+        keys = ",".join(storage_identifier(column) for column in CMS_IDENTITY_KEYS[root])
+        await connection.execute(
+            f"INSERT INTO {storage_relation(canonical_schema, root)} ({fields}) "
+            f"SELECT {fields} FROM {relation} ORDER BY {keys} ON CONFLICT ({keys}) DO NOTHING"
+        )
+    from process.provider_directory_generic_source_storage import refresh_statistics
+
+    await refresh_statistics(connection, canonical_schema, relations)
+    await verify_identity_replay(connection, relations, canonical_schema, complete=True)
+
+
 async def publish_identity_stages(publisher, identity, receipts):
     """One savepoint: native uniqueness plus exact revalidation, never remap UUIDs."""
     connection, policy = publisher.connection, publisher.policy
     _require(connection.is_in_transaction() is True and publisher is bound_publisher(), "publisher_changed")
     source_copy_session()
     relations = _relations(policy, receipts)
+    canonical_schema = _canonical_schema(policy)
     try:
         async with connection.transaction():
             await _protected_auxiliary(connection, policy, identity, receipts, ("sealed",))
             await _source_coordinates(connection, policy, identity, receipts)
-            await _global_replay(connection, policy, receipts)
-            await _canonical_authority(connection, policy, receipts)
-            for table, column, root in (
-                ("provider_directory_organization_identity", "organization_id", CMS_IDENTITY_TABLES[0]),
-                ("provider_directory_site_identity", "site_id", CMS_IDENTITY_TABLES[0]),
-                ("provider_directory_insurance_network_identity", "network_id", CMS_IDENTITY_TABLES[2]),
-            ):
-                await _publish_canonical_ids(connection, policy, relations, table, column, root)
-            for root, relation in relations.items():
-                fields = ",".join(storage_identifier(column) for column in CMS_IDENTITY_COLUMNS[root])
-                keys = ",".join(storage_identifier(column) for column in CMS_IDENTITY_KEYS[root])
-                await connection.execute(
-                    f"INSERT INTO {storage_relation(policy.schema, root)} ({fields}) "
-                    f"SELECT {fields} FROM {relation} ORDER BY {keys} ON CONFLICT ({keys}) DO NOTHING"
-                )
-            from process.provider_directory_generic_source_storage import refresh_statistics
-
-            await refresh_statistics(connection, policy.schema, relations)
-            await _global_replay(connection, policy, receipts, complete=True)
+            await publish_identity_relations(connection, relations, canonical_schema)
     except asyncpg.SerializationError as error:
         raise CMSIdentityReprepareRequired(
             "provider_directory_cms_identity_whole_candidate_reprepare_required"

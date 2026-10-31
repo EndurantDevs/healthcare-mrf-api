@@ -79,7 +79,12 @@ NATIVE_INPUT_MIGRATIONS = (
     "20260929040000",
     "20261001110000",
     "20261004000000",
+    "20261007150000",
+    "20261017210000",
     "20261019030000",
+    "20261022120000",
+    "20261023100000_provider_directory_retirement_parent_updates",
+    "20261024050000",
 )
 
 
@@ -89,13 +94,13 @@ def source_component_native_migrations():
 
     baseline = source_component_migrations()
     assert len(baseline) == len(set(baseline)) == 99
-    assert len(NATIVE_INPUT_MIGRATIONS) == len(set(NATIVE_INPUT_MIGRATIONS)) == 26
+    assert len(NATIVE_INPUT_MIGRATIONS) == len(set(NATIVE_INPUT_MIGRATIONS)) == 31
     from tests.nppes_candidate_postgres_support import nppes_source_component_migrations
 
     callable_migrations = nppes_source_component_migrations()
     selected = set(baseline) | set(NATIVE_INPUT_MIGRATIONS) | set(callable_migrations)
     assert set(baseline) & set(NATIVE_INPUT_MIGRATIONS) == {"20260920100000", "20260929000000", "20260929040000"}
-    assert len(selected) == 130
+    assert len(selected) == 135
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
@@ -112,7 +117,7 @@ def source_component_native_migrations():
     prefix_by_revision = {found[0].revision: prefix for prefix, found in nodes_by_prefix.items()}
     assert len(prefix_by_revision) == len(selected)
     ordered_prefixes = tuple(prefix_by_revision[node.revision] for node in nodes if node.revision in prefix_by_revision)
-    assert set(ordered_prefixes) == selected and len(ordered_prefixes) == 130
+    assert set(ordered_prefixes) == selected and len(ordered_prefixes) == 135
     assert tuple(prefix for prefix in ordered_prefixes if prefix in set(baseline)) == baseline
     return ordered_prefixes
 

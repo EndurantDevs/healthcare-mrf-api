@@ -24,6 +24,7 @@ from process.provider_directory_cms_control_privileges import (
     cms_control_read_oids,
 )
 from process.provider_directory_cms_receipt_custody import _CATALOG_SQL, _require_migration_identity
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_profile_initial_custody import (
     _OWNER_USAGE_SQL,
@@ -450,7 +451,10 @@ def _require_callable_definition(entry, schema, namespace):
     _require(
         int(definition["pronamespace"]) == namespace
         and entry["language"] == language
-        and all(definition[name] == field_value for name, field_value in expected_by_field.items())
+        and definition["proconfig"] in approved_cms_routine_settings(expected_by_field["proconfig"])
+        and all(
+            definition[name] == field_value for name, field_value in expected_by_field.items() if name != "proconfig"
+        )
         and _body_digest(definition["prosrc"], schema) == digest,
         "callable_definition_changed",
     )

@@ -85,6 +85,7 @@ from db.models import (
 )
 from db.plan_release_storage import storage_relation
 from process import provider_directory_christus as christus
+from process import provider_directory_cms_desired_fence as cms_desired_fence
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_artifact_custody as profile_artifact_custody
@@ -8920,6 +8921,22 @@ def _artifact_dataset_publication_statement(
         source_summary_contract_id=SOURCE_SUMMARY_CONTRACT_ID,
         source_summary_contract_version=SOURCE_SUMMARY_CONTRACT_VERSION,
     )
+    if dataset.source_id == "cms-npd" and dataset.status == ENDPOINT_DATASET_PUBLISHED and dataset.is_current is False:
+        if not dataset.published_at:
+            raise ProviderDirectoryArtifactBuildStale("cms_serving_candidate_seal_required")
+        assignment = "SET status = :published_status,\n                   is_current = true,\n                   published_at = now(),"
+        predicate = "AND status = :validated_status"
+        if publish_sql.count(assignment) != 1 or publish_sql.count(predicate) != 1:
+            raise RuntimeError("cms_serving_publication_template_changed")
+        publish_sql = publish_sql.replace(assignment, "SET is_current = true,", 1).replace(
+            predicate,
+            "AND status = :published_status "
+            "AND published_at=CAST(CAST(:cms_sealed_at AS text) AS timestamp) "
+            "AND candidate.eligibility_metadata_jsonb->'source_ids'='[\"cms-npd\"]'::jsonb",
+            1,
+        )
+        parameters_by_name.pop("validated_status")
+        parameters_by_name["cms_sealed_at"] = dataset.published_at
     return publish_sql, parameters_by_name
 
 
@@ -13115,6 +13132,7 @@ class ProviderDirectoryArtifactDataset:
     source_authority_id: str | None = None
     admission_id: str | None = None
     operation_key: str | None = None
+    published_at: str | None = None
 
     @property
     def artifact_resources(self) -> tuple[str, ...]:
@@ -17874,6 +17892,7 @@ def _artifact_dataset_state_from_row(
             int(dataset_row_map.get("resource_count")) if dataset_row_map.get("resource_count") is not None else None
         ),
         "validated_at": validated_at,
+        "published_at": selection_state["published_at"],
         **_artifact_dataset_authority_state_from_row(
             dataset_row_map,
             publication_metadata,
@@ -17917,6 +17936,15 @@ def _artifact_dataset_selection_from_row(
         "current_dataset_id": current_dataset_id,
         "validated_candidate_count": validated_candidate_count,
         "previous_dataset_id": previous_dataset_id,
+        "published_at": (
+            str(dataset_row_map["published_at"])
+            if dataset_row_map.get("source_id") == "cms-npd"
+            and status == ENDPOINT_DATASET_PUBLISHED
+            and is_current is False
+            and dataset_row_map.get("published_at") is not None
+            and dataset_row_map.get("superseded_at") is None
+            else None
+        ),
     }
     _assert_artifact_dataset_selection_state(
         selection_state_map,
@@ -17931,34 +17959,7 @@ def _assert_artifact_dataset_selection_state(
     dataset_id: str,
     endpoint_id: str,
 ) -> None:
-    should_reconcile_source_alias = bool(selection_state.get("should_reconcile_source_alias"))
-    if selection_state["should_promote_on_cutover"]:
-        if should_reconcile_source_alias:
-            raise RuntimeError("provider_directory_artifact_alias_cutover_ambiguous:" + dataset_id)
-        if selection_state["validated_candidate_count"] != 1:
-            raise RuntimeError("provider_directory_artifact_validated_candidate_ambiguous:" + endpoint_id)
-        if selection_state["status"] != ENDPOINT_DATASET_VALIDATED or selection_state["is_current"]:
-            raise RuntimeError("provider_directory_artifact_validated_candidate_invalid:" + dataset_id)
-        if (
-            selection_state["current_dataset_count"] > 1
-            or selection_state["previous_dataset_id"] != selection_state["current_dataset_id"]
-        ):
-            raise RuntimeError("provider_directory_artifact_expected_incumbent_mismatch:" + dataset_id)
-        return
-    if should_reconcile_source_alias and (
-        selection_state["status"] != ENDPOINT_DATASET_PUBLISHED
-        or not selection_state["is_current"]
-        or selection_state["current_dataset_count"] != 1
-        or selection_state["current_dataset_id"] != dataset_id
-    ):
-        raise RuntimeError("provider_directory_artifact_alias_reconciliation_invalid:" + dataset_id)
-    if (
-        selection_state["status"] != ENDPOINT_DATASET_PUBLISHED
-        or not selection_state["is_current"]
-        or selection_state["current_dataset_count"] != 1
-        or selection_state["current_dataset_id"] != dataset_id
-    ):
-        raise RuntimeError("provider_directory_artifact_current_dataset_invalid:" + dataset_id)
+    cms_desired_fence.require_dataset_selection_state(sys.modules[__name__], selection_state, dataset_id, endpoint_id)
 
 
 def _validate_provider_directory_artifact_datasets(
@@ -18074,6 +18075,7 @@ def _artifact_endpoint_selection_identity(
         dataset.source_authority_id,
         dataset.admission_id,
         dataset.operation_key,
+        dataset.published_at,
     )
 
 
@@ -20805,14 +20807,7 @@ def _is_artifact_fence_dataset_row_exact(
     dataset: ProviderDirectoryArtifactDataset,
     dataset_row_map: dict[str, Any],
 ) -> bool:
-    actual_identity = _artifact_fence_dataset_row_identity(dataset_row_map)
-    expected_identity_by_name = _expected_artifact_fence_dataset_identity(dataset)
-    for field_index, (actual_value, expected_value) in enumerate(zip(actual_identity, expected_identity_by_name)):
-        if field_index in {5, 6, 7, 8} and expected_value is None:
-            continue
-        if actual_value != expected_value:
-            return False
-    return True
+    return cms_desired_fence.is_dataset_row_exact(sys.modules[__name__], dataset, dataset_row_map)
 
 
 def _current_published_artifact_dataset_ids(
@@ -23622,6 +23617,7 @@ def _artifact_fence_selection_identity(
                     dataset.dataset_hash,
                     dataset.resource_count,
                     dataset.validated_at,
+                    dataset.published_at,
                 )
                 for dataset in fence.datasets
             )

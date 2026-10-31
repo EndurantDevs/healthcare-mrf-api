@@ -484,6 +484,7 @@ async def _completed_source_case(monkeypatch, case, *, completed=True):
         ("release", "cms_npd_candidate_release_changed"),
         ("endpoint", "cms_npd_candidate_identity_changed"),
         ("date", "cms_npd_candidate_identity_changed"),
+        ("published_noncurrent", "cms_npd_candidate_identity_changed"),
         ("root", "cms_npd_candidate_root_invalid"),
         ("status", "cms_npd_candidate_state_invalid"),
         ("disposed", "cms_npd_candidate_disposed"),
@@ -497,6 +498,12 @@ async def test_reused_candidate_identity_fails_before_ingestion(npd_case, fault,
         case.state["endpoint_id"] = "different-endpoint"
     if fault == "date":
         case.state["publication_metadata_json"][fhir.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY] = "2026-09-23"
+    if fault == "published_noncurrent":
+        case.state.update(
+            status=fhir.ENDPOINT_DATASET_PUBLISHED,
+            published_at="published-synthetic",
+            validated_at="validated-synthetic",
+        )
     if fault == "root":
         case.state["acquisition_root_run_id"] = None
     if fault == "status":
