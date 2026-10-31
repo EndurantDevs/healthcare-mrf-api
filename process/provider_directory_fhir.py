@@ -84,6 +84,7 @@ from db.models import (
     db,
 )
 from db.plan_release_storage import storage_relation
+from process import provider_directory_christus as christus
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_artifact_custody as profile_artifact_custody
@@ -1173,7 +1174,7 @@ CIGNA_PROVIDER_DIRECTORY_BASE = "https://fhir.cigna.com/ProviderDirectory/v1"
 CIGNA_EXPECTED_NONEMPTY_RESOURCES = frozenset(
     resource_type for resource_type in DEFAULT_RESOURCES if resource_type != "Endpoint"
 )
-REST_PAGE_PREFETCH_PILOT_API_BASES = frozenset({CIGNA_PROVIDER_DIRECTORY_BASE})
+REST_PAGE_PREFETCH_PILOT_API_BASES = frozenset({CIGNA_PROVIDER_DIRECTORY_BASE, christus.API_BASE})
 CIGNA_UNEXPECTED_EMPTY_RESOURCE_ERROR = "cigna_expected_nonempty_resource_returned_zero_rows"
 CIGNA_EMPTY_COLLECTION_RETRY_DELAYS_SECONDS = (15.0, 30.0, 60.0, 120.0)
 CARESOURCE_PROVIDER_DIRECTORY_BASE = (
@@ -1481,6 +1482,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         ARKANSAS_PROVIDER_DIRECTORY_BASE,
         CARESOURCE_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
+        christus.API_BASE,
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
@@ -1700,6 +1702,7 @@ IMMUTABLE_ENDPOINT_DATASET_STATUSES = (
 FHIR_CONTINUATION_QUERY_NAMES = frozenset(
     {
         "_continuationtoken",
+        "_cursor",
         "_getpages",
         "_getpagesid",
         "_getpagesoffset",
@@ -40520,24 +40523,19 @@ def _seed_rows_from_supplemental_catalogs(
     )
     supplemental_rows.extend(remote_rows)
     metrics_by_name["catalogs"].update(remote_metrics_by_catalog)
-    catalog_rows = _health_partners_plans_seed_rows(source_query=source_query)
-    supplemental_rows.extend(catalog_rows)
-    metrics_by_name["catalogs"]["health_partners_plans"] = {
-        "source": HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
-        "rows": len(catalog_rows),
-    }
-    catalog_rows = _aetna_provider_directory_data_seed_rows(source_query=source_query)
-    supplemental_rows.extend(catalog_rows)
-    metrics_by_name["catalogs"]["aetna_provider_directorydata"] = {
-        "source": AETNA_PROVIDER_DIRECTORY_DATA_BASE,
-        "rows": len(catalog_rows),
-    }
-    catalog_rows = _provider_directory_blocker_seed_rows(source_query=source_query)
-    supplemental_rows.extend(catalog_rows)
-    metrics_by_name["catalogs"]["provider_directory_blockers"] = {
-        "source": PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
-        "rows": len(catalog_rows),
-    }
+    for name, base, seed_loader in (
+        ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
+        ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
+        ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
+        (
+            "provider_directory_blockers",
+            PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
+            _provider_directory_blocker_seed_rows,
+        ),
+    ):
+        catalog_rows = [seed_row for seed_row in seed_loader() if _is_seed_row_query_match(seed_row, source_query)]
+        supplemental_rows.extend(catalog_rows)
+        metrics_by_name["catalogs"][name] = {"source": base, "rows": len(catalog_rows)}
     metrics_by_name["rows"] = len(supplemental_rows)
     return supplemental_rows, metrics_by_name
 
@@ -40993,13 +40991,13 @@ async def _fetch_json_with_source_session(
         sock_read=timeout,
     )
     started = time.monotonic()
-    request_url = URL(url, encoded=True) if preserve_url_bytes else url
+    request_url = URL(url, encoded=True) if preserve_url_bytes or christus.is_request_url(url) else url
     try:
         async with session.get(
             request_url,
             headers=headers_by_name,
             timeout=request_timeout,
-            allow_redirects=allow_redirects,
+            allow_redirects=allow_redirects and not christus.is_request_url(url),
         ) as response:
             payload_by_field = await _read_source_http_payload(
                 response,
@@ -41039,7 +41037,7 @@ def _fetch_json_sync(
     started = time.monotonic()
     request = urllib.request.Request(fetch_url, headers=headers_by_name)
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+        with christus.open_source_request(request, timeout=timeout, context=_ssl_context()) as response:
             body = _read_response_body_with_deadline(response, timeout=timeout)
             return response.status, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
     except urllib.error.HTTPError as exc:
@@ -41261,7 +41259,7 @@ def _source_fetch_candidate_urls(url: str) -> list[str]:
     parsed = urllib.parse.urlsplit(url)
     query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query_by_name = dict(query_items)
-    if FHIR_CONTINUATION_QUERY_NAMES.intersection(name.lower() for name in query_by_name):
+    if christus.is_request_url(url) or _has_fhir_continuation_query(url):
         return [url]
     try:
         requested_count = int(query_by_name.get("_count") or 0)
@@ -43082,6 +43080,8 @@ def _resolved_fhir_next_url(
     next_url = urllib.parse.urljoin(current_url, next_link)
     api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     parsed_next = urllib.parse.urlsplit(next_url)
+    if api_base == christus.API_BASE:
+        return christus.resolved_christus_next_url(current_url, next_url)
     if api_base in FHIR_OFFSET_PAGINATION_BASES:
         return _resolved_offset_next_url(api_base, current_url, next_url)
     if api_base == AETNA_PROVIDER_DIRECTORY_DATA_BASE:
