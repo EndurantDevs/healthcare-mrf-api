@@ -276,6 +276,7 @@ from process.provider_directory_fhir_subset_identity import (
     server_issued_subset_source_scope_payload,
     subset_activation_source_contract_payload,
 )
+from process.provider_directory_generic_source_adapters import resource_scan_types
 from process.provider_directory_generic_source_policy import is_source_storage_required
 from process.provider_directory_identifier_policy import (
     CMS_NPD_PSEUDO_EIN_SYSTEM,
@@ -57723,25 +57724,12 @@ def _source_resource_fetch_order(
     return foundational_resources + practitioner_role_resources
 
 
-def _resource_scan_foundation_types(
-    source_record: dict[str, Any],
-    resource_types: tuple[str, ...],
-) -> tuple[str, ...]:
-    """Return the ordered Cigna wave that may run before the role tail."""
-    return tuple(
-        resource_type
-        for resource_type in _source_resource_fetch_order(
-            source_record,
-            list(resource_types),
-        )
-        if resource_type != "PractitionerRole"
-    )
-
-
 def _has_parallel_resource_transport(
     source_record: dict[str, Any],
     resource_types: tuple[str, ...],
     page_count: int,
+    *,
+    minimum_resources: int = 2,
 ) -> bool:
     """Require one anonymous, nonpartitioned start URL for every wave member."""
     fetchable_count = 0
@@ -57763,7 +57751,7 @@ def _has_parallel_resource_transport(
         if _rest_page_prefetch_session(source_record, request_url) is None:
             return False
         fetchable_count += 1
-    return fetchable_count >= 2
+    return fetchable_count >= minimum_resources
 
 
 def _has_bound_resource_scan_checkpoint(
@@ -57806,10 +57794,7 @@ def _effective_resource_scan_concurrency(
     )
     source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     checkpoint_context = source_record.get("_pagination_checkpoint_context")
-    foundation_types = _resource_scan_foundation_types(
-        source_record,
-        options.resource_types,
-    )
+    foundation_types = resource_scan_types(sys.modules[__name__], source_record, options.resource_types, options)
     is_safe_shape = bool(
         requested > 1
         and current_version_census_contract(source_record) is None
@@ -67811,7 +67796,7 @@ class ResourceGroupScanRunner:
         self,
         requested_resource_types: list[str],
     ) -> ResourceFetchResult | None:
-        """Run a foundation wave and retain the serial role-tail outcome."""
+        """Run independent cursors and retain any zero-role result for retry."""
         self.source_record.setdefault("_provider_directory_request_pacing_state", {})
         ordered_resource_types = tuple(
             _source_resource_fetch_order(
@@ -67821,13 +67806,19 @@ class ResourceGroupScanRunner:
         )
         concurrency = self._effective_concurrency(ordered_resource_types)
         self.effective_concurrency = concurrency
+        zero_role_result = None
         if concurrency > 1:
             from process.provider_directory_generic_source_adapters import resource_scan_estimates
 
             resource_count_by_type = await resource_scan_estimates(sys.modules[__name__], self.source_record)
             foundation_types = tuple(
                 sorted(
-                    (resource_type for resource_type in ordered_resource_types if resource_type != "PractitionerRole"),
+                    resource_scan_types(
+                        sys.modules[__name__],
+                        self.source_record,
+                        ordered_resource_types,
+                        self.options,
+                    ),
                     key=lambda resource: resource_count_by_type.get(resource, -1),
                     reverse=True,
                 )
@@ -67836,13 +67827,13 @@ class ResourceGroupScanRunner:
                 foundation_types,
                 summary="parallel FHIR resources",
             )
-            await self.wave(foundation_types, concurrency)
+            wave_results = await self.wave(foundation_types, concurrency)
+            zero_role_result = next((fetch_result for fetch_result in wave_results if fetch_result is not None), None)
             serial_types = tuple(
-                resource_type for resource_type in ordered_resource_types if resource_type == "PractitionerRole"
+                resource_type for resource_type in ordered_resource_types if resource_type not in foundation_types
             )
         else:
             serial_types = ordered_resource_types
-        zero_role_result = None
         for resource_type in serial_types:
             candidate = await self.import_one(resource_type, report_start=True)
             if candidate is not None:
@@ -68111,8 +68102,8 @@ async def _import_resources(
                 and not result.is_bounded
                 and result.rows_fetched == 0
                 and result.rows_written == 0
-                and source_count_by_resource.get("Practitioner", 0) > 0
-                and source_count_by_resource.get("Location", 0) > 0
+                and resource_stats_by_type.get("Practitioner", {}).get("rows_fetched", 0) > 0
+                and resource_stats_by_type.get("Location", {}).get("rows_fetched", 0) > 0
             )
 
         async def persist_resource_rows(

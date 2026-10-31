@@ -390,6 +390,30 @@ async def current_endpoint_dataset_record(directory, endpoint_id, *, exclude_dat
     return directory._pagination_checkpoint_row_mapping(predecessor)
 
 
+def resource_scan_types(directory, source_record, resource_types, options):
+    """Include an independent role cursor only for deferred isolated storage."""
+    from process.provider_directory_generic_source_policy import _FACTORY
+
+    factory = _FACTORY.get()
+    include_role = (
+        options.deferred_materialization
+        and "PractitionerRole" in resource_types
+        and directory.is_source_storage_required()
+        and getattr(factory, "storage_binding", None) is not None
+        and not directory._needs_practitioner_role_reverse_lookup(source_record, "PractitionerRole")
+        and directory._has_parallel_resource_transport(
+            source_record, ("PractitionerRole",), options.page_count, minimum_resources=1
+        )
+    )
+    if include_role:
+        factory._require_current_policy()
+    return tuple(
+        resource_type
+        for resource_type in directory._source_resource_fetch_order(source_record, list(resource_types))
+        if resource_type != "PractitionerRole" or include_role
+    )
+
+
 async def resource_scan_estimates(directory, source_record):
     """Use published header counts only as estimates for download ordering."""
     endpoint_id = directory._clean_text(source_record.get("_endpoint_id"))
