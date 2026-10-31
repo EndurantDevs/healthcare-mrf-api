@@ -424,6 +424,12 @@ from process.provider_directory_source_coverage import (
     acquisition_coverage_blocked_reason,
     michigan_provider_directory_metadata,
 )
+from process.provider_directory_source_selection import (
+    qualify_stale_isolated_source,
+)
+from process.provider_directory_source_selection import (
+    resource_import_selection_metrics as _resource_import_selection_metrics,
+)
 from process.provider_directory_source_summary import (
     SOURCE_SUMMARY_CONTRACT_ID,
     SOURCE_SUMMARY_CONTRACT_VERSION,
@@ -5020,28 +5026,6 @@ def _validate_current_version_census_source_transport(
         return
     if _has_source_declared_credentialed_access(source_record) or _credential_spec_for_source(source_record):
         raise ValueError("provider_directory_current_version_census_credentials_forbidden")
-
-
-def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
-    return {
-        "source_import_sources_considered": source_count,
-        "source_import_sources_selected": 0,
-        "source_import_skipped_blocked_source": 0,
-        "source_import_skipped_blocked_source_shared_backend_unverified": 0,
-        "source_import_skipped_blocked_source_coverage_mode_probe_only": 0,
-        "source_import_skipped_blocked_source_fully_enumerable_resources_empty": 0,
-        "source_import_skipped_blocked_source_upstream_search_window_incomplete": 0,
-        "source_import_skipped_missing_api_base": 0,
-        "source_import_skipped_probe_not_valid": 0,
-        "source_import_skipped_open_only": 0,
-        "source_import_skipped_validation_status": 0,
-        "source_import_skipped_auth_required_policy": 0,
-        "source_import_skipped_manual_only": 0,
-        "source_import_sources_selected_live_probe_valid": 0,
-        "source_import_sources_selected_checkpoint_retry": 0,
-        "source_import_sources_selected_declared_credentialed": 0,
-        "source_import_sources_selected_auth_required_seed": 0,
-    }
 
 
 @dataclass(frozen=True)
@@ -70274,6 +70258,9 @@ async def process_provider_directory_fhir_data(
                 limit=limit,
             )
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
+        source_rows = await qualify_stale_isolated_source(
+            sys.modules[__name__], source_rows, task, timeout=timeout, run_id=run_id
+        )
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
         census_contract = (

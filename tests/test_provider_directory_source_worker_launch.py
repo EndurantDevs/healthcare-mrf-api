@@ -458,11 +458,13 @@ def test_exact_route_refuses_other_same_root_identity(monkeypatch, field):
 
 @pytest.mark.asyncio
 async def test_route_keeps_image_and_secret_across_valid_later_retries(monkeypatch):
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
     monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
     recorded = _source_route_run()
     later_parent = "run_" + "d" * 32
     recorded["params"]["retry_of_run_id"] = later_parent
     launch = source.admit_fhir_source_worker_launch(recorded)
+    assert launch.image == ORDINARY_IMAGE and launch.secret_name == "synthetic-successor"
     root = _source_route_config()["root_run_id"]
     current_params = recorded["params"]
     lineage_rows = [
@@ -1037,3 +1039,140 @@ def test_ensure_refuses_existing_job_code_changes(admitted, mounted_job, monkeyp
     result = workers._ensure_spec(SPEC, admitted)
     assert result["status"] == "failed" and result["job_status"] == "purpose_mismatch"
     assert len(calls) == 1 and calls[0][0] == "GET"
+
+
+def _original_route_run():
+    route = _source_route_config()
+    return {
+        **_recorded(),
+        "run_id": route["root_run_id"],
+        "status": "running",
+        "retry_of_run_id": None,
+        "metrics": {
+            "queue": SPEC.queue,
+            "function": "control_single_job_start",
+            "job_id": "provider_directory_start_" + route["root_run_id"],
+        },
+        "params": {
+            "source_ids": [route["source_id"]],
+            "provider_directory_endpoint_scope": route["endpoint_scope"],
+        },
+    }
+
+
+@pytest.fixture
+def original_job_before_default_change(monkeypatch):
+    """Create the original Job before installing a new default and its old-root route."""
+    recorded = _original_route_run()
+    monkeypatch.delenv(source.ROUTES_ENV, raising=False)
+    monkeypatch.setenv(source.IMAGE_ENV, ORDINARY_IMAGE)
+    _both_source_secrets(monkeypatch)
+    for setting in ("HLTHPRT_WORKER_JOB_SECRET_ENV_JSON", "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON"):
+        selectors = json.loads(workers.os.environ[setting])
+        monkeypatch.setenv(
+            setting, json.dumps([entry for entry in selectors if entry["secretName"] != "synthetic-default"])
+        )
+    request = workers._AdmittedWorkerRequest(run_id=recorded["run_id"], importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, recorded)
+    request.fhir_source_launch = source.admit_fhir_source_worker_launch(recorded)
+    job = workers._worker_job_manifest(SPEC, request, ORDINARY_IMAGE)
+    job["status"] = {"active": 1}
+    assert "healthporta.com/source-root-run-id" not in job["metadata"]["annotations"]
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
+    _both_source_secrets(monkeypatch)
+    return recorded, job
+
+
+def _mock_original_worker_control(monkeypatch, recorded, lineage_rows, job):
+    native_connection = SimpleNamespace(all=AsyncMock(return_value=lineage_rows))
+
+    @asynccontextmanager
+    async def connection():
+        yield native_connection
+
+    monkeypatch.setattr(workers.db, "acquire", connection)
+    monkeypatch.setattr(workers, "acquire_control_run_worker_action_lock", AsyncMock())
+    monkeypatch.setattr(workers, "admit_existing_outer_run_action", AsyncMock(return_value=recorded))
+    monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    api_calls = []
+    monkeypatch.setattr(workers, "_kubernetes_request", lambda *args: api_calls.append(args) or {"items": [job]})
+    return native_connection, api_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", [None, "image", "environment", "foreign_job", "retry_annotation", "policy"])
+async def test_original_worker_survives_default_change(monkeypatch, original_job_before_default_change, drift):
+    """Reuse an unchanged original Job, with every existing runtime check still enforced."""
+    recorded, job = original_job_before_default_change
+    pod = job["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    match drift:
+        case "image":
+            container["image"] = IMAGE
+        case "environment":
+            container["env"].append({"name": "UNREVIEWED", "value": "1"})
+        case "foreign_job":
+            next(entry for entry in container["env"] if entry["name"] == "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID")[
+                "value"
+            ] = JOB_ID
+        case "retry_annotation":
+            job["metadata"]["annotations"]["healthporta.com/source-root-run-id"] = recorded["run_id"]
+        case "policy":
+            pod["volumes"][0]["secret"]["secretName"] = "synthetic-default"
+    native_connection, api_calls = _mock_original_worker_control(monkeypatch, recorded, [deepcopy(recorded)], job)
+    before = deepcopy(job)
+    outcome = await workers.guarded_ensure_worker({"run_id": recorded["run_id"], "importer": "provider-directory-fhir"})
+    assert outcome["status"] == ("failed" if drift else "already_running")
+    if drift:
+        assert outcome["items"][0]["job_status"] == "purpose_mismatch"
+    native_connection.all.assert_awaited_once()
+    assert len(api_calls) == 1 and api_calls[0][0] == "GET"
+    assert job == before
+    assert "retry_of_run_id" not in recorded["params"]
+    assert "provider_directory_pagination_root_run_id" not in recorded["params"]
+
+
+@pytest.mark.parametrize("drift", ["source", "endpoint", "parent", "params_parent", "params_root"])
+def test_original_route_refuses_changed_identity(monkeypatch, original_job_before_default_change, drift):
+    recorded, _job = original_job_before_default_change
+    if drift == "source":
+        recorded["params"]["source_ids"] = ["other-source"]
+    elif drift == "endpoint":
+        recorded["params"]["provider_directory_endpoint_scope"] += "/other"
+    elif drift == "parent":
+        recorded["retry_of_run_id"] = RUN_ID
+    else:
+        key = "retry_of_run_id" if drift == "params_parent" else "provider_directory_pagination_root_run_id"
+        recorded["params"][key] = RUN_ID
+    with pytest.raises(ValueError, match="fhir_source_worker_route_changed"):
+        source.admit_fhir_source_worker_launch(recorded)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["missing", "failed", "source", "endpoint", "parent", "params_parent", "params_root"])
+async def test_original_route_checks_native_identity_before_job_lookup(
+    monkeypatch, original_job_before_default_change, drift
+):
+    recorded, job = original_job_before_default_change
+    native = deepcopy(recorded)
+    match drift:
+        case "failed":
+            native["status"] = "failed"
+        case "source":
+            native["params"]["source_ids"] = ["other-source"]
+        case "endpoint":
+            native["params"]["provider_directory_endpoint_scope"] += "/other"
+        case "parent":
+            native["retry_of_run_id"] = RUN_ID
+        case "params_parent" | "params_root":
+            key = "retry_of_run_id" if drift == "params_parent" else "provider_directory_pagination_root_run_id"
+            native["params"][key] = RUN_ID
+    native_connection, api_calls = _mock_original_worker_control(
+        monkeypatch, recorded, [] if drift == "missing" else [native], job
+    )
+    outcome = await workers.guarded_ensure_worker({"run_id": recorded["run_id"], "importer": "provider-directory-fhir"})
+    assert outcome["status"] == "failed"
+    native_connection.all.assert_awaited_once()
+    assert api_calls == []
