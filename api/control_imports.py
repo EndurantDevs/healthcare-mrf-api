@@ -48,6 +48,7 @@ from api.control_workers import (
     exact_worker_presence,
 )
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
+from process import npi_isolated_execution as npi_execution
 from process.control_lifecycle import (
     _SOURCE_PROFILE_IMPORTERS_BY_MODULE,
     _where_no_places_handoff,
@@ -1245,6 +1246,9 @@ def _redis_client() -> redis.Redis:
 async def ensure_import_run_table() -> None:
     """Create the public import-run control table once per process."""
 
+    if (scope := npi_execution.current_npi_isolated_execution()) is not None:
+        await scope.verify(None, phase="control")
+        return
     if _IMPORT_RUN_ENSURE_STATE.ensured:
         return
     async with _IMPORT_RUN_ENSURE_LOCK:
@@ -1706,9 +1710,7 @@ def _decode_import_run_cursor(cursor: str) -> tuple[dt.datetime, str]:
 async def get_import_run(run_id: str) -> dict[str, Any] | None:
     """Return one import run; plan-pricing terminalization stays explicit."""
 
-    query_result = await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))
-    durable_run = query_result.scalar_one_or_none()
-    if not durable_run:
+    if not (durable_run := await npi_execution.read_control_run(db, run_id)):
         return None
     public_run = normalize_run(durable_run)
     if public_run.get("importer") not in STALE_WORKER_RECONCILIATION_IMPORTERS and public_run.get("importer") != "nucc":
@@ -1824,9 +1826,7 @@ async def _sync_terminal_worker_failure(run: dict[str, Any]) -> dict[str, Any]:
         )
     )
     if updated.rowcount != 1:
-        latest = (
-            await db.execute(select(ImportRun).where(ImportRun.run_id == run["run_id"]).limit(1))
-        ).scalar_one_or_none()
+        latest = await npi_execution.read_control_run(db, run["run_id"])
         return normalize_run(latest) if latest is not None else run
     return {
         **run,
@@ -1865,7 +1865,7 @@ def _worker_failure_update_statement(run: dict[str, Any]):
             statement = statement.where(
                 field == expected_attempt_value if expected_attempt_value is not None else field.is_(None)
             )
-    return statement
+    return npi_execution.npi_control_run_statement(statement, run_id=run["run_id"])
 
 
 async def _active_worker_state(run: dict[str, Any]) -> dict[str, Any]:

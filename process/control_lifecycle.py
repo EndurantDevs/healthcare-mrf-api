@@ -1412,6 +1412,9 @@ async def _execute_nucc_claim_update(stmt, run_id) -> int | dict[str, Any]:
 async def _execute_control_run_update(
     stmt: Any, *, pricing_claim_task=None, nucc_claim_run_id=None
 ) -> int | dict[str, Any]:
+    from process.npi_isolated_execution import npi_control_run_statement
+
+    stmt = npi_control_run_statement(stmt)
     if pricing_claim_task is not None:
         from process.plan_pricing_control_transaction import (
             pricing_worker_claim_transaction,

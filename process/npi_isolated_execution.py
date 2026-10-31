@@ -8,6 +8,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from sqlalchemy import Table, select
+from sqlalchemy.sql import visitors
+from sqlalchemy.sql.dml import Update
+from sqlalchemy.sql.selectable import Select
+
 _CURRENT = ContextVar("npi_isolated_execution", default=None)
 _HANDOFF = "_npi_isolated_handoff"
 _UNKNOWN = "_npi_isolated_handoff_unknown"
@@ -118,11 +123,13 @@ class NpiIsolatedExecution:
     def __post_init__(self):
         _require(type(self.run_id) is str and bool(self.run_id) and "\0" not in self.run_id)
         _identifier(self.output_schema)
-        _require(self.control_schema == "mrf" and self.output_schema not in {"mrf", "public"})
+        _identifier(self.control_schema)
+        _require(self.control_schema == "mrf" or re.fullmatch(r"npi_control_[0-9a-f]{32}", self.control_schema))
+        _require(self.output_schema not in {"mrf", "public", self.control_schema})
         _require(not self.output_schema.startswith("pg_"))
         if self.source_schema is not None:
             _identifier(self.source_schema)
-            _require(self.source_schema not in {"mrf", "public", self.output_schema})
+            _require(self.source_schema not in {"mrf", "public", self.output_schema, self.control_schema})
             _require(not self.source_schema.startswith("pg_"))
         _require(isinstance(self.inputs, Mapping) and set(self.inputs) == INPUT_NAMES)
         inputs_by_name = {name: tuple(relations) for name, relations in self.inputs.items()}
@@ -155,6 +162,39 @@ class _CommittedHandoff:
 def current_npi_isolated_execution():
     """Return only the locally bound execution; task fields cannot select it."""
     return _CURRENT.get()
+
+
+def npi_control_run_statement(statement, *, run_id=None):
+    """Route only the bound run's native lifecycle statements, never a connection."""
+    scope = current_npi_isolated_execution()
+    if scope is None:
+        return statement
+    from db.models import ImportRun
+
+    _require(run_id is None or run_id == scope.run_id)
+    table = ImportRun.__table__
+    targets = (
+        (statement.table,)
+        if isinstance(statement, Update)
+        else (statement.get_final_froms() if isinstance(statement, Select) else ())
+    )
+    _require(table.schema == "mrf" and len(targets) == 1 and targets[0].compare(table))
+    _require(all(not isinstance(part, Table) or part.compare(table) for part in visitors.iterate(statement)))
+    schema_by_name = {table.schema: scope.control_schema}
+    options = statement.get_execution_options()
+    _require("schema_translate_map" not in options or options["schema_translate_map"] == schema_by_name)
+    return statement.where(ImportRun.run_id == scope.run_id, ImportRun.importer == "npi").execution_options(
+        schema_translate_map=schema_by_name
+    )
+
+
+async def read_control_run(executor, run_id):
+    """Read one lifecycle row through the authenticated run scope when bound."""
+    from db.models import ImportRun
+
+    statement = select(ImportRun).where(ImportRun.run_id == run_id).limit(1)
+    result = await executor.execute(npi_control_run_statement(statement, run_id=run_id))
+    return result.scalar_one_or_none()
 
 
 @asynccontextmanager
