@@ -1422,7 +1422,7 @@ def _worker_job_manifest(
         "healthporta.com/importers": ",".join(spec.importers),
         "healthporta.com/run-id": run_id,
     }
-    if fhir_launch is not None and fhir_launch.root_run_id:
+    if fhir_launch is not None and fhir_launch.retry_of_run_id:
         annotations_by_key["healthporta.com/source-root-run-id"] = fhir_launch.root_run_id
     return {
         "apiVersion": "batch/v1",
