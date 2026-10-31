@@ -159,13 +159,12 @@ def _envelope(source_id, release_id, resource_type, resources):
     return encoded
 
 
-async def _copy_stage(connection, stage, encoded):
+async def copy_network_stage_native(connection, session, driver, stage, encoded):
+    """Retain binary framing and interruption cleanup on the qualified driver."""
     from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
-    from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
 
     raw_connection = await connection.get_raw_connection()
-    driver = raw_connection.driver_connection
-    if driver is not bound_publisher().connection:
+    if raw_connection.driver_connection is not driver:
         raise RuntimeError("provider_directory_insurance_network_physical_transaction_changed")
     source = io.BytesIO(encoded[0])
     try:
@@ -176,7 +175,7 @@ async def _copy_stage(connection, stage, encoded):
     except (asyncio.CancelledError, TimeoutError) as interruption:
         try:
             await close_interrupted_copy(driver)
-            await invalidate_copy_owner(source_copy_session(), driver)
+            await invalidate_copy_owner(session, driver)
         except (Exception, asyncio.CancelledError) as cleanup_error:
             raise interruption from cleanup_error
         raise
@@ -185,10 +184,16 @@ async def _copy_stage(connection, stage, encoded):
 
 
 def _sql_names(connection, publisher, receipts):
+    from process.provider_directory_cms_identity_candidate import _canonical_schema
+
+    return network_batch_relations(connection, publisher.policy.schema, _canonical_schema(publisher.policy), receipts)
+
+
+def network_batch_relations(connection, schema, canonical_schema, receipts):
+    """Resolve only caller-qualified private targets and accepted observations."""
     from db.plan_release_storage import storage_relation
     from process.provider_directory_cms_identity_candidate import CMS_IDENTITY_TABLES
 
-    schema = publisher.policy.schema
     namespace = connection.dialect.identifier_preparer.quote_schema(schema)
     suffix = uuid4().hex
     stage = f"insurance_network_stage_{suffix}"
@@ -203,8 +208,8 @@ def _sql_names(connection, publisher, receipts):
         ("entity_binding", "entity_evidence", "network_binding", "plan_evidence"), CMS_IDENTITY_TABLES, strict=True
     ):
         names_by_field[key] = storage_relation(schema, receipts[root]["name"])
-    names_by_field["global_network_binding"] = storage_relation(schema, CMS_IDENTITY_TABLES[2])
-    names_by_field["global_plan_evidence"] = storage_relation(schema, CMS_IDENTITY_TABLES[3])
+    names_by_field["global_network_binding"] = storage_relation(canonical_schema, CMS_IDENTITY_TABLES[2])
+    names_by_field["global_plan_evidence"] = storage_relation(canonical_schema, CMS_IDENTITY_TABLES[3])
     return names_by_field
 
 
@@ -219,6 +224,13 @@ async def _write_batch(connection, encoded, parameters):
     ):
         raise ValueError("provider_directory_insurance_network_scope_changed")
     names = _sql_names(connection, publisher, receipts)
+    return await write_network_batch_native(
+        connection, source_copy_session(), publisher.connection, names, encoded, parameters
+    )
+
+
+async def write_network_batch_native(connection, session, driver, names, encoded, parameters):
+    """Reuse the bounded set SQL after callers verify their session and targets."""
     await connection.execute(
         text(
             f"CREATE TEMP TABLE {names['stage']} (source_row_ordinal integer PRIMARY KEY,"
@@ -226,7 +238,7 @@ async def _write_batch(connection, encoded, parameters):
             "observation_json jsonb NOT NULL) ON COMMIT DROP"
         )
     )
-    await _copy_stage(connection, names["stage"], encoded)
+    await copy_network_stage_native(connection, session, driver, names["stage"], encoded)
     await connection.execute(text(_TARGETS_SQL.format(**names)), parameters)
     error = await connection.scalar(text(_VALIDATE_SQL.format(**names)), parameters)
     if error is not None:

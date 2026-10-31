@@ -74,7 +74,9 @@ async def _enable_candidate_checks(engine, schema):
             ADD content_proof_admission_version integer DEFAULT 1,
             ADD content_proof_admission_kind text DEFAULT 'generic',
             ADD content_proof_resource_types varchar[] DEFAULT ARRAY['Endpoint','HealthcareService','InsurancePlan',
-                'Location','Organization','OrganizationAffiliation','Practitioner','PractitionerRole']::varchar[]""")
+                'Location','Organization','OrganizationAffiliation','Practitioner','PractitionerRole']::varchar[],
+            ADD validated_at timestamp,
+            ADD superseded_at timestamp""")
         )
         await connection.execute(
             text(f"""ALTER TABLE {schema}.provider_directory_cms_candidate_coverage

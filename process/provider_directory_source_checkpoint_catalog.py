@@ -8,6 +8,7 @@ from db.migration_expression_adoption import _normalized_expression
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import storage_roles
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_generic_source_storage import _json, _require, require_private_source_readers_closed
 from process.provider_directory_source_coverage_control import _GUARD_SQL, _digest
 
@@ -453,7 +454,7 @@ def _require_guards(guards, root, policy, *, legacy):
             and guard["returns_trigger"]
             and guard["prosecdef"]
             and guard["provolatile"] == "v"
-            and guard["proconfig"] == ["search_path=pg_catalog"]
+            and guard["proconfig"] in approved_cms_routine_settings(["search_path=pg_catalog"])
             and guard["function_owner"] in (policy.owner_role, *policy.control_runtime_roles)
             and hashlib.sha256(body.encode()).hexdigest() == _BODIES[guard["proname"]],
             "checkpoint_guard_changed",

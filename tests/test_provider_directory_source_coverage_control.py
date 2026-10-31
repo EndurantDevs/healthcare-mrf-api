@@ -122,8 +122,23 @@ async def test_coverage_preparation_borrows_factory_rr_before_any_target_query(m
     from process import provider_directory_generic_source_policy as policy
 
     events = []
-    result = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: {"admission_sha256": "a" * 64}))
-    session = SimpleNamespace(execute=AsyncMock(return_value=result), scalar=AsyncMock(return_value=True))
+    admission_query = SimpleNamespace(
+        mappings=lambda: SimpleNamespace(
+            one_or_none=lambda: {"admission_sha256": "a" * 64},
+            one=lambda: {"statement_timeout": "0", "lock_timeout": "0", "plan_cache_mode": "auto"},
+        )
+    )
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        execute=AsyncMock(return_value=admission_query),
+        scalar=AsyncMock(return_value=True),
+    )
+
+    @asynccontextmanager
+    async def savepoint():
+        yield
+
+    session.begin_nested = savepoint
 
     @asynccontextmanager
     async def transaction(database, *, isolation):

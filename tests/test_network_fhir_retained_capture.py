@@ -625,12 +625,15 @@ async def test_admission_refusal_removes_metadata_copy(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_parent_reader_refusal_stops_leaf_checks():
+@pytest.mark.parametrize("version", [1, 2])
+async def test_parent_reader_refusal_stops_leaf_checks(version):
     from db import migration_generic_source_candidates as guards
 
     origin = retained().origin
     snapshot_by_field = {
-        "body": guards._canonical_copy_guard_bodies(origin.schema_name, origin.preparation_schema)[1],
+        "body": guards._canonical_copy_guard_bodies(origin.schema_name, origin.preparation_schema)[1]
+        if version == 1
+        else guards._cms_canonical_copy_guard_body(origin.schema_name, origin.preparation_schema),
         "identity": {"oid": 44, "proowner": 55},
     }
     statements = [
@@ -650,6 +653,26 @@ async def test_parent_reader_refusal_stops_leaf_checks():
     assert reader.prepare.await_count == 3
     reader.fetch.assert_not_awaited()
     reader.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [0, 1, 2])
+async def test_unapproved_guard_body_refuses_before_reader_authority(version):
+    from db import migration_generic_source_candidates as guards
+
+    origin = retained().origin
+    body = (
+        *guards._canonical_copy_guard_bodies(origin.schema_name, origin.preparation_schema),
+        guards._cms_canonical_copy_guard_body(origin.schema_name, origin.preparation_schema),
+    )[version]
+    if version:
+        body += "\n-- changed\n"
+    statement = SimpleNamespace(get_attributes=lambda: (), fetch=AsyncMock(return_value=[{"body": body}]))
+    reader = SimpleNamespace(prepare=AsyncMock(return_value=statement), fetchval=AsyncMock())
+    with pytest.raises(RetainedFHIRCaptureError, match="retained_fhir_capture_unavailable"):
+        await capture._candidate_parent_proof(reader, origin)
+    reader.prepare.assert_awaited_once()
+    reader.fetchval.assert_not_awaited()
 
 
 @pytest.mark.asyncio

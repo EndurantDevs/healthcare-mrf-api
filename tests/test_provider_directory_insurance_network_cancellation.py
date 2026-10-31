@@ -69,7 +69,6 @@ async def test_ordinary_storage_and_cleanup_errors_still_refuse(monkeypatch, out
 @pytest.mark.parametrize("failure_stage", ["close", "invalidate"])
 async def test_copy_cleanup_failure_preserves_original_interruption(monkeypatch, interruption, failure_stage):
     from process import native_copy_cleanup as cleanup
-    from process import provider_directory_generic_source_policy as source
 
     driver = SimpleNamespace(copy_to_table=AsyncMock(side_effect=interruption))
     owner = object()
@@ -78,12 +77,10 @@ async def test_copy_cleanup_failure_preserves_original_interruption(monkeypatch,
     invalidate = AsyncMock(side_effect=cleanup_error if failure_stage == "invalidate" else None)
     monkeypatch.setattr(cleanup, "close_interrupted_copy", close)
     monkeypatch.setattr(cleanup, "invalidate_copy_owner", invalidate)
-    monkeypatch.setattr(source, "bound_publisher", lambda: SimpleNamespace(connection=driver))
-    monkeypatch.setattr(source, "source_copy_session", lambda: owner)
     connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
 
     with pytest.raises(type(interruption)) as rejected:
-        await batch._copy_stage(connection, "owned_stage", (b"copy payload", 1, 1, 0))
+        await batch.copy_network_stage_native(connection, owner, driver, "owned_stage", (b"copy payload", 1, 1, 0))
     assert rejected.value is interruption and interruption.__cause__ is cleanup_error
     close.assert_awaited_once_with(driver)
     if failure_stage == "close":

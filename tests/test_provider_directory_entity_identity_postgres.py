@@ -466,7 +466,7 @@ async def _identity_rows(component):
 
 
 async def _commit_between_replay_and_authority(monkeypatch, winner, contender):
-    original = cms_identity._global_replay
+    original = cms_identity.verify_identity_replay
     replayed, committed = asyncio.Event(), asyncio.Event()
     contender_task = None
 
@@ -476,7 +476,7 @@ async def _commit_between_replay_and_authority(monkeypatch, winner, contender):
             replayed.set()
             await committed.wait()
 
-    monkeypatch.setattr(cms_identity, "_global_replay", replay)
+    monkeypatch.setattr(cms_identity, "verify_identity_replay", replay)
     contender_task = asyncio.create_task(contender.publish(include_entities=True))
     try:
         await asyncio.wait_for(replayed.wait(), 5)

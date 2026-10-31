@@ -10,7 +10,7 @@ from db.plan_release_storage import storage_relation
 from process import network_fhir_source_custody as retained
 from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import storage_roles
-from process.provider_directory_cms_callable_custody import _decoded
+from process.provider_directory_cms_callable_custody import _body_digest, _decoded
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_generic_source_provision import (
     _RETIRED_FUNCTIONS,
@@ -348,10 +348,35 @@ def _payload_hooks(root, *, history=False, sealed_always=False):
     return hook_by_name
 
 
+def _finalization_spec(spec, schema, body):
+    from db.migration_cms_snapshot_allocator import generic_finalization_bodies
+
+    if body == generic_finalization_bodies(schema)[1]:
+        return (*spec[:-1], _body_digest(body, schema))
+    return spec
+
+
 def _require_native_function(definition, spec, language, schema, namespace, owners):
     from process.provider_directory_source_callable_custody import _require_definition
 
     _require(int(definition["proowner"]) in owners, "release_legacy_function_owner_changed")
+    if (
+        definition["proname"] == "guard_pd_dataset_candidate_parent"
+        and spec == _LEGACY_FUNCTIONS["guard_pd_dataset_candidate_parent()"]
+    ):
+        from db.migration_generic_source_candidates import _canonical_copy_guard_bodies, _cms_canonical_copy_guard_body
+
+        approved_bodies = (
+            _canonical_copy_guard_bodies(schema, "hp_snapshot_retention")[1],
+            _cms_canonical_copy_guard_body(schema, "hp_snapshot_retention"),
+        )
+        if definition["prosrc"] in approved_bodies:
+            spec = (*spec[:-1], _body_digest(definition["prosrc"], schema))
+    if (
+        definition["proname"] == "guard_pd_generic_dataset_finalization"
+        and spec == _LEGACY_FUNCTIONS["guard_pd_generic_dataset_finalization()"]
+    ):
+        spec = _finalization_spec(spec, schema, definition["prosrc"])
     _require_definition(
         dict(definition=definition, language=language),
         spec,
@@ -360,6 +385,53 @@ def _require_native_function(definition, spec, language, schema, namespace, owne
         {"trigger": "2279", "void": "2278", "boolean": "16", "text[]": "1009", "text": "25", "jsonb": "3802"},
         '"' + schema.replace('"', '""') + '"',
     )
+
+
+def _require_allocator_guard_acl(function_record, allocator, schema, namespace, owners, namespace_owner):
+    """Admit one allocator edge after the caller verifies the guard's fixed definition."""
+    owner = int(_decoded(function_record["definition"])["proowner"])
+    expected_acl_edges = {(owner, owner, "EXECUTE", False)}
+    actual_acl_edges = set(map(tuple, _decoded(function_record["acl"])))
+    if actual_acl_edges == expected_acl_edges:
+        return
+    _require(allocator is not None, "release_legacy_callable_acl_changed")
+    definition = _decoded(allocator["definition"])
+    _require(
+        definition["proname"] == "prepare_pd_generic_dataset_storage"
+        and allocator["signature"] == storage_relation(schema, definition["proname"]) + "()"
+        and 0 < int(definition["oid"]) < 2**32
+        and int(definition["oid"]) != int(_decoded(function_record["definition"])["oid"]),
+        "release_legacy_callable_acl_changed",
+    )
+    _require_native_function(
+        definition,
+        _LEGACY_FUNCTIONS["prepare_pd_generic_dataset_storage()"],
+        allocator["language"],
+        schema,
+        namespace,
+        owners,
+    )
+    allocator_owner = int(definition["proowner"])
+    _require(
+        allocator_owner == namespace_owner
+        and owner in owners
+        and owner != namespace_owner
+        and set(map(tuple, _decoded(allocator["acl"]))) == {(allocator_owner, allocator_owner, "EXECUTE", False)}
+        and actual_acl_edges == expected_acl_edges | {(namespace_owner, owner, "EXECUTE", False)},
+        "release_legacy_callable_acl_changed",
+    )
+
+
+def _candidate_acl_edges(signature, owner, writers, role_by_name):
+    expected_acl_edges = {(owner, owner, "EXECUTE", False)}
+    if signature == "guard_provider_directory_resource_identity()":
+        expected_acl_edges.add((0, owner, "EXECUTE", False))
+    for kind, names in writers.items():
+        if signature in {action + "_pd_" + kind + "_dataset_candidate(text)" for action in ("prepare", "finish")}:
+            expected_acl_edges.update(
+                (0 if name == "PUBLIC" else role_by_name[name], owner, "EXECUTE", False) for name in names
+            )
+    return expected_acl_edges
 
 
 def _require_hook(row, expected):
@@ -492,6 +564,8 @@ class _SourceReleaseChecks:
                 and set(names) <= {"PUBLIC", *self.policy.control_runtime_roles},
                 "release_legacy_writers_changed",
             )
+        allocator_signature = storage_relation(schema, "prepare_pd_generic_dataset_storage") + "()"
+        allocator = next(entry for entry in function_rows if entry["signature"] == allocator_signature)
         for function_record in function_rows:
             signature = function_record["signature"].split(".", 1)[1].replace('"', "")
             definition = _decoded(function_record["definition"])
@@ -504,20 +578,21 @@ class _SourceReleaseChecks:
                 owners,
             )
             owner = int(definition["proowner"])
-            expected_acl_edges = {(owner, owner, "EXECUTE", False)}
-            if signature == "guard_provider_directory_resource_identity()":
-                expected_acl_edges.add((0, owner, "EXECUTE", False))
-            for kind, names in writers.items():
-                if signature in {
-                    action + "_pd_" + kind + "_dataset_candidate(text)" for action in ("prepare", "finish")
-                }:
-                    expected_acl_edges.update(
-                        (0 if name == "PUBLIC" else role_by_name[name], owner, "EXECUTE", False) for name in names
-                    )
-            _require(
-                set(map(tuple, _decoded(function_record["acl"]))) == expected_acl_edges,
-                "release_legacy_callable_acl_changed",
-            )
+            if signature == "guard_pd_dataset_candidate_parent()":
+                _require_allocator_guard_acl(
+                    function_record,
+                    allocator,
+                    schema,
+                    self.receipt["schema_oid"],
+                    owners,
+                    self.receipt["roles"]["namespace_owner"],
+                )
+            else:
+                _require(
+                    set(map(tuple, _decoded(function_record["acl"])))
+                    == _candidate_acl_edges(signature, owner, writers, role_by_name),
+                    "release_legacy_callable_acl_changed",
+                )
         return {
             int(_decoded(function_record["definition"])["oid"]): _decoded(function_record["definition"])
             for function_record in function_rows
