@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import text
 
 _RESOURCE_TYPES = frozenset(
@@ -62,9 +64,12 @@ async def resolve_desired_fence(fhir, execution):
         if sources
         else fhir.ProviderDirectoryArtifactDatasetFence(())
     )
-    cms = await fhir._resolve_provider_directory_artifact_datasets(
-        ["cms-npd"], should_select_validated_candidates=desired["publication_status"] == "validated"
-    )
+    if desired["publication_status"] == "published" and desired["is_current"] is False:
+        cms = await _resolve_sealed_candidate(fhir, desired)
+    else:
+        cms = await fhir._resolve_provider_directory_artifact_datasets(
+            ["cms-npd"], should_select_validated_candidates=desired["publication_status"] == "validated"
+        )
     _assert_cms_fence(execution, cms, desired)
     if others.promotion_datasets:
         raise RuntimeError("cms_serving_other_candidate_selected")
@@ -76,6 +81,44 @@ async def resolve_desired_fence(fhir, execution):
     fhir._assert_profile_selection_matches_artifact_fence(execution, fence)
     await fhir._verify_provider_directory_artifact_dataset_fence(fence)
     return fence
+
+
+async def _resolve_sealed_candidate(fhir, desired):
+    """Resolve only the attested CMS seal; ordinary source selection stays current-only."""
+    projection, publication = fhir._artifact_dataset_option_projection_parts(True)
+    schema = fhir._schema()
+    datasets = fhir._unscoped_qt(schema, fhir.ProviderDirectoryEndpointDataset.__tablename__)
+    source_ref = fhir._unscoped_qt(schema, fhir.ProviderDirectorySource.__tablename__)
+    metadata = "publication.full_metadata_jsonb"
+    eligibility = fhir._artifact_reviewed_candidate_eligibility_sql(
+        datasets,
+        source_ref,
+        metadata=metadata,
+        content_proof_admitted=fhir._artifact_content_proof_admitted_marker_sql(metadata),
+        use_admission_seals=False,
+    )
+    dataset_rows = await fhir.db.all(
+        f"""SELECT {projection},source.source_id,source.endpoint_id AS serving_endpoint_id,
+             to_jsonb(source) AS source_record_json,dataset.published_at,
+             true AS promote_on_cutover,false AS reconcile_source_alias_on_cutover,
+             (SELECT count(*) FROM {datasets} incumbent
+              WHERE incumbent.endpoint_id=dataset.endpoint_id AND incumbent.is_current) AS current_dataset_count,
+             (SELECT min(dataset_id) FROM {datasets} incumbent
+              WHERE incumbent.endpoint_id=dataset.endpoint_id AND incumbent.is_current) AS current_dataset_id,
+             count(*) OVER () AS validated_candidate_count
+           FROM {datasets} dataset JOIN {source_ref} source ON source.endpoint_id=dataset.endpoint_id
+           {publication}
+           WHERE source.source_id='cms-npd' AND dataset.dataset_id=:dataset_id
+             AND dataset.endpoint_id=:endpoint_id AND dataset.status='published'
+             AND dataset.is_current IS FALSE AND dataset.validated_at IS NOT NULL
+             AND dataset.published_at IS NOT NULL AND dataset.superseded_at IS NULL
+             AND publication.full_metadata_jsonb->'source_ids'='["cms-npd"]'::jsonb
+             AND {fhir.candidate_available_sql("dataset", schema, dataset_relation=datasets)}
+             AND ({eligibility})""",
+        dataset_id=desired["dataset_id"],
+        endpoint_id=desired["endpoint_id"],
+    )
+    return fhir._validate_provider_directory_artifact_datasets(dataset_rows, ["cms-npd"])
 
 
 async def prepare_desired_fence(fhir, execution, *, run_id, metrics, publish_targets):
@@ -244,3 +287,66 @@ async def retained_relation_metrics(fhir, fence, *, run_id, publish_targets):
         if spec not in enabled_specs:
             aggregate[spec[1]] = fhir._provider_directory_publish_target_skipped()
     return aggregate
+
+
+def require_dataset_selection_state(
+    fhir,
+    selection_state: dict[str, Any],
+    dataset_id: str,
+    endpoint_id: str,
+) -> None:
+    """Keep ordinary lifecycle checks and admit the exact CMS sealed replacement."""
+    should_reconcile_source_alias = bool(selection_state.get("should_reconcile_source_alias"))
+    if selection_state["should_promote_on_cutover"]:
+        if should_reconcile_source_alias:
+            raise RuntimeError("provider_directory_artifact_alias_cutover_ambiguous:" + dataset_id)
+        if selection_state["validated_candidate_count"] != 1:
+            raise RuntimeError("provider_directory_artifact_validated_candidate_ambiguous:" + endpoint_id)
+        if (
+            selection_state["status"] != fhir.ENDPOINT_DATASET_VALIDATED
+            and not (
+                selection_state["status"] == fhir.ENDPOINT_DATASET_PUBLISHED and selection_state.get("published_at")
+            )
+        ) or selection_state["is_current"]:
+            raise RuntimeError("provider_directory_artifact_validated_candidate_invalid:" + dataset_id)
+        if (
+            selection_state["current_dataset_count"] > 1
+            or selection_state["previous_dataset_id"] != selection_state["current_dataset_id"]
+        ):
+            raise RuntimeError("provider_directory_artifact_expected_incumbent_mismatch:" + dataset_id)
+        return
+    if should_reconcile_source_alias and (
+        selection_state["status"] != fhir.ENDPOINT_DATASET_PUBLISHED
+        or not selection_state["is_current"]
+        or selection_state["current_dataset_count"] != 1
+        or selection_state["current_dataset_id"] != dataset_id
+    ):
+        raise RuntimeError("provider_directory_artifact_alias_reconciliation_invalid:" + dataset_id)
+    if (
+        selection_state["status"] != fhir.ENDPOINT_DATASET_PUBLISHED
+        or not selection_state["is_current"]
+        or selection_state["current_dataset_count"] != 1
+        or selection_state["current_dataset_id"] != dataset_id
+    ):
+        raise RuntimeError("provider_directory_artifact_current_dataset_invalid:" + dataset_id)
+
+
+def is_dataset_row_exact(
+    fhir,
+    dataset: Any,
+    dataset_row_map: dict[str, Any],
+) -> bool:
+    """Recheck the historical identity fields and any captured CMS seal timestamp."""
+    if dataset.published_at is not None and (
+        str(dataset_row_map.get("published_at")) != dataset.published_at
+        or dataset_row_map.get("superseded_at") is not None
+    ):
+        return False
+    actual_identity = fhir._artifact_fence_dataset_row_identity(dataset_row_map)
+    expected_identity_by_name = fhir._expected_artifact_fence_dataset_identity(dataset)
+    for field_index, (actual_value, expected_value) in enumerate(zip(actual_identity, expected_identity_by_name)):
+        if field_index in {5, 6, 7, 8} and expected_value is None:
+            continue
+        if actual_value != expected_value:
+            return False
+    return True

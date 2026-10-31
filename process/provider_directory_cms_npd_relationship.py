@@ -144,6 +144,11 @@ def _projection_sql(fhir):
     resource = fhir._qt(schema, _RESOURCE)
     witness = fhir._qt(schema, _WITNESS)
     binding = fhir._qt(schema, _BINDING)
+    return _projection_sql_for(resource, witness, binding)
+
+
+def _projection_sql_for(resource, witness, binding):
+    """Render the existing projection for caller-qualified relation coordinates."""
     page = _family_page_sql(resource, witness)
     return (
         _references(page)
@@ -194,12 +199,17 @@ async def _family_complete(fhir, session, dataset_id, release_id, resource_type)
     """Compare one family's complete indexed projection, including resolved target identity."""
     relationship = fhir._qt(fhir._schema(), _TABLE)
     params_by_field = {"dataset_id": dataset_id, "release_id": release_id, "resource_type": resource_type}
+    return await _family_complete_for(session, _projection_sql(fhir), relationship, params_by_field)
+
+
+async def _family_complete_for(session, projection, relationship, params_by_field):
+    """Compare the same complete family using explicit private coordinates."""
     fields = ",".join(_COLUMNS)
     different = " OR ".join(f"link.{column} IS DISTINCT FROM expected.{column}" for column in _COLUMNS)
     expected, missing = (
         await session.execute(
             text(
-                f"WITH expected({fields}) AS ({_projection_sql(fhir)}) "
+                f"WITH expected({fields}) AS ({projection}) "
                 f"SELECT count(*),coalesce(bool_or(link.resource_type IS NULL OR {different}),false) "
                 f"FROM expected LEFT JOIN {relationship} link ON link.dataset_id=expected.dataset_id "
                 "AND link.resource_type=expected.resource_type AND link.resource_id=expected.resource_id "

@@ -10,7 +10,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource, _require_pinned_source
+from process.network_fhir_retained_capture import pin_retained_fhir_read
+from process.network_fhir_retained_capture_contract import PRODUCER
 from process.network_fhir_source_epoch import _TABLES, RetainedCMSFHIRSourceEpoch
 from process.network_membership_candidate_lifecycle import (
     MembershipCandidateError,
@@ -36,6 +38,8 @@ from process.registry_source_recipe_store import (
 )
 from tests.test_network_custom_address_source_postgres import custom_db
 from tests.test_network_fhir_membership_source_postgres import fhir_source, reviewed_fhir_source
+from tests.test_network_fhir_retained_capture_postgres import _capture
+from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
 from tests.test_network_legacy_membership_source_postgres import reviewed_aca_source
 from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_candidate_composition_postgres import _roles
@@ -535,3 +539,106 @@ async def test_native_retained_tamper_rejected(recipe_serving, damage):
             await resolve_retained_registry_source_recipes(
                 fixture.connection, manifest, control_schema=fixture.control_schema
             )
+
+
+_ORIGIN_SQL = """SELECT c.oid::bigint,c.relname,c.relfilenode::bigint,
+ c.relpartbound::text,ARRAY(SELECT inhparent::bigint FROM pg_inherits WHERE inhrelid=c.oid) AS parents,
+ (SELECT jsonb_agg(jsonb_build_array(i.indexrelid::bigint,idx.relfilenode::bigint,
+ i.indisvalid,i.indisready,pg_get_indexdef(i.indexrelid)) ORDER BY i.indexrelid)
+ FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid WHERE i.indrelid=c.oid) AS indexes
+ FROM pg_class c WHERE c.oid=ANY($1::oid[]) ORDER BY c.oid"""
+
+
+def _capture_recipe(capture):
+    """Use the existing complete contract and producer-bound decoder wire."""
+    origin = capture.origin
+    source = PinnedFHIRMembershipSource(
+        origin.schema_name,
+        origin.source_id,
+        origin.endpoint_id,
+        origin.dataset_id,
+        origin.dataset_sha256,
+        capture.release_id,
+        origin.resource_parent_oid,
+        "registry-source-one",
+        "2026-01-01",
+        retained_capture=capture,
+    )
+    coordinates = RegistryNetworkSourceCoordinates(
+        "fhir", origin.source_id, origin.schema_name, origin.dataset_id, PRODUCER, capture.capture_id
+    )
+    return RegistrySourceMembershipRecipe(source, coordinates)
+
+
+async def _guard_version(fixture, version):
+    """Change only the disposable guard body to the exact approved v2 variant."""
+    if version == 1:
+        return
+    from db.migration_generic_source_candidates import _cms_canonical_copy_guard_body
+
+    signature = f'"{fixture.schema}".guard_pd_dataset_candidate_parent()'
+    query = "SELECT to_jsonb(p)-'prosrc' FROM pg_proc p WHERE oid=$1::regprocedure"
+    before = await fixture.admin.fetchval(query, signature)
+    body = _cms_canonical_copy_guard_body(fixture.schema, fixture.origin.preparation_schema)
+    await fixture.admin.execute(
+        f"CREATE OR REPLACE FUNCTION {signature} RETURNS trigger LANGUAGE plpgsql "
+        f"SECURITY DEFINER SET search_path TO pg_catalog AS $fn${body}$fn$"
+    )
+    assert await fixture.admin.fetchval(query, signature) == before
+
+
+@pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("guard_version", [1, 2])
+async def test_capture_reader_keeps_original_wire_after_owner_transition(legacy_capture_db, commit, guard_version):
+    fixture = legacy_capture_db
+    await _guard_version(fixture, guard_version)
+    capture = await _capture(fixture)
+    wire = canonical_registry_source_recipes((_capture_recipe(capture),))
+    oids = [capture.origin.resource_parent_oid, capture.origin.resource_leaf_oid]
+    original = await fixture.admin.fetch(_ORIGIN_SQL, oids)
+    resources_sql = (
+        "SELECT jsonb_agg(to_jsonb(resource) ORDER BY resource_type,resource_id) "
+        f'FROM "{fixture.schema}".provider_directory_dataset_resource resource'
+    )
+    original_resources = await fixture.admin.fetchval(resources_sql)
+    transaction = fixture.admin.transaction()
+    await transaction.start()
+    try:
+        await fixture.admin.execute("SET LOCAL lock_timeout='100ms'")
+        for name in ("provider_directory_dataset_resource", "retained_input"):
+            await fixture.admin.execute(
+                f'ALTER TABLE ONLY "{fixture.schema}"."{name}" OWNER TO "{fixture.role_by_kind["owner"]}"'
+            )
+        assert await fixture.admin.fetch(_ORIGIN_SQL, oids) == original
+        if commit:
+            await transaction.commit()
+        else:
+            await transaction.rollback()
+    except BaseException:
+        await transaction.rollback()
+        raise
+    recipe = decode_registry_source_recipes(wire)[0]
+    assert recipe.source_pin.retained_capture == capture
+    assert canonical_registry_source_recipes((recipe,)) == wire
+    reader = await fixture.connect("reader")
+    async with reader.transaction(isolation="repeatable_read", readonly=True):
+        read = await pin_retained_fhir_read(reader, capture)
+        await _require_pinned_source(reader, recipe.source_pin, retained_read=read)
+        await read.verify(reader, capture)
+        assert recipe.source_pin.read_resource_table_oid != capture.origin.resource_leaf_oid
+        assert recipe.source_pin.read_schema_name == capture.schema_name
+        assert await reader.fetchval(
+            f'SELECT count(*) FROM "{capture.schema_name}".provider_directory_dataset_resource'
+        ) == sum(dict(capture.origin.resource_counts).values())
+    assert await fixture.admin.fetch(_ORIGIN_SQL, oids) == original
+    assert await fixture.admin.fetchval(resources_sql) == original_resources
+    assert (
+        await fixture.admin.fetchval(
+            "SELECT bool_and(relowner=$2::regrole) FROM pg_class WHERE oid=ANY($1::oid[])",
+            oids,
+            fixture.role_by_kind["owner" if commit else "source"],
+        )
+        is True
+    )
+    assert json.loads(wire)[0]["source_pin"]["retained_capture"]["origin"]["resource_leaf_oid"] == oids[1]
