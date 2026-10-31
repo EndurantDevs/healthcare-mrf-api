@@ -50,6 +50,7 @@ from db.models import (
     ProviderDirectorySource,
     ProviderDirectorySourceResource,
 )
+from process import provider_directory_generic_source_adapters as source_adapters
 from process.provider_directory_proof_store import build_dataset_proof_shard
 from process.provider_directory_resource_hash import LEGACY_RESOURCE_HASH_CONTRACT
 from scripts.research import provider_directory_fhir_harness as harness
@@ -26452,10 +26453,12 @@ def test_resource_scan_concurrency_uses_effective_bulk_export_selection(
         )
 
 
-def test_resource_scan_concurrency_requires_every_start_url(monkeypatch):
-    """Fail closed when any member of the proposed wave has no start URL."""
+@pytest.mark.parametrize("missing_resource", ("HealthcareService", "PractitionerRole"))
+def test_resource_scan_concurrency_requires_every_start_url(monkeypatch, missing_resource):
+    """Keep eligible foundations parallel when only the optional role is absent."""
     source_record = _parallel_resource_source()
     resource_start_url = importer._resource_start_url
+    _patch_resource_scan_storage(monkeypatch, True)
     monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "16")
     monkeypatch.setattr(importer, "_credential_spec_for_source", Mock(return_value={}))
     monkeypatch.setattr(
@@ -26467,18 +26470,15 @@ def test_resource_scan_concurrency_requires_every_start_url(monkeypatch):
         importer,
         "_resource_start_url",
         lambda source, resource_type, **kwargs: (
-            None if resource_type == "HealthcareService" else resource_start_url(source, resource_type, **kwargs)
+            None if resource_type == missing_resource else resource_start_url(source, resource_type, **kwargs)
         ),
     )
 
     with _source_http_test_session():
-        assert (
-            importer._effective_resource_scan_concurrency(
-                source_record,
-                _resource_concurrency_options(),
-            )
-            == 1
-        )
+        assert importer._effective_resource_scan_concurrency(
+            source_record,
+            _resource_concurrency_options(resource_types=("Location", "HealthcareService", "PractitionerRole")),
+        ) == (2 if missing_resource == "PractitionerRole" else 1)
 
 
 def test_resource_scan_concurrency_checks_parallel_transport_shape(monkeypatch):
@@ -26600,6 +26600,42 @@ def test_resource_scan_concurrency_requires_candidate_bound_checkpoint(
         )
 
 
+@pytest.mark.parametrize("role_denial", ("unsupported", "partitioned", "credentialed"))
+def test_resource_scan_retains_foundations_without_role_transport(monkeypatch, role_denial):
+    """A role-only transport restriction must not serialize eligible siblings."""
+    source_record = _parallel_resource_source()
+    _patch_resource_scan_storage(monkeypatch, True)
+    options = _resource_concurrency_options(resource_types=("Location", "HealthcareService", "PractitionerRole"))
+    if role_denial == "unsupported":
+        source_record["metadata_json"] = {"provider_directory_supported_resources": ["Location", "HealthcareService"]}
+    elif role_denial == "partitioned":
+        original = importer._partitioned_resource_start_urls
+        monkeypatch.setattr(
+            importer,
+            "_partitioned_resource_start_urls",
+            lambda source, resource, **kwargs: (
+                ["https://directory.example.test/one", "https://directory.example.test/two"]
+                if resource == "PractitionerRole"
+                else original(source, resource, **kwargs)
+            ),
+        )
+    else:
+        original = importer._rest_page_prefetch_session
+        monkeypatch.setattr(
+            importer,
+            "_rest_page_prefetch_session",
+            lambda source, url: (
+                None if urllib.parse.urlsplit(url).path.endswith("/PractitionerRole") else original(source, url)
+            ),
+        )
+    with _source_http_test_session():
+        assert source_adapters.resource_scan_types(importer, source_record, options.resource_types, options) == (
+            "Location",
+            "HealthcareService",
+        )
+        assert importer._effective_resource_scan_concurrency(source_record, options) == 2
+
+
 @pytest.mark.parametrize("raises_runtime_error", (False, True))
 def test_resource_scan_concurrency_rejects_bound_upsert_session(
     monkeypatch,
@@ -26656,17 +26692,29 @@ def _patch_parallel_resource_flow(
     return source_record
 
 
+def _patch_resource_scan_storage(monkeypatch, isolated):
+    """Classify storage while the wave harness owns all IO dependencies."""
+    from process import provider_directory_generic_source_policy as policy
+
+    binding = SimpleNamespace(catalog_schema=importer._schema()) if isolated else None
+    factory = SimpleNamespace(storage_binding=binding, _require_current_policy=Mock())
+    monkeypatch.setattr(policy, "_FACTORY", SimpleNamespace(get=lambda: factory))
+    monkeypatch.setattr(importer, "is_source_storage_required", lambda: isolated)
+
+
 async def _run_parallel_resource_import(
     source_record,
     progress_callback=None,
     *,
     bulk_export=False,
+    resources=None,
+    concurrency=2,
 ):
     """Run the exact checkpointed deferred acquisition shape under test."""
     with _source_http_test_session():
         return await importer._import_resources(
             [source_record],
-            resources=["PractitionerRole", "Location", "HealthcareService"],
+            resources=resources or ["PractitionerRole", "Location", "HealthcareService"],
             per_resource_limit=0,
             page_limit=0,
             page_count=100,
@@ -26674,7 +26722,7 @@ async def _run_parallel_resource_import(
             run_id="run_1",
             stream_batch_size=100,
             source_concurrency=1,
-            resource_scan_concurrency=2,
+            resource_scan_concurrency=concurrency,
             bulk_export=bulk_export,
             progress_callback=progress_callback,
             is_pagination_checkpointing_enabled=True,
@@ -26780,8 +26828,99 @@ async def test_resource_scan_overlaps_foundation_and_keeps_role_serial(
     )
 
 
+@pytest.mark.parametrize("api_base", (importer.SCAN_PROVIDER_DIRECTORY_BASE, importer.UHC_PROVIDER_DIRECTORY_BASE))
+def test_resource_scan_keeps_reverse_lookup_role_outside_wave(monkeypatch, api_base):
+    """Existing-seed discovery still needs its barrier without selected seeds."""
+    _patch_resource_scan_storage(monkeypatch, True)
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_UHC_ROLE_POSTAL_PARTITIONS", "0")
+    source_record_by_field = {"api_base": api_base}
+    resources = ("PractitionerRole", "InsurancePlan", "Endpoint")
+    assert not importer._is_practitioner_role_reverse_lookup_planned(source_record_by_field, list(resources))
+    assert importer._needs_practitioner_role_reverse_lookup(source_record_by_field, "PractitionerRole")
+    assert source_adapters.resource_scan_types(
+        importer, source_record_by_field, resources, _resource_concurrency_options()
+    ) == (
+        "InsurancePlan",
+        "Endpoint",
+    )
+
+
+@pytest.mark.parametrize("isolated,deferred", ((False, True), (True, False)))
+def test_resource_scan_retains_canonical_and_immediate_role_barriers(monkeypatch, isolated, deferred):
+    """Canonical Source and immediate typed writes retain the previous ordering."""
+    _patch_resource_scan_storage(monkeypatch, isolated)
+    monkeypatch.setattr(importer, "is_source_storage_required", lambda: True)
+    assert source_adapters.resource_scan_types(
+        importer, {}, ("Location", "PractitionerRole"), _resource_concurrency_options(deferred_materialization=deferred)
+    ) == ("Location",)
+
+
 @pytest.mark.asyncio
-async def test_resource_scan_failure_cancels_and_joins_sibling(monkeypatch):
+@pytest.mark.parametrize("role_retry", (None, "rows", "empty", "missing"))
+async def test_resource_scan_overlaps_all_eight_and_retries_empty_role_after_wave(monkeypatch, role_retry):
+    """Start every independent cursor, then assess empty roles using final counts."""
+    started, finished, calls = set(), set(), collections.Counter()
+    all_started, role_finished = asyncio.Event(), asyncio.Event()
+
+    async def fetch(source_record, resource_type, **kwargs):
+        calls[resource_type] += 1
+        model = importer.RESOURCE_MODELS_BY_TYPE[resource_type]
+        if resource_type == "PractitionerRole" and calls[resource_type] == 2:
+            assert finished == set(importer.DEFAULT_RESOURCES)
+            if role_retry == "missing":
+                return None
+        else:
+            assert not finished
+            started.add(resource_type)
+            if len(started) == 8:
+                all_started.set()
+            await all_started.wait()
+            if resource_type != "PractitionerRole":
+                await role_finished.wait()
+        is_empty = (
+            resource_type == "PractitionerRole"
+            and role_retry is not None
+            and (calls[resource_type] == 1 or role_retry == "empty")
+        )
+        written = (
+            0
+            if is_empty
+            else await kwargs["row_batch_handler"](
+                model, [{"source_id": source_record["source_id"], "resource_id": resource_type.lower()}]
+            )
+        )
+        finished.add(resource_type)
+        if resource_type == "PractitionerRole":
+            role_finished.set()
+        return _checkpoint_complete_fetch_result(model, written)
+
+    source_record = _patch_parallel_resource_flow(monkeypatch, fetch)
+    if role_retry is not None:
+        source_record["canonical_api_base"] = source_record["api_base"] = "https://directory.example.test/fhir"
+        source_record["_pagination_checkpoint_context"] = dataclasses.replace(
+            source_record["_pagination_checkpoint_context"], canonical_api_base=source_record["api_base"]
+        )
+    _patch_resource_scan_storage(monkeypatch, True)
+    monkeypatch.setattr(source_adapters, "resource_scan_estimates", AsyncMock(return_value={"PractitionerRole": 1000}))
+    counts = await asyncio.wait_for(
+        _run_parallel_resource_import(source_record, resources=list(importer.DEFAULT_RESOURCES), concurrency=8),
+        timeout=5,
+    )
+    assert started == finished == set(importer.DEFAULT_RESOURCES)
+    assert counts == {
+        resource: int(resource != "PractitionerRole" or role_retry in (None, "rows"))
+        for resource in importer.DEFAULT_RESOURCES
+    }
+    assert calls["PractitionerRole"] == (1 if role_retry is None else 2)
+    diagnostic = importer._update_source_resource_import_metadata.await_args.kwargs["diagnostics"]["PractitionerRole"]
+    assert diagnostic["error"] == (
+        importer.PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR if role_retry in ("empty", "missing") else None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolated", (False, True))
+async def test_resource_scan_failure_cancels_and_joins_sibling(monkeypatch, isolated):
     """Propagate a source failure only after the other cursor is joined."""
     sibling_started = asyncio.Event()
     sibling_cancelled = asyncio.Event()
@@ -26797,14 +26936,15 @@ async def test_resource_scan_failure_cancels_and_joins_sibling(monkeypatch):
             except asyncio.CancelledError:
                 sibling_cancelled.set()
                 raise
-        raise AssertionError("role cursor must not start after foundation failure")
+        await asyncio.Event().wait()
 
     source_record = _patch_parallel_resource_flow(monkeypatch, fake_fetch)
+    _patch_resource_scan_storage(monkeypatch, isolated)
     with pytest.raises(
         RuntimeError,
         match="synthetic_resource_failure",
     ):
-        await _run_parallel_resource_import(source_record)
+        await _run_parallel_resource_import(source_record, concurrency=3)
 
     assert sibling_cancelled.is_set()
     assert not any(
@@ -26813,16 +26953,21 @@ async def test_resource_scan_failure_cancels_and_joins_sibling(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resource_scan_external_cancellation_joins_every_cursor(monkeypatch):
+@pytest.mark.parametrize("isolated", (False, True))
+@pytest.mark.parametrize("missing_start", (False, True))
+async def test_resource_scan_external_cancellation_joins_every_cursor(monkeypatch, isolated, missing_start):
     """Cancel and join every resource cursor when the source task is stopped."""
     started_resources: set[str] = set()
     cancelled_resources: set[str] = set()
     foundation_started = asyncio.Event()
+    cursors_started = asyncio.Event()
 
     async def fake_fetch(_source, resource_type, **_kwargs):
         started_resources.add(resource_type)
-        if len(started_resources) == 2:
-            foundation_started.set()
+        if len(started_resources) == (3 if isolated else 2):
+            cursors_started.set()
+            if not missing_start:
+                foundation_started.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -26830,13 +26975,21 @@ async def test_resource_scan_external_cancellation_joins_every_cursor(monkeypatc
             raise
 
     source_record = _patch_parallel_resource_flow(monkeypatch, fake_fetch)
-    import_task = asyncio.create_task(_run_parallel_resource_import(source_record))
-    await foundation_started.wait()
-    import_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await import_task
+    _patch_resource_scan_storage(monkeypatch, isolated)
+    import_task = asyncio.create_task(_run_parallel_resource_import(source_record, concurrency=3))
+    try:
+        await asyncio.wait_for(cursors_started.wait(), timeout=5)
+        if missing_start:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(foundation_started.wait(), timeout=0)
+        else:
+            await asyncio.wait_for(foundation_started.wait(), timeout=5)
+    finally:
+        import_task.cancel()
+        await asyncio.gather(import_task, return_exceptions=True)
 
-    assert started_resources == {"Location", "HealthcareService"}
+    assert import_task.cancelled()
+    assert started_resources == {"Location", "HealthcareService"} | ({"PractitionerRole"} if isolated else set())
     assert cancelled_resources == started_resources
     assert not any(
         task.get_name() == "provider-directory-resource-scan" and not task.done() for task in asyncio.all_tasks()
@@ -26846,7 +26999,9 @@ async def test_resource_scan_external_cancellation_joins_every_cursor(monkeypatc
 class _ResourceRestartHarness:
     """Model durable per-resource checkpoints across one synthetic failure."""
 
-    def __init__(self):
+    def __init__(self, isolated=False):
+        self.isolated = isolated
+        self.role_complete = asyncio.Event()
         self.next_page_by_resource = {
             "Location": 0,
             "HealthcareService": 0,
@@ -26895,6 +27050,8 @@ class _ResourceRestartHarness:
         self.complete_resources.add(resource_type)
         if resource_type == "Location":
             self.location_complete.set()
+        if resource_type == "PractitionerRole":
+            self.role_complete.set()
         return dataclasses.replace(
             _checkpoint_complete_fetch_result(model, written),
             rows_fetched=target_pages,
@@ -26905,30 +27062,114 @@ class _ResourceRestartHarness:
         if not (self.should_fail and resource_type == "HealthcareService" and page_number == 1):
             return
         await self.location_complete.wait()
+        if self.isolated:
+            await self.role_complete.wait()
         self.should_fail = False
         raise RuntimeError("synthetic_restart_boundary")
 
 
+class _EmptyRoleResumeHarness:
+    """Keep real pagination result semantics around one synthetic sibling failure."""
+
+    def __init__(self, retry_result):
+        self.retry_result = retry_result
+        self.checkpoints = {}
+        self.http_calls = collections.Counter()
+        self.seeds_finished = asyncio.Event()
+
+    async def load(self, _context, resource_type, start_url, **_kwargs):
+        return self.checkpoints.get(resource_type, importer.PaginationResumeState(start_url, 0, 0, ()))
+
+    async def save(self, _context, resource_type, **kwargs):
+        self.checkpoints[resource_type] = importer.PaginationResumeState(
+            kwargs["next_url"],
+            kwargs["pages_processed"],
+            kwargs["rows_processed"],
+            tuple(kwargs["recent_url_hashes"]),
+            complete=kwargs["next_url"] is None,
+            resumed=True,
+        )
+        if {"Practitioner", "Location", "PractitionerRole"} <= self.checkpoints.keys():
+            self.seeds_finished.set()
+
+    async def fetch(self, _source, url, **_kwargs):
+        resource_type = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
+        self.http_calls[resource_type] += 1
+        attempt = self.http_calls[resource_type]
+        if resource_type == "HealthcareService" and attempt == 1:
+            await self.seeds_finished.wait()
+            raise RuntimeError("synthetic_resource_failure")
+        if resource_type == "PractitionerRole" and attempt > 1 and self.retry_result == "missing":
+            return 200, None, None, 1
+        is_empty = resource_type == "PractitionerRole" and (attempt == 1 or self.retry_result == "empty")
+        entries = [] if is_empty else [{"resource": {"resourceType": resource_type, "id": resource_type.lower()}}]
+        return 200, {"resourceType": "Bundle", "type": "searchset", "entry": entries}, None, 1
+
+
 @pytest.mark.asyncio
-async def test_resource_scan_retry_skips_complete_and_resumes_partial(monkeypatch):
+@pytest.mark.parametrize("retry_result", ("rows", "empty", "missing"))
+async def test_resource_scan_rechecks_empty_role_after_resumed_siblings(monkeypatch, retry_result):
+    """Cumulative checkpoint rows trigger the retry without counting them as writes."""
+    resume_harness = _EmptyRoleResumeHarness(retry_result)
+    source_record = _patch_parallel_resource_flow(monkeypatch, importer._fetch_resource_rows)
+    source_record["api_base"] = source_record["canonical_api_base"] = "https://directory.example.test/fhir"
+    source_record["_pagination_checkpoint_context"] = dataclasses.replace(
+        source_record["_pagination_checkpoint_context"],
+        canonical_api_base=source_record["api_base"],
+        allow_retained_pagination_reset=False,
+    )
+    _patch_resource_scan_storage(monkeypatch, True)
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", resume_harness.load)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", resume_harness.save)
+    monkeypatch.setattr(importer, "_fetch_source_json", resume_harness.fetch)
+    monkeypatch.setattr(importer, "source_checkpoint_transaction", lambda *_args, **_kwargs: contextlib.nullcontext())
+    reset = AsyncMock(side_effect=AssertionError("retained checkpoint reset"))
+    monkeypatch.setattr(importer, "_reset_pagination_checkpoint", reset)
+    resources = ["PractitionerRole", "Practitioner", "Location", "HealthcareService"]
+    with pytest.raises(RuntimeError, match="synthetic_resource_failure"):
+        await asyncio.wait_for(_run_parallel_resource_import(source_record, resources=resources, concurrency=4), 5)
+    assert all(resume_harness.checkpoints[resource].complete for resource in resources[:3])
+    counts = await asyncio.wait_for(_run_parallel_resource_import(source_record, resources=resources, concurrency=4), 5)
+    assert counts == {
+        "PractitionerRole": int(retry_result == "rows"),
+        "Practitioner": 0,
+        "Location": 0,
+        "HealthcareService": 1,
+    }
+    assert resume_harness.http_calls == {
+        "PractitionerRole": 2,
+        "Practitioner": 1,
+        "Location": 1,
+        "HealthcareService": 2,
+    }
+    diagnostic = importer._update_source_resource_import_metadata.await_args.kwargs["diagnostics"]["PractitionerRole"]
+    assert diagnostic["retry_of_zero_rows"] is True
+    assert diagnostic["complete"] is (retry_result == "rows")
+    reset.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolated", (False, True))
+async def test_resource_scan_retry_skips_complete_and_resumes_partial(monkeypatch, isolated):
     """Retain a completed cursor and resume only its interrupted sibling."""
-    restart_harness = _ResourceRestartHarness()
+    restart_harness = _ResourceRestartHarness(isolated)
     source_record = _patch_parallel_resource_flow(
         monkeypatch,
         restart_harness.fetch,
         restart_harness.persist,
     )
+    _patch_resource_scan_storage(monkeypatch, isolated)
 
     with pytest.raises(RuntimeError, match="synthetic_restart_boundary"):
-        await _run_parallel_resource_import(source_record)
-    assert restart_harness.complete_resources == {"Location"}
+        await _run_parallel_resource_import(source_record, concurrency=3)
+    assert restart_harness.complete_resources == {"Location"} | ({"PractitionerRole"} if isolated else set())
     assert restart_harness.next_page_by_resource["HealthcareService"] == 1
     location_remote_pages = restart_harness.remote_pages_by_resource["Location"]
 
-    counts = await _run_parallel_resource_import(source_record)
+    counts = await _run_parallel_resource_import(source_record, concurrency=3)
 
     assert counts == {
-        "PractitionerRole": 1,
+        "PractitionerRole": 0 if isolated else 1,
         "Location": 0,
         "HealthcareService": 1,
     }
