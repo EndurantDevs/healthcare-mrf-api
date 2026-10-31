@@ -107,6 +107,7 @@ from process import provider_directory_profile_payload_custody as profile_payloa
 from process import provider_directory_profile_scope_copy as profile_scope_copy
 from process import provider_directory_profile_target_wal_witness as profile_statement_wal
 from process import provider_directory_serving_recovery as serving_recovery
+from process import provider_directory_source_selection as source_selection
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
     mark_control_run,
@@ -424,6 +425,9 @@ from process.provider_directory_source_coverage import (
     MICHIGAN_SUPPORTED_RESOURCES,
     acquisition_coverage_blocked_reason,
     michigan_provider_directory_metadata,
+)
+from process.provider_directory_source_selection import (
+    resource_import_selection_metrics as _resource_import_selection_metrics,
 )
 from process.provider_directory_source_summary import (
     SOURCE_SUMMARY_CONTRACT_ID,
@@ -4918,7 +4922,7 @@ def _fetch_oauth2_client_token_sync(
     if cached and cached[1] > now:
         return cached[0]
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+        with source_selection.open_token_request(sys.modules[__name__], request, timeout=timeout) as response:
             payload_by_field = _decode_json_body(response.read(1024 * 1024))
     except Exception:
         return None
@@ -4939,6 +4943,7 @@ def _fetch_oauth2_client_token_sync(
 
 
 def _credential_request_options_for_source(source_record: dict[str, Any], url: str) -> dict[str, Any]:
+    source_selection.require_qualification_url(sys.modules[__name__], url)
     spec = _credential_spec_for_source(source_record)
     if not spec or not _is_credential_allowed_for_url(source_record, url):
         return {"headers": {}, "query_params": {}, "descriptor": None}
@@ -5021,28 +5026,6 @@ def _validate_current_version_census_source_transport(
         return
     if _has_source_declared_credentialed_access(source_record) or _credential_spec_for_source(source_record):
         raise ValueError("provider_directory_current_version_census_credentials_forbidden")
-
-
-def _resource_import_selection_metrics(source_count: int) -> dict[str, int]:
-    return {
-        "source_import_sources_considered": source_count,
-        "source_import_sources_selected": 0,
-        "source_import_skipped_blocked_source": 0,
-        "source_import_skipped_blocked_source_shared_backend_unverified": 0,
-        "source_import_skipped_blocked_source_coverage_mode_probe_only": 0,
-        "source_import_skipped_blocked_source_fully_enumerable_resources_empty": 0,
-        "source_import_skipped_blocked_source_upstream_search_window_incomplete": 0,
-        "source_import_skipped_missing_api_base": 0,
-        "source_import_skipped_probe_not_valid": 0,
-        "source_import_skipped_open_only": 0,
-        "source_import_skipped_validation_status": 0,
-        "source_import_skipped_auth_required_policy": 0,
-        "source_import_skipped_manual_only": 0,
-        "source_import_sources_selected_live_probe_valid": 0,
-        "source_import_sources_selected_checkpoint_retry": 0,
-        "source_import_sources_selected_declared_credentialed": 0,
-        "source_import_sources_selected_auth_required_seed": 0,
-    }
 
 
 @dataclass(frozen=True)
@@ -40993,7 +40976,9 @@ async def _fetch_json_with_source_session(
             request_url,
             headers=headers_by_name,
             timeout=request_timeout,
-            allow_redirects=allow_redirects and not christus.is_request_url(url),
+            allow_redirects=allow_redirects
+            and not christus.is_request_url(url)
+            and source_selection.QUALIFICATION_API_BASE.get() is None,
         ) as response:
             payload_by_field = await _read_source_http_payload(
                 response,
@@ -41033,7 +41018,7 @@ def _fetch_json_sync(
     started = time.monotonic()
     request = urllib.request.Request(fetch_url, headers=headers_by_name)
     try:
-        with christus.open_source_request(request, timeout=timeout, context=_ssl_context()) as response:
+        with source_selection.open_source_request(sys.modules[__name__], request, timeout=timeout) as response:
             body = _read_response_body_with_deadline(response, timeout=timeout)
             return response.status, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
     except urllib.error.HTTPError as exc:
@@ -41458,6 +41443,7 @@ async def _fetch_source_json_unpaced(
     *,
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
+    source_selection.require_qualification_url(sys.modules[__name__], url)
     census_contract = current_version_census_contract(source_record)
     if census_contract is not None:
         if _has_source_declared_credentialed_access(source_record) or _credential_spec_for_source(source_record):
@@ -41480,7 +41466,9 @@ async def _fetch_source_json_unpaced(
             timeout=timeout,
             allow_redirects=True,
         )
-    options = _credential_request_options_for_source(source_record, url)
+    options = await source_selection.resolve_probe_credentials(
+        _credential_request_options_for_source, source_record, url
+    )
     if not options["headers"] and not options["query_params"]:
         return await _fetch_json(url, timeout=timeout)
     return await _fetch_json_with_options(
@@ -42061,6 +42049,10 @@ def _resource_access_probe_result(
         "url": resource_url,
         "resource_type": resource_type,
         "error": resource_error,
+        "search_bundle_valid": (
+            not resource_error
+            and source_selection.is_search_bundle_valid(sys.modules[__name__], resource_payload, resource_type)
+        ),
     }
 
 
@@ -42143,6 +42135,7 @@ async def _probe_resource_access(
             resource_type,
             targeted_search_error,
         )
+    source_selection.require_qualification_url(sys.modules[__name__], resource_url)
     status_code, resource_payload, fetch_error, elapsed_ms = await _fetch_source_json(
         resource_probe_source_map,
         resource_url,
@@ -42162,11 +42155,14 @@ async def _probe_resource_access(
 async def _probe_metadata_candidate(
     source_record: dict[str, Any], candidate_base: str, metadata_url: str, *, timeout: int, run_id: str | None
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    source_selection.require_qualification_url(sys.modules[__name__], metadata_url)
     status_code, capability_payload, error, elapsed = await _fetch_source_json(
         source_record, metadata_url, timeout=timeout
     )
     status = _classify_http(status_code, error, capability_payload, source_record)
-    credential = _credential_request_options_for_source(source_record, metadata_url)
+    credential = await source_selection.resolve_probe_credentials(
+        _credential_request_options_for_source, source_record, metadata_url
+    )
     is_credential_missing = not credential["descriptor"] and not _uses_alohr_graphql_connector(source_record)
     if status == "valid" and _has_source_declared_credentialed_access(source_record) and is_credential_missing:
         status = "auth_required"
@@ -42292,6 +42288,9 @@ def _credential_probe_short_circuit(
     is_credential_access_required = _has_source_declared_credentialed_access(
         source_record
     ) or _uses_source_known_onboarding_gateway(source_record)
+    if source_selection.QUALIFICATION_API_BASE.get() is not None:
+        # Unused fallbacks must not block the first scoped metadata request.
+        metadata_urls = metadata_urls[:1]
     has_credentials = any(
         _credential_request_options_for_source(source_record, metadata_url)["descriptor"]
         for _candidate_base, metadata_url in metadata_urls
@@ -42339,10 +42338,8 @@ async def _probe_source(
             "run_id": run_id,
         }
         return source_probe_map, None
-    missing_credential_result = _credential_probe_short_circuit(
-        source_record,
-        metadata_urls,
-        run_id=run_id,
+    missing_credential_result = await source_selection.resolve_probe_credentials(
+        _credential_probe_short_circuit, source_record, metadata_urls, run_id=run_id
     )
     if missing_credential_result:
         return missing_credential_result
@@ -70270,6 +70267,9 @@ async def process_provider_directory_fhir_data(
                 limit=limit,
             )
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
+        source_rows = await source_selection.qualify_stale_isolated_source(
+            sys.modules[__name__], source_rows, task, timeout=timeout, run_id=run_id
+        )
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
         census_contract = (

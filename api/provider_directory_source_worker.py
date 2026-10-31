@@ -73,20 +73,34 @@ def _configured_routes():
 
 
 def _source_route(admitted_run):
-    """Resolve a private exact retry route from persisted native run coordinates."""
+    """Resolve an exact original or retry route from persisted native coordinates."""
     params = admitted_run.get("params")
     params = params if type(params) is dict else {}
-    root = params.get("provider_directory_pagination_root_run_id")
-    root_routes = [route for route in _configured_routes() if route["root_run_id"] == root]
+    routes = _configured_routes()
+    root = admitted_run.get("run_id")
+    root_routes = [route for route in routes if route["root_run_id"] == root]
+    if not root_routes:
+        root = params.get("provider_directory_pagination_root_run_id")
+        root_routes = [route for route in routes if route["root_run_id"] == root]
     if not root_routes:
         return None
+    if root == admitted_run.get("run_id"):
+        has_route_lineage = (
+            admitted_run.get("retry_of_run_id") is None
+            and params.get("retry_of_run_id") is None
+            and params.get("provider_directory_pagination_root_run_id") in (None, root)
+        )
+    else:
+        has_route_lineage = (
+            type(params.get("retry_of_run_id")) is str
+            and re.fullmatch(r"run_[0-9a-f]{32}", params["retry_of_run_id"]) is not None
+        )
     matches = [
         route
         for route in root_routes
         if params.get("source_ids") == [route["source_id"]]
         and params.get("provider_directory_endpoint_scope") == route["endpoint_scope"]
-        and type(params.get("retry_of_run_id")) is str
-        and re.fullmatch(r"run_[0-9a-f]{32}", params["retry_of_run_id"])
+        and has_route_lineage
     ]
     if len(matches) != 1:
         raise ValueError("fhir_source_worker_route_changed")
@@ -150,7 +164,7 @@ def admit_fhir_source_worker_launch(admitted_run):
         route["secret_name"] if route else "",
         route["source_id"] if route else "",
         route["endpoint_scope"] if route else "",
-        params_by_name["retry_of_run_id"] if route else "",
+        (params_by_name.get("retry_of_run_id") or "") if route else "",
     )
 
 
@@ -165,8 +179,23 @@ def _lineage_by_id(lineage_rows):
     }
 
 
+def _is_admissible_route_root(lineage_record, launch):
+    """Keep active originals distinct from failed ancestors of native retries."""
+    if lineage_record["retry_of_run_id"] is not None:
+        return False
+    if launch.run_id != launch.root_run_id:
+        return lineage_record["status"] == "failed"
+    params = lineage_record["params"]
+    return (
+        lineage_record["status"] in {"queued", "starting", "running", "finalizing"}
+        and not launch.retry_of_run_id
+        and params.get("retry_of_run_id") is None
+        and params.get("provider_directory_pagination_root_run_id") in (None, launch.root_run_id)
+    )
+
+
 async def require_fhir_source_route_ancestry(connection, launch):
-    """Accept a configured route only for a genuine failed-parent retry chain."""
+    """Require the active original root or a genuine failed-parent retry chain."""
     if type(launch) is not FHIRSourceWorkerLaunch or not launch.root_run_id:
         return
     from sqlalchemy import text
@@ -206,7 +235,7 @@ async def require_fhir_source_route_ancestry(connection, launch):
         ):
             break
         if current_id == launch.root_run_id:
-            if lineage_record["retry_of_run_id"] is None and lineage_record["status"] == "failed":
+            if _is_admissible_route_root(lineage_record, launch):
                 return
             break
         parent_id = lineage_record["retry_of_run_id"]
@@ -370,7 +399,8 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
             and containers[0]["securityContext"] == _worker_job_container_security_context()
             and containers[0]["image"] == launch.image
             and (expected_env is None or containers[0]["env"] == expected_env)
-            and job["metadata"]["annotations"].get("healthporta.com/source-root-run-id", "") == launch.root_run_id
+            and job["metadata"]["annotations"].get("healthporta.com/source-root-run-id", "")
+            == (launch.root_run_id if launch.retry_of_run_id else "")
             and containers[0]["command"] == COMMAND
             and containers[0]["workingDir"] == "/app"
             and not containers[0].get("args")

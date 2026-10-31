@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+from copy import deepcopy
+
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from api import control_imports
+from api import control_workers as workers
+from api import provider_directory_source_worker as source
 from db.models import ImportRun, db
 from process import control_lifecycle
 from process.control_lifecycle import mark_control_run
@@ -15,13 +19,14 @@ from tests.control_imports_cancel_race_support import (
     finish_cancel_race_run,
     insert_queued_cancel_race_run,
 )
-
+from tests.test_provider_directory_source_worker_launch import JOB_ID, ORDINARY_IMAGE, RUN_ID, SPEC
+from tests.test_provider_directory_source_worker_launch import (
+    original_job_before_default_change as original_job_before_default_change,
+)
 
 pytestmark = [
     pytest.mark.asyncio(loop_scope="module"),
-    pytest.mark.filterwarnings(
-        "ignore:coroutine 'Connection._cancel' was never awaited:RuntimeWarning"
-    ),
+    pytest.mark.filterwarnings("ignore:coroutine 'Connection._cancel' was never awaited:RuntimeWarning"),
 ]
 
 
@@ -169,11 +174,14 @@ async def test_fhir_admission_matrix(monkeypatch):
             "run_acquisition_two",
         ]
         active_rows = (
-            await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES)))
-        ).scalars().all()
+            (await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES))))
+            .scalars()
+            .all()
+        )
         assert len(active_rows) == 3
     finally:
         await _drop_import_run_schema()
+
 
 async def test_fhir_artifact_admission_race(monkeypatch):
     await _reset_import_run_schema()
@@ -194,8 +202,10 @@ async def test_fhir_artifact_admission_race(monkeypatch):
 
         assert sorted(created for _, created in admission_results) == [False, True]
         active_rows = (
-            await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES)))
-        ).scalars().all()
+            (await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES))))
+            .scalars()
+            .all()
+        )
         active_artifacts = [
             active_row
             for active_row in active_rows
@@ -216,9 +226,7 @@ async def test_fhir_disjoint_relation_artifact_admission_race(monkeypatch):
             "_enqueue_import_start",
             _fake_enqueue,
         )
-        relation_targets = (
-            "dataset_network_plan,dataset_affiliation_organization"
-        )
+        relation_targets = "dataset_network_plan,dataset_affiliation_organization"
         admission_requests = [
             control_imports.create_import_run(
                 {
@@ -237,17 +245,14 @@ async def test_fhir_disjoint_relation_artifact_admission_race(monkeypatch):
 
         assert sorted(created for _, created in admission_results) == [True, True]
         active_rows = (
-            await db.execute(
-                select(ImportRun).where(
-                    ImportRun.status.in_(control_imports.ACTIVE_STATUSES)
-                )
-            )
-        ).scalars().all()
+            (await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES))))
+            .scalars()
+            .all()
+        )
         assert len(active_rows) == 2
-        assert {
-            control_imports._provider_directory_operation(active_row.params)[0]
-            for active_row in active_rows
-        } == {control_imports._PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT}
+        assert {control_imports._provider_directory_operation(active_row.params)[0] for active_row in active_rows} == {
+            control_imports._PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT
+        }
     finally:
         await _drop_import_run_schema()
 
@@ -278,12 +283,10 @@ async def test_fhir_overlapping_relation_artifact_admission_race(monkeypatch):
 
         assert sorted(created for _, created in admission_results) == [False, True]
         active_rows = (
-            await db.execute(
-                select(ImportRun).where(
-                    ImportRun.status.in_(control_imports.ACTIVE_STATUSES)
-                )
-            )
-        ).scalars().all()
+            (await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES))))
+            .scalars()
+            .all()
+        )
         assert len(active_rows) == 1
     finally:
         await _drop_import_run_schema()
@@ -304,9 +307,7 @@ async def test_fhir_general_and_relation_artifact_admission_race(monkeypatch):
                     "importer": "provider-directory-fhir",
                     "params": _artifact_params(
                         "pdfhir_relation_summary",
-                        publish_artifacts_targets=(
-                            "dataset_affiliation_organization"
-                        ),
+                        publish_artifacts_targets=("dataset_affiliation_organization"),
                     ),
                 }
             ),
@@ -323,12 +324,10 @@ async def test_fhir_general_and_relation_artifact_admission_race(monkeypatch):
 
         assert sorted(created for _, created in admission_results) == [False, True]
         active_rows = (
-            await db.execute(
-                select(ImportRun).where(
-                    ImportRun.status.in_(control_imports.ACTIVE_STATUSES)
-                )
-            )
-        ).scalars().all()
+            (await db.execute(select(ImportRun).where(ImportRun.status.in_(control_imports.ACTIVE_STATUSES))))
+            .scalars()
+            .all()
+        )
         assert len(active_rows) == 1
     finally:
         await _drop_import_run_schema()
@@ -361,9 +360,7 @@ async def test_terminal_status_write_does_not_clobber_canceling_run():
             metrics={"rows": 10},
         )
 
-        stored_run = (
-            await db.execute(select(ImportRun).where(ImportRun.run_id == "run_canceling"))
-        ).scalar_one()
+        stored_run = (await db.execute(select(ImportRun).where(ImportRun.run_id == "run_canceling"))).scalar_one()
         assert stored_run.status == "canceling"
         assert stored_run.phase_detail == "cancel requested"
         assert stored_run.metrics == {"cancel_signal": {"redis": True}}
@@ -385,9 +382,7 @@ async def test_cancel_request_does_not_clobber_concurrent_terminal_run(
             finish_cancel_race_run,
         )
 
-        cancel_result_map = await control_imports.request_cancel(
-            "run_cancel_terminal_race"
-        )
+        cancel_result_map = await control_imports.request_cancel("run_cancel_terminal_race")
 
         assert cancel_result_map["status"] == "succeeded"
         assert cancel_result_map["phase_detail"] == "worker succeeded"
@@ -408,15 +403,15 @@ async def test_running_status_clears_previous_finished_at(monkeypatch):
                 engine=control_imports.ENGINE_NAME,
                 importer="ptg",
                 family="pricing",
-                    status="queued",
-                    phase_detail="ptg import queued",
+                status="queued",
+                phase_detail="ptg import queued",
                 params={},
                 created_at=control_imports.utc_now(),
                 started_at=control_imports.utc_now(),
                 finished_at=finished_at,
                 heartbeat_at=finished_at,
-                    progress={"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "queued"},
-                    error=None,
+                progress={"unit": "run", "total": 1, "done": 0, "pct": 0, "message": "queued"},
+                error=None,
             )
         )
 
@@ -427,12 +422,79 @@ async def test_running_status_clears_previous_finished_at(monkeypatch):
             progress_message="running",
         )
 
-        stored_run = (
-            await db.execute(select(ImportRun).where(ImportRun.run_id == "run_retry"))
-        ).scalar_one()
+        stored_run = (await db.execute(select(ImportRun).where(ImportRun.run_id == "run_retry"))).scalar_one()
         assert stored_run.status == "running"
         assert stored_run.phase_detail == "ptg import running"
         assert stored_run.finished_at is None
         assert stored_run.error is None
+    finally:
+        await _drop_import_run_schema()
+
+
+async def _persist_source_run(recorded):
+    await db.execute(
+        control_imports.insert(ImportRun).values(
+            **recorded,
+            engine=control_imports.ENGINE_NAME,
+            family="provider-directory",
+            created_at=control_imports.utc_now(),
+            heartbeat_at=control_imports.utc_now(),
+            progress={},
+        )
+    )
+
+
+async def _persist_original_and_retry(recorded):
+    root_id = recorded["run_id"]
+    await _persist_source_run({**deepcopy(recorded), "status": "failed"})
+    recorded["run_id"] = RUN_ID
+    recorded["retry_of_run_id"] = root_id
+    recorded["metrics"]["job_id"] = JOB_ID
+    recorded["params"].update(retry_of_run_id=root_id, provider_directory_pagination_root_run_id=root_id)
+    await _persist_source_run(recorded)
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, recorded)
+    request.fhir_source_launch = source.admit_fhir_source_worker_launch(recorded)
+    job = workers._worker_job_manifest(SPEC, request, ORDINARY_IMAGE)
+    job["status"] = {"active": 1}
+    assert job["metadata"]["annotations"]["healthporta.com/source-root-run-id"] == root_id
+    assert job["spec"]["template"]["spec"]["containers"][0]["image"] == ORDINARY_IMAGE
+    return job
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", [False, True])
+async def test_native_original_and_retry_keep_reviewed_runtime(monkeypatch, original_job_before_default_change, retry):
+    """Changing the default never replaces a matching original or its genuine retry."""
+    recorded, job = original_job_before_default_change
+    root_id = recorded["run_id"]
+    await _reset_import_run_schema()
+    try:
+        if retry:
+            job = await _persist_original_and_retry(recorded)
+        else:
+            await _persist_source_run(recorded)
+        monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+        monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+        api_calls = []
+        monkeypatch.setattr(workers, "_kubernetes_request", lambda *args: api_calls.append(args) or {"items": [job]})
+        before = (await db.execute(select(ImportRun.__table__).order_by(ImportRun.run_id))).mappings().all()
+        outcome = await workers.guarded_ensure_worker(
+            {"run_id": recorded["run_id"], "importer": "provider-directory-fhir"}
+        )
+        assert outcome["status"] == "already_running"
+        assert len(api_calls) == 1 and api_calls[0][0] == "GET"
+        after = (await db.execute(select(ImportRun.__table__).order_by(ImportRun.run_id))).mappings().all()
+        assert after == before
+        await db.execute(
+            update(ImportRun)
+            .where(ImportRun.run_id == root_id)
+            .values(params={**recorded["params"], "source_ids": ["other-source"]})
+        )
+        refused = await workers.guarded_ensure_worker(
+            {"run_id": recorded["run_id"], "importer": "provider-directory-fhir"}
+        )
+        assert refused["status"] == "failed"
+        assert len(api_calls) == 1
     finally:
         await _drop_import_run_schema()
