@@ -647,7 +647,8 @@ def _require_foreign_scope(edges, roots, schema, owner, family=None):
         )
 
 
-def _require_source_endpoint_fk(edges, relations_by_root):
+def _require_source_endpoint_fk(edges, relations_by_root, *, legacy=False):
+    """Bind the alias fence to its original native constraint and four hooks."""
     native_by_root = {
         root: next(entry for entry in relations_by_root[root]["catalog"]["classes"] if entry["relname"] == root)
         for root in CONTROL_ROOTS[:2]
@@ -661,13 +662,14 @@ def _require_source_endpoint_fk(edges, relations_by_root):
         for root, native in native_by_root.items()
     }
     matches = [
-        edge["constraint"]
+        edge
         for edge in edges
         if edge["constraint"]["conname"] == "provider_directory_source_endpoint_id_fkey"
         and int(edge["constraint"]["conrelid"]) == int(native_by_root[CONTROL_ROOTS[0]]["oid"])
     ]
     _require(len(matches) == 1, "source_endpoint_fk_required")
-    constraint = matches[0]
+    edge = matches[0]
+    constraint = edge["constraint"]
     _require(
         int(constraint["confrelid"]) == int(native_by_root[CONTROL_ROOTS[1]]["oid"])
         and constraint["conkey"] == [column_by_root[CONTROL_ROOTS[0]]]
@@ -682,6 +684,53 @@ def _require_source_endpoint_fk(edges, relations_by_root):
         and constraint["conenforced"],
         "source_endpoint_fk_changed",
     )
+    _require_source_endpoint_hooks(edge, relations_by_root, legacy=legacy)
+    return edge
+
+
+def _require_source_endpoint_hooks(edge, relations_by_root, *, legacy):
+    """Verify the same four native hook records in both captured representations."""
+    constraint = edge["constraint"]
+    hooks = edge["hooks"] or ()
+    child, parent = int(constraint["conrelid"]), int(constraint["confrelid"])
+    _require(
+        len(hooks) == 4
+        and len({hook["oid"] for hook in hooks}) == 4
+        and {(int(hook["tgrelid"]), hook["tgtype"]) for hook in hooks}
+        == {(child, 5), (child, 17), (parent, 9), (parent, 17)}
+        and all(
+            hook["tgisinternal"]
+            and str(hook["tgconstraint"]) == str(constraint["oid"])
+            and hook["tgenabled"] in ({"O", "A"} if legacy else {"A"})
+            for hook in hooks
+        ),
+        "source_endpoint_fk_hooks_changed",
+    )
+    catalog_hooks = [
+        hook
+        for root in CONTROL_ROOTS[:2]
+        for hook in relations_by_root[root]["catalog"]["triggers"] or ()
+        if str(hook["tgconstraint"]) == str(constraint["oid"])
+    ]
+    _require(
+        sorted(catalog_hooks, key=lambda hook: int(hook["oid"])) == sorted(hooks, key=lambda hook: int(hook["oid"])),
+        "source_endpoint_fk_catalog_changed",
+    )
+
+
+async def _enable_source_endpoint_fk(connection, policy, before):
+    """Keep the existing native alias FK active in every writer's replication mode."""
+    edge = _require_source_endpoint_fk(before["foreign"], before["relations"], legacy=True)
+    roots_by_oid = {
+        int(edge["constraint"]["conrelid"]): CONTROL_ROOTS[0],
+        int(edge["constraint"]["confrelid"]): CONTROL_ROOTS[1],
+    }
+    for hook in sorted(edge["hooks"], key=lambda hook: (int(hook["tgrelid"]), int(hook["oid"]))):
+        if hook["tgenabled"] != "A":
+            await connection.execute(
+                f"ALTER TABLE {storage_relation(policy.schema, roots_by_oid[int(hook['tgrelid'])])} "
+                f"ENABLE ALWAYS TRIGGER {storage_identifier(hook['tgname'])}"
+            )
 
 
 def _expected_relation_acl(root, catalog, owner, builder):
@@ -918,7 +967,7 @@ async def _capture_control_relations(
         )
     ]
     _require_foreign_scope(foreign_edges, natives_by_root, policy.schema, owner, family)
-    _require_source_endpoint_fk(foreign_edges, relations_by_root)
+    _require_source_endpoint_fk(foreign_edges, relations_by_root, legacy=legacy)
     return relations_by_root, foreign_edges
 
 
@@ -1160,7 +1209,7 @@ async def capture_cms_control_custody(connection, policy, *, migration_role, nam
     )
 
 
-def _require_relation_delta(root, before, after, owner, builder, read_grantees=()):
+def _require_relation_delta(root, before, after, owner, builder, read_grantees=(), *, source_endpoint_hooks=()):
     expected = deepcopy(before)
     _require(
         {entry["oid"] for entry in before["catalog"]["classes"]}
@@ -1194,13 +1243,18 @@ def _require_relation_delta(root, before, after, owner, builder, read_grantees=(
             if (current["attrelid"], current["attnum"]) == (entry["attrelid"], entry["attnum"])
         )
     expected["composite"]["typowner"] = str(owner)
+    source_hooks_by_oid = {str(hook["oid"]): hook for hook in source_endpoint_hooks}
+    for hook in expected["catalog"]["triggers"] or ():
+        if str(hook["oid"]) in source_hooks_by_oid:
+            _require(hook == source_hooks_by_oid[str(hook["oid"])], "adoption_source_endpoint_hook_changed")
+            hook["tgenabled"] = "A"
     for field in ("table_acl", "column_acl", "access"):
         expected["catalog"][field] = after["catalog"][field]
     _require(expected == after, "adoption_relation_changed")
 
 
 def require_cms_control_adoption_delta(before, after, expected_checks, *, read_policy=None):
-    """Compare complete native snapshots; only fixed ownership/ACL changes are permitted."""
+    """Preserve native snapshots except fixed ownership/ACL and alias FK enablement."""
     _require(
         {
             key: receipt_value
@@ -1217,13 +1271,20 @@ def require_cms_control_adoption_delta(before, after, expected_checks, *, read_p
     _require(before["relations"].keys() == after["relations"].keys() == set(CONTROL_ROOTS), "adoption_roots_changed")
     read_grantees = () if read_policy is None else cms_control_read_oids(read_policy, before["role_graph"])
     _require(read_policy is None or read_policy.schema == before["schema"], "adoption_read_scope_changed")
+    source_endpoint = _require_source_endpoint_fk(before["foreign"], before["relations"], legacy=True)
+    _require_source_endpoint_fk(after["foreign"], after["relations"])
     for root in CONTROL_ROOTS:
         _require_relation_delta(
-            root, before["relations"][root], after["relations"][root], after["owner"], after["builder"], read_grantees
+            root,
+            before["relations"][root],
+            after["relations"][root],
+            after["owner"],
+            after["builder"],
+            read_grantees,
+            source_endpoint_hooks=source_endpoint["hooks"],
         )
     from process.provider_directory_source_acquisition_custody import require_source_acquisition_delta
     from process.provider_directory_source_callable_custody import require_source_callable_delta
-    from process.provider_directory_source_cohort_custody import HISTORY
 
     _require(
         before["functions"] == before["source"]["functions"] and after["functions"] == after["source"]["functions"],
@@ -1233,6 +1294,13 @@ def require_cms_control_adoption_delta(before, after, expected_checks, *, read_p
     require_source_acquisition_delta(
         before["acquisition"], after["acquisition"], after["source"]["roles"], expected_checks
     )
+    _require_control_foreign_delta(before, after, source_endpoint)
+
+
+def _require_control_foreign_delta(before, after, source_endpoint):
+    """Permit only existing owner changes, retired cohort FK, and exact alias hook modes."""
+    from process.provider_directory_source_cohort_custody import HISTORY
+
     retired_oids = {
         str(constraint["oid"])
         for constraint in before["acquisition"]["cohort"]["relations"][HISTORY]["catalog"]["constraints"] or ()
@@ -1242,6 +1310,9 @@ def require_cms_control_adoption_delta(before, after, expected_checks, *, read_p
         edge for edge in deepcopy(before["foreign"]) if str(edge["constraint"]["oid"]) not in retired_oids
     ]
     for edge in expected_foreign_rows:
+        if str(edge["constraint"]["oid"]) == str(source_endpoint["constraint"]["oid"]):
+            for hook in edge["hooks"]:
+                hook["tgenabled"] = "A"
         for field in ("child", "parent"):
             if edge[field][1] == before["schema"] and edge[field][2] in {
                 *CONTROL_ROOTS,
@@ -1306,6 +1377,7 @@ async def adopt_cms_control_custody(connection, policy, before):
             builder_oid=builder_oid,
             delegation=delegation,
         )
+    await _enable_source_endpoint_fk(connection, policy, before)
     from process.provider_directory_source_acquisition_custody import (
         adopt_source_acquisition_custody,
         canonical_acquisition_checks,

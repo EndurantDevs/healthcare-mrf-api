@@ -1000,32 +1000,177 @@ async def _retire_payload_hooks(connection, policy, family):
         )
 
 
-async def _partition_dataset_payload(connection, policy, root_name, keys_by_column):
-    """Reuse the old native heap as history; never copy its payload rows."""
-    root = storage_relation(policy.schema, root_name)
-    relation_by_field = await connection.fetchrow(
-        "SELECT oid::bigint,relkind::text FROM pg_class WHERE oid=to_regclass($1)", root
+_HISTORY_BOUND = "pd_generic_source_history_bound"
+_HISTORY_TEMPLATE = "pd_generic_source_history_bound_template"
+_HISTORY_INDEX_SQL = """SELECT i.indexrelid::bigint,c.relname,pg_relation_filenode(c.oid)::bigint AS filenode,
+ i.indisprimary,i.indisvalid AND i.indisready AND i.indislive AS usable,
+ jsonb_build_object('method',c.relam,'unique',i.indisunique,'immediate',i.indimmediate,
+ 'nulls_not_distinct',i.indnullsnotdistinct,'key_count',i.indnkeyatts,'column_count',i.indnatts,
+ 'columns',ARRAY(SELECT a.attname FROM unnest(i.indkey) WITH ORDINALITY k(attnum,ordinal)
+  LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum ORDER BY ordinal),
+ 'opclasses',i.indclass::oid[],'collations',i.indcollation::oid[],'options',i.indoption::smallint[],
+ 'expressions',pg_get_expr(i.indexprs,i.indrelid),'predicate',pg_get_expr(i.indpred,i.indrelid)) AS signature
+ FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=$1 ORDER BY i.indexrelid"""
+
+
+def _history_bound_expression(keys):
+    """Use native text equality and escape data independently of session string settings."""
+    literals = ["E'" + key.replace("\\", "\\\\").replace("'", "''") + "'::pg_catalog.text" for key in keys]
+    return "dataset_id OPERATOR(pg_catalog.=) ANY (ARRAY[" + ",".join(literals) + "])" if keys else "false"
+
+
+def _history_index_signature(index):
+    signature = index["signature"]
+    return json.loads(signature) if isinstance(signature, str) else signature
+
+
+def _history_primary_index(indexes, keys_by_column):
+    primary_indexes = [index for index in indexes if index["indisprimary"]]
+    _require(len(primary_indexes) == 1 and all(index["usable"] for index in indexes), "history_index_unprepared")
+    signature = _history_index_signature(primary_indexes[0])
+    _require(
+        signature["columns"] == list(keys_by_column)
+        and signature["key_count"] == signature["column_count"]
+        and signature["expressions"] is None
+        and signature["predicate"] is None,
+        "history_index_unprepared",
     )
-    _require(relation_by_field is not None and relation_by_field["relkind"] in {"r", "p"}, "dataset_root_changed")
-    if relation_by_field["relkind"] == "p":
-        return
-    history_name = "pd_generic_source_history_" + str(relation_by_field["oid"])
-    history = storage_relation(policy.schema, history_name)
-    keys = await connection.fetchval(f"SELECT array_agg(DISTINCT dataset_id ORDER BY dataset_id) FROM {root}") or []
-    await connection.execute(f"ALTER TABLE {root} RENAME TO {storage_identifier(history_name)}")
-    indexes = await connection.fetch(
-        "SELECT indexrelid::bigint,relname FROM pg_index JOIN pg_class ON oid=indexrelid WHERE indrelid=$1",
-        relation_by_field["oid"],
+    return primary_indexes[0]
+
+
+def _require_history_key_plan(plan, index_names):
+    plan = json.loads(plan) if isinstance(plan, str) else plan
+    pending, probes, ranges = [plan[0]["Plan"]], 0, 0
+    while pending:
+        node = pending.pop()
+        kind = node["Node Type"]
+        _require(
+            kind
+            in {
+                "Recursive Union",
+                "CTE Scan",
+                "WorkTable Scan",
+                "Nested Loop",
+                "Limit",
+                "Index Only Scan",
+                "Index Scan",
+                "Materialize",
+                "Memoize",
+                "Result",
+            },
+            "history_key_plan_unprepared",
+        )
+        if kind in {"Index Only Scan", "Index Scan"}:
+            _require(node["Index Name"] in index_names and "Filter" not in node, "history_key_plan_unprepared")
+            probes += 1
+            ranges += bool(node.get("Index Cond"))
+        pending.extend(node.get("Plans", ()))
+    _require(probes == 2 and ranges == 1, "history_key_plan_unprepared")
+
+
+async def _history_dataset_keys(connection, root, indexes):
+    """Seek successive leading keys; dead index entries can still add physical work."""
+    statement = (
+        "WITH RECURSIVE history_keys(dataset_id) AS ((SELECT dataset_id FROM "
+        + root
+        + " ORDER BY dataset_id LIMIT 1) UNION ALL SELECT next_key.dataset_id FROM history_keys previous_key "
+        "CROSS JOIN LATERAL (SELECT dataset_id FROM "
+        + root
+        + " WHERE dataset_id OPERATOR(pg_catalog.>) previous_key.dataset_id ORDER BY dataset_id LIMIT 1) next_key) "
+        "SELECT dataset_id FROM history_keys"
     )
+    index_names = {
+        index["relname"]
+        for index in indexes
+        if _history_index_signature(index)["columns"][0] == "dataset_id"
+        and _history_index_signature(index)["expressions"] is None
+        and _history_index_signature(index)["predicate"] is None
+        and index["usable"]
+    }
+    # Even one-page fixtures may otherwise choose a heap scan. Keep this hint
+    # inside a savepoint: a query error restores it by rollback, never by issuing
+    # cleanup SQL in an aborted transaction or changing later bulk-query plans.
+    async with connection.transaction():
+        original_setting = await connection.fetchval("SHOW enable_seqscan")
+        await connection.execute("SET LOCAL enable_seqscan=off")
+        plan = await connection.fetchval("EXPLAIN (FORMAT JSON, COSTS OFF) " + statement)
+        _require_history_key_plan(plan, index_names)
+        key_rows = await connection.fetch(statement)
+        await connection.execute("SELECT set_config('enable_seqscan',$1,true)", original_setting)
+    keys = [key_row["dataset_id"] for key_row in key_rows]
+    _require(all(isinstance(key, str) for key in keys) and len(set(keys)) == len(keys), "history_keys_changed")
+    return sorted(keys)
+
+
+async def _require_prepared_history_bound(connection, root, oid, keys):
+    bound = await connection.fetchrow(
+        "SELECT pg_get_expr(conbin,conrelid) AS expression,convalidated AND conenforced AND NOT connoinherit "
+        "AND conislocal AND coninhcount=0 AND conparentid=0 AS ready FROM pg_constraint "
+        "WHERE conrelid=$1 AND contype='c' AND conname=$2",
+        oid,
+        _HISTORY_BOUND,
+    )
+    _require(bound is not None and bound["ready"], "history_bound_unprepared")
+    template = storage_relation("pg_temp", _HISTORY_TEMPLATE)
+    _require(await connection.fetchval("SELECT to_regclass($1) IS NULL", template), "history_template_exists")
+    await connection.execute(f"CREATE TEMP TABLE {storage_identifier(_HISTORY_TEMPLATE)} (LIKE {root}) ON COMMIT DROP")
+    await connection.execute(
+        f"ALTER TABLE {template} ADD CONSTRAINT {storage_identifier(_HISTORY_BOUND)} "
+        f"CHECK ({_history_bound_expression(keys)}) NOT VALID"
+    )
+    expected = await connection.fetchval(
+        "SELECT pg_get_expr(conbin,conrelid) FROM pg_constraint WHERE conrelid=to_regclass($1) AND conname=$2",
+        template,
+        _HISTORY_BOUND,
+    )
+    _require(bound["expression"] == expected, "history_bound_changed")
+    await connection.execute(f"DROP TABLE {template}")
+
+
+async def _history_keys_for_cut(connection, root, relation, indexes):
+    if relation["heap_bytes"] == 0:
+        # Physical emptiness under the caller's ACCESS EXCLUSIVE lock is exact;
+        # neither stale planner estimates nor an unbounded emptiness scan is used.
+        exists = await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_constraint WHERE conrelid=$1 AND conname=$2)",
+            relation["oid"],
+            _HISTORY_BOUND,
+        )
+        if not exists:
+            await connection.execute(
+                f"ALTER TABLE {root} ADD CONSTRAINT {storage_identifier(_HISTORY_BOUND)} CHECK (false)"
+            )
+        keys = []
+    else:
+        expression = await connection.fetchval(
+            "SELECT pg_get_expr(conbin,conrelid) FROM pg_constraint WHERE conrelid=$1 AND conname=$2 "
+            "AND contype='c' AND convalidated AND conenforced",
+            relation["oid"],
+            _HISTORY_BOUND,
+        )
+        _require(expression is not None, "history_bound_unprepared")
+        keys = [] if expression == "false" else await _history_dataset_keys(connection, root, indexes)
+    await _require_prepared_history_bound(connection, root, relation["oid"], keys)
+    return keys
+
+
+async def _rename_history_indexes(connection, policy, indexes):
     for index in indexes:
         await connection.execute(
             f"ALTER INDEX {storage_relation(policy.schema, index['relname'])} RENAME TO "
             f"{storage_identifier('pd_generic_source_idx_' + str(index['indexrelid']))}"
         )
+
+
+async def _create_history_parent(connection, policy, root_name, history, keys_by_column):
+    root = storage_relation(policy.schema, root_name)
     await connection.execute(
         f"CREATE TABLE {root} (LIKE {history} INCLUDING DEFAULTS INCLUDING CONSTRAINTS "
         "INCLUDING STORAGE) PARTITION BY LIST (dataset_id)"
     )
+    # The finite validated CHECK belongs only to the retained heap. Copying it
+    # onto the parent would silently reject every future dataset partition.
+    await connection.execute(f"ALTER TABLE {root} DROP CONSTRAINT {storage_identifier(_HISTORY_BOUND)}")
     await connection.execute(f"ALTER TABLE {root} OWNER TO {storage_identifier(policy.owner_role)}")
     key_columns = ",".join(storage_identifier(column) for column in keys_by_column)
     await connection.execute(f"ALTER TABLE {root} ADD PRIMARY KEY ({key_columns})")
@@ -1033,13 +1178,52 @@ async def _partition_dataset_payload(connection, policy, root_name, keys_by_colu
         await connection.execute(
             f"CREATE INDEX {storage_identifier(root_name + '_target_idx')} ON {root} (dataset_id,target_type,target_resource_id)"
         )
+
+
+async def _require_history_index_reuse(connection, root, indexes):
+    parent_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", root)
+    parents = await connection.fetch(_HISTORY_INDEX_SQL, parent_oid)
+    remaining_indexes = list(indexes)
+    for parent in parents:
+        matches = [
+            index for index in remaining_indexes if _history_index_signature(index) == _history_index_signature(parent)
+        ]
+        _require(parent["usable"] and len(matches) == 1, "history_index_equivalence_changed")
+        remaining_indexes.remove(matches[0])
+    _require(not remaining_indexes and parents, "history_index_equivalence_changed")
+
+
+async def _attach_prepared_history(connection, root, history, keys, indexes, oid):
     if keys:
-        literals = ",".join("'" + dataset_id.replace("'", "''") + "'" for dataset_id in keys)
+        literals = ",".join("E'" + key.replace("\\", "\\\\").replace("'", "''") + "'" for key in keys)
         await connection.execute(f"ALTER TABLE {root} ATTACH PARTITION {history} FOR VALUES IN ({literals})")
-    else:
-        # Preserve even an empty historical OID without introducing a default
-        # partition that would force scans on every new snapshot attachment.
-        await connection.execute(f"ALTER TABLE {history} ADD CHECK (false)")
+    retained = await connection.fetch(_HISTORY_INDEX_SQL, oid)
+    physical = lambda items: {(index["indexrelid"], index["filenode"]) for index in items}
+    _require(physical(retained) == physical(indexes), "history_index_storage_changed")
+
+
+async def _partition_dataset_payload(connection, policy, root_name, keys_by_column):
+    """Require independently prepared native history proof before the bounded cut."""
+    _require(root_name in {WITNESS, RELATIONSHIP}, "history_root_changed")
+    root = storage_relation(policy.schema, root_name)
+    relation = await connection.fetchrow(
+        "SELECT oid::bigint,relkind::text,pg_relation_size(oid)::bigint AS heap_bytes "
+        "FROM pg_class WHERE oid=to_regclass($1)",
+        root,
+    )
+    _require(relation is not None and relation["relkind"] in {"r", "p"}, "dataset_root_changed")
+    if relation["relkind"] == "p":
+        return
+    indexes = await connection.fetch(_HISTORY_INDEX_SQL, relation["oid"])
+    _history_primary_index(indexes, keys_by_column)
+    keys = await _history_keys_for_cut(connection, root, relation, indexes)
+    history_name = "pd_generic_source_history_" + str(relation["oid"])
+    history = storage_relation(policy.schema, history_name)
+    await connection.execute(f"ALTER TABLE {root} RENAME TO {storage_identifier(history_name)}")
+    await _rename_history_indexes(connection, policy, indexes)
+    await _create_history_parent(connection, policy, root_name, history, keys_by_column)
+    await _require_history_index_reuse(connection, root, indexes)
+    await _attach_prepared_history(connection, root, history, keys, indexes, relation["oid"])
 
 
 async def _retire_header_entrypoints(connection, policy):

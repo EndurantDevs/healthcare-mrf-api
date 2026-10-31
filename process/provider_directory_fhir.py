@@ -20125,16 +20125,10 @@ async def _verify_provider_directory_artifact_dataset_fence(
 
 
 async def _lock_source_publication_controls() -> None:
-    """Freeze the full alias scope only during the short original SOURCE cut."""
-    from process.provider_directory_generic_source_policy import require_source_publication_transaction
+    """Retain native alias guards while independent SOURCE cuts overlap."""
+    from process.provider_directory_source_control_privileges import lock_source_publication_controls
 
-    publisher = await require_source_publication_transaction(db)
-    if publisher.policy.schema != _schema():
-        raise RuntimeError("provider_directory_source_publication_schema_changed")
-    endpoint_ref = _unscoped_qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)
-    source_ref = _unscoped_qt(_schema(), ProviderDirectorySource.__tablename__)
-    await db.status(f"LOCK TABLE {endpoint_ref} IN SHARE MODE NOWAIT;")
-    await db.status(f"LOCK TABLE {source_ref} IN SHARE ROW EXCLUSIVE MODE NOWAIT;")
+    await lock_source_publication_controls(db, _schema())
 
 
 async def _lock_and_verify_artifact_dataset_fence(

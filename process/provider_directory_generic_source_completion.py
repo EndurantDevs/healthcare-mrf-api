@@ -497,17 +497,26 @@ async def _attach_final_tables(connection, policy, binding_by_field):
     storage._require(binding_by_field.get("contract") != storage.ISOLATED_CONTRACT, "isolated_attach_forbidden")
     dataset_id = binding_by_field["identity"]["dataset_id"]
     literal = "'" + dataset_id.replace("'", "''") + "'"
-    roots = [storage_relation(policy.schema, root) for root in storage.RELATIONS]
-    await connection.execute("LOCK TABLE " + ",".join(roots) + " IN SHARE UPDATE EXCLUSIVE MODE")
     for root in storage.RELATIONS:
         name = binding_by_field["tables"][root]["name"]
         relation = storage_relation(policy.schema, name)
         await connection.execute(f"ALTER TABLE {relation} ADD CHECK (dataset_id={literal})")
         await connection.execute(f"ALTER TABLE {relation} RESET (autovacuum_enabled)")
         await storage._close_grants(connection, policy, name, readable=True)
+    previous_timeout, timeout_ms = await connection.fetchrow(
+        "SELECT current_setting('lock_timeout'),setting::bigint FROM pg_settings WHERE name='lock_timeout'"
+    )
+    if timeout_ms == 0 or timeout_ms > 1000:
+        await connection.execute("SET LOCAL lock_timeout='1s'")
+    roots = sorted("ONLY " + storage_relation(policy.schema, root) for root in storage.RELATIONS)
+    await connection.execute("LOCK TABLE " + ",".join(roots) + " IN SHARE UPDATE EXCLUSIVE MODE")
+    for root in storage.RELATIONS:
+        relation = storage_relation(policy.schema, binding_by_field["tables"][root]["name"])
         await connection.execute(
             f"ALTER TABLE {storage_relation(policy.schema, root)} ATTACH PARTITION {relation} FOR VALUES IN ({literal})"
         )
+    # Failure rolls back the owner's savepoint, including the local timeout.
+    await connection.execute("SELECT set_config('lock_timeout',$1,true)", previous_timeout)
 
 
 async def _finish_derived_indexes(connection, policy, binding_by_field):

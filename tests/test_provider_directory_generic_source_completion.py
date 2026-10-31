@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Complete-key semantics, exact raw replay and bounded asynchronous output."""
 
+import asyncio
 import hashlib
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
@@ -575,6 +576,85 @@ async def test_attach_refuses_unvalidated_header_before_indexes_or_attach(monkey
             publisher, {"phase": "prepared", "identity": {"dataset_id": "dataset"}}
         )
     connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_private_preparation_finishes_before_locking_only_sorted_parents(monkeypatch):
+    events, checking, resume = [], asyncio.Event(), asyncio.Event()
+    binding_by_field = {
+        "identity": {"dataset_id": "dataset"},
+        "tables": {root: {"name": "heap_" + str(index)} for index, root in enumerate(completion.storage.RELATIONS)},
+    }
+
+    async def execute(statement, *args):
+        events.append(statement)
+        if "ADD CHECK" in statement:
+            checking.set()
+            await resume.wait()
+
+    grants = AsyncMock(side_effect=lambda *args, **kwargs: events.append("readable grant"))
+    monkeypatch.setattr(completion.storage, "_close_grants", grants)
+    connection = SimpleNamespace(execute=execute, fetchrow=AsyncMock(return_value=("100ms", 100)))
+    policy = SimpleNamespace(schema="source_schema")
+    attachment = asyncio.create_task(completion._attach_final_tables(connection, policy, binding_by_field))
+    try:
+        await asyncio.wait_for(checking.wait(), 1)
+        assert not any("LOCK TABLE" in event or "ATTACH PARTITION" in event for event in events)
+    finally:
+        resume.set()
+        await asyncio.wait_for(attachment, 1)
+    lock_index = next(index for index, event in enumerate(events) if event.startswith("LOCK TABLE"))
+    prepared = events[:lock_index]
+    assert sum("ADD CHECK" in event for event in prepared) == len(completion.storage.RELATIONS)
+    assert sum("RESET (autovacuum_enabled)" in event for event in prepared) == len(completion.storage.RELATIONS)
+    assert prepared.count("readable grant") == len(completion.storage.RELATIONS)
+    assert events[lock_index] == (
+        "LOCK TABLE "
+        + ",".join(f'ONLY "source_schema"."{root}"' for root in sorted(completion.storage.RELATIONS))
+        + " IN SHARE UPDATE EXCLUSIVE MODE"
+    )
+    assert all("ATTACH PARTITION" in event for event in events[lock_index + 1 : -1])
+    assert events[-1] == "SELECT set_config('lock_timeout',$1,true)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout,timeout_ms", [("0", 0), ("5s", 5000), ("100ms", 100)])
+async def test_attach_bounds_parent_waits_and_restores_caller_setting(monkeypatch, timeout, timeout_ms):
+    connection = SimpleNamespace(execute=AsyncMock(), fetchrow=AsyncMock(return_value=(timeout, timeout_ms)))
+    monkeypatch.setattr(completion.storage, "_close_grants", AsyncMock())
+    binding_by_field = {
+        "identity": {"dataset_id": "dataset"},
+        "tables": {root: {"name": "heap_" + str(index)} for index, root in enumerate(completion.storage.RELATIONS)},
+    }
+    await completion._attach_final_tables(connection, SimpleNamespace(schema="source_schema"), binding_by_field)
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    lock_index = next(index for index, statement in enumerate(statements) if statement.startswith("LOCK TABLE"))
+    assert ("SET LOCAL lock_timeout='1s'" in statements[:lock_index]) is (timeout_ms == 0 or timeout_ms > 1000)
+    assert sum("ADD CHECK" in statement for statement in statements[:lock_index]) == len(completion.storage.RELATIONS)
+    assert connection.execute.await_args.args == ("SELECT set_config('lock_timeout',$1,true)", timeout)
+
+
+@pytest.mark.asyncio
+async def test_invalid_private_partition_bound_fails_before_parent_locks(monkeypatch):
+    events = []
+    binding_by_field = {
+        "identity": {"dataset_id": "dataset"},
+        "tables": {root: {"name": "heap_" + str(index)} for index, root in enumerate(completion.storage.RELATIONS)},
+    }
+    failure = RuntimeError("candidate row outside partition")
+
+    async def execute(statement):
+        events.append(statement)
+        if '"heap_1" ADD CHECK' in statement:
+            raise failure
+
+    monkeypatch.setattr(completion.storage, "_close_grants", AsyncMock())
+    with pytest.raises(RuntimeError) as caught:
+        await completion._attach_final_tables(
+            SimpleNamespace(execute=execute), SimpleNamespace(schema="source_schema"), binding_by_field
+        )
+    assert caught.value is failure
+    assert not any("LOCK TABLE" in event or "ATTACH PARTITION" in event for event in events)
 
 
 @pytest.mark.asyncio

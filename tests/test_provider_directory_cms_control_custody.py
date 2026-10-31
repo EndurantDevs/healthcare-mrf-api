@@ -166,6 +166,7 @@ def _writer_replay(monkeypatch, root, *, adopted=True):
         acquisition=dict(cohort={}),
     )
     monkeypatch.setattr(custody, "_admin_identity", AsyncMock(return_value=("admin", "admin")))
+    monkeypatch.setattr(custody, "_enable_source_endpoint_fk", AsyncMock())
     monkeypatch.setattr(acquisition, "adopt_source_acquisition_custody", AsyncMock())
     monkeypatch.setattr(acquisition, "canonical_acquisition_checks", AsyncMock(return_value={}))
     monkeypatch.setattr(source, "adopt_source_callable_custody", AsyncMock())
@@ -223,6 +224,7 @@ async def test_exact_owned_writer_replay_preserves_builder_and_reader_acl_order(
     assert len(statements) == 2 and statements[0].startswith("ALTER TABLE ")
     assert statements[1].startswith("REVOKE SELECT(") and statements[1].endswith(' FROM "owner"')
     assert before == original
+    custody._enable_source_endpoint_fk.assert_awaited_once_with(connection, policy, before)
 
 
 @pytest.mark.parametrize(
@@ -434,22 +436,35 @@ def test_callable_body_default_overload_security_and_settings_drift_refuses(fiel
         custody._require_callable_definition(entry, "snapshot_schema", 44)
 
 
-def _source_endpoint_foreign_key():
-    relations_by_root = {
+def _source_endpoint_foreign_key(relations_by_root=None):
+    """Capture both native representations of the original alias constraint."""
+    relations_by_root = relations_by_root or {
         root: dict(
             catalog=dict(
                 classes=[dict(relname=root, oid=str(number))],
                 attributes=[dict(attrelid=str(number), attname="endpoint_id", attnum=position)],
+                triggers=[],
             )
         )
         for root, number, position in zip(custody.CONTROL_ROOTS[:2], (41, 42), (8, 1), strict=True)
     }
+    natives = [relations_by_root[root]["catalog"]["classes"][0] for root in custody.CONTROL_ROOTS[:2]]
+    columns = [
+        next(
+            field["attnum"]
+            for field in relations_by_root[root]["catalog"]["attributes"]
+            if field["attname"] == "endpoint_id"
+        )
+        for root in custody.CONTROL_ROOTS[:2]
+    ]
     constraint_by_field = dict(
+        oid="81",
         conname="provider_directory_source_endpoint_id_fkey",
-        conrelid="41",
-        confrelid="42",
-        conkey=[8],
-        confkey=[1],
+        contype="f",
+        conrelid=natives[0]["oid"],
+        confrelid=natives[1]["oid"],
+        conkey=[columns[0]],
+        confkey=[columns[1]],
         confmatchtype="s",
         confupdtype="a",
         confdeltype="n",
@@ -459,7 +474,46 @@ def _source_endpoint_foreign_key():
         convalidated=True,
         conenforced=True,
     )
-    return [dict(constraint=constraint_by_field)], relations_by_root
+    hooks = _source_endpoint_hooks(natives)
+    for root, native in zip(custody.CONTROL_ROOTS[:2], natives, strict=True):
+        relations_by_root[root]["catalog"]["triggers"].extend(
+            deepcopy(hook) for hook in hooks if hook["tgrelid"] == native["oid"]
+        )
+    return [
+        dict(
+            constraint=constraint_by_field,
+            hooks=hooks,
+            child=[int(natives[0]["oid"]), "snapshot_schema", custody.CONTROL_ROOTS[0], 19],
+            parent=[int(natives[1]["oid"]), "snapshot_schema", custody.CONTROL_ROOTS[1], 19],
+        )
+    ], relations_by_root
+
+
+def _source_endpoint_hooks(natives):
+    return [
+        dict(
+            oid=str(101 + number),
+            tgname=f"RI_ConstraintTrigger_{101 + number}",
+            tgconstraint="81",
+            tgrelid=native["oid"],
+            tgtype=mask,
+            tgisinternal=True,
+            tgenabled="O",
+            tgfoid="901",
+        )
+        for number, (native, mask) in enumerate(((natives[0], 5), (natives[0], 17), (natives[1], 9), (natives[1], 17)))
+    ]
+
+
+def _set_source_endpoint_modes(edges, relations_by_root, mode):
+    for edge in edges:
+        if edge["constraint"]["conname"] == "provider_directory_source_endpoint_id_fkey":
+            for hook in edge["hooks"]:
+                hook["tgenabled"] = mode
+    for root in custody.CONTROL_ROOTS[:2]:
+        for hook in relations_by_root[root]["catalog"]["triggers"]:
+            if hook["tgconstraint"] == "81":
+                hook["tgenabled"] = mode
 
 
 @pytest.mark.parametrize(
@@ -483,10 +537,74 @@ def test_source_api_native_foreign_key_is_required_with_its_original_semantics(c
         case "enforced":
             edges[0]["constraint"]["conenforced"] = False
     if change is None:
-        custody._require_source_endpoint_fk(edges, relations_by_root)
+        custody._require_source_endpoint_fk(edges, relations_by_root, legacy=True)
     else:
         with pytest.raises(ValueError, match="cms_control_source_endpoint_fk"):
-            custody._require_source_endpoint_fk(edges, relations_by_root)
+            custody._require_source_endpoint_fk(edges, relations_by_root, legacy=True)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("mode", ["A", "O", "R", "D"])
+def test_source_api_fk_requires_always_after_adoption(legacy, mode):
+    edges, relations_by_root = _source_endpoint_foreign_key()
+    _set_source_endpoint_modes(edges, relations_by_root, mode)
+    if mode == "A" or legacy and mode == "O":
+        assert custody._require_source_endpoint_fk(edges, relations_by_root, legacy=legacy) is edges[0]
+    else:
+        with pytest.raises(ValueError, match="source_endpoint_fk_hooks_changed"):
+            custody._require_source_endpoint_fk(edges, relations_by_root, legacy=legacy)
+
+
+@pytest.mark.parametrize(
+    "change", ["missing", "extra", "duplicate", "external", "constraint", "relation", "event", "catalog"]
+)
+async def test_source_api_fk_transition_refuses_inexact_captured_hooks_before_sql(change):
+    edges, relations_by_root = _source_endpoint_foreign_key()
+    hooks = edges[0]["hooks"]
+    match change:
+        case "missing":
+            hooks.pop()
+        case "extra":
+            hooks.append({**hooks[0], "oid": "999"})
+        case "duplicate":
+            hooks[1]["oid"] = hooks[0]["oid"]
+        case "external":
+            hooks[0]["tgisinternal"] = False
+        case "constraint":
+            hooks[0]["tgconstraint"] = "999"
+        case "relation":
+            hooks[0]["tgrelid"] = "999"
+        case "event":
+            hooks[0]["tgtype"] = 9
+        case "catalog":
+            relations_by_root[custody.CONTROL_ROOTS[0]]["catalog"]["triggers"][0]["tgfoid"] = "999"
+    connection = SimpleNamespace(execute=AsyncMock())
+    with pytest.raises(ValueError, match="source_endpoint_fk"):
+        await custody._enable_source_endpoint_fk(
+            connection, SimpleNamespace(schema="snapshot_schema"), dict(foreign=edges, relations=relations_by_root)
+        )
+    connection.execute.assert_not_awaited()
+
+
+async def test_source_api_fk_transition_changes_only_original_hooks_and_is_replayable():
+    edges, relations_by_root = _source_endpoint_foreign_key()
+    before_by_field = dict(foreign=edges, relations=relations_by_root)
+    original = deepcopy(before_by_field)
+    connection = SimpleNamespace(execute=AsyncMock())
+    await custody._enable_source_endpoint_fk(connection, SimpleNamespace(schema="snapshot_schema"), before_by_field)
+    assert [call.args[0] for call in connection.execute.await_args_list] == [
+        f'ALTER TABLE "snapshot_schema"."{root}" ENABLE ALWAYS TRIGGER "RI_ConstraintTrigger_{number}"'
+        for root, number in zip(
+            (custody.CONTROL_ROOTS[0], custody.CONTROL_ROOTS[0], custody.CONTROL_ROOTS[1], custody.CONTROL_ROOTS[1]),
+            range(101, 105),
+            strict=True,
+        )
+    ]
+    assert before_by_field == original
+    _set_source_endpoint_modes(edges, relations_by_root, "A")
+    connection.execute.reset_mock()
+    await custody._enable_source_endpoint_fk(connection, SimpleNamespace(schema="snapshot_schema"), before_by_field)
+    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize("model", list(custody._models().values()), ids=lambda model: model.__name__)
@@ -717,14 +835,20 @@ def _control_adoption(monkeypatch, legacy=True):
         for number, parent in enumerate(parents)
     ]
     retired = _adoption_foreign_edge(74, history_fields, header_fields, "pd_uhc_flex_npi_member_cohort_fkey")
+    relations_by_root = {root: _relation(root) for root in custody.CONTROL_ROOTS}
+    endpoint = relations_by_root[custody.CONTROL_ROOTS[1]]["catalog"]
+    endpoint["classes"][0]["oid"] = "42"
+    for attribute in endpoint["attributes"]:
+        attribute["attrelid"] = "42"
+    source_edges, _ = _source_endpoint_foreign_key(relations_by_root)
     before_by_field = dict(
         schema="snapshot_schema",
         owner=17,
         builder=19,
         functions={},
         source=dict(functions={}, roles={}),
-        relations={root: _relation(root) for root in custody.CONTROL_ROOTS},
-        foreign=headers + ([retired] if legacy else []),
+        relations=relations_by_root,
+        foreign=headers + ([retired] if legacy else []) + source_edges,
         acquisition=dict(
             relations={},
             cohort=dict(
@@ -739,10 +863,12 @@ def _control_adoption(monkeypatch, legacy=True):
     after["relations"] = {
         root: _adopted_relation(root, before_by_field["relations"][root]) for root in custody.CONTROL_ROOTS
     }
-    after["foreign"] = deepcopy(headers)
+    after["foreign"] = deepcopy(headers + source_edges)
     for edge in after["foreign"]:
-        if edge["parent"][2] in custody.CONTROL_ROOTS:
-            edge["parent"][3] = 17
+        for field in ("child", "parent"):
+            if edge[field][2] in custody.CONTROL_ROOTS:
+                edge[field][3] = 17
+    _set_source_endpoint_modes(after["foreign"], after["relations"], "A")
     return before_by_field, after
 
 
@@ -750,7 +876,7 @@ def _control_adoption(monkeypatch, legacy=True):
 def test_control_adoption_preserves_header_foreign_keys(monkeypatch, legacy):
     before, after = _control_adoption(monkeypatch, legacy)
     custody.require_cms_control_adoption_delta(before, after, {})
-    assert len(after["foreign"]) == 3
+    assert len(after["foreign"]) == 4
 
 
 @pytest.mark.parametrize("change", ["removed", "oid", "parent", "columns", "hook", "action"])
@@ -778,11 +904,55 @@ def test_control_adoption_keeps_unrelated_history_foreign(monkeypatch):
     from process.provider_directory_source_cohort_custody import HISTORY
 
     before, after = _control_adoption(monkeypatch)
-    unrelated = deepcopy(before["foreign"][-1])
+    unrelated = deepcopy(
+        next(
+            edge for edge in before["foreign"] if edge["constraint"]["conname"] == "pd_uhc_flex_npi_member_cohort_fkey"
+        )
+    )
     unrelated["constraint"].update(oid="75", conname="unrelated_history_foreign")
     before["foreign"].append(unrelated)
     before["acquisition"]["cohort"]["relations"][HISTORY]["catalog"]["constraints"].append(unrelated["constraint"])
     with pytest.raises(ValueError, match="cms_control_adoption_foreign_changed"):
+        custody.require_cms_control_adoption_delta(before, after, {})
+
+
+@pytest.mark.parametrize("already_enabled", [False, True])
+def test_source_api_adoption_delta_allows_only_verified_enablement(monkeypatch, already_enabled):
+    before, after = _control_adoption(monkeypatch)
+    if already_enabled:
+        _set_source_endpoint_modes(before["foreign"], before["relations"], "A")
+    original = deepcopy(before)
+    custody.require_cms_control_adoption_delta(before, after, {})
+    assert before == original
+
+
+@pytest.mark.parametrize("change", ["mode", "oid", "function", "name", "constraint", "unrelated", "foreign"])
+def test_source_api_enablement_cannot_hide_other_hook_or_constraint_changes(monkeypatch, change):
+    before, after = _control_adoption(monkeypatch)
+    edge = next(
+        edge
+        for edge in after["foreign"]
+        if edge["constraint"]["conname"] == "provider_directory_source_endpoint_id_fkey"
+    )
+    catalog_hook = after["relations"][custody.CONTROL_ROOTS[0]]["catalog"]["triggers"][0]
+    if change in {"mode", "oid", "function", "name"}:
+        field, value = {
+            "mode": ("tgenabled", "O"),
+            "oid": ("oid", "999"),
+            "function": ("tgfoid", "999"),
+            "name": ("tgname", "replacement"),
+        }[change]
+        edge["hooks"][0][field] = catalog_hook[field] = value
+    elif change == "constraint":
+        edge["constraint"]["conindid"] = "999"
+    elif change == "unrelated":
+        hook_by_field = dict(oid="999", tgconstraint="0", tgenabled="O")
+        root = custody.CONTROL_ROOTS[0]
+        before["relations"][root]["catalog"]["triggers"].append(hook_by_field)
+        after["relations"][root]["catalog"]["triggers"].append({**hook_by_field, "tgenabled": "A"})
+    else:
+        after["foreign"][0]["hooks"][0]["tgenabled"] = "A"
+    with pytest.raises(ValueError, match="cms_control_(source_endpoint_fk|adoption)"):
         custody.require_cms_control_adoption_delta(before, after, {})
 
 

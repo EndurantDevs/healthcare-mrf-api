@@ -780,10 +780,110 @@ async def _source_guard_preimage(driver, provision, schema):
     )
 
 
+async def _stage_source_history_bound(engine, policy, provision, root_name):
+    """Prepare only fixture-owned populated heaps before the real enrollment cut."""
+    from process.provider_directory_generic_source_completion import _KEYS
+
+    root = provision.storage_relation(policy.schema, root_name)
+    async with engine.begin() as connection:
+        assert await connection.scalar(text("SELECT current_user=session_user"))
+        driver = (await connection.get_raw_connection()).driver_connection
+        await driver.execute(f"LOCK TABLE {root} IN ACCESS EXCLUSIVE MODE NOWAIT")
+        native = await driver.fetchrow(
+            "SELECT oid::bigint,relkind::text,pg_relation_size(oid)::bigint AS heap_bytes "
+            "FROM pg_class WHERE oid=to_regclass($1)",
+            root,
+        )
+        assert native is not None and native["relkind"] in {"r", "p"}
+        if native["relkind"] == "p" or native["heap_bytes"] == 0:
+            return None
+        indexes = await driver.fetch(provision._HISTORY_INDEX_SQL, native["oid"])
+        provision._history_primary_index(indexes, _KEYS[root_name])
+        keys = await provision._history_dataset_keys(driver, root, indexes)
+        await driver.execute(
+            f"ALTER TABLE {root} ADD CONSTRAINT {provision.storage_identifier(provision._HISTORY_BOUND)} "
+            f"CHECK ({provision._history_bound_expression(keys)}) NOT VALID"
+        )
+        return native["oid"]
+
+
+async def _prepare_source_history_bounds(engine, policy, provision):
+    """Validate the genuine native bound in a separate committed fixture phase."""
+    for root_name in (provision.WITNESS, provision.RELATIONSHIP):
+        oid = await _stage_source_history_bound(engine, policy, provision, root_name)
+        if oid is None:
+            continue
+        root = provision.storage_relation(policy.schema, root_name)
+        async with engine.begin() as connection:
+            assert await connection.scalar(text("SELECT current_user=session_user"))
+            driver = (await connection.get_raw_connection()).driver_connection
+            assert await driver.fetchval("SELECT to_regclass($1)::oid::bigint", root) == oid
+            await driver.execute(
+                f"ALTER TABLE {root} VALIDATE CONSTRAINT {provision.storage_identifier(provision._HISTORY_BOUND)}"
+            )
+            assert await driver.fetchval(
+                "SELECT convalidated AND conenforced FROM pg_constraint WHERE conrelid=$1 AND conname=$2",
+                oid,
+                provision._HISTORY_BOUND,
+            )
+
+
+async def _fixture_source_alias_snapshot(driver, policy, custody):
+    """Read the original native FK and both catalog representations without synthesizing fields."""
+    owner, builder = await driver.fetchrow(
+        "SELECT to_regrole($1)::oid::bigint,to_regrole($2)::oid::bigint",
+        policy.owner_role,
+        policy.control_runtime_roles[0],
+    )
+    relations_by_root = {
+        root: {
+            "catalog": custody._decoded(
+                await driver.fetchval(
+                    custody._CATALOG_SQL, custody.storage_relation(policy.schema, root), owner, builder
+                )
+            )
+        }
+        for root in custody.CONTROL_ROOTS[:2]
+    }
+    oids = [
+        int(next(native["oid"] for native in entry["catalog"]["classes"] if native["relname"] == root))
+        for root, entry in relations_by_root.items()
+    ]
+    foreign_edges = [
+        {field: custody._decoded(native[field]) for field in native.keys()}
+        for native in await driver.fetch(custody._FOREIGN_SQL, oids)
+    ]
+    return {"relations": relations_by_root, "foreign": foreign_edges}
+
+
+async def _provision_fixture_source_alias_fence(driver, policy):
+    """Bring partial component setup to the real alias prerequisite; issue no manifest or full custody claim."""
+    from process import provider_directory_cms_control_custody as custody
+
+    actor = await driver.fetchrow(
+        "SELECT session_user::text AS session,current_user::text AS current,"
+        "(SELECT rolsuper FROM pg_roles WHERE rolname=current_user) AS admin"
+    )
+    assert actor["session"] == actor["current"] and actor["admin"]
+    assert actor["current"] not in (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
+    before = await _fixture_source_alias_snapshot(driver, policy, custody)
+    previous = custody._require_source_endpoint_fk(before["foreign"], before["relations"], legacy=True)
+    await custody._enable_source_endpoint_fk(driver, policy, before)
+    after = await _fixture_source_alias_snapshot(driver, policy, custody)
+    current = custody._require_source_endpoint_fk(after["foreign"], after["relations"])
+    assert current["constraint"] == previous["constraint"]
+    assert [hook["oid"] for hook in current["hooks"]] == [hook["oid"] for hook in previous["hooks"]]
+    assert [{field: value for field, value in hook.items() if field != "tgenabled"} for hook in current["hooks"]] == [
+        {field: value for field, value in hook.items() if field != "tgenabled"} for hook in previous["hooks"]
+    ]
+    assert await driver.fetchval("SELECT current_user=session_user AND current_user=$1", actor["current"])
+
+
 async def provision_source_component(engine, policy):
     """Real native writer/legacy custody callbacks, without an enrolled-manifest claim."""
     from process import provider_directory_generic_source_provision as provision
 
+    await _prepare_source_history_bounds(engine, policy, provision)
     async with async_sessionmaker(engine)() as session, session.begin():
         await session.execute(text("SELECT current_user=session_user"))
         driver = await _copy_driver(session)
@@ -805,13 +905,15 @@ async def provision_source_component(engine, policy):
                 list(policy.runtime_roles),
             )
 
-        return await provision.provision_generic_source_storage(
+        family = await provision.provision_generic_source_storage(
             driver,
             policy,
             verify_role_profile=verify_native_source_profile,
             verify_writer_closure=writers,
             verify_legacy_guards=legacy,
         )
+        await _provision_fixture_source_alias_fence(driver, policy)
+        return family
 
 
 @asynccontextmanager
