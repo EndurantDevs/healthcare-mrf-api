@@ -12,6 +12,7 @@ from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from api import network_read_execution
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
 from db.connection import current_session
@@ -258,16 +259,40 @@ async def test_legacy_education_without_native_ledger_remains_available(monkeypa
         assert profile["categories"]["education"]["items"]
 
 
-async def test_optional_status_failure_rolls_back_only_its_savepoint(monkeypatch):
+@pytest.mark.parametrize("use_request_session", [False, True])
+@pytest.mark.parametrize("fail_closed", [False, True])
+async def test_optional_status_failure_rolls_back_only_its_savepoint(monkeypatch, use_request_session, fail_closed):
     async with snapshot_database(monkeypatch, populated=False) as (database, schema):
         async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
-            status = await npi._fetch_location_status_by_record_id(
+            transaction = session.get_transaction()
+            driver, pid = await snapshot._original_read_driver(session)
+            read_snapshot = await driver.fetchval("SELECT pg_catalog.pg_current_snapshot()::text")
+            inventories = network_read_execution._NAME_INVENTORIES.get()
+            assert inventories and database.has_reader_session() and current_session() is session
+            assert await driver.fetchval(
+                "SELECT current_user=session_user AND current_user::text=$1", database._reader_database._reader_login[0]
+            )
+
+            lookup = npi._fetch_location_status_by_record_id(
                 ["provider_directory_fhir:practitioner_role:example:role:location"],
                 session=session,
-                use_request_session=True,
+                use_request_session=use_request_session,
+                fail_closed=fail_closed,
             )
-            assert status == {}
-            assert await database.scalar("SELECT 1") == 1
+            if fail_closed:
+                with pytest.raises(DBAPIError) as caught:
+                    await lookup
+                assert snapshot.postgres_sqlstate(caught.value) == "42P01"
+            else:
+                assert await lookup == {}
+
+            assert database.has_reader_session() and current_session() is session
+            assert session.get_transaction() is transaction and transaction.is_active
+            assert session.get_nested_transaction() is None
+            assert await snapshot._original_read_driver(session) == (driver, pid)
+            assert network_read_execution._NAME_INVENTORIES.get() is inventories
+            assert await driver.fetchval("SELECT pg_catalog.pg_current_snapshot()::text") == read_snapshot
+            assert (await snapshot.execute_network_read(session, "SELECT 1")).scalar_one() == 1
 
 
 def _detail_loaders(database, schema):
