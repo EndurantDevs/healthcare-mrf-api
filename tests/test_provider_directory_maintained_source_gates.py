@@ -24,7 +24,9 @@ def _observation_payload_by_kind():
             "source_id": maintained_source["source_id"],
         }
         dataset_id = f"pdds-{maintained_source['entry_id']}"
-        acquisition_list.append({**identity_by_field, "dataset_id": dataset_id, "is_current": True, "terminal_state": "succeeded"})
+        acquisition_list.append(
+            {**identity_by_field, "dataset_id": dataset_id, "is_current": True, "terminal_state": "succeeded"}
+        )
         artifact_list.append({**identity_by_field, "dataset_id": dataset_id, "mapped_artifact_count": 1})
         unified_list.append(
             {
@@ -35,8 +37,12 @@ def _observation_payload_by_kind():
                 "geo_evidence_count": 1,
             }
         )
-        api_list.append({**identity_by_field, "dataset_id": dataset_id, "profile_status": "ready", "evidence_status": "ready"})
-        latency_list.append({**identity_by_field, "dataset_id": dataset_id, "search_latency_ms": 40.0, "detail_latency_ms": 40.0})
+        api_list.append(
+            {**identity_by_field, "dataset_id": dataset_id, "profile_status": "ready", "evidence_status": "ready"}
+        )
+        latency_list.append(
+            {**identity_by_field, "dataset_id": dataset_id, "search_latency_ms": 40.0, "detail_latency_ms": 40.0}
+        )
     return {
         "acquisition": acquisition_list,
         "artifacts": artifact_list,
@@ -75,16 +81,16 @@ def _write_observations(tmp_path, observation_payload_by_kind):
     return path_by_label
 
 
-def test_all_28_maintained_sources_can_produce_ready_rows_and_table():
+def test_all_maintained_sources_can_produce_ready_rows_and_table():
     report = _report(_observation_payload_by_kind())
 
-    assert report["maintained_source_count"] == 28
+    assert report["maintained_source_count"] == 29
     assert report["ready"] is True
-    assert len(report["sources"]) == 28
+    assert len(report["sources"]) == 29
     assert next(row for row in report["sources"] if row["entry_id"] == "cms-npd")["source_id"] == "cms-npd"
     assert {row["status"] for row in report["sources"]} == {"ready"}
     table = gates.format_table(report)
-    assert table.count("\n") == 29
+    assert table.count("\n") == 30
     assert "aetna-commercial-medicare" in table
     assert "current_terminal_acquisition" not in table
 
@@ -163,17 +169,25 @@ def test_exact_40ms_latency_boundary_is_ready():
 
 def test_cli_strict_mode_fails_for_active_aetna_and_emits_deterministic_json(tmp_path, capsys):
     observation_payload_by_kind = _observation_payload_by_kind()
-    _observation_by_entry_by_kind(observation_payload_by_kind)["acquisition"]["aetna-commercial-medicare"]["terminal_state"] = "active"
+    _observation_by_entry_by_kind(observation_payload_by_kind)["acquisition"]["aetna-commercial-medicare"][
+        "terminal_state"
+    ] = "active"
     path_by_label = _write_observations(tmp_path, observation_payload_by_kind)
 
     exit_code = gates.run_gate(
         [
-            "--acquisition-observations", str(path_by_label["acquisition"]),
-            "--artifact-observations", str(path_by_label["artifacts"]),
-            "--unified-observations", str(path_by_label["unified"]),
-            "--api-observations", str(path_by_label["api"]),
-            "--latency-observations", str(path_by_label["latency"]),
-            "--format", "json",
+            "--acquisition-observations",
+            str(path_by_label["acquisition"]),
+            "--artifact-observations",
+            str(path_by_label["artifacts"]),
+            "--unified-observations",
+            str(path_by_label["unified"]),
+            "--api-observations",
+            str(path_by_label["api"]),
+            "--latency-observations",
+            str(path_by_label["latency"]),
+            "--format",
+            "json",
             "--strict",
         ]
     )

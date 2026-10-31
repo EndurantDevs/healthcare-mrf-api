@@ -283,6 +283,13 @@
       "access_verification": "not_recorded",
       "checked_at": null,
       "proof_state": "not_recorded"
+    },
+    "christus-health-plan": {
+      "terminal_status": null,
+      "run_id": null,
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "proof_state": "not_recorded"
     }
   }
 }
