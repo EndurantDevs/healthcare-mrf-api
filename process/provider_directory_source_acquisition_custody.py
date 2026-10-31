@@ -252,7 +252,11 @@ def _require_migration_plans(plans, roots):
     _require(set(plans) == set(METADATA_ROOTS), "migration_plan_missing")
     rooted = plans[METADATA_ROOTS[1]]
     _require(rooted == [{"singleton": True, "complete": True}], "rooted_migration_incomplete")
-    practitioner = plans[METADATA_ROOTS[0]]
+    _require_practitioner_migration_plan(plans[METADATA_ROOTS[0]], roots)
+
+
+def _require_practitioner_migration_plan(practitioner, roots):
+    """Bind the unchanged practitioner singleton to its five original/current OIDs."""
     expected_plan_by_field = dict(
         singleton=True,
         acquisition_oid=roots[ACQUISITION_ROOTS[2]]["oid"],

@@ -575,7 +575,9 @@ SELECT t.oid AS trigger_oid,t.tgconstraint AS constraint_oid,t.tgname,p.prosrc,
  AND p.proargmodes IS NULL AND p.proargnames IS NULL AND NOT p.proretset
  AND p.prokind='f' AND p.prorettype='pg_catalog.trigger'::regtype AND NOT p.prosecdef
  AND NOT p.proisstrict AND NOT p.proleakproof AND p.prosupport=0
- AND p.provolatile='v' AND p.proparallel='u' AND p.proconfig=ARRAY['search_path=pg_catalog']::text[]
+ AND p.provolatile='v' AND p.proparallel='u'
+ AND (p.proconfig=ARRAY['search_path=pg_catalog']::text[]
+      OR p.proconfig=ARRAY['search_path=pg_catalog, pg_temp']::text[])
  AND language.lanname='plpgsql'
  AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_roles principal WHERE {ordinary}
      AND pg_catalog.pg_has_role(principal.oid,p.proowner,'MEMBER'))

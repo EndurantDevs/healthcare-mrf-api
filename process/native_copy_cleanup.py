@@ -27,13 +27,19 @@ async def native_model_copy_driver(session, methods, require_transaction, error_
 
 async def close_interrupted_copy(driver):
     """Drain cancellation on the exact transport, with a bounded abort fallback."""
+    # asyncpg can mark its driver closed before aborting the original socket.
+    transport = getattr(driver, "_transport", None)
     try:
         await drain_operation(
             asyncio.wait_for(driver.close(timeout=_COPY_CLOSE_TIMEOUT_SECONDS), _COPY_CLOSE_TIMEOUT_SECONDS),
             preserve_cancellation=False,
         )
     except Exception, asyncio.CancelledError:
-        driver.terminate()
+        try:
+            driver.terminate()
+        finally:
+            if transport is not None:
+                transport.abort()
 
 
 async def invalidate_copy_owner(session, driver):

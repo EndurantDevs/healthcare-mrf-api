@@ -8,6 +8,7 @@ from process.provider_directory_generic_source_release_checks import (
     _HOOKS,
     _LEGACY_FUNCTIONS,
     _payload_hooks,
+    _require_allocator_guard_acl,
     _require_hook,
     _require_native_function,
 )
@@ -20,6 +21,14 @@ from process.provider_directory_terminal_root_retirement_contract import (
 
 _ROOTS = TABLES[:5]
 _NAMES = ("guard_pd_dataset_candidate_parent", "deny_pd_dataset_candidate_write")
+_ALLOCATOR = "prepare_pd_generic_dataset_storage"
+_NAMESPACE_SQL = """SELECT n.oid::bigint AS oid,n.nspowner::bigint AS owner,
+ NOT (owner.rolcanlogin OR owner.rolsuper OR owner.rolcreatedb OR owner.rolcreaterole
+ OR owner.rolreplication OR owner.rolbypassrls) AND NOT EXISTS(
+ SELECT FROM pg_catalog.pg_roles elevated WHERE
+ (elevated.rolsuper OR elevated.rolcreatedb OR elevated.rolcreaterole OR elevated.rolreplication OR elevated.rolbypassrls)
+ AND pg_catalog.pg_has_role(owner.oid,elevated.oid,'MEMBER')) AS protected
+ FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles owner ON owner.oid=n.nspowner WHERE n.nspname=:schema"""
 _FAMILY = """WITH RECURSIVE family(oid,root) AS (
  SELECT to_regclass(relation)::oid,root FROM jsonb_to_recordset(CAST(:roots AS jsonb)) r(relation text,root text)
  UNION ALL SELECT i.inhrelid,f.root FROM pg_inherits i JOIN family f ON i.inhparent=f.oid)
@@ -47,21 +56,38 @@ def _require(condition):
 
 
 async def _native_functions(database, schema, owners):
-    signatures = [quoted_relation(name) + "()" for name in _NAMES]
+    signatures = [quoted_relation(name) + "()" for name in (*_NAMES, _ALLOCATOR)]
     query = _FUNCTIONS.replace("$1::text[]", "CAST(:signatures AS text[])")
     query = query.replace("$2", ":schema").replace("$3::text[]", "CAST(:names AS text[])")
-    function_rows = await database.all(query, signatures=signatures, schema=schema, names=list(_NAMES))
-    _require(len(function_rows) == len(signatures))
-    namespace = await database.scalar("SELECT to_regnamespace(:schema)::oid::bigint", schema=schema)
-    definition_by_oid = {}
+    function_rows = await database.all(query, signatures=signatures, schema=schema, names=[*_NAMES, _ALLOCATOR])
+    rows_by_signature = {}
     for raw in function_rows:
-        row = row_mapping(raw)
-        _require(row["signature"] in signatures)
-        definition = _decoded(row["definition"])
+        function_record = row_mapping(raw)
+        _require(function_record["signature"] in signatures and function_record["signature"] not in rows_by_signature)
+        rows_by_signature[function_record["signature"]] = function_record
+    _require(set(signatures[:2]) <= rows_by_signature.keys())
+    namespace = row_mapping(await database.first(_NAMESPACE_SQL, schema=schema))
+    _require(bool(namespace))
+    definition_by_oid = {}
+    for signature in signatures[:2]:
+        function_record = rows_by_signature[signature]
+        definition = _decoded(function_record["definition"])
         signature = definition["proname"] + "()"
-        _require_native_function(definition, _LEGACY_FUNCTIONS[signature], row["language"], schema, namespace, owners)
+        _require_native_function(
+            definition, _LEGACY_FUNCTIONS[signature], function_record["language"], schema, namespace["oid"], owners
+        )
         owner = int(definition["proowner"])
-        _require(_decoded(row["acl"]) == [[owner, owner, "EXECUTE", False]])
+        if definition["proname"] == "guard_pd_dataset_candidate_parent":
+            _require_allocator_guard_acl(
+                function_record,
+                rows_by_signature.get(signatures[2]),
+                schema,
+                namespace["oid"],
+                owners,
+                namespace["owner"] if namespace["protected"] else None,
+            )
+        else:
+            _require(_decoded(function_record["acl"]) == [[owner, owner, "EXECUTE", False]])
         definition_by_oid[int(definition["oid"])] = definition
     return definition_by_oid
 

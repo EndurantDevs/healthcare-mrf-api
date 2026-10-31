@@ -147,9 +147,12 @@ def _plans():
 def test_practitioner_plan_requires_each_original_or_current_oid(field):
     plans, roots = _plans()
     custody._require_migration_plans(plans, roots)
+    custody._require_practitioner_migration_plan(plans[custody.METADATA_ROOTS[0]], roots)
     plans[custody.METADATA_ROOTS[0]][0][field] += 1
     with pytest.raises(ValueError, match="practitioner_migration_changed"):
         custody._require_migration_plans(plans, roots)
+    with pytest.raises(ValueError, match="practitioner_migration_changed"):
+        custody._require_practitioner_migration_plan(plans[custody.METADATA_ROOTS[0]], roots)
 
 
 @pytest.mark.parametrize("plan", custody.METADATA_ROOTS)

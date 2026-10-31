@@ -54,6 +54,7 @@ from process.provider_directory_admission_seal import (
     validate_generic_admission_copy,
 )
 from process.provider_directory_admission_stream import _copy_field_reader
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_dataset_rehydrate_pin import _same_database
 from process.provider_directory_fhir_subset_canonical import canonical_payload_sha256
 from process.provider_directory_resource_hash import (
@@ -483,7 +484,7 @@ async def _origin_guard(reader, origin):
         guard
         and guard["guards"] == 4
         and guard["prosecdef"]
-        and guard["proconfig"] == ["search_path=pg_catalog"]
+        and guard["proconfig"] in approved_cms_routine_settings(["search_path=pg_catalog"])
         and guard["lanname"] == "plpgsql"
         and guard["provolatile"] == "v"
     )
@@ -542,7 +543,11 @@ async def _candidate_parent_proof(reader, origin):
     observed = (await session.execute(guards._COPY_GUARD_SNAPSHOT, {"signature": signature})).one_or_none()
     require(
         observed is not None
-        and observed["body"] == guards._canonical_copy_guard_bodies(origin.schema_name, origin.preparation_schema)[1]
+        and observed["body"]
+        in (
+            guards._canonical_copy_guard_bodies(origin.schema_name, origin.preparation_schema)[1],
+            guards._cms_canonical_copy_guard_body(origin.schema_name, origin.preparation_schema),
+        )
     )
     preparation_oid = await reader.fetchval(
         "SELECT c.oid::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "

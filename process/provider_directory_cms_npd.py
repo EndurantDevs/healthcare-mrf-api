@@ -12,6 +12,7 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import stat
 import tempfile
 import time
 from collections import deque
@@ -49,6 +50,20 @@ _NETWORK_ROLE_SQL = (
 )
 
 
+def _is_isolated_intake():
+    from process import provider_directory_generic_source_policy as source_policy
+
+    factory = source_policy._FACTORY.get()
+    if getattr(factory, "storage_binding", None) is None:
+        return False
+    # Protocol selection grants no IO; each operation still binds its original publisher.
+    current = getattr(factory, "_require_current_policy", None)
+    if not callable(current):
+        raise RuntimeError("cms_npd_isolated_factory_required")
+    current()
+    return True
+
+
 def durable_artifact_root() -> Path:
     """Require configured durable storage before any download begins."""
 
@@ -78,7 +93,30 @@ def durable_artifact_root() -> Path:
             raise ValueError("cms_npd_artifact_root_unsafe")
     except OSError as error:
         raise ValueError("cms_npd_artifact_root_unavailable") from error
+    if _is_isolated_intake():
+        return _worker_artifact_root(root)
     return root
+
+
+def _worker_artifact_root(root: Path) -> Path:
+    """Acquire new private bytes without opening another actor's retained releases."""
+    directory = root / "cms-source-worker"
+    try:
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            observed = directory.lstat()
+        else:
+            observed = directory.lstat()
+    except OSError as error:
+        raise ValueError("cms_npd_worker_artifact_root_unavailable") from error
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != os.geteuid()
+        or stat.S_IMODE(observed.st_mode) & 0o777 != 0o700
+    ):
+        raise ValueError("cms_npd_worker_artifact_root_unsafe")
+    return directory
 
 
 def validate_task(task: dict[str, Any], run_id: str | None) -> None:
@@ -309,7 +347,7 @@ async def _candidate(
     )
     state = await fhir._endpoint_dataset_state(dataset_id)
     if state:
-        if await recovery.is_disposed(fhir, dataset_id):
+        if not _is_isolated_intake() and await recovery.is_disposed(fhir, dataset_id):
             raise RuntimeError("cms_npd_candidate_disposed")
         root_run_id = _existing_candidate_root(fhir, state, endpoint_id, identity)
     else:
@@ -448,6 +486,7 @@ async def _dispose_changed_release(fhir, candidate, identity, error):
 
     if (
         not candidate.already_published
+        and not _is_isolated_intake()
         and str(error)
         in {"cms_npd_retained_file_missing", "cms_npd_source_vector_changed", "cms_npd_retained_receipt_changed"}
         and (not is_source_storage_required() or source_transaction_available() is None)
@@ -1471,6 +1510,12 @@ def _source_stage_workers(fhir):
 
 async def _stage_and_validate_candidate(fhir, directory, candidate, identity, receipt_by_field, ctx, task):
     """Retain bounded resources and verify their counts, witnesses, and resolved evidence."""
+    if _is_isolated_intake() and (candidate.already_validated or candidate.already_published):
+        from process.provider_directory_generic_source_completion import record_candidate_handoff
+
+        handoff_by_field = {}
+        await record_candidate_handoff(fhir, candidate, handoff_by_field)
+        return {"validated": True, "source_candidate_handoff": handoff_by_field[candidate.dataset_id]}
     if not candidate.already_validated and not candidate.already_published:
         files = iter(source.RESOURCE_FILES)
         executor = _stage_executor()
@@ -1512,6 +1557,66 @@ async def _stage_and_validate_candidate(fhir, directory, candidate, identity, re
         raise
 
 
+async def _select_acquired_candidate(fhir, endpoint_id, run_id, identity, task, is_isolated):
+    """Keep exact recovery exclusions and legacy cleanup before candidate staging."""
+    if is_isolated:
+        if any(
+            task.get(key) is not None
+            for key in (
+                "cms_npd_retained_operation",
+                "cms_npd_rollback_vector_sha256",
+                "cms_npd_rollback_root_run_id",
+                "provider_directory_repair_id",
+            )
+        ):
+            raise RuntimeError("cms_npd_isolated_recovery_unsupported")
+        candidate = await _candidate(fhir, endpoint_id, run_id, identity)
+    else:
+        repair_selection = await recovery.repaired_candidate_selection(fhir, endpoint_id, identity, task, run_id)
+    if task.get("cms_npd_retained_operation") or task.get("provider_directory_repair_id") is not None:
+        await _register_source(fhir)
+    if not is_isolated:
+        await recovery.resume_pending_cleanup(fhir, endpoint_id)
+        await recovery.dispose_prior_vectors(fhir, endpoint_id, identity["vector_sha256"])
+        candidate = await _admission_candidate(fhir, endpoint_id, run_id, identity, task, repair_selection)
+    return candidate
+
+
+def _isolated_candidate_result(candidate, identity, finalization):
+    """Require the exact detached handoff before returning pending CMS finalization."""
+    from process.provider_directory_generic_source_storage import (
+        CMS_ISOLATED_CONTRACT,
+        validate_handoff_document,
+    )
+
+    handoff = finalization.get("source_candidate_handoff")
+    if type(handoff) is not dict or set(handoff) != {"document", "sha256"}:
+        raise RuntimeError("cms_npd_isolated_handoff_required")
+    document = handoff["document"]
+    validate_handoff_document(document, document.get("storage"))
+    if (
+        document["contract"] != CMS_ISOLATED_CONTRACT
+        or document["identity"]["dataset_id"] != candidate.dataset_id
+        or document["identity"]["metadata"]["source_release"] != identity
+        or hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+        ).hexdigest()
+        != handoff["sha256"]
+    ):
+        raise RuntimeError("cms_npd_isolated_handoff_changed")
+    return {
+        "source_id": SOURCE_ID,
+        "dataset_id": candidate.dataset_id,
+        "vector_sha256": identity["vector_sha256"],
+        "resource_count": document["admission"]["resource_count"],
+        "status": "validated",
+        "replayed": candidate.already_validated,
+        "cms_finalization": "pending",
+        "source_candidate_handoffs": {candidate.dataset_id: handoff},
+        "tax_candidates": {"status": "pending", "retryable": True, "retry_via": "same_byte_import"},
+    }
+
+
 async def _stage_acquired(
     ctx: dict[str, Any],
     task: dict[str, Any],
@@ -1532,15 +1637,13 @@ async def _stage_acquired(
     _observe_intake(ctx, phase="release_validation")
     await _verify_release(directory, receipt_by_field, client, task)
     _observe_intake(ctx, phase="candidate_setup")
-    repair_selection = await recovery.repaired_candidate_selection(fhir, endpoint_id, identity, task, run_id)
-    if task.get("cms_npd_retained_operation") or task.get("provider_directory_repair_id") is not None:
-        await _register_source(fhir)
-    await recovery.resume_pending_cleanup(fhir, endpoint_id)
-    await recovery.dispose_prior_vectors(fhir, endpoint_id, identity["vector_sha256"])
-    candidate = await _admission_candidate(fhir, endpoint_id, run_id, identity, task, repair_selection)
+    is_isolated = _is_isolated_intake()
+    candidate = await _select_acquired_candidate(fhir, endpoint_id, run_id, identity, task, is_isolated)
     finalization = await _stage_and_validate_candidate(
         fhir, directory, candidate, identity, receipt_by_field, ctx, task
     )
+    if is_isolated:
+        return _isolated_candidate_result(candidate, identity, finalization)
     registry_admission = await _registry_source_admission(fhir, candidate, finalization)
     _observe_intake(ctx, phase="coverage")
     state, serving_candidate = await _prepare_serving_candidate(
@@ -1741,7 +1844,7 @@ async def _run_upstream_check(ctx: dict[str, Any], task: dict[str, Any], run_id:
             vector_sha256=observed.vector_sha256,
             outcome="acquisition_required",
         )
-        current = await _current_observed_publication(observed)
+        current = None if _is_isolated_intake() else await _current_observed_publication(observed)
         has_tax_followup = importlib.util.find_spec("process.cms_npd_tax_candidate_followup") is not None
         tax_status_by_field = (
             await _completed_tax_candidate_status(observed, current, root)
@@ -1819,9 +1922,10 @@ async def _validate_staged_source_snapshot(fhir, directory, candidate, identity,
     _observe_intake(ctx, phase="witness_validation")
     await _assert_witness_counts(fhir, candidate, identity)
     _observe_intake(ctx, phase="identity")
-    await _materialize_identity_evidence(fhir, directory, candidate, identity, ctx, task)
-    _observe_intake(ctx, phase="relationships")
-    await relationships.materialize(fhir, candidate, identity["vector_sha256"], ctx, task)
+    if not _is_isolated_intake():
+        await _materialize_identity_evidence(fhir, directory, candidate, identity, ctx, task)
+        _observe_intake(ctx, phase="relationships")
+        await relationships.materialize(fhir, candidate, identity["vector_sha256"], ctx, task)
     _observe_intake(ctx, phase="release_validation")
     await _verify_or_dispose(fhir, candidate, identity, directory, receipt_by_field, None, task)
     _observe_intake(ctx, phase="candidate_validation")

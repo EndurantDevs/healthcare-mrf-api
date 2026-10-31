@@ -57,6 +57,60 @@ async def _stage(monkeypatch, directory):
     return candidate, cms.release_identity(receipt)["vector_sha256"], state["dataset_hash"]
 
 
+@pytest.mark.asyncio
+async def test_prepared_coverage_body_keeps_original_native_transaction_and_atomic_rollback(
+    monkeypatch, cms_artifact_root
+):
+    """Exercise existing native coverage rules without a SOURCE binding or pointer write."""
+    async with support.intake_admission_database(monkeypatch) as database:
+        candidate, release_id, dataset_hash = await _stage(monkeypatch, cms_artifact_root)
+        ambient = (source_policy._FACTORY.get(), source_policy._PUBLISHER.get(), source_policy._OWNER.get())
+
+        class Rollback(Exception):
+            pass
+
+        with pytest.raises(Rollback):
+            async with database.session() as session, session.begin():
+                before = await session.scalar(text("SELECT pg_current_xact_id()::text"))
+                await coverage.prepare_cms_candidate_coverage_in_session(session, candidate, release_id, dataset_hash)
+                assert await session.scalar(text("SELECT pg_current_xact_id()::text")) == before
+                assert (
+                    source_policy._FACTORY.get(),
+                    source_policy._PUBLISHER.get(),
+                    source_policy._OWNER.get(),
+                ) == ambient
+                raise Rollback
+        async with database.session() as session, session.begin():
+            assert await session.scalar(text("SELECT count(*) FROM mrf.provider_directory_cms_candidate_coverage")) == 0
+            proof = await coverage.prepare_cms_candidate_coverage_in_session(
+                session, candidate, release_id, dataset_hash
+            )
+            created = await session.scalar(text("SELECT created_at FROM mrf.provider_directory_cms_candidate_coverage"))
+        async with database.session() as session, session.begin():
+            assert (
+                await coverage.prepare_cms_candidate_coverage_in_session(session, candidate, release_id, dataset_hash)
+                == proof
+            )
+            assert (
+                await session.scalar(text("SELECT created_at FROM mrf.provider_directory_cms_candidate_coverage"))
+                == created
+            )
+            assert (
+                await session.scalar(
+                    text("SELECT count(*) FROM mrf.provider_directory_endpoint_dataset WHERE is_current")
+                )
+                == 0
+            )
+            assert (
+                await session.scalar(
+                    text("SELECT status FROM mrf.provider_directory_endpoint_dataset WHERE dataset_id=:dataset"),
+                    {"dataset": candidate.dataset_id},
+                )
+                == "validated"
+            )
+        assert (source_policy._FACTORY.get(), source_policy._PUBLISHER.get(), source_policy._OWNER.get()) == ambient
+
+
 def _include_candidate_migration(monkeypatch):
     prefix = "20260930090000"
     if prefix not in support.MIGRATION_PREFIXES:

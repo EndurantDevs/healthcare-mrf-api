@@ -273,10 +273,19 @@ async def test_coverage_seal_requires_the_exact_published_dataset_row_before_rec
 
 @pytest.mark.parametrize("failure", ["no-transaction", "release-busy"])
 async def test_complete_candidate_coverage_checks_require_owner_transaction_and_release_authority(monkeypatch, failure):
+    from contextlib import asynccontextmanager
+
     monkeypatch.setattr(publication.coverage, "_schema_name", lambda: '"synthetic"')
     session = SimpleNamespace(
         in_transaction=lambda: failure != "no-transaction", execute=AsyncMock(), scalar=AsyncMock(return_value=False)
     )
+
+    @asynccontextmanager
+    async def query_scope(actual):
+        assert actual is session
+        yield
+
+    monkeypatch.setattr(publication.coverage, "_coverage_query_scope", query_scope)
     if failure == "no-transaction":
         with pytest.raises(ValueError, match="coverage_requires_transaction"):
             await publication.coverage.validate_cms_candidate_coverage(session, "synthetic-dataset", "a" * 64)

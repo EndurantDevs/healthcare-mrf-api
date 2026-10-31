@@ -12,14 +12,17 @@ from api.provider_directory_medical_groups import _schema_name
 
 _TABLE = "provider_directory_cms_serving_coverage"
 _PROOF_VERSION = 2
-_PROOF_TABLES = (
+_DATASET_PROOF_TABLES = (
     "provider_directory_dataset_resource",
+    "provider_directory_cms_npd_relationship",
+)
+_PROOF_TABLES = (
+    *_DATASET_PROOF_TABLES,
     "provider_directory_entity_source_binding",
     "provider_directory_entity_release_evidence",
     "provider_directory_insurance_network_source_binding",
     "provider_directory_insurance_network_plan_evidence",
     "provider_directory_resource_identity",
-    "provider_directory_cms_npd_relationship",
 )
 
 
@@ -39,12 +42,50 @@ async def require_cms_coverage(session, schema, generation):
         raise DirectoryReadError(503)
 
 
-async def _lock_cms_proof_inputs(session, schema):
+@asynccontextmanager
+async def _coverage_query_scope(session):
+    """Keep proof plans scoped and preserve stricter caller limits and outer locks."""
+    async with session.begin_nested():
+        settings_by_name = dict(
+            (
+                await session.execute(
+                    text(
+                        "SELECT current_setting('statement_timeout') AS statement_timeout,"
+                        "current_setting('lock_timeout') AS lock_timeout,"
+                        "current_setting('plan_cache_mode') AS plan_cache_mode"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        for name, bound in (("lock_timeout", "250ms"), ("statement_timeout", "15min")):
+            await session.execute(
+                text(
+                    "SELECT set_config(:name,CASE WHEN current_setting(:name)::interval=interval '0' "
+                    "OR current_setting(:name)::interval>CAST(CAST(:bound AS text) AS interval) "
+                    "THEN CAST(:bound AS text) ELSE current_setting(:name) END,true)"
+                ),
+                {"name": name, "bound": bound},
+            )
+        await session.execute(text("SET LOCAL plan_cache_mode='force_custom_plan'"))
+        yield
+        for name, setting in settings_by_name.items():
+            await session.execute(text("SELECT set_config(:name,:setting,true)"), {"name": name, "setting": setting})
+
+
+async def _lock_cms_proof_inputs(session, schema, dataset_id):
     # Validated dataset rows and sealed source facts are immutable; the release
     # advisory lock serializes the only mutable witness. Keep TRUNCATE/DDL out
     # without blocking writers for other sources during the full scan.
-    tables = ", ".join(f"{schema}.{name}" for name in _PROOF_TABLES)
-    await session.execute(text(f"LOCK TABLE {tables} IN ACCESS SHARE MODE"))
+    tables = ", ".join(f"ONLY {schema}.{name}" for name in sorted(_PROOF_TABLES))
+    await session.execute(text(f"LOCK TABLE {tables} IN ACCESS SHARE MODE NOWAIT"))
+    for root in _DATASET_PROOF_TABLES:
+        # The scope forces custom plans so bound dataset values prune siblings.
+        await session.execute(
+            text(f"SELECT dataset_id FROM {schema}.{root} WHERE dataset_id=:dataset_id LIMIT 0"),
+            {"dataset_id": dataset_id},
+        )
 
 
 async def validate_cms_candidate_coverage(session, dataset_id, release_id):
@@ -54,17 +95,16 @@ async def validate_cms_candidate_coverage(session, dataset_id, release_id):
         raise ValueError("cms_serving_coverage_requires_transaction")
     schema = _schema_name()
     generation_by_field = {"dataset_id": dataset_id, "release_id": release_id}
-    await session.execute(text("SET LOCAL statement_timeout = '15min'"))
-    await session.execute(text("SET LOCAL lock_timeout = '5s'"))
-    await _lock_cms_proof_inputs(session, schema)
-    locked = await session.scalar(
-        text("SELECT pg_try_advisory_xact_lock(hashtext('cms-npd'), hashtext(:release_id))"),
-        {"release_id": release_id},
-    )
-    if not locked:
-        raise DirectoryReadError(503)
-    for kind in KINDS:
-        await require_cms_bindings(session, schema, generation_by_field, kind)
+    async with _coverage_query_scope(session):
+        await _lock_cms_proof_inputs(session, schema, dataset_id)
+        locked = await session.scalar(
+            text("SELECT pg_try_advisory_xact_lock(hashtext('cms-npd'), hashtext(:release_id))"),
+            {"release_id": release_id},
+        )
+        if not locked:
+            raise DirectoryReadError(503)
+        for kind in KINDS:
+            await require_cms_bindings(session, schema, generation_by_field, kind)
 
 
 async def seal_cms_candidate_coverage(fhir, candidate, release_id, dataset_hash):
@@ -134,13 +174,11 @@ async def build_cms_coverage(session):
     if session.in_transaction():
         raise ValueError("cms_serving_coverage_requires_own_transaction")
     schema = _schema_name()
-    async with session.begin():
-        await session.execute(text("SET LOCAL statement_timeout = '15min'"))
-        await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+    async with session.begin(), _coverage_query_scope(session):
         generation = await accepted_cms_generation(session, None)
         if await _is_cms_covered(session, schema, generation):
             return generation["dataset_id"]
-        await _lock_cms_proof_inputs(session, schema)
+        await _lock_cms_proof_inputs(session, schema, generation["dataset_id"])
         locked = await session.scalar(
             text("SELECT pg_try_advisory_xact_lock(hashtext('cms-npd'), hashtext(:release_id))"),
             {"release_id": generation["release_id"]},
@@ -171,7 +209,9 @@ def _candidate_dataset_sql(schema):
         JOIN {schema}.provider_directory_cms_npd_relationship_receipt r USING (dataset_id)
         WHERE d.dataset_id=:dataset_id AND d.endpoint_id=:endpoint_id AND d.dataset_hash=:dataset_hash
           AND ((d.status='validated' AND NOT d.is_current AND d.published_at IS NULL)
-            OR (d.status='published' AND d.is_current AND d.published_at IS NOT NULL))
+            OR (d.status='published' AND d.is_current AND d.published_at IS NOT NULL)
+            OR (d.status='published' AND NOT d.is_current AND d.published_at IS NOT NULL
+                AND d.validated_at IS NOT NULL AND d.superseded_at IS NULL))
           AND d.publication_metadata_summary_json->'source_ids'='["cms-npd"]'::jsonb
           AND d.content_proof_admission_version=1
           AND d.content_proof_admission_kind='generic'
@@ -211,19 +251,30 @@ async def prepare_cms_candidate_coverage(fhir, candidate, release_id, dataset_ha
     from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
     from process.provider_directory_source_coverage_control import capture_source_coverage_control
 
-    schema = _schema_name()
-    proof_by_field = {
-        "dataset_id": candidate.dataset_id,
-        "endpoint_id": candidate.endpoint_id,
-        "release_id": release_id,
-        "dataset_hash": dataset_hash,
-        "proof_version": _PROOF_VERSION,
-    }
     async with source_transaction(fhir.db, isolation="repeatable read") as session:
         publisher = bound_publisher()
         await capture_source_coverage_control(publisher.connection, publisher.policy)
-        await session.execute(text("SET LOCAL lock_timeout = '5s'"))
-        await session.execute(text("SET LOCAL statement_timeout = '15min'"))
+        return await prepare_cms_candidate_coverage_in_session(session, candidate, release_id, dataset_hash)
+
+
+async def prepare_cms_candidate_coverage_in_session(session, candidate, release_id, dataset_hash):
+    """Seal exact candidate coverage in the caller's existing transaction.
+
+    This reuses the native checks without opening a session or binding SOURCE.
+    The caller must independently qualify CMS custody, authority and its fence.
+    No pointer is changed and returned data is not publication authority.
+    """
+    if not session.in_transaction():
+        raise ValueError("cms_serving_coverage_requires_transaction")
+    async with _coverage_query_scope(session):
+        schema = _schema_name()
+        proof_by_field = {
+            "dataset_id": candidate.dataset_id,
+            "endpoint_id": candidate.endpoint_id,
+            "release_id": release_id,
+            "dataset_hash": dataset_hash,
+            "proof_version": _PROOF_VERSION,
+        }
         current = (await session.execute(text(_candidate_dataset_sql(schema)), proof_by_field)).mappings().one_or_none()
         if current is None:
             raise RuntimeError("cms_npd_candidate_coverage_invalid")
@@ -246,4 +297,4 @@ async def prepare_cms_candidate_coverage(fhir, candidate, release_id, dataset_ha
                 {**proof_by_field, **current},
             )
         await assert_sealed_cms_candidate_coverage(session, schema, proof_by_field)
-    return proof_by_field
+        return proof_by_field

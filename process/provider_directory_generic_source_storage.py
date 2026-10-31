@@ -54,6 +54,8 @@ CMS_RESOURCE_IDENTITY_ROOT = "provider_directory_resource_identity"
 AUXILIARY_ROOTS = (*CMS_IDENTITY_ROOTS, CMS_RESOURCE_IDENTITY_ROOT)
 CONTRACT = "generic-source-candidate-v2"
 ISOLATED_CONTRACT = "generic-source-detached-v1"
+CMS_ISOLATED_CONTRACT = "generic-source-cms-detached-v1"
+ISOLATED_CONTRACTS = (ISOLATED_CONTRACT, CMS_ISOLATED_CONTRACT)
 # Autovacuum on a private heap competes with the bulk load and reduce for I/O; statistics come from
 # explicit ANALYZE and attached heaps get the default back right before they join their root.
 PRIVATE_HEAP_OPTIONS = " WITH (autovacuum_enabled = false)"
@@ -136,18 +138,22 @@ def candidate_identity(directory, candidate):
 def _validate_binding(binding_by_field, identity, *, phases):
     """Authenticate the complete closed candidate document before native lookup."""
     _validate_binding_shape(binding_by_field, identity, phases=phases)
-    _validate_binding_storage(binding_by_field, is_isolated=binding_by_field["contract"] == ISOLATED_CONTRACT)
+    _validate_binding_storage(binding_by_field, is_isolated=binding_by_field["contract"] in ISOLATED_CONTRACTS)
     _validate_binding_tables(binding_by_field, identity)
 
 
 def _validate_binding_shape(binding_by_field, identity, *, phases):
     """Share the document checks across loading and protected snapshot readers."""
-    is_isolated = type(binding_by_field) is dict and binding_by_field.get("contract") == ISOLATED_CONTRACT
+    is_isolated = type(binding_by_field) is dict and binding_by_field.get("contract") in ISOLATED_CONTRACTS
     keys = _BINDING_KEYS | {"storage", "admission"} if is_isolated else _BINDING_KEYS
     _require(
         type(binding_by_field) is dict
         and set(binding_by_field) == keys
-        and binding_by_field["contract"] == (ISOLATED_CONTRACT if is_isolated else CONTRACT)
+        and (
+            binding_by_field["contract"] in ISOLATED_CONTRACTS
+            if is_isolated
+            else binding_by_field["contract"] == CONTRACT
+        )
         and type(binding_by_field["identity"]) is dict
         and set(binding_by_field["identity"]) == {"dataset_id", "endpoint_id", "acquisition_root_run_id", "metadata"}
         and type(binding_by_field["identity"]["metadata"]) is dict
@@ -188,6 +194,19 @@ def _validate_isolated_binding_storage(binding_by_field, expected_storage):
         binding_by_field["phase"] != "published" and binding_by_field["auxiliary"] is None,
         "isolated_kind_unsupported",
     )
+    if binding_by_field["contract"] == CMS_ISOLATED_CONTRACT:
+        from process.provider_directory_cms_source_handoff import require_cms_handoff_identity
+
+        require_cms_handoff_identity(binding_by_field["identity"], expected_storage["catalog_schema"])
+        _require(binding_by_field["relationship_sha256"] is None, "isolated_cms_relationship_unexpected")
+    else:
+        metadata = binding_by_field["identity"]["metadata"]
+        _require(
+            metadata.get("source_release") is None
+            and type(metadata.get("source_ids")) is list
+            and "cms-npd" not in metadata["source_ids"],
+            "isolated_kind_unsupported",
+        )
     if binding_by_field["phase"] == "ready_for_freeze":
         validate_handoff_header(binding_by_field["admission"])
     else:
@@ -196,7 +215,7 @@ def _validate_isolated_binding_storage(binding_by_field, expected_storage):
 
 def validate_handoff_document(document, expected_storage):
     """Check data against issued coordinates; this grants no read or publication rights."""
-    _require(type(document) is dict and document.get("contract") == ISOLATED_CONTRACT, "isolated_storage_required")
+    _require(type(document) is dict and document.get("contract") in ISOLATED_CONTRACTS, "isolated_storage_required")
     _validate_binding_shape(document, document.get("identity"), phases=("ready_for_freeze",))
     _validate_isolated_binding_storage(document, expected_storage)
     _validate_binding_tables(document, document["identity"])
@@ -233,7 +252,7 @@ def _validate_binding_tables(binding_by_field, identity):
         )
         if root in HANDOFF_CONTROL_ROOTS or table["name"].endswith(("_h", "_p")):
             _require(
-                binding_by_field["contract"] == ISOLATED_CONTRACT
+                binding_by_field["contract"] in ISOLATED_CONTRACTS
                 and binding_by_field["phase"] == "ready_for_freeze"
                 and root in HANDOFF_CONTROL_ROOTS
                 and table["name"].endswith("_" + _SUFFIXES[root]),
@@ -299,11 +318,16 @@ def _require_candidate_storage(publisher, directory, identity):
     binding = require_storage_schema(publisher, directory._schema())
     if binding is not None:
         metadata = identity["metadata"]
+        if metadata.get("source_ids") == ["cms-npd"]:
+            from process.provider_directory_cms_source_handoff import require_cms_handoff_identity
+
+            require_cms_handoff_identity(identity, binding.catalog_schema)
+            return binding
         _require(
             metadata.get("source_release") is None
             and type(metadata.get("source_ids")) is list
             and bool(metadata["source_ids"])
-            and all(type(source) is str and 1 <= len(source) <= 64 for source in metadata["source_ids"])
+            and all(type(source_id) is str and 1 <= len(source_id) <= 64 for source_id in metadata["source_ids"])
             and type(metadata.get("selected_resources")) is list
             and bool(metadata["selected_resources"])
             and all(type(resource) is str for resource in metadata["selected_resources"])
@@ -352,7 +376,10 @@ def _auxiliary_tables(binding_by_field, identity):
         return auxiliary["tables"]
     else:
         _require(
-            not is_cms_identity(identity) or binding_by_field["phase"] in {"loading", "disposed"}, "auxiliary_required"
+            not is_cms_identity(identity)
+            or binding_by_field["phase"] in {"loading", "disposed"}
+            or binding_by_field["contract"] == CMS_ISOLATED_CONTRACT,
+            "auxiliary_required",
         )
     return {}
 
@@ -393,7 +420,7 @@ async def _locked(connection, policy, identity, *, phases=("loading",), lock="UP
         from process.provider_directory_generic_source_policy import current_source_storage_binding
 
         _require(
-            (current_source_storage_binding() is not None) == (binding_by_field["contract"] == ISOLATED_CONTRACT),
+            (current_source_storage_binding() is not None) == (binding_by_field["contract"] in ISOLATED_CONTRACTS),
             "storage_contract_changed",
         )
     return binding_by_field
@@ -645,7 +672,11 @@ async def prepare_generic_source_candidate(database, directory, candidate):
             relationship_sha256=None,
         )
         if isolated is not None:
-            binding_by_field.update(contract=ISOLATED_CONTRACT, storage=storage_document(publisher), admission=None)
+            binding_by_field.update(
+                contract=CMS_ISOLATED_CONTRACT if is_cms_identity(identity) else ISOLATED_CONTRACT,
+                storage=storage_document(publisher),
+                admission=None,
+            )
         await _store(connection, policy, identity, None, binding_by_field)
         return binding_by_field
 

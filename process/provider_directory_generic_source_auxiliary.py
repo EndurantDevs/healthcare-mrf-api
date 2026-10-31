@@ -44,20 +44,21 @@ async def prepare_identity_candidate(publisher, identity, prefix):
         and identity["metadata"]["source_release"].get("source_id") == "cms-npd"
         and coordinates.get("source_system") == "fhir"
         and coordinates.get("source_id") == "cms-npd"
-        and coordinates.get("dataset_schema") == publisher.policy.schema
         and coordinates.get("dataset_id") == identity["dataset_id"]
         and coordinates.get("edition_id") == identity["dataset_id"]
         and coordinates.get("producer_id") == "cms-npd-bulk-fhir-v1"
         and coordinates.get("alias_scope") == "cms-npd"
-        and coordinates.get("source_key_kind") == "organization_resource_id",
+        and coordinates.get("source_key_kind") == "organization_resource_id"
+        and coordinates.get("dataset_schema") == _identity_helper()._canonical_schema(publisher.policy),
         "auxiliary_producer_changed",
     )
     helper = _identity_helper()
     names_by_root = {root: prefix + "_" + storage._SUFFIXES[root] for root in storage.AUXILIARY_ROOTS}
     connection, policy = publisher.connection, publisher.policy
+    canonical_schema = helper._canonical_schema(policy)
     for root, name in names_by_root.items():
         await connection.execute(
-            f"CREATE TABLE {storage_relation(policy.schema, name)} (LIKE {storage_relation(policy.schema, root)} "
+            f"CREATE TABLE {storage_relation(policy.schema, name)} (LIKE {storage_relation(canonical_schema, root)} "
             "INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE)"
             + storage.PRIVATE_HEAP_OPTIONS
         )

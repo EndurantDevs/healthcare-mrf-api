@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from db.migration_generic_source_candidates import _canonical_copy_guard_bodies, _cms_canonical_copy_guard_body
 from db.migration_provider_directory_dataset_candidates import candidate_functions
 from db.plan_release_storage import storage_relation
 from process import provider_directory_generic_source_provision as provision
@@ -138,6 +139,91 @@ async def test_candidate_callable_contract_and_exact_writer_acl(monkeypatch, dam
         with pytest.raises(ValueError if damage == "body" else GenericCandidateError):
             await harness.verifier._candidate_functions(plan_by_field)
     harness.connection.execute.assert_not_awaited()
+
+
+def allocator_guard_rows(monkeypatch, *, guard_version="v0", additional_execute=True):
+    """Retain real source bodies while modeling the exact protected allocator postimage."""
+    rows = legacy_function_rows(monkeypatch)
+    by_name = {row["definition"]["proname"]: row for row in rows}
+    allocator = by_name["prepare_pd_generic_dataset_storage"]
+    allocator["definition"]["proowner"] = "104"
+    allocator["acl"] = [[104, 104, "EXECUTE", False]]
+    guard = by_name["guard_pd_dataset_candidate_parent"]
+    if guard_version == "v1":
+        guard["definition"]["prosrc"] = _canonical_copy_guard_bodies("source_schema", "hp_snapshot_retention")[1]
+    elif guard_version == "v2":
+        guard["definition"]["prosrc"] = _cms_canonical_copy_guard_body("source_schema", "hp_snapshot_retention")
+    if additional_execute:
+        guard["acl"].append([104, 105, "EXECUTE", False])
+    return rows, allocator, guard
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard_version", ["v0", "v1", "v2"])
+@pytest.mark.parametrize("additional_execute", [False, True])
+async def test_allocator_guard_allows_only_exact_optional_postimage(monkeypatch, guard_version, additional_execute):
+    harness = await release_harness(monkeypatch)
+    rows, _, _ = allocator_guard_rows(monkeypatch, guard_version=guard_version, additional_execute=additional_execute)
+    harness.connection.fetch.return_value = list(reversed(rows))
+    before = deepcopy(rows)
+
+    actual = await harness.verifier._candidate_functions(
+        dict(writers=dict(practitioner=["builder"], rooted=["PUBLIC"]))
+    )
+
+    assert actual == {int(row["definition"]["oid"]): row["definition"] for row in rows}
+    assert rows == before
+    harness.connection.fetch.assert_awaited_once()
+    harness.connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage",
+    ["allocator_owner", "allocator_body", "allocator_acl", "grantee", "grantor", "grantable", "privilege", "deny"],
+)
+async def test_allocator_guard_refuses_unapproved_authority(monkeypatch, damage):
+    harness = await release_harness(monkeypatch)
+    rows, allocator, guard = allocator_guard_rows(monkeypatch, guard_version="v1")
+    if damage == "allocator_owner":
+        allocator["definition"]["proowner"] = "105"
+        allocator["acl"] = [[105, 105, "EXECUTE", False]]
+    elif damage == "allocator_body":
+        allocator["definition"]["prosrc"] += " RETURN NULL;"
+    elif damage == "allocator_acl":
+        allocator["acl"].append([999, 104, "EXECUTE", False])
+    elif damage == "deny":
+        deny = next(row for row in rows if row["definition"]["proname"] == "deny_pd_dataset_candidate_write")
+        deny["acl"].append([104, 105, "EXECUTE", False])
+    else:
+        position, changed = {
+            "grantee": (0, 103),
+            "grantor": (1, 104),
+            "grantable": (3, True),
+            "privilege": (2, "SELECT"),
+        }[damage]
+        guard["acl"][-1][position] = changed
+    harness.connection.fetch.return_value = rows
+    with pytest.raises(ValueError if damage == "allocator_body" else GenericCandidateError):
+        await harness.verifier._candidate_functions(dict(writers=dict(practitioner=["builder"], rooted=["PUBLIC"])))
+    harness.connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard_version", ["v1", "v2"])
+@pytest.mark.parametrize("damage", ["changed", "preparation_schema"])
+async def test_allocator_guard_rejects_unapproved_current_body(monkeypatch, guard_version, damage):
+    harness = await release_harness(monkeypatch)
+    rows, _, guard = allocator_guard_rows(monkeypatch, guard_version=guard_version)
+    if damage == "changed":
+        guard["definition"]["prosrc"] += " RETURN NULL;"
+    else:
+        guard["definition"]["prosrc"] = guard["definition"]["prosrc"].replace(
+            "hp_snapshot_retention", "other_retention"
+        )
+    harness.connection.fetch.return_value = rows
+    with pytest.raises(ValueError, match="definition_changed"):
+        await harness.verifier._candidate_functions(dict(writers=dict(practitioner=["builder"], rooted=["PUBLIC"])))
 
 
 @pytest.mark.asyncio

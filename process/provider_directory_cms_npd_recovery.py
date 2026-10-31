@@ -36,7 +36,8 @@ def candidate_available_sql(dataset_alias: str, schema: str, *, dataset_relation
         private_schema, header = source_relation_coordinates(
             schema, "provider_directory_endpoint_dataset", "provider_directory_endpoint_dataset"
         )
-        # Issued private headers reject CMS source_release data at candidate admission.
+        # Private intake has its own closed handoff lifecycle; catalog dispositions
+        # cannot authorize or suppress an unrelated private candidate.
         if private_schema != schema and dataset_relation == storage_relation(private_schema, header):
             return "TRUE"
 
@@ -345,7 +346,7 @@ async def _repair_candidate_state(fhir, endpoint_id, identity):
     rows = await fhir.db.all(
         f"SELECT dataset_id, acquisition_root_run_id, import_run_id FROM {_table(fhir, 'provider_directory_endpoint_dataset')} "
         "AS candidate WHERE endpoint_id=:endpoint_id "
-        "AND (status IN (:acquiring,:validated) OR (status=:published AND is_current)) "
+        "AND (status IN (:acquiring,:validated) OR (status=:published AND is_current=true)) "
         "AND publication_metadata_json::jsonb -> 'source_release' = CAST(:release AS jsonb) "
         f"AND {candidate_available_sql('candidate', fhir._schema())} LIMIT 2",
         endpoint_id=endpoint_id,

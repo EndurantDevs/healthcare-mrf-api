@@ -19,6 +19,7 @@ from process.network_custom_address_source import _require_transaction
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_membership_writer_closure import _protected_owner
 from process.provider_directory_cms_receipt_guard import _normalized
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_cms_serving_coverage import _PROOF_VERSION
 
 _TABLES = (
@@ -752,6 +753,45 @@ _FIRST_OWNER_LINEAGE_BODY_HASHES = {
 }
 
 
+def _typed_retirement_digest(name, schema):
+    """Keep retained readers compatible with only the exact source-reviewed casts."""
+    from db.migration_cms_retirement_resolution import ORIGINAL_SHA256, retirement_resolution_bodies
+
+    if name not in ORIGINAL_SHA256:
+        return None
+    hardened = retirement_resolution_bodies(schema)[name][1].replace(_identifier(schema) + ".", '"__schema__".')
+    return hashlib.sha256(_normalized(hardened).encode()).hexdigest()
+
+
+def _typed_terminal_digest(name, schema):
+    """Accept the typed terminal guard only under its unchanged predecessor contract."""
+    from db.migration_cms_terminal_resolution import GUARD, terminal_guard_bodies
+
+    if name != GUARD:
+        return None
+    previous, hardened = terminal_guard_bodies(schema)
+    bodies = [body.replace(_identifier(schema) + ".", '"__schema__".') for body in (previous, hardened)]
+    if hashlib.sha256(_normalized(bodies[0]).encode()).hexdigest() != _REACHABLE_FUNCTIONS[GUARD][0]:
+        return None
+    return hashlib.sha256(_normalized(bodies[1]).encode()).hexdigest()
+
+
+def _cms_lifecycle_digests(name, schema):
+    """Bind exact typed/CMS lifecycle alternatives to both retained predecessor pins."""
+    from db.migration_cms_noncurrent_seal import GUARD, _migration, lifecycle_guard_bodies
+
+    if name != GUARD:
+        return ()
+    compact = _migration("20260818020000_provider_directory_terminal_publication_compact_guard.py")
+    original = compact._function_body(compact._endpoint_guard_sql(schema, compact=True))
+    bodies = [original, *lifecycle_guard_bodies(schema)]
+    bodies = [body.replace(_identifier(schema) + ".", '"__schema__".') for body in bodies]
+    predecessor = hashlib.sha256(_normalized(bodies[0]).encode()).hexdigest()
+    if predecessor != _REACHABLE_FUNCTIONS[GUARD][0] or predecessor != _FUNCTION_HASHES[GUARD]:
+        return ()
+    return tuple(hashlib.sha256(_normalized(body).encode()).hexdigest() for body in bodies[1:])
+
+
 def _require_function(function_record, schema, owner_oid):
     """Recognize only the actual source-rendered reachable routine contract."""
     expected = _REACHABLE_FUNCTIONS.get(function_record["proname"])
@@ -766,10 +806,26 @@ def _require_function(function_record, schema, owner_oid):
         function_record["prosecdef"],
         None if function_record["proconfig"] is None else tuple(function_record["proconfig"]),
     )
+    typed_replay_digest = None
+    if function_record["proname"] == "guard_pd_endpoint_dataset_subset_replay_evidence":
+        from db.migration_cms_replay_resolution import replay_guard_bodies
+
+        hardened = replay_guard_bodies(schema)[1].replace(_identifier(schema) + ".", '"__schema__".')
+        typed_replay_digest = hashlib.sha256(_normalized(hardened).encode()).hexdigest()
     is_matching = (
         expected is not None
-        and actual[1:] == expected[1:]
-        and actual[0] in (expected[0], _FIRST_OWNER_LINEAGE_BODY_HASHES.get(function_record["proname"]))
+        and actual[1:4] == expected[1:4]
+        and function_record["proconfig"]
+        in approved_cms_routine_settings(None if expected[4] is None else list(expected[4]))
+        and actual[0]
+        in (
+            expected[0],
+            _FIRST_OWNER_LINEAGE_BODY_HASHES.get(function_record["proname"]),
+            typed_replay_digest,
+            _typed_retirement_digest(function_record["proname"], schema),
+            _typed_terminal_digest(function_record["proname"], schema),
+            *_cms_lifecycle_digests(function_record["proname"], schema),
+        )
     )
     if not is_matching or function_record["proowner"] != owner_oid:
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
@@ -780,6 +836,8 @@ def _require_guard(guard_record, schema, owner_oid, name, event_mask):
     if guard_record is None:
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
     function_name = _GUARD_FUNCTIONS[name]
+    if function_name == "guard_tin_npi_connector_endpoint_dataset":
+        _require_function(guard_record, schema, owner_oid)
     expected_arguments = b"raw\x00" if name == "provider_directory_endpoint_dataset_admission_raw_guard" else b""
     body = _normalized(guard_record["prosrc"].replace(_identifier(schema) + ".", '"__schema__".'))
     is_security_definer = function_name in {
@@ -804,8 +862,9 @@ def _require_guard(guard_record, schema, owner_oid, name, event_mask):
         or guard_record["lanname"] != "plpgsql"
         or not guard_record["returns_trigger"]
         or guard_record["prosecdef"] is not is_security_definer
-        or guard_record["proconfig"] != settings
-        or hashlib.sha256(body.encode()).hexdigest() != _FUNCTION_HASHES[function_name]
+        or guard_record["proconfig"] not in approved_cms_routine_settings(settings)
+        or hashlib.sha256(body.encode()).hexdigest()
+        not in (_FUNCTION_HASHES[function_name], *_cms_lifecycle_digests(function_name, schema))
     ):
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
 

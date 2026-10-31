@@ -12,7 +12,11 @@ from datetime import datetime, timezone
 import asyncpg
 
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.provider_directory_cms_identity_candidate import CMSIdentityReprepareRequired, copy_identity_rows
+from process.provider_directory_cms_identity_candidate import (
+    CMSIdentityReprepareRequired,
+    _canonical_schema,
+    copy_identity_rows,
+)
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
 
@@ -55,7 +59,7 @@ def _source_release(publisher, identity):
         and re.fullmatch(r"[0-9a-f]{64}", release["vector_sha256"]) is not None
         and producer.get("source_system") == "fhir"
         and producer.get("source_id") == "cms-npd"
-        and producer.get("dataset_schema") == publisher.policy.schema
+        and producer.get("dataset_schema") == _canonical_schema(publisher.policy)
         and producer.get("dataset_id") == identity.get("dataset_id")
         and producer.get("edition_id") == identity.get("dataset_id")
         and producer.get("producer_id") == "cms-npd-bulk-fhir-v1"
@@ -164,6 +168,13 @@ async def _complete_source(connection, publisher, identity, binding, receipt):
     expected = _stage_name(receipt).removesuffix("_re") + "_w"
     _require(witness_receipt.get("name") == expected, "witness_changed")
     witness = storage_relation(publisher.policy.schema, expected)
+    await verify_resource_identity_source(
+        connection, stage, witness, identity["dataset_id"], _source_release(publisher, identity)
+    )
+
+
+async def verify_resource_identity_source(connection, stage, witness, dataset_id, release_id):
+    """Compare complete raw-resource coverage on caller-qualified coordinates."""
     invalid = await connection.fetchval(
         f"SELECT EXISTS(SELECT FROM {stage} WHERE source_id<>'cms-npd' "
         "OR resource_type NOT IN ('InsurancePlan','PractitionerRole') "
@@ -175,8 +186,8 @@ async def _complete_source(connection, publisher, identity, binding, receipt):
         f"SELECT FROM {witness} w WHERE w.dataset_id=$1 AND w.resource_type IN ('InsurancePlan','PractitionerRole') "
         f"AND (w.source_id<>'cms-npd' OR w.release_id<>$2 OR NOT EXISTS(SELECT FROM {stage} c "
         "WHERE (c.source_id,c.resource_type,c.resource_id)=(w.source_id,w.resource_type,w.resource_id))))",
-        identity["dataset_id"],
-        _source_release(publisher, identity),
+        dataset_id,
+        release_id,
     )
     _require(invalid is False, "source_evidence_incomplete")
 
@@ -198,14 +209,15 @@ async def finish_resource_identity_stage(publisher, identity, receipt):
     from process.provider_directory_generic_source_storage import _close_grants
 
     connection, schema = publisher.connection, publisher.policy.schema
+    canonical_schema = _canonical_schema(publisher.policy)
     binding = await _protected_stage(publisher, identity, receipt, ("loading",))
     name = _stage_name(receipt)
     raw, reduced = storage_relation(schema, name), storage_relation(schema, name + "_u")
     async with connection.transaction():
         await _verify_raw_identities(connection, raw)
-        await _global_replay(connection, schema, raw)
+        await _global_replay(connection, canonical_schema, raw)
         await connection.execute(
-            f"CREATE TABLE {reduced} (LIKE {storage_relation(schema, RESOURCE_IDENTITY_ROOT)} "
+            f"CREATE TABLE {reduced} (LIKE {storage_relation(canonical_schema, RESOURCE_IDENTITY_ROOT)} "
             "INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE)"
         )
         await _close_grants(connection, publisher.policy, name + "_u")
@@ -214,7 +226,7 @@ async def finish_resource_identity_stage(publisher, identity, receipt):
             "candidate.entity_id,COALESCE(incumbent.created_at,candidate.created_at) "
             f"FROM (SELECT source_id,resource_type,resource_id,entity_id,min(created_at) AS created_at FROM {raw} "
             "GROUP BY source_id,resource_type,resource_id,entity_id) candidate "
-            f"LEFT JOIN {storage_relation(schema, RESOURCE_IDENTITY_ROOT)} incumbent USING(source_id,resource_type,resource_id)"
+            f"LEFT JOIN {storage_relation(canonical_schema, RESOURCE_IDENTITY_ROOT)} incumbent USING(source_id,resource_type,resource_id)"
         )
         await connection.execute(f"ALTER TABLE {reduced} ADD PRIMARY KEY(source_id,resource_type,resource_id)")
         await connection.execute(
@@ -226,24 +238,35 @@ async def finish_resource_identity_stage(publisher, identity, receipt):
         await _complete_source(connection, publisher, identity, binding, receipt)
 
 
+async def publish_resource_identity_relation(connection, relation, canonical_schema):
+    """Merge a caller-qualified resource map; its caller owns authority and rollback.
+
+    Preserve the existing Source UUID replay contract. Prepared CMS publication
+    additionally verifies exact timestamps and reverse-key collisions outside it.
+    """
+    _require(connection.is_in_transaction() is True, "transaction_required")
+    fields = ",".join(RESOURCE_IDENTITY_COLUMNS)
+    await _global_replay(connection, canonical_schema, relation)
+    await connection.execute(
+        f"INSERT INTO {storage_relation(canonical_schema, RESOURCE_IDENTITY_ROOT)}({fields}) "
+        f"SELECT {fields} FROM {relation} ORDER BY source_id,resource_type,resource_id "
+        "ON CONFLICT(source_id,resource_type,resource_id) DO NOTHING"
+    )
+    from process.provider_directory_generic_source_storage import refresh_statistics
+
+    await refresh_statistics(connection, canonical_schema, (RESOURCE_IDENTITY_ROOT,))
+    await _global_replay(connection, canonical_schema, relation, complete=True)
+
+
 async def publish_resource_identity_stage(publisher, identity, receipt):
     """Publish set-wise, retaining accepted timestamps and rejecting immutable drift."""
     connection, schema = publisher.connection, publisher.policy.schema
+    canonical_schema = _canonical_schema(publisher.policy)
     await _protected_stage(publisher, identity, receipt, ("sealed",))
     relation = storage_relation(schema, _stage_name(receipt))
-    fields = ",".join(RESOURCE_IDENTITY_COLUMNS)
     try:
         async with connection.transaction():
-            await _global_replay(connection, schema, relation)
-            await connection.execute(
-                f"INSERT INTO {storage_relation(schema, RESOURCE_IDENTITY_ROOT)}({fields}) "
-                f"SELECT {fields} FROM {relation} ORDER BY source_id,resource_type,resource_id "
-                "ON CONFLICT(source_id,resource_type,resource_id) DO NOTHING"
-            )
-            from process.provider_directory_generic_source_storage import refresh_statistics
-
-            await refresh_statistics(connection, schema, (RESOURCE_IDENTITY_ROOT,))
-            await _global_replay(connection, schema, relation, complete=True)
+            await publish_resource_identity_relation(connection, relation, canonical_schema)
     except (asyncpg.SerializationError, asyncpg.UniqueViolationError) as error:
         raise CMSIdentityReprepareRequired(
             "provider_directory_resource_identity_whole_candidate_reprepare_required"

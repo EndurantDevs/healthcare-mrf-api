@@ -688,7 +688,7 @@ def test_complete_native_source_prefix_uses_unique_actual_ancestor_order():
 
     merged = complete.source_component_native_migrations()
     baseline = source_component_migrations()
-    assert len(merged) == len(set(merged)) == 130
+    assert len(merged) == len(set(merged)) == 135
     assert tuple(prefix for prefix in merged if prefix in set(baseline)) == baseline
     assert set(merged) - (set(baseline) | set(complete.NATIVE_INPUT_MIGRATIONS)) == {
         "20260830090000",
@@ -701,11 +701,16 @@ def test_complete_native_source_prefix_uses_unique_actual_ancestor_order():
         "20261019130000",
     }
     assert set(complete.NATIVE_INPUT_MIGRATIONS) <= set(merged)
+    assert {"20261007150000", "20261017210000"} <= set(merged)
     assert {"20260628143000", "20260629160000", "20260729120000", "20261019030000"} <= set(merged)
     assert merged.index("20260629123000") < merged.index("20260629160000") < merged.index("20260630112000")
     assert merged.index("20260729110000") < merged.index("20260729120000") < merged.index("20260730110000")
     assert merged.index("20260628100000") < merged.index("20260628143000") < merged.index("20260628170000")
-    assert merged[-1] == "20261019130000"
+    assert merged[-3:] == (
+        "20261022120000",
+        "20261023100000_provider_directory_retirement_parent_updates",
+        "20261024050000",
+    )
 
 
 @pytest.mark.parametrize("damage", ["duplicate", "unknown", "overlap"])

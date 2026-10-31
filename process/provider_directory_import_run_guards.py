@@ -3,6 +3,8 @@
 
 import hashlib
 
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
+
 # Body digests are derived from the existing migration constructors, with only the
 # quoted schema qualifier replaced before whitespace normalization.
 _FUNCTIONS = {
@@ -216,6 +218,19 @@ def _fail():
     raise RuntimeError("provider_directory_profile_capacity_import_run_guard_shape_changed")
 
 
+def _is_approved_source(name, source, schema):
+    expected = _FUNCTIONS[name]["source_sha256"]
+    if _source_hash(source, schema) == expected:
+        return True
+    from db.migration_cms_retirement_resolution import retirement_resolution_bodies
+    from db.migration_provider_directory_terminal_root_retirement_guards import IMPORT_RUN_GUARD
+
+    if name != IMPORT_RUN_GUARD:
+        return False
+    original, typed = retirement_resolution_bodies(schema)[name]
+    return _source_hash(original, schema) == expected and source == typed
+
+
 async def assert_import_run_guards(database, relation_map, captured=None):
     """Validate all migration guards and return their complete dependency fingerprint entries."""
     schema = relation_map["schema_name"]
@@ -230,9 +245,15 @@ async def assert_import_run_guards(database, relation_map, captured=None):
     functions_by_name = {}
     for catalog_row in functions:
         function_source = catalog_row.pop("source")
+        if not _is_approved_source(catalog_row["function_name"], function_source, schema):
+            _fail()
         catalog_row["source_sha256"] = _source_hash(function_source, schema)
-        expected = _FUNCTIONS[catalog_row["function_name"]] | _FUNCTION_DEFAULTS | {"function_schema": schema}
-        if any(catalog_row[name] != expected_value for name, expected_value in expected.items()):
+        expected = (
+            _FUNCTIONS[catalog_row["function_name"]]
+            | _FUNCTION_DEFAULTS
+            | {"function_schema": schema, "source_sha256": catalog_row["source_sha256"]}
+        )
+        if not _function_attributes_match(catalog_row, expected):
             _fail()
         catalog_row["raw_source_sha256"] = hashlib.sha256(function_source.encode("utf-8")).hexdigest()
         catalog_row["dependency_kind"] = "function"
@@ -270,3 +291,15 @@ async def assert_import_run_guards(database, relation_map, captured=None):
                 _fail()
         catalog_row["dependency_kind"] = "trigger"
     return tuple(functions + triggers)
+
+
+def _function_attributes_match(catalog_row, expected):
+    permitted_settings = (expected["settings"],)
+    if catalog_row["function_name"] in {
+        "guard_provider_directory_terminal_root_retirement_run",
+        "provider_directory_terminal_root_run_retired",
+    }:
+        permitted_settings = approved_cms_routine_settings(expected["settings"])
+    return catalog_row["settings"] in permitted_settings and all(
+        catalog_row[name] == expected_value for name, expected_value in expected.items() if name != "settings"
+    )

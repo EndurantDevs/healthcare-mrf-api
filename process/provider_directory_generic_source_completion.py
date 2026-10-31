@@ -390,7 +390,11 @@ async def complete_generic_source_candidate(database, directory, candidate):
         await _complete_payloads(connection, policy, previous, candidate, directory, tables_by_root)
         from process.provider_directory_generic_source_auxiliary import prepare_identity_candidate
 
-        auxiliary = await prepare_identity_candidate(publisher, identity, prefix)
+        auxiliary = (
+            None
+            if previous["contract"] == storage.CMS_ISOLATED_CONTRACT
+            else await prepare_identity_candidate(publisher, identity, prefix)
+        )
         captured = await storage._capture(connection, policy, [table["name"] for table in tables_by_root.values()])
         binding_by_field = {
             **previous,
@@ -488,23 +492,23 @@ async def _prepare_final_tables(connection, policy, binding_by_field):
         await connection.execute(f"ALTER TABLE {relation} ADD CHECK (dataset_id={literal})")
         await connection.execute(f"ALTER TABLE {relation} RESET (autovacuum_enabled)")
         await storage._close_grants(
-            connection, policy, name, readable=binding_by_field.get("contract") != storage.ISOLATED_CONTRACT
+            connection, policy, name, readable=binding_by_field.get("contract") not in storage.ISOLATED_CONTRACTS
         )
 
 
 async def _attach_final_tables(connection, policy, binding_by_field):
     """Attach the verified group without committing or moving any reader pointer."""
-    storage._require(binding_by_field.get("contract") != storage.ISOLATED_CONTRACT, "isolated_attach_forbidden")
+    storage._require(binding_by_field.get("contract") not in storage.ISOLATED_CONTRACTS, "isolated_attach_forbidden")
+    await _prepare_final_tables(connection, policy, binding_by_field)
     dataset_id = binding_by_field["identity"]["dataset_id"]
     literal = "'" + dataset_id.replace("'", "''") + "'"
-    roots = [storage_relation(policy.schema, root) for root in storage.RELATIONS]
-    await connection.execute("LOCK TABLE " + ",".join(roots) + " IN SHARE UPDATE EXCLUSIVE MODE")
-    for root in storage.RELATIONS:
+    roots = sorted(storage_relation(policy.schema, root) for root in storage.RELATIONS)
+    await connection.execute(
+        "LOCK TABLE " + ",".join("ONLY " + root for root in roots) + " IN SHARE UPDATE EXCLUSIVE MODE NOWAIT"
+    )
+    for root in sorted(storage.RELATIONS):
         name = binding_by_field["tables"][root]["name"]
         relation = storage_relation(policy.schema, name)
-        await connection.execute(f"ALTER TABLE {relation} ADD CHECK (dataset_id={literal})")
-        await connection.execute(f"ALTER TABLE {relation} RESET (autovacuum_enabled)")
-        await storage._close_grants(connection, policy, name, readable=True)
         await connection.execute(
             f"ALTER TABLE {storage_relation(policy.schema, root)} ATTACH PARTITION {relation} FOR VALUES IN ({literal})"
         )
@@ -517,7 +521,11 @@ async def _finish_derived_indexes(connection, policy, binding_by_field):
     from process.provider_directory_generic_source_auxiliary import relationship_seal
 
     if binding_by_field["relationship_sha256"] is None:
-        storage._require(not storage.is_cms_identity(binding_by_field["identity"]), "relationship_seal_required")
+        storage._require(
+            not storage.is_cms_identity(binding_by_field["identity"])
+            or binding_by_field["contract"] == storage.CMS_ISOLATED_CONTRACT,
+            "relationship_seal_required",
+        )
         await _indexes(
             connection, policy, storage.RELATIONSHIP, binding_by_field["tables"][storage.RELATIONSHIP]["name"]
         )
@@ -562,21 +570,8 @@ async def _validated_header(publisher, binding_by_field):
     return header
 
 
-async def prepare_generic_source_handoff(publisher, binding_by_field):
-    """Prepare exact detached inputs; a separate publisher must close all writers."""
-    storage._require(
-        bound_publisher() is publisher and publisher.storage_binding is not None, "original_storage_publisher_required"
-    )
-    source_copy_session()
-    storage._validate_binding(binding_by_field, binding_by_field["identity"], phases=("prepared", "ready_for_freeze"))
-    storage._require(binding_by_field["contract"] == storage.ISOLATED_CONTRACT, "isolated_storage_required")
-    header = await _validated_header(publisher, binding_by_field)
-    storage._require(
-        header["status"] == "validated" and header["content_proof_admission_kind"] == "generic",
-        "isolated_kind_unsupported",
-    )
-    storage.validate_handoff_completion(header)
-    identity = binding_by_field["identity"]
+def _validate_handoff_acquisition(header, identity):
+    """Require the selected endpoint, acquisition root and every declared metadata field."""
     metadata = storage._json(header["publication_metadata_json"])
     storage._require(
         header["endpoint_id"] == identity["endpoint_id"]
@@ -585,6 +580,24 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
         and all(metadata.get(key) == expected_value for key, expected_value in identity["metadata"].items()),
         "acquisition_changed",
     )
+
+
+async def prepare_generic_source_handoff(publisher, binding_by_field):
+    """Prepare exact detached inputs; a separate publisher must close all writers."""
+    storage._require(
+        bound_publisher() is publisher and publisher.storage_binding is not None, "original_storage_publisher_required"
+    )
+    source_copy_session()
+    storage._validate_binding(binding_by_field, binding_by_field["identity"], phases=("prepared", "ready_for_freeze"))
+    storage._require(binding_by_field["contract"] in storage.ISOLATED_CONTRACTS, "isolated_storage_required")
+    header = await _validated_header(publisher, binding_by_field)
+    storage._require(
+        header["status"] == "validated" and header["content_proof_admission_kind"] == "generic",
+        "isolated_kind_unsupported",
+    )
+    storage.validate_handoff_completion(header)
+    identity = binding_by_field["identity"]
+    _validate_handoff_acquisition(header, identity)
     admission_by_field = {field: header[field] for field in storage.HANDOFF_HEADER_FIELDS}
     storage.validate_handoff_header(admission_by_field)
     connection, policy = publisher.connection, publisher.policy
@@ -595,6 +608,10 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
         return FHIRSourceCandidateHandoff(storage._encoded(binding_by_field))
     await _finish_derived_indexes(connection, policy, binding_by_field)
     await _relationships(connection, policy, binding_by_field)
+    if binding_by_field["contract"] == storage.CMS_ISOLATED_CONTRACT:
+        from process.provider_directory_cms_source_handoff import validate_cms_handoff_rows
+
+        await validate_cms_handoff_rows(connection, policy, binding_by_field)
     await _prepare_final_tables(connection, policy, binding_by_field)
     names_by_root = await _prepare_handoff_controls(connection, policy, binding_by_field)
     for key in ("resource_input", "witness_input"):
@@ -901,6 +918,35 @@ async def validate_frozen_source_handoff(connection, directory, handoff, *, prot
     layout before calling. This data check never grants publication authority.
     """
     storage._require(type(handoff) is FHIRSourceCandidateHandoff, "handoff_required")
+    storage._require(handoff.document.get("contract") == storage.ISOLATED_CONTRACT, "ordinary_handoff_required")
+    return await _validate_frozen_source_handoff(
+        connection, directory, handoff, protected_owner_role=protected_owner_role
+    )
+
+
+async def validate_frozen_cms_source_handoff(connection, directory, handoff, *, protected_owner_role):
+    """Check complete frozen CMS intake without claiming identity or serving readiness."""
+    from process.provider_directory_cms_source_handoff import validate_cms_handoff_rows
+
+    storage._require(type(handoff) is FHIRSourceCandidateHandoff, "handoff_required")
+    document = handoff.document
+    storage._require(document.get("contract") == storage.CMS_ISOLATED_CONTRACT, "cms_handoff_required")
+    storage._require(connection.is_in_transaction() is True, "transaction_required")
+    transaction_id = await connection.fetchval("SELECT pg_current_xact_id()::text")
+    result = await _validate_frozen_source_handoff(
+        connection, directory, handoff, protected_owner_role=protected_owner_role
+    )
+    policy = SimpleNamespace(schema=document["storage"]["storage_schema"], owner_role=protected_owner_role)
+    await validate_cms_handoff_rows(connection, policy, document)
+    storage._require(
+        connection.is_in_transaction() is True
+        and await connection.fetchval("SELECT pg_current_xact_id()::text") == transaction_id,
+        "transaction_changed",
+    )
+    return {**result, "source_release": document["identity"]["metadata"]["source_release"]}
+
+
+async def _validate_frozen_source_handoff(connection, directory, handoff, *, protected_owner_role):
     storage._require(connection.is_in_transaction() is True, "transaction_required")
     document = handoff.document
     storage.validate_handoff_document(document, document.get("storage"))

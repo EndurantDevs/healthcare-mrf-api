@@ -8,6 +8,7 @@ from db import migration_provider_directory_first_acquisition_retirement as firs
 from db import migration_provider_directory_first_retirement_owner_lineage as owner_lineage
 from db import migration_provider_directory_terminal_root_retirement_evidence as evidence
 from db import migration_provider_directory_terminal_root_retirement_guards as guards
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_terminal_root_retirement_contract import TerminalRootRetirementError, schema_name
 from process.provider_directory_terminal_root_retirement_native import require_native_retirement_controls
 
@@ -27,6 +28,8 @@ def _function_contract(sql):
 
 
 def _retirement_contracts(schema, native):
+    from db.migration_cms_retirement_resolution import retirement_resolution_bodies
+
     functions = [
         _function_contract(sql)
         for sql in (
@@ -42,8 +45,14 @@ def _retirement_contracts(schema, native):
         _function_contract(old)["signature"]: _function_contract(new)["body"]
         for old, new in owner_lineage.replacements(schema)
     }
+    typed_by_function = {
+        guards._qf(schema, name): re.sub(r"\s+", " ", bodies[1]).strip()
+        for name, bodies in retirement_resolution_bodies(schema).items()
+    }
     for function in functions:
         function["alternate_body"] = alternate_body_by_signature.get(function["signature"])
+        function["typed_body"] = typed_by_function.get(function["signature"].split("(", 1)[0])
+        function["settings_successor"] = approved_cms_routine_settings(function["settings"])[1]
     roots = (
         ("provider_directory_endpoint_dataset", "dataset", guards.PARENT_GUARD),
         ("import_run", "import_run", guards.IMPORT_RUN_GUARD),
@@ -75,16 +84,20 @@ async def require_retirement_controls(database):
         r"""
         SELECT NOT EXISTS (
             SELECT FROM pg_catalog.jsonb_to_recordset(CAST(:functions AS jsonb))
-                AS expected(signature text, body text, alternate_body text, settings jsonb, language text, volatility text)
+                AS expected(signature text, body text, alternate_body text, typed_body text,
+                            settings jsonb, settings_successor jsonb, language text, volatility text)
             LEFT JOIN pg_catalog.pg_proc p ON p.oid=pg_catalog.to_regprocedure(expected.signature)
             LEFT JOIN pg_catalog.pg_language l ON l.oid=p.prolang
             WHERE p.oid IS NULL OR NOT p.prosecdef OR p.prokind<>'f'
                OR p.proisstrict OR p.proretset
-               OR pg_catalog.to_jsonb(p.proconfig) IS DISTINCT FROM expected.settings
+               OR (pg_catalog.to_jsonb(p.proconfig) IS DISTINCT FROM expected.settings
+                   AND pg_catalog.to_jsonb(p.proconfig) IS DISTINCT FROM expected.settings_successor)
                OR l.lanname<>expected.language OR p.provolatile::text<>expected.volatility
                OR (pg_catalog.btrim(pg_catalog.regexp_replace(p.prosrc,'\s+',' ','g'))<>expected.body
                    AND (expected.alternate_body IS NULL OR
-                       pg_catalog.btrim(pg_catalog.regexp_replace(p.prosrc,'\s+',' ','g'))<>expected.alternate_body))
+                       pg_catalog.btrim(pg_catalog.regexp_replace(p.prosrc,'\s+',' ','g'))<>expected.alternate_body)
+                   AND (expected.typed_body IS NULL OR
+                       pg_catalog.btrim(pg_catalog.regexp_replace(p.prosrc,'\s+',' ','g'))<>expected.typed_body))
                OR EXISTS (SELECT FROM pg_catalog.pg_proc overload
                    WHERE overload.pronamespace=p.pronamespace AND overload.proname=p.proname
                      AND overload.oid<>p.oid)

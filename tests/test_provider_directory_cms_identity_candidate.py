@@ -332,7 +332,7 @@ async def test_network_sql_targets_only_bound_private_stages_at_constant_stateme
 
     monkeypatch.setattr(policy, "source_copy_session", lambda: session)
     copy = AsyncMock()
-    monkeypatch.setattr(network, "_copy_stage", copy)
+    monkeypatch.setattr(network, "copy_network_stage_native", copy)
     async with candidate.bind_cms_identity_candidate(publisher, identity, receipts):
         receipt = await network._write_batch(
             SQLConnection(),
@@ -347,6 +347,7 @@ async def test_network_sql_targets_only_bound_private_stages_at_constant_stateme
     assert receipt["plan_link_count"] == count
     assert len(sql_statements) == 9
     copy.assert_awaited_once()
+    assert copy.await_args.args[1:3] == (session, publisher.connection)
     writes = [statement for statement in sql_statements if "INSERT INTO" in statement]
     assert len(writes) == 2
     assert all(
@@ -480,12 +481,12 @@ async def test_canonical_authority_rechecks_drift_without_accepting_uuid_reuse(
     publisher.connection.fetchval = AsyncMock(side_effect=[False] * invalid_table + [True])
     changed = candidate.CMSIdentityReprepareRequired("whole_candidate_reprepare_required")
     replay = AsyncMock(side_effect=changed if incumbent_changed else None)
-    monkeypatch.setattr(candidate, "_global_replay", replay)
+    monkeypatch.setattr(candidate, "verify_identity_replay", replay)
     expected = candidate.CMSIdentityReprepareRequired if incumbent_changed else candidate.GenericCandidateError
     message = "whole_candidate_reprepare" if incumbent_changed else "canonical_identity_reuse_forbidden"
     with pytest.raises(expected, match=message):
         await candidate._canonical_authority(publisher.connection, publisher.policy, receipts)
-    replay.assert_awaited_once_with(publisher.connection, publisher.policy, receipts)
+    replay.assert_awaited_once_with(publisher.connection, candidate._relations(publisher.policy, receipts), "mrf")
     assert publisher.connection.fetchval.await_count == invalid_table + 1
     assert publisher.connection.statements == publisher.connection.copies == []
 
@@ -494,7 +495,7 @@ async def test_canonical_authority_rechecks_drift_without_accepting_uuid_reuse(
 async def test_valid_canonical_authority_does_not_repeat_global_reads(scope, monkeypatch):
     publisher, _, _, receipts = scope
     replay = AsyncMock()
-    monkeypatch.setattr(candidate, "_global_replay", replay)
+    monkeypatch.setattr(candidate, "verify_identity_replay", replay)
     await candidate._canonical_authority(publisher.connection, publisher.policy, receipts)
     replay.assert_not_awaited()
     assert len(publisher.connection.reads) == 3

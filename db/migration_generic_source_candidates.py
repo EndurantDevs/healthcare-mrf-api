@@ -54,13 +54,28 @@ def _canonical_copy_guard_bodies(schema, preparation_schema):
     return old, old.replace(anchor, closure + anchor, 1)
 
 
+def _cms_canonical_copy_guard_body(schema, preparation_schema):
+    """Keep the exact v1 rules and also close a protected CMS terminal receipt."""
+    generic = _canonical_copy_guard_bodies(schema, preparation_schema)[1]
+    anchor = "preparation.publication->'native_publication'->>'contract'=\n                         'generic-source-canonical-copy-v1'"
+    if generic.count(anchor) != 1:
+        raise RuntimeError("provider_directory_canonical_copy_guard_template_changed")
+    cms = """(preparation.handoff->>'contract'='generic-source-cms-detached-v1'
+                          AND preparation.handoff->'identity'->'metadata'->'source_ids'='["cms-npd"]'::jsonb
+                          AND preparation.publication->>'contract'='cms-npd-noncurrent-candidate-v2'
+                          AND preparation.publication->>'state'='prepared'
+                          AND preparation.publication->>'dataset_id'=changed.dataset_id)"""
+    return generic.replace(anchor, "(" + anchor + " OR " + cms + ")", 1)
+
+
 _COPY_GUARD_SNAPSHOT = sa.text("""
             SELECT p.prosrc AS body, pg_get_functiondef(p.oid) AS definition,
                    to_jsonb(p)-'prosrc' AS identity, obj_description(p.oid,'pg_proc') AS description
               FROM pg_proc p JOIN pg_language language ON language.oid=p.prolang
              WHERE p.oid=to_regprocedure(:signature) AND p.prokind='f' AND p.pronargs=0
                AND p.prorettype='trigger'::regtype AND language.lanname='plpgsql' AND p.prosecdef
-               AND p.proconfig=ARRAY['search_path=pg_catalog']::text[]
+               AND p.proconfig IN (ARRAY['search_path=pg_catalog']::text[],
+                                   ARRAY['search_path=pg_catalog, pg_temp']::text[])
         """)
 
 
@@ -144,7 +159,9 @@ def _require_canonical_copy_guard_inputs(connection, schema, preparation_schema,
     )
 
 
-async def verify_generic_source_canonical_copy_guard(connection, schema, *, preparation_schema="hp_snapshot_retention"):
+async def verify_generic_source_canonical_copy_guard(
+    connection, schema, *, preparation_schema="hp_snapshot_retention", require_cms=False
+):
     """Read the installed guard on the publisher's original transaction; never repair it."""
     from process.network_cms_registry_address_capture import NativeReceiptSession
 
@@ -155,7 +172,9 @@ async def verify_generic_source_canonical_copy_guard(connection, schema, *, prep
     session = NativeReceiptSession(connection)
     signature = storage_relation(schema, "guard_pd_dataset_candidate_parent") + "()"
     observed = (await session.execute(_COPY_GUARD_SNAPSHOT, {"signature": signature})).one_or_none()
-    if observed is None or observed["body"] != _canonical_copy_guard_bodies(schema, preparation_schema)[1]:
+    generic = _canonical_copy_guard_bodies(schema, preparation_schema)[1]
+    cms = _cms_canonical_copy_guard_body(schema, preparation_schema)
+    if observed is None or observed["body"] not in ((cms,) if require_cms else (generic, cms)):
         raise RuntimeError("provider_directory_canonical_copy_guard_changed")
     reader, triggers = _canonical_copy_guard_input_parameters(schema, preparation_schema, observed["identity"])
     _require_canonical_copy_guard_observations(
@@ -163,22 +182,27 @@ async def verify_generic_source_canonical_copy_guard(connection, schema, *, prep
     )
 
 
-def upgrade_generic_source_canonical_copy_guard(connection, schema, *, preparation_schema="hp_snapshot_retention"):
+def upgrade_generic_source_canonical_copy_guard(
+    connection, schema, *, preparation_schema="hp_snapshot_retention", include_cms=False
+):
     """Update only the existing guard, using immutable protected publication authority.
 
     Enrollment must keep preparation writes outside untrusted runtime authority,
     including inherited global-write roles; the canonical header is not trusted.
+    CMS requires a separately accepted consumer transition before include_cms.
     """
     if not connection.in_transaction():
         raise RuntimeError("provider_directory_canonical_copy_guard_transaction_required")
     old, new = _canonical_copy_guard_bodies(schema, preparation_schema)
+    cms = _cms_canonical_copy_guard_body(schema, preparation_schema)
     signature = storage_relation(schema, "guard_pd_dataset_candidate_parent") + "()"
     before = _canonical_copy_guard_snapshot(connection, signature)
-    if before is None or before["body"] not in (old, new):
+    if before is None or before["body"] not in ((new, cms) if include_cms else (old, new, cms)):
         raise RuntimeError("provider_directory_canonical_copy_guard_changed")
     _require_canonical_copy_guard_inputs(connection, schema, preparation_schema, before["identity"])
-    if before["body"] == new:
+    if before["body"] == cms or (before["body"] == new and not include_cms):
         return
+    old, new = (new, cms) if include_cms else (old, new)
     if before["definition"].count(old) != 1:
         raise RuntimeError("provider_directory_canonical_copy_guard_changed")
     with connection.begin_nested():

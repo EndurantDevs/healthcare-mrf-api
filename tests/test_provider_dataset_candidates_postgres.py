@@ -497,7 +497,7 @@ async def _prepare_copy_guard_catalog(context, roles):
     )
 
 
-async def _update_canonical_copy_guard(context, *, add_column=False):
+async def _update_canonical_copy_guard(context, *, add_column=False, include_cms=False):
     async with context.engine.begin() as transaction:
         await transaction.exec_driver_sql("SET LOCAL lock_timeout='100ms'")
         if add_column:
@@ -506,7 +506,7 @@ async def _update_canonical_copy_guard(context, *, add_column=False):
             )
         await transaction.run_sync(
             lambda connection: upgrade_generic_source_canonical_copy_guard(
-                connection, context.schema_name, preparation_schema=context.schema_name
+                connection, context.schema_name, preparation_schema=context.schema_name, include_cms=include_cms
             )
         )
 
@@ -528,10 +528,10 @@ async def _candidate_triggers(context):
     )
 
 
-async def _verify_copy_guard(context):
+async def _verify_copy_guard(context, *, require_cms=False):
     async with context.connection.transaction(readonly=True):
         await verify_generic_source_canonical_copy_guard(
-            context.connection, context.schema_name, preparation_schema=context.schema_name
+            context.connection, context.schema_name, preparation_schema=context.schema_name, require_cms=require_cms
         )
 
 
@@ -578,7 +578,8 @@ async def _assert_copy_guard_drift_refusals(context, roles, after):
 
 
 @pytest.mark.asyncio
-async def test_canonical_copy_guard_update_preserves_native_identity_and_refuses_drift(monkeypatch):
+@pytest.mark.parametrize("include_cms", (False, True))
+async def test_canonical_copy_guard_update_preserves_native_identity_and_refuses_drift(monkeypatch, include_cms):
     async with _candidate_test_scope(monkeypatch) as (context, roles):
         await _install_retirement_child_guards(context)
         await run_migration(context.engine, _candidate_migration(), "upgrade")
@@ -594,9 +595,17 @@ async def test_canonical_copy_guard_update_preserves_native_identity_and_refuses
         before, triggers = await _candidate_guard_metadata(context), await _candidate_triggers(context)
         with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
             await _verify_copy_guard(context)
+        with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
+            await _update_canonical_copy_guard(context, include_cms=True)
         async with context.connection.transaction():
             await context.connection.fetchval(f"SELECT count(*) FROM {context.schema}.{TABLES[0]}")
             await _update_canonical_copy_guard(context)
+        if include_cms:
+            await _update_canonical_copy_guard(context, include_cms=True)
+            await _verify_copy_guard(context, require_cms=True)
+        else:
+            with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
+                await _verify_copy_guard(context, require_cms=True)
         after = await _candidate_guard_metadata(context)
         assert after["identity"] == before["identity"] and after["description"] == before["description"]
         assert after["prosrc"] != before["prosrc"]
@@ -800,13 +809,162 @@ async def _assert_preparation_writes_denied(connection, schema):
                 await connection.execute(statement)
 
 
+async def _record_cms_copy_guard_publication(context, dataset_id, damage):
+    handoff_by_field = {
+        "contract": "generic-source-cms-detached-v1",
+        "identity": {"dataset_id": dataset_id, "metadata": {"source_ids": ["cms-npd"]}},
+    }
+    publication_by_field = {
+        "contract": "cms-npd-noncurrent-candidate-v2",
+        "state": "prepared",
+        "dataset_id": dataset_id,
+    }
+    importer, state = "provider-directory-fhir", "published"
+    match damage:
+        case "importer":
+            importer = "synthetic-other-importer"
+        case "state":
+            state = "validated"
+        case "handoff":
+            handoff_by_field["contract"] = "synthetic-other-handoff"
+        case "sources":
+            handoff_by_field["identity"]["metadata"]["source_ids"] = ["synthetic-other-source"]
+        case "publication_state":
+            publication_by_field["state"] = "synthetic-other-value"
+        case "legacy_contract":
+            publication_by_field["contract"] = "cms-npd-noncurrent-candidate-v1"
+        case "contract":
+            publication_by_field["contract"] = "cms-npd-noncurrent-candidate-v3"
+        case "dataset_id":
+            publication_by_field["dataset_id"] = "synthetic-other-value"
+    await context.connection.execute(
+        f"INSERT INTO {context.schema}.preparation(importer_id,state,handoff,publication) VALUES($1,$2,$3::jsonb,$4::jsonb)",
+        importer,
+        state,
+        json.dumps(handoff_by_field),
+        json.dumps(publication_by_field),
+    )
+
+
+async def _assert_cms_guard_moves(connection, parent, key, dataset_id, *, protected):
+    mutable = "synthetic-cms-open"
+    for origin, destination in ((dataset_id, mutable), (mutable, dataset_id)):
+        transaction = connection.transaction()
+        await transaction.start()
+        try:
+            statement = f"UPDATE {parent} SET dataset_id=$2,{key}='moved' WHERE dataset_id=$1"
+            if protected:
+                with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
+                    await connection.execute(statement, origin, destination)
+            else:
+                assert await connection.execute(statement, origin, destination) == "UPDATE 1"
+        finally:
+            await transaction.rollback()
+
+
+async def _assert_cms_guard_writes(context, role, root, dataset_id, *, protected):
+    connection, schema = context.connection, context.schema
+    parent, columns = f"{schema}.{root}", _COPY_GUARD_COLUMNS[root]
+    child = await connection.fetchval(f"SELECT tableoid::regclass::text FROM {parent} WHERE dataset_id=$1", dataset_id)
+    for relation in (parent, child):
+        await connection.execute(f"GRANT SELECT,INSERT,UPDATE,DELETE ON {relation} TO {quoted(role)}")
+    async with connection.transaction():
+        await connection.execute(f"SET LOCAL ROLE {quoted(role)}")
+        await _assert_cms_guard_moves(connection, parent, columns[0], dataset_id, protected=protected)
+        if not protected:
+            key = columns[0]
+            for relation in (parent, child):
+                assert await _insert_copy_guard_row(connection, relation, root, dataset_id, "late") == "INSERT 0 1"
+                assert (
+                    await connection.execute(f"UPDATE {relation} SET {key}={key} WHERE dataset_id=$1", dataset_id)
+                    == "UPDATE 2"
+                )
+                assert (
+                    await connection.execute(f"DELETE FROM {relation} WHERE dataset_id=$1 AND {key}='late'", dataset_id)
+                    == "DELETE 1"
+                )
+            return
+        for relation in (parent, child):
+            await _assert_copy_guard_rejects_changes(connection, relation, root, dataset_id)
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
+            async with connection.transaction():
+                await connection.copy_records_to_table(
+                    root,
+                    schema_name=context.schema_name,
+                    columns=("dataset_id", *columns),
+                    records=[_copy_guard_record(root, dataset_id, "copy-batch")],
+                )
+
+
 @pytest.mark.asyncio
-async def test_canonical_copy_guard_closes_only_finalized_copies_across_writer_paths(monkeypatch):
+@pytest.mark.parametrize("include_cms", (False, True))
+async def test_cms_receipt_guard_scope(monkeypatch, include_cms):
     async with _candidate_test_scope(monkeypatch) as (context, roles):
         await _install_retirement_child_guards(context)
         await run_migration(context.engine, _candidate_migration(), "upgrade")
         await _prepare_copy_guard_catalog(context, roles)
         await _update_canonical_copy_guard(context, add_column=True)
+        if include_cms:
+            await _update_canonical_copy_guard(context, include_cms=True)
+        await _seed_copy_guard_dataset(context, "synthetic-cms-open", "acquiring", False)
+        for damage in (
+            None,
+            "importer",
+            "state",
+            "handoff",
+            "sources",
+            "legacy_contract",
+            "contract",
+            "publication_state",
+            "dataset_id",
+        ):
+            dataset_id = "synthetic-cms-" + str(damage)
+            await _seed_copy_guard_dataset(context, dataset_id, "acquiring", False)
+            await _record_cms_copy_guard_publication(context, dataset_id, damage)
+            for root in _COPY_GUARD_COLUMNS:
+                await _assert_cms_guard_writes(
+                    context, roles["generic"], root, dataset_id, protected=include_cms and damage is None
+                )
+
+
+@pytest.mark.asyncio
+async def test_cms_guard_upgrade_rollback(monkeypatch):
+    async with _candidate_test_scope(monkeypatch) as (context, roles):
+        await _install_retirement_child_guards(context)
+        await run_migration(context.engine, _candidate_migration(), "upgrade")
+        await _prepare_copy_guard_catalog(context, roles)
+        await _update_canonical_copy_guard(context, add_column=True)
+        before, triggers = await _candidate_guard_metadata(context), await _candidate_triggers(context)
+        with pytest.raises(RuntimeError, match="synthetic_outer_rollback"):
+            async with context.engine.begin() as transaction:
+                await transaction.run_sync(
+                    lambda connection: upgrade_generic_source_canonical_copy_guard(
+                        connection, context.schema_name, preparation_schema=context.schema_name, include_cms=True
+                    )
+                )
+                body = await transaction.exec_driver_sql(
+                    f"SELECT prosrc FROM pg_proc WHERE oid='{context.schema}.guard_pd_dataset_candidate_parent()'::regprocedure"
+                )
+                assert body.scalar_one() != before["prosrc"]
+                raise RuntimeError("synthetic_outer_rollback")
+        assert await _candidate_guard_metadata(context) == before
+        assert await _candidate_triggers(context) == triggers
+        with pytest.raises(RuntimeError, match="canonical_copy_guard_changed"):
+            await _verify_copy_guard(context, require_cms=True)
+        await _update_canonical_copy_guard(context, include_cms=True)
+        await _verify_copy_guard(context, require_cms=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_cms", (False, True))
+async def test_canonical_copy_guard_closes_only_finalized_copies_across_writer_paths(monkeypatch, include_cms):
+    async with _candidate_test_scope(monkeypatch) as (context, roles):
+        await _install_retirement_child_guards(context)
+        await run_migration(context.engine, _candidate_migration(), "upgrade")
+        await _prepare_copy_guard_catalog(context, roles)
+        await _update_canonical_copy_guard(context, add_column=True)
+        if include_cms:
+            await _update_canonical_copy_guard(context, include_cms=True)
         connection, schema = context.connection, context.schema
         protected_ids, mutable = await _seed_copy_guard_writer_cases(context, roles)
         relations = await _grant_copy_guard_relation_access(context, roles)

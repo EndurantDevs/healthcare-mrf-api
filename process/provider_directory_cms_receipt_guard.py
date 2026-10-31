@@ -3,6 +3,15 @@
 
 import re
 
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
+
+_CMS_SETTINGS_FUNCTIONS = {
+    "cms_serving_profile_transition",
+    "cms_serving_no_truncate",
+    "cms_serving_receipt_immutable",
+    "cms_serving_receipt_insert",
+}
+
 PROFILE_FIELDS = (
     "status",
     "operation",
@@ -84,9 +93,17 @@ async def assert_profile_receipt_guards(database, relation_by_field, captured_tr
             RAISE EXCEPTION 'cms_serving_native_truncate_forbidden'; END IF; RETURN NULL; END""",
         ),
     }
-    if await database.scalar("SELECT to_regclass(:relation) IS NOT NULL",
-                             relation=f"{quoted_schema}.provider_directory_profile_initial_receipt") is True:
-        from process.provider_directory_profile_initial_guards import initial_serving_guard_expected, _assert_match_function
+    if (
+        await database.scalar(
+            "SELECT to_regclass(:relation) IS NOT NULL",
+            relation=f"{quoted_schema}.provider_directory_profile_initial_receipt",
+        )
+        is True
+    ):
+        from process.provider_directory_profile_initial_guards import (
+            _assert_match_function,
+            initial_serving_guard_expected,
+        )
 
         expected_by_name.update(initial_serving_guard_expected(schema))
         await _assert_match_function(database, schema)
@@ -145,7 +162,12 @@ async def _assert_guards(database, relation_by_field, expected_by_name, captured
             or guard_by_field["function_name"] != guard_by_field["name"]
             or guard_by_field["function_arguments"] != 0
             or guard_by_field["security_definer"] is not False
-            or guard_by_field["function_settings"] != ["search_path=pg_catalog"]
+            or guard_by_field["function_settings"]
+            not in (
+                approved_cms_routine_settings(["search_path=pg_catalog"])
+                if guard_by_field["name"] in _CMS_SETTINGS_FUNCTIONS
+                else (["search_path=pg_catalog"],)
+            )
             or guard_by_field["language"] != "plpgsql"
             or guard_by_field["returns_trigger"] is not True
             or _normalized(guard_by_field["function_body"]) != _normalized(expected[2])

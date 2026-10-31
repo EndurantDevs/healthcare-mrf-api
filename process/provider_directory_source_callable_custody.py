@@ -4,6 +4,8 @@
 import asyncio
 from copy import deepcopy
 
+from db.migration_cms_noncurrent_seal import GUARD as _CMS_SEAL_GUARD
+from db.migration_cms_noncurrent_seal import ORIGINAL_SHA256, lifecycle_guard_bodies
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.plan_release_storage_custody import storage_roles
 from process.provider_directory_cms_callable_custody import (
@@ -14,6 +16,7 @@ from process.provider_directory_cms_callable_custody import (
     _decoded,
 )
 from process.provider_directory_cms_receipt_custody import _require_migration_identity
+from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_profile_initial_custody import _role_rows
 
@@ -792,6 +795,38 @@ def source_callable_signatures(schema):
     )
 
 
+def _is_approved_body(definition, schema, digest):
+    """Recognize only the fixed predecessor or its exact source-rendered successor."""
+    if _body_digest(definition["prosrc"], schema) == digest:
+        return True
+    if definition["proname"] == _CMS_SEAL_GUARD and digest == ORIGINAL_SHA256:
+        return definition["prosrc"] == lifecycle_guard_bodies(schema)[1]
+    from db import migration_cms_snapshot_allocator as allocator
+
+    if definition["proname"] == "prepare_pd_generic_dataset_storage" and digest == allocator.ORIGINAL_ALLOCATOR_SHA256:
+        return definition["prosrc"] in (
+            allocator.allocator_bodies(schema)[1],
+            allocator.bound_cms_allocator_body(schema),
+        )
+    from db import migration_cms_terminal_resolution as terminal
+
+    if definition["proname"] == terminal.GUARD and digest == terminal.ORIGINAL_SHA256:
+        return definition["prosrc"] == terminal.terminal_guard_bodies(schema)[1]
+    from db import migration_cms_ptg_json_resolution as ptg
+
+    if definition["proname"] == ptg.FUNCTION and digest == ptg.ORIGINAL_SHA256:
+        return definition["prosrc"] == ptg.ptg_json_bodies(schema)[1]
+    from db.migration_cms_retirement_resolution import ORIGINAL_SHA256 as retirement_digests
+    from db.migration_cms_retirement_resolution import retirement_resolution_bodies
+
+    name = definition["proname"]
+    return (
+        name in retirement_digests
+        and digest == retirement_digests[name]
+        and definition["prosrc"] == retirement_resolution_bodies(schema)[name][1]
+    )
+
+
 def _require_definition(entry, spec, schema, namespace, types, quoted_schema):
     arguments, returns, outputs, language, volatility, strict, parallel, security, digest = spec
     definition = entry["definition"]
@@ -825,11 +860,14 @@ def _require_definition(entry, spec, schema, namespace, types, quoted_schema):
         if definition["proname"].startswith("ptg_wave_")
         else ["search_path=pg_catalog"],
     )
+    expected_settings = expected_by_field.pop("proconfig")
+    has_approved_body = _is_approved_body(definition, schema, digest)
     _require(
         int(definition["pronamespace"]) == namespace
         and entry["language"] == language
+        and definition["proconfig"] in approved_cms_routine_settings(expected_settings)
         and all(definition[field] == field_value for field, field_value in expected_by_field.items())
-        and _body_digest(definition["prosrc"], schema) == digest,
+        and has_approved_body,
         "definition_changed",
     )
 
