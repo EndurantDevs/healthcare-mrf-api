@@ -13614,15 +13614,13 @@ async def _fetch_location_status_by_record_id(
             _runtime_db_schema(),
             overlay_table_sql,
         )
-        if use_request_session and session is not None:
-            async with provider_read_savepoint(session):
-                query_result = await _execute_stmt(
-                    status_query,
-                    session=session,
-                    params={"source_record_ids": normalized_record_ids},
-                )
-                return _status_map_from_result(query_result)
-        async with db.session() as status_session:
+        use_passed_session = use_request_session and session is not None
+        async with (
+            contextlib.nullcontext(session) if use_passed_session else db.session() as status_session,
+            provider_read_savepoint(status_session)
+            if use_passed_session or has_network_read_inventory(status_session)
+            else contextlib.nullcontext(),
+        ):
             query_result = await _execute_stmt(
                 status_query,
                 session=status_session,
