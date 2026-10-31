@@ -84,7 +84,7 @@ async def test_distance_card_resolves_release_metadata_once(monkeypatch, project
         {"zip_radius_miles": "26"},
     ],
 )
-async def test_ineligible_distance_request_keeps_projection_free_guard(monkeypatch, updates):
+async def test_ineligible_distance_card_keeps_guard_but_bounded_full_skips_it(monkeypatch, updates):
     session = _Session([_binding_row()])
     resolver = AsyncMock(return_value=None)
     monkeypatch.setattr(pricing_module, "resolve_plan_release_serving", resolver)
@@ -96,13 +96,16 @@ async def test_ineligible_distance_request_keeps_projection_free_guard(monkeypat
     response = await pricing_module.list_providers_by_procedure(request)
 
     assert response.status == 200
-    assert len(session.calls) == 3
-    assert "AS readable" in session.calls[0][0]
-    assert "AS storage_present" in session.calls[1][0]
-    assert "plan_pricing_projection_candidate" not in session.calls[1][0]
-    assert "to_regclass" not in session.calls[1][0]
-    assert "plan_pricing_projection_candidate" not in session.calls[2][0]
-    assert "to_regclass" not in session.calls[2][0]
+    if updates.get("view") == "full":
+        assert session.calls == []
+    else:
+        assert len(session.calls) == 3
+        assert "AS readable" in session.calls[0][0]
+        assert "AS storage_present" in session.calls[1][0]
+        assert "plan_pricing_projection_candidate" not in session.calls[1][0]
+        assert "to_regclass" not in session.calls[1][0]
+        assert "plan_pricing_projection_candidate" not in session.calls[2][0]
+        assert "to_regclass" not in session.calls[2][0]
     resolver.assert_awaited_once()
 
 

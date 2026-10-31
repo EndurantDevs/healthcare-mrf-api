@@ -10063,12 +10063,9 @@ def _membership_knn_prefilter_sql(
 
 
 def _membership_projection_knn_prefilter_sql(
-    args: Mapping[str, Any],
-    parameter_map: dict[str, Any],
-    knn_order_sql: str | None,
+    args: Mapping[str, Any], parameter_map: dict[str, Any], knn_order_sql: str | None
 ) -> str:
     """Render the attested taxonomy superset before broad raw KNN limits."""
-
     if knn_order_sql is None:
         return "TRUE"
     if not _uses_npi_search_taxonomy_projection():
@@ -10076,7 +10073,10 @@ def _membership_projection_knn_prefilter_sql(
     projection_sql = _membership_scope_projection_sql(args, parameter_map)
     if projection_sql == "TRUE":
         return _membership_knn_prefilter_sql(args, parameter_map, knn_order_sql)
-    return f"addr.npi IN (SELECT scope_provider.npi FROM {PTG2_SCHEMA}.npi scope_provider WHERE {projection_sql})"
+    return (
+        f"EXISTS (SELECT 1 FROM {PTG2_SCHEMA}.npi scope_provider "
+        f"WHERE scope_provider.npi = addr.npi AND ({projection_sql}) OFFSET 0)"
+    )
 
 
 def _membership_location_taxonomy_index_sql(

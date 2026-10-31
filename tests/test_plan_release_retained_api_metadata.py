@@ -221,7 +221,12 @@ async def test_original_session_installs_verified_pins_before_return(monkeypatch
     native = _Native()
     session = _orm_session(native)
     _verify(monkeypatch, native)
+    catalog = AsyncMock(side_effect=AssertionError("API metadata must bypass the ORM catalog tuner"))
+    monkeypatch.setattr(storage, "_catalog_session_rows", catalog)
     assert await storage.is_retained_session_read(session, _SCHEMA, api_read=True) is True
+    catalog.assert_not_awaited()
+    assert any(sql == storage._API_CATALOG_SQL for _, sql in native.calls)
+    assert all(sql != storage.CATALOG_SQL for _, sql in native.calls)
     installed = execution._installed_read_inventory(session)
     assert installed.connection is native and installed.relations == _pins() and installed.backend_pid == 42
     assert session.get_transaction() is session.transaction

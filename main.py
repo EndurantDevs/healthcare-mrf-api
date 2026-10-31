@@ -12,22 +12,22 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-env_path = Path(__file__).absolute().parent / '.env'
+env_path = Path(__file__).absolute().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-with open(os.environ['HLTHPRT_LOG_CFG'], encoding="utf-8") as log_config_file:
+with open(os.environ["HLTHPRT_LOG_CFG"], encoding="utf-8") as log_config_file:
     logging.config.dictConfig(yaml.safe_load(log_config_file))
 
 import arq.cli
 import click
 import uvloop
-from asyncpg import connection
 from arq.logs import default_log_config
 from arq.utils import import_string
 from arq.worker import create_worker
-from sanic import Sanic
+from asyncpg import connection
 
 from api import init_api
+from api.request_lifecycle import RequestLifecycleSanic
 from db.migrator import db_group
 from process import process_group, process_group_end
 from process.ptg_wave_receipt_process_authority import (
@@ -47,7 +47,7 @@ def _run_async(coro):
 
 asyncio.set_event_loop(_new_event_loop())
 
-api = Sanic('mrf-api', env_prefix="HLTHPRT_")
+api = RequestLifecycleSanic("mrf-api", env_prefix="HLTHPRT_")
 init_api(api)
 
 
@@ -55,16 +55,14 @@ def _default_api_workers() -> int:
     raw = os.getenv("HLTHPRT_API_WORKERS", "1")
     try:
         return max(int(raw), 1)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 1
 
 
 def _restrict_asyncpg_server_capabilities() -> None:
     """Disable unsupported backend operations when asyncpg exposes its hook."""
 
-    detect_server_capabilities = getattr(
-        connection, "_detect_server_capabilities", None
-    )
+    detect_server_capabilities = getattr(connection, "_detect_server_capabilities", None)
     if not callable(detect_server_capabilities):
         return
 
@@ -87,32 +85,26 @@ def _restrict_asyncpg_server_capabilities() -> None:
 
 
 @click.command(help="Run sanic server")
-@click.option('--host', help='Setup host ip to listen up, default to 0.0.0.0', default='0.0.0.0')
-@click.option('--port', help='Setup port to attach, default to 8080', type=int, default=8080)
+@click.option("--host", help="Setup host ip to listen up, default to 0.0.0.0", default="0.0.0.0")
+@click.option("--port", help="Setup port to attach, default to 8080", type=int, default=8080)
 @click.option(
-    '--workers',
-    help='Setup workers to run, default from HLTHPRT_API_WORKERS or 1',
+    "--workers",
+    help="Setup workers to run, default from HLTHPRT_API_WORKERS or 1",
     type=int,
     default=_default_api_workers(),
 )
-@click.option('--debug', help='Enable or disable debugging', is_flag=True)
-@click.option('--accesslog', help='Enable or disable access log', is_flag=True)
+@click.option("--debug", help="Enable or disable debugging", is_flag=True)
+@click.option("--accesslog", help="Enable or disable access log", is_flag=True)
 def start(host, port, workers, debug, accesslog):
     """Start the API server with the requested runtime options."""
     if receipt_authority_role() == RECEIPT_AUTHORITY_ROLE_SIGNER:
         require_receipt_authority_worker_count(workers)
     _restrict_asyncpg_server_capabilities()
     if debug:
-        os.environ['HLTHPRT_DB_ECHO'] = 'True'
-    with open(api.config['LOG_CFG'], encoding="utf-8") as log_file:
+        os.environ["HLTHPRT_DB_ECHO"] = "True"
+    with open(api.config["LOG_CFG"], encoding="utf-8") as log_file:
         logging.config.dictConfig(yaml.safe_load(log_file))
-    api.run(
-        host=host,
-        port=port,
-        workers=workers,
-        debug=debug,
-        auto_reload=debug,
-        access_log=accesslog)
+    api.run(host=host, port=port, workers=workers, debug=debug, auto_reload=debug, access_log=accesslog)
 
 
 @click.group()
@@ -121,6 +113,7 @@ def server():
 
 
 server.add_command(start)
+
 
 @click.group()
 def cli():
@@ -220,7 +213,7 @@ def _job_id_text(job_id) -> str:
 def _positive_int(value) -> int | None:
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return parsed if parsed > 0 else None
 
@@ -258,9 +251,7 @@ def rollback_terminology_synonyms(
             )
         )
     except Exception:
-        raise click.ClickException(
-            "terminology synonym rollback failed"
-        ) from None
+        raise click.ClickException("terminology synonym rollback failed") from None
     click.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
@@ -272,9 +263,7 @@ def sync_structure(skip_columns: bool, skip_indexes: bool):
     from db.maintenance import render_sync_summary
     from db.maintenance import sync_structure as _sync_structure  # lazy import
 
-    results = _run_async(
-        _sync_structure(add_columns=not skip_columns, add_indexes=not skip_indexes)
-    )
+    results = _run_async(_sync_structure(add_columns=not skip_columns, add_indexes=not skip_indexes))
     render_sync_summary(results)
 
 
@@ -296,9 +285,9 @@ def verify_formulary_fhir(
 ) -> None:
     """Run the default-off, source-locked, verify-only formulary adapter."""
 
-    from process.formulary_fhir.manual_worker import ManualSynchronizationError
-    from process.formulary_fhir.manual_worker import manual_result_json
     from process.formulary_fhir.manual_worker import (
+        ManualSynchronizationError,
+        manual_result_json,
         synchronize_verified_dataset_manually,
     )
 
@@ -315,13 +304,9 @@ def verify_formulary_fhir(
     except ManualSynchronizationError as error:
         raise click.ClickException(str(error)) from None
     except TimeoutError:
-        raise click.ClickException(
-            "FHIR formulary manual synchronization timed out"
-        ) from None
+        raise click.ClickException("FHIR formulary manual synchronization timed out") from None
     except Exception:
-        raise click.ClickException(
-            "FHIR formulary manual synchronization failed"
-        ) from None
+        raise click.ClickException("FHIR formulary manual synchronization failed") from None
     click.echo(rendered_result)
 
 
@@ -329,8 +314,7 @@ def verify_formulary_fhir(
 @click.option("--test", is_flag=True, help="Use the test database suffix defined via HLTHPRT_TEST_DATABASE_SUFFIX.")
 def rebuild_plan_summary(test: bool):
     """Rebuild the plan_search_summary table so /plan/search can use precomputed filters."""
-    from process.plan_summary import \
-        rebuild_plan_search_summary as _rebuild  # lazy import
+    from process.plan_summary import rebuild_plan_search_summary as _rebuild  # lazy import
 
     rows = _run_async(_rebuild(test_mode=test))
     click.echo(f"Rebuilt plan_search_summary with {rows} rows")
@@ -461,5 +445,5 @@ cli.add_command(arq.cli.cli, name="worker")
 cli.add_command(manage, name="manage")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     cli()

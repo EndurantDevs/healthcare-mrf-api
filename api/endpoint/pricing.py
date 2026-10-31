@@ -88,6 +88,7 @@ from api.plan_release_serving_resolution import (
     _release_market_type_for_guard,
     resolve_plan_release_guard_selection,
 )
+from api.pricing_provider_scope import _is_bounded_provider_expansion, _raise_broad_group_plan_provider_expansion
 from api.provider_demographic_filters import (
     normalize_provider_sex_code,
     provider_sex_exists_sql,
@@ -201,6 +202,7 @@ from api.ptg2_shared_blocks import (
 from api.ptg2_snapshot import current_network_snapshots_for_plan, current_source_snapshot_id_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
 from api.reference_family_reads import _query_catalog_neighbors, claims_dictionary_tables
+from api.signed_request_reader import is_owned_reader
 from db.connection import db, gather_reader_calls
 from db.models import (
     DoctorClinicianAddress,
@@ -1332,39 +1334,6 @@ def _validated_plan_release_id(args: Mapping[str, Any]) -> str:
     return normalized_release_id
 
 
-def _raise_broad_group_plan_provider_expansion(
-    *,
-    has_taxonomy_scope: bool,
-) -> None:
-    """Raise the actionable error for an unbounded provider expansion."""
-
-    if has_taxonomy_scope:
-        raise InvalidUsage(
-            "Statewide taxonomy-scoped CPT office-visit provider expansion is too broad; "
-            "add zip5 with zip_radius_miles (or lat, long, and radius_miles).",
-            context={
-                "fix_it": {
-                    "reason": (
-                        "A statewide taxonomy search expands too many provider-rate "
-                        "candidates for an interactive request."
-                    ),
-                    "retry_options": [
-                        {
-                            "zip5": "<member ZIP>",
-                            "zip_radius_miles": 10,
-                            "note": "Retry inside a bounded ZIP radius.",
-                        }
-                    ],
-                }
-            },
-        )
-    raise InvalidUsage(
-        "Broad CPT office-visit provider expansion for a group plan is a provider-directory request; "
-        "use /api/v1/pricing/group-plan-providers with specialty/classification/location filters, or add "
-        "specialty/taxonomy/npi and use procedure pricing only when the user asks for office-visit cost."
-    )
-
-
 def _has_provider_expansion_location(
     args: Mapping[str, Any],
     context: Mapping[str, Any],
@@ -1422,13 +1391,8 @@ def _reject_broad_group_plan_provider_expansion(
         if has_taxonomy_scope:
             _raise_broad_group_plan_provider_expansion(has_taxonomy_scope=True)
         return
-    has_bounded_location = bool(zip5 or (latitude is not None and longitude is not None))
-    if has_bounded_location and (
-        has_taxonomy_scope
-        or (
-            str(args.get("order_by") or "").strip().lower() in {"distance", "distance_miles"}
-            and (_request_value_or_none(args.get("order")) is None or str(args.get("order")).strip().lower() == "asc")
-        )
+    if _is_bounded_provider_expansion(
+        args, zip5=zip5, latitude=latitude, longitude=longitude, has_taxonomy_scope=has_taxonomy_scope
     ):
         return
     _raise_broad_group_plan_provider_expansion(has_taxonomy_scope=has_taxonomy_scope)
@@ -11766,6 +11730,21 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
 
     if not query_text and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
+    if (
+        plan_release_id
+        and native_args is None
+        and import_context is None
+        and not is_state_scan
+        and projected_result_type is None
+        and _parse_bool(args.get("include_providers"), "include_providers", default=True)
+        and getattr(request.ctx, "_sa_reader_scope", None) is not None
+        and is_owned_reader(session)
+    ):
+        # The HTTP Reader owns this transaction through response encoding.
+        await execute_network_read(
+            session,
+            text("SELECT set_config('jit', 'off', true), set_config('plan_cache_mode', 'force_custom_plan', true)"),
+        )
     ptg_specialty_filter = None
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         # Plan-scoped searches filter via taxonomy codes; an unresolvable
@@ -11847,7 +11826,21 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
             )
             guard_release_selection = release_selection
             release_selection_args_by_name = _release_selection_args_by_name(release_selection)
-        else:
+        elif (
+            native_args is not None
+            or import_context is not None
+            or view != "full"
+            or projected_result_type is not None
+            or not _is_bounded_provider_expansion(
+                args,
+                zip5=zip5,
+                latitude=latitude,
+                longitude=longitude,
+                has_taxonomy_scope=bool(
+                    ptg_specialty_filter.is_active or args.get("taxonomy_code") or args.get("taxonomy_classification")
+                ),
+            )
+        ):
             guard_release_selection = await resolve_plan_release_guard_selection(
                 session,
                 plan_release_id,
