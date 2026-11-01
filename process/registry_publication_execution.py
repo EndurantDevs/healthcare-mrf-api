@@ -482,9 +482,10 @@ async def _source_rollback_address_sources(connection, source_pin, control_schem
         if receipt.address_source != address_pin:
             raise ValueError("registry_source_rollback_address_changed")
         if bootstrap:
-            await bootstrap_sources.verify_network_bootstrap_sources(connection, receipt)
             if compact_upgrade:
+                await bootstrap_sources._verify_capture(connection, receipt, verify_content=False)
                 return RegistryCompositionAddressSources(receipt.address_source, receipt.npi_source, compact=True)
+            await bootstrap_sources.verify_network_bootstrap_sources(connection, receipt)
         else:
             if compact_upgrade:
                 raise ValueError("registry_publication_compact_bootstrap_required")
