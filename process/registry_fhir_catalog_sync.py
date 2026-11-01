@@ -250,6 +250,8 @@ async def _prepare_fhir_catalog_snapshot(
     producer_options = {"source_export": source_export} if source_export is not None else {}
     async with _catalog_source_reads(source_pool, sealer_pool, config.grant, source_export) as source_reads:
         export_options = {"exports_by_profile": source_reads[2]} if source_reads[2] is not None else {}
+        if (endpoint_ids := getattr(config, "source_endpoint_ids", None)) is not None:
+            export_options["endpoint_ids"] = endpoint_ids
         accepted, unavailable = await _discover_catalog_sources(source_reads[0], config.grant, **export_options)
         if not accepted and any(
             disposition.reason in {"catalog_observation_unavailable", "catalog_observation_timeout"}
@@ -304,8 +306,9 @@ def _report_retained_sources(retained_sources):
         )
 
 
-async def _discover_catalog_sources(source_connection, grant, *, exports_by_profile=None):
+async def _discover_catalog_sources(source_connection, grant, *, exports_by_profile=None, endpoint_ids=None):
     accepted, unavailable = [], []
+    seen_endpoints = set()
     for profile in grant.source_profiles:
         report = current_fhir_catalog_report()
         profile_index = report.add_profile(profile) if report else None
@@ -318,6 +321,9 @@ async def _discover_catalog_sources(source_connection, grant, *, exports_by_prof
             else iter_fhir_catalog_sources(source_connection, profile, observation_contract=grant.observation_contract)
         )
         async for page in pages:
+            if endpoint_ids is not None and any(disposition.endpoint_id not in endpoint_ids for disposition in page):
+                raise ValueError("registry_fhir_catalog_source_endpoint_scope_changed")
+            seen_endpoints.update(disposition.endpoint_id for disposition in page)
             if report:
                 report.add_sources(
                     page,
@@ -335,6 +341,8 @@ async def _discover_catalog_sources(source_connection, grant, *, exports_by_prof
                 raise ValueError("registry_fhir_catalog_source_vector_bounds")
         if report:
             report.document["profiles"][profile_index]["complete"] = True
+    if endpoint_ids is not None and seen_endpoints != set(endpoint_ids):
+        raise ValueError("registry_fhir_catalog_source_endpoint_unavailable")
     return accepted, unavailable
 
 

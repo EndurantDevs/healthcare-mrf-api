@@ -128,7 +128,8 @@ class FHIRCatalogQuery:
 def _literal_pattern(text):
     if text is None:
         return None
-    return "%" + text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    escaped = text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return "%" + "%".join(escaped.split()) + "%"
 
 
 def _object(document, fields):
@@ -438,7 +439,11 @@ _DIRECTORY_AVAILABLE_SQL = """EXISTS(SELECT 1 FROM {candidate}.network_membershi
 
 
 _PAGE_SQL = r"""
-WITH matching_edges AS NOT MATERIALIZED (
+WITH searched_edges AS MATERIALIZED (
+ SELECT edge.network_id,edge.relationship_id FROM {control}.registry_fhir_catalog_relationship edge
+ WHERE edge.metadata_generation=$1
+   AND (edge.company_search LIKE $10 ESCAPE '\' OR edge.plan_search LIKE $10 ESCAPE '\')
+), matching_edges AS NOT MATERIALIZED (
  SELECT edge.network_id,edge.relationship_id,
    CASE WHEN edge.group_id=ANY($4::uuid[]) THEN
      (edge.document_json-'relationship_id') || jsonb_build_object('group',NULL)
@@ -467,7 +472,9 @@ WITH matching_edges AS NOT MATERIALIZED (
  SELECT network.* FROM {control}.registry_fhir_catalog_network network
  WHERE network.metadata_generation=$1 AND NOT network.network_id=ANY($2::integer[])
    AND ($9::boolean IS NULL OR network.archived=$9)
-   AND ($10::text IS NULL OR network.search_name LIKE $10 ESCAPE '\')
+   AND ($10::text IS NULL OR network.search_name LIKE $10 ESCAPE '\'
+     OR network.network_id IN (SELECT edge.network_id FROM matching_edges edge
+       JOIN searched_edges searched USING(network_id,relationship_id)))
    AND ($11::text IS NULL OR $11=ANY(network.benefit_codes))
    AND ($12::text[] IS NULL OR EXISTS(SELECT 1 FROM {control}.registry_fhir_catalog_binding binding
      WHERE binding.metadata_generation=$1 AND binding.network_id=network.network_id
