@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -223,12 +224,27 @@ def test_provider_directory_guide_local_links_resolve():
     root = Path(__file__).resolve().parents[1]
     guide_path = root / "docs/imports/provider-directory-fhir.md"
     guide = guide_path.read_text(encoding="utf-8")
-    links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", guide)
+    _assert_guide_links(guide_path, guide)
 
-    assert links
-    for target in links:
-        assert not target.startswith(("http://", "https://", "#"))
-        assert (guide_path.parent / target).resolve().is_file(), target
+
+def _assert_guide_links(guide_path, guide):
+    targets = re.findall(r"\[[^\]]+\]\(([^)]+)\)", guide)
+    assert targets
+    for target in targets:
+        parsed = urlsplit(target)
+        if parsed.scheme in {"http", "https"}:
+            assert parsed.hostname, target
+            continue
+        assert not parsed.scheme and parsed.path, target
+        assert (guide_path.parent / parsed.path).resolve().is_file(), target
+
+
+def test_guide_link_check_keeps_local_existence_checks_with_external_references(tmp_path):
+    guide_path = tmp_path / "guide.md"
+    (tmp_path / "local.md").write_text("local documentation")
+    _assert_guide_links(guide_path, "[local](local.md#details) [external](https://example.org/developer)")
+    with pytest.raises(AssertionError, match="missing.md"):
+        _assert_guide_links(guide_path, "[missing](missing.md) [external](https://example.org/developer)")
 
 
 def test_provider_directory_guide_documents_the_full_lifecycle():
