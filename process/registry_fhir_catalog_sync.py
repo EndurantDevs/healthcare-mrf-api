@@ -30,7 +30,7 @@ from process.registry_fhir_catalog_enrichment import (
 from process.registry_fhir_catalog_extraction import (
     FHIRCatalogOrganization,
     FHIRCatalogReferenceEdge,
-    extract_fhir_catalog_batch,
+    iter_fhir_catalog_batches,
     iter_fhir_catalog_pages,
 )
 from process.registry_fhir_catalog_fingerprints import (
@@ -1002,21 +1002,21 @@ async def _stage_plan_observations(
         resource_types=("Organization", "InsurancePlan"),
         source_read=source_read,
     ):
-        batch = extract_fhir_catalog_batch(
+        for batch in iter_fhir_catalog_batches(
             resource_batch, profile=descriptor["profile"], source_uri=descriptor["source_uri"]
-        )
-        source_count += batch.source_rows
-        observation_rows = [
-            (generation, "Organization", org.resource_id, "organization", 0, canonical_json(asdict(org)))
-            for org in batch.organizations
-        ]
-        ordinals_by_resource = {}
-        for edge in batch.edges:
-            key = (edge.owner_resource_type, edge.owner_resource_id)
-            ordinal = ordinals_by_resource.get(key, 0)
-            observation_rows.append((generation, *key, "edge", ordinal, canonical_json(asdict(edge))))
-            ordinals_by_resource[key] = ordinal + 1
-        await observations(sorted(observation_rows, key=lambda row: row[:5]))
+        ):
+            source_count += batch.source_rows
+            observation_rows = [
+                (generation, "Organization", org.resource_id, "organization", 0, canonical_json(asdict(org)))
+                for org in batch.organizations
+            ]
+            ordinals_by_resource = {}
+            for edge in batch.edges:
+                key = (edge.owner_resource_type, edge.owner_resource_id)
+                ordinal = ordinals_by_resource.get(key, 0)
+                observation_rows.append((generation, *key, "edge", ordinal, canonical_json(asdict(edge))))
+                ordinals_by_resource[key] = ordinal + 1
+            await observations(sorted(observation_rows, key=lambda row: row[:5]))
     return source_count
 
 
