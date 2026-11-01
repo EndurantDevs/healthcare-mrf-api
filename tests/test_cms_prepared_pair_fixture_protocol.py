@@ -1105,3 +1105,46 @@ async def test_source_template_collision_never_drops_an_unowned_database(monkeyp
         assert native_source._SOURCE_COMPONENT_BASELINES == {}
     admin.execute.assert_not_awaited()
     assert admin.close.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy_checks", [0, 2, 120])
+async def test_source_template_waits_for_disconnection_before_sealing(monkeypatch, busy_checks):
+    from tests import provider_directory_source_postgres_support as native_source
+
+    baseline = SimpleNamespace(name="synthetic_template", owner="synthetic_owner", builder="synthetic_builder")
+    admin = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=[True] * busy_checks + [False, False, False]), execute=AsyncMock()
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(native_source.asyncio, "sleep", sleep)
+
+    await native_source._close_source_component_baseline(admin, baseline)
+
+    assert sleep.await_count == busy_checks
+    assert all(call.args == (0.5,) for call in sleep.await_args_list)
+    assert [call.args for call in admin.fetchval.await_args_list[: busy_checks + 1]] == [
+        ("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", baseline.name)
+    ] * (busy_checks + 1)
+    assert [call.args for call in admin.execute.await_args_list] == [
+        ('ALTER ROLE "synthetic_builder" NOLOGIN',),
+        ('ALTER DATABASE "synthetic_template" ALLOW_CONNECTIONS false',),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_source_template_never_seals_a_busy_or_cancelled_baseline(monkeypatch, cancelled):
+    from tests import provider_directory_source_postgres_support as native_source
+
+    baseline = SimpleNamespace(name="synthetic_template", owner="synthetic_owner", builder="synthetic_builder")
+    admin = SimpleNamespace(fetchval=AsyncMock(return_value=True), execute=AsyncMock())
+    sleep = AsyncMock(side_effect=asyncio.CancelledError if cancelled else None)
+    monkeypatch.setattr(native_source.asyncio, "sleep", sleep)
+
+    with pytest.raises(asyncio.CancelledError if cancelled else AssertionError):
+        await native_source._close_source_component_baseline(admin, baseline)
+
+    assert admin.fetchval.await_count == (1 if cancelled else 121)
+    assert sleep.await_count == (1 if cancelled else 120)
+    admin.execute.assert_not_awaited()
