@@ -60,6 +60,17 @@ a list of exact `root_run_id`, `source_id`, `endpoint_scope`, immutable `image`,
 and `secret_name` records. The launcher verifies the admitted stored run's
 failed-parent chain back to that root. Other roots keep the default image and
 purpose-scoped secrets; a mismatched run within a configured root is refused.
+An explicit `root_run_id: null` selects a fresh-root route for only the exact
+singleton source and endpoint. It requires a stored run with no retry parent
+and no retry or pagination-root parameters. Other sources retain their default
+route; a changed or multiple-source identity containing the configured source
+is refused. Fresh routes do not select retained retries, which still require
+an exact string-root route and the existing failed-parent ancestry checks.
+Fresh routed Jobs expose the admitted coordinates in
+`healthporta.com/source-id` and `healthporta.com/source-endpoint-scope`
+annotations, while keeping `healthporta.com/source-root-run-id` absent. Request
+fields cannot supply these annotations; admission policy can bind them to the
+specific immutable fresh-route image and its runtime Secret.
 Publisher secret selectors must name only that exact purpose,
 importer and worker class. Missing image configuration or an existing worker
 with changed purpose, target or process isolation is refused. The separately
@@ -1835,11 +1846,24 @@ Molina seed rows can point at the developer portal
 working Provider Directory metadata base at
 `https://api.interop.molinahealthcare.com/providerdirectory`, so the importer
 maps those rows to that concrete base and records the portal and metadata URLs
-in source metadata. Fresh dev probes validate all five configured resource
-searches and the source-specific rewrite of
-`molina.sapphirethreesixtyfive.com` cursor continuations. Molina remains
-acquisition-configured, but endpoint-wide completeness is not claimed until an
-unbounded exact-source run reaches a terminal success.
+in source metadata. The source uses the shared eight-resource acquisition profile,
+including InsurancePlan, even when capability metadata omits collection routes.
+InsurancePlan uses a broad status search. HealthcareService exhausts both
+`name:missing=false` and `name:missing=true` through one durable cursor, including
+when the second search resumes after a quota stop. Continuations and retained
+positions must preserve the search phase. Endpoint uses a persisted-ID presence
+search. The shared paginator retains both same-origin `starting_after` links and
+the source-specific rewrite of `molina.sapphirethreesixtyfive.com` cursor
+continuations. Source request handling and endpoint-wide completeness require
+separate verification; completeness is not claimed until an unbounded exact-source
+run reaches a terminal success.
+
+The [shared Source HTTP proxy](source-http-proxy.md) can opt an exact Source and
+canonical endpoint into a versioned pool of fixed proxy routes. Its policy belongs
+to trusted deployment configuration; imported metadata cannot enable it. The
+shared FHIR importer preserves encoded continuation URLs and keeps upstream
+credentials separate from proxy credentials. Changing transport does not change
+the Source identity or increase an upstream quota.
 
 UnitedHealthcare seed rows can point at the UHC interoperability landing page
 `https://www.uhc.com/legal/interoperability-apis` or stale retest bases such as

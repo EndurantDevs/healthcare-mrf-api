@@ -202,13 +202,16 @@ def source_publication_request(directory, source_records, enabled):
 
 async def import_resources_with_source_session(directory, source_records, rest_page_prefetch, source_only, options):
     """Retain the HTTP-session lifecycle and bind publication only to this request."""
+    proxy_run = directory.source_proxy.current_run()
     force_session = any(directory.current_version_census_contract(record) is not None for record in source_records)
+    require_verified_tls = force_session
+    force_session = force_session or bool(proxy_run is not None and proxy_run.bindings)
     token = directory._REST_PAGE_PREFETCH_OVERRIDE.set(rest_page_prefetch)
     try:
         with source_publication_request(directory, source_records, source_only):
             async with directory._source_http_session_scope(
                 force=force_session,
-                require_verified_tls=force_session,
+                require_verified_tls=require_verified_tls,
                 request_concurrency=max(
                     directory._validated_resource_scan_concurrency(options.get("resource_scan_concurrency", 1)),
                     min(100, max(1, options.get("linked_resource_concurrency", 5)))
