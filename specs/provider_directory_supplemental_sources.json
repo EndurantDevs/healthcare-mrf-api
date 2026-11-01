@@ -61,5 +61,83 @@
       "provider_directory_acquisition_enabled": true,
       "provider_directory_probe_resource": "Practitioner"
     }
+  },
+  {
+    "id": "bcbs-alabama-public-provider-directory",
+    "org_name": "Blue Cross and Blue Shield of Alabama",
+    "plan_name": null,
+    "api_base": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory",
+    "source": "https://www.bcbsal.org/web/documents/d/portal/fhir-documentation-1-",
+    "source_url": "https://www.bcbsal.org/web/documents/d/portal/fhir-documentation-1-",
+    "source_detail": "official public Provider Directory FHIR API",
+    "auth_type": "none",
+    "requires_registration": false,
+    "last_validated_status": "valid",
+    "note": "Carrier-native directory; native plan and membership evidence retain their product scope.",
+    "endpoint_insurance_plan": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/InsurancePlan?_total=accurate",
+    "endpoint_practitioner": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/Practitioner?_total=accurate",
+    "endpoint_organization": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/Organization?_total=accurate",
+    "endpoint_location": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/Location?_total=accurate",
+    "endpoint_practitioner_role": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/PractitionerRole?_total=accurate",
+    "endpoint_healthcare_service": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/HealthcareService?_total=accurate",
+    "endpoint_organization_affiliation": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/OrganizationAffiliation?_total=accurate",
+    "endpoint_endpoint": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/Endpoint?_total=accurate",
+    "metadata_json": {
+      "provider_directory_confirmed_base": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory",
+      "provider_directory_confirmed_metadata_url": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory/metadata",
+      "provider_directory_confirmed_catalog_url": "https://www.bcbsal.org/web/documents/d/portal/fhir-documentation-1-",
+      "provider_directory_supported_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ],
+      "provider_directory_fully_enumerable_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ],
+      "provider_directory_expected_nonempty_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ],
+      "provider_directory_resource_page_count_caps": {
+        "InsurancePlan": 100,
+        "PractitionerRole": 100,
+        "Practitioner": 100,
+        "Organization": 100,
+        "Location": 100,
+        "HealthcareService": 100,
+        "OrganizationAffiliation": 100,
+        "Endpoint": 100
+      },
+      "provider_directory_resource_fetch_order": [
+        "PractitionerRole",
+        "Location",
+        "HealthcareService",
+        "Practitioner",
+        "OrganizationAffiliation",
+        "Organization",
+        "InsurancePlan",
+        "Endpoint"
+      ],
+      "provider_directory_request_interval_seconds": 1.1,
+      "provider_directory_coverage_mode": "full",
+      "provider_directory_acquisition_enabled": true
+    }
   }
 ]

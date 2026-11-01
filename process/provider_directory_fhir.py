@@ -1509,6 +1509,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         CARESOURCE_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
         christus.API_BASE,
+        "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory",
         "https://api.capitalbluecrossfhir.com/r4/public-ma",
         "https://api.capitalbluecrossfhir.com/r4/public-chip",
         FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE,
@@ -58306,10 +58307,7 @@ def _pagination_checkpoint_scope_identity(
         separators=(",", ":"),
         default=str,
     )
-    return (
-        canonical_api_base,
-        hashlib.sha256(scope_payload.encode("utf-8")).hexdigest(),
-    )
+    return canonical_api_base, hashlib.sha256(scope_payload.encode("utf-8")).hexdigest()
 
 
 def _pagination_checkpoint_context(

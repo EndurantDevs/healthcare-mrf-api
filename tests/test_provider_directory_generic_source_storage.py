@@ -294,6 +294,7 @@ async def test_named_candidate_refuses_unsupported_source(harness, monkeypatch):
 
     factory = _named_factory()
     database, _, savepoints, capture = _named_candidate_context(harness, monkeypatch, factory, "other-source")
+    harness.header["publication_metadata_json"]["source_ids"].append("second-source")
     async with _bind_named_publisher(harness, factory, AsyncMock()):
         with pytest.raises(GenericCandidateError, match="isolated_kind_unsupported"):
             await storage.prepare_generic_source_candidate(database, harness.directory, harness.candidate)

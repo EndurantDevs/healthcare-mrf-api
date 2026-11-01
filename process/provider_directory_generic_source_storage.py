@@ -199,35 +199,30 @@ def _validate_binding_storage(binding_by_field, *, is_isolated):
         _require(binding_by_field["phase"] != "ready_for_freeze", "binding_changed")
 
 
-def _validate_isolated_binding_storage(binding_by_field, expected_storage):
-    if binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
+def _validate_isolated_binding_storage(binding, expected_storage):
+    metadata = binding["identity"]["metadata"]
+    if binding["contract"] == NAMED_ISOLATED_CONTRACT:
         _validate_named_storage(expected_storage)
-        _require(
-            binding_by_field["identity"]["metadata"]["source_ids"] == [VSP_SOURCE_ID],
-            "isolated_kind_unsupported",
-        )
-    _require(binding_by_field["storage"] == expected_storage, "storage_binding_changed")
-    _require(
-        binding_by_field["phase"] != "published" and binding_by_field["auxiliary"] is None,
-        "isolated_kind_unsupported",
-    )
-    if binding_by_field["contract"] == CMS_ISOLATED_CONTRACT:
+        _require_ordinary_source_metadata(metadata)
+        _require(len(metadata["source_ids"]) == 1, "isolated_kind_unsupported")
+    _require(binding["storage"] == expected_storage, "storage_binding_changed")
+    _require(binding["phase"] != "published" and binding["auxiliary"] is None, "isolated_kind_unsupported")
+    if binding["contract"] == CMS_ISOLATED_CONTRACT:
         from process.provider_directory_cms_source_handoff import require_cms_handoff_identity
 
-        require_cms_handoff_identity(binding_by_field["identity"], expected_storage["catalog_schema"])
-        _require(binding_by_field["relationship_sha256"] is None, "isolated_cms_relationship_unexpected")
+        require_cms_handoff_identity(binding["identity"], expected_storage["catalog_schema"])
+        _require(binding["relationship_sha256"] is None, "isolated_cms_relationship_unexpected")
     else:
-        metadata = binding_by_field["identity"]["metadata"]
         _require(
             metadata.get("source_release") is None
             and type(metadata.get("source_ids")) is list
             and "cms-npd" not in metadata["source_ids"],
             "isolated_kind_unsupported",
         )
-    if binding_by_field["phase"] == "ready_for_freeze":
-        validate_handoff_header(binding_by_field["admission"])
+    if binding["phase"] == "ready_for_freeze":
+        validate_handoff_header(binding["admission"])
     else:
-        _require(binding_by_field["admission"] is None, "admission_changed")
+        _require(binding["admission"] is None, "admission_changed")
 
 
 def _validate_named_storage(document):
@@ -358,6 +353,31 @@ def validate_handoff_completion(header):
     )
 
 
+def _require_ordinary_source_metadata(metadata):
+    """Validate the ordinary FHIR source and resource scope for isolated storage."""
+    _require(
+        metadata.get("source_release") is None
+        and type(metadata.get("source_ids")) is list
+        and bool(metadata["source_ids"])
+        and all(type(source_id) is str and 1 <= len(source_id) <= 64 for source_id in metadata["source_ids"])
+        and type(metadata.get("selected_resources")) is list
+        and bool(metadata["selected_resources"])
+        and all(type(resource) is str for resource in metadata["selected_resources"])
+        and set(metadata["selected_resources"])
+        <= {
+            "Organization",
+            "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+            "Location",
+            "HealthcareService",
+            "InsurancePlan",
+            "Endpoint",
+        },
+        "isolated_kind_unsupported",
+    )
+
+
 def _require_candidate_storage(publisher, directory, identity):
     binding = require_storage_schema(publisher, directory._schema())
     if binding is not None:
@@ -367,27 +387,7 @@ def _require_candidate_storage(publisher, directory, identity):
 
             require_cms_handoff_identity(identity, binding.catalog_schema)
             return binding
-        _require(
-            metadata.get("source_release") is None
-            and type(metadata.get("source_ids")) is list
-            and bool(metadata["source_ids"])
-            and all(type(source_id) is str and 1 <= len(source_id) <= 64 for source_id in metadata["source_ids"])
-            and type(metadata.get("selected_resources")) is list
-            and bool(metadata["selected_resources"])
-            and all(type(resource) is str for resource in metadata["selected_resources"])
-            and set(metadata["selected_resources"])
-            <= {
-                "Organization",
-                "OrganizationAffiliation",
-                "Practitioner",
-                "PractitionerRole",
-                "Location",
-                "HealthcareService",
-                "InsurancePlan",
-                "Endpoint",
-            },
-            "isolated_kind_unsupported",
-        )
+        _require_ordinary_source_metadata(metadata)
     return binding
 
 
