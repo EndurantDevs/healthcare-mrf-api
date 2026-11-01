@@ -12,6 +12,104 @@ from process import provider_directory_generic_source_policy as source_policy
 QUALIFICATION_API_BASE = contextvars.ContextVar("provider_directory_qualification_api_base", default=None)
 
 
+def capital_blue_cross_product_seed_rows(directory):
+    """Keep the official public product contracts separate from the legacy candidate."""
+    seed_rows = []
+    for product, path in (("Medicare", "public-ma"), ("CHIP", "public-chip")):
+        base = f"https://api.capitalbluecrossfhir.com/r4/{path}"
+        seed_rows.append(
+            {
+                "id": f"capital-blue-cross-{product.lower()}-provider-directory",
+                "org_name": "Capital Blue Cross",
+                "plan_name": f"Capital Blue Cross {product} Provider Directory",
+                "api_base": base,
+                "auth_type": "none",
+                "requires_registration": False,
+                "fhir_version": "4.0.1",
+                "source": "capital-blue-cross-public-directory",
+                "source_detail": "official public product-specific Provider Directory FHIR API",
+                "source_url": "https://www.capbluecross.com/wps/portal/cap/about/developer",
+                "metadata_json": {
+                    "provider_directory_confirmed_base": base,
+                    "provider_directory_confirmed_metadata_url": f"{base}/metadata",
+                    "provider_directory_confirmed_catalog_url": (
+                        "https://www.capbluecross.com/wps/portal/cap/about/developer"
+                    ),
+                    "provider_directory_supported_resources": list(directory.DEFAULT_RESOURCES),
+                    "provider_directory_fully_enumerable_resources": list(directory.DEFAULT_RESOURCES),
+                    "provider_directory_expected_nonempty_resources": list(directory.PUBLIC_DIRECTORY_SEVEN_RESOURCES),
+                    "provider_directory_resource_page_count_caps": {
+                        resource: 100 for resource in directory.DEFAULT_RESOURCES
+                    },
+                    "provider_directory_coverage_mode": "full",
+                    "provider_directory_acquisition_enabled": True,
+                    "provider_directory_pagination_same_collection": True,
+                    "provider_directory_bulk_export_auto_enabled": False,
+                    "provider_directory_bulk_export_eligible": False,
+                },
+            }
+        )
+    return seed_rows
+
+
+def pagination_host_key(directory, url_or_host: str | None) -> str | None:
+    """Normalize only verified HTTPS origins for source continuation policy."""
+    text = directory._clean_text(url_or_host)
+    if not text:
+        return None
+    parsed = urllib.parse.urlsplit(text if "://" in text else f"https://{text}")
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        return None
+    return f"{parsed.hostname.lower()}:{port}"
+
+
+def pagination_allowed_hosts(
+    directory,
+    source_record: dict,
+    current_url: str,
+) -> set[str]:
+    """Keep configured host allowances within verified HTTPS origins."""
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    allowed_hosts = {
+        host_key
+        for candidate_url in (api_base, current_url)
+        if (host_key := directory._pagination_host_key(candidate_url))
+    }
+    configured_hosts = directory._string_list(
+        directory._source_metadata(source_record).get("provider_directory_pagination_allowed_hosts")
+    )
+    for configured_host in configured_hosts:
+        if host_key := directory._pagination_host_key(configured_host):
+            allowed_hosts.add(host_key)
+    return allowed_hosts
+
+
+def is_trusted_fhir_pagination_url(
+    directory,
+    source_record: dict,
+    current_url: str,
+    next_url: str,
+) -> bool:
+    """Retain the existing host policy and optional exact collection boundary."""
+    parsed_next = urllib.parse.urlsplit(next_url)
+    next_host_key = directory._pagination_host_key(next_url)
+    return bool(
+        next_host_key
+        and next_host_key in directory._pagination_allowed_hosts(source_record, current_url)
+        and parsed_next.username is None
+        and parsed_next.password is None
+        and not parsed_next.fragment
+        and (
+            directory._source_metadata(source_record).get("provider_directory_pagination_same_collection") is not True
+            or parsed_next.path == urllib.parse.urlsplit(current_url).path
+        )
+    )
+
+
 class QualificationURLRejected(ValueError):
     """A qualification request would leave the selected endpoint scope."""
 

@@ -60,6 +60,20 @@
       "checked_at": null,
       "proof_state": "not_recorded"
     },
+    "capital-blue-cross-medicare": {
+      "terminal_status": null,
+      "run_id": null,
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "proof_state": "not_recorded"
+    },
+    "capital-blue-cross-chip": {
+      "terminal_status": null,
+      "run_id": null,
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "proof_state": "not_recorded"
+    },
     "idaho": {
       "terminal_status": null,
       "run_id": null,

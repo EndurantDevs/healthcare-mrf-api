@@ -1990,7 +1990,7 @@ must never be reported as a completed UHC Profile import.
 The official-file, Flex-cohort, formulary, and release boundaries are recorded
 in [Provider-directory and formulary source acceptance](provider-directory-formulary-source-acceptance.md).
 
-Capital Blue Cross publishes seven populated Plan-Net collections and an empty
+The legacy Capital Blue Cross source publishes seven populated Plan-Net collections and an empty
 `Endpoint` collection at `https://providerdirectory-api.capbluecross.com/r4`.
 US-dev probes succeed over normal verified TLS, but broad exact census requests
 return an HTTP-200 OperationOutcome requiring a search predicate. A `ge1900`
@@ -1998,8 +1998,38 @@ return an HTTP-200 OperationOutcome requiring a search predicate. A `ge1900`
 `ge0001`, `_lastUpdated:missing`, and `_id:missing`, however. The advertised
 CapabilityStatement offers only read, vread, and type search, with no history or
 Bulk Export operation. Because no endpoint-wide witness can cover older or
-missing `meta.lastUpdated` values, Capital remains probe-only, resource
+missing `meta.lastUpdated` values, that legacy source remains probe-only, resource
 acquisition stays disabled, and it cannot be published to Profile.
+
+The current [official developer page](https://www.capbluecross.com/wps/portal/cap/about/developer)
+lists separate 1upHealth product endpoints: Medicare at
+`https://api.capitalbluecrossfhir.com/r4/public-ma` and CHIP at
+`https://api.capitalbluecrossfhir.com/r4/public-chip`. These are additive
+`capital-blue-cross-medicare` and `capital-blue-cross-chip` source contracts;
+they do not replace the legacy identity or establish commercial coverage.
+Both configure all eight directory collections through the common REST importer,
+with seven expected nonempty collections and an independently empty `Endpoint`.
+Unfiltered searches and successive issued continuations work anonymously in
+bounded checks; pages are capped at 100. `_summary=count` also returns resources,
+so it is not a count-only transport. The advertised generic CapabilityStatement
+and registration notice do not establish an OAuth requirement for these public
+directory routes. Bulk Export is not enabled or proven for either product.
+
+The source metadata opt-in `provider_directory_pagination_same_collection`
+requires next links to retain the current collection path in addition to the
+common HTTPS origin checks. It preserves opaque query bytes and participates in
+the durable checkpoint and publication contract identities. Acquisition forces
+the existing verified-TLS asynchronous session, preserves query bytes at the HTTP
+boundary and refuses redirects; standalone calls without an anonymous session
+fail closed. The products use
+existing candidate storage, checkpoints, adaptive throttling, bounded COPY and
+atomic publication; no synthetic offsets or timestamp filters are configured.
+Normal acquisition requests up to eight independent resource cursors per source,
+subject to the existing global admission and durable-storage gates. Bounded
+access and paging checks do not establish completed acquisition, validated
+publication, Profile/search readiness or network participation. Only native plan,
+role and affiliation references can establish network evidence; an Organization
+alone does not establish membership.
 
 SCAN Health Plan seed rows can point at the developer portal
 `https://developer.scanhealthplan.com`. The portal's embedded Provider Directory

@@ -33,11 +33,11 @@ from tests.provider_directory_profile_capacity_trust_fixtures import (
 UTC = datetime.timezone.utc
 VALIDATION_TIME = datetime.datetime(2026, 7, 30, 12, 0, 2, tzinfo=UTC)
 PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-GOLDEN_ATTESTATION_ID = "c4000a7858eed09d1ebd0a327b2628ff93846d1d607120eb01d6704abf060ec5"
-GOLDEN_SIGNATURE = "zrRdwwvwIBaCv2r57EXiMR3_dwxy5u7h3oKTJLg9H0HbX8vCIDME5Vbng_RBL5T14Xfnk2HoI9OKrhkHhe-zAg"
-GOLDEN_CANONICAL_BODY_SHA256 = "5d3b07e33b6cbf3a83271287eb78fc2db35390a6d6e96aeb951492cdd2fc396b"
-GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256 = "b421a6fbf9ea47b36b71052a60a69eb3b9f62e4acf07289ce87f444238492d69"
-GOLDEN_HEALTHCARE_PREFLIGHT_RECEIPT_SHA256 = "48ccf0b039141bca2915af5f7dff8587eed224ff0e94171e3faffbe875a8f6f2"
+GOLDEN_ATTESTATION_ID = "88d7b8fac5747337203477b653d36d70ddcb1db07bce3c86ad2520469a2280fc"
+GOLDEN_SIGNATURE = "RujjSP96VxM2tXzIbYYrsqSyQYGeqXaRhsnifQCAHO29B_Fnbg6XKVfngJbAqQcR8zadKHcV3BzXUI7w49iDBg"
+GOLDEN_CANONICAL_BODY_SHA256 = "f53db9cd2b90c91d324cd108e585e322a5356248aec9d5a8b243cfd76f12222a"
+GOLDEN_SIGNING_PREFLIGHT_GUARD_SHA256 = "f820d921b5349e2d05bff9b4402de184112c7495f6955254edb100518c54ebb8"
+GOLDEN_HEALTHCARE_PREFLIGHT_RECEIPT_SHA256 = "dd565f9a9e64f98ac121240fe4a5a9464ac1660ba34006e33cb64aa937302d25"
 
 
 def _golden_body() -> dict[str, object]:
@@ -152,7 +152,7 @@ def test_golden_vector_verifies_exact_canonical_schema_and_signature():
         "temp": 20_000_000_000,
         "wal": 150_000_000_000,
     }
-    assert verified.lease_digest == ("13cad6676ae3c7242fbdb7ccb9d156c344593a388ed2fedffa67d3371a960fff")
+    assert verified.lease_digest == ("2704cb34ffb064c91c7075db10775d849bef2d0e2af5db829bc027b833b1b334")
     assert verified.public_key_fingerprint == ("05549452c2988321a6d9e7daa9a7704bf150aa556ea2ddb9c45c8fe92dc7f643")
     assert verified.tablespace_identity_hash == ("4c53f2792f1198c75a1e6a7ca1d03621924d19c72bd39f8997ede9c312371f0e")
     assert verified.volume_identity_hash == ("fd8a7e7f2a446dac51955276d6865c16954b4526c3b6cc0bd5d66320a798d975")

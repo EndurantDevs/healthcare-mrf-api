@@ -15570,8 +15570,8 @@ def _write_supplemental_catalog_fixtures(tmp_path):
 
 
 def _assert_supplemental_catalog_metrics(metrics) -> None:
-    assert metrics["sources_seeded"] == 17
-    assert metrics["supplemental_catalog_sources_considered"] == 16
+    assert metrics["sources_seeded"] == 19
+    assert metrics["supplemental_catalog_sources_considered"] == 18
     catalog_metrics = metrics["supplemental_catalogs"]["catalogs"]
     assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 8
     assert catalog_metrics["amerihealth_caritas"]["rows"] == 1

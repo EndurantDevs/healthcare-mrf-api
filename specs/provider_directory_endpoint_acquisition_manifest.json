@@ -23,6 +23,8 @@
       "el-dorado-county-behavioral-health": {"support_level": "probe-only", "access_requirement": "registration-approval", "requires_registration": true, "reviewed_at": "2026-10-11", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "The retained April 2026 county documentation requires organization registration and approval for /provider/system-access/v2. The older /payer/provider-directory/v2 endpoint does not establish access or source equivalence for that contract. Acquisition requires approved access and complete exhaustive proof."},
       "devoted-health": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Seven Plan-Net collections are configured with same-origin opaque HAPI continuations and durable checkpoints. PractitionerRole uses adaptive _lastUpdated partitions. Complete source proof is required before publication."},
       "simpra-advantage": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Six Plan-Net collections are configured with same-origin opaque HAPI continuations. Acquisition retains durable checkpoints and requires exhaustive completion before publication."},
+      "capital-blue-cross-medicare": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-01", "method": "rest", "limitation": "Separate official Medicare public directory at the product-specific 1upHealth base. Anonymous unfiltered collections use byte-preserved server-issued cursors, pages capped at 100 and durable checkpoints. Same-collection continuations prevent crossing product routes. Seven collections are populated; Endpoint reports zero. Bounded successive-page checks establish a supported traversal contract, not terminal acquisition, validated publication, Profile, search or network readiness. No commercial coverage or equivalence with the legacy source is inferred."},
+      "capital-blue-cross-chip": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-01", "method": "rest", "limitation": "Separate official CHIP public directory at the product-specific 1upHealth base. Anonymous unfiltered collections use byte-preserved server-issued cursors, pages capped at 100 and durable checkpoints. Same-collection continuations prevent crossing product routes. Seven collections are populated; Endpoint reports zero. Bounded successive-page checks establish a supported traversal contract, not terminal acquisition, validated publication, Profile, search or network readiness. No commercial coverage or equivalence with the legacy source is inferred."},
       "capital-blue-cross": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "Historical source and probe notes: Broad exact census requests require a search predicate. Ranged counts do not establish endpoint completeness when ge0001, _lastUpdated:missing, and _id:missing predicates are unsupported and no history or bulk-export operation is advertised. Acquisition remains probe-only."},
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Accepts official public cursor continuations with checkpoints. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections and bounded searches succeeded. A bounded advertised-cursor follow succeeded without overlapping the first sampled page. Exhaustive traversal, population adequacy, terminal acquisition and publication readiness remained unverified."},
       "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition retains durable pagination checkpoints and fails closed with pagination_resume_required when a complete traversal cannot resume. Terminal endpoint-wide proof and downstream publication require separate verification."},
@@ -209,6 +211,50 @@
       "launch_mode": "create",
       "resource_profile": "NONE",
       "resources": []
+    },
+    {
+      "entry_id": "capital-blue-cross-medicare",
+      "display_name": "Capital Blue Cross Medicare",
+      "owner_id": "capital-blue-cross-medicare",
+      "source_ids": [
+        "pdfhir_a756316e811afc3e5c1b9330"
+      ],
+      "canonical_base": "https://api.capitalbluecrossfhir.com/r4/public-ma",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "capital-blue-cross-chip",
+      "display_name": "Capital Blue Cross CHIP",
+      "owner_id": "capital-blue-cross-chip",
+      "source_ids": [
+        "pdfhir_5c4da9c19d969edfdebc9ce1"
+      ],
+      "canonical_base": "https://api.capitalbluecrossfhir.com/r4/public-chip",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
     },
     {
       "entry_id": "idaho",
