@@ -341,15 +341,16 @@ async def test_native_13542_unique_and_repeated_edges_remain_streamed(monkeypatc
         )
         plan = json.loads(
             await case.writer.fetchval(
-                "EXPLAIN (FORMAT JSON) " + query,
+                "EXPLAIN (ANALYZE, FORMAT JSON) " + query,
                 case.origin.source_uri.rstrip("/"),
                 date.fromisoformat(_AS_OF),
-                "",
+                "PractitionerRole",
                 "",
                 "PractitionerRole",
                 "zzzz",
             )
         )[0]["Plan"]
+        assert plan["Actual Rows"] > 0, json.dumps(plan)
         pending, keyed = [plan], []
         while pending:
             node = pending.pop()

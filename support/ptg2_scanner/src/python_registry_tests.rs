@@ -35,6 +35,114 @@ fn registry_bytes_digest(input: &[u8]) -> String {
         .collect()
 }
 
+fn python_plan_tier_binding(plan_id: &str, tier: &str, network: i32) -> Value {
+    let logical = serde_json::json!({"contract":"healthporta-uhc-logical-scope-v1",
+        "entry_id":"uhc-provider-files","family":"ifp","market":"individual-exchange",
+        "product":"IEX","jurisdiction":"AZ"});
+    let key = serde_json::json!({"logical_scope_id":registry_bytes_digest(&serde_json::to_vec(&logical).unwrap()),
+        "family":"ifp","market":"individual-exchange","plan_id_type":"hios",
+        "plan_id":plan_id,"plan_year":2026});
+    let mut plan_key = key.clone();
+    plan_key["contract"] = serde_json::json!("healthporta-uhc-plan-key-v1");
+    let plan_key = registry_bytes_digest(&serde_json::to_vec(&plan_key).unwrap());
+    let mut network_key = key.clone();
+    network_key["contract"] = serde_json::json!("healthporta-uhc-network-key-v1");
+    network_key["network_tier"] = serde_json::json!(tier);
+    let network_key = registry_bytes_digest(&serde_json::to_vec(&network_key).unwrap());
+    let mut plan_scope = key;
+    plan_scope["product"] = serde_json::json!("IEX");
+    plan_scope["jurisdiction"] = serde_json::json!("AZ");
+    plan_scope["plan_key_id"] = serde_json::json!(plan_key);
+    serde_json::json!({"binding_id":format!("01234567-89ab-cdef-8123-{network:012}"),
+        "source_system":"fhir","source_id":"pdfhir_2754e999dd691175821ec26e",
+        "dataset_schema":"synthetic_source","dataset_id":"edition-one",
+        "producer_id":"registry-source-fhir-witness-v1",
+        "edition_id":"01234567-89ab-cdef-8123-456789abcde0",
+        "source_key":format!("UHCPlanTier/{network_key}"),
+        "source_scope_json":{"kind":"uhc_plan_tier_v1","plan_scope":plan_scope,
+            "network_tier":tier,"network_key_id":network_key,
+            "plan_resource_id":format!("uhcplan-{}",&plan_key[..48]),"capture_sha256":"a".repeat(64)},
+        "network_id":network,"evidence_id":"synthetic-evidence","evidence_sha256":"b".repeat(64),
+        "operation":"bind","expected_revision":0,"expected_network_id":null})
+}
+
+#[test]
+fn python_plan_tier_bridge_preserves_complete_binary_copy() {
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let encoder = module
+            .getattr("encode_network_source_binding_batch")
+            .unwrap();
+        for rows in [
+            vec![],
+            vec![python_plan_tier_binding("12345AZ001", "preferred", 42)],
+            vec![
+                python_plan_tier_binding("12345AZ001", "preferred", 42),
+                python_plan_tier_binding("Café東京", "standard", 43),
+            ],
+        ] {
+            let input = serde_json::to_vec(&rows).unwrap();
+            let expected =
+                crate::network_source_binding_values::encode_network_source_binding_batch(&input)
+                    .unwrap();
+            let (copy, count): (Py<PyBytes>, usize) = encoder
+                .call1((PyBytes::new(py, &input),))
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(count, rows.len());
+            assert_eq!(copy.bind(py).as_bytes(), expected.copy_bytes);
+            assert!(copy
+                .bind(py)
+                .as_bytes()
+                .starts_with(crate::network_membership_codec::COPY_HEADER));
+            assert!(copy.bind(py).as_bytes().ends_with(&[255, 255]));
+        }
+    });
+}
+
+#[test]
+fn python_plan_tier_bridge_refuses_unprintable_identity_without_partial_output() {
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let encoder = module
+            .getattr("encode_network_source_binding_batch")
+            .unwrap();
+        for (plan, tier) in [
+            ("12345AZ001", "standard\u{200b}"),
+            ("12345AZ\u{2028}001", "standard"),
+        ] {
+            let input = serde_json::to_vec(&[
+                python_plan_tier_binding("12345AZ001", "preferred", 42),
+                python_plan_tier_binding(plan, tier, 43),
+            ])
+            .unwrap();
+            assert_eq!(
+                crate::network_source_binding_values::encode_network_source_binding_batch(&input)
+                    .unwrap()
+                    .row_count,
+                2
+            );
+            let error = encoder.call1((PyBytes::new(py, &input),)).unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                error.value(py).str().unwrap().to_str().unwrap(),
+                "Source binding plan identity is not printable"
+            );
+        }
+        let error = encoder.call1((PyBytes::new(py, b"{}"),)).unwrap_err();
+        assert!(error.is_instance_of::<PyValueError>(py));
+        let error: Value =
+            serde_json::from_str(error.value(py).str().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(error["code"], "invalid_json");
+        assert!(error["row_index"].is_null());
+    });
+}
+
 fn naic_python_edition(input: &[u8]) -> Vec<u8> {
     use crate::naic_company_registry::{NaicEdition, NaicMember, PARSER_VERSION};
     let member = NaicMember::GroupCompanies;

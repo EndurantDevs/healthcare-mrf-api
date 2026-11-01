@@ -265,6 +265,7 @@ def test_supplemental_catalog_failures_are_reported(monkeypatch):
     for name in (
         "_reviewed_provider_directory_candidate_seed_rows",
         "_health_partners_plans_seed_rows",
+        "_capital_blue_cross_product_seed_rows",
         "_aetna_provider_directory_data_seed_rows",
         "_provider_directory_blocker_seed_rows",
     ):

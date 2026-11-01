@@ -259,8 +259,17 @@ def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contract
     profile_spec = matrix.load_matrix_source_spec()
     selections = matrix.resolve_matrix_source_selection(manifest, profile_spec)
 
-    assert len(profile_spec["source_ids"]) == 32
-    assert len(selections) == 30
+    assert len(profile_spec["source_ids"]) == 34
+    assert len(selections) == 32
+    source_id_by_entry = {
+        selection.entry_id: selection.source_id
+        for selection in selections
+        if selection.entry_id.startswith("capital-blue-cross")
+    }
+    assert source_id_by_entry == {
+        "capital-blue-cross-medicare": "pdfhir_a756316e811afc3e5c1b9330",
+        "capital-blue-cross-chip": "pdfhir_5c4da9c19d969edfdebc9ce1",
+    }
     assert selections[0].source_id == "cms-npd"
     molina = next(selection for selection in selections if selection.entry_id == "molina")
     assert molina.resource_profile == "R8"
