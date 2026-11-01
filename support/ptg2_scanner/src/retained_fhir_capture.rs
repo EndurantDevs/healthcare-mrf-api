@@ -4,7 +4,7 @@
 
 use crate::network_membership_codec::{uuid_bytes, write_field, COPY_HEADER};
 #[path = "retained_fhir_capture/hash.rs"]
-mod hash;
+pub(crate) mod hash;
 use hash::{json_bytes, object_json_bytes, payload_hash, write_array};
 use serde::de::{self, DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};

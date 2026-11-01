@@ -535,21 +535,37 @@ async def copy_fhir_fact_page(connection, batch, table_name, recipe_sha256, afte
 
 async def contribution_fact_sha256(connection, relation, recipe_sha256):
     """Hash ordered native facts with bounded transfers and strict ordinal continuity."""
+    from process.uhc_flex_practitioner_async_safety import drain_operation
+
     digest, cursor = hashlib.sha256(), 0
     while True:
-        page = await connection.fetch(
-            f"SELECT ordinal,encode(sha256(convert_to(jsonb_build_array(ordinal,fact_json)::text,'UTF8')),'hex') "
-            f"AS fingerprint FROM {relation} WHERE recipe_sha256=$1 AND ordinal>$2 ORDER BY ordinal LIMIT 1000",
-            recipe_sha256,
-            cursor,
+        page = await drain_operation(
+            connection.fetch(
+                f"SELECT ordinal,encode(sha256(convert_to(jsonb_build_array(ordinal,fact_json)::text,'UTF8')),'hex') "
+                f"AS fingerprint FROM {relation} WHERE recipe_sha256=$1 AND ordinal>$2 "
+                "AND ordinal<=LEAST($2,9223372036854774807::bigint)+1000 ORDER BY ordinal LIMIT 1000",
+                recipe_sha256,
+                cursor,
+            ),
+            preserve_cancellation=True,
         )
         if not page:
-            return digest.hexdigest(), cursor
-        for row in page:
-            if row["ordinal"] != cursor + 1:
+            has_tail = await drain_operation(
+                connection.fetchval(
+                    f"SELECT EXISTS(SELECT 1 FROM {relation} WHERE recipe_sha256=$1 AND ordinal>$2)",
+                    recipe_sha256,
+                    cursor,
+                ),
+                preserve_cancellation=True,
+            )
+            if has_tail:
                 raise RegistrySourceContributionError("registry_source_contribution_ordinal_invalid")
-            digest.update(row["fingerprint"].encode("ascii"))
-            cursor = row["ordinal"]
+            return digest.hexdigest(), cursor
+        for fact_record in page:
+            if fact_record["ordinal"] != cursor + 1:
+                raise RegistrySourceContributionError("registry_source_contribution_ordinal_invalid")
+            digest.update(fact_record["fingerprint"].encode("ascii"))
+            cursor = fact_record["ordinal"]
 
 
 async def reuse_fhir_facts(connection, retained_relation, source, table_name, recipe_sha256):
@@ -1175,56 +1191,94 @@ async def copy_source_witness_page_v2(connection, page, table_name, recipe_sha25
 
 copy_fhir_source_witness_page_v2 = copy_source_witness_page_v2
 
-_WITNESS_MAP_SQL_V2 = """WITH {bindings}, facts AS MATERIALIZED (
- SELECT fact_json FROM {fact_relation} WHERE recipe_sha256=$8
-), headers AS MATERIALIZED (
- SELECT fact_json, fact_json->>'resource_type' AS resource_type,fact_json->>'resource_id' AS resource_id
- FROM facts WHERE fact_json->>'kind'='resource'
-), edges AS MATERIALIZED (
- SELECT fact_json FROM facts WHERE fact_json->>'kind'='edge'
-), invalid AS (
- SELECT 1 FROM facts WHERE fact_json->'fact_version' IS DISTINCT FROM '2'::jsonb
- OR fact_json->'source_binding' IS DISTINCT FROM $10::jsonb
- OR fact_json->>'kind' IS NULL OR fact_json->>'kind' NOT IN ('resource','edge')
- UNION ALL SELECT 1 FROM headers GROUP BY resource_type,resource_id HAVING count(*)<>1
- UNION ALL SELECT 1 FROM edges LEFT JOIN headers ON
- headers.resource_type=edges.fact_json->>'resource_type' AND headers.resource_id=edges.fact_json->>'resource_id'
- WHERE headers.fact_json IS NULL OR headers.fact_json->'payload_sha256' IS DISTINCT FROM edges.fact_json->'payload_sha256'
-), mapped AS MATERIALIZED (
- SELECT edges.fact_json,headers.fact_json AS header,approved.network_id,
-   (headers.fact_json->>'malformed')::boolean OR (edges.fact_json->>'provider_unresolved')::boolean
-   OR (edges.fact_json->>'location_unresolved')::boolean OR edges.fact_json->>'source_key' IS NULL
-   OR (NOT (edges.fact_json->>'network_witness_complete')::boolean AND (NOT $9::boolean OR approved.network_id IS NOT NULL))
-   AS unresolved
- FROM edges JOIN headers ON headers.resource_type=edges.fact_json->>'resource_type'
- AND headers.resource_id=edges.fact_json->>'resource_id'
- LEFT JOIN approved_network_bindings approved ON approved.record_json->>'source_key'=edges.fact_json->>'source_key'
- AND approved.record_json->'source_scope_json'=edges.fact_json->'source_scope_json'
-), edge_status AS MATERIALIZED (
- SELECT *,NOT unresolved AND header->>'omission_reason' IS NULL AND network_id IS NULL AS omitted,
- NOT unresolved AND header->>'omission_reason' IS NULL AND network_id IS NOT NULL AS accepted FROM mapped
-), resource_status AS (
- SELECT headers.resource_type,headers.resource_id,
- CASE WHEN (headers.fact_json->>'malformed')::boolean OR coalesce(bool_or(edge_status.unresolved),false)
-   OR (headers.fact_json->>'omission_reason' IS NULL AND count(edge_status.fact_json)=0) THEN 'unresolved'
- WHEN headers.fact_json->>'omission_reason' IS NOT NULL THEN 'omitted'
- WHEN coalesce(bool_or(edge_status.accepted),false) THEN 'accepted' ELSE 'omitted' END AS outcome
- FROM headers LEFT JOIN edge_status ON edge_status.fact_json->>'resource_type'=headers.resource_type
- AND edge_status.fact_json->>'resource_id'=headers.resource_id GROUP BY headers.resource_type,headers.resource_id,headers.fact_json
-), inserted AS (
- {insert}
-)
-SELECT EXISTS(SELECT 1 FROM invalid) AS invalid,(SELECT count(*) FROM facts) AS fact_rows,
- (SELECT count(*) FROM edge_status WHERE accepted AND fact_json->>'location_id' IS NOT NULL) AS membership_rows,
- (SELECT count(*) FROM edge_status WHERE omitted) AS omitted_rows,
- (SELECT count(*) FROM edge_status WHERE unresolved) AS unresolved_rows,
- (SELECT count(*) FROM headers) AS raw_source_rows,
- (SELECT count(*) FROM resource_status WHERE outcome='accepted') AS accepted_raw_source_rows,
- (SELECT count(*) FROM resource_status WHERE outcome='unresolved') AS unresolved_raw_source_rows,
- (SELECT count(*) FROM resource_status WHERE outcome='omitted') AS omitted_raw_source_rows,
- (SELECT count(DISTINCT(fact_json->>'resource_type',fact_json->>'resource_id')) FROM edge_status
- WHERE accepted AND (fact_json->>'provider_only')::boolean) AS provider_only_rows,
- (SELECT count(*) FROM inserted) AS inserted_rows"""
+
+def witness_mapping_workspace_name(raw_table):
+    """Keep each member stage's sibling identifier below PostgreSQL's identifier limit."""
+    _identifier(raw_table)
+    return "registry_witness_map_" + hashlib.sha256(raw_table.encode()).hexdigest()[:32]
+
+
+async def create_witness_mapping_workspace(connection, raw_table):
+    """Precreate indexed compact status before any read-only snapshot begins."""
+    name = witness_mapping_workspace_name(raw_table)
+    await connection.execute(f"""CREATE TEMP TABLE {_identifier(name)}(
+      recipe_sha256 text NOT NULL,resource_type text COLLATE "C" NOT NULL,resource_id text COLLATE "C" NOT NULL,
+      payload_sha256 jsonb,malformed boolean,omission_reason text,
+      edge_count bigint NOT NULL DEFAULT 0,has_accepted boolean NOT NULL DEFAULT false,
+      has_unresolved boolean NOT NULL DEFAULT false,has_provider_only boolean NOT NULL DEFAULT false,
+      PRIMARY KEY(recipe_sha256,resource_type,resource_id))""")
+    return name
+
+
+async def _witness_header_pass(connection, fact_relation, workspace, identity, source_binding):
+    from process.registry_source_witness_mapping_sql import WITNESS_HEADERS_SQL, WITNESS_PAGE_SQL
+    from process.uhc_flex_practitioner_async_safety import drain_operation
+
+    query = WITNESS_HEADERS_SQL.format(
+        page=WITNESS_PAGE_SQL.format(fact_relation=fact_relation, identity="$1", cursor="$3"), workspace=workspace
+    )
+    cursor, fact_count = 0, 0
+    while True:
+        summary = await drain_operation(
+            connection.fetchrow(query, identity, source_binding, cursor), preserve_cancellation=True
+        )
+        if summary["invalid"]:
+            raise RegistrySourceContributionError("registry_source_witness_facts_invalid")
+        if not summary["fact_rows"]:
+            return fact_count
+        fact_count += summary["fact_rows"]
+        cursor = summary["last_ordinal"]
+
+
+async def _witness_mapping_passes(
+    connection, recipe, approved, fact_relation, raw_table, workspace, control_schema, insert
+):
+    """Build all headers before applying bounded edge pages in arbitrary fact order."""
+    from process.network_fhir_membership_source import fhir_source_witness_binding_v2
+    from process.registry_source_witness_mapping_sql import WITNESS_MAP_SQL_V2, WITNESS_PAGE_SQL, WITNESS_TOTALS_SQL
+    from process.uhc_flex_practitioner_async_safety import drain_operation
+
+    identity = verified_office_fact_identity(recipe)[0]
+    source_binding = _canonical(fhir_source_witness_binding_v2(recipe.source_pin))
+    fact_count = await _witness_header_pass(connection, fact_relation, workspace, identity, source_binding)
+    arguments = (
+        approved.approved_revision,
+        *recipe.binding_coordinates.sql_parameters,
+        identity,
+        fhir_normalized_capture(fhir_physical_source(recipe.source_pin)) is not None,
+        source_binding,
+    )
+    insert_sql = f"""INSERT INTO pg_temp.{_identifier(raw_table)}
+      SELECT status.network_id,edges.fact_json->>'provider_system',edges.fact_json->>'provider_id',
+        (edges.fact_json->>'location_id')::uuid,
+        encode(sha256(convert_to(jsonb_set(edges.fact_json->'evidence_basis','{{6}}',to_jsonb(status.network_id))::text,'UTF8')),'hex')
+      FROM edge_status status JOIN edges USING(ordinal) WHERE status.accepted AND status.has_location
+        AND NOT EXISTS(SELECT 1 FROM invalid) RETURNING 1"""
+    query = WITNESS_MAP_SQL_V2.format(
+        bindings=APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema)),
+        page=WITNESS_PAGE_SQL.format(fact_relation=fact_relation, identity="$8", cursor="$11"),
+        workspace=workspace,
+        insert=insert_sql if insert else "SELECT 1 WHERE false",
+    )
+    totals_by_field = dict.fromkeys(
+        ("fact_rows", "membership_rows", "omitted_rows", "unresolved_rows", "inserted_rows"), 0
+    )
+    cursor = 0
+    while True:
+        summary = await drain_operation(connection.fetchrow(query, *arguments, cursor), preserve_cancellation=True)
+        if summary["invalid"]:
+            raise RegistrySourceContributionError("registry_source_witness_facts_invalid")
+        if not summary["fact_rows"]:
+            totals_by_field.update(
+                await drain_operation(
+                    connection.fetchrow(WITNESS_TOTALS_SQL.format(workspace=workspace), identity),
+                    preserve_cancellation=True,
+                )
+            )
+            return fact_count, totals_by_field
+        for field in totals_by_field:
+            totals_by_field[field] += summary[field]
+        cursor = summary["last_ordinal"]
 
 
 def _mapped_witness_descriptor_v2(accounting, identity, capture, mapping, fact_sha256, transform_version):
@@ -1260,42 +1314,31 @@ async def map_fhir_source_witnesses_v2(
     their exact immutable original anchor. Office policy/address/correspondence is
     separately bound and is never inferred from this descriptor.
     """
-    from process.network_fhir_membership_source import (
-        FHIR_SOURCE_WITNESS_TRANSFORM_V2,
-        fhir_source_witness_binding_v2,
-    )
+    from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
 
     if not connection.is_in_transaction():
         raise RegistrySourceContributionError("registry_source_witness_transaction_required")
     if type(insert) is not bool:
         raise RegistrySourceContributionError("registry_source_witness_descriptor_invalid")
+    from process.uhc_flex_practitioner_async_safety import drain_operation
+
     identity, capture = verified_office_fact_identity(recipe)
-    mapping = await source_mapping_sha256(connection, recipe, approved, control_schema)
-    insert_sql = f"""INSERT INTO pg_temp.{_identifier(raw_table)}
-      SELECT network_id,fact_json->>'provider_system',fact_json->>'provider_id',
-        (fact_json->>'location_id')::uuid,
-        encode(sha256(convert_to(jsonb_set(fact_json->'evidence_basis','{{6}}',to_jsonb(network_id))::text,'UTF8')),'hex')
-      FROM edge_status WHERE accepted AND fact_json->>'location_id' IS NOT NULL
-        AND NOT EXISTS(SELECT 1 FROM invalid) RETURNING 1"""
-    accounting = await connection.fetchrow(
-        _WITNESS_MAP_SQL_V2.format(
-            bindings=APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema)),
-            fact_relation=fact_relation,
-            insert=insert_sql if insert else "SELECT 1 WHERE false",
-        ),
-        approved.approved_revision,
-        *recipe.binding_coordinates.sql_parameters,
-        identity,
-        fhir_normalized_capture(fhir_physical_source(recipe.source_pin)) is not None,
-        _canonical(fhir_source_witness_binding_v2(recipe.source_pin)),
-    )
-    if accounting["invalid"]:
-        raise RegistrySourceContributionError("registry_source_witness_facts_invalid")
-    fact_sha256, fact_rows = await contribution_fact_sha256(connection, fact_relation, identity)
-    if fact_rows != accounting["fact_rows"] or accounting["inserted_rows"] != (
-        accounting["membership_rows"] if insert else 0
-    ):
-        raise RegistrySourceContributionError("registry_source_contribution_accounting_invalid")
-    return _mapped_witness_descriptor_v2(
-        accounting, identity, capture, mapping, fact_sha256, FHIR_SOURCE_WITNESS_TRANSFORM_V2
-    )
+    workspace = "pg_temp." + _identifier(witness_mapping_workspace_name(raw_table))
+    async with connection.transaction():
+        mapping = await drain_operation(
+            source_mapping_sha256(connection, recipe, approved, control_schema), preserve_cancellation=True
+        )
+        await drain_operation(connection.execute(f"DELETE FROM {workspace}"), preserve_cancellation=True)
+        fact_count, accounting = await _witness_mapping_passes(
+            connection, recipe, approved, fact_relation, raw_table, workspace, control_schema, insert
+        )
+        fact_sha256, fact_rows = await contribution_fact_sha256(connection, fact_relation, identity)
+        if (
+            fact_rows != fact_count
+            or fact_rows != accounting["fact_rows"]
+            or accounting["inserted_rows"] != (accounting["membership_rows"] if insert else 0)
+        ):
+            raise RegistrySourceContributionError("registry_source_contribution_accounting_invalid")
+        return _mapped_witness_descriptor_v2(
+            accounting, identity, capture, mapping, fact_sha256, FHIR_SOURCE_WITNESS_TRANSFORM_V2
+        )

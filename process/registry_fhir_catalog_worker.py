@@ -134,6 +134,7 @@ async def run_fhir_catalog_sync(config, *, source_export=None):
     with fhir_catalog_run_reporting() as report:
         if config.source_endpoint_ids is not None:
             report.select_endpoints(config.source_endpoint_ids)
+        report.progress("discovery")
         async with asyncio.timeout(config.operation_seconds):
             if source_export is None:
                 result = await reconcile_fhir_catalog(config)

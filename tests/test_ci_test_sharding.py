@@ -354,6 +354,48 @@ def test_anchor_collisions_keep_module_fixtures_together() -> None:
         assert SHARDER.shard_index_for_nodeid(node, 32) == 21 + digest % 11
 
 
+@pytest.mark.parametrize("shard_count", (1, 2, 4, 6, 8, 16, 32, 48))
+def test_catalog_proofs_use_measured_shards_without_redistributing_other_cases(shard_count) -> None:
+    catalog = "tests/test_registry_execution_catalog_postgres.py"
+    shards_by_nodeid = {
+        f"{catalog}::test_inaccessible_public_view_does_not_hide_unsafe_callbacks": (28, 2),
+        f"{catalog}::test_inaccessible_public_view_keeps_complete_metadata_and_transition_census": (28, 2),
+        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent": (
+            1,
+            12,
+        ),
+    }
+    nodeids = sorted(
+        set(shards_by_nodeid)
+        | {node + "[variant]" for node in shards_by_nodeid}
+        | {node.replace("::test_", "::TestCatalog::test_") for node in shards_by_nodeid}
+        | {node.replace("tests/", "other/", 1) for node in shards_by_nodeid}
+        | {f"{catalog}::test_case[{index}]" for index in range(500)}
+        | {f"tests/test_unrelated.py::test_case[{index}]" for index in range(500)}
+    )
+    shards = [
+        SHARDER.select_nodeids(nodeids, shard_count=shard_count, shard_index=index) for index in range(shard_count)
+    ]
+    assert sorted(node for shard in shards for node in shard) == nodeids
+    assert all(shard == sorted(shard) for shard in shards)
+    assert len(SHARDER.EXCLUSIVE_REGISTRY_TEST_SHARDS) == 21
+    for node in nodeids:
+        digest = int.from_bytes(hashlib.sha256(node.encode()).digest(), byteorder="big")
+        expected = 21 + digest % (shard_count - 21) if shard_count in (32, 48) else digest % shard_count
+        if shard_count == 48:
+            if expected == 21:
+                module_digest = int.from_bytes(
+                    hashlib.sha256(node.split("::", 1)[0].encode()).digest(), byteorder="big"
+                )
+                expected = (1, 6, 10, 16)[module_digest % 4]
+            if node in shards_by_nodeid:
+                original, destination = shards_by_nodeid[node]
+                assert expected == original
+                expected = destination
+        assert node in shards[expected]
+    assert SHARDER.TEST_PROCESS_TIMEOUT_SECONDS == "295s"
+
+
 def _main_cost_moves() -> dict[str, tuple[int, int]]:
     """Bind exact measured cases to their original and balanced six-shard assignments."""
     return {

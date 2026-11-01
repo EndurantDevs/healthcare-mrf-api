@@ -534,7 +534,7 @@ def _validate_fhir_catalog_page_scope(schema_name, dataset_id, after_resource, r
         _fail()
 
 
-async def iter_fhir_catalog_pages(
+async def iter_fhir_catalog_raw_pages(
     connection,
     *,
     schema_name,
@@ -565,18 +565,22 @@ async def iter_fhir_catalog_pages(
         source_records = await connection.fetch(query, dataset_id, resource_types, *cursor, page_rows, page_bytes)
         if not source_records:
             return
-        source_rows = _decode_fhir_catalog_page(source_records, page_bytes)
-        cursor = (source_rows[-1]["resource_type"], source_rows[-1]["resource_id"])
-        yield source_rows
+        _check_fhir_catalog_page_bounds(source_records, page_bytes)
+        cursor = (source_records[-1]["resource_type"], source_records[-1]["resource_id"])
+        yield source_records
 
 
-def _decode_fhir_catalog_page(source_records, page_bytes):
-    """Decode one SQL-bounded page and reject oversized or invalid payloads."""
+def _check_fhir_catalog_page_bounds(source_records, page_bytes):
     if any(
         source_record["row_bytes"] > page_bytes or source_record["payload_json"] is None
         for source_record in source_records
     ):
         _fail("page_bounds")
+
+
+def _decode_fhir_catalog_page(source_records, page_bytes):
+    """Decode one SQL-bounded page and reject oversized or invalid payloads."""
+    _check_fhir_catalog_page_bounds(source_records, page_bytes)
     source_rows = tuple(
         {key: source_record[key] for key in ("resource_type", "resource_id", "payload_hash", "payload_json")}
         for source_record in source_records
@@ -590,3 +594,28 @@ def _decode_fhir_catalog_page(source_records, page_bytes):
     if len(_json_bytes(source_rows)) > page_bytes:
         _fail("page_bounds")
     return source_rows
+
+
+async def iter_fhir_catalog_pages(
+    connection,
+    *,
+    schema_name,
+    dataset_id,
+    after_resource=None,
+    page_rows=MAX_ROWS,
+    page_bytes=DEFAULT_BYTES,
+    resource_types=RESOURCE_TYPES,
+    source_read=None,
+):
+    """Decode admitted immutable pages without changing their snapshot or bounds."""
+    async for source_records in iter_fhir_catalog_raw_pages(
+        connection,
+        schema_name=schema_name,
+        dataset_id=dataset_id,
+        after_resource=after_resource,
+        page_rows=page_rows,
+        page_bytes=page_bytes,
+        resource_types=resource_types,
+        source_read=source_read,
+    ):
+        yield _decode_fhir_catalog_page(source_records, page_bytes)

@@ -20,6 +20,7 @@ from process.registry_source_contribution_artifacts import anchored_source_fact_
 from process.registry_source_contribution_store import (
     _digest,
     copy_fhir_source_witness_page_v2,
+    create_witness_mapping_workspace,
     map_fhir_source_witnesses_v2,
     retained_source_contributions,
     verified_office_fact_identity,
@@ -169,9 +170,15 @@ async def _stage_witness_source(
         relation = "pg_temp." + _identifier(fact_table)
     else:
         relation, copied = artifact.relation, artifact.descriptor["fact_rows"]
-    descriptor = await map_fhir_source_witnesses_v2(
-        connection, recipe, approved, relation, member_table, control_schema
-    )
+    workspace = await create_witness_mapping_workspace(connection, member_table)
+    try:
+        descriptor = await map_fhir_source_witnesses_v2(
+            connection, recipe, approved, relation, member_table, control_schema
+        )
+    finally:
+        await drain_operation(
+            connection.execute(f"DROP TABLE pg_temp.{_identifier(workspace)}"), preserve_cancellation=True
+        )
     if descriptor["fact_rows"] != copied or descriptor["raw_source_rows"] != expected_headers:
         raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
     if artifact is not None:

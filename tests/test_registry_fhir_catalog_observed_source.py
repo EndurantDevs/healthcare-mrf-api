@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 
 from process import registry_fhir_catalog_observed_source as observed
+from process import registry_fhir_catalog_reporting as reporting
 from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
 
 
@@ -139,11 +140,12 @@ async def test_actual_stream_counts_and_physical_tableoids_must_agree(
                 "resource_type": "Organization",
                 "resource_id": "network",
                 "payload_hash": "a" * 64,
-                "payload_json": {"name": "Example"},
+                "payload_json": json.dumps({"name": "Example"}),
+                "row_bytes": 512,
             },
         )
 
-    monkeypatch.setattr(observed, "iter_fhir_catalog_pages", pages)
+    monkeypatch.setattr(observed, "iter_fhir_catalog_raw_pages", pages)
     with pytest.raises(observed.FHIRCatalogObservedSourceError, match=expected_error):
         await observed._facts(
             connection, _profile(), "edition", {"resource_leaf_oids": [104]}, "https://example.test/fhir"
@@ -160,3 +162,41 @@ async def test_invalid_caller_scope_cannot_reach_database(changes):
     with pytest.raises(ValueError):
         await observed.collect_fhir_catalog_observation(connection, **arguments_by_name)
     connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_observation_reports_before_count_query_and_bounds_page_updates(monkeypatch):
+    events = []
+    monkeypatch.setattr(reporting, "current_live_progress_context", lambda: {"run_id": "synthetic-run"})
+    monkeypatch.setattr(reporting, "enqueue_live_progress", lambda **payload: events.append(payload))
+    monkeypatch.setattr(reporting, "monotonic", lambda: 0.0)
+
+    async def fetch(*_args):
+        assert len(events) == 1
+        assert events[0]["file_name"] == "edition" and events[0]["counters"]["resource_rows_scanned"] == 0
+        return [{"resource_type": "Organization", "rows": 2, "physical_match": True}]
+
+    async def pages(*_args, **_kwargs):
+        for index in range(2):
+            yield (
+                {
+                    "resource_type": "Organization",
+                    "resource_id": f"network-{index}",
+                    "payload_hash": "a" * 64,
+                    "payload_json": json.dumps({"name": "Example"}),
+                    "row_bytes": 512,
+                },
+            )
+
+    monkeypatch.setattr(observed, "iter_fhir_catalog_raw_pages", pages)
+    connection = Mock(fetch=AsyncMock(side_effect=fetch))
+    with reporting.fhir_catalog_run_reporting() as report:
+        facts = await observed.collect_fhir_catalog_observation_facts(
+            connection, _profile(), "edition", {"resource_leaf_oids": [104]}, "https://example.test/fhir"
+        )
+        assert report.document["inventory_complete"] is False and report.document["sources"] == []
+    assert facts["Organization"]["rows"] == 2
+    assert [event["counters"]["resource_rows_scanned"] for event in events] == [0, 2]
+    assert all(event["total"] is None and event["done"] == 0 for event in events)
+    assert "example.test" not in json.dumps(events)
+    connection.fetch.assert_awaited_once()

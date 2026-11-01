@@ -6,14 +6,24 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from datetime import datetime, timedelta
 
 from process.registry_fhir_catalog_extraction import (
+    DEFAULT_BYTES,
     MAX_BYTES,
     RESOURCE_TYPES,
+    _check_fhir_catalog_page_bounds,
+    _decode_fhir_catalog_page,
     fhir_catalog_json_bytes,
     fhir_catalog_text,
 )
+from process.registry_fhir_catalog_reference_rollup import MAX_PAGE_REFERENCES
+
+try:
+    from ptg2_address_canon import encode_catalog_observation_page as _native_page
+except ImportError:
+    _native_page = None
 
 CATALOG_OBSERVATION_CONTRACT = "registry-fhir-catalog-observation-v1"
 _ROW_FIELDS = {"resource_type", "resource_id", "payload_hash", "payload_json"}
@@ -134,6 +144,55 @@ class FHIRCatalogObservationDigests:
             }
             for resource_type in RESOURCE_TYPES
         }
+
+    def add_page(self, source_records, validate_metadata, *, page_bytes=DEFAULT_BYTES):
+        """Observe a complete bounded SQL page atomically, with a reference encoding fallback."""
+        _check_fhir_catalog_page_bounds(source_records, page_bytes)
+        observation_rows = tuple(
+            tuple(source_record[field] for field in ("resource_type", "resource_id", "payload_hash", "payload_json"))
+            for source_record in source_records
+        )
+        encoded = None
+        if _native_page is not None and all(
+            type(field_value) is str for observation_row in observation_rows for field_value in observation_row
+        ):
+            try:
+                encoded = _native_page(observation_rows, page_bytes, MAX_PAGE_REFERENCES, sys.get_int_max_str_digits())
+            except UnicodeError:
+                encoded = None
+        if encoded is None:
+            page = _decode_fhir_catalog_page(source_records, page_bytes)
+            validate_metadata(page)
+            candidate = FHIRCatalogObservationDigests()
+            candidate._hashes_by_type = {family: digest.copy() for family, digest in self._hashes_by_type.items()}
+            candidate._counts_by_type = self._counts_by_type.copy()
+            candidate._last_key = self._last_key
+            for observation_row in page:
+                candidate.add(observation_row)
+            self._hashes_by_type = candidate._hashes_by_type
+            self._counts_by_type = candidate._counts_by_type
+            self._last_key = candidate._last_key
+            return
+        validate_metadata(
+            tuple(
+                json.loads(frame)
+                for observation_row, frame in zip(observation_rows, encoded)
+                if observation_row[0] in {"Organization", "InsurancePlan"}
+            )
+        )
+        last_key = self._last_key
+        counts = self._counts_by_type.copy()
+        for resource_type, resource_id, _, _ in observation_rows:
+            key = (resource_type.encode("ascii"), resource_id.encode("ascii"))
+            if last_key is not None and key <= last_key:
+                _fail("order_invalid")
+            counts[resource_type] += 1
+            _count(counts[resource_type])
+            last_key = key
+        for observation_row, frame in zip(observation_rows, encoded):
+            self._hashes_by_type[observation_row[0]].update(frame + b"\n")
+        self._counts_by_type = counts
+        self._last_key = last_key
 
 
 def validate_catalog_observation_receipt(receipt):

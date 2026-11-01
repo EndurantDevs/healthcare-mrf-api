@@ -85,6 +85,7 @@ async def _approve_mapping(serving, recipe, capture, *, organization=None, captu
 
 async def _temporary_facts(reader):
     await facts.create_contribution_stage(reader, "source_witness_m2_facts")
+    await facts.create_witness_mapping_workspace(reader, "source_witness_m2_members")
     await reader.execute(
         "CREATE TEMP TABLE source_witness_m2_members("
         "network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text)"

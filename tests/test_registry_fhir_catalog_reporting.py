@@ -5,11 +5,13 @@ import asyncio
 import json
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from process import live_progress
 from process import registry_fhir_catalog_reporting as reporting
 from process import registry_fhir_catalog_sync as sync
 from process.control_cancel import ImportCancelledError
@@ -203,8 +205,15 @@ def test_progress_uses_existing_attempt_context_once_per_source_boundary(monkeyp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail", [False, True])
 async def test_discovery_records_every_disposition_and_only_complete_profile_eof(monkeypatch, fail):
+    events = []
+    monkeypatch.setattr(reporting, "current_live_progress_context", lambda: {"run_id": "synthetic-run"})
+    monkeypatch.setattr(reporting, "enqueue_live_progress", lambda **payload: events.append(payload))
+
     async def pages(*_args, **_kwargs):
+        assert len(events) == 1 and events[0]["phase"] == "discovery"
+        assert events[0]["denominator_state"] == "unknown" and events[0]["total"] is None
         yield (disposition(), disposition(status="unavailable", dataset=None))
+        assert events[-1]["counters"]["sources_inspected"] == 2
         if fail:
             raise RuntimeError("private SQL error")
 
@@ -223,6 +232,71 @@ async def test_discovery_records_every_disposition_and_only_complete_profile_eof
         assert len(report.document["sources"]) == 2
         assert report.document["profiles"][0]["complete"] is not fail
         assert report.document["inventory_complete"] is False
+        assert len(events) == 2
+
+
+def merged_catalog_progress(previous_by_field, event_by_field, *, seconds):
+    """Apply the actual progress writer's merge at a deterministic observation time."""
+    observed_at = datetime(2026, 1, 1) + timedelta(seconds=seconds)
+    return live_progress._merged_live_progress_candidate(
+        run_id="synthetic-catalog",
+        context={},
+        progress_by_field=event_by_field,
+        observed_at=observed_at.isoformat(),
+        now=observed_at,
+        previous=previous_by_field,
+    )
+
+
+def test_discovery_progress_survives_heartbeat_without_inventing_a_total(monkeypatch):
+    """Keep unknown work, writer-owned ordering and passive observations distinct."""
+    events = []
+    monkeypatch.setattr(reporting, "current_live_progress_context", lambda: {"run_id": "synthetic-catalog"})
+    monkeypatch.setattr(reporting, "enqueue_live_progress", lambda **payload: events.append(payload))
+    clock = iter((2.0, 4.0, 6.0))
+    monkeypatch.setattr(reporting, "monotonic", lambda: next(clock))
+    report = reporting.FHIRCatalogRunReport()
+    report.progress("discovery")
+    report.observation_progress("edition-one", 2)
+    report.observation_progress("edition-two", 3)
+    live_progress._reset_attempt_sequences("synthetic-catalog")
+    progress_by_field = {
+        "attempt_id": "synthetic-catalog",
+        "unit": "run",
+        "done": 0,
+        "total": 1,
+        "pct": 0,
+        "source": "engine-heartbeat",
+        "progress_seq": 40,
+    }
+    for index, event in enumerate(events):
+        progress_by_field = merged_catalog_progress(progress_by_field, event, seconds=index)
+        assert "total" not in progress_by_field and "pct" not in progress_by_field
+    assert progress_by_field["counters"]["resource_rows_scanned"] == 5
+    assert progress_by_field["progress_seq"] == 43
+    report.observation_progress("edition-three", 4)
+    heartbeat_by_field = merged_catalog_progress(
+        progress_by_field,
+        {
+            "source": "engine-heartbeat",
+            "phase": "control_start running",
+            "message": "running",
+            "unit": "run",
+            "done": 0,
+            "total": 1,
+            "pct": 0,
+        },
+        seconds=20,
+    )
+    assert heartbeat_by_field["phase"] == "discovery"
+    assert heartbeat_by_field["message"] == progress_by_field["message"]
+    assert heartbeat_by_field["observed_at"] != progress_by_field["observed_at"]
+    assert heartbeat_by_field["progressed_at"] == progress_by_field["progressed_at"]
+    assert heartbeat_by_field["progress_seq"] == progress_by_field["progress_seq"]
+    assert "total" not in heartbeat_by_field and "pct" not in heartbeat_by_field
+    next_progress_by_field = merged_catalog_progress(heartbeat_by_field, events[-1], seconds=21)
+    assert next_progress_by_field["counters"]["resource_rows_scanned"] == 9
+    assert next_progress_by_field["progress_seq"] == 44
 
 
 @pytest.mark.asyncio
