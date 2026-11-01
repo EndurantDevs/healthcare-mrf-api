@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """One owner-authorized read-access successor for an immutable bootstrap."""
 
+import hashlib
 import json
 import re
 from uuid import UUID
@@ -24,6 +25,10 @@ def _require(condition):
 
 def _namespace(receipt):
     return "network_bootstrap_access_" + UUID(receipt.specification.bootstrap_id).hex
+
+
+def _history_namespace(proof_sha256):
+    return "network_bootstrap_prior_" + proof_sha256[:32]
 
 
 def _digest(value):
@@ -142,7 +147,7 @@ _SERIAL_SQL = """SELECT d.oid,seq.oid AS sequence_oid,
  WHERE d.oid=$1::oid AND native.oid=1574"""
 
 
-async def _dormant_sequence(connection, receipt, document, reader_oid):
+async def _dormant_sequence(connection, receipt, document, reader_oid, *, roles=None):
     """The copied NPI serial default is dormant: no reader may execute its sequence."""
     own_objects = {str(oid) for _, oid in (*receipt.relation_oids, *receipt.index_oids)}
     external_dependencies = [
@@ -157,7 +162,8 @@ async def _dormant_sequence(connection, receipt, document, reader_oid):
     dependency = external_dependencies[0]
     serial = await connection.fetchrow(_SERIAL_SQL, int(dependency["objid"]), int(dependency["refobjid"]))
     _require(serial is not None and serial["safe"] is True)
-    roles = json.loads(await connection.fetchval(_ROLE_SQL, reader_oid))["roles"]
+    if roles is None:
+        roles = json.loads(await connection.fetchval(_ROLE_SQL, reader_oid))["roles"]
     await _component_read_only(connection, receipt, roles, sequence_oid=serial["sequence_oid"])
     return {"sequence": json.loads(serial["sequence"]), "nextval": json.loads(serial["nextval"])}
 
@@ -227,14 +233,17 @@ async def _reader(connection, receipt, reader):
     return row["oid"], _digest(component)
 
 
-async def _base_catalog(connection, receipt):
+async def _base_catalog(connection, receipt, *, api_read=False):
+    from process.network_address_artifact import _require_api_read_context
     from process.network_bootstrap_sources import _catalog, _decode, _schema_name
 
+    await _require_api_read_context(connection, api_read)
     schema_name = _schema_name(receipt.specification)
     stored = await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", receipt.schema_oid)
     _require(_decode(stored) == receipt)
     tables = ",".join(f"{_identifier(schema_name)}.{_identifier(name)}" for name, _ in receipt.relation_oids)
-    await connection.execute(f"LOCK TABLE {tables} IN ACCESS SHARE MODE NOWAIT")
+    if not api_read:
+        await connection.execute(f"LOCK TABLE {tables} IN ACCESS SHARE MODE NOWAIT")
     catalog = await _catalog(connection, schema_name)
     _require(catalog["namespace"] == {"oid": receipt.schema_oid, "nspowner": receipt.owner_oid})
     _require(tuple(sorted(catalog["heaps"].items())) == receipt.relation_oids)
@@ -246,10 +255,10 @@ async def _base_catalog(connection, receipt):
     return schema_name
 
 
-async def _native(connection, receipt, reader_oid):
+async def _native(connection, receipt, reader_oid, *, api_read=False):
     from process.network_registry_cms_prepared_address import _require_prepared_copy_key
 
-    schema_name = await _base_catalog(connection, receipt)
+    schema_name = await _base_catalog(connection, receipt, api_read=api_read)
     for name, oid in receipt.relation_oids:
         await _require_prepared_copy_key(
             connection,
@@ -264,7 +273,7 @@ async def _native(connection, receipt, reader_oid):
     return _digest(document)
 
 
-async def _proof(connection, receipt):
+async def _proof(connection, receipt, *, namespace=None):
     row = await connection.fetchrow(
         "SELECT n.oid,n.nspowner,obj_description(n.oid,'pg_namespace') AS document,"
         "NOT EXISTS(SELECT FROM aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a "
@@ -272,7 +281,7 @@ async def _proof(connection, receipt):
         "WHERE refclassid='pg_namespace'::regclass AND refobjid=n.oid) "
         "AND NOT EXISTS(SELECT FROM pg_default_acl WHERE defaclnamespace=n.oid) AS closed "
         "FROM pg_namespace n WHERE n.nspname=$1",
-        _namespace(receipt),
+        namespace or _namespace(receipt),
     )
     if row is None:
         return None
@@ -297,27 +306,27 @@ def _extended_acl(receipt, before, reader_oid):
     return sorted(before + additions)
 
 
-async def bootstrap_read_roles(connection, receipt):
+async def bootstrap_read_roles(connection, receipt, *, api_read=False):
     """Accept only the original ACLs or the single native-bound read successor."""
     from process.network_custom_address_source import NetworkCustomAddressSourceError, _closed
 
-    await _base_catalog(connection, receipt)
+    await _base_catalog(connection, receipt, api_read=api_read)
     try:
         await _closed(connection, receipt.schema_oid, receipt.owner_oid, receipt.runtime_roles, None)
     except NetworkCustomAddressSourceError:
         proof = await _proof(connection, receipt)
         _require(proof is not None)
-        return await _successor_roles(connection, receipt, proof)
+        return await _successor_roles(connection, receipt, proof, api_read=api_read)
     # Restored original authority never depends on a retired successor actor.
     return receipt.runtime_roles
 
 
-async def _successor_roles(connection, receipt, proof, *, allow_original=False):
+async def _successor_roles(connection, receipt, proof, *, allow_original=False, api_read=False):
     from process.network_custom_address_source import _closed
 
     reader_oid, roles_sha256 = await _reader(connection, receipt, proof["reader"])
     _require((reader_oid, roles_sha256) == (proof["reader_oid"], proof["roles_sha256"]))
-    _require(await _native(connection, receipt, reader_oid) == proof["native_sha256"])
+    _require(await _native(connection, receipt, reader_oid, api_read=api_read) == proof["native_sha256"])
     _require(proof["after"] == _extended_acl(receipt, proof["before"], reader_oid))
     current = await _acl(connection, receipt)
     _require(current == proof["after"] or (allow_original and current == proof["before"]))
@@ -330,7 +339,7 @@ async def _successor_roles(connection, receipt, proof, *, allow_original=False):
     return roles
 
 
-async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_actors=()):
+async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_actors=(), api_read=False):
     """Preserve authenticated readers and reject unsafe input reach by output actors."""
     from process.network_bootstrap_sources import _decode
     from process.network_custom_address_source import NetworkCustomAddressSourceError
@@ -342,9 +351,19 @@ async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_a
             )
         )
         _require(pin in (receipt.address_source, receipt.npi_source))
-        roles = await bootstrap_read_roles(connection, receipt)
+        roles = await bootstrap_read_roles(connection, receipt, api_read=api_read)
         _require(set(required_roles) <= set(roles))
         actors = sorted(set((*roles, *runtime_actors))) if runtime_actors else ()
+        sequence_oid = None
+        if actors:
+            caller = await connection.fetchval("SELECT current_user::text")
+            caller_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", caller)
+            native = await connection.fetchrow(_NATIVE_SQL, receipt.schema_oid)
+            _require(native["safe"] is True)
+            dormant = await _dormant_sequence(connection, receipt, json.loads(native["document"]), caller_oid, roles=())
+            sequence_oid = int(dormant["sequence"][0]) if dormant is not None else None
+            if api_read:
+                actors = sorted(set((*actors, caller)))
         for actor in actors:
             _identifier(actor)
             actor_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", actor)
@@ -358,7 +377,10 @@ async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_a
                 [int(role[0]) for role in component["roles"]],
             )
             await _component_read_only(
-                connection, receipt, [role for role in component["roles"] if int(role[0]) in reachable]
+                connection,
+                receipt,
+                [role for role in component["roles"] if int(role[0]) in reachable],
+                sequence_oid=sequence_oid,
             )
         return roles
     except NetworkBootstrapSourceError as error:
@@ -430,6 +452,81 @@ async def install_bootstrap_read_access(connection, receipt, *, reader_role):
         _require(reader_role in await bootstrap_read_roles(connection, receipt))
         await connection.execute(f"SET LOCAL ROLE {original_role}")
         return proof
+
+
+async def _renewal_predecessor(connection, receipt, proof, locked, expected_proof_sha256):
+    if hashlib.sha256(locked.encode()).hexdigest() == expected_proof_sha256:
+        return proof, locked
+    history_name = _history_namespace(expected_proof_sha256)
+    predecessor = await _proof(connection, receipt, namespace=history_name)
+    document = await connection.fetchval(
+        "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1", history_name
+    )
+    _require(
+        predecessor is not None
+        and type(document) is str
+        and hashlib.sha256(document.encode()).hexdigest() == expected_proof_sha256
+    )
+    return predecessor, document
+
+
+async def renew_bootstrap_read_access(connection, receipt, *, expected_proof_sha256, expected_roles_sha256):
+    """Original-admin CAS of the role census only, retaining the complete prior v1 proof."""
+    from process.network_bootstrap_sources import _transaction, verify_network_bootstrap_sources
+
+    for digest in (expected_proof_sha256, expected_roles_sha256):
+        _require(type(digest) is str and re.fullmatch("[0-9a-f]{64}", digest) is not None)
+    async with connection.transaction():
+        await _transaction(connection)
+        _require(
+            await connection.fetchval(
+                "SELECT session_user=current_user AND rolsuper FROM pg_roles WHERE rolname=current_user"
+            )
+            is True
+        )
+        locked = await connection.fetchval(
+            "SELECT d.description FROM pg_description d JOIN pg_namespace n ON n.oid=d.objoid "
+            "WHERE n.nspname=$1 AND d.classoid='pg_namespace'::regclass AND d.objsubid=0 "
+            "FOR UPDATE OF d NOWAIT",
+            _namespace(receipt),
+        )
+        proof = await _proof(connection, receipt)
+        _require(proof is not None and type(locked) is str and json.loads(locked) == proof)
+        original_role = await _operator(connection, receipt)
+        history_name = _history_namespace(expected_proof_sha256)
+        predecessor, predecessor_document = await _renewal_predecessor(
+            connection, receipt, proof, locked, expected_proof_sha256
+        )
+        proof_by_field = {**predecessor, "roles_sha256": expected_roles_sha256}
+        _require(proof == predecessor or proof == proof_by_field)
+        # This deliberately reuses the unchanged v1 reader/native/ACL safety checks.
+        await _successor_roles(connection, receipt, proof_by_field)
+        if proof != proof_by_field:
+            history = await _proof(connection, receipt, namespace=history_name)
+            if history is None:
+                await connection.execute(f"SET LOCAL ROLE {original_role}")
+                await connection.execute(
+                    f"CREATE SCHEMA {_identifier(history_name)} AUTHORIZATION {_identifier(receipt.owner_role)}"
+                )
+                await connection.execute(f"SET LOCAL ROLE {_identifier(receipt.owner_role)}")
+                literal = await connection.fetchval("SELECT quote_literal($1::text)", predecessor_document)
+                await connection.execute(f"COMMENT ON SCHEMA {_identifier(history_name)} IS {literal}")
+            else:
+                _require(history == predecessor)
+                _require(
+                    await connection.fetchval(
+                        "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1", history_name
+                    )
+                    == predecessor_document
+                )
+            literal = await connection.fetchval(
+                "SELECT quote_literal($1::text)", json.dumps(proof_by_field, sort_keys=True, separators=(",", ":"))
+            )
+            await connection.execute(f"COMMENT ON SCHEMA {_identifier(_namespace(receipt))} IS {literal}")
+        _require(await _proof(connection, receipt) == proof_by_field)
+        await verify_network_bootstrap_sources(connection, receipt)
+        await connection.execute(f"SET LOCAL ROLE {original_role}")
+        return proof_by_field
 
 
 async def revoke_bootstrap_read_access(connection, receipt, *, reader_role):

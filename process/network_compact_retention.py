@@ -9,6 +9,7 @@ from db.registry_schema import registry_schema
 from process import network_candidate_custody as custody
 from process.network_address_artifact import _descriptor
 from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_bootstrap_address_artifact import CONTRACT as BOOTSTRAP_ARTIFACT_CONTRACT
 from process.network_compact_readiness import COMPONENT, compact_readiness, is_compact_candidate
 from process.network_membership_validation import _json_object, _scope_report
 
@@ -127,7 +128,12 @@ def _dependencies(candidate, receipt):
         and owned.get("network_slice_ref") == canonical["ref_map_oid"],
         "closure_changed",
     )
-    dependencies = {address["table"]["oid"], address["authority_table_oid"], *owned.values()}
+    address_oids = (
+        address["dependency_oids"]
+        if address["contract"] == BOOTSTRAP_ARTIFACT_CONTRACT
+        else (address["table"]["oid"], address["authority_table_oid"])
+    )
+    dependencies = {*address_oids, *owned.values()}
     carriers = compact_carrier_receipt(candidate)
     if carriers is not None:
         dependencies.update(oid for origin in carriers.origin_references for oid in origin[3:5])
