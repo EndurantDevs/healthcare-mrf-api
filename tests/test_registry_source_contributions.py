@@ -180,16 +180,29 @@ async def test_native_fact_fingerprint_is_ordered_bounded_and_rejects_gaps():
             self.calls = []
 
         async def fetch(self, query, identity, cursor):
-            assert "LIMIT 1000" in query and "ordinal>$2 ORDER BY ordinal" in query
+            assert "LIMIT 1000" in query and "ordinal>$2" in query and "ordinal<=LEAST($2," in query
             self.calls.append(cursor)
-            return [{"ordinal": ordinal, "fingerprint": "a" * 64} for ordinal in self.ordinals if ordinal > cursor]
+            return [
+                {"ordinal": ordinal, "fingerprint": "a" * 64}
+                for ordinal in self.ordinals
+                if cursor < ordinal <= cursor + 1000
+            ]
+
+        async def fetchval(self, query, identity, cursor):
+            assert "SELECT EXISTS" in query
+            return any(ordinal > cursor for ordinal in self.ordinals)
 
     complete = Connection([1, 2])
-    digest, rows = await contributions.contribution_fact_sha256(complete, 'pg_temp."synthetic_facts"', "b" * 64)
-    assert rows == 2 and digest == contributions.hashlib.sha256(("a" * 128).encode()).hexdigest()
+    digest, row_count = await contributions.contribution_fact_sha256(complete, 'pg_temp."synthetic_facts"', "b" * 64)
+    assert row_count == 2 and digest == contributions.hashlib.sha256(("a" * 128).encode()).hexdigest()
     assert complete.calls == [0, 2]
-    with pytest.raises(contributions.RegistrySourceContributionError, match="ordinal_invalid"):
-        await contributions.contribution_fact_sha256(Connection([1, 3]), 'pg_temp."synthetic_facts"', "b" * 64)
+    assert await contributions.contribution_fact_sha256(Connection([]), 'pg_temp."synthetic_facts"', "b" * 64) == (
+        contributions.hashlib.sha256().hexdigest(),
+        0,
+    )
+    for ordinals in ([1, 3], [1, 1002], [1001], [2**63 - 1]):
+        with pytest.raises(contributions.RegistrySourceContributionError, match="ordinal_invalid"):
+            await contributions.contribution_fact_sha256(Connection(ordinals), 'pg_temp."synthetic_facts"', "b" * 64)
 
 
 def test_receipt_rejects_deep_noncontract_documents_with_closed_error():

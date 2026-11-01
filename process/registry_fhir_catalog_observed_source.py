@@ -20,7 +20,7 @@ from process.registry_fhir_catalog_extraction import (
     fhir_catalog_text,
     fhir_source_uri,
     iter_fhir_catalog_batches,
-    iter_fhir_catalog_pages,
+    iter_fhir_catalog_raw_pages,
 )
 from process.registry_fhir_catalog_observation import (
     CATALOG_OBSERVATION_CONTRACT,
@@ -30,6 +30,7 @@ from process.registry_fhir_catalog_observation import (
 )
 from process.registry_fhir_catalog_published_read import fhir_catalog_published_reads, pin_fhir_catalog_published_read
 from process.registry_fhir_catalog_reference_rollup import MAX_PAGE_REFERENCES
+from process.registry_fhir_catalog_reporting import current_fhir_catalog_report
 
 _MAX_CATALOG_ROWS = 1000
 _HEADER = "provider_directory_endpoint_dataset"
@@ -314,6 +315,9 @@ async def _registration(connection, profile, endpoint_id, families):
 
 
 async def _facts(connection, profile, dataset_id, native, source_uri, *, published_read=None):
+    report = current_fhir_catalog_report()
+    if report:
+        report.observation_progress(dataset_id, 0)
     resource_relation = storage_relation(profile.schema_name, _RESOURCE)
     table_oid = "tableoid::oid"
     if published_read is not None:
@@ -329,12 +333,12 @@ async def _facts(connection, profile, dataset_id, native, source_uri, *, publish
         native["resource_leaf_oids"],
     )
     digests = FHIRCatalogObservationDigests()
-    async for page in iter_fhir_catalog_pages(
+    async for page in iter_fhir_catalog_raw_pages(
         connection, schema_name=profile.schema_name, dataset_id=dataset_id, source_read=published_read
     ):
-        _validate_metadata_page(page, source_uri)
-        for resource_row in page:
-            digests.add(resource_row)
+        digests.add_page(page, lambda rows: _validate_metadata_page(rows, source_uri))
+        if report:
+            report.observation_progress(dataset_id, len(page))
     families = digests.document()
     counts_by_type = dict.fromkeys(RESOURCE_TYPES, 0)
     for count in counts:
@@ -343,6 +347,8 @@ async def _facts(connection, profile, dataset_id, native, source_uri, *, publish
         counts_by_type[count["resource_type"]] = count["rows"]
     if any(families[family]["rows"] != counts_by_type[family] for family in RESOURCE_TYPES):
         _fail("resource_count_changed")
+    if report:
+        report.observation_progress(dataset_id, 0)
     return families
 
 

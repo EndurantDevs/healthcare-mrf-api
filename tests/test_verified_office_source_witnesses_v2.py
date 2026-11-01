@@ -5,6 +5,7 @@ import asyncio
 import copy
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID
@@ -13,6 +14,7 @@ import pytest
 
 from process import network_fhir_membership_source as fhir
 from process import registry_source_contribution_store as facts
+from process.registry_source_witness_mapping_sql import WITNESS_MAP_SQL_V2
 from tests.test_network_fhir_retained_capture import pin, retained
 from tests.test_registry_generic_fhir_facts import _legacy_pin, _recipe
 
@@ -163,8 +165,8 @@ def test_mixed_valid_unresolved_and_missing_network_edges_remain_distinct():
     assert facts.decode_fhir_source_witness_page_v2(_page(source, documents)) == documents
     # These flags are source-native witnesses. Selected approved bindings remain absent.
     assert all("network_id" not in document and "outcome" not in document for document in documents)
-    assert "coalesce(bool_or(edge_status.unresolved),false)" in facts._WITNESS_MAP_SQL_V2
-    assert "NOT $9::boolean OR approved.network_id IS NOT NULL" in facts._WITNESS_MAP_SQL_V2
+    assert "coalesce(bool_or(unresolved),false)" in WITNESS_MAP_SQL_V2
+    assert "NOT $9::boolean OR approved.network_id IS NOT NULL" in WITNESS_MAP_SQL_V2
 
 
 def test_malformed_and_temporally_omitted_resources_have_raw_headers():
@@ -500,10 +502,19 @@ async def test_map_protocol_binds_exact_physical_discriminator_and_new_identity(
         def is_in_transaction(self):
             return True
 
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+        async def execute(self, sql):
+            assert sql.startswith("DELETE FROM pg_temp.")
+
         async def fetchrow(self, sql, *arguments):
             observed_calls.append((sql, arguments))
             return {
                 **{field: descriptor[field] for field in facts._WITNESS_COUNTERS_V2},
+                "fact_rows": 0 if len(arguments) > 1 and arguments[-1] else descriptor["fact_rows"],
+                "last_ordinal": descriptor["fact_rows"],
                 "invalid": False,
                 "inserted_rows": 0,
             }
@@ -521,7 +532,7 @@ async def test_map_protocol_binds_exact_physical_discriminator_and_new_identity(
         insert=False,
     )
     assert mapping_result == descriptor
-    _, arguments = observed_calls[0]
+    _, arguments = next(call for call in observed_calls if len(call[1]) == 11)
     assert arguments[7] == facts.verified_office_fact_identity(recipe)[0]
     assert arguments[8] is (fhir.fhir_physical_source(source_pin).retained_capture is not None)
     assert json.loads(arguments[9]) == fhir.fhir_source_witness_binding_v2(source_pin)
@@ -541,3 +552,45 @@ def test_descriptor_requires_disjoint_edge_counts_and_a_resource_header(damage):
 def test_explicit_v2_identity_rejects_other_source_families():
     with pytest.raises(facts.RegistrySourceContributionError, match="witness_descriptor_invalid"):
         facts.verified_office_fact_identity(SimpleNamespace(source_pin=object()))
+
+
+@pytest.mark.asyncio
+async def test_fact_digest_cancellation_drains_only_the_inflight_page():
+    started, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    cursors = []
+
+    class Connection:
+        async def fetch(self, query, identity, cursor):
+            cursors.append(cursor)
+            assert cursor == 0
+            started.set()
+            await release.wait()
+            finished.set()
+            return [{"ordinal": 1, "fingerprint": "a" * 64}]
+
+    operation = asyncio.create_task(facts.contribution_fact_sha256(Connection(), "synthetic_facts", "b" * 64))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert not operation.done() and not finished.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert finished.is_set() and cursors == [0]
+    finally:
+        release.set()
+        if not operation.done():
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+
+
+def test_workspace_names_are_bounded_and_do_not_reuse_a_truncated_suffix():
+    first = "registry_witness_members_" + "a" * 32
+    second = "registry_witness_members_" + "b" * 32
+    names = {facts.witness_mapping_workspace_name(first), facts.witness_mapping_workspace_name(second)}
+    assert len(names) == 2 and all(len(name) <= 63 for name in names)
+    assert facts.witness_mapping_workspace_name(first) == facts.witness_mapping_workspace_name(first)
+    with pytest.raises(ValueError):
+        facts.witness_mapping_workspace_name('invalid"name')

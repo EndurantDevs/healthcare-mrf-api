@@ -224,7 +224,7 @@ fn organization_hash(payload: &Map<String, Value>) -> std::result::Result<String
     Ok(composed_hash(base, hashes))
 }
 
-pub(super) fn json_bytes(value: &Value, spaced: bool, ascii: bool) -> Vec<u8> {
+pub(crate) fn json_bytes(value: &Value, spaced: bool, ascii: bool) -> Vec<u8> {
     let mut output = Vec::new();
     write_json(value, spaced, ascii, &mut output);
     output

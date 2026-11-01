@@ -192,9 +192,10 @@ async def test_v2_builder_validates_mapper_and_exact_artifact_before_projection(
     monkeypatch.setattr(projection, "map_fhir_source_witnesses_v2", mapper)
     monkeypatch.setattr(projection, "map_fhir_facts", AsyncMock(side_effect=AssertionError("v1 mapper selected")))
     monkeypatch.setattr(projection, "_append", append)
+    connection = SimpleNamespace(execute=AsyncMock())
     approved = ApprovedMembershipSource(3, "d" * 64)
     await projection.append_provider_only_source(
-        object(), copy_target, recipe, descriptor, approved, control_schema="controls"
+        connection, copy_target, recipe, descriptor, approved, control_schema="controls"
     )
     assert artifact.await_count == int(anchored)
     expected = '"original".facts' if anchored else f'"{copy_target.schema_name}".network_source_contribution'
@@ -205,9 +206,13 @@ async def test_v2_builder_validates_mapper_and_exact_artifact_before_projection(
     append.reset_mock()
     with pytest.raises(projection.ProviderOnlyProjectionError):
         await projection.append_provider_only_source(
-            object(), copy_target, recipe, descriptor, approved, control_schema="controls"
+            connection, copy_target, recipe, descriptor, approved, control_schema="controls"
         )
     append.assert_not_awaited()
+
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert sum(statement.startswith("CREATE TEMP TABLE") for statement in statements) == 2
+    assert sum(statement.startswith("DROP TABLE pg_temp.") for statement in statements) == 2
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import json
 from collections import Counter
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
+from types import SimpleNamespace
 
 import asyncpg
 import pytest
@@ -15,6 +16,7 @@ import pytest
 from process import network_fhir_membership_source as fhir
 from process import registry_source_contribution_store as facts
 from process.registry_source_recipe_composition import _require_recipe_custody
+from process.registry_source_witness_mapping_sql import WITNESS_PAGE_SQL
 from tests import generic_fhir_capture_postgres_support as retained
 from tests import generic_source_successor_postgres_support as source
 from tests import test_network_serving_schema_postgres as registry
@@ -136,6 +138,7 @@ async def _identity(reader, fixture):
 async def _temp_heaps(reader):
     for table in ("witness_facts", "witness_replay", "witness_cancel"):
         await facts.create_contribution_stage(reader, table)
+    await facts.create_witness_mapping_workspace(reader, "witness_members")
     await reader.execute(
         "CREATE TEMP TABLE witness_members(network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text)"
     )
@@ -523,3 +526,205 @@ async def test_provider_only_v2_sql_uses_genuine_source_headers(monkeypatch):
                     "WHERE fact_json->>'kind'='resource' AND fact_json->>'resource_id'='P-provider-only'"
                 )
                 assert await reader.fetch(query, *parameters) == []
+
+
+async def _replace_facts(reader, recipe, documents):
+    await reader.execute("DELETE FROM pg_temp.witness_replay")
+    identity = facts.verified_office_fact_identity(recipe)[0]
+    await reader.copy_records_to_table(
+        "witness_replay",
+        schema_name="pg_temp",
+        columns=("recipe_sha256", "ordinal", "fact_json"),
+        records=[(identity, index, json.dumps(document)) for index, document in enumerate(documents, 1)],
+    )
+
+
+async def _mapping_state(reader):
+    workspace = facts.witness_mapping_workspace_name("witness_members")
+    return (
+        await reader.fetch("SELECT * FROM pg_temp.witness_members ORDER BY network_id,provider_id,evidence_id"),
+        await reader.fetch(f'SELECT * FROM pg_temp."{workspace}" ORDER BY resource_type,resource_id'),
+    )
+
+
+async def _assert_late_failures(reader, recipe, approved, control, documents):
+    original = await _mapping_state(reader)
+    edge = next(document for document in documents if document["kind"] == "edge")
+    header = next(document for document in documents if document["kind"] == "resource")
+    for damage in ("duplicate", "orphan", "hash", "binding", "ordinal", "large_gap"):
+        changed_by_field = dict(edge)
+        if damage == "duplicate":
+            changed_by_field = header
+        if damage == "orphan":
+            changed_by_field["resource_id"] = "missing-header"
+        if damage == "hash":
+            changed_by_field["payload_sha256"] = "f" * 64
+        if damage == "binding":
+            changed_by_field["source_binding"] = {}
+        await _replace_facts(reader, recipe, [*documents, changed_by_field])
+        if damage in {"ordinal", "large_gap"}:
+            await reader.execute(
+                "UPDATE pg_temp.witness_replay SET ordinal=ordinal+$2 WHERE ordinal=$1",
+                len(documents) + 1,
+                1 if damage == "ordinal" else 1001,
+            )
+        with pytest.raises(facts.RegistrySourceContributionError, match="facts_invalid|ordinal_invalid"):
+            await _map(reader, recipe, approved, control, table="witness_replay")
+        assert await _mapping_state(reader) == original
+        assert await reader.fetchval("SELECT 1") == 1
+
+
+async def _assert_cancelled_page_rolls_back(reader, recipe, approved, control, documents):
+    await _replace_facts(reader, recipe, documents)
+    original = await _mapping_state(reader)
+    started, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class PausedPage:
+        def __getattr__(self, name):
+            return getattr(reader, name)
+
+        async def fetchrow(self, query, *arguments):
+            result = await reader.fetchrow(query, *arguments)
+            if len(arguments) == 11 and arguments[-1] >= 1000:
+                started.set()
+                await release.wait()
+                finished.set()
+            return result
+
+    operation = asyncio.create_task(_map(PausedPage(), recipe, approved, control, table="witness_replay"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        operation.cancel()
+        await asyncio.sleep(0)
+        assert not operation.done() and not finished.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert finished.is_set() and await _mapping_state(reader) == original
+        assert await reader.fetchval("SELECT 1") == 1
+    finally:
+        release.set()
+        if not operation.done():
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+
+
+async def _assert_bounded_replay(reader, recipe, approved, control, documents, descriptor):
+    original_members = (await _mapping_state(reader))[0]
+    edges = [document for document in documents if document["kind"] == "edge"]
+    headers = [document for document in documents if document["kind"] == "resource"]
+    repeated = edges * 240 + headers  # Headers follow all edges; resources span ordinal pages.
+    await _replace_facts(reader, recipe, repeated)
+    await reader.execute("DELETE FROM pg_temp.witness_members")
+    mapped = await _map(reader, recipe, approved, control, table="witness_replay")
+    for field in ("membership_rows", "omitted_rows", "unresolved_rows"):
+        assert mapped[field] == descriptor[field] * 240
+    for field in (
+        "raw_source_rows",
+        "accepted_raw_source_rows",
+        "omitted_raw_source_rows",
+        "unresolved_raw_source_rows",
+        "provider_only_rows",
+    ):
+        assert mapped[field] == descriptor[field]
+    assert mapped["fact_rows"] == len(repeated) > 1000
+    assert Counter(tuple(member_record) for member_record in (await _mapping_state(reader))[0]) == Counter(
+        {
+            tuple(member_record): count * 240
+            for member_record, count in Counter(tuple(member_record) for member_record in original_members).items()
+        }
+    )
+    digest = hashlib.sha256()
+    for fact_record in await reader.fetch(
+        "SELECT jsonb_build_array(ordinal,fact_json)::text AS framed FROM pg_temp.witness_replay ORDER BY ordinal"
+    ):
+        digest.update(hashlib.sha256(fact_record["framed"].encode()).hexdigest().encode("ascii"))
+    assert mapped["fact_sha256"] == digest.hexdigest()
+    before = await _mapping_state(reader)
+    assert await _map(reader, recipe, approved, control, table="witness_replay", insert=False) == mapped
+    assert await _mapping_state(reader) == before
+    await _assert_late_failures(reader, recipe, approved, control, repeated)
+    await _assert_cancelled_page_rolls_back(reader, recipe, approved, control, repeated)
+
+
+async def _assert_byte_pages(reader, recipe, document):
+    # Exercise the page boundary separately from the producer's closed fact schema.
+    wide_by_field = {**document, "padding": "x" * 1_048_576}
+    await _replace_facts(reader, recipe, [wide_by_field] * 10)
+    page = WITNESS_PAGE_SQL.format(fact_relation="pg_temp.witness_replay", identity="$1", cursor="$2")
+    query = "WITH " + page + " SELECT count(*) AS rows,sum(row_bytes) AS bytes,max(ordinal) AS last FROM facts"
+    identity = facts.verified_office_fact_identity(recipe)[0]
+    first = await reader.fetchrow(query, identity, 0)
+    assert 0 < first["rows"] < 10 and first["bytes"] <= 8_388_608
+    second = await reader.fetchrow(query, identity, first["last"])
+    assert first["rows"] + second["rows"] == 10 and second["bytes"] <= 8_388_608
+    await _replace_facts(reader, recipe, [{**document, "padding": "x" * 8_388_608}])
+    indivisible = await reader.fetchrow(query, identity, 0)
+    assert indivisible["rows"] == indivisible["last"] == 1 and indivisible["bytes"] > 8_388_608
+
+
+def _assert_fact_scan_bounds(plan):
+    pending_nodes = [plan[0]["Plan"]]
+    scan_visits = []
+    while pending_nodes:
+        node = pending_nodes.pop()
+        pending_nodes.extend(node.get("Plans", []))
+        if node.get("Relation Name") == "witness_replay":
+            scanned_rows = (
+                node["Actual Rows"]
+                + node.get("Rows Removed by Filter", 0)
+                + node.get("Rows Removed by Index Recheck", 0)
+            )
+            scan_visits.append(scanned_rows * node["Actual Loops"])
+    assert scan_visits and max(scan_visits) <= 1000
+
+
+async def _assert_native_scans_are_bounded(reader, recipe, document):
+    await _replace_facts(reader, recipe, [document] * 20_000)
+    page = WITNESS_PAGE_SQL.format(fact_relation="pg_temp.witness_replay", identity="$1", cursor="$2")
+    query = "WITH " + page + " SELECT count(*),sum(row_bytes) FROM facts"
+    identity = facts.verified_office_fact_identity(recipe)[0]
+    _assert_fact_scan_bounds(
+        json.loads(
+            await reader.fetchval(
+                "EXPLAIN (ANALYZE,VERBOSE,FORMAT JSON) " + query,
+                identity,
+                0,
+            )
+        )
+    )
+
+    async def checked_fingerprint_page(query, *parameters):
+        if parameters[-1] == 0:
+            _assert_fact_scan_bounds(
+                json.loads(
+                    await reader.fetchval(
+                        "EXPLAIN (ANALYZE,VERBOSE,FORMAT JSON) " + query,
+                        *parameters,
+                    )
+                )
+            )
+        return await reader.fetch(query, *parameters)
+
+    checked_reader = SimpleNamespace(fetch=checked_fingerprint_page, fetchval=reader.fetchval)
+    _, count = await facts.contribution_fact_sha256(checked_reader, "pg_temp.witness_replay", identity)
+    assert count == 20_000
+
+
+async def test_bounded_mapping_preserves_replay_and_rolls_back_late_failure(monkeypatch):
+    monkeypatch.setattr(source, "_edition_rows", _census_rows)
+    async with source.native_generic_source(monkeypatch) as fixture:
+        capture = await source.publish_edition(fixture, 1)
+        async with _registry_on_source(fixture, monkeypatch) as serving, _reader(fixture) as reader:
+            _, control, _ = serving
+            recipe, approved, _ = await retained._approved_capture_recipe(fixture, serving, capture)
+            await _temp_heaps(reader)
+            async with reader.transaction(isolation="repeatable_read", readonly=True):
+                original_identity = await _identity(reader, fixture)
+                _, documents, _ = await _extract(reader, recipe, approved, control, limit=2, target="witness_facts")
+                descriptor = await _map(reader, recipe, approved, control)
+                await _assert_bounded_replay(reader, recipe, approved, control, documents, descriptor)
+                await _assert_byte_pages(reader, recipe, documents[0])
+                await _assert_native_scans_are_bounded(reader, recipe, documents[0])
+                assert await _identity(reader, fixture) == original_identity
