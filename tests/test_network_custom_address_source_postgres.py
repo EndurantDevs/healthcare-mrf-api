@@ -2145,10 +2145,11 @@ async def test_bootstrap_access_api_mode_is_metadata_only_and_requires_readonly_
 async def test_bootstrap_access_api_mode_checks_output_actor_dormant_sequence(bootstrap_access_fixture, api_read):
     fixture = bootstrap_access_fixture
     connection, receipt = fixture.fixture.connection, fixture.receipt
-    await _change_bootstrap_access(fixture)
+    proof = await _change_bootstrap_access(fixture)
     sequence = await connection.fetchval(
         "SELECT pg_get_serial_sequence($1,'npi')", fixture.fixture.source_schema + ".npi"
     )
+    before = await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
     assert not await connection.fetchval(
         "SELECT has_table_privilege($1::name,$2::oid,'SELECT')", fixture.stranger, receipt.relation_oids[0][1]
     )
@@ -2162,20 +2163,21 @@ async def test_bootstrap_access_api_mode_checks_output_actor_dormant_sequence(bo
             caller.transaction(isolation="repeatable_read", readonly=True),
         ):
             assert await bootstrap_access.bootstrap_pin_read_roles(caller, receipt.address_source, (), api_read=True)
-    await connection.execute(f'GRANT USAGE ON SEQUENCE {sequence} TO "{fixture.stranger}"')
+    await connection.execute(f'GRANT SELECT,USAGE,UPDATE ON SEQUENCE {sequence} TO "{fixture.stranger}"')
     async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
         async with reader.transaction(isolation="repeatable_read", readonly=True):
-            with pytest.raises(NetworkCustomAddressSourceError, match="Retained bootstrap read access differs"):
-                await bootstrap_access.bootstrap_pin_read_roles(
-                    reader, receipt.address_source, (), runtime_actors=(fixture.stranger,), api_read=api_read
-                )
+            assert await bootstrap_access.bootstrap_pin_read_roles(
+                reader, receipt.address_source, (), runtime_actors=(fixture.stranger,), api_read=api_read
+            ) == tuple(sorted((*receipt.runtime_roles, fixture.reader)))
     if api_read:
         async with (
             _bootstrap_access_login(fixture.stranger, fixture.password) as caller,
             caller.transaction(isolation="repeatable_read", readonly=True),
         ):
-            with pytest.raises(NetworkCustomAddressSourceError, match="Retained bootstrap read access differs"):
-                await bootstrap_access.bootstrap_pin_read_roles(caller, receipt.address_source, (), api_read=True)
+            assert await bootstrap_access.bootstrap_pin_read_roles(caller, receipt.address_source, (), api_read=True)
+    assert await _verify_bootstrap_access(fixture) == receipt
+    assert await bootstrap_access._proof(connection, receipt) == proof
+    assert await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == before
 
 
 async def test_bootstrap_access_revoke_keeps_proof_and_restores_original_acl(bootstrap_access_fixture):
@@ -2471,36 +2473,45 @@ async def test_bootstrap_access_dormant_serial_default_never_executes(bootstrap_
     )
     sequence_oid = await connection.fetchval("SELECT $1::regclass::oid", sequence)
     before = await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
-    await _change_bootstrap_access(bootstrap_access_fixture)
+    proof = await _change_bootstrap_access(bootstrap_access_fixture)
     async with _bootstrap_access_login(bootstrap_access_fixture.reader, bootstrap_access_fixture.password) as reader:
-        assert await _verify_bootstrap_access(bootstrap_access_fixture, reader) == receipt
-        assert not await reader.fetchval(
-            "SELECT has_sequence_privilege(current_user,$1::oid,'SELECT,USAGE,UPDATE')", sequence_oid
-        )
-        assert not await reader.fetchval(
-            "SELECT has_schema_privilege(current_user,$1,'USAGE')", bootstrap_access_fixture.fixture.source_schema
-        )
-        with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await reader.fetchval("SELECT nextval($1::oid::regclass)", sequence_oid)
-    assert await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == before
+        for sequence_access in (False, True):
+            if sequence_access:
+                await connection.execute(
+                    f'GRANT SELECT,USAGE,UPDATE ON SEQUENCE {sequence} TO "{bootstrap_access_fixture.reader}"'
+                )
+            assert await _verify_bootstrap_access(bootstrap_access_fixture, reader) == receipt
+            assert (
+                await reader.fetchval(
+                    "SELECT has_sequence_privilege(current_user,$1::oid,'SELECT,USAGE,UPDATE')", sequence_oid
+                )
+                is sequence_access
+            )
+            assert not await reader.fetchval(
+                "SELECT has_schema_privilege(current_user,$1,'USAGE')", bootstrap_access_fixture.fixture.source_schema
+            )
+            if not sequence_access:
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await reader.fetchval("SELECT nextval($1::oid::regclass)", sequence_oid)
+            assert await bootstrap_access._proof(connection, receipt) == proof
+            assert await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == before
 
 
 @pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
-@pytest.mark.parametrize(
-    "drift", ["sequence_grant", "indirect_grant", "npi_write", "sequence_reference", "default_function"]
-)
+@pytest.mark.parametrize("drift", ["indirect_grant", "npi_write", "sequence_reference", "default_function"])
 async def test_bootstrap_access_dormant_serial_drift_refuses(bootstrap_access_fixture, drift):
     connection, receipt = bootstrap_access_fixture.fixture.connection, bootstrap_access_fixture.receipt
-    if drift == "indirect_grant":
-        await connection.execute(f'GRANT "{bootstrap_access_fixture.reader}" TO "{bootstrap_access_fixture.stranger}"')
     sequence = await connection.fetchval(
         "SELECT pg_get_serial_sequence($1,'npi')", bootstrap_access_fixture.fixture.source_schema + ".npi"
     )
-    await _change_bootstrap_access(bootstrap_access_fixture)
+    proof = await _change_bootstrap_access(bootstrap_access_fixture)
     npi_table = '"' + receipt.address_source.schema_name + '".npi'
-    if drift in {"sequence_grant", "indirect_grant"}:
-        role = bootstrap_access_fixture.stranger if drift == "indirect_grant" else bootstrap_access_fixture.reader
-        await connection.execute(f'GRANT USAGE ON SEQUENCE {sequence} TO "{role}"')
+    if drift == "indirect_grant":
+        await connection.execute(f'GRANT USAGE ON SEQUENCE {sequence} TO "{bootstrap_access_fixture.stranger}"')
+        await connection.execute(f'GRANT "{bootstrap_access_fixture.reader}" TO "{bootstrap_access_fixture.stranger}"')
+        assert (await bootstrap_access._reader(connection, receipt, bootstrap_access_fixture.reader))[1] != proof[
+            "roles_sha256"
+        ]
     elif drift == "npi_write":
         await connection.execute(f'GRANT INSERT ON {npi_table} TO "{bootstrap_access_fixture.reader}"')
     elif drift == "sequence_reference":
