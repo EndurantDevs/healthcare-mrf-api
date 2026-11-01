@@ -19,6 +19,7 @@ class _FHIR:
     retained_capture: object = None
     retained_successor: object = None
     retained_epoch: object = None
+    source_witness_capture: object = None
 
 
 @dataclass
