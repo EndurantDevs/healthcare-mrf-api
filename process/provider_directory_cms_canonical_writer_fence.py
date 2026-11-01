@@ -15,7 +15,7 @@ import json
 import math
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_callable_custody as callables
@@ -114,6 +114,11 @@ class _WriterPreparation:
     connection: object
     task: object
     native: str
+    _actor: str = field(init=False, repr=False)
+
+    def __post_init__(self):
+        # Actor-only rechecks need no copy of the full immutable expected catalog.
+        object.__setattr__(self, "_actor", _encoded(json.loads(self.native)["actor"]))
 
 
 @dataclass(frozen=True)
@@ -487,7 +492,7 @@ async def _closure(connection, native):
     return {"functions": functions, "foreign": foreign_edges}
 
 
-async def _original(connection, preparation):
+async def _original(connection, preparation, *, actor_only=False):
     _require(
         type(preparation) is _WriterPreparation
         and preparation.connection is connection
@@ -495,9 +500,10 @@ async def _original(connection, preparation):
         "original_scope_required",
     )
     _require(connection.is_closed() is False and connection.is_in_transaction() is True, "transaction_required")
-    native = json.loads(preparation.native)
-    _require(dict(await connection.fetchrow(_ACTOR_SQL)) == native["actor"], "original_admin_changed")
-    return native
+    native = json.loads(preparation._actor if actor_only else preparation.native)
+    actor = native if actor_only else native["actor"]
+    _require(dict(await connection.fetchrow(_ACTOR_SQL)) == actor, "original_admin_changed")
+    return None if actor_only else native
 
 
 def _callee_arguments(arguments, storage_binding):
@@ -764,7 +770,7 @@ async def acquire_cms_canonical_writer_fence(connection, preparation, *, deadlin
         _require(observed == native["family"], "family_changed")
         await _require_locks(connection, native)
         _require(await _closure(connection, native) == native["closure"], "closure_changed")
-        await _original(connection, preparation)
+        await _original(connection, preparation, actor_only=True)
         return _WriterFence(preparation, deadline)
 
 
