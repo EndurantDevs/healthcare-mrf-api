@@ -86,6 +86,36 @@ revalidates the current company association, reviewed binding and retained
 source. Historical capture receipts stay immutable. The worker disposes this
 pool on every exit. No additional DSN or authority bypass is accepted.
 
+For exact approved Source witness captures, the optional `source_witness` object
+contains exactly `source_profiles`, `capture_owner_role`, and `runtime_roles`.
+`source_profiles` is a nonempty array of validated native FHIR profiles with
+unique schema names. Each profile uses the existing `schema_name`, `owner_role`,
+`runtime_roles`, and `catalog_schema_name` fields, with an optional validated
+`published_read_scope`. The capture census is a sorted, unique array of 1–32 role
+names and must exclude the capture owner. It must include every actual original
+and effective worker actor, queue owner, reader and custodian; a metadata-owner
+label does not exempt a role that also acts at runtime. Incomplete census refuses
+before the custodian pool is created.
+
+This configuration requires `custody_dsn` and compact `initial_address_sources`.
+The image must provide
+`directory_membership_runtime.membership_source_export_runtime`, exposing the
+original membership export context. The same module must re-export the original
+`CatalogSnapshotRuntime`, `FHIRSourceMembershipInput` and
+`open_membership_source_export` objects so exact type and function identity checks
+remain intact. The metadata-only catalog factory cannot
+substitute for it. The worker opens this context through its existing owned
+lifecycle and closes it after its other pools, including on failure and
+cancellation. Configuration does not accept factories, extra connections or
+authority callbacks. A missing package refuses explicitly.
+
+Each selected capture still requires protected approval of its whole digest,
+the configured owner and census, independent complete Source replay, and native
+candidate custody before ordinary publication. These settings do not enroll
+successors or enable membership refresh. CMS, PTG and ACA source-notification
+workers do not accept this new server configuration; their existing modes are
+unchanged.
+
 The worker owns a lifecycle pool with minimum 1 and maximum 2 connections, an
 execution pool with minimum and maximum 1, and one authority client. Cleanup
 runs after completion, startup failure, work failure and cancellation; a failed

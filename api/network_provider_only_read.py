@@ -24,7 +24,7 @@ from process.network_approved_source_bindings import (
     require_retained_approved_network_source_bindings,
 )
 from process.network_compact_layout import CompactAddressRelation
-from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_normalized_capture
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
@@ -91,7 +91,7 @@ SELECT bounds.valid,bounds.bounded AND octet_length(result.document)<=${maximum_
 
 
 def _binding_scope(source):
-    capture = source.retained_capture
+    capture = fhir_normalized_capture(source)
     return ("alias_scope", source.alias_scope) if capture is None else ("capture_sha256", capture.capture_sha256)
 
 
@@ -168,7 +168,7 @@ async def _source_bindings(connection, current, control_schema, *, candidate=Non
         arguments.append(recipe_contribution_identity(recipe)[0])
         recipe_parameter = len(arguments)
         parameters_by_recipe[recipe_contribution_identity(recipe)[0]] = recipe_parameter
-        capture = recipe.source_pin.retained_capture
+        capture = fhir_normalized_capture(recipe.source_pin)
         scope_key, scope_value = _binding_scope(recipe.source_pin)
         arguments.append(scope_value)
         selected.append(

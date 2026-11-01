@@ -18,8 +18,10 @@ import asyncpg
 
 from process.network_address_projection import _identifier
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_fhir_membership_source import SOURCE_WITNESS_PRODUCER, PinnedFHIRMembershipSource
 from process.network_fhir_source_epoch import validate_retained_cms_fhir_source_epoch
+from process.network_fhir_source_witness_contract import SourceWitnessCaptureAnchor
+from process.network_fhir_source_witness_contract import validate_capture as validate_source_witness_capture
 from process.network_legacy_membership_source import PinnedACAMembershipSource, aca_source_descriptor
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
@@ -64,6 +66,11 @@ def _validate_recipe_scope(recipe):
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
     if type(source_pin) is PinnedFHIRMembershipSource:
         expected_scope = ("fhir", source_pin.source_id, source_pin.schema_name, source_pin.dataset_id)
+        if source_pin.source_witness_capture is not None and (
+            coordinates.producer_id != SOURCE_WITNESS_PRODUCER
+            or coordinates.edition_id != source_pin.source_witness_capture.capture_id
+        ):
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
     elif type(source_pin) is PinnedACAMembershipSource:
         ownership = source_pin.prepared.ownership
         expected_scope = ("aca", source_pin.source_id, ownership.schema_name, str(ownership.dataset_id))
@@ -231,11 +238,23 @@ def _decode_flat_fhir_pin(document):
 
 def _decode_flat_fhir_pin_values(document):
     all_names = {field.name for field in fields(PinnedFHIRMembershipSource)} - {"retained_successor"}
-    custody_names = all_names - {"retained_epoch", "retained_capture"}
+    custody_names = all_names - {
+        "retained_epoch",
+        "retained_capture",
+        "source_witness_capture",
+        "source_witness_anchor",
+    }
     legacy_names = {name for name in custody_names if not name.startswith("custody_")}
     epoch_names = legacy_names | {"retained_epoch"}
     capture_names = legacy_names | {"retained_capture"}
-    if type(document) is not dict or set(document) not in (legacy_names, custody_names, epoch_names, capture_names):
+    witness_names = legacy_names | {"source_witness_capture", "source_witness_anchor"}
+    if type(document) is not dict or set(document) not in (
+        legacy_names,
+        custody_names,
+        epoch_names,
+        capture_names,
+        witness_names,
+    ):
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
     values_by_name = dict(document)
     if set(document) == custody_names:
@@ -252,6 +271,13 @@ def _decode_flat_fhir_pin_values(document):
         if type(document["retained_capture"]) is not dict:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         values_by_name["retained_capture"] = validate_capture(document["retained_capture"])
+    if set(document) == witness_names:
+        if type(document["source_witness_capture"]) is not dict:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        values_by_name["source_witness_capture"] = validate_source_witness_capture(document["source_witness_capture"])
+        values_by_name["source_witness_anchor"] = SourceWitnessCaptureAnchor(
+            **_closed_document(document["source_witness_anchor"], SourceWitnessCaptureAnchor)
+        )
     return values_by_name
 
 

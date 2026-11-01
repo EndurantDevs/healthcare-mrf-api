@@ -434,7 +434,9 @@ async def _retained_address_runtime_closure(connection, address_source, runtime_
 
 
 @asynccontextmanager
-async def _preservation_scope(connection, copy_target, candidate, schema, inventory_entries):
+async def _preservation_scope(
+    connection, copy_target, candidate, schema, inventory_entries, *, source_witness_runtime=None
+):
     """Keep authenticated carry selections alive through full and compact custody, then drain cleanup."""
     from process.registry_fhir_serving_preservation import (
         cleanup_fhir_serving_preservation,
@@ -443,7 +445,12 @@ async def _preservation_scope(connection, copy_target, candidate, schema, invent
     )
 
     preservation = await rederive_fhir_serving_preservation(
-        connection, copy_target, candidate, control_schema=schema, inventory_entries=inventory_entries
+        connection,
+        copy_target,
+        candidate,
+        control_schema=schema,
+        inventory_entries=inventory_entries,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     )
     primary = None
     try:
@@ -465,13 +472,19 @@ async def _preservation_scope(connection, copy_target, candidate, schema, invent
             primary._registry_preservation_cleanup_error = cleanup_error
 
 
-async def _final_proof(connection, copy_target, candidate, schema, *, office_authority=None, inventory_entries=None):
+async def _final_proof(
+    connection, copy_target, candidate, schema, *, office_authority=None, inventory_entries=None, **source_options
+):
+    """Reconstruct the complete closed candidate under independent Source and office context."""
+    _require(set(source_options) <= {"source_witness_runtime"})
     from process.network_membership_publication import _publication_readiness, _verify_provider_custody
 
     readiness = _publication_readiness(candidate)
     report = _json_object(candidate["validation_json"])
     address_source = PinnedAddressSource(**report["address_source"])
-    async with _preservation_scope(connection, copy_target, candidate, schema, inventory_entries) as preservation:
+    async with _preservation_scope(
+        connection, copy_target, candidate, schema, inventory_entries, **source_options
+    ) as preservation:
         await verify_registry_source_retention_rows(connection, copy_target, candidate)
         from process.network_source_contribution_custody import verify_independent_source_contributions
 
@@ -482,6 +495,7 @@ async def _final_proof(connection, copy_target, candidate, schema, *, office_aut
             control_schema=schema,
             office_authority=office_authority,
             preservation=preservation,
+            **source_options,
             **({"inventory_entries": inventory_entries} if inventory_entries is not None else {}),
         )
         from process.registry_source_office_custody import verify_independent_initial_source_offices
@@ -500,9 +514,8 @@ async def _final_proof(connection, copy_target, candidate, schema, *, office_aut
         if is_compact_candidate(candidate):
             from process.network_compact_validation import verify_compact_final_proof
 
-            await verify_compact_final_proof(
-                connection, copy_target, candidate, control_schema=schema, office_authority=office_authority
-            )
+            proof_options_by_name = {"control_schema": schema, "office_authority": office_authority, **source_options}
+            await verify_compact_final_proof(connection, copy_target, candidate, **proof_options_by_name)
             await _verify_provider_custody(connection, candidate, readiness[3])
             return
         # Unlike the READY public replay, this helper reruns complete accounting and parity.
@@ -816,7 +829,7 @@ async def _store_candidate_seal(
 
 def _validated_seal_options(options):
     """Keep the two private seal modes closed without changing public authority checks."""
-    _require(set(options) <= {"pre_enrolled_only", "office_authority"})
+    _require(set(options) <= {"pre_enrolled_only", "office_authority", "source_witness_runtime"})
     pre_enrolled_only = options.get("pre_enrolled_only", False)
     _require(type(pre_enrolled_only) is bool)
     return pre_enrolled_only, options.get("office_authority")
@@ -841,7 +854,13 @@ async def _seal_ready_candidate(
         checkpoint_key, _ = _source_event_assertion(report)
         _require(checkpoint_key not in report)
     catalog = await _prove_ready_candidate(
-        connection, copy_target, candidate, control, control_schema, runtime_roles, actor, office_authority
+        connection,
+        copy_target,
+        candidate,
+        control,
+        control_schema,
+        (runtime_roles, actor),
+        seal_options,
     )
     # Preserve only pre-existing effective reads; the forbidden census grants no fact access.
     readers = await _existing_readers(connection, catalog, runtime_roles)
@@ -868,7 +887,13 @@ async def _seal_ready_candidate(
 
 
 async def _prove_ready_candidate(
-    connection, copy_target, candidate, control, schema, runtime_roles, actor, office_authority
+    connection,
+    copy_target,
+    candidate,
+    control,
+    schema,
+    actor_scope,
+    proof_options,
 ):
     from process.network_membership_publication import _publication_writer_closure
     from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
@@ -876,6 +901,15 @@ async def _prove_ready_candidate(
     from process.registry_source_inventory_store import INVENTORY_TABLE, _load_locked_source_inventory
     from process.registry_source_recipe_store import decode_registry_source_recipes, verify_registry_source_recipes
 
+    runtime_roles, actor = actor_scope
+    office_authority = proof_options.get("office_authority")
+    source_witness_runtime = proof_options.get("source_witness_runtime")
+    if source_witness_runtime is not None:
+        from process.registry_source_recipe_composition import SourceWitnessRuntime
+
+        _require(type(source_witness_runtime) is SourceWitnessRuntime)
+        source_witness_runtime.__post_init__()
+        _require(set(runtime_roles) | {actor["current"]} <= set(source_witness_runtime.runtime_roles))
     catalog = await _lock_objects(connection, copy_target, candidate, exclusive=True, assume_owner=True)
     retained = _publication_writer_closure(candidate, _json_object(candidate["validation_json"]))
     prepared_roles_by_group = {name: retained[name] for name in ("owner_role", "loader_roles", "reader_roles")}
@@ -899,6 +933,8 @@ async def _prove_ready_candidate(
         )
         _require(not any(type(recipe.source_pin) is PinnedPTGOfficeMembershipSource for recipe in recipes))
     options_by_name = {}
+    if source_witness_runtime is not None:
+        options_by_name["source_witness_runtime"] = source_witness_runtime
     if office_authority is not None:
         options_by_name["office_authority"] = office_authority
     if entries is not None:
@@ -942,6 +978,11 @@ async def _seal_or_verify_candidate(
         actor,
         pre_enrolled_only=pre_enrolled_only,
         office_authority=office_authority,
+        **(
+            {"source_witness_runtime": seal_options["source_witness_runtime"]}
+            if seal_options.get("source_witness_runtime") is not None
+            else {}
+        ),
     )
 
 
@@ -955,7 +996,15 @@ def _seal_options(runtime_roles, authorize, pre_enrolled_only):
 
 
 async def _seal_in_transaction(
-    connection, copy_target, *, control_schema, runtime_roles, authorize, pre_enrolled_only, office_authority=None
+    connection,
+    copy_target,
+    *,
+    control_schema,
+    runtime_roles,
+    authorize,
+    pre_enrolled_only,
+    office_authority=None,
+    source_witness_runtime=None,
 ):
     from process.network_membership_publication import _publication_readiness
 
@@ -985,6 +1034,7 @@ async def _seal_in_transaction(
         actor,
         pre_enrolled_only=pre_enrolled_only,
         office_authority=office_authority,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     )
     _require(await authorize(connection, copy_target) is True)
     _require(asyncio.current_task() is task and await _original_actor(connection) == actor)
@@ -994,7 +1044,14 @@ async def _seal_in_transaction(
 
 
 async def seal_network_candidate_custody(
-    connection, copy_target, *, control_schema, runtime_roles, authorize, pre_enrolled_only=False
+    connection,
+    copy_target,
+    *,
+    control_schema,
+    runtime_roles,
+    authorize,
+    pre_enrolled_only=False,
+    source_witness_runtime=None,
 ):
     """Commit exact READY custody on an independent original authorized operator.
 
@@ -1016,6 +1073,7 @@ async def seal_network_candidate_custody(
             runtime_roles=runtime_roles,
             authorize=authorize,
             pre_enrolled_only=pre_enrolled_only,
+            **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
         )
 
 
@@ -1028,7 +1086,7 @@ async def seal_network_candidate_custody_in_session(
     authorize,
     office_store,
     office_read_budget,
-    pre_enrolled_only=False,
+    **seal_options,
 ):
     """Seal under the independent custodian's genuine pre-snapshot fenced session.
 
@@ -1039,7 +1097,9 @@ async def seal_network_candidate_custody_in_session(
 
     from process.registry_ptg_office_membership import require_ptg_office_authority
 
-    _seal_options(runtime_roles, authorize, pre_enrolled_only)
+    _require(set(seal_options) <= {"pre_enrolled_only", "source_witness_runtime"})
+    options_by_name = {"pre_enrolled_only": False, **seal_options}
+    _seal_options(runtime_roles, authorize, options_by_name["pre_enrolled_only"])
     _require(type(session) is AsyncSession and session.in_transaction())
     connection = (await (await session.connection()).get_raw_connection()).driver_connection
     office_authority = await require_ptg_office_authority(
@@ -1052,8 +1112,8 @@ async def seal_network_candidate_custody_in_session(
             control_schema=control_schema,
             runtime_roles=runtime_roles,
             authorize=authorize,
-            pre_enrolled_only=pre_enrolled_only,
             office_authority=office_authority,
+            **options_by_name,
         )
         await require_ptg_office_authority(connection, control_schema, office_authority)
         return sealed

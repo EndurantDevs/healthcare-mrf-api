@@ -82,17 +82,43 @@ def _require_configured_writer_roles(roles_by_group, closure):
         raise NetworkMembershipPipelineError("Configured writer roles differ from retained closure")
 
 
-async def _prepare_phase(connection, copy_target, address_source, roles_by_group, control_schema, *, compact=False):
+async def _prepare_phase(
+    connection,
+    copy_target,
+    address_source,
+    roles_by_group,
+    control_schema,
+    *,
+    compact=False,
+    source_witness_runtime=None,
+):
     async with connection.transaction(isolation="repeatable_read"):
         await _prepare_phase_snapshot(
-            connection, copy_target, address_source, roles_by_group, control_schema, compact=compact
+            connection,
+            copy_target,
+            address_source,
+            roles_by_group,
+            control_schema,
+            compact=compact,
+            **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
         )
 
 
 async def _prepare_phase_snapshot(
-    connection, copy_target, address_source, roles_by_group, control_schema, *, compact=False, office_authority=None
+    connection,
+    copy_target,
+    address_source,
+    roles_by_group,
+    control_schema,
+    *,
+    compact=False,
+    **source_options,
 ):
     """Prepare using the caller's genuine fenced snapshot when source authority requires it."""
+    if set(source_options) - {"source_witness_runtime", "office_authority"}:
+        raise ValueError("registry_source_runtime_options_invalid")
+    office_authority = source_options.pop("office_authority", None)
+    proof_options_by_name = dict(control_schema=control_schema, office_authority=office_authority, **source_options)
     candidate = await _locked_candidate(connection, copy_target, _identifier(control_schema))
     if candidate["state"] == "published":
         return
@@ -110,9 +136,7 @@ async def _prepare_phase_snapshot(
         if is_compact_candidate(candidate):
             from process.network_compact_validation import verify_compact_final_proof
 
-            await verify_compact_final_proof(
-                connection, copy_target, candidate, control_schema=control_schema, office_authority=office_authority
-            )
+            await verify_compact_final_proof(connection, copy_target, candidate, **proof_options_by_name)
             return
         await prepare_network_serving_indexes(connection, copy_target, address_source, control_schema=control_schema)
         return
@@ -123,13 +147,9 @@ async def _prepare_phase_snapshot(
     if compact:
         from process.network_compact_preparation import prepare_compact_network_readiness
 
+        runtime_roles = tuple(sorted(set(roles_by_group["loader_roles"] + roles_by_group["reader_roles"])))
         await prepare_compact_network_readiness(
-            connection,
-            copy_target,
-            address_source,
-            runtime_roles=tuple(sorted(set(roles_by_group["loader_roles"] + roles_by_group["reader_roles"]))),
-            control_schema=control_schema,
-            office_authority=office_authority,
+            connection, copy_target, address_source, runtime_roles=runtime_roles, **proof_options_by_name
         )
     else:
         await validate_network_membership_candidate(
@@ -213,7 +233,7 @@ async def prepare_network_candidate(
     loader_roles,
     reader_roles,
     control_schema=None,
-    compact=None,
+    **source_options,
 ):
     """Close writers and prepare an isolated candidate before final authorization.
 
@@ -221,6 +241,9 @@ async def prepare_network_candidate(
     a closed sealed candidate; final CAS failures keep a closed ready candidate.
     Published candidates remain untouched; callers verify retained publication.
     """
+    if set(source_options) - {"source_witness_runtime", "compact"}:
+        raise ValueError("registry_source_runtime_options_invalid")
+    compact = source_options.pop("compact", None)
     if type(copy_target) is not MembershipCopyTarget or type(address_source) is not PinnedAddressSource:
         raise NetworkMembershipPipelineError("Trusted candidate and pinned source are required")
     if compact is not None and type(compact) is not bool:
@@ -237,7 +260,9 @@ async def prepare_network_candidate(
     if candidate["state"] == "published":
         return candidate
     await _close_raw_phase(connection, copy_target, roles_by_group, schema_name)
-    await _prepare_phase(connection, copy_target, address_source, roles_by_group, schema_name, compact=compact)
+    await _prepare_phase(
+        connection, copy_target, address_source, roles_by_group, schema_name, compact=compact, **source_options
+    )
     return await _inspect_candidate(connection, copy_target, schema_name)
 
 

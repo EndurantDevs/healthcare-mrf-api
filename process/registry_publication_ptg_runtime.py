@@ -158,7 +158,9 @@ class RegistryPublicationPTGRuntime:
         }
         return await compose_registry_membership_candidate(self.sessions, **composition_by_name)
 
-    async def prepare(self, connection, copy_target, address_source, *, writer_roles, control_schema):
+    async def prepare(
+        self, connection, copy_target, address_source, *, writer_roles, control_schema, source_witness_runtime=None
+    ):
         """Keep native office authority on the actual preparation backend and snapshot."""
         from process.network_membership_pipeline import (
             _close_raw_phase,
@@ -174,7 +176,12 @@ class RegistryPublicationPTGRuntime:
         candidate = await _inspect_candidate(connection, copy_target, control_schema)
         if not _compact_selection(candidate, None):
             return await prepare_network_candidate(
-                connection, copy_target, address_source, **writer_roles, control_schema=control_schema
+                connection,
+                copy_target,
+                address_source,
+                **writer_roles,
+                control_schema=control_schema,
+                **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
             )
         if candidate["state"] == "published":
             return candidate
@@ -191,5 +198,6 @@ class RegistryPublicationPTGRuntime:
                 control_schema,
                 compact=True,
                 office_authority=(session, self.store, budget),
+                **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
             )
         return await _inspect_candidate(connection, copy_target, control_schema)

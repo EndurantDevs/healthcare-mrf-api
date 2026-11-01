@@ -804,6 +804,7 @@ class _CompositionInputs:
     verified_office_inputs: tuple | None = None
     compact: bool = False
     source_operation: dict | None = None
+    source_witness_runtime: object = None
 
 
 async def _composition_inputs(connection, address_sources, source_manifest, writer_roles, revision, control_schema):
@@ -823,6 +824,7 @@ async def _composition_inputs(connection, address_sources, source_manifest, writ
         {},
         _verified_office_inputs(address_sources, writer_roles),
         address_sources.compact,
+        source_witness_runtime=address_sources.source_witness_runtime,
     )
 
 
@@ -1452,6 +1454,7 @@ async def _prepare_selected_source_stage(
             office_authority,
             inventory=inventory,
         )
+    runtime = inputs.source_witness_runtime
     preservation = await _prepare_preservation(
         connection,
         source_manifest,
@@ -1459,6 +1462,7 @@ async def _prepare_selected_source_stage(
         approved.approved_revision,
         (request_id, expected_head, control_schema),
         inventory=inventory,
+        **({"source_witness_runtime": runtime} if runtime is not None else {}),
     )
     verified_inputs, phase_artifact = await _prepare_preserved_address_inputs(
         inputs, recipes, preservation, request_id, control_schema, artifact_inputs
@@ -1479,6 +1483,7 @@ async def _prepare_selected_source_stage(
             verified_office_inputs=verified_inputs
             if _retained_fhir_only(recipes) and (inventory or approved.total_rows == 0)
             else None,
+            source_witness_runtime=inputs.source_witness_runtime,
         ),
     )
     _bind_composition_stage(
