@@ -204,6 +204,9 @@ async def import_resources_with_source_session(directory, source_records, rest_p
     """Retain the HTTP-session lifecycle and bind publication only to this request."""
     proxy_run = directory.source_proxy.current_run()
     force_session = any(directory.current_version_census_contract(record) is not None for record in source_records)
+    force_session = force_session or any(
+        directory.capped_partition.enabled(directory, record) for record in source_records
+    )
     require_verified_tls = force_session
     force_session = force_session or bool(proxy_run is not None and proxy_run.bindings)
     token = directory._REST_PAGE_PREFETCH_OVERRIDE.set(rest_page_prefetch)

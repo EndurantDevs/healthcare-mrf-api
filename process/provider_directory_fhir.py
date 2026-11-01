@@ -85,10 +85,12 @@ from db.models import (
 )
 from db.plan_release_storage import storage_relation
 from process import provider_directory_bulk_parallel as bulk_parallel
+from process import provider_directory_capped_partition as capped_partition
 from process import provider_directory_christus as christus
 from process import provider_directory_cms_desired_fence as cms_desired_fence
 from process import provider_directory_fhir_response as fhir_response
 from process import provider_directory_molina as molina
+from process import provider_directory_mvp as mvp
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_artifact_custody as profile_artifact_custody
@@ -1773,6 +1775,7 @@ class LastUpdatedPartitionConfig:
     page_count: int
     volatile_metadata_paths: tuple[str, ...]
     maximum_pages_per_window: int | None = None
+    versioned_search_limit: int | None = None
 
     def identity(self) -> dict[str, Any]:
         """Return stable metadata identity without a moving resolved cutoff."""
@@ -1788,6 +1791,8 @@ class LastUpdatedPartitionConfig:
         }
         if self.maximum_pages_per_window is not None:
             identity_by_field["maximum_pages_per_window"] = self.maximum_pages_per_window
+        if self.versioned_search_limit is not None:
+            identity_by_field["versioned_search_limit"] = self.versioned_search_limit
         return identity_by_field
 
     def root_end(self) -> datetime.datetime:
@@ -1827,6 +1832,7 @@ class LastUpdatedCompletenessCensus:
     ranged_root_post: int | None = None
     unfiltered_post: int | None = None
     failure: str | None = None
+    capped: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -3584,6 +3590,7 @@ def _build_partition_config(
         page_count=page_count,
         volatile_metadata_paths=volatile_paths,
         maximum_pages_per_window=maximum_pages,
+        versioned_search_limit=capped_partition.search_limit(resource_settings, ceiling),
     )
     validation_end = partition_end or (partition_start + minimum_width)
     PartitionPlan.create(
@@ -40515,6 +40522,7 @@ def _seed_rows_from_supplemental_catalogs(
         ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
         ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
         ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
+        ("mvp_health_care", mvp.API_BASE, mvp.seed_rows),
         (
             "provider_directory_blockers",
             PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
@@ -41468,6 +41476,19 @@ async def _fetch_source_json_unpaced(
             raise RuntimeError("provider_directory_current_version_census_session_required")
         return await _fetch_json_with_source_session(
             census_session,
+            url,
+            timeout=timeout,
+            allow_redirects=False,
+            preserve_url_bytes=True,
+        )
+    if capped_partition.enabled(sys.modules[__name__], source_record):
+        capped_session = _SOURCE_HTTP_SESSION.get()
+        if capped_session is None or capped_session.closed:
+            raise RuntimeError("provider_directory_capped_search_session_required")
+        if _has_source_declared_credentialed_access(source_record) or _credential_spec_for_source(source_record):
+            raise RuntimeError("provider_directory_capped_search_anonymous_required")
+        return await _fetch_json_with_source_session(
+            capped_session,
             url,
             timeout=timeout,
             allow_redirects=False,
@@ -49333,35 +49354,7 @@ def _last_updated_partition_checkpoint_payload(
     plan: PartitionPlan,
     census: LastUpdatedCompletenessCensus | None = None,
 ) -> str:
-    census = census or LastUpdatedCompletenessCensus()
-    planner_checkpoint = plan.to_dict()
-    control_windows = [
-        {
-            **{key: field_value for key, field_value in window.items() if key != "passes"},
-            "completed_passes": sorted(int(pass_number) for pass_number in window["passes"]),
-        }
-        for window in planner_checkpoint["windows"]
-    ]
-    return json.dumps(
-        {
-            "version": 2,
-            "strategy_version": LAST_UPDATED_PARTITION_STRATEGY_VERSION,
-            "config": config.identity(),
-            "control": {
-                "windows": control_windows,
-                "failure": planner_checkpoint["failure"],
-                "census": {
-                    "unfiltered_pre": census.unfiltered_pre,
-                    "ranged_root_pre": census.ranged_root_pre,
-                    "ranged_root_post": census.ranged_root_post,
-                    "unfiltered_post": census.unfiltered_post,
-                    "failure": census.failure,
-                },
-            },
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return capped_partition.checkpoint_payload(sys.modules[__name__], config, plan, census)
 
 
 def _partition_checkpoint_control(
@@ -49384,39 +49377,9 @@ def _partition_checkpoint_control(
 
 def _partition_census_from_control(
     control_dict: dict[str, Any],
+    versioned_search_limit: int | None = None,
 ) -> LastUpdatedCompletenessCensus:
-    census_dict = control_dict.get("census")
-    if not isinstance(census_dict, dict):
-        raise ValueError("checkpoint census missing")
-    count_names = (
-        "unfiltered_pre",
-        "ranged_root_pre",
-        "ranged_root_post",
-        "unfiltered_post",
-    )
-    count_by_name = {count_name: census_dict.get(count_name) for count_name in count_names}
-    if any(
-        count_value is not None
-        and (isinstance(count_value, bool) or not isinstance(count_value, int) or count_value < 0)
-        for count_value in count_by_name.values()
-    ):
-        raise ValueError("checkpoint census count invalid")
-    failure = census_dict.get("failure")
-    if failure is not None and (not isinstance(failure, str) or not failure):
-        raise ValueError("checkpoint census failure invalid")
-    if count_by_name["ranged_root_pre"] is not None and count_by_name["unfiltered_pre"] is None:
-        raise ValueError("checkpoint ranged pre census lacks unfiltered pre")
-    if count_by_name["ranged_root_post"] is not None and count_by_name["ranged_root_pre"] is None:
-        raise ValueError("checkpoint ranged post census lacks ranged pre")
-    if count_by_name["unfiltered_post"] is not None and count_by_name["ranged_root_post"] is None:
-        raise ValueError("checkpoint unfiltered post census lacks ranged post")
-    observed_counts = [count_value for count_value in count_by_name.values() if count_value is not None]
-    if failure is None and len(set(observed_counts)) > 1:
-        raise ValueError("checkpoint census counts conflict without failure")
-    return LastUpdatedCompletenessCensus(
-        **count_by_name,
-        failure=failure,
-    )
+    return capped_partition.restore_census(sys.modules[__name__], control_dict, versioned_search_limit)
 
 
 def _partition_checkpoint_windows(
@@ -49511,7 +49474,7 @@ def _last_updated_partition_resume_from_checkpoint(
                 restored_plan,
                 completed_passes_by_window,
             ),
-            census=_partition_census_from_control(control_dict),
+            census=_partition_census_from_control(control_dict, config.versioned_search_limit),
         )
     except (json.JSONDecodeError, TypeError, ValueError, PartitionPlanError) as exc:
         raise RuntimeError("provider_directory_last_updated_partition_checkpoint_invalid") from exc
@@ -49520,6 +49483,8 @@ def _last_updated_partition_resume_from_checkpoint(
 def _is_last_updated_partition_census_complete(
     census: LastUpdatedCompletenessCensus,
 ) -> bool:
+    if census.capped is not None:
+        return census.failure is None and capped_partition.complete(census.capped)
     return (
         census.failure is None
         and census.unfiltered_pre is not None
@@ -49888,6 +49853,11 @@ async def _fetch_last_updated_partition_count(
             request_url,
             timeout=timeout,
         )
+        split_observation = capped_partition.split_observation(
+            sys.modules[__name__], source_record, request_url, status_code, response_payload, error
+        )
+        if split_observation is not None:
+            return LastUpdatedCountFetch(split_observation, pages_fetched=attempt_index + 1)
         pages_fetched = attempt_index + 1
         if status_code != 200 or error:
             failure_error = error or f"http_{status_code}"
@@ -51606,6 +51576,7 @@ def _last_updated_partition_completeness_diagnostic(
         "unfiltered_post": state.census.unfiltered_post,
         "verified": verified,
         "failure": state.census.failure,
+        **({"capped_search": dict(state.census.capped)} if state.census.capped is not None else {}),
     }
 
 
@@ -51897,6 +51868,10 @@ async def _observe_partition_pre_census(
     fetch_options: LastUpdatedPartitionFetchOptions,
 ) -> ResourceFetchResult | None:
     """Establish immutable unfiltered and ranged counts before acquisition."""
+    if config.versioned_search_limit is not None:
+        return await capped_partition.pre_census(
+            sys.modules[__name__], source_record, resource_type, model, config, state, fetch_options
+        )
     root_window = state.plan.windows["root"]
     census_requests = (
         LastUpdatedCensusRequest(
@@ -51945,6 +51920,8 @@ async def _reconcile_partition_leaf_counts(
     config: LastUpdatedPartitionConfig,
     state: LastUpdatedPartitionState,
 ) -> ResourceFetchResult | None:
+    if config.versioned_search_limit is not None:
+        return await capped_partition.reconcile(sys.modules[__name__], resource_type, model, config, state)
     leaf_count_sum = sum(window.count or 0 for window in state.plan.leaf_windows())
     if leaf_count_sum == state.census.ranged_root_pre:
         return None
@@ -52317,6 +52294,10 @@ async def _observe_partition_post_census(
     state: LastUpdatedPartitionState,
     fetch_options: LastUpdatedPartitionFetchOptions,
 ) -> ResourceFetchResult | None:
+    if config.versioned_search_limit is not None:
+        return await capped_partition.post_census(
+            sys.modules[__name__], source_record, resource_type, model, config, state, fetch_options
+        )
     expected_count = state.census.ranged_root_pre
     assert expected_count is not None
     root_window = state.plan.windows["root"]
@@ -52374,7 +52355,7 @@ async def _verified_partition_proof_counts(
             state,
             str(exc),
         )
-    expected_count = state.census.ranged_root_pre
+    expected_count = capped_partition.expected_count(state.census)
     observed_counts = [
         proof_counts.leaf_count_sum,
         proof_counts.pass1_unique,
@@ -56344,30 +56325,8 @@ def _record_pagination_cooldown_stats(
         resource_stats["pagination_cooldown_deadline_blocked_sources"] += 1
 
 
-def _record_last_updated_partition_stats(
-    resource_stats: dict[str, Any],
-    fetch_result: ResourceFetchResult,
-) -> None:
-    if fetch_result.fetch_mode != LAST_UPDATED_PARTITION_FETCH_MODE:
-        return
-    resource_stats["last_updated_partition_sources"] += 1
-    completeness_proof = fetch_result.fetch_diagnostic
-    if not isinstance(completeness_proof, dict) or completeness_proof.get("verified") is not True:
-        return
-    resource_stats["last_updated_completeness_verified_sources"] += 1
-    for proof_field in (
-        "unfiltered_pre",
-        "ranged_root_pre",
-        "exact_leaf_count_sum",
-        "pass1_unique",
-        "pass2_unique",
-        "staged_candidate_count",
-        "ranged_root_post",
-        "unfiltered_post",
-    ):
-        proof_value = completeness_proof.get(proof_field)
-        if isinstance(proof_value, int) and not isinstance(proof_value, bool):
-            resource_stats[f"last_updated_{proof_field}"] += proof_value
+def _record_last_updated_partition_stats(resource_stats: dict[str, Any], fetch_result: ResourceFetchResult) -> None:
+    capped_partition.record_stats(sys.modules[__name__], resource_stats, fetch_result)
 
 
 def _record_caresource_opaque_cursor_stats(
@@ -57668,6 +57627,17 @@ def _source_resource_fetch_order(
     requested_resources: list[str],
 ) -> list[str]:
     """Return the requested resources in the order appropriate for one source."""
+    priority = _source_metadata(source).get("provider_directory_resource_fetch_order")
+    if priority is not None:
+        if (
+            not isinstance(priority, list)
+            or any(not isinstance(item, str) or item not in DEFAULT_RESOURCES for item in priority)
+            or len(set(priority)) != len(priority)
+        ):
+            raise ValueError("provider_directory_resource_fetch_order_invalid")
+        return [item for item in priority if item in requested_resources] + [
+            item for item in requested_resources if item not in priority
+        ]
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if api_base != CIGNA_PROVIDER_DIRECTORY_BASE:
         return list(requested_resources)
@@ -70297,9 +70267,12 @@ async def process_provider_directory_fhir_data(
         probe_source_rows = _source_rows_allowed_for_probe(source_rows)
         metrics_by_key["manual_only_sources_skipped_before_probe"] = len(source_rows) - len(probe_source_rows)
         if not seed_only and probe and probe_source_rows:
+            has_capped_sources = any(
+                capped_partition.enabled(sys.modules[__name__], source_record) for source_record in probe_source_rows
+            )
             async with _source_http_session_scope(
-                force=census_contract is not None or bool(proxy_run.bindings),
-                require_verified_tls=census_contract is not None,
+                force=census_contract is not None or bool(proxy_run.bindings) or has_capped_sources,
+                require_verified_tls=census_contract is not None or has_capped_sources,
             ):
                 probed, valid, valid_source_ids = await _run_source_probe_batch(
                     probe_source_rows,

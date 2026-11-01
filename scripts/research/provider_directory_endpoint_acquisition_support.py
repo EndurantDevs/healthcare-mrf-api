@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
 SCAN_PROVIDER_DIRECTORY_BASE = "https://providerdirectory.scanhealthplan.com"
 CARESOURCE_PROVIDER_DIRECTORY_BASE = (
     "https://orchestrateserver.caresource.careevolution.com/api/fhir/provider-directory"
@@ -19,6 +18,31 @@ LAST_UPDATED_PROOF_METRIC_NAMES = (
     "last_updated_staged_candidate_count",
     "last_updated_ranged_root_post",
     "last_updated_unfiltered_post",
+)
+CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES = (
+    "last_updated_capped_count_pre",
+    "last_updated_capped_count_post",
+    "last_updated_exact_leaf_count_sum",
+    "last_updated_pass1_unique",
+    "last_updated_pass2_unique",
+    "last_updated_staged_candidate_count",
+)
+CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES = (
+    "last_updated_capped_before_start_pre",
+    "last_updated_capped_after_end_pre",
+    "last_updated_capped_before_start_post",
+    "last_updated_capped_after_end_post",
+    "last_updated_unfiltered_pre",
+    "last_updated_ranged_root_pre",
+    "last_updated_ranged_root_post",
+    "last_updated_unfiltered_post",
+)
+CAPPED_LAST_UPDATED_SOURCE_METRIC_NAMES = (
+    "last_updated_partition_sources",
+    "last_updated_completeness_verified_sources",
+    "last_updated_capped_sources",
+    "last_updated_capped_verified_sources",
+    "last_updated_capped_versioned_sources",
 )
 CARESOURCE_PROOF_METRIC_NAMES = (
     "caresource_opaque_cursor_pre_count",
@@ -54,38 +78,51 @@ def _last_updated_completeness_errors(
 ) -> list[str]:
     """Validate exact partition reconciliation for sources that expose it."""
 
+    if resource_type in entry.get("capped_last_updated_resources", []) or resource_stats.get(
+        "last_updated_capped_sources"
+    ) not in (None, 0):
+        return _capped_last_updated_completeness_errors(entry, resource_type, resource_stats)
     canonical_base = str(entry.get("canonical_base") or "").rstrip("/")
     partition_source_count = resource_stats.get("last_updated_partition_sources")
-    is_proof_required = (
-        canonical_base == SCAN_PROVIDER_DIRECTORY_BASE
-        or partition_source_count not in (None, 0)
-    )
+    is_proof_required = canonical_base == SCAN_PROVIDER_DIRECTORY_BASE or partition_source_count not in (None, 0)
     if not is_proof_required:
         return []
     expected_source_count = len(entry["source_ids"])
     errors: list[str] = []
     if partition_source_count != expected_source_count:
-        errors.append(
-            f"{resource_type} lacks exact last-updated partition source metrics"
-        )
+        errors.append(f"{resource_type} lacks exact last-updated partition source metrics")
+    if resource_stats.get("last_updated_completeness_verified_sources") != expected_source_count:
+        errors.append(f"{resource_type} lacks verified last-updated completeness proof")
+    proof_values = [resource_stats.get(metric_name) for metric_name in LAST_UPDATED_PROOF_METRIC_NAMES]
     if (
-        resource_stats.get("last_updated_completeness_verified_sources")
-        != expected_source_count
+        any(isinstance(proof_value, bool) or not isinstance(proof_value, int) for proof_value in proof_values)
+        or len(set(proof_values)) != 1
     ):
-        errors.append(
-            f"{resource_type} lacks verified last-updated completeness proof"
-        )
-    proof_values = [
-        resource_stats.get(metric_name)
-        for metric_name in LAST_UPDATED_PROOF_METRIC_NAMES
-    ]
+        errors.append(f"{resource_type} last-updated completeness counts do not reconcile")
+    return errors
+
+
+def _capped_last_updated_completeness_errors(
+    entry: dict[str, Any],
+    resource_type: str,
+    resource_stats: dict[str, Any],
+) -> list[str]:
+    """Require exact leaves, versioned-source coverage and empty outside tails."""
+    expected_sources = len(entry["source_ids"])
+    errors = []
     if any(
-        isinstance(proof_value, bool) or not isinstance(proof_value, int)
-        for proof_value in proof_values
-    ) or len(set(proof_values)) != 1:
-        errors.append(
-            f"{resource_type} last-updated completeness counts do not reconcile"
-        )
+        type(resource_stats.get(name)) is not int or resource_stats[name] != expected_sources
+        for name in CAPPED_LAST_UPDATED_SOURCE_METRIC_NAMES
+    ):
+        errors.append(f"{resource_type} lacks exact verified capped last-updated source metrics")
+    counts = [resource_stats.get(name) for name in CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES]
+    if any(type(count) is not int or count < 0 for count in counts) or len(set(counts)) != 1:
+        errors.append(f"{resource_type} capped last-updated completeness counts do not reconcile")
+    if any(
+        type(resource_stats.get(name)) is not int or resource_stats[name] != 0
+        for name in CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES
+    ):
+        errors.append(f"{resource_type} capped last-updated tails or legacy census fields are not exact zero")
     return errors
 
 
@@ -98,36 +135,25 @@ def _caresource_completeness_errors(
 
     canonical_base = str(entry.get("canonical_base") or "").rstrip("/")
     proof_source_count = resource_stats.get("caresource_opaque_cursor_sources")
-    is_proof_required = (
-        canonical_base == CARESOURCE_PROVIDER_DIRECTORY_BASE
-        or proof_source_count not in (None, 0)
-    )
+    is_proof_required = canonical_base == CARESOURCE_PROVIDER_DIRECTORY_BASE or proof_source_count not in (None, 0)
     if not is_proof_required:
         return []
     expected_source_count = len(entry["source_ids"])
     errors: list[str] = []
     if proof_source_count != expected_source_count:
         errors.append(f"{resource_type} lacks exact CareSource census source metrics")
-    if (
-        resource_stats.get("caresource_opaque_cursor_verified_sources")
-        != expected_source_count
-    ):
+    if resource_stats.get("caresource_opaque_cursor_verified_sources") != expected_source_count:
         errors.append(f"{resource_type} lacks verified CareSource census proof")
-    proof_values = [
-        resource_stats.get(metric_name)
-        for metric_name in CARESOURCE_PROOF_METRIC_NAMES
-    ]
-    if any(
-        isinstance(proof_value, bool) or not isinstance(proof_value, int)
-        for proof_value in proof_values
-    ) or len(set(proof_values)) != 1:
+    proof_values = [resource_stats.get(metric_name) for metric_name in CARESOURCE_PROOF_METRIC_NAMES]
+    if (
+        any(isinstance(proof_value, bool) or not isinstance(proof_value, int) for proof_value in proof_values)
+        or len(set(proof_values)) != 1
+    ):
         errors.append(f"{resource_type} CareSource census counts do not reconcile")
     return errors
 
 
-def acquisition_metric_errors(
-    entry: dict[str, Any], metrics: dict[str, Any]
-) -> list[str]:
+def acquisition_metric_errors(entry: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
     """Validate exact completion metrics for one REST acquisition entry."""
 
     errors: list[str] = []
@@ -146,14 +172,9 @@ def acquisition_metric_errors(
         if completion_by_resource.get(resource_type) != source_ids:
             errors.append(f"{resource_type} did not complete for the exact source")
         resource_stats = stats_by_resource.get(resource_type)
-        if (
-            not isinstance(resource_stats, dict)
-            or resource_stats.get("sources_completed", 0) < 1
-        ):
+        if not isinstance(resource_stats, dict) or resource_stats.get("sources_completed", 0) < 1:
             errors.append(f"{resource_type} lacks completed fetch metrics")
-        elif resource_stats.get("sources_bounded", 0) or resource_stats.get(
-            "sources_failed", 0
-        ):
+        elif resource_stats.get("sources_bounded", 0) or resource_stats.get("sources_failed", 0):
             errors.append(f"{resource_type} was bounded or failed")
         if isinstance(resource_stats, dict):
             errors.extend(
@@ -173,18 +194,13 @@ def acquisition_metric_errors(
     return errors
 
 
-def bulk_acquisition_metric_errors(
-    entry: dict[str, Any], metrics: dict[str, Any]
-) -> list[str]:
+def bulk_acquisition_metric_errors(entry: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
     """Validate that every selected resource used the configured Bulk path."""
 
     bulk_export_mode = metrics.get("bulk_export_mode")
     if bulk_export_mode is None:
         return []
-    if (
-        not isinstance(bulk_export_mode, dict)
-        or bulk_export_mode.get("effective") is not True
-    ):
+    if not isinstance(bulk_export_mode, dict) or bulk_export_mode.get("effective") is not True:
         return ["bulk_export_mode must be effective for every selected resource"]
     source_count = len(entry["source_ids"])
     expected_fetches = len(entry["resources"]) * source_count
@@ -209,7 +225,7 @@ def _positive_resource_row_count(metrics: dict[str, Any]) -> int:
     for row_count in resource_rows.values():
         try:
             total += max(0, int(row_count or 0))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return total
 
@@ -234,9 +250,7 @@ def external_result_errors(
         errors.append("result params.source_ids does not match the endpoint")
     if metrics_by_name.get("source_ids") != expected_source_ids:
         errors.append("result metrics.source_ids does not match the endpoint")
-    if metrics_by_name.get("source_import_sources_selected") != len(
-        expected_source_ids
-    ):
+    if metrics_by_name.get("source_import_sources_selected") != len(expected_source_ids):
         errors.append("result selected source count is not exact")
     if metrics_by_name.get("source_import_groups_attempted") != 1:
         errors.append("result selected source group count is not one")
@@ -271,32 +285,23 @@ def result_param_errors(
     for param_name, expected_value in expected_params.items():
         if actual_params.get(param_name) != expected_value:
             errors.append(f"params.{param_name} does not match the manifest")
-    unsupported_params = sorted(
-        set(actual_params) - set(expected_params) - RUN_LINEAGE_PARAM_FIELDS
-    )
+    unsupported_params = sorted(set(actual_params) - set(expected_params) - RUN_LINEAGE_PARAM_FIELDS)
     if unsupported_params:
         errors.append("result params are not controlled: " + ",".join(unsupported_params))
     endpoint_scope = actual_params.get("provider_directory_endpoint_scope")
     if endpoint_scope is not None and endpoint_scope != entry["canonical_base"]:
         errors.append("params.provider_directory_endpoint_scope does not match the manifest")
     pagination_attempt = actual_params.get("provider_directory_pagination_attempt")
-    if pagination_attempt is not None and (
-        type(pagination_attempt) is not int or pagination_attempt < 1
-    ):
+    if pagination_attempt is not None and (type(pagination_attempt) is not int or pagination_attempt < 1):
         errors.append("params.provider_directory_pagination_attempt is invalid")
     for run_id_field in ("provider_directory_pagination_root_run_id", "retry_of_run_id"):
         run_id = actual_params.get(run_id_field)
-        if run_id is not None and (
-            not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id)
-        ):
+        if run_id is not None and (not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id)):
             errors.append(f"params.{run_id_field} is invalid")
     if entry["classification"] == "probe_only":
         forbidden_keys = sorted(PROBE_OMITTED_KEYS.intersection(actual_params))
         if forbidden_keys:
-            errors.append(
-                "probe-only result contains resource/pagination params: "
-                + ",".join(forbidden_keys)
-            )
+            errors.append("probe-only result contains resource/pagination params: " + ",".join(forbidden_keys))
     return errors
 
 

@@ -16,18 +16,18 @@ from typing import Any
 
 try:
     from scripts.research.provider_directory_endpoint_acquisition_support import (
+        RUN_ID_PATTERN,
         acquisition_metric_errors,
         bulk_acquisition_metric_errors,
         external_result_errors,
-        RUN_ID_PATTERN,
         result_param_errors,
     )
 except ModuleNotFoundError:
     from provider_directory_endpoint_acquisition_support import (
+        RUN_ID_PATTERN,
         acquisition_metric_errors,
         bulk_acquisition_metric_errors,
         external_result_errors,
-        RUN_ID_PATTERN,
         result_param_errors,
     )
 
@@ -115,9 +115,7 @@ def _utc_now() -> str:
 
 
 def _json_hash(json_value: Any) -> str:
-    encoded = json.dumps(json_value, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
+    encoded = json.dumps(json_value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -141,9 +139,7 @@ def _reject_sensitive_content(json_value: Any, location: str = "manifest") -> No
                 "credential",
             )
             if any(fragment in normalized_name for fragment in sensitive_fragments):
-                raise ManifestError(
-                    f"{location}.{field_name} may not contain credentials"
-                )
+                raise ManifestError(f"{location}.{field_name} may not contain credentials")
             _reject_sensitive_content(field_value, f"{location}.{field_name}")
     elif isinstance(json_value, list):
         for position, member in enumerate(json_value):
@@ -179,12 +175,7 @@ def write_json(json_path: Path, json_value: dict[str, Any]) -> None:
 def _credential_free_https_url(value: Any, label: str) -> str:
     normalized = str(value or "").rstrip("/")
     parsed = urllib.parse.urlsplit(normalized)
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or parsed.username
-        or parsed.password
-    ):
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
         raise ManifestError(f"{label} must be a credential-free HTTPS URL")
     return normalized
 
@@ -208,20 +199,14 @@ def _validate_manifest_header(manifest: dict[str, Any]) -> None:
         "probe_only",
     ):
         if not isinstance(parameter_profiles.get(classification), dict):
-            raise ManifestError(
-                f"parameter_profiles.{classification} must be an object"
-            )
+            raise ManifestError(f"parameter_profiles.{classification} must be an object")
 
 
-def _validate_manifest_entry(
-    entry: dict[str, Any], seen_by_kind: dict[str, set[str]]
-) -> None:
+def _validate_manifest_entry(entry: dict[str, Any], seen_by_kind: dict[str, set[str]]) -> None:
     entry_id = str(entry.get("entry_id") or "")
     owner_id = str(entry.get("owner_id") or "")
     source_ids = entry.get("source_ids")
-    canonical_base = _credential_free_https_url(
-        entry.get("canonical_base"), f"{entry_id or '<entry>'}.canonical_base"
-    )
+    canonical_base = _credential_free_https_url(entry.get("canonical_base"), f"{entry_id or '<entry>'}.canonical_base")
     classification = str(entry.get("classification") or "")
     if not SLUG_PATTERN.fullmatch(entry_id) or not SLUG_PATTERN.fullmatch(owner_id):
         raise ManifestError(f"entry_id/owner_id must be lowercase slugs: {entry_id!r}")
@@ -229,8 +214,7 @@ def _validate_manifest_entry(
         not isinstance(source_ids, list)
         or not source_ids
         or not all(
-            SOURCE_ID_PATTERN.fullmatch(str(source_id))
-            or (entry_id == "cms-npd" and source_id == "cms-npd")
+            SOURCE_ID_PATTERN.fullmatch(str(source_id)) or (entry_id == "cms-npd" and source_id == "cms-npd")
             for source_id in source_ids
         )
     ):
@@ -239,13 +223,20 @@ def _validate_manifest_entry(
         raise ManifestError(f"{entry_id}: unsupported classification")
     expected_resources = RESOURCE_PROFILES.get(str(entry.get("resource_profile") or ""))
     if expected_resources is None or entry.get("resources") != expected_resources:
-        raise ManifestError(
-            f"{entry_id}: resources do not exactly match resource_profile"
-        )
+        raise ManifestError(f"{entry_id}: resources do not exactly match resource_profile")
     if classification not in RESOURCE_CLASSIFICATIONS and entry.get("resources"):
-        raise ManifestError(
-            f"{entry_id}: only acquisition or manual entries may list resources"
-        )
+        raise ManifestError(f"{entry_id}: only acquisition or manual entries may list resources")
+    if "capped_last_updated_resources" in entry:
+        capped_resources = entry["capped_last_updated_resources"]
+        if (
+            classification != "acquisition"
+            or not isinstance(capped_resources, list)
+            or not capped_resources
+            or not all(isinstance(resource, str) for resource in capped_resources)
+            or len(capped_resources) != len(set(capped_resources))
+            or not set(capped_resources).issubset(entry["resources"])
+        ):
+            raise ManifestError(f"{entry_id}: capped_last_updated_resources must select distinct acquisition resources")
     unique_values_by_kind = {
         "entry": [entry_id],
         "owner": [owner_id],
@@ -267,9 +258,7 @@ def load_manifest(manifest_path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
     entries = manifest.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ManifestError("entries must be a non-empty list")
-    seen_by_kind = {
-        kind_name: set() for kind_name in ("entry", "owner", "base", "source")
-    }
+    seen_by_kind = {kind_name: set() for kind_name in ("entry", "owner", "base", "source")}
     for entry in entries:
         if not isinstance(entry, dict):
             raise ManifestError("every entry must be an object")
@@ -295,22 +284,14 @@ def _entry_fingerprint(manifest: dict[str, Any], entry: dict[str, Any]) -> str:
     return _json_hash({"entry": entry, "params": entry_params(manifest, entry)})
 
 
-def _selected_entries(
-    manifest: dict[str, Any], selected_entry_ids: frozenset[str]
-) -> list[dict[str, Any]]:
+def _selected_entries(manifest: dict[str, Any], selected_entry_ids: frozenset[str]) -> list[dict[str, Any]]:
     entries_by_id = {str(entry["entry_id"]): entry for entry in manifest["entries"]}
     unknown_entry_ids = selected_entry_ids - entries_by_id.keys()
     if unknown_entry_ids:
-        raise ManifestError(
-            "unknown manifest entries: " + ",".join(sorted(unknown_entry_ids))
-        )
+        raise ManifestError("unknown manifest entries: " + ",".join(sorted(unknown_entry_ids)))
     if not selected_entry_ids:
         return list(manifest["entries"])
-    return [
-        entry
-        for entry in manifest["entries"]
-        if entry["entry_id"] in selected_entry_ids
-    ]
+    return [entry for entry in manifest["entries"] if entry["entry_id"] in selected_entry_ids]
 
 
 def build_operator_plan(
@@ -350,7 +331,8 @@ def terminal_metric_errors(
     classification = str(entry["classification"])
     if classification == "external":
         errors = external_result_errors(
-            entry, operator_result_by_field,
+            entry,
+            operator_result_by_field,
             expected_importer=str(manifest["importer"]),
         )
     elif classification == MANUAL_CLASSIFICATION:
@@ -374,13 +356,11 @@ def terminal_metric_errors(
         if classification == "bulk_acquisition":
             errors.extend(bulk_acquisition_metric_errors(entry, metrics))
     elif classification == "probe_only":
-        if metrics.get("source_ids") != entry["source_ids"] or metrics.get(
-            "sources_probed"
-        ) != len(entry["source_ids"]):
-            errors.append("probe did not inspect the exact source")
-        if metrics.get("resource_rows") not in ({}, None) or metrics.get(
-            "source_import_sources_selected", 0
+        if metrics.get("source_ids") != entry["source_ids"] or metrics.get("sources_probed") != len(
+            entry["source_ids"]
         ):
+            errors.append("probe did not inspect the exact source")
+        if metrics.get("resource_rows") not in ({}, None) or metrics.get("source_import_sources_selected", 0):
             errors.append("probe-only result imported resources")
     return errors
 
@@ -417,10 +397,7 @@ def evaluate_operator_input(
         raise ManifestError("operator input results must be an object")
     unknown_result_ids = set(operator_results_by_entry_id) - entries_by_id.keys()
     if unknown_result_ids:
-        raise ManifestError(
-            "operator input contains unknown entries: "
-            + ",".join(sorted(unknown_result_ids))
-        )
+        raise ManifestError("operator input contains unknown entries: " + ",".join(sorted(unknown_result_ids)))
 
     report_entry_by_id: dict[str, dict[str, Any]] = {}
     for entry in selected_entries:
@@ -447,10 +424,7 @@ def evaluate_operator_input(
         "generated_at": _utc_now(),
         "campaign_id": manifest["campaign_id"],
         "manifest_sha256": _json_hash(manifest),
-        "ok": all(
-            report_entry["status"] == "passed"
-            for report_entry in report_entry_by_id.values()
-        ),
+        "ok": all(report_entry["status"] == "passed" for report_entry in report_entry_by_id.values()),
         "entries": report_entry_by_id,
     }
 

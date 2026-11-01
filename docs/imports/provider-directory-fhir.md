@@ -2022,6 +2022,38 @@ streaming flush behavior as direct resource reads and honors the configured
 `linked_resource_deadline_seconds`; when the deadline is reached, stale cleanup
 for SCAN roles is skipped because the resource is incomplete.
 
+## Versioned directories with capped searches
+
+An explicitly configured `versioned_search_limit` enables capped time chunks
+inside the existing last-updated acquisition path. The collection must be an
+unfiltered anonymous HTTPS search on an R4 server advertising versioned create
+and update interactions, whose REST contract populates `meta.lastUpdated`.
+This requirement is checked before and after acquisition. Every returned record
+must have a valid timestamp inside its half-open window. Name prefixes are not
+used, so missing names, punctuation and non-Latin names remain included.
+
+Exact-zero count witnesses before the configured start and at or after the
+root's frozen end are required before acquisition and after the final leaf
+recount. Nonempty, unknown or errored tails prevent completion. A recognized
+`SearchTooCostly` response retains a lower bound, not a fabricated exact total.
+A transport timeout can subdivide an uncounted window without asserting its
+size. Authentication failures, throttling and unrelated errors retain their
+normal handling. Windows that cannot be subdivided fail closed.
+
+Every leaf requires an exact count below the configured chunk ceiling, complete
+sequential issued cursors, two equal content passes and an unchanged final
+count. The leaf sum must reconcile with both passes and the staged candidate.
+The separately reported capped census never substitutes that sum for an
+unfiltered server total. Durable checkpoints include the contract and split
+evidence; earlier exact-census contracts retain their existing identity.
+
+MVP's direct Provider Directory configures this path for Organization, Location,
+PractitionerRole and Practitioner, with chunks of at most 10,000 rows and
+100-row pages. The other four advertised collections use the ordinary REST
+path. Source metadata is distinct from the older transport alias and does not
+infer product, state or network participation. Publication and downstream
+Profile/API readiness require their ordinary validation gates.
+
 ## Self-Harness
 
 Run the parser-only harness:
