@@ -18,8 +18,10 @@ from process import registry_source_contribution_store as facts
 from process import registry_source_fact_offices as fact_offices
 from process import registry_source_inventory_store as inventory_store
 from process import registry_source_recipe_composition as composition
+from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.registry_composition_addresses import RegistryCompositionAddressSources, RegistryCompositionError
 from process.registry_source_inventory_contract import RegistrySourceInventoryError, make_source_inventory_entry
 from process.registry_source_recipe_store import (
     RegistrySourceMembershipRecipe,
@@ -201,6 +203,52 @@ def test_source_successors_are_explicitly_deferred():
         replace(source, retained_successor=source)
     with pytest.raises(ValueError):
         fhir.with_fhir_successor(source, _reader_recipe().source_pin)
+
+
+def test_address_sources_refuse_a_duck_source_runtime():
+    with pytest.raises(RegistryCompositionError, match="registry_source_witness_runtime_invalid"):
+        RegistryCompositionAddressSources(
+            PinnedAddressSource("address_source", "address_rows", "one"), source_witness_runtime=object()
+        )
+
+
+def test_source_recipe_cannot_enter_noncompact_address_inputs():
+    with pytest.raises(RegistryCompositionError, match="registry_source_witness_verified_inventory_required"):
+        RegistryCompositionAddressSources(
+            PinnedAddressSource("address_source", "address_rows", "one"), initial_source_recipes=(_source_recipe(),)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inventory", (False, True))
+async def test_source_staging_requires_verified_inventory_before_database_access(inventory):
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(), fetchrow=AsyncMock())
+    with pytest.raises(composition.RegistrySourceCompositionError, match="verified_inventory_required"):
+        await composition.stage_registry_source_recipes(
+            connection,
+            (_source_recipe(),),
+            ApprovedMembershipSource(1, "a" * 64),
+            request_id=UUID(int=1),
+            control_schema="registry_example",
+            inventory=inventory,
+        )
+    for method in (connection.execute, connection.fetchval, connection.fetchrow):
+        method.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_source_recipe_cannot_use_the_flat_custody_path():
+    connection = SimpleNamespace(fetchval=AsyncMock())
+    with pytest.raises(composition.RegistrySourceCompositionError, match="source_witness_custody_unavailable"):
+        await composition._require_fhir_custody(connection, _source_recipe().source_pin)
+    connection.fetchval.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", ("2026-13-02T00:00:00.000000+00:00", "2026-02-30T00:00:00.000000+00:00"))
+def test_capture_timestamp_refuses_invalid_calendar_values_with_canonical_length(value):
+    assert len(value) == 32
+    with pytest.raises(witness.SourceWitnessContractError, match="source_fhir_witness_contract_invalid"):
+        witness.canonical_timestamp(value)
 
 
 @pytest.mark.parametrize(
