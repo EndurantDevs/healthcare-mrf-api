@@ -182,6 +182,39 @@ async def test_combined_filters_share_relationship(catalog_database):
 
 
 @pytest.mark.asyncio
+async def test_partial_plan_and_company_labels_find_networks_on_visible_relationships(catalog_database):
+    fixture = catalog_database
+    plan = relationship_document()
+    plan["relationship_id"] = "5" * 64
+    plan["plan"]["display_name"] = "Example Personal Alliance PPO"
+    plan["company"] = {"company_id": SECOND_COMPANY, "display_name": "Sample Health Insurance"}
+    await _edge(fixture, 8, plan)
+    other = relationship_document()
+    other["relationship_id"] = "6" * 64
+    other["plan"]["display_name"] = "Basic HMO"
+    await _edge(fixture, 8, other)
+
+    for fields in (
+        {"plan_search": "Example PPO"},
+        {"search": "Example PPO"},
+        {"company_search": "Sample Insurance"},
+        {"search": "Sample Insurance"},
+        {"search": "Other Network"},
+    ):
+        page = await _read(fixture, catalog.FHIRCatalogQuery(**fields))
+        assert [network["network_id"] for network in page["items"]] == [8]
+    for fields in (
+        {"company_search": "Example Insurance", "plan_search": "Example PPO"},
+        {"company_search": "Example Insurance", "search": "Example PPO"},
+        {"plan_search": "Basic HMO", "search": "Sample Insurance"},
+    ):
+        assert (await _read(fixture, catalog.FHIRCatalogQuery(**fields)))["total"] == 0
+    policy = RegistryOrganizationVisibility((SECOND_COMPANY,), ())
+    for search in ("Example PPO", "Sample Insurance"):
+        assert (await _read(fixture, catalog.FHIRCatalogQuery(search=search), policy))["total"] == 0
+
+
+@pytest.mark.asyncio
 async def test_visibility_precedes_counts(catalog_database):
     fixture = catalog_database
     second = relationship_document()
@@ -296,11 +329,15 @@ async def test_literal_alias_unicode_and_last_good(catalog_database):
     fixture = catalog_database
     document = relationship_document()
     document["relationship_id"] = "3" * 64
-    await _edge(fixture, 8, document, plan_search="Česká 100%_Gold", company_search="Example Insurance\nOld Insurer")
+    await _edge(
+        fixture, 8, document, plan_search="Česká 100%_Gold\\Plan", company_search="Example Insurance\nOld Insurer"
+    )
     query = catalog.FHIRCatalogQuery(plan_search="100%_", company_search="OLD INSURER")
     page = await _read(fixture, query)
     assert [network["network_id"] for network in page["items"]] == [8]
     assert (await _read(fixture, catalog.FHIRCatalogQuery(plan_search="ČESKÁ")))["total"] == 1
+    assert (await _read(fixture, catalog.FHIRCatalogQuery(search="100%_Gold\\Plan")))["total"] == 1
+    assert (await _read(fixture, catalog.FHIRCatalogQuery(plan_search="100_ Gold\\Plan")))["total"] == 0
     await fixture.connection.execute(
         f'UPDATE "{fixture.metadata}".registry_fhir_catalog_binding '
         "SET document_json=jsonb_set(document_json,'{status}','\"last_good\"')"
@@ -372,7 +409,8 @@ async def test_representative_query_uses_trigram(catalog_database):
         f"""INSERT INTO "{fixture.metadata}".registry_fhir_catalog_relationship
       (metadata_generation,relationship_id,network_id,source_id,company_id,group_id,company_search,plan_search,document_json,
         source_generation,binding_id)
-      SELECT $1,encode(sha256(convert_to(ordinal::text,'UTF8')),'hex'),8,'sample-fhir',NULL,NULL,'',
+      SELECT $1,encode(sha256(convert_to(ordinal::text,'UTF8')),'hex'),8,'sample-fhir',NULL,NULL,
+        CASE WHEN ordinal=12346 THEN 'needle precise insurer' ELSE '' END,
         CASE WHEN ordinal=12345 THEN 'needle precise plan' ELSE 'ordinary plan '||ordinal END,$2::jsonb,$3,$4
       FROM generate_series(1,30000) ordinal""",
         GENERATION,
@@ -381,16 +419,22 @@ async def test_representative_query_uses_trigram(catalog_database):
         binding_id,
     )
     await fixture.connection.execute(f'ANALYZE "{fixture.metadata}".registry_fhir_catalog_relationship')
-    query = catalog.FHIRCatalogQuery(plan_search="needle precise")
-    parameters = catalog._query_parameters(query, GENERATION, (), RegistryOrganizationVisibility(), None)
     sql, address_parameters, _ = catalog._catalog_page_statement({"schema_name": fixture.metadata}, fixture.manifest)
-    explained = await fixture.connection.fetchval(
-        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + sql,
-        *parameters,
-        *address_parameters,
-    )
-    plan = json.loads(explained)
-    assert "registry_fhir_catalog_plan_trgm" in _plan_names(plan)
+    for fields, index in (
+        ({"plan_search": "needle plan"}, "registry_fhir_catalog_plan_trgm"),
+        ({"search": "needle plan"}, "registry_fhir_catalog_plan_trgm"),
+        ({"search": "needle insurer"}, "registry_fhir_catalog_company_trgm"),
+    ):
+        parameters = catalog._query_parameters(
+            catalog.FHIRCatalogQuery(**fields), GENERATION, (), RegistryOrganizationVisibility(), None
+        )
+        explained = await fixture.connection.fetchval(
+            "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + sql,
+            *parameters,
+            *address_parameters,
+        )
+        names = _plan_names(json.loads(explained))
+        assert index in names, (fields, names)
 
 
 @pytest.mark.asyncio

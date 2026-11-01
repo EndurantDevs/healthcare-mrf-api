@@ -45,6 +45,15 @@ class FHIRCatalogRunReport:
         self.document["profiles"].append(scope_by_field)
         return len(self.document["profiles"]) - 1
 
+    def select_endpoints(self, endpoint_ids):
+        """Complete selected inventory is distinct from a complete namespace inventory."""
+        scope_by_field = {
+            "inventory_scope": "selected_endpoints_and_retained_bindings",
+            "selected_endpoint_ids": list(endpoint_ids),
+        }
+        self._reserve(scope_by_field)
+        self.document.update(scope_by_field)
+
     def add_sources(self, dispositions, *, profile_index=None, generations=()):
         """Reserve complete source identities before any catalog candidate writes."""
         generations = iter(generations)
