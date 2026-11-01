@@ -1483,30 +1483,30 @@ def _worker_job_env_from() -> list[dict[str, Any]]:
 
 def _reject_broad_proxy_pool_secret(secret_name):
     """Keep the configured pool available only through its explicit Source keyref."""
-    pool_secret = os.getenv(provider_directory_source_worker.PROXY_POOL_SECRET_ENV, "").strip()
-    if pool_secret and secret_name == pool_secret:
+    pool_secrets = provider_directory_source_worker.configured_source_proxy_pool_secrets()
+    if secret_name in pool_secrets:
         raise ValueError("worker_proxy_pool_broad_secret_forbidden")
 
 
 def _has_broad_proxy_pool_reference(job):
     """Refuse inherited pool env or mounted pool data before reusing any worker Job."""
-    pool_secret = os.getenv(provider_directory_source_worker.PROXY_POOL_SECRET_ENV, "").strip()
-    if not pool_secret:
+    pool_secrets = provider_directory_source_worker.configured_source_proxy_pool_secrets()
+    if not pool_secrets:
         return False
     try:
         pod = job["spec"]["template"]["spec"]
         containers = [*pod.get("containers", []), *pod.get("initContainers", []), *pod.get("ephemeralContainers", [])]
         if any(
-            reference.get("secretRef", {}).get("name") == pool_secret
+            reference.get("secretRef", {}).get("name") in pool_secrets
             for container in containers
             for reference in container.get("envFrom", [])
         ):
             return True
         for volume in pod.get("volumes", []):
-            if volume.get("secret", {}).get("secretName") == pool_secret:
+            if volume.get("secret", {}).get("secretName") in pool_secrets:
                 return True
             if any(
-                reference.get("secret", {}).get("name") == pool_secret
+                reference.get("secret", {}).get("name") in pool_secrets
                 for reference in volume.get("projected", {}).get("sources", [])
             ):
                 return True

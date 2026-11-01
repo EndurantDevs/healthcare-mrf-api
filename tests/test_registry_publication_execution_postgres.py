@@ -284,9 +284,23 @@ async def _assert_revoked_execution_unchanged(fixture, lease, before, history_co
     assert status["state"] == "running" and status["result"] is None
 
 
+async def _assert_publication_controls_unlocked(fixture):
+    assert (
+        await fixture.observer.fetchval(
+            "SELECT count(*) FROM pg_locks WHERE pid=$1 AND granted AND mode<>'AccessShareLock' "
+            "AND relation IN (to_regclass($2),to_regclass($3))",
+            fixture.connection.get_server_pid(),
+            f'"{fixture.control_schema}".registry_revision_control',
+            f'"{fixture.control_schema}".network_serving_control',
+        )
+        == 0
+    )
+
+
 async def _revoke_while_request_locked(fixture, lease, phase, table_name="registry_publication_request"):
     """Release the actual native row fence only after trusted authority is revoked."""
     checked = asyncio.Event()
+    observer_rollback_done = asyncio.Event()
     calls = []
     is_revoked = False
 
@@ -294,16 +308,9 @@ async def _revoke_while_request_locked(fixture, lease, phase, table_name="regist
         """Model trusted live authority changing while PostgreSQL fences the request."""
         checked.set()
         if is_revoked and table_name == "registry_publication_request":
-            assert (
-                await fixture.observer.fetchval(
-                    "SELECT count(*) FROM pg_locks WHERE pid=$1 AND granted AND mode<>'AccessShareLock' "
-                    "AND relation IN (to_regclass($2),to_regclass($3))",
-                    fixture.connection.get_server_pid(),
-                    f'"{fixture.control_schema}".registry_revision_control',
-                    f'"{fixture.control_schema}".network_serving_control',
-                )
-                == 0
-            )
+            # The lock waiter can resume while the observer is still completing ROLLBACK.
+            await observer_rollback_done.wait()
+            await _assert_publication_controls_unlocked(fixture)
         return await _authority(calls, denied=is_revoked)(**request_by_name)
 
     blocker = fixture.observer.transaction()
@@ -334,6 +341,7 @@ async def _revoke_while_request_locked(fixture, lease, phase, table_name="regist
         await _wait_for_request_lock(fixture, pending)
         is_revoked = True
         await blocker.rollback()
+        observer_rollback_done.set()
         with pytest.raises(PermissionError, match="registry_publication_denied"):
             await asyncio.wait_for(pending, 5)
     finally:
@@ -344,6 +352,53 @@ async def _revoke_while_request_locked(fixture, lease, phase, table_name="regist
             await asyncio.gather(pending, return_exceptions=True)
     assert len(calls) == (2 if table_name == "registry_publication_request" else 3)
     assert all(call == calls[0] for call in calls)
+
+
+@pytest.mark.parametrize("phase", ["approval", "publication"])
+async def test_revocation_waits_for_observer_rollback(pipeline_db, serving_schema, monkeypatch, phase):
+    """Force the lock waiter to resume before the observer finishes its rollback."""
+    fixture = pipeline_db
+    lease = await _claim(fixture, serving_schema[2])
+    if phase == "publication":
+        await _approve(fixture, lease, [])
+    observer, fresh_authority = fixture.observer, execution._fresh_authority
+    callback_entered = asyncio.Event()
+    rollback_in_progress = asyncio.Event()
+
+    async def observe_authority(*arguments, **options):
+        if rollback_in_progress.is_set():
+            callback_entered.set()
+        return await fresh_authority(*arguments, **options)
+
+    class ObservedConnection:
+        def __getattr__(self, name):
+            return getattr(observer, name)
+
+        def transaction(self):
+            transaction = observer.transaction()
+
+            async def rollback():
+                rollback_in_progress.set()
+                try:
+                    await transaction.rollback()
+                    await asyncio.wait_for(callback_entered.wait(), 5)
+                finally:
+                    rollback_in_progress.clear()
+
+            return SimpleNamespace(start=transaction.start, rollback=rollback)
+
+        async def fetchval(self, *arguments, **options):
+            if rollback_in_progress.is_set():
+                raise asyncpg.InterfaceError("observer rollback is still in progress")
+            return await observer.fetchval(*arguments, **options)
+
+    monkeypatch.setattr(execution, "_fresh_authority", observe_authority)
+    fixture.observer = ObservedConnection()
+    try:
+        await _revoke_while_request_locked(fixture, lease, phase)
+        assert callback_entered.is_set()
+    finally:
+        fixture.observer = observer
 
 
 @pytest.mark.parametrize("phase", ["approval", "publication"])
