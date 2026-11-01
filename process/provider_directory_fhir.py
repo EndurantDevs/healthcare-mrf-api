@@ -86,6 +86,7 @@ from db.models import (
 from db.plan_release_storage import storage_relation
 from process import provider_directory_christus as christus
 from process import provider_directory_cms_desired_fence as cms_desired_fence
+from process import provider_directory_molina as molina
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_artifact_custody as profile_artifact_custody
@@ -107,6 +108,7 @@ from process import provider_directory_profile_payload_custody as profile_payloa
 from process import provider_directory_profile_scope_copy as profile_scope_copy
 from process import provider_directory_profile_target_wal_witness as profile_statement_wal
 from process import provider_directory_serving_recovery as serving_recovery
+from process import provider_directory_source_proxy as source_proxy
 from process import provider_directory_source_selection as source_selection
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
@@ -1255,9 +1257,9 @@ HUMANA_PROVIDER_DIRECTORY_METADATA_URL = f"{HUMANA_PROVIDER_DIRECTORY_BASE}/meta
 IEHP_PROVIDER_DIRECTORY_BASE = "https://fhir.iehp.org/provider-directory"
 IEHP_PROVIDER_DIRECTORY_METADATA_URL = f"{IEHP_PROVIDER_DIRECTORY_BASE}/metadata"
 MOLINA_DEVELOPER_PORTAL_URL = "https://developer.interop.molinahealthcare.com"
-MOLINA_PROVIDER_DIRECTORY_BASE = "https://api.interop.molinahealthcare.com/providerdirectory"
+MOLINA_PROVIDER_DIRECTORY_BASE = molina.API_BASE
 MOLINA_PROVIDER_DIRECTORY_METADATA_URL = f"{MOLINA_PROVIDER_DIRECTORY_BASE}/metadata"
-MOLINA_PAGINATION_HOST = "molina.sapphirethreesixtyfive.com"
+MOLINA_PAGINATION_HOST = molina.PAGINATION_HOST
 TMHP_PROVIDER_DIRECTORY_BASE = "https://cmsinterop.tmhp.com/tmhp/fhir/pd/R4"
 TMHP_PROVIDER_DIRECTORY_METADATA_URL = f"{TMHP_PROVIDER_DIRECTORY_BASE}/metadata"
 NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE = "https://dhhs-api.ne.gov/dhhs/trading-partner/api/cmsi/provider/1.0.0"
@@ -1722,6 +1724,7 @@ FHIR_CONTINUATION_QUERY_NAMES = frozenset(
         "nexttoken",
         "page",
         "pagetoken",
+        "starting_after",
     }
 )
 
@@ -4749,6 +4752,9 @@ def _credential_api_base_candidates(
 
 
 def _credential_spec_for_source(source_record: dict[str, Any]) -> dict[str, Any]:
+    frozen = source_proxy.frozen_credentials(source_record)
+    if frozen is not None:
+        return frozen
     config = _load_credentials_config()
     if not config:
         return {}
@@ -4942,9 +4948,11 @@ def _fetch_oauth2_client_token_sync(
     return access_token
 
 
-def _credential_request_options_for_source(source_record: dict[str, Any], url: str) -> dict[str, Any]:
+def _credential_request_options_for_source(
+    source_record: dict[str, Any], url: str, *, spec: dict[str, Any] | None = None
+) -> dict[str, Any]:
     source_selection.require_qualification_url(sys.modules[__name__], url)
-    spec = _credential_spec_for_source(source_record)
+    spec = _credential_spec_for_source(source_record) if spec is None else spec
     if not spec or not _is_credential_allowed_for_url(source_record, url):
         return {"headers": {}, "query_params": {}, "descriptor": None}
     headers_by_name: dict[str, str] = {}
@@ -5585,7 +5593,12 @@ def _molina_provider_directory_override(
         "requires_registration": False,
         "auth_type": "none",
         "last_validated_status": "valid",
-        "endpoints": _source_override_endpoint_fields(MOLINA_PROVIDER_DIRECTORY_BASE),
+        "endpoints": {
+            **_source_override_endpoint_fields(MOLINA_PROVIDER_DIRECTORY_BASE),
+            "endpoint_insurance_plan": (f"{MOLINA_PROVIDER_DIRECTORY_BASE}/InsurancePlan?status:not=entered-in-error"),
+            "endpoint_healthcare_service": (f"{MOLINA_PROVIDER_DIRECTORY_BASE}/HealthcareService?name:missing=false"),
+            "endpoint_endpoint": f"{MOLINA_PROVIDER_DIRECTORY_BASE}/Endpoint?_id:missing=false",
+        },
         "metadata": {
             "provider_directory_override": "molina_interop_providerdirectory",
             "provider_directory_override_reason": (
@@ -5597,16 +5610,10 @@ def _molina_provider_directory_override(
             "provider_directory_confirmed_base": MOLINA_PROVIDER_DIRECTORY_BASE,
             "provider_directory_confirmed_catalog_url": MOLINA_DEVELOPER_PORTAL_URL,
             "provider_directory_confirmed_metadata_url": MOLINA_PROVIDER_DIRECTORY_METADATA_URL,
-            "provider_directory_supported_resources": [
-                "Location",
-                "Organization",
-                "OrganizationAffiliation",
-                "Practitioner",
-                "PractitionerRole",
-            ],
+            "provider_directory_supported_resources": list(DEFAULT_RESOURCES),
             "provider_directory_resource_probe_caveat": (
-                "Live declared resources are public; generated searches for undeclared resource "
-                "types return HTTP 500 and are intentionally skipped."
+                "Capability metadata omits collection routes that require explicit search parameters; "
+                "all configured resource types retain the shared acquisition and pagination checks."
             ),
         },
     }
@@ -40956,6 +40963,8 @@ async def _fetch_json_with_source_session(
     timeout: int,
     allow_redirects: bool = True,
     preserve_url_bytes: bool = False,
+    proxy_options: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     """Fetch anonymous FHIR JSON through a persistent source session."""
     headers_by_name = {
@@ -40963,27 +40972,28 @@ async def _fetch_json_with_source_session(
         "Accept-Encoding": "identity",
         "User-Agent": USER_AGENT,
     }
-    request_timeout = aiohttp.ClientTimeout(
-        total=None,
-        connect=timeout,
-        sock_connect=timeout,
-        sock_read=timeout,
-    )
+    request_timeout = aiohttp.ClientTimeout(total=None, connect=timeout, sock_connect=timeout, sock_read=timeout)
     started = time.monotonic()
-    request_url = URL(url, encoded=True) if preserve_url_bytes or christus.is_request_url(url) else url
     try:
+        request_options = proxy_options or {}
+        if extra_headers:
+            if any(key.lower() == "proxy-authorization" for key in extra_headers):
+                raise ValueError("source_proxy_origin_header_forbidden")
+            headers_by_name.update(extra_headers)
+        request_url = (
+            URL(url, encoded=True) if preserve_url_bytes or request_options or christus.is_request_url(url) else url
+        )
         async with session.get(
             request_url,
             headers=headers_by_name,
             timeout=request_timeout,
             allow_redirects=allow_redirects
             and not christus.is_request_url(url)
-            and source_selection.QUALIFICATION_API_BASE.get() is None,
+            and source_selection.QUALIFICATION_API_BASE.get() is None
+            and not request_options,
+            **request_options,
         ) as response:
-            payload_by_field = await _read_source_http_payload(
-                response,
-                timeout=timeout,
-            )
+            payload_by_field = await _read_source_http_payload(response, timeout=timeout)
             return (
                 response.status,
                 payload_by_field,
@@ -41444,6 +41454,9 @@ async def _fetch_source_json_unpaced(
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     source_selection.require_qualification_url(sys.modules[__name__], url)
+    proxy_run = source_proxy.selected_run(sys.modules[__name__], source_record)
+    if proxy_run is not None:
+        return await proxy_run.fetch(source_record, url, timeout=timeout)
     census_contract = current_version_census_contract(source_record)
     if census_contract is not None:
         if _has_source_declared_credentialed_access(source_record) or _credential_spec_for_source(source_record):
@@ -42215,6 +42228,7 @@ async def _probe_alohr_graphql_connector(
     timeout: int,
     run_id: str | None,
 ) -> tuple[dict[str, Any], None]:
+    source_proxy.require_direct_transport(sys.modules[__name__], source_record)
     status_code, response_payload, request_error, elapsed = await asyncio.to_thread(
         _post_json_sync,
         ALOHR_GRAPHQL_URL,
@@ -42252,6 +42266,7 @@ async def _probe_uhc_official_file_connector(
 ) -> tuple[dict[str, Any], None]:
     """Probe the official catalog transport without inventing FHIR metadata."""
 
+    source_proxy.require_direct_transport(sys.modules[__name__], source_record)
     started = time.monotonic()
     catalog = await asyncio.wait_for(
         refresh_uhc_provider_file_catalog(),
@@ -43058,6 +43073,9 @@ def _resolved_fhir_next_url(
 ) -> str | None:
     """Resolve a source-specific continuation without widening trust."""
 
+    api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if api_base == MOLINA_PROVIDER_DIRECTORY_BASE and resource_type == "HealthcareService":
+        return molina.healthcare_service_next_url(current_url, next_link, page_entry_count)
     if not next_link:
         return None
     census_page_url = _resolved_current_version_census_page_url(
@@ -43071,7 +43089,6 @@ def _resolved_fhir_next_url(
     if census_page_url is not None:
         return census_page_url
     next_url = urllib.parse.urljoin(current_url, next_link)
-    api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     parsed_next = urllib.parse.urlsplit(next_url)
     if api_base == christus.API_BASE:
         return christus.resolved_christus_next_url(current_url, next_url)
@@ -43225,43 +43242,8 @@ def _resolved_offset_next_url(
 
 
 def _resolved_molina_next_url(current_url: str, next_url: str) -> str:
-    canonical_base = urllib.parse.urlsplit(MOLINA_PROVIDER_DIRECTORY_BASE)
-    parsed_next = urllib.parse.urlsplit(next_url)
-    if parsed_next.scheme.lower() == canonical_base.scheme and parsed_next.netloc.lower() == canonical_base.netloc:
-        return next_url
-
-    parsed_current = urllib.parse.urlsplit(current_url)
-    resource_prefix = f"{canonical_base.path.rstrip('/')}/"
-    resource_type = (
-        parsed_current.path[len(resource_prefix) :] if parsed_current.path.startswith(resource_prefix) else ""
-    )
-    cursor_values = [
-        cursor_value
-        for key, cursor_value in urllib.parse.parse_qsl(
-            parsed_next.query,
-            keep_blank_values=True,
-        )
-        if key == "cursorMark"
-    ]
-    is_allowlisted = (
-        parsed_next.scheme.lower() == "https"
-        and parsed_next.netloc.lower() == MOLINA_PAGINATION_HOST
-        and not parsed_next.fragment
-        and resource_type in DEFAULT_RESOURCES
-        and parsed_next.path == f"/fhir/{resource_type}"
-        and len(cursor_values) == 1
-    )
-    if not is_allowlisted:
-        raise ValueError("untrusted_molina_pagination_link")
-    return urllib.parse.urlunsplit(
-        (
-            canonical_base.scheme,
-            canonical_base.netloc,
-            f"{canonical_base.path.rstrip('/')}/{resource_type}",
-            parsed_next.query,
-            "",
-        )
-    )
+    """Retain the shared facade for existing continuation callers."""
+    return molina.resolved_next_url(current_url, next_url, DEFAULT_RESOURCES)
 
 
 class _PublicBulkResolver(aiohttp.abc.AbstractResolver):
@@ -43619,6 +43601,7 @@ def _bulk_export_source_request_options(
     source: dict[str, Any],
     url: str,
 ) -> dict[str, Any]:
+    source_proxy.require_direct_transport(sys.modules[__name__], source)
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if not api_base or not _is_safe_bulk_https_url(url) or not _is_same_bulk_url_origin(url, api_base):
         raise ValueError("bulk_export_untrusted_source_url")
@@ -43693,6 +43676,7 @@ def _bulk_export_output_request_options(
     *,
     requires_access_token: bool | None,
 ) -> dict[str, Any]:
+    source_proxy.require_direct_transport(sys.modules[__name__], source)
     if not _is_allowed_bulk_output_url(source, output_url):
         raise ValueError("bulk_export_untrusted_output_url")
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
@@ -48794,15 +48778,12 @@ def _page_token_query_value(url: str) -> str | None:
 
 
 def _has_replay_sensitive_continuation(url: str) -> bool:
-    query_names = {
-        query_name.lower()
-        for query_name, _query_value in urllib.parse.parse_qsl(
-            urllib.parse.urlsplit(url).query,
-            keep_blank_values=True,
-        )
-    }
+    query = urllib.parse.urlsplit(url).query
+    query_names = {name.lower() for name in urllib.parse.parse_qs(query, keep_blank_values=True)}
     return bool(
-        _has_cursor_mark_query_parameter(url) or _page_token_query_value(url) is not None or "_getpages" in query_names
+        _has_cursor_mark_query_parameter(url)
+        or _page_token_query_value(url) is not None
+        or bool({"_getpages", "starting_after"}.intersection(query_names))
     )
 
 
@@ -53683,10 +53664,11 @@ async def _fetch_resource_rows(
                     retryable=False,
                     contract=current_version_contract,
                 )
-    synthetic_resume_guard_error = _synthetic_position_resume_guard_error(
-        source_record,
-        resume_state,
-    )
+    synthetic_resume_guard_error = molina.healthcare_service_resume_error(
+        _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")),
+        resource_type,
+        resume_state.next_url if resume_state else None,
+    ) or _synthetic_position_resume_guard_error(source_record, resume_state)
     if synthetic_resume_guard_error and resume_state is not None:
         return ResourceFetchResult(
             model=model,
@@ -58275,7 +58257,11 @@ def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if not api_base:
         return source.get("source_id") or "", "", ()
-    credential_descriptor = _credential_request_options_for_source(source, f"{api_base}/metadata")["descriptor"]
+    proxy_run = source_proxy.current_run()
+    if proxy_run is not None and source.get("source_id") in proxy_run.descriptors:
+        credential_descriptor = proxy_run.descriptors[source["source_id"]]
+    else:
+        credential_descriptor = _credential_request_options_for_source(source, f"{api_base}/metadata")["descriptor"]
     return (
         api_base,
         json.dumps(credential_descriptor or {}, sort_keys=True, default=str),
@@ -63201,6 +63187,8 @@ async def _import_alohr_graphql_source_group(
     dict[str, list[str]],
 ]:
     """Import alohr graphql source group into the provider-directory snapshot."""
+    for source_record in source_group:
+        source_proxy.require_direct_transport(sys.modules[__name__], source_record)
     import_state = _initialize_alohr_graphql_import_state(
         source_group,
         resource_types,
@@ -69748,11 +69736,8 @@ async def _import_uhc_official_file_source_group(
     run_id: str | None,
 ) -> ResourceImportGroupResult:
     """Import official files as one normal Provider Directory source group."""
-    required_run_id, source_record = _validated_uhc_import_source(
-        source_group,
-        resources,
-        run_id,
-    )
+    required_run_id, source_record = _validated_uhc_import_source(source_group, resources, run_id)
+    source_proxy.require_direct_transport(sys.modules[__name__], source_record)
     (
         catalog_set_sha256,
         acquisition,
@@ -70256,6 +70241,7 @@ async def process_provider_directory_fhir_data(
             supplemental_catalog_metric_by_name["enabled"] = True
             seed_rows.extend(supplemental_catalog_seed_rows)
 
+    proxy_token, proxy_run = source_proxy.enter_run(sys.modules[__name__])
     try:
         source_rows = _dedupe_source_rows([_source_row_from_seed(seed_record) for seed_record in seed_rows])
         if census_request is None:
@@ -70267,9 +70253,6 @@ async def process_provider_directory_fhir_data(
                 limit=limit,
             )
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
-        source_rows = await source_selection.qualify_stale_isolated_source(
-            sys.modules[__name__], source_rows, task, timeout=timeout, run_id=run_id
-        )
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
         census_contract = (
@@ -70277,6 +70260,13 @@ async def process_provider_directory_fhir_data(
         )
         for source_record in source_rows:
             _validate_current_version_census_source_transport(source_record)
+        await proxy_run.prepare(source_rows, endpoint_scope=provider_directory_endpoint_scope)
+        if proxy_run.bindings:
+            proxy_run.attach_audit(ctx["context"].setdefault("audit", {}))
+        async with _source_http_session_scope(force=True) if proxy_run.bindings else contextlib.nullcontext():
+            source_rows = await source_selection.qualify_stale_isolated_source(
+                sys.modules[__name__], source_rows, task, timeout=timeout, run_id=run_id
+            )
         endpoint_rows_seeded = await _upsert_provider_directory_source_rows(
             source_rows,
             require_reviewed_subset_generation=bool(
@@ -70345,6 +70335,8 @@ async def process_provider_directory_fhir_data(
             "credential_config_file_configured": bool(credential_config_file),
             "current_version_census_identity": (census_contract.identity() if census_contract is not None else None),
         }
+        proxy_run.attach_audit(metrics_by_key)
+        ctx["context"]["audit"] = metrics_by_key
         await _mark_provider_directory_progress(
             run_id,
             phase="provider-directory sources seeded",
@@ -70359,7 +70351,7 @@ async def process_provider_directory_fhir_data(
         metrics_by_key["manual_only_sources_skipped_before_probe"] = len(source_rows) - len(probe_source_rows)
         if not seed_only and probe and probe_source_rows:
             async with _source_http_session_scope(
-                force=census_contract is not None,
+                force=census_contract is not None or bool(proxy_run.bindings),
                 require_verified_tls=census_contract is not None,
             ):
                 probed, valid, valid_source_ids = await _run_source_probe_batch(
@@ -70648,6 +70640,7 @@ async def process_provider_directory_fhir_data(
         print("PROVIDER_DIRECTORY_FHIR_IMPORT_DONE\t" + json.dumps(metrics_by_key, sort_keys=True, default=str))
         return metrics_by_key
     finally:
+        source_proxy.exit_run(proxy_token)
         if seen_stage_table_for_publish:
             await _drop_import_seen_stage_table(seen_stage_table_for_publish)
         await _clear_resource_rows_seen(run_id)

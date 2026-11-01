@@ -3450,7 +3450,7 @@ def test_cms_sma_catalog_sources_need_live_probe_before_resource_import():
 
 
 def test_source_row_from_seed_overrides_molina_developer_portal_base():
-    row = importer._source_row_from_seed(
+    source_row = importer._source_row_from_seed(
         {
             "id": "molina-ca",
             "org_name": "Molina Healthcare",
@@ -3462,21 +3462,44 @@ def test_source_row_from_seed_overrides_molina_developer_portal_base():
         }
     )
 
-    assert row["api_base"] == importer.MOLINA_PROVIDER_DIRECTORY_BASE
-    assert row["canonical_api_base"] == importer.MOLINA_PROVIDER_DIRECTORY_BASE
-    assert row["requires_registration"] is False
-    assert row["auth_type"] == "none"
-    assert row["last_validated_status"] == "valid"
-    assert row["endpoint_practitioner"] == f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner"
-    assert row["metadata_json"]["provider_directory_override"] == "molina_interop_providerdirectory"
-    assert row["metadata_json"]["provider_directory_confirmed_metadata_url"] == (
+    assert source_row["api_base"] == importer.MOLINA_PROVIDER_DIRECTORY_BASE
+    assert source_row["canonical_api_base"] == importer.MOLINA_PROVIDER_DIRECTORY_BASE
+    assert source_row["requires_registration"] is False
+    assert source_row["auth_type"] == "none"
+    assert source_row["last_validated_status"] == "valid"
+    assert source_row["endpoint_practitioner"] == f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner"
+    assert source_row["metadata_json"]["provider_directory_override"] == "molina_interop_providerdirectory"
+    assert source_row["metadata_json"]["provider_directory_confirmed_metadata_url"] == (
         importer.MOLINA_PROVIDER_DIRECTORY_METADATA_URL
     )
-    assert importer._resource_start_url(row, "Practitioner", page_count=100) == (
+    assert importer._resource_start_url(source_row, "Practitioner", page_count=100) == (
         f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/Practitioner?_count=100"
     )
-    assert importer._resource_start_url(row, "InsurancePlan", page_count=100) is None
-    assert importer._resource_start_url(row, "Endpoint", page_count=100) is None
+    assert importer._source_supported_resource_types(source_row) == set(importer.DEFAULT_RESOURCES)
+    assert importer._resource_start_url(source_row, "InsurancePlan", page_count=100) == (
+        f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/InsurancePlan?status%3Anot=entered-in-error&_count=100"
+    )
+    for resource_type, search in (("HealthcareService", "name"), ("Endpoint", "_id")):
+        assert importer._resource_start_url(source_row, resource_type, page_count=100) == (
+            f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/{resource_type}?{search}%3Amissing=false&_count=100"
+        )
+
+
+@pytest.mark.asyncio
+async def test_starting_after_cursor_retains_shared_continuation_and_cycle_checks():
+    base = f"{importer.MOLINA_PROVIDER_DIRECTORY_BASE}/InsurancePlan"
+    first = f"{base}?status=active&_count=100&starting_after=example%2Bcursor"
+    reordered = f"{base}?starting_after=example%2bcursor&_count=100&status=active"
+
+    assert importer._has_fhir_continuation_query(first)
+    assert importer._has_replay_sensitive_continuation(first)
+    assert importer._pagination_url_identity(first) == importer._pagination_url_identity(reordered)
+    assert not importer._has_fhir_continuation_query(f"{base}?status=active&_count=100")
+    assert importer._resolved_molina_next_url(f"{base}?status=active&_count=100", first) == first
+    fetch_state = importer.PartitionFetchState(result_model=object, retained_resource_rows=[])
+    assert await importer._can_fetch_partition_url(fetch_state, first, max_pages=0)
+    assert not await importer._can_fetch_partition_url(fetch_state, reordered, max_pages=0)
+    assert fetch_state.error_message == "pagination_cursor_repeated"
 
 
 def test_source_row_from_seed_overrides_molina_dead_fhir_host():
