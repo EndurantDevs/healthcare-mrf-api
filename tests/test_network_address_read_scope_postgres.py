@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Exact native count, page and existing NPI hydration on one filtered heap."""
 
+import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -11,7 +12,8 @@ import pytest
 from sanic import Sanic, response
 from sanic.compat import Header
 from sanic.exceptions import InvalidUsage, NotFound
-from sqlalchemy import MetaData, func, select, text
+from sqlalchemy import MetaData, event, func, select, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.endpoint import npi, plan
@@ -28,6 +30,8 @@ from api.network_address_scope import (
 from api.network_read_execution import execute_network_read
 from api.provider_geo_sql import nearby_row_tiebreaker
 from api.provider_list_sql import _is_unified_address_table, _provider_list_connection, _provider_list_parameters
+from api.request_lifecycle import RequestLifecycleSanic
+from db.connection import current_session, db
 from db.models import EntityAddressUnified, Issuer, NPIData, NPIDataTaxonomy, NPIDataTaxonomyGroup, PlanNetworkTierRaw
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_network_address_projection_postgres import projection_db
@@ -372,6 +376,181 @@ async def test_registered_http_wrapper_uses_verified_manifest_and_no_fallback(pr
     _, unavailable = await app.asgi_client.get(f"/addresses?network_ids={network_id}", headers=headers_by_name)
     assert unavailable.status == 503 and len(invoked_generations) == 3
     assert current_network_address_scope() is None
+
+
+@pytest.fixture
+async def request_snapshot_database(protected_provider_app, monkeypatch):
+    """Use real middleware pools and restore the fixture's exact temporary login."""
+    context = protected_provider_app
+    url, owner = context.fixture.engine.url, context.fixture.connection
+    reader, password = context.fixture.roles["reader"], uuid4().hex
+    assert tuple(await owner.fetchrow("SELECT rolcanlogin,rolpassword FROM pg_authid WHERE rolname=$1", reader)) == (
+        False,
+        None,
+    )
+    await db.disconnect()
+    for field, setting in {
+        "HOST": url.host,
+        "PORT": url.port or 5432,
+        "DATABASE": url.database,
+        "DATABASE_OVERRIDE": url.database,
+        "USER": url.username,
+        "PASSWORD": url.password or "",
+        "READER_USER": reader,
+        "READER_PASSWORD": password,
+    }.items():
+        monkeypatch.setenv("HLTHPRT_DB_" + field, str(setting))
+    await owner.execute(f"ALTER ROLE \"{reader}\" LOGIN PASSWORD '{password}'")
+    try:
+        yield context
+    finally:
+        await db.disconnect()
+        await owner.execute(f'ALTER ROLE "{reader}" NOLOGIN PASSWORD NULL')
+        assert tuple(
+            await owner.fetchrow("SELECT rolcanlogin,rolpassword FROM pg_authid WHERE rolname=$1", reader)
+        ) == (False, None)
+
+
+async def _network_request_snapshot(session):
+    """Observe native modes and identity without changing the caller's transaction."""
+    driver = (await (await session.connection()).get_raw_connection()).driver_connection
+    identity_values = tuple(
+        await driver.fetchrow(
+            "SELECT current_user,pg_backend_pid(),current_setting('transaction_isolation'),"
+            "current_setting('transaction_read_only')"
+        )
+    )
+    return session.get_transaction(), driver, identity_values
+
+
+def _request_snapshot_app(monkeypatch, observations, entered):
+    """Keep the real manifest verifier and shared NPI hydration behind real middleware."""
+    from process import network_serving_read
+
+    original = network_serving_read.resolve_network_serving_manifest
+
+    async def resolve(driver, **arguments):
+        snapshot = await _network_request_snapshot(current_session())
+        assert snapshot[1] is driver
+        observations.append(snapshot)
+        return await original(driver, **arguments)
+
+    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", resolve)
+    app = RequestLifecycleSanic("network-request-snapshot-" + uuid4().hex)
+    db.init_app(app)
+
+    @app.get("/api/v1/npi/snapshot-test")
+    @canonical_network_read
+    async def read_addresses(request):
+        session = request.ctx.sa_session
+        before = await _network_request_snapshot(session)
+        addresses = await npi._fetch_npi_location_candidates_map([1000000004, 1000000491], session=session)
+        assert await _network_request_snapshot(session) == before == observations[-1]
+        if request.args.get("ending") == "error":
+            raise NotFound("Synthetic missing provider.")
+        if request.args.get("ending") == "cancel":
+            entered.set()
+            await asyncio.Event().wait()
+        return response.json({"locations": [row["location_key"] for rows in addresses.values() for row in rows]})
+
+    return app
+
+
+async def _assert_request_snapshot_closed(context, request):
+    """Require middleware ownership and native transactions to end after each request."""
+    assert request.ctx.sa_session is request.ctx.session is None
+    assert request.ctx._sa_reader_scope is request.ctx._sa_session_token is None
+    assert not db.has_reader_session() and current_network_address_scope() is None
+    assert (
+        await context.fixture.connection.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename=ANY($1::text[]) "
+            "AND pid<>pg_backend_pid() AND xact_start IS NOT NULL",
+            [context.fixture.engine.url.username, context.fixture.roles["reader"]],
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_enabled", [False, True])
+async def test_http_network_snapshot_uses_real_request_lifecycle(
+    request_snapshot_database, monkeypatch, middleware_enabled
+):
+    """Ordinary HTTP defaults must become RR/RO before native resolution and hydration."""
+    context, observations, statements, entered = request_snapshot_database, [], [], asyncio.Event()
+    monkeypatch.setenv("HLTHPRT_API_READER_ENABLED", str(middleware_enabled).lower())
+    app = _request_snapshot_app(monkeypatch, observations, entered)
+    path = f"/api/v1/npi/snapshot-test?network_ids={context.source_network_id}"
+    headers_by_name = {"Authorization": "Bearer synthetic-network-provider-token"}
+
+    def record(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", record)
+    try:
+        for query, authorization, status in ((path, {}, 403), (path + "&network_generation=01", headers_by_name, 400)):
+            request, reply = await app.asgi_client.get(query, headers=authorization)
+            assert reply.status == status and observations == []
+            assert not any(sql.startswith("SET TRANSACTION") for sql in statements)
+            await _assert_request_snapshot_closed(context, request)
+        for ending, status in (("success", 200), ("error", 404)):
+            request, reply = await app.asgi_client.get(path + "&ending=" + ending, headers=headers_by_name)
+            assert reply.status == status, reply.text
+            assert observations[-1][2][2:] == ("repeatable read", "on")
+            expected_role = (
+                context.fixture.roles["reader"] if middleware_enabled else context.fixture.engine.url.username
+            )
+            assert observations[-1][2][0] == expected_role
+            assert reply.headers["X-Network-Generation"] == str(
+                current_generation := await context.fixture.connection.fetchval(
+                    f'SELECT generation_id FROM "{context.fixture.control_schema}".network_serving_control WHERE id=1'
+                )
+            )
+            if ending == "success":
+                assert reply.json == {"locations": ["a" * 64]} and current_generation > 0
+            await _assert_request_snapshot_closed(context, request)
+        task = asyncio.create_task(app.asgi_client.get(path + "&ending=cancel", headers=headers_by_name))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await _assert_request_snapshot_closed(context, app.asgi_client.last_request)
+    finally:
+        event.remove(Engine, "before_cursor_execute", record)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True])
+async def test_network_snapshot_preserves_active_borrowed_session(protected_provider_app, read_only):
+    """Native callers retain their transaction and modes, including a refused RW read."""
+    context = protected_provider_app
+    async with async_sessionmaker(context.engine)() as session, session.begin():
+        await session.execute(
+            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ " + ("READ ONLY" if read_only else "READ WRITE"))
+        )
+        before = await _network_request_snapshot(session)
+        request = SimpleNamespace(
+            query_string=f"network_ids={context.source_network_id}",
+            headers=Header({"Authorization": "Bearer synthetic-network-provider-token"}),
+            ctx=SimpleNamespace(sa_session=session),
+        )
+        handler = AsyncMock(return_value=response.json({"ok": True}))
+        if read_only:
+            assert (await canonical_network_read(handler)(request)).status == 200
+            handler.assert_awaited_once()
+        else:
+            from sanic.exceptions import ServiceUnavailable
+
+            with pytest.raises(ServiceUnavailable):
+                await canonical_network_read(handler)(request)
+            handler.assert_not_awaited()
+        assert await _network_request_snapshot(session) == before
+        assert session.in_transaction() and before[1].is_in_transaction()
 
 
 @pytest.mark.asyncio
