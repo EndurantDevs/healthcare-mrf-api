@@ -251,6 +251,11 @@ async def _prepare_fhir_catalog_snapshot(
     async with _catalog_source_reads(source_pool, sealer_pool, config.grant, source_export) as source_reads:
         export_options = {"exports_by_profile": source_reads[2]} if source_reads[2] is not None else {}
         accepted, unavailable = await _discover_catalog_sources(source_reads[0], config.grant, **export_options)
+        if not accepted and any(
+            disposition.reason in {"catalog_observation_unavailable", "catalog_observation_timeout"}
+            for disposition in unavailable
+        ):
+            raise ValueError("registry_fhir_catalog_all_source_observations_failed")
         async with loader.transaction(isolation="repeatable_read"):
             head, manifest, previous = await _catalog_registry_head(loader, config.grant)
             retained_sources = await _retained_catalog_sources(loader, config.grant, manifest)

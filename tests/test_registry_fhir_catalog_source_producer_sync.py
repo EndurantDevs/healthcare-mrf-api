@@ -295,6 +295,73 @@ async def test_preparation_closes_source_before_sealing_and_records_inventory(mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["catalog_observation_unavailable", "catalog_observation_timeout"])
+async def test_all_failed_observations_refuse_before_retained_sources_or_candidate_writes(
+    monkeypatch, source_case, reason
+):
+    _preparation(monkeypatch, source_case)
+    failed = replace(disposition(status="unavailable"), reason=reason)
+    missing = disposition(status="unavailable", dataset=None)
+    source_case.export["inventory"].side_effect = lambda: _pages((missing,), (failed,))
+    sync._retained_catalog_sources.return_value = [source_case.accepted]
+    with reporting.fhir_catalog_run_reporting() as report:
+        with pytest.raises(ValueError, match="all_source_observations_failed") as caught:
+            await sync.prepare_fhir_catalog_snapshot(
+                source_case.config, source_case.loader, None, source_case.sealer_pool, source_export=source_case.factory
+            )
+        assert report.document["profiles"][0]["complete"] is True
+        assert [source["reason"] for source in report.document["sources"]] == ["current_dataset_missing", reason]
+        assert report.document["publication_state"] == "not_attempted"
+    source_case.loader.transaction.assert_not_called()
+    sync._catalog_registry_head.assert_not_awaited()
+    sync._retained_catalog_sources.assert_not_awaited()
+    sync._catalog_snapshot_inputs.assert_not_awaited()
+    sync._build_source_catalog_candidate.assert_not_awaited()
+    sync._seal_catalog_snapshot.assert_not_awaited()
+    sync.discard_fhir_catalog_candidate.assert_not_awaited()
+    assert source_case.events[-2:] == [("error", caught.value), ("exit",)]
+    assert source_case.probe_events[-2:] == [("rollback", caught.value), "release"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["mixed", "retained-only", "manual-only"])
+async def test_partial_success_and_nonfailed_retained_or_manual_paths_still_prepare(monkeypatch, source_case, mode):
+    _preparation(monkeypatch, source_case)
+    unavailable = disposition(status="unavailable", dataset=None)
+    current_sources = []
+    retained_sources = []
+    if mode == "mixed":
+        current_sources = [source_case.accepted]
+        unavailable = replace(unavailable, dataset_id="failed-edition", reason="catalog_observation_unavailable")
+    elif mode == "retained-only":
+        retained_sources = [source_case.accepted]
+    source_case.export["inventory"].side_effect = lambda: _pages(tuple(current_sources), (unavailable,))
+    previous = snapshot(source_case.config.grant, metadata_approved_revision=5)
+    expected = snapshot(
+        source_case.config.grant,
+        tuple(accepted_source.descriptor for accepted_source in current_sources + retained_sources),
+    )
+    by_generation = {
+        sync.fhir_catalog_source_generation(accepted_source.descriptor): accepted_source
+        for accepted_source in current_sources + retained_sources
+    }
+    sync._catalog_registry_head.return_value = ({}, None, previous)
+    sync._retained_catalog_sources.return_value = retained_sources
+    sync._catalog_snapshot_inputs.return_value = (expected, by_generation)
+    selected, original, accounting = await sync.prepare_fhir_catalog_snapshot(
+        source_case.config, source_case.loader, None, source_case.sealer_pool, source_export=source_case.factory
+    )
+    assert selected is expected and original is previous
+    assert sync._catalog_snapshot_inputs.await_args.args[-1] == current_sources + retained_sources
+    assert accounting["accepted_sources"] == len(current_sources + retained_sources)
+    assert accounting["unavailable_sources"] == 1
+    sync._build_source_catalog_candidate.assert_awaited_once()
+    sync._seal_catalog_snapshot.assert_awaited_once()
+    sync.discard_fhir_catalog_candidate.assert_not_awaited()
+    assert source_case.events == [("enter", read_profile()), ("exit",)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["inventory", "build", "exit"])
 @pytest.mark.parametrize("error", [RuntimeError("source failure"), asyncio.CancelledError("source canceled")])
 async def test_incomplete_or_failed_source_never_seals(monkeypatch, source_case, phase, error):
