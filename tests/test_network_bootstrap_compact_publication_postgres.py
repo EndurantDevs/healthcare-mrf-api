@@ -4,12 +4,14 @@
 import json
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
 
 from api.network_compact_address import compact_address_native_sql
 from db.models import EntityAddressUnified
+from process import network_bootstrap_sources as bootstrap_sources
 from process.network_serving_read import resolve_network_serving_manifest
 from tests.source_witness_capture_postgres_support import capture_retained_source_for_roles
 from tests.test_network_custom_address_source_postgres import (
@@ -122,6 +124,7 @@ async def _assert_compact_generation(context, manifest, bootstrap, retained_netw
 
 
 async def test_legacy_bootstrap_head_upgrades_and_reuses_compact_origin(monkeypatch, record_property):
+    """Preserve exact memberships and pinned readers while reusing immutable bootstrap content."""
     async with _publication_case(monkeypatch) as context, _retained_bootstrap(context, monkeypatch) as bootstrap:
         retained_capture = await capture_retained_source_for_roles(context.case, context.runtime.runtime_roles)
         retained, context.approved, retained_network = await _approved_capture_recipe(
@@ -141,6 +144,8 @@ async def test_legacy_bootstrap_head_upgrades_and_reuses_compact_origin(monkeypa
             "table_name": bootstrap.address_source.table_name,
             "generation_id": bootstrap.generation_sha256,
         }
+        content_scan = AsyncMock(side_effect=AssertionError("Immutable bootstrap reuse must not rehash content"))
+        monkeypatch.setattr(bootstrap_sources, "_content", content_scan)
         replacement = replace(
             initial, compact=True, initial_source_recipes=(), replacement_source_recipes=(retained, context.recipe)
         )
@@ -165,10 +170,12 @@ async def test_legacy_bootstrap_head_upgrades_and_reuses_compact_origin(monkeypa
         third = await _queued_publication(context, replacement, head=second.generation_id)
         assert await _assert_compact_generation(context, third, bootstrap, retained_network, original) == second_rows
         assert third.compact_layout.base == second.compact_layout.base
+        content_scan.assert_not_awaited()
         record_property("component", "legacy_bootstrap_to_compact_ordinary_publication")
         record_property("generations", json.dumps([first.generation_id, second.generation_id, third.generation_id]))
         record_property(
             "memberships", "one retained; two after approved witness introduction; two on same-origin reuse"
         )
         record_property("legacy_pinned_reads", "membership and address results unchanged across publication")
+        record_property("ordinary_bootstrap_content_scans", content_scan.await_count)
         record_property("limits", "local real queue/custody/Source fixture; no deployed import or API timing claim")

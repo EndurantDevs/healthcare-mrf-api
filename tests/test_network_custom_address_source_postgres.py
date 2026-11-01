@@ -2141,7 +2141,8 @@ async def test_bootstrap_access_api_mode_is_metadata_only_and_requires_readonly_
 
 
 @pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
-async def test_bootstrap_access_api_mode_checks_output_actor_dormant_sequence(bootstrap_access_fixture):
+@pytest.mark.parametrize("api_read", [False, True])
+async def test_bootstrap_access_api_mode_checks_output_actor_dormant_sequence(bootstrap_access_fixture, api_read):
     fixture = bootstrap_access_fixture
     connection, receipt = fixture.fixture.connection, fixture.receipt
     await _change_bootstrap_access(fixture)
@@ -2151,13 +2152,30 @@ async def test_bootstrap_access_api_mode_checks_output_actor_dormant_sequence(bo
     assert not await connection.fetchval(
         "SELECT has_table_privilege($1::name,$2::oid,'SELECT')", fixture.stranger, receipt.relation_oids[0][1]
     )
+    if api_read:
+        await connection.execute(
+            f'GRANT "{fixture.fixture.roles["reader"]}" TO "{fixture.stranger}" '
+            "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"
+        )
+        async with (
+            _bootstrap_access_login(fixture.stranger, fixture.password) as caller,
+            caller.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            assert await bootstrap_access.bootstrap_pin_read_roles(caller, receipt.address_source, (), api_read=True)
     await connection.execute(f'GRANT USAGE ON SEQUENCE {sequence} TO "{fixture.stranger}"')
     async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
         async with reader.transaction(isolation="repeatable_read", readonly=True):
             with pytest.raises(NetworkCustomAddressSourceError, match="Retained bootstrap read access differs"):
                 await bootstrap_access.bootstrap_pin_read_roles(
-                    reader, receipt.address_source, (), runtime_actors=(fixture.stranger,), api_read=True
+                    reader, receipt.address_source, (), runtime_actors=(fixture.stranger,), api_read=api_read
                 )
+    if api_read:
+        async with (
+            _bootstrap_access_login(fixture.stranger, fixture.password) as caller,
+            caller.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            with pytest.raises(NetworkCustomAddressSourceError, match="Retained bootstrap read access differs"):
+                await bootstrap_access.bootstrap_pin_read_roles(caller, receipt.address_source, (), api_read=True)
 
 
 async def test_bootstrap_access_revoke_keeps_proof_and_restores_original_acl(bootstrap_access_fixture):

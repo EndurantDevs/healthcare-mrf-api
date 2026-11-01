@@ -1,9 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Genuine restricted bootstrap artifact reads on the existing isolated native fixture."""
 
+import copy
 import json
 from dataclasses import replace
 
+import asyncpg
 import pytest
 
 from process import network_address_artifact as artifact
@@ -62,9 +64,16 @@ async def _verify(fixture, connection, descriptor, *, api_read=True):
 
 
 @pytest.mark.parametrize("bootstrap_access_fixture", ["constant", "serial"], indirect=True)
-async def test_genuine_bootstrap_artifact_full_capture_and_metadata_only_reader(bootstrap_access_fixture, monkeypatch):
+async def test_genuine_bootstrap_artifact_reuses_closed_content_for_worker_and_api(
+    bootstrap_access_fixture, monkeypatch
+):
     fixture, receipt = bootstrap_access_fixture, bootstrap_access_fixture.receipt
     await _change_bootstrap_access(fixture)
+
+    async def no_content_scan(*_):
+        pytest.fail("Immutable bootstrap artifact reuse must not rescan either heap")
+
+    monkeypatch.setattr(bootstrap, "_content", no_content_scan)
     async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
         assert not await reader.fetchval(
             "SELECT has_table_privilege($1,$2::oid,'SELECT')", fixture.stranger, dict(receipt.relation_oids)["npi"]
@@ -81,10 +90,6 @@ async def test_genuine_bootstrap_artifact_full_capture_and_metadata_only_reader(
         assert descriptor["dependency_oids"] == sorted(expected_oids)
         assert await _verify(fixture, reader, descriptor, api_read=False)
 
-        async def no_content_scan(*_):
-            pytest.fail("API verification must not scan either bootstrap heap")
-
-        monkeypatch.setattr(bootstrap, "_content", no_content_scan)
         observed = _ObservedConnection(reader)
         resolved = await _verify(fixture, observed, descriptor)
         assert resolved.table_oid == dict(receipt.relation_oids)["entity_address_unified"]
@@ -92,6 +97,78 @@ async def test_genuine_bootstrap_artifact_full_capture_and_metadata_only_reader(
             statement.lstrip().upper().startswith(("SELECT", "WITH", "SHOW")) for statement in observed.statements
         )
         assert not any("LOCK TABLE" in statement or "pg_try_advisory" in statement for statement in observed.statements)
+
+
+@pytest.mark.parametrize("changed", ["receipt", "filenode", "native"])
+async def test_rehashed_descriptor_requires_current_protected_evidence(bootstrap_access_fixture, changed):
+    fixture = bootstrap_access_fixture
+    await _change_bootstrap_access(fixture)
+    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
+        descriptor = copy.deepcopy(await _capture(fixture, reader))
+        if changed == "receipt":
+            receipt = replace(fixture.receipt, capture_snapshot="forged")
+            receipt = replace(receipt, generation_sha256=bootstrap._generation(receipt))
+            descriptor["bootstrap_receipt"] = json.loads(artifact._json(receipt.as_dict()))
+            descriptor["generation_id"] = receipt.generation_sha256
+        elif changed == "filenode":
+            descriptor["heaps"]["npi"]["relfilenode"] += 1
+        else:
+            descriptor["native_sha256"] = "f" * 64
+        descriptor["descriptor_sha256"] = artifact._digest(
+            {key: value for key, value in descriptor.items() if key != "descriptor_sha256"}
+        )
+        assert bootstrap_artifact._descriptor(descriptor) == descriptor
+        with pytest.raises(ValueError, match="[Bb]ootstrap"):
+            await _verify(fixture, reader, descriptor, api_read=False)
+
+
+@pytest.mark.parametrize("drift", ["acl", "native", "receipt"])
+async def test_worker_reuse_refuses_changed_native_custody(bootstrap_access_fixture, drift):
+    fixture = bootstrap_access_fixture
+    await _change_bootstrap_access(fixture)
+    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
+        descriptor = await _capture(fixture, reader)
+    connection = fixture.fixture.connection
+    namespace = '"' + fixture.receipt.address_source.schema_name + '"'
+    transaction = connection.transaction(isolation="repeatable_read")
+    await transaction.start()
+    try:
+        if drift == "acl":
+            await connection.execute(f'GRANT UPDATE ON {namespace}.npi TO "{fixture.reader}"')
+        elif drift == "native":
+            await connection.execute(f"ALTER TABLE {namespace}.npi ADD COLUMN unexpected integer")
+        else:
+            await connection.execute(f"COMMENT ON SCHEMA {namespace} IS NULL")
+        await connection.execute(f'SET LOCAL ROLE "{fixture.reader}"')
+        with pytest.raises(ValueError, match="[Bb]ootstrap"):
+            await _capture(fixture, connection)
+        with pytest.raises(ValueError, match="[Bb]ootstrap"):
+            await _verify(fixture, connection, descriptor, api_read=False)
+    finally:
+        await transaction.rollback()
+
+
+async def test_worker_reuse_keeps_both_heap_locks_until_transaction_end(bootstrap_access_fixture):
+    fixture = bootstrap_access_fixture
+    await _change_bootstrap_access(fixture)
+    namespace = '"' + fixture.receipt.address_source.schema_name + '"'
+    tables = f"{namespace}.entity_address_unified,{namespace}.npi"
+    administrator = fixture.fixture.connection
+    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
+        async with reader.transaction(isolation="repeatable_read"):
+            descriptor = await _capture(fixture, reader)
+            assert await _verify(fixture, reader, descriptor, api_read=False)
+            locked = await reader.fetch(
+                "SELECT relation::bigint FROM pg_locks WHERE pid=pg_backend_pid() AND mode='AccessShareLock' "
+                "AND granted AND relation=ANY($1::oid[]) ORDER BY relation",
+                [oid for _, oid in fixture.receipt.relation_oids],
+            )
+            assert {row["relation"] for row in locked} == {oid for _, oid in fixture.receipt.relation_oids}
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                async with administrator.transaction():
+                    await administrator.execute(f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE NOWAIT")
+        async with administrator.transaction():
+            await administrator.execute(f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE NOWAIT")
 
 
 async def test_access_proof_renewal_preserves_existing_bootstrap_descriptor(bootstrap_access_fixture):
@@ -113,7 +190,7 @@ async def test_full_verification_rejects_changed_content_in_either_heap(bootstra
     fixture = bootstrap_access_fixture
     await _change_bootstrap_access(fixture)
     async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
-        descriptor = await _capture(fixture, reader)
+        await _capture(fixture, reader)
         qualified = f'"{fixture.receipt.address_source.schema_name}"."{heap}"'
         field = "first_line" if heap == "entity_address_unified" else "provider_first_name"
         transaction = fixture.fixture.connection.transaction(isolation="repeatable_read")
@@ -123,9 +200,7 @@ async def test_full_verification_rejects_changed_content_in_either_heap(bootstra
             # The separate login sees committed state, so verify the changed copy as the reader in this transaction.
             await fixture.fixture.connection.execute(f'SET LOCAL ROLE "{fixture.reader}"')
             with pytest.raises(bootstrap.NetworkBootstrapSourceError, match="content or shape"):
-                await artifact.verify_network_address_artifact(
-                    fixture.fixture.connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
-                )
+                await bootstrap.verify_network_bootstrap_sources(fixture.fixture.connection, fixture.receipt)
         finally:
             await transaction.rollback()
 
