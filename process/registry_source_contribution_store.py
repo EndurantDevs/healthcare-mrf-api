@@ -13,7 +13,11 @@ from process.network_approved_source_bindings import (
     APPROVED_NETWORK_BINDINGS_SQL,
     require_approved_network_source_bindings,
 )
-from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_physical_source
+from process.network_fhir_membership_source import (
+    PinnedFHIRMembershipSource,
+    fhir_normalized_capture,
+    fhir_physical_source,
+)
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_source_recipe_store import canonical_registry_source_recipes, verify_registry_source_recipes
@@ -86,7 +90,7 @@ def fhir_fact_transform(source_pin):
     """Keep old CMS identities fixed; generic permanent omissions have their own transform."""
     return (
         GENERIC_TRANSFORM_VERSION
-        if fhir_physical_source(source_pin).retained_capture is not None
+        if fhir_normalized_capture(fhir_physical_source(source_pin)) is not None
         else TRANSFORM_VERSION
     )
 
@@ -419,7 +423,7 @@ def _validate_fhir_fact(fact, source_pin):
     edge_fields = _FACT_FIELDS - {"resource_type", "resource_id", "payload_sha256", "omission_reason"}
     if fact["omission_reason"] is not None:
         allowed_reasons = {"inactive", "expired", "future"}
-        if fhir_physical_source(source_pin).retained_capture is not None:
+        if fhir_normalized_capture(fhir_physical_source(source_pin)) is not None:
             allowed_reasons.add(GENERIC_UNVERIFIED_NETWORK)
         if fact["omission_reason"] not in allowed_reasons or any(fact[field] is not None for field in edge_fields):
             raise ValueError
@@ -446,7 +450,7 @@ def _validate_fhir_fact(fact, source_pin):
 
 def _validate_fhir_scope(fact, source_pin):
     """Retain exact native-capture scope without manufacturing legacy identity."""
-    capture = source_pin.retained_capture
+    capture = fhir_normalized_capture(source_pin)
     if capture is not None:
         scope = fact["source_scope_json"]
         if (
@@ -1000,10 +1004,11 @@ def _validate_witness_scope_v2(fact, source_pin):
         raise ValueError
     if type(scope) is not dict or scope.get("organization_id") != key:
         raise ValueError
-    if fhir_physical_source(source_pin).retained_capture is not None:
+    capture = fhir_normalized_capture(source_pin)
+    if fhir_normalized_capture(fhir_physical_source(source_pin)) is not None:
         if scope != {
             "organization_id": key,
-            "capture_sha256": source_pin.retained_capture.capture_sha256,
+            "capture_sha256": capture.capture_sha256,
         }:
             raise ValueError
     elif (
@@ -1281,7 +1286,7 @@ async def map_fhir_source_witnesses_v2(
         approved.approved_revision,
         *recipe.binding_coordinates.sql_parameters,
         identity,
-        fhir_physical_source(recipe.source_pin).retained_capture is not None,
+        fhir_normalized_capture(fhir_physical_source(recipe.source_pin)) is not None,
         _canonical(fhir_source_witness_binding_v2(recipe.source_pin)),
     )
     if accounting["invalid"]:

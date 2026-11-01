@@ -300,7 +300,8 @@ fn fhir_scope(raw: &str, input: &BindingInput) -> Option<serde_json::Value> {
         }
         return serde_json::to_value(scope).ok();
     }
-    if input.producer_id == "registry-retained-normalized-fhir-v1"
+    let source_witness = input.producer_id == "registry-source-fhir-witness-v1";
+    if (input.producer_id == "registry-retained-normalized-fhir-v1" || source_witness)
         && input.source_id != "cms-npd"
         && let Ok(scope) = serde_json::from_str::<RetainedFhirScope>(raw)
     {
@@ -310,10 +311,15 @@ fn fhir_scope(raw: &str, input: &BindingInput) -> Option<serde_json::Value> {
                 .capture_sha256
                 .bytes()
                 .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || source_witness
+                && (scope.organization_id != input.source_key || !canonical_uuid(&input.edition_id))
         {
             return None;
         }
         return serde_json::to_value(scope).ok();
+    }
+    if source_witness {
+        return None;
     }
     let scope: FhirScope = serde_json::from_str(raw).ok()?;
     if !valid_fhir_id(&scope.organization_id)

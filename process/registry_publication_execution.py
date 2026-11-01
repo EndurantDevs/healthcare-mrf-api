@@ -484,21 +484,40 @@ async def source_worker_address_sources(connection, source_pin, control_schema):
 
 
 async def prepare_registry_publication_candidate(
-    connection, copy_target, address_source, *, writer_roles, control_schema, composition_runtime=None
+    connection,
+    copy_target,
+    address_source,
+    *,
+    writer_roles,
+    control_schema,
+    composition_runtime=None,
+    source_witness_runtime=None,
 ):
     """Use the genuine source session when compact carriers need native office proof."""
     if composition_runtime is not None:
         if type(composition_runtime) is not RegistryPublicationPTGRuntime:
             raise ValueError("registry_publication_ptg_runtime_invalid")
         return await composition_runtime.prepare(
-            connection, copy_target, address_source, writer_roles=writer_roles, control_schema=control_schema
+            connection,
+            copy_target,
+            address_source,
+            writer_roles=writer_roles,
+            control_schema=control_schema,
+            **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
         )
     return await prepare_network_candidate(
-        connection, copy_target, address_source, **writer_roles, control_schema=control_schema
+        connection,
+        copy_target,
+        address_source,
+        **writer_roles,
+        control_schema=control_schema,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     )
 
 
-async def prepare_registry_candidate_for_context(connection, copy_target, address_source, writer_context):
+async def prepare_registry_candidate_for_context(
+    connection, copy_target, address_source, writer_context, *, source_witness_runtime=None
+):
     """Prepare from the caller's fixed writer roles and native source runtime."""
     return await prepare_registry_publication_candidate(
         connection,
@@ -507,6 +526,7 @@ async def prepare_registry_candidate_for_context(connection, copy_target, addres
         writer_roles=writer_context.writer_roles,
         control_schema=writer_context.control_schema,
         composition_runtime=writer_context.composition_runtime,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     )
 
 
@@ -607,6 +627,11 @@ async def _prepare_rollback_candidate(
         writer_roles=writer_roles,
         control_schema=control_schema,
         composition_runtime=composition_runtime,
+        **(
+            {"source_witness_runtime": address_sources.source_witness_runtime}
+            if getattr(address_sources, "source_witness_runtime", None) is not None
+            else {}
+        ),
     )
     return copy_target, source_pin, current_pin
 
@@ -985,7 +1010,17 @@ async def complete_queued_registry_initial_inventory(
         writer_roles=writer_context.writer_roles,
         control_schema=control_schema,
     )
-    await prepare_registry_candidate_for_context(connection, copy_target, address_source, writer_context)
+    await prepare_registry_candidate_for_context(
+        connection,
+        copy_target,
+        address_source,
+        writer_context,
+        **(
+            {"source_witness_runtime": initial_address_sources.source_witness_runtime}
+            if getattr(initial_address_sources, "source_witness_runtime", None) is not None
+            else {}
+        ),
+    )
     await _fresh_operation_authority(authorize, request_record, "publish_initial_inventory")
     await _initial_candidate_custody_enrollment(connection, copy_target, writer_context)
     await writer_context.seal_candidate(copy_target, pre_enrolled_only=True)
@@ -1120,21 +1155,16 @@ def _require_candidate_approval(candidate_scope, approval_by_name, command_by_na
 
 
 async def complete_queued_registry_publication(
-    connection,
-    request_id,
-    lease_id,
-    copy_target,
-    address_source,
-    *,
-    authorize,
-    writer_context,
-    seal_candidate=None,
+    connection, request_id, lease_id, copy_target, address_source, *, authorize, writer_context, **source_options
 ):
     """Prepare, reauthorize, then commit the manifest and exact success receipt together.
 
     Lease expiry, revocation or a changed head preserves a closed candidate and
     the serving manifest. The controller uses a separate connection to renew.
     """
+    if set(source_options) - {"source_witness_runtime", "seal_candidate"}:
+        raise ValueError("registry_source_runtime_options_invalid")
+    seal_candidate = source_options.pop("seal_candidate", None)
     from process.registry_publication_consumer import RegistryPublicationConsumerConfig
 
     if type(writer_context) is not RegistryPublicationConsumerConfig:
@@ -1143,7 +1173,9 @@ async def complete_queued_registry_publication(
     _require_outside_transaction(connection)
     namespace = _namespace(control_schema)
     await _request(connection, request_id, lease_id, namespace)
-    await prepare_registry_candidate_for_context(connection, copy_target, address_source, writer_context)
+    await prepare_registry_candidate_for_context(
+        connection, copy_target, address_source, writer_context, **source_options
+    )
     request_record = await _request(connection, request_id, lease_id, namespace)
     await _fresh_authority(authorize, request_record)
     if seal_candidate is not None:

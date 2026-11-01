@@ -14,7 +14,11 @@ from uuid import UUID, uuid4
 
 from process.network_address_projection import _identifier
 from process.network_custom_address_source import _artifact_dependency_identity, _require_transaction
-from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_source_witness_binding_v2
+from process.network_fhir_membership_source import (
+    PinnedFHIRMembershipSource,
+    fhir_normalized_capture,
+    fhir_source_witness_binding_v2,
+)
 from process.network_initial_cms_office_bindings import (
     InitialCMSOfficeBindingError,
     _digest,
@@ -46,12 +50,22 @@ class WitnessOfficeSource:
     table_name: str
 
 
+@dataclass(frozen=True)
+class _WitnessOfficeContext:
+    """Unserialized operation inputs; the Source runtime is not supplied by a recipe or receipt."""
+
+    approved: object
+    control_schema: str
+    recipes_sha256: str
+    source_witness_runtime: object = None
+
+
 def _descriptor(witness_source):
     _identifier(witness_source.table_name)
     recipe, descriptor = witness_source.recipe, validate_source_witness_descriptor_v2(witness_source.descriptor)
     if (
         type(recipe.source_pin) is not PinnedFHIRMembershipSource
-        or recipe.source_pin.retained_capture is None
+        or fhir_normalized_capture(recipe.source_pin) is None
         or (descriptor["recipe_sha256"], descriptor["capture_sha256"]) != verified_office_fact_identity(recipe)
     ):
         raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
@@ -279,9 +293,32 @@ async def _prepare_witness_office_mapping(
     control_schema,
     recipes_sha256,
 ):
-    """The owned savepoint rolls back appended members and random stages on every failure."""
+    """Preserve the legacy policy inputs while sharing the common office mapping body."""
+    return await _map_witness_offices(
+        connection,
+        address_source,
+        runtime_roles,
+        witness_sources,
+        source_table,
+        _WitnessOfficeContext(approved, control_schema, recipes_sha256),
+    )
+
+
+async def _prepare_source_witness_mapping(
+    connection, address_source, runtime_roles, witness_sources, source_table, context
+):
+    """Keep trusted Source runtime explicit while sharing the original office savepoint and policy."""
+    await _require_transaction(connection)
+    async with connection.transaction():
+        return await _map_witness_offices(
+            connection, address_source, runtime_roles, witness_sources, source_table, context
+        )
+
+
+async def _map_witness_offices(connection, address_source, runtime_roles, witness_sources, source_table, options):
     from process.registry_source_recipe_composition import _require_recipe_custody
 
+    approved, control_schema, recipes_sha256 = options.approved, options.control_schema, options.recipes_sha256
     await _require_transaction(connection)
     context, identity = await _policy_context(connection, address_source, runtime_roles, approved, control_schema)
     input_name, result_name = "witness_office_inputs_" + uuid4().hex, "witness_office_matches_" + uuid4().hex
@@ -294,7 +331,16 @@ async def _prepare_witness_office_mapping(
         descriptor = _descriptor(witness_source)
         if descriptor["recipe_sha256"] in keys_by_recipe:
             raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
-        read = await _require_recipe_custody(connection, witness_source.recipe, approved, control_schema)
+        if witness_source.recipe.source_pin.source_witness_capture is not None:
+            read = await _require_recipe_custody(
+                connection,
+                witness_source.recipe,
+                approved,
+                control_schema,
+                source_witness_runtime=options.source_witness_runtime,
+            )
+        else:
+            read = await _require_recipe_custody(connection, witness_source.recipe, approved, control_schema)
         keys_by_recipe[descriptor["recipe_sha256"]] = await _stage_source_members(
             connection, witness_source, read, input_name, source_table, proofs
         )

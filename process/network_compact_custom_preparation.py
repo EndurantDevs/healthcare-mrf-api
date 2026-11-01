@@ -90,9 +90,10 @@ async def _merge_bindings(connection, receipt):
 
 
 async def prepare_compact_custom_contribution(
-    connection, copy_target, candidate, base, *, runtime_roles, control_schema, office_authority=None
+    connection, copy_target, candidate, base, *, runtime_roles, control_schema, office_authority=None, **source_options
 ):
     """Prepare current direct rows once; verify final merged bindings on every resume."""
+    _require(set(source_options) <= {"source_witness_runtime"})
     await verify_compact_custom_approval(connection, candidate, control_schema)
     receipt = compact_custom_receipt(candidate)
     if receipt is None:
@@ -122,6 +123,7 @@ async def prepare_compact_custom_contribution(
                 runtime_roles=runtime_roles,
                 control_schema=control_schema,
                 office_authority=office_authority,
+                **source_options,
             )
         await connection.execute(
             f"UPDATE {_identifier(control_schema)}.network_membership_candidate "
@@ -144,6 +146,7 @@ async def prepare_compact_custom_contribution(
         runtime_roles=runtime_roles,
         control_schema=control_schema,
         office_authority=office_authority,
+        **source_options,
     )
     return CompactOfficeSources(base, custom, carriers=compact_carrier_receipt(candidate))
 
@@ -165,7 +168,7 @@ async def _complete_binding_domain(connection, receipt, carrier):
 
 
 async def verify_compact_custom_contribution(
-    connection, candidate, *, runtime_roles, control_schema, office_authority=None
+    connection, candidate, *, runtime_roles, control_schema, office_authority=None, source_witness_runtime=None
 ):
     """Verify the entire direct-plus-carrier heap and canonical binding domain."""
     receipt = compact_custom_receipt(candidate)
@@ -185,6 +188,7 @@ async def verify_compact_custom_contribution(
         runtime_roles=runtime_roles,
         control_schema=control_schema,
         office_authority=office_authority,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     ) as projection:
         custom = await verify_compact_custom_offices(
             connection,

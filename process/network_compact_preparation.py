@@ -50,9 +50,11 @@ def _require_address_origin(candidate, artifact):
 
 
 async def prepare_compact_network_readiness(
-    connection, copy_target, address_source, *, runtime_roles, control_schema, office_authority=None
+    connection, copy_target, address_source, *, runtime_roles, control_schema, office_authority=None, **source_options
 ):
     """The caller closes raw writers, owns the transaction and freezes final storage."""
+    if set(source_options) - {"source_witness_runtime"}:
+        raise ValueError("registry_source_runtime_options_invalid")
     from process.network_compact_address_origin import resolve_compact_address_origin
 
     candidate = await _locked_candidate(connection, copy_target, _identifier(control_schema))
@@ -60,14 +62,11 @@ async def prepare_compact_network_readiness(
         connection, candidate, address_source, runtime_roles=runtime_roles, control_schema=control_schema
     )
     _require_address_origin(candidate, artifact)
+    office_options_by_name = dict(
+        runtime_roles=runtime_roles, control_schema=control_schema, office_authority=office_authority, **source_options
+    )
     offices = await prepare_compact_custom_contribution(
-        connection,
-        copy_target,
-        candidate,
-        address_source,
-        runtime_roles=runtime_roles,
-        control_schema=control_schema,
-        office_authority=office_authority,
+        connection, copy_target, candidate, address_source, **office_options_by_name
     )
     offices = replace(offices, physical_base=physical)
     candidate = await _locked_candidate(connection, copy_target, _identifier(control_schema))

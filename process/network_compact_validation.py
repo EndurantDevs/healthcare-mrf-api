@@ -26,14 +26,23 @@ def _actual_memberships(layout):
     )
 
 
-async def verify_compact_final_proof(connection, copy_target, candidate, *, control_schema, office_authority=None):
+async def verify_compact_final_proof(
+    connection, copy_target, candidate, *, control_schema, office_authority=None, source_witness_runtime=None
+):
     """Recheck original address authority and full membership parity before sealing."""
     report = _json_object(candidate["validation_json"])
     address_source = PinnedAddressSource(**report["address_source"])
     scope = _scope_report(candidate, address_source)
     _, serving = compact_readiness(candidate, report, scope)
     layout = await capture_compact_dependencies(connection, candidate, control_schema=control_schema)
-    await _verify_custom_contribution(connection, candidate, layout, control_schema, office_authority)
+    await _verify_custom_contribution(
+        connection,
+        candidate,
+        layout,
+        control_schema,
+        office_authority,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
+    )
     await verify_compact_slice_contents(connection, copy_target, layout)
     namespace = _identifier(copy_target.schema_name)
     from process.network_compact_custom_preparation import compact_carrier_receipt
@@ -76,7 +85,9 @@ async def verify_compact_final_proof(connection, copy_target, candidate, *, cont
     _require(mismatch is False)
 
 
-async def _verify_custom_contribution(connection, candidate, layout, control_schema, office_authority):
+async def _verify_custom_contribution(
+    connection, candidate, layout, control_schema, office_authority, *, source_witness_runtime=None
+):
     from process.network_compact_custom_preparation import (
         compact_custom_receipt,
         verify_compact_custom_approval,
@@ -92,5 +103,6 @@ async def _verify_custom_contribution(connection, candidate, layout, control_sch
             runtime_roles=receipt.runtime_roles,
             control_schema=control_schema,
             office_authority=office_authority,
+            **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
         )
         _require(custom == layout.custom)

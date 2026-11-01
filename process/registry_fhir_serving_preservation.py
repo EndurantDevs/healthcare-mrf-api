@@ -304,12 +304,20 @@ async def append_fhir_preservation_memberships(connection, stage, preservation):
     )
 
 
-async def _coverage(connection, recipes, approved, control_schema, side, inventory, coverage):
+async def _coverage(
+    connection, recipes, approved, control_schema, side, inventory, coverage, *, source_witness_runtime=None
+):
     """Authenticate complete native families before any membership eligibility filter."""
     for recipe in recipes:
         if type(recipe.source_pin) is not PinnedFHIRMembershipSource:
             continue
-        await require_registry_source_recipe_custody(connection, recipe, approved, control_schema)
+        await require_registry_source_recipe_custody(
+            connection,
+            recipe,
+            approved,
+            control_schema,
+            **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
+        )
         await require_retained_approved_network_source_bindings(
             connection, approved, recipe.binding_coordinates, control_schema=control_schema
         )
@@ -456,9 +464,11 @@ def _legacy_predecessor_pins(manifest):
 
 
 async def _identity_stages(
-    connection, previous, recipes, old_approved, current_approved, approved_revision, control_schema
+    connection, previous, recipes, old_approved, current_approved, approved_revision, control_schema, **source_options
 ):
     """Stage complete authenticated Organization families and both reviewed subject maps."""
+    if set(source_options) - {"source_witness_runtime"}:
+        _fail("source_runtime_invalid")
     identity = uuid4().hex
     names = [
         "fhir_preserve_" + kind + "_" + identity
@@ -477,8 +487,12 @@ async def _identity_stages(
     )
     for relation in (current_subjects, reviewed_subjects):
         await connection.execute(f"CREATE TEMP TABLE {relation}(LIKE {subjects}) ON COMMIT DROP")
-    await _coverage(connection, previous, old_approved, control_schema, "previous", inventory, coverage)
-    await _coverage(connection, recipes, current_approved, control_schema, "current", inventory, coverage)
+    await _coverage(
+        connection, previous, old_approved, control_schema, "previous", inventory, coverage, **source_options
+    )
+    await _coverage(
+        connection, recipes, current_approved, control_schema, "current", inventory, coverage, **source_options
+    )
     await _subjects(
         connection,
         inventory,
@@ -667,17 +681,12 @@ def _carry_receipt(predecessor, previous, recipes, provenance, counters_by_name,
 
 
 async def prepare_fhir_serving_preservation(
-    connection,
-    predecessor,
-    recipes,
-    *,
-    request_id,
-    expected_head,
-    approved_revision,
-    control_schema,
-    inventory=False,
+    connection, predecessor, recipes, *, request_id, expected_head, approved_revision, control_schema, **source_options
 ):
     """Derive exact whole-network carry under the caller's repeatable-read snapshot."""
+    if set(source_options) - {"source_witness_runtime", "inventory"}:
+        _fail("source_runtime_invalid")
+    inventory = source_options.pop("inventory", False)
     if not connection.is_in_transaction() or await connection.fetchval("SHOW transaction_isolation") not in {
         "repeatable read",
         "serializable",
@@ -699,7 +708,14 @@ async def prepare_fhir_serving_preservation(
     previous, old_approved, current_approved, old_receipt, operation_sha256 = baseline
     async with connection.transaction():
         relations = await _identity_stages(
-            connection, previous, recipes, old_approved, current_approved, approved_revision, control_schema
+            connection,
+            previous,
+            recipes,
+            old_approved,
+            current_approved,
+            approved_revision,
+            control_schema,
+            **source_options,
         )
         previous_selection = await _previous_selection(connection, predecessor, relations, old_receipt)
         address_relation, address_arguments = await _predecessor_addresses(connection, predecessor)
@@ -1026,7 +1042,9 @@ async def _current_raw_parity(connection, candidate, preservation, current_stage
         _fail("membership_parity")
 
 
-async def _verify_current_fhir_rows(connection, candidate, preservation, recipes, approved, control_schema):
+async def _verify_current_fhir_rows(
+    connection, candidate, preservation, recipes, approved, control_schema, *, source_witness_runtime=None
+):
     """Replay all current FHIR inputs without acquiring unrelated graph authority."""
     from process.registry_source_recipe_composition import stage_registry_source_recipes
 
@@ -1040,7 +1058,9 @@ async def _verify_current_fhir_rows(connection, candidate, preservation, recipes
         approved,
         request_id=uuid4(),
         control_schema=control_schema,
-        read_context=SourceRecipeReadContext(verified_office_inputs=office_inputs),
+        read_context=SourceRecipeReadContext(
+            verified_office_inputs=office_inputs, source_witness_runtime=source_witness_runtime
+        ),
     )
     primary = None
     try:
@@ -1161,7 +1181,14 @@ async def _verify_current_overlay(connection, copy_target, candidate, approved, 
 
 
 async def rederive_fhir_serving_preservation(
-    connection, copy_target, candidate, *, control_schema, inventory_entries=None, reviewed_source_manifest=None
+    connection,
+    copy_target,
+    candidate,
+    *,
+    control_schema,
+    inventory_entries=None,
+    reviewed_source_manifest=None,
+    source_witness_runtime=None,
 ):
     """Reconstruct phase-local carry selection; target rows are checked separately after materialization."""
     if any(
@@ -1195,6 +1222,7 @@ async def rederive_fhir_serving_preservation(
         approved_revision=candidate["approved_custom_revision"],
         control_schema=control_schema,
         inventory=stored["revision"] == 2,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     )
     if preservation is None or preservation.receipt != stored:
         error = FHIRServingPreservationError("registry_fhir_serving_preservation_selection_changed")
@@ -1254,8 +1282,11 @@ async def verify_fhir_preservation_rows(
     office_authority=None,
     inventory_entries=None,
     reviewed_source_manifest=None,
+    **source_options,
 ):
     """Rebuild current inventory once, keeping current proofs and carried target rows separate."""
+    if set(source_options) - {"source_witness_runtime"}:
+        _fail("source_runtime_invalid")
     from process.network_approved_membership_source import pin_approved_membership_source
     from process.network_source_contribution_custody import verify_independent_source_contributions
 
@@ -1266,6 +1297,7 @@ async def verify_fhir_preservation_rows(
         control_schema=control_schema,
         inventory_entries=inventory_entries,
         reviewed_source_manifest=reviewed_source_manifest,
+        **source_options,
     )
     if preservation is None:
         return None
@@ -1284,12 +1316,15 @@ async def verify_fhir_preservation_rows(
                 office_authority=office_authority,
                 inventory_entries=entries,
                 preservation=preservation,
+                **source_options,
             )
         else:
             approved = await pin_approved_membership_source(
                 connection, approved_revision=candidate["approved_custom_revision"], control_schema=control_schema
             )
-            await _verify_current_fhir_rows(connection, candidate, preservation, recipes, approved, control_schema)
+            await _verify_current_fhir_rows(
+                connection, candidate, preservation, recipes, approved, control_schema, **source_options
+            )
             await _verify_current_overlay(connection, copy_target, candidate, approved, control_schema)
         return preservation.receipt
     except BaseException as error:

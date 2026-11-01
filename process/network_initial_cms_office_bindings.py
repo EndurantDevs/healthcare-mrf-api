@@ -18,6 +18,7 @@ from process.network_fhir_membership_source import (
     FHIRMembershipBatch,
     PinnedFHIRMembershipSource,
     RetainedFHIRSuccessorReads,
+    fhir_normalized_capture,
     fhir_physical_source,
     read_fhir_membership_batch,
     read_retained_fhir_membership_batch,
@@ -92,11 +93,20 @@ async def _verify_batch(connection, batch, after_resource, control_schema, retai
 
 
 async def _verify_retained_office_read(connection, source_pin, retained_read):
-    """Verify both admission anchors before reading a successor's actual Location payloads."""
+    """Verify the native Source or Reader capability before reading actual Location payloads."""
     from process.network_fhir_retained_capture import RetainedFHIRRead
 
-    if type(source_pin) is not PinnedFHIRMembershipSource or source_pin.retained_capture is None:
+    if type(source_pin) is not PinnedFHIRMembershipSource or fhir_normalized_capture(source_pin) is None:
         raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
+    if source_pin.source_witness_capture is not None:
+        from process.network_fhir_source_witness_capture import SourceWitnessRead
+        from process.network_fhir_source_witness_contract import require_capture_anchor
+
+        if type(retained_read) is not SourceWitnessRead or source_pin.retained_successor is not None:
+            raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
+        require_capture_anchor(source_pin.source_witness_capture, source_pin.source_witness_anchor)
+        await retained_read.verify(connection, source_pin.source_witness_capture)
+        return
     physical = fhir_physical_source(source_pin)
     if physical is source_pin:
         if type(retained_read) is not RetainedFHIRRead:
