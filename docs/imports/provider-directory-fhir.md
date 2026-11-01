@@ -45,7 +45,7 @@ unbound standalone invocation. A worker launcher must select the actual
 `process.ProviderDirectoryFHIR` settings and keep the same factory context across
 its complete lifecycle, without holding one physical transaction across jobs.
 
-Ordinary API and scheduled launches require a native stored-job admission for
+Resource-acquisition API and scheduled launches require a native stored-job admission for
 the exact Provider Directory importer, queue, function and enqueue ID. That
 server-held capability selects the fixed Source worker purpose and immutable
 paired image; serialized request fields cannot select its credentials or
@@ -75,6 +75,21 @@ Publisher secret selectors must name only that exact purpose,
 importer and worker class. Missing image configuration or an existing worker
 with changed purpose, target or process isolation is refused. The separately
 signed CMS Registry launch retains precedence and its own admission boundary.
+
+Non-CMS global Profile follow-ups use the ordinary worker command after the
+stored job and existing signed capacity lease are verified. Their complete
+execution parameters must match the authenticated preflight request. Set the
+optional `HLTHPRT_PROVIDER_DIRECTORY_PROFILE_WORKER_IMAGE` to an immutable
+normal-worker image with the matching Profile registry and schema/strategy
+versions. An unset or blank value uses `HLTHPRT_WORKER_JOB_IMAGE`. Job creation
+and reuse use the same selector; Source-purpose credentials remain excluded.
+An exact active Job may be reused after the capacity observation ages, while
+current signature/trust and the build deadline remain valid. A new or replacement
+Job still requires a fresh observation. The ordinary worker checks registered
+selection and runtime capacity. An explicitly dated non-CMS selection uses
+the existing v2 proof with both CMS fields null; the date is part of its identity.
+When a populated legacy target has no recorded snapshot date, use the existing
+guarded initial full swap rather than inferring a date or adopting that target.
 
 An issued isolated-storage manifest keeps ordinary REST acquisition in private
 tables. The existing worker closes candidate writes, validates the complete

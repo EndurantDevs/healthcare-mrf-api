@@ -64,6 +64,8 @@ class _AdmittedWorkerRequest(dict[str, Any]):
     aca_source_launch: object | None = None
     fhir_source_launch: object | None = None
     ordinary_fhir_overlay_job: tuple[str, str, str, str, str] | None = None
+    ordinary_fhir_profile_job: tuple[str, str, str, str, str] | None = None
+    ordinary_fhir_profile_lease: object | None = None
     npi_source_launch: object | None = None
     pricing_control_admission: object | None = None
 
@@ -316,15 +318,19 @@ async def _admit_source_worker_launches(worker_payload, admitted_run):
             return _failed_worker_admission(worker_payload, "CMS registry worker admission is unavailable")
         if worker_payload.cms_registry_launch is None:
             try:
-                worker_payload.fhir_source_launch = provider_directory_source_worker.admit_fhir_source_worker_launch(
-                    admitted_run
+                worker_payload.ordinary_fhir_profile_job = provider_directory_source_worker.admit_ordinary_profile_job(
+                    admitted_run, worker_payload
                 )
-                worker_payload.ordinary_fhir_overlay_job = (
-                    worker_payload.admitted_job
-                    if admitted_run.get("importer") == "provider-directory-fhir"
-                    and worker_payload.fhir_source_launch is None
-                    else None
-                )
+                if worker_payload.ordinary_fhir_profile_job is None:
+                    worker_payload.fhir_source_launch = (
+                        provider_directory_source_worker.admit_fhir_source_worker_launch(admitted_run)
+                    )
+                    worker_payload.ordinary_fhir_overlay_job = (
+                        worker_payload.admitted_job
+                        if admitted_run.get("importer") == "provider-directory-fhir"
+                        and worker_payload.fhir_source_launch is None
+                        else None
+                    )
             except ValueError, RuntimeError:
                 return _failed_worker_admission(worker_payload, "FHIR source worker admission is unavailable")
         try:
@@ -670,7 +676,7 @@ def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, 
     aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
     cms_launch = authorized_cms_registry_worker_launch(spec, launch_request)
     fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
-    overlay_job_id = provider_directory_source_worker.admitted_overlay_job(spec, launch_request)
+    ordinary_job_id = provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_request)
     npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
     if spec.worker_class == "process.NPI" and npi_launch is None:
         return {"status": "failed", "message": "NPI source worker requires exact admitted job"}
@@ -678,7 +684,7 @@ def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, 
         spec.worker_class == "process.ProviderDirectoryFHIR"
         and cms_launch is None
         and fhir_launch is None
-        and overlay_job_id is None
+        and ordinary_job_id is None
     ):
         return {"status": "failed", "message": "FHIR source worker requires exact admitted job"}
     if spec.worker_class == "process.RegistryACASource" and aca_launch is None:
@@ -688,7 +694,7 @@ def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, 
     if (
         cms_launch is not None
         or fhir_launch is not None
-        or overlay_job_id is not None
+        or ordinary_job_id is not None
         or npi_launch is not None
         or reference_launch is not None
         or aca_launch is not None
@@ -787,9 +793,18 @@ def _launcher_mode() -> str:
     return os.getenv("HLTHPRT_WORKER_LAUNCHER", "process").strip().lower()
 
 
-def _configured_worker_job_image(spec: WorkerSpec) -> str:
+def _configured_worker_job_image(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> str:
     """Select optional worker images while preserving the shared fallback."""
     generic_image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
+    if (
+        type(launch_request) is _AdmittedWorkerRequest
+        and launch_request.ordinary_fhir_profile_job is not None
+        and provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_request) is not None
+    ):
+        image = os.getenv(provider_directory_source_worker.PROFILE_IMAGE_ENV, "").strip() or generic_image
+        if provider_directory_source_worker._IMAGE.fullmatch(image) is None:
+            raise ValueError("fhir_profile_worker_image_unavailable")
+        return image
     if (spec.worker_class, spec.importers) == ("process.RegistryFHIRCatalogSync", ("registry-fhir-catalog-sync",)):
         return os.getenv("HLTHPRT_REGISTRY_FHIR_CATALOG_WORKER_IMAGE", "").strip() or generic_image
     if spec.importers == ("mrf-source-discovery",):
@@ -804,6 +819,10 @@ def _ensure_kubernetes_job(
 ) -> dict[str, Any]:
     from api.provider_directory_cms_registry_worker import authorized_cms_registry_worker_launch
 
+    try:
+        provider_directory_source_worker.require_fresh_ordinary_profile_launch(spec, launch_request)
+    except ValueError, RuntimeError:
+        return {**state, "status": "failed", "message": "Profile worker requires fresh launch capacity"}
     launch = authorized_cms_registry_worker_launch(spec, launch_request)
     fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
     launch = fhir_launch if fhir_launch is not None else launch
@@ -813,7 +832,7 @@ def _ensure_kubernetes_job(
     launch = reference_launch if reference_launch is not None else launch
     aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
     launch = aca_launch if aca_launch is not None else launch
-    image = launch.image if launch is not None else _configured_worker_job_image(spec)
+    image = launch.image if launch is not None else _configured_worker_job_image(spec, launch_request)
     if not image:
         return {**state, "status": "failed", "message": "HLTHPRT_WORKER_JOB_IMAGE is not configured"}
 
@@ -1850,7 +1869,7 @@ def _single_job_worker_target(
         return None
     source_job_id = _admitted_source_job_target(
         spec, launch_payload
-    ) or provider_directory_source_worker.admitted_overlay_job(spec, launch_payload)
+    ) or provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_payload)
     if source_job_id is not None:
         return source_job_id
     queued_job_id = str(launch_payload.get("job_id") or "").strip()

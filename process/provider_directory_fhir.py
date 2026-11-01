@@ -84,8 +84,10 @@ from db.models import (
     db,
 )
 from db.plan_release_storage import storage_relation
+from process import provider_directory_bulk_parallel as bulk_parallel
 from process import provider_directory_christus as christus
 from process import provider_directory_cms_desired_fence as cms_desired_fence
+from process import provider_directory_fhir_response as fhir_response
 from process import provider_directory_molina as molina
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_profile as profile_artifact
@@ -43343,7 +43345,7 @@ async def _bulk_checkpoint_worker_guard(
 
         async def ownership_probe() -> None:
             """Serialize probes that share the advisory-lock connection."""
-            async with connection_lock:
+            async with profile_scope_copy.source_read_transaction(sys.modules[__name__]), connection_lock:
                 await _assert_bulk_checkpoint_guard_owner(
                     autocommit_connection,
                     identity,
@@ -43629,21 +43631,7 @@ def _is_bulk_range_resume_enabled(source: dict[str, Any]) -> bool:
 
 
 def _bulk_output_concurrency(source: dict[str, Any]) -> int:
-    if not _is_bulk_range_resume_enabled(source):
-        return BULK_EXPORT_DEFAULT_OUTPUT_CONCURRENCY
-    configured = _source_metadata(source).get(
-        "provider_directory_bulk_export_output_concurrency",
-        BULK_EXPORT_DEFAULT_OUTPUT_CONCURRENCY,
-    )
-    if isinstance(configured, bool):
-        raise ValueError("bulk_export_output_concurrency_invalid")
-    try:
-        concurrency = int(configured)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("bulk_export_output_concurrency_invalid") from exc
-    if not 1 <= concurrency <= BULK_EXPORT_MAX_OUTPUT_CONCURRENCY:
-        raise ValueError("bulk_export_output_concurrency_invalid")
-    return 1 if is_source_storage_required() else concurrency  # Reserve Source capacity for ownership checks.
+    return bulk_parallel.output_concurrency(sys.modules[__name__], source)
 
 
 def _bulk_output_pool_capacity() -> int:
@@ -43651,7 +43639,7 @@ def _bulk_output_pool_capacity() -> int:
 
 
 def _assert_bulk_output_pool_capacity(output_concurrency: int) -> None:
-    if output_concurrency <= 1:
+    if output_concurrency <= 1 or is_source_storage_required():
         return
     if _bulk_output_pool_capacity() < output_concurrency + 1:
         raise ValueError("bulk_export_output_concurrency_pool_insufficient")
@@ -44151,7 +44139,10 @@ async def _bulk_http_probe_output(
         if expected_etag is not None:
             headers["If-Match"] = expected_etag
         fetch_url = _url_with_query_params(output_url, options["query_params"])
-        async with session.get(
+        async with bulk_parallel.request(
+            sys.modules[__name__],
+            source_record,
+            session,
             fetch_url,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=timeout),
@@ -44225,8 +44216,12 @@ async def _bulk_http_get_json(
         headers = _bulk_json_headers(prefer_async=prefer_async)
         headers.update(options["headers"])
         fetch_url = _url_with_query_params(url, options["query_params"])
-        async with session.get(
+        async with bulk_parallel.request(
+            sys.modules[__name__],
+            source_record,
+            session,
             fetch_url,
+            export_start=prefer_async,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=timeout),
             allow_redirects=False,
@@ -44325,6 +44320,7 @@ async def _bulk_export_poll_outputs(
             session, source_record, status_url, timeout=timeout
         )
         if error:
+            await fhir_response.clear_bulk_export_wait(has_primary_error=True)
             _bulk_export_log_poll_error(source_record, resource_type, poll, max_polls, error)
             return None, error, poll
         if status_code == 202:
@@ -44338,9 +44334,12 @@ async def _bulk_export_poll_outputs(
             output_urls, payload_error = _bulk_export_poll_ready_result(
                 source_record, resource_type, poll, status_payload
             )
+            await fhir_response.clear_bulk_export_wait(has_primary_error=bool(payload_error))
             return output_urls, payload_error, poll
+        await fhir_response.clear_bulk_export_wait(has_primary_error=True)
         _bulk_export_log_poll_http_error(source_record, resource_type, poll, status_code)
         return None, f"bulk_export_status_http_{status_code}", poll
+    await fhir_response.clear_bulk_export_wait(has_primary_error=True)
     return _bulk_export_poll_timeout(source_record, resource_type, max_polls, status_url)
 
 
@@ -44402,35 +44401,7 @@ async def _handle_bulk_export_pending_poll(
     headers: dict[str, str],
     poll: int,
 ) -> tuple[datetime.datetime | None, str | None]:
-    current_time = _bulk_export_now_utc()
-    if context.pending_deadline is not None and current_time >= context.pending_deadline:
-        return None, BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
-    next_poll_at = _next_bulk_export_poll_at(
-        headers.get("retry-after"),
-        context.poll_seconds,
-        current_time,
-        context.pending_deadline,
-    )
-    if context.options.next_poll_handler is not None:
-        await context.options.next_poll_handler(next_poll_at)
-    if poll == 1 or poll % 10 == 0:
-        _bulk_export_log(
-            "poll_wait",
-            source_id=context.source_record.get("source_id"),
-            resource=context.resource_type,
-            poll=poll,
-            max_polls=context.poll_limit,
-            status=202,
-            sleep_seconds=max(0.0, (next_poll_at - current_time).total_seconds()),
-            status_url=_bulk_capability_log_identity(context.status_url),
-        )
-    if poll >= context.poll_limit:
-        return next_poll_at, "bulk_export_timeout"
-    wait_error = await _wait_for_bulk_export_poll_boundary(
-        next_poll_at,
-        context.pending_deadline,
-    )
-    return next_poll_at, wait_error
+    return await fhir_response.handle_bulk_export_pending_poll(sys.modules[__name__], context, headers, poll)
 
 
 def _bulk_export_finished_poll_result(
@@ -44512,6 +44483,7 @@ async def _bulk_export_poll_manifest(
             context.pending_deadline,
         )
         if wait_error:
+            await fhir_response.clear_bulk_export_wait(has_primary_error=True)
             return None, wait_error, poll - 1
         if options.cancel_probe is not None:
             await options.cancel_probe()
@@ -44530,15 +44502,12 @@ async def _bulk_export_poll_manifest(
                 poll,
             )
             if wait_error:
+                await fhir_response.clear_bulk_export_wait(has_primary_error=True)
                 return None, wait_error, poll
             continue
-        return _bulk_export_finished_poll_result(
-            context,
-            poll,
-            status_code,
-            status_payload,
-            request_error,
-        )
+        poll_result = _bulk_export_finished_poll_result(context, poll, status_code, status_payload, request_error)
+        await fhir_response.clear_bulk_export_wait(has_primary_error=bool(poll_result[1]))
+        return poll_result
     return None, "bulk_export_timeout", context.poll_limit
 
 
@@ -44571,6 +44540,11 @@ async def _bulk_export_sleep_after_poll_wait(
     if poll >= max(1, max_polls):
         return
     sleep_seconds = _retry_after_seconds(headers.get("retry-after")) or poll_seconds
+    wait_callback = fhir_response.BULK_EXPORT_WAIT_CALLBACK.get()
+    if wait_callback is not None:
+        observed_at = _bulk_export_now_utc()
+        next_poll_at = observed_at + datetime.timedelta(seconds=sleep_seconds)
+        await wait_callback(fhir_response.bulk_export_wait_observation(resource_type, observed_at, next_poll_at))
     if poll == 1 or poll % 10 == 0:
         _bulk_export_log(
             "poll_wait",
@@ -46872,7 +46846,7 @@ class _BulkOutputStreamState:
         rows_written = self.rows_written
         committed_bytes = self.committed_bytes
         scope = source_checkpoint_transaction(db, schema=_schema()) if progress_handler else contextlib.nullcontext()
-        async with scope:
+        async with bulk_parallel.write_slot(sys.modules[__name__], self.context.source_record), scope:
             if handler and pending_rows:
                 rows_written += await handler(self.context.model, pending_rows)
             if progress_handler and committed_boundary > committed_bytes:
@@ -46996,7 +46970,10 @@ async def _stream_bulk_output_response(
         sock_connect=context.timeout,
         sock_read=context.timeout,
     )
-    async with context.session.get(
+    async with bulk_parallel.request(
+        sys.modules[__name__],
+        context.source_record,
+        context.session,
         output_request.fetch_url,
         headers=output_request.headers_by_name,
         timeout=client_timeout,
@@ -47157,8 +47134,12 @@ async def _start_checkpointed_bulk_export(
     await ownership_probe()
     if start_error or status_code is None:
         return await _fail_unknown_bulk_export_acceptance(identity)
+    if status_code in {503, 504}:
+        return await _fail_unknown_bulk_export_acceptance(identity)
     if status_code not in {200, 202}:
         await _release_bulk_export_reservation(identity)
+        if status_code == 429:
+            return {}, None, "bulk_export_start_http_429"
         return None, None, None
     if status_code == 200 and not _is_bulk_export_status_payload(status_payload):
         await _release_bulk_export_reservation(identity)
@@ -57762,57 +57743,7 @@ def _effective_resource_scan_concurrency(
     source_record: dict[str, Any],
     options: ResourceScanConcurrencyOptions,
 ) -> int:
-    """Admit only configured sources with independent durable cursors."""
-    requested = min(
-        _validated_resource_scan_concurrency(options.requested_concurrency),
-        _source_resource_scan_concurrency(source_record),
-    )
-    source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    checkpoint_context = source_record.get("_pagination_checkpoint_context")
-    foundation_types = resource_scan_types(sys.modules[__name__], source_record, options.resource_types, options)
-    is_safe_shape = bool(
-        requested > 1
-        and current_version_census_contract(source_record) is None
-        and _has_bound_resource_scan_checkpoint(
-            source_record,
-            checkpoint_context,
-        )
-        and checkpoint_context.canonical_api_base == source_api_base
-        and len(options.resource_types) == len(set(options.resource_types))
-        and options.per_resource_limit <= 0
-        and options.page_limit <= 0
-        and options.page_count > 0
-        and options.stream_batch_size > 0
-        and options.source_concurrency == 1
-        and options.linked_resource_limit <= 0
-        and not options.stale_cleanup
-        and not _is_source_bulk_export_effective(
-            source_record,
-            options.bulk_export,
-            per_resource_limit=options.per_resource_limit,
-            checkpoint_context=checkpoint_context,
-        )
-        and options.checkpointing_enabled
-        and options.deferred_materialization
-        and not _is_practitioner_role_reverse_lookup_planned(
-            source_record,
-            list(options.resource_types),
-        )
-        and (is_source_storage_required() or _provider_directory_database_pool_capacity() >= requested + 1)
-        and _has_parallel_resource_transport(
-            source_record,
-            foundation_types,
-            options.page_count,
-        )
-    )
-    if not is_safe_shape:
-        return 1
-    try:
-        if _bound_upsert_session() is not None:
-            return 1
-    except RuntimeError:
-        return 1
-    return min(requested, len(foundation_types))
+    return bulk_parallel.effective_resource_concurrency(sys.modules[__name__], source_record, options)
 
 
 def _source_resource_scan_concurrency(source_record: dict[str, Any]) -> int:
@@ -67486,6 +67417,19 @@ class ResourceGroupScanRunner:
             active_group["resource_started_monotonic"] = time.monotonic()
         await self.report_progress(force=True)
 
+    async def report_bulk_wait(self, resource_type: str, observation: dict[str, Any] | None) -> None:
+        """Observe one cursor without advancing its resource-row counters."""
+        async with self.progress_lock:
+            wait_by_resource = dict(self.active_group_by_key[self.group_key].get("bulk_export_wait") or {})
+            if observation is None and resource_type not in wait_by_resource:
+                return
+            if observation is None:
+                wait_by_resource.pop(resource_type)
+            else:
+                wait_by_resource[resource_type] = observation
+            self.active_group_by_key[self.group_key]["bulk_export_wait"] = wait_by_resource
+        await self.report_progress(force=True)
+
     async def persist_batch(
         self,
         resource_type: str,
@@ -67536,7 +67480,8 @@ class ResourceGroupScanRunner:
                 self.options.run_id,
                 self.options.seen_stage_table,
             )
-        return await self._fetch_rows(resource_type, source_record_by_field)
+        async with fhir_response.bulk_export_wait_scope(partial(self.report_bulk_wait, resource_type)):
+            return await self._fetch_rows(resource_type, source_record_by_field)
 
     async def _fetch_rows(
         self,
@@ -67733,7 +67678,7 @@ class ResourceGroupScanRunner:
         concurrency: int,
     ) -> list[ResourceFetchResult | None]:
         """Run a fail-fast wave and always cancel and join every sibling."""
-        resource_semaphore = asyncio.Semaphore(concurrency)
+        resource_semaphore = bulk_parallel.resource_slots(self.source_record, concurrency)
         resource_tasks = [
             asyncio.create_task(
                 self._run_bounded(resource_type, resource_semaphore),
@@ -67787,6 +67732,8 @@ class ResourceGroupScanRunner:
         )
         concurrency = self._effective_concurrency(ordered_resource_types)
         self.effective_concurrency = concurrency
+        if bulk_parallel.is_bulk_scan(sys.modules[__name__], self.source_record, self.options):
+            bulk_parallel.prepare_scan(sys.modules[__name__], self.source_record, concurrency)
         zero_role_result = None
         if concurrency > 1:
             from process.provider_directory_generic_source_adapters import resource_scan_estimates

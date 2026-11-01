@@ -5,6 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,7 +18,259 @@ RUN_ID = "run_" + "a" * 32
 JOB_ID = "provider_directory_start_" + RUN_ID
 IMAGE = "example/source-worker@sha256:" + "c" * 64
 ORDINARY_IMAGE = "example/ordinary-worker@sha256:" + "d" * 64
+PROFILE_IMAGE = "example/profile-worker@sha256:" + "e" * 64
 SPEC = workers._BY_WORKER_CLASS["process.ProviderDirectoryFHIR"]
+
+
+def _signed_profile_run(monkeypatch, database_identity=None):
+    """Reuse the genuine signed lease and configured public trust fixtures."""
+    from process.provider_directory_profile_capacity_preflight_contract import validated_capacity_preflight_request
+    from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _signed_envelope
+    from tests.test_provider_directory_profile_capacity_trust import _trust_payload
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
+    envelope = _signed_envelope(body_mutator=lambda body: body.update(database_identity or {}))
+    trust = _trust_payload(**(database_identity or {}))
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON", json.dumps(trust))
+    monkeypatch.setattr(source, "datetime", SimpleNamespace(now=lambda _zone: VALIDATION_TIME))
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", ORDINARY_IMAGE)
+    monkeypatch.setenv(source.PROFILE_IMAGE_ENV, PROFILE_IMAGE)
+    request = validated_capacity_preflight_request(envelope["lease"]["signing_preflight_guard"]["healthcare_request"])
+    return {
+        **_recorded(),
+        "params": {**request.execution_payload, "provider_directory_profile_capacity_attestation": envelope},
+    }
+
+
+@pytest.fixture
+async def profile_admitted(monkeypatch):
+    recorded = _signed_profile_run(monkeypatch)
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, recorded)
+    assert await workers._admit_source_worker_launches(request, recorded) is None
+    assert request.ordinary_fhir_profile_job == request.admitted_job
+    assert request.fhir_source_launch is None
+    return request
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_profile_image_launch_and_reuse(profile_admitted, monkeypatch, secret_selection, source_runtime_mount, scoped):
+    """A signed Profile uses one ordinary image for creation and exact reuse."""
+    if not scoped:
+        monkeypatch.delenv(source.PROFILE_IMAGE_ENV)
+    expected_image = PROFILE_IMAGE if scoped else ORDINARY_IMAGE
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+    jobs, calls = [], []
+
+    def kubernetes(method, path, body=None):
+        calls.append(method)
+        if method == "POST":
+            jobs.append({**body, "status": {"active": 1}})
+        return {"items": jobs}
+
+    monkeypatch.setattr(workers, "_kubernetes_request", kubernetes)
+    assert workers._ensure_spec(SPEC, profile_admitted)["status"] == "started"
+    assert workers._ensure_spec(SPEC, profile_admitted)["status"] == "already_running"
+    assert calls.count("POST") == len(jobs) == 1
+    pod = jobs[0]["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    assert container["image"] == expected_image
+    assert container["command"] == workers._worker_command(workers._worker_python(), SPEC)
+    assert "healthporta.com/worker-purpose" not in jobs[0]["metadata"]["labels"]
+    assert "SOURCE_USER" not in {entry["name"] for entry in container["env"]}
+    assert [entry["name"] for entry in pod["volumes"]] == ["ordinary-credentials"]
+
+
+@pytest.mark.parametrize("job_state", ["missing", "succeeded", "failed"])
+@pytest.mark.parametrize("lease_state", ["missing", "serialized"])
+def test_profile_replacement_requires_verified_lease(
+    profile_admitted, monkeypatch, secret_selection, source_runtime_mount, job_state, lease_state
+):
+    job = workers._worker_job_manifest(SPEC, profile_admitted, PROFILE_IMAGE)
+    job["status"] = {job_state: 1}
+    lease = profile_admitted.ordinary_fhir_profile_lease
+    profile_admitted.ordinary_fhir_profile_lease = (
+        None if lease_state == "missing" else json.loads(lease.canonical_lease_json)
+    )
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+    calls = []
+    monkeypatch.setattr(
+        workers,
+        "_kubernetes_request",
+        lambda *args: calls.append(args) or {"items": [] if job_state == "missing" else [job]},
+    )
+    response = workers._ensure_spec(SPEC, profile_admitted)
+    assert response["status"] == "failed"
+    assert response["message"] == "Profile worker requires fresh launch capacity"
+    assert calls and all(call[0] == "GET" for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "job_state",
+    ["active", "missing", "succeeded", "failed", "image", "command", "target", "source_mount", "source_env"],
+)
+async def test_profile_aged_observation_only_reuses_exact_active_job(
+    monkeypatch, secret_selection, source_runtime_mount, job_state
+):
+    """A stale capacity observation can reuse an exact active Job, never replace it."""
+    from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME
+
+    recorded = _signed_profile_run(monkeypatch)
+    admitted_request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(admitted_request, recorded)
+    assert await workers._admit_source_worker_launches(admitted_request, recorded) is None
+    job = workers._worker_job_manifest(SPEC, admitted_request, PROFILE_IMAGE)
+    job["status"] = {job_state: 1} if job_state in {"succeeded", "failed"} else {"active": 1}
+    if job_state not in {"active", "missing", "succeeded", "failed"}:
+        _change_overlay_job(job, job_state)
+    native_connection, api_calls = _mock_original_worker_control(monkeypatch, recorded, [deepcopy(recorded)], job)
+    if job_state == "missing":
+        monkeypatch.setattr(workers, "_kubernetes_request", lambda *args: api_calls.append(args) or {"items": []})
+    advanced_time = VALIDATION_TIME + timedelta(seconds=304)
+    monkeypatch.setattr(source, "datetime", SimpleNamespace(now=lambda _zone: advanced_time))
+    response_by_field = await workers.guarded_ensure_worker(
+        {"run_id": RUN_ID, "importer": "provider-directory-fhir", "params": {"import_resources": True}}
+    )
+    assert response_by_field["status"] == ("already_running" if job_state == "active" else "failed")
+    native_connection.all.assert_not_awaited()
+    assert api_calls and all(call[0] == "GET" for call in api_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds", [3298, 3598, -10])
+async def test_profile_reuse_still_requires_current_lease_validity(
+    monkeypatch, profile_admitted, secret_selection, source_runtime_mount, seconds
+):
+    """An active exact Job cannot bypass the signed deadline, expiry or future check."""
+    from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME
+
+    recorded = _signed_profile_run(monkeypatch)
+    job = workers._worker_job_manifest(SPEC, profile_admitted, PROFILE_IMAGE)
+    job["status"] = {"active": 1}
+    _native_connection, api_calls = _mock_original_worker_control(monkeypatch, recorded, [deepcopy(recorded)], job)
+    advanced_time = VALIDATION_TIME + timedelta(seconds=seconds)
+    monkeypatch.setattr(source, "datetime", SimpleNamespace(now=lambda _zone: advanced_time))
+    response_by_field = await workers.guarded_ensure_worker({"run_id": RUN_ID, "importer": "provider-directory-fhir"})
+    assert response_by_field["status"] == "failed"
+    assert api_calls == []
+
+
+@pytest.mark.parametrize("drift", ["image", "command", "target", "source_mount", "source_env", "service_account"])
+def test_profile_reuse_refuses_runtime_drift(
+    profile_admitted, monkeypatch, secret_selection, source_runtime_mount, drift
+):
+    job = workers._worker_job_manifest(SPEC, profile_admitted, PROFILE_IMAGE)
+    assert source.is_fhir_job_set_matching(SPEC, profile_admitted, [job])
+    _change_overlay_job(job, drift)
+    assert not source.is_fhir_job_set_matching(SPEC, profile_admitted, [job])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "signature",
+        "missing_trust",
+        "key",
+        "database",
+        "expired",
+        "future",
+        "generation",
+        "proof",
+        "node",
+        "flags",
+        "extra",
+    ],
+)
+async def test_profile_admission_authenticates_signed_request(monkeypatch, mutation):
+    from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME
+
+    recorded = _signed_profile_run(monkeypatch)
+    params = recorded["params"]
+    if mutation == "signature":
+        params["provider_directory_profile_capacity_attestation"]["signature"] = "A" * 86
+    if mutation == "missing_trust":
+        monkeypatch.delenv("HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON")
+    if mutation in {"key", "database"}:
+        trust = json.loads(workers.os.environ["HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON"])
+        if mutation == "key":
+            trust["keys"][0]["public_key_hex"] = "00" * 32
+        else:
+            trust["database_oid"] += 1
+        monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON", json.dumps(trust))
+    if mutation in {"expired", "future"}:
+        clock = VALIDATION_TIME.replace(year=2027 if mutation == "expired" else 2025)
+        monkeypatch.setattr(source, "datetime", SimpleNamespace(now=lambda _zone: clock))
+    if mutation == "generation":
+        params["provider_directory_profile_generation"] += 1
+    if mutation == "proof":
+        proof = params["provider_directory_profile_selection_attestation"]["proof_id"]
+        params["provider_directory_profile_selection_attestation"]["proof_id"] = proof[:-1] + (
+            "0" if proof[-1] != "0" else "1"
+        )
+    if mutation == "node":
+        params["provider_directory_profile_selection_attestation"]["node_id"] = "another-node"
+    if mutation == "flags":
+        params["import_resources"] = True
+    if mutation == "extra":
+        params["test_mode"] = False
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, recorded)
+    refused = await workers._admit_source_worker_launches(request, recorded)
+    assert refused["status"] == "failed"
+    assert request.ordinary_fhir_profile_job is None and request.fhir_source_launch is None
+    assert workers._ensure_spec(SPEC, request)["status"] == "failed"
+
+
+@pytest.mark.parametrize("index", range(5))
+def test_profile_identity_cannot_drift(profile_admitted, index):
+    identity_values = list(profile_admitted.admitted_job)
+    identity_values[index] = "different"
+    profile_admitted.admitted_job = tuple(identity_values)
+    with pytest.raises(ValueError, match="admission_unavailable"):
+        workers._configured_worker_job_image(SPEC, profile_admitted)
+
+
+def test_serialized_profile_cannot_select_runtime(profile_admitted):
+    serialized_request_by_field = {**profile_admitted, "ordinary_fhir_profile_job": list(profile_admitted.admitted_job)}
+    assert source.admitted_ordinary_fhir_job(SPEC, serialized_request_by_field) is None
+    assert workers._configured_worker_job_image(SPEC, serialized_request_by_field) == ORDINARY_IMAGE
+    assert workers._ensure_spec(SPEC, serialized_request_by_field)["status"] == "failed"
+
+
+@pytest.mark.parametrize("configured", ["", " ", "example/profile:latest"])
+def test_profile_image_setting_is_narrow(profile_admitted, monkeypatch, configured):
+    monkeypatch.setenv(source.PROFILE_IMAGE_ENV, configured)
+    if configured.strip():
+        with pytest.raises(ValueError, match="profile_worker_image_unavailable"):
+            workers._configured_worker_job_image(SPEC, profile_admitted)
+    else:
+        assert workers._configured_worker_job_image(SPEC, profile_admitted) == ORDINARY_IMAGE
+
+
+@pytest.mark.parametrize(
+    "metrics", [None, {"queue": "another-queue", "function": "control_single_job_start", "job_id": JOB_ID}]
+)
+@pytest.mark.asyncio
+async def test_profile_requires_observed_native_job(monkeypatch, metrics):
+    recorded = _signed_profile_run(monkeypatch)
+    recorded["metrics"] = metrics
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="provider-directory-fhir")
+    workers._bind_admitted_job(request, recorded)
+    assert (await workers._admit_source_worker_launches(request, recorded))["status"] == "failed"
+    assert request.ordinary_fhir_profile_job is None and request.fhir_source_launch is None
+
+
+@pytest.mark.asyncio
+async def test_profile_markers_cannot_reclassify_source(admitted, monkeypatch):
+    admitted["params"] = _signed_profile_run(monkeypatch)["params"]
+    assert await workers._admit_source_worker_launches(admitted, _recorded()) is None
+    assert admitted.ordinary_fhir_profile_job is None
+    assert source.authorized_fhir_source_worker_launch(SPEC, admitted).job_id == JOB_ID
 
 
 def _overlay_run():
@@ -122,7 +375,7 @@ def test_overlay_serialization_cannot_admit_job(overlay_admitted):
         "admitted_job": list(overlay_admitted.admitted_job),
         "params": _overlay_run()["params"],
     }
-    assert source.admitted_overlay_job(SPEC, raw_by_field) is None
+    assert source.admitted_ordinary_fhir_job(SPEC, raw_by_field) is None
     assert workers._ensure_spec(SPEC, raw_by_field)["status"] == "failed"
 
 
@@ -243,7 +496,7 @@ async def test_overlay_request_cannot_reclassify_acquisition(admitted):
     """Caller parameters never replace the actual stored operation."""
     admitted["params"] = _overlay_run()["params"]
     assert await workers._admit_source_worker_launches(admitted, _recorded()) is None
-    assert source.admitted_overlay_job(SPEC, admitted) is None
+    assert source.admitted_ordinary_fhir_job(SPEC, admitted) is None
     assert source.authorized_fhir_source_worker_launch(SPEC, admitted).job_id == JOB_ID
 
 

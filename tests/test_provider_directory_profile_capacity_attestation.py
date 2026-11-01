@@ -309,6 +309,12 @@ def test_verifier_requires_observed_database_identity_arguments():
         )
 
 
+@pytest.mark.parametrize("require_fresh_observation", [None, 0, 1, "false"])
+def test_freshness_control_requires_a_boolean(require_fresh_observation):
+    with pytest.raises(lease.ProviderDirectoryCapacityLeaseError, match="invalid_type: require_fresh_observation"):
+        _verify(_signed_envelope(), require_fresh_observation=require_fresh_observation)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [

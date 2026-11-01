@@ -23,6 +23,7 @@ PROXY_POLICY_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_POLICY_JSON"
 PROXY_POOL_ENV = "HLTHPRT_HTTP_PROXY_POOL_JSON"
 PROXY_BINDING_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_BINDING_JSON"
 PROXY_COOLDOWNS_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_COOLDOWNS_JSON"
+PROFILE_IMAGE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_WORKER_IMAGE"
 _WORKER_CLASS = "process.ProviderDirectoryFHIR"
 _IMPORTER = "provider-directory-fhir"
 _QUEUE = "arq:ProviderDirectoryFHIR"
@@ -272,6 +273,81 @@ def _require_source_proxy_scope(policy, params):
         )
     ):
         raise ValueError("fhir_source_worker_proxy_source_scope_required")
+
+
+def admit_ordinary_profile_job(admitted_run, launch_request):
+    """Authenticate a stored non-CMS Profile without consuming its worker lease."""
+    if admitted_run.get("importer") != _IMPORTER:
+        return None
+    params = admitted_run.get("params")
+    if not isinstance(params, dict) or not params.get("provider_directory_profile_contract_id"):
+        return None
+    from api.control_workers import _BY_WORKER_CLASS, _AdmittedWorkerRequest
+    from process.provider_directory_profile_capacity_preflight_contract import (
+        canonical_preflight_json,
+        validated_capacity_preflight_request,
+    )
+    from process.provider_directory_profile_selection_contract import validated_profile_execution
+
+    if type(launch_request) is not _AdmittedWorkerRequest or type(admitted_run.get("metrics")) is not dict:
+        raise ValueError("fhir_profile_worker_admission_unavailable")
+    _require_fhir_job_identity(
+        _BY_WORKER_CLASS[_WORKER_CLASS],
+        launch_request,
+        admitted_run.get("run_id"),
+        admitted_run["metrics"].get("job_id"),
+    )
+    execution = validated_profile_execution(params)
+    if (
+        execution.attestation.desired_cms_dataset is not None
+        or execution.cms_nonprofile_capacity_attestation is not None
+    ):
+        return None
+    lease = _verified_profile_capacity_lease(execution.capacity_attestation, require_fresh_observation=False)
+    request = validated_capacity_preflight_request(lease.signing_preflight_guard["healthcare_request"])
+    observed_execution_by_field = {**params, "provider_directory_profile_capacity_attestation": {}}
+    if request.cms_nonprofile_admission is not None or canonical_preflight_json(
+        observed_execution_by_field
+    ) != canonical_preflight_json(request.execution_payload):
+        raise ValueError("fhir_profile_worker_admission_unavailable")
+    launch_request.ordinary_fhir_profile_lease = lease
+    return launch_request.admitted_job
+
+
+def _verified_profile_capacity_lease(envelope, *, require_fresh_observation):
+    """Use the shared verifier with current trust and build-deadline checks."""
+    from process.provider_directory_profile_capacity_attestation import verify_database_capacity_lease
+    from process.provider_directory_profile_capacity_trust_config import configured_capacity_lease_trust
+
+    trust = configured_capacity_lease_trust()
+    body = envelope.get("lease")
+    return verify_database_capacity_lease(
+        envelope,
+        trust=trust,
+        now=datetime.now(UTC),
+        require_fresh_observation=require_fresh_observation,
+        expected_capacity_geometry_hash=body.get("capacity_geometry_hash") if isinstance(body, dict) else None,
+        expected_database_system_identifier=trust.database_system_identifier,
+        expected_database_oid=trust.database_oid,
+        expected_database_name=trust.database_name,
+    )
+
+
+def require_fresh_ordinary_profile_launch(spec, launch_request):
+    """Permit stale observation reuse, never creation of a replacement Job."""
+    from api.control_workers import _AdmittedWorkerRequest
+    from process.provider_directory_profile_capacity_attestation import VerifiedDatabaseCapacityLease
+
+    if type(launch_request) is not _AdmittedWorkerRequest or launch_request.ordinary_fhir_profile_job is None:
+        return
+    admitted_ordinary_fhir_job(spec, launch_request)
+    lease = launch_request.ordinary_fhir_profile_lease
+    if not isinstance(lease, VerifiedDatabaseCapacityLease):
+        raise ValueError("fhir_profile_worker_admission_unavailable")
+    _verified_profile_capacity_lease(
+        {"lease": json.loads(lease.canonical_lease_json), "signature": lease.signature},
+        require_fresh_observation=True,
+    )
 
 
 def admit_fhir_source_worker_launch(admitted_run):
@@ -674,17 +750,20 @@ def fresh_route_annotations(spec, launch_request):
     }
 
 
-def admitted_overlay_job(spec, launch_request):
-    """Select ordinary execution only for the overlay classified from the native run."""
+def admitted_ordinary_fhir_job(spec, launch_request):
+    """Keep authenticated ordinary operations bound to their original native job."""
     from api.control_workers import _AdmittedWorkerRequest
 
     if type(launch_request) is not _AdmittedWorkerRequest:
         return None
-    identity = launch_request.ordinary_fhir_overlay_job
+    overlay = launch_request.ordinary_fhir_overlay_job
+    profile = launch_request.ordinary_fhir_profile_job
+    identity = overlay if overlay is not None else profile
     if identity is None:
         return None
     if (
         type(identity) is not tuple
+        or (overlay is not None and profile is not None)
         or len(identity) != 5
         or identity != launch_request.admitted_job
         or launch_request.cms_registry_launch is not None
@@ -891,9 +970,9 @@ def is_fhir_job_set_matching(spec, launch_request, jobs):
     launch = authorized_fhir_source_worker_launch(spec, launch_request)
     if launch is not None:
         return all(is_fhir_source_job_matching(job, launch, launch_request) for job in jobs)
-    if admitted_overlay_job(spec, launch_request) is None:
+    if admitted_ordinary_fhir_job(spec, launch_request) is None:
         return True
-    from api.control_workers import _worker_job_manifest
+    from api.control_workers import _configured_worker_job_image, _worker_job_manifest
 
-    expected_job = _worker_job_manifest(spec, launch_request, os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip())
+    expected_job = _worker_job_manifest(spec, launch_request, _configured_worker_job_image(spec, launch_request))
     return all(is_overlay_job_matching(job, expected_job) for job in jobs)

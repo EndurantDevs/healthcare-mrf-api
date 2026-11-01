@@ -394,6 +394,7 @@ def resource_scan_types(directory, source_record, resource_types, options):
     """Include an independent role cursor only for deferred isolated storage."""
     from process.provider_directory_generic_source_policy import _FACTORY
 
+    is_bulk = directory.bulk_parallel.is_bulk_scan(directory, source_record, options)
     factory = _FACTORY.get()
     include_role = (
         options.deferred_materialization
@@ -401,8 +402,12 @@ def resource_scan_types(directory, source_record, resource_types, options):
         and directory.is_source_storage_required()
         and getattr(factory, "storage_binding", None) is not None
         and not directory._needs_practitioner_role_reverse_lookup(source_record, "PractitionerRole")
-        and directory._has_parallel_resource_transport(
-            source_record, ("PractitionerRole",), options.page_count, minimum_resources=1
+        and (
+            directory.bulk_parallel.has_parallel_transport(directory, source_record, ("PractitionerRole",))
+            if is_bulk
+            else directory._has_parallel_resource_transport(
+                source_record, ("PractitionerRole",), options.page_count, minimum_resources=1
+            )
         )
     )
     if include_role:

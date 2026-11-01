@@ -398,6 +398,9 @@ def _status_event_for_accepted_progress(
     progress_by_field["attempt_started_at"] = merged.get("attempt_started_at")
     progress_by_field["event_seq"] = merged.get("event_seq")
     progress_by_field["progress_seq"] = merged.get("progress_seq")
+    if merged.get("importer") == "provider-directory-fhir":
+        progress_by_field["observed_at"] = merged.get("observed_at")
+        progress_by_field["progressed_at"] = merged.get("progressed_at")
     event_by_field["progress"] = progress_by_field
     supplied_heartbeat_at = event_by_field.get("heartbeat_at")
     if (
@@ -775,7 +778,10 @@ def _preserve_progress_for_heartbeat(
         return
     if str(previous.get("source") or "") in {"", _HEARTBEAT_SOURCE}:
         return
-    for key in _PROGRESS_FIELDS:
+    fields = (
+        (*_PROGRESS_FIELDS, "detail") if previous.get("importer") == "provider-directory-fhir" else _PROGRESS_FIELDS
+    )
+    for key in fields:
         if previous.get(key) is not None:
             merged[key] = previous[key]
     for key in ("source", "confidence"):

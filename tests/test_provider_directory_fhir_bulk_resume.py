@@ -162,7 +162,8 @@ async def test_source_bulk_output_concurrency_preserves_legacy_configuration(mon
 
     assert importer._bulk_output_concurrency(source_map) == configured_concurrency
     async with synthetic_source_database(monkeypatch, _Connection(1)):
-        assert importer._bulk_output_concurrency(source_map) == 1
+        assert importer._bulk_output_concurrency(source_map) == configured_concurrency
+        importer._assert_bulk_output_pool_capacity(configured_concurrency)
     assert importer._bulk_output_concurrency(source_map) == configured_concurrency
     assert source_map["metadata_json"]["provider_directory_bulk_export_output_concurrency"] == configured_concurrency
 
@@ -347,10 +348,10 @@ async def test_bulk_stream_resumes_at_exact_committed_ndjson_boundary(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("concurrency", [1, 2])
+@pytest.mark.parametrize("concurrency", [1, 2, 8])
 async def test_bulk_output_concurrency_is_bounded(monkeypatch, concurrency):
     identity = _checkpoint_identity()
-    manifest = _manifest(6)
+    manifest = _manifest(10)
     concurrency_by_name = {"active": 0, "maximum": 0}
     checkpoints = _output_checkpoints(identity, manifest)
     checkpoints[0]["state"] = importer.BULK_EXPORT_OUTPUT_COMPLETE
@@ -385,4 +386,4 @@ async def test_bulk_output_concurrency_is_bounded(monkeypatch, concurrency):
 
     assert error is None
     assert concurrency_by_name["maximum"] == concurrency
-    assert sorted(streamed_outputs) == list(range(1, 6))
+    assert sorted(streamed_outputs) == list(range(1, 10))
