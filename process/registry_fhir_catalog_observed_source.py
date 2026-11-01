@@ -4,6 +4,7 @@
 import hashlib
 import json
 import re
+from collections import deque
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 
@@ -15,10 +16,10 @@ from process.provider_directory_generic_source_provision import fhir_source_cata
 from process.registry_fhir_catalog_extraction import (
     DEFAULT_BYTES,
     RESOURCE_TYPES,
-    extract_fhir_catalog_batch,
     fhir_catalog_json_bytes,
     fhir_catalog_text,
     fhir_source_uri,
+    iter_fhir_catalog_batches,
     iter_fhir_catalog_pages,
 )
 from process.registry_fhir_catalog_observation import (
@@ -348,7 +349,7 @@ async def _facts(connection, profile, dataset_id, native, source_uri, *, publish
 def _validate_metadata_page(page, source_uri):
     metadata_rows = tuple(row for row in page if row["resource_type"] in {"Organization", "InsurancePlan"})
     if metadata_rows:
-        extract_fhir_catalog_batch(metadata_rows, profile="published_normalized", source_uri=source_uri)
+        deque(iter_fhir_catalog_batches(metadata_rows, profile="published_normalized", source_uri=source_uri), maxlen=0)
     for row in page:
         if row["resource_type"] in {"OrganizationAffiliation", "PractitionerRole"}:
             references = row["payload_json"].get("network_refs")
