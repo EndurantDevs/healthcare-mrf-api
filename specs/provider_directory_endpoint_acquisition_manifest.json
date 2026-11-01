@@ -26,6 +26,7 @@
       "capital-blue-cross": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"], "limitation": "Historical source and probe notes: Broad exact census requests require a search predicate. Ranged counts do not establish endpoint completeness when ge0001, _lastUpdated:missing, and _id:missing predicates are unsupported and no history or bulk-export operation is advertised. Acquisition remains probe-only."},
       "idaho": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Accepts official public cursor continuations with checkpoints. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections and bounded searches succeeded. A bounded advertised-cursor follow succeeded without overlapping the first sampled page. Exhaustive traversal, population adequacy, terminal acquisition and publication readiness remained unverified."},
       "molina": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition retains durable pagination checkpoints and fails closed with pagination_resume_required when a complete traversal cannot resume. Terminal endpoint-wide proof and downstream publication require separate verification."},
+      "mvp-health-care": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-01", "method": "rest", "limitation": "The public versioned R4 directory uses source-issued continuations with pages of at most 100 records. Large collections use adaptive half-open time chunks, exact-zero historical and future tail witnesses, exact leaf counts, twin content passes and post-census reconciliation. Recognized capped searches and transport timeouts subdivide without claiming an exact parent total; unsplittable windows fail closed. Native product labels do not establish complete geography or network membership. Complete acquisition, publication and Profile/API readiness require separate verification."},
       "michigan": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-19", "method": "rest", "limitation": "Acquisition is configured for Location, Organization, OrganizationAffiliation, Practitioner, and PractitionerRole using exact advertised cursor replay and durable checkpoints. Synthetic _getpagesoffset continuation is not equivalent and remains prohibited. Bounded source review (2026-10-19): The official CMS directory still lists the legacy InteropStation MDHHS base. Anonymous metadata at the configured base returned HTTP 200 with an active FHIR 4.0.1 CapabilityStatement advertising all five configured collections. This metadata observation does not establish equivalence with the legacy catalog entry, exhaustive collection traversal, terminal acquisition, publication or API readiness. Complete source-coverage proof remains required before publication."},
       "christus-health-plan": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-31", "method": "rest", "limitation": "Seven public FHIR R4 collections use server-issued next links with pages of up to 100 records. Opaque _cursor continuations support traversal beyond the direct _offset cap; Organization uses issued offsets. Continuation totals may be absent and a final next link may return an empty page. Full reconciliation is required for deletions. Complete acquisition, publication and API readiness require separate verification."},
       "cigna": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Sequential REST pagination preserves Plan-Net network extensions and supports configured _count=100 and _count=75 searches. Bulk/export is disabled in the maintained source configuration. Expected nonempty initial searches retry transient HTTP-200 empty search sets with cooldowns. Bounded source observations (2026-10-10): Anonymous R4 metadata listed all eight configured collections. Bounded reads succeeded, including 75- and 100-row Practitioner pages; Endpoint search was empty. No Bulk/export operation was advertised in the reviewed metadata. Complete traversal and publication readiness remained unverified."},
@@ -231,6 +232,34 @@
       "launch_mode": "create",
       "resource_profile": "R8",
       "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"]
+    },
+    {
+      "entry_id": "mvp-health-care",
+      "display_name": "MVP Health Care Provider Directory",
+      "owner_id": "mvp-health-care",
+      "source_ids": [
+        "pdfhir_85af3c3ea1fc08c2516ef15d"
+      ],
+      "canonical_base": "https://api.mvphealthcare.com/provdirfhirapi",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ],
+      "capped_last_updated_resources": [
+        "Organization",
+        "Location",
+        "PractitionerRole",
+        "Practitioner"
+      ]
     },
     {
       "entry_id": "michigan",
