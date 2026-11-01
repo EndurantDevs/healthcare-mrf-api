@@ -21,6 +21,7 @@ from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_callable_custody as callables
 from process import provider_directory_cms_callee_inventory as callee_inventory
 from process import provider_directory_cms_history_conversion as history
+from process import provider_directory_cms_history_postimage as history_postimage
 from process import provider_directory_cms_preparation_custody as custody
 from process import provider_directory_cms_preparation_policy as policy_checks
 from process import provider_directory_cms_prepared_context as physical_scope
@@ -148,7 +149,7 @@ def _deadline(deadline):
     return deadline
 
 
-async def _actor(connection, storage_binding, policy, migration_role):
+async def _actor(connection, storage_binding, policy, migration_role, *, allow_serializable=False):
     actor_by_field = dict(await connection.fetchrow(_ACTOR_SQL))
     _require(
         actor_by_field["session"] == actor_by_field["current"]
@@ -164,7 +165,8 @@ async def _actor(connection, storage_binding, policy, migration_role):
         and actor_by_field["backend"] == connection.get_server_pid()
         and actor_by_field["database_oid"] == storage_binding.database_oid
         and actor_by_field["replication"] == "origin"
-        and actor_by_field["isolation"] == "read committed"
+        and actor_by_field["isolation"]
+        in ({"read committed", "serializable"} if allow_serializable else {"read committed"})
         and actor_by_field["readonly"] == "off"
         and actor_by_field["search_path"] in {"pg_catalog", "pg_catalog, pg_temp"}
         and bool(actor_by_field["transaction"]),
@@ -282,6 +284,7 @@ def _read_definers(routines, arguments, protected_sha256):
 
 
 async def _callable_closure(connection, arguments, relation_oids, retained_routines=(), protected_routines_sha256=None):
+    """Verify fresh routine rows and settings before deriving the fixed execution frontier."""
     signatures = (
         *callables.cms_callee_signatures(arguments["catalog_schema"]),
         *(
@@ -315,27 +318,28 @@ async def _callable_closure(connection, arguments, relation_oids, retained_routi
     routines = await _retained_routine_inventory(
         connection, arguments, relation_oids, routine_roots, protected_routines_sha256
     )
-    routine_oids = [entry["oid"] for entry in routines]
-    _require(set(frontier_oids) <= set(routine_oids), "callable_closure_changed")
+    _require(set(frontier_oids) <= {entry["oid"] for entry in routines}, "callable_closure_changed")
     callables.require_cms_terminal_guard_resolution(
         routines,
         catalog_schema=arguments["catalog_schema"],
         catalog_schema_oid=arguments["catalog_schema_oid"],
         preparation_schema=arguments["preparation_schema"],
     )
-    routine_settings.require_cms_terminal_routine_settings(
-        routines,
-        catalog_schema=arguments["catalog_schema"],
-        catalog_schema_oid=arguments["catalog_schema_oid"],
-        preparation_schema=arguments["preparation_schema"],
-    )
+    read_definers = _read_definers(routines, arguments, protected_routines_sha256)
+    if protected_routines_sha256 is None:
+        routine_settings.require_cms_terminal_routine_settings(
+            routines,
+            catalog_schema=arguments["catalog_schema"],
+            catalog_schema_oid=arguments["catalog_schema_oid"],
+            preparation_schema=arguments["preparation_schema"],
+        )
     return {
         "frontier": {
             name: {key: field_value for key, field_value in entry.items() if key != "access"}
             for name, entry in verified.items()
         },
         "routines": routines,
-        "read_definers": _read_definers(routines, arguments, protected_routines_sha256),
+        "read_definers": read_definers,
         "allocator": allocator,
         **({"proofs": proofs} if proofs else {}),
     }
@@ -381,19 +385,32 @@ def _require_foreign_boundary(edges, relation_oids):
 
 def _require_creator_bodies(native, routines):
     """Require the complete fixed postimage before accepting ordinary staging CREATE."""
-    from process.provider_directory_cms_routine_bodies import cms_terminal_body_postimage
+    from process.provider_directory_cms_routine_bodies import _targets
 
     arguments = native["arguments"]
-    _require(
-        cms_terminal_body_postimage(
-            routines,
-            catalog_schema=arguments["catalog_schema"],
-            catalog_schema_oid=arguments["catalog_schema_oid"],
-            preparation_schema=arguments["preparation_schema"],
-        )
-        == routines,
-        "creator_body_postimage_required",
+    routine_checks.require_cms_transition_routine_definitions(
+        routines,
+        catalog_schema=arguments["catalog_schema"],
+        catalog_schema_oid=arguments["catalog_schema_oid"],
+        preparation_schema=arguments["preparation_schema"],
     )
+    targets = _targets(arguments["catalog_schema"], arguments["preparation_schema"])
+    matched_names = set()
+    for routine in routines:
+        native_routine = routine["native"]
+        name, body = native_routine["definition"]["proname"], native_routine["definition"]["prosrc"]
+        if name not in targets:
+            continue
+        allowed, target = targets[name]
+        _require(
+            name not in matched_names
+            and body in allowed
+            and body == target
+            and native_routine["body"].count(body) == 1,
+            "creator_body_postimage_required",
+        )
+        matched_names.add(name)
+    _require(matched_names == targets.keys(), "creator_body_postimage_required")
 
 
 async def _closure_relation_oids(connection, native):
@@ -543,7 +560,68 @@ async def _profile_fingerprints(connection, storage_binding, policy, profile, so
     return custody._evidence_digests(evidence), routines, canonical
 
 
-async def prepare_cms_canonical_writer_fence(
+def _history_prework(history_prework):
+    _require(
+        type(history_prework) is dict
+        and set(history_prework) == {"history_dataset_ids", "bounds_validated"}
+        and type(history_prework["bounds_validated"]) is bool,
+        "history_prework_required",
+    )
+    datasets_by_root = history_prework["history_dataset_ids"]
+    _require(
+        type(datasets_by_root) is dict and set(datasets_by_root) == set(history.ROOTS), "history_datasets_required"
+    )
+    for dataset_ids in datasets_by_root.values():
+        history._bounds(dataset_ids)
+    return json.loads(_encoded(history_prework))
+
+
+async def _preparation_fingerprints(connection, storage_binding, policy, profile, arguments, deadline, history_prework):
+    if history_prework is None:
+        return (
+            *await _profile_fingerprints(connection, storage_binding, policy, profile, "source_document" in arguments),
+            {},
+        )
+    inventory_by_kind, bounds_by_root = await history_postimage.require_cms_history_prework_postimage(
+        connection,
+        storage_binding=storage_binding,
+        policy=policy,
+        cms_profile=profile,
+        deadline=deadline,
+        **history_prework,
+    )
+    projected_by_kind = history_postimage._without_history_bounds(inventory_by_kind, bounds_by_root)
+    retained_routines = (
+        sorted(entry["oid"] for entry in inventory_by_kind["routines"]) if "source_document" in arguments else []
+    )
+    return (
+        custody._evidence_digests(projected_by_kind),
+        retained_routines,
+        inventory_by_kind["canonical"],
+        bounds_by_root,
+    )
+
+
+async def _prepared_canonical(connection, storage_binding, policy, profile, authenticated_canonical, bounds_by_root):
+    canonical_by_field, family = await policy_checks._canonical(
+        connection, storage_binding, policy, profile["fixed_descendant_oids"]
+    )
+    if profile["contract"] == policy_checks.DEPENDENCY_CONTRACT or bounds_by_root:
+        _require(
+            {field: authenticated_canonical[field] for field in ("relations", "migration_plan")} == canonical_by_field,
+            "canonical_policy_changed",
+        )
+        canonical_by_field = authenticated_canonical
+    projected_by_field = canonical_by_field
+    if bounds_by_root:
+        projected_by_field = history_postimage._without_history_bounds(
+            {"canonical": canonical_by_field}, bounds_by_root
+        )["canonical"]
+    _require(custody._digest(projected_by_field) == profile["canonical_sha256"], "canonical_policy_changed")
+    return canonical_by_field, family
+
+
+async def _prepare_writer_fence(
     connection,
     *,
     storage_binding,
@@ -552,6 +630,7 @@ async def prepare_cms_canonical_writer_fence(
     callee_arguments,
     migration_role,
     deadline,
+    history_prework=None,
 ):
     """Preflight source-defined custody before the short lock window; caller authenticates the profile."""
     _deadline(deadline)
@@ -560,26 +639,23 @@ async def prepare_cms_canonical_writer_fence(
     arguments_by_field = _callee_arguments(callee_arguments, storage_binding)
     _require(connection.is_in_transaction() is True and connection.is_closed() is False, "transaction_required")
     async with asyncio.timeout_at(deadline):
-        actor = await _actor(connection, storage_binding, policy, migration_role)
-        observed_profile, retained_routines, authenticated_canonical = await _profile_fingerprints(
-            connection, storage_binding, policy, profile, "source_document" in arguments_by_field
+        actor = await _actor(
+            connection, storage_binding, policy, migration_role, allow_serializable=history_prework is not None
+        )
+        observed_profile, retained_routines, authenticated_canonical, bounds_by_root = await _preparation_fingerprints(
+            connection, storage_binding, policy, profile, arguments_by_field, deadline, history_prework
         )
         _require(
             observed_profile == {field: profile[field] for field in custody._DIGEST_FIELDS}, "protected_profile_changed"
         )
-        canonical_by_field, family = await policy_checks._canonical(
-            connection, storage_binding, policy, profile["fixed_descendant_oids"]
+        canonical_by_field, family = await _prepared_canonical(
+            connection, storage_binding, policy, profile, authenticated_canonical, bounds_by_root
         )
-        read_dependencies = []
-        if profile["contract"] == policy_checks.DEPENDENCY_CONTRACT:
-            _require(
-                {field: authenticated_canonical[field] for field in ("relations", "migration_plan")}
-                == canonical_by_field,
-                "canonical_policy_changed",
-            )
-            canonical_by_field = authenticated_canonical
-            read_dependencies = canonical_by_field["dependency_relations"]
-        _require(custody._digest(canonical_by_field) == profile["canonical_sha256"], "canonical_policy_changed")
+        read_dependencies = (
+            canonical_by_field["dependency_relations"]
+            if profile["contract"] == policy_checks.DEPENDENCY_CONTRACT
+            else []
+        )
         native_by_field = dict(
             actor=actor,
             deadline=deadline,
@@ -589,6 +665,7 @@ async def prepare_cms_canonical_writer_fence(
             family=family,
             arguments=arguments_by_field,
             **({"retained_routines": retained_routines} if retained_routines else {}),
+            **({"history_prework_only": True} if history_prework is not None else {}),
         )
         native_by_field = json.loads(_encoded(native_by_field))
         if retained_routines and profile["contract"] == policy_checks.DEPENDENCY_CONTRACT:
@@ -601,6 +678,58 @@ async def prepare_cms_canonical_writer_fence(
         preparation = _WriterPreparation(connection, asyncio.current_task(), _encoded(native_by_field))
         await _original(connection, preparation)
         return preparation
+
+
+async def prepare_cms_canonical_writer_fence(
+    connection, *, storage_binding, policy, cms_profile, callee_arguments, migration_role, deadline
+):
+    """Preflight source-defined custody before the short terminal lock window."""
+    return await _prepare_writer_fence(
+        connection,
+        storage_binding=storage_binding,
+        policy=policy,
+        cms_profile=cms_profile,
+        callee_arguments=callee_arguments,
+        migration_role=migration_role,
+        deadline=deadline,
+    )
+
+
+async def prepare_cms_history_prework_fence(
+    connection, *, storage_binding, policy, cms_profile, callee_arguments, migration_role, deadline, history_prework
+):
+    """Authenticate genuine profile custody with exactly two proved CHECK additions; prework only.
+
+    history_prework contains only history_dataset_ids and the boolean bounds_validated.
+    Read committed and serializable OriginalAdmin transactions are supported.
+    """
+    history_prework = _history_prework(history_prework)
+    return await _prepare_writer_fence(
+        connection,
+        storage_binding=storage_binding,
+        policy=policy,
+        cms_profile=cms_profile,
+        callee_arguments=callee_arguments,
+        migration_role=migration_role,
+        deadline=deadline,
+        history_prework=history_prework,
+    )
+
+
+async def require_cms_history_prework_fence(connection, preparation):
+    """Recheck the same prework actor, transaction, actual family and complete writer closure."""
+    _require(type(preparation) is _WriterPreparation, "preparation_required")
+    native = json.loads(preparation.native)
+    _require(native.get("history_prework_only") is True, "history_prework_required")
+    _deadline(native["deadline"])
+    async with asyncio.timeout_at(native["deadline"]):
+        native = await _original(connection, preparation)
+        observed_family = await custody._inventory(
+            connection, native["arguments"]["catalog_schema"], native["inventory_names"]
+        )
+        _require(observed_family == native["family"], "family_changed")
+        _require(await _closure(connection, native) == native["closure"], "closure_changed")
+        await _original(connection, preparation)
 
 
 async def _require_locks(connection, native):
@@ -623,6 +752,7 @@ async def acquire_cms_canonical_writer_fence(connection, preparation, *, deadlin
     _deadline(deadline)
     async with asyncio.timeout_at(deadline):
         native = await _original(connection, preparation)
+        _require(native.get("history_prework_only") is not True, "history_prework_only")
         _require(deadline <= native["deadline"], "deadline_extended")
         relations = sorted(storage_relation(entry["nspname"], entry["relname"]) for entry in native["relations"])
         await connection.execute(
@@ -644,6 +774,7 @@ async def require_cms_canonical_writer_fence(connection, fence):
     _deadline(fence.deadline)
     async with asyncio.timeout_at(fence.deadline):
         native = await _original(connection, fence.preparation)
+        _require(native.get("history_prework_only") is not True, "history_prework_only")
         observed_relations = [
             dict(row) for row in await connection.fetch(_IDENTITY_SQL, [entry["oid"] for entry in native["relations"]])
         ]

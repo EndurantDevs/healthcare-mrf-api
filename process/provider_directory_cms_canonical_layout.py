@@ -684,6 +684,25 @@ def _require_constraints(constraint_rows, expected, columns, root, schema_sql, c
     )
 
 
+def _without_authenticated_history_bounds(constraints, expected):
+    retained_constraints = []
+    seen = Counter()
+    by_oid = {entry["native"]["constraint"]["oid"]: entry["old_oid"] for entry in expected.values()}
+    for constraint in constraints:
+        if constraint["oid"] in by_oid:
+            _require(
+                constraint["root"] == by_oid[constraint["oid"]]
+                and constraint["conname"] == "cms_history_bound"
+                and constraint["contype"] == "c",
+                "history_bound_changed",
+            )
+            seen[constraint["oid"]] += 1
+        else:
+            retained_constraints.append(constraint)
+    _require(seen == Counter(dict.fromkeys(by_oid, 1)), "history_bound_changed")
+    return retained_constraints
+
+
 def _require_indexes(index_rows, expected, root, schema_sql):
     import json
 
@@ -781,7 +800,28 @@ def _require_root_layouts(
         _require_indexes([entry for entry in indexes if entry["root"] == oid], expected["indexes"], root, schema_sql)
 
 
-async def require_cms_canonical_layout(connection, *, catalog_schema, storage_class):
+async def _require_layout_dependencies(connection, catalog_schema, oids):
+    clones = await connection.fetch(
+        _CLONES_SQL, oids, list(_RESOURCE_FKS), storage_relation(catalog_schema, "provider_directory_dataset_resource")
+    )
+    _require(all(row["valid"] is True for row in clones), "fk_clone")
+    _require(await connection.fetchval(_CLONE_COVERAGE_SQL, oids, list(_RESOURCE_FKS)), "fk_clone_coverage")
+    clone_oids = [row["oid"] for row in clones]
+    # Reject nonnative dependencies before metadata rendering invokes native output functions.
+    _require(
+        await connection.fetchval(
+            _DEPENDENCIES_SQL,
+            oids,
+            catalog_schema,
+            storage_relation(catalog_schema, "provider_directory_endpoint_dataset"),
+            clone_oids,
+        ),
+        "dependencies",
+    )
+    return frozenset(clone_oids)
+
+
+async def require_cms_canonical_layout(connection, *, catalog_schema, storage_class, expected_history_bounds=None):
     """Read fixed legacy root semantics only; caller retains every authority/fence.
 
     No payload scan, explicit lock, setting change or observation hash is
@@ -793,6 +833,10 @@ async def require_cms_canonical_layout(connection, *, catalog_schema, storage_cl
     """
     _require(storage_class == CONTRACT, "storage_class")
     _require(type(catalog_schema) is str and 0 < len(catalog_schema.encode()) <= 63, "schema")
+    if expected_history_bounds is not None:
+        from process.provider_directory_cms_history_bounds import require_cms_history_expectations
+
+        expected_history_bounds = require_cms_history_expectations(expected_history_bounds)
     _require(connection.is_in_transaction(), "transaction")
     settings = await connection.fetchrow(
         "SELECT pg_catalog.current_setting('server_version_num')::integer AS version,"
@@ -805,31 +849,27 @@ async def require_cms_canonical_layout(connection, *, catalog_schema, storage_cl
     )
     roots = await connection.fetch(_ROOTS_SQL, [storage_relation(catalog_schema, name) for name in _LAYOUTS])
     _require(len(roots) == len(_LAYOUTS) and {entry["relname"] for entry in roots} == set(_LAYOUTS), "roots")
+    if expected_history_bounds is not None:
+        roots_by_name = {entry["relname"]: entry for entry in roots}
+        _require(
+            all(roots_by_name[root]["oid"] == entry["old_oid"] for root, entry in expected_history_bounds.items()),
+            "history_bound_changed",
+        )
     oids = [root_row["oid"] for root_row in roots]
-    clones = await connection.fetch(
-        _CLONES_SQL, oids, list(_RESOURCE_FKS), storage_relation(catalog_schema, "provider_directory_dataset_resource")
-    )
-    _require(all(root_row["valid"] is True for root_row in clones), "fk_clone")
-    _require(await connection.fetchval(_CLONE_COVERAGE_SQL, oids, list(_RESOURCE_FKS)), "fk_clone_coverage")
-    clone_oids = [root_row["oid"] for root_row in clones]
-    clone_oid_set = frozenset(clone_oids)
-    # Reject nonnative dependencies before metadata rendering can invoke type
-    # output/typmod functions. This is still a point-in-time check, not a fence.
-    _require(
-        await connection.fetchval(
-            _DEPENDENCIES_SQL,
-            oids,
-            catalog_schema,
-            storage_relation(catalog_schema, "provider_directory_endpoint_dataset"),
-            clone_oids,
-        ),
-        "dependencies",
-    )
+    clone_oid_set = await _require_layout_dependencies(connection, catalog_schema, oids)
+    if expected_history_bounds is not None:
+        from process.provider_directory_cms_history_bounds import require_cms_source_history_bounds
+
+        expected_history_bounds = await require_cms_source_history_bounds(
+            connection, catalog_schema=catalog_schema, expected=expected_history_bounds
+        )
     partitions_by_oid = {
         root_row["root"]: root_row["partition_key"] for root_row in await connection.fetch(_PARTITIONS_SQL, oids)
     }
     columns = await connection.fetch(_COLUMNS_SQL, oids, sorted(_TYPES))
     constraints = await connection.fetch(_CONSTRAINTS_SQL, oids)
+    if expected_history_bounds is not None:
+        constraints = _without_authenticated_history_bounds(constraints, expected_history_bounds)
     indexes = await connection.fetch(_INDEXES_SQL, oids)
     _require_root_layouts(
         roots, catalog_schema, settings, clone_oid_set, partitions_by_oid, columns, constraints, indexes

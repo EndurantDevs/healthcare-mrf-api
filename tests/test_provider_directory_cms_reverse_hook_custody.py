@@ -13,6 +13,7 @@ import pytest
 from db import migration_provider_directory_first_acquisition_retirement as retirement
 from process import provider_directory_cms_reverse_hook_custody as reverse
 from tests.test_provider_directory_cms_callee_custody import _catalog_definition, _parse_statements
+from tests.test_provider_directory_cms_history_bounds import _expectations
 from tests.test_provider_directory_cms_owner_permissions import _authenticate
 from tests.test_provider_directory_cms_owner_permissions import owner_case as owner_case
 from tests.test_provider_directory_cms_transition_routines import _raw
@@ -157,6 +158,60 @@ def _context(case, **changes):
     )
     arguments_by_name.update(changes)
     return reverse.cms_reverse_hook_custody(case.connection, **arguments_by_name)
+
+
+@pytest.mark.parametrize("fault", [None, "lock", "native", "profile", "recheck"])
+async def test_history_projection_keeps_actual_hooks_and_requires_live_bound_pins(reverse_case, monkeypatch, fault):
+    from process import provider_directory_cms_history_bounds as bounds
+
+    case = reverse_case
+    expected = _expectations([])
+    for relation in case.inventory["canonical"]["relations"]:
+        relation["native"].setdefault("constraints", [])
+    _authenticate(case)
+    for root, entry in expected.items():
+        relation = next(entry for entry in case.inventory["canonical"]["relations"] if entry["relname"] == root)
+        entry["old_oid"] = relation["oid"]
+        proof = entry["native"]["constraint"]
+        relation["native"]["constraints"].append(
+            [
+                dict(
+                    oid=str(proof["oid"]),
+                    conname="cms_history_bound",
+                    conrelid=str(relation["oid"]),
+                    contype="c",
+                    conbin=proof["tree"],
+                    convalidated=True,
+                    conkey=None,
+                ),
+                "CHECK (false)",
+            ]
+        )
+    case.fixed = {key: deepcopy(case.inventory["canonical"][key]) for key in ("relations", "migration_plan")}
+    case.family = deepcopy(case.fixed["relations"])
+    original_fetch = case.connection.fetchval
+
+    async def fetchval(statement, *arguments):
+        if arguments == (sorted(entry["old_oid"] for entry in expected.values()), ["ShareLock"]):
+            return fault != "lock"
+        return await original_fetch(statement, *arguments)
+
+    case.connection.fetchval = AsyncMock(side_effect=fetchval)
+    native = AsyncMock(side_effect=ValueError("native_pin_changed") if fault == "native" else None)
+    monkeypatch.setattr(bounds, "require_cms_source_history_bounds", native)
+    if fault == "profile":
+        case.inventory["roles"]["unissued"] = True
+    if fault:
+        with pytest.raises(ValueError, match="history_locks_required|native_pin_changed|inventory_changed"):
+            async with _context(case, history_bounds=expected) as recheck:
+                native.side_effect = ValueError("native_pin_changed")
+                await recheck()
+    else:
+        async with _context(case, history_bounds=expected) as recheck:
+            await recheck()
+        assert native.await_count == 2
+        assert case.fixed["relations"] == case.inventory["canonical"]["relations"]
+    assert all(call.kwargs["owner_oid"] == case.storage.namespace_owner_oid for call in native.await_args_list)
 
 
 @pytest.mark.parametrize("json_codec", [False, True])

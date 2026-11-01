@@ -10,6 +10,7 @@ import asyncio
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_canonical_layout as layout
+from process import provider_directory_cms_history_bounds as bounds
 from process import provider_directory_cms_prepared_context as context
 from process.provider_directory_cms_prepared_outputs import _copy_native_content
 from process.provider_directory_generic_source_policy import _savepoint
@@ -88,8 +89,23 @@ async def _state(database, session, connection):
     return actor_by_field
 
 
-async def _roots(connection, schema, expected):
-    await layout.require_cms_canonical_layout(connection, catalog_schema=schema, storage_class=layout.CONTRACT)
+def _history_bounds(value, expected, datasets):
+    if value is None:
+        return None
+    checked = bounds.require_cms_history_expectations(value)
+    _require(
+        all(entry["old_oid"] == expected["roots"][root]["oid"] for root, entry in checked.items())
+        and datasets == sorted({key for entry in checked.values() for key in entry["dataset_ids"]}),
+        "history_bounds_changed",
+    )
+    return checked
+
+
+async def _roots(connection, schema, expected, *, expected_history_bounds=None):
+    options = {} if expected_history_bounds is None else {"expected_history_bounds": expected_history_bounds}
+    await layout.require_cms_canonical_layout(
+        connection, catalog_schema=schema, storage_class=layout.CONTRACT, **options
+    )
     rows = await connection.fetch(_ROOTS_SQL, schema, list(ROOTS))
     _require(len(rows) == len(ROOTS) and {row["name"] for row in rows} == set(ROOTS), "roots_changed")
     for row in rows:
@@ -147,22 +163,30 @@ async def _scan_relations(connection, session, *, schema, receipts, datasets_by_
     return {"dataset_rows": counts, "content": content}
 
 
-async def _scan_history(connection, session, *, schema, expected, datasets):
+async def _scan_history(connection, session, *, schema, expected, datasets, expected_history_bounds=None):
     """Share complete scans; the enclosing entry point authenticates custody and transaction mode."""
-    await _roots(connection, schema, expected)
+    checked = _history_bounds(expected_history_bounds, expected, datasets)
+    options = {} if checked is None else {"expected_history_bounds": checked}
+    await _roots(connection, schema, expected, **options)
     scanned = await _scan_relations(
         connection,
         session,
         schema=schema,
         receipts={root: {"name": root, "oid": expected["roots"][root]["oid"]} for root in (WITNESS, RELATIONSHIP)},
-        datasets_by_root=dict.fromkeys((WITNESS, RELATIONSHIP), datasets),
+        datasets_by_root=(
+            dict.fromkeys((WITNESS, RELATIONSHIP), datasets)
+            if checked is None
+            else {root: entry["dataset_ids"] for root, entry in checked.items()}
+        ),
         relations_by_root={root: storage_relation(schema, root) for root in ROOTS},
     )
-    await _roots(connection, schema, expected)
+    await _roots(connection, schema, expected, **options)
     return {"catalog": expected, **scanned}
 
 
-async def read_cms_legacy_history(database, session, connection, *, catalog_schema, expected_catalog, dataset_ids):
+async def read_cms_legacy_history(
+    database, session, connection, *, catalog_schema, expected_catalog, dataset_ids, expected_history_bounds=None
+):
     """Read both complete heaps on one bounded original-admin snapshot and physical session.
 
     Native COPY streams every stored value in primary-key order. Three indexed
@@ -171,12 +195,17 @@ async def read_cms_legacy_history(database, session, connection, *, catalog_sche
     This is preparatory data evidence, not a closed-writer or conversion receipt.
     """
     expected, datasets = _request(catalog_schema, expected_catalog, dataset_ids)
+    checked = _history_bounds(expected_history_bounds, expected, datasets)
     actor_by_field = await _state(database, session, connection)
     _require(actor_by_field["database_oid"] == expected["database_oid"], "database_changed")
     async with _savepoint(connection):
-        scanned = await _scan_history(connection, session, schema=catalog_schema, expected=expected, datasets=datasets)
+        options = {} if checked is None else {"expected_history_bounds": checked}
+        scanned = await _scan_history(
+            connection, session, schema=catalog_schema, expected=expected, datasets=datasets, **options
+        )
         _require(await _state(database, session, connection) == actor_by_field, "snapshot_changed")
         _require(_request(catalog_schema, expected_catalog, dataset_ids) == (expected, datasets), "inputs_changed")
+        _require(_history_bounds(expected_history_bounds, expected, datasets) == checked, "inputs_changed")
     return {
         "contract": CONTRACT,
         "evidence": "read_only_snapshot",

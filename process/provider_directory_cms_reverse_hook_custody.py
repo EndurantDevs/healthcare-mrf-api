@@ -187,9 +187,45 @@ async def _bindings(connection, function_oids, catalog_oids):
     return dict(catalog_oid=_oid(observed["catalog_oid"]), bindings=custody._decoded(observed["bindings"]))
 
 
+async def _history_projection(connection, inventory, binding, history_bounds):
+    if history_bounds is None:
+        return inventory
+    from process import provider_directory_cms_history_bounds as bounds
+    from process.provider_directory_cms_history_postimage import _without_history_bounds
+
+    checked = bounds.require_cms_history_expectations(history_bounds)
+    _require(
+        await connection.fetchval(
+            custody._ALLOCATION_LOCKS_SQL,
+            sorted(entry["old_oid"] for entry in checked.values()),
+            ["ShareLock"],
+        )
+        is True,
+        "history_locks_required",
+    )
+    await bounds.require_cms_source_history_bounds(
+        connection,
+        catalog_schema=binding.catalog_schema,
+        expected=checked,
+        owner_oid=binding.namespace_owner_oid,
+    )
+    return _without_history_bounds(inventory, checked)
+
+
+async def _catalog_locks(connection):
+    catalog_oids = await custody._lock_allocation_catalogs(connection)
+    _require(
+        type(catalog_oids) is list
+        and len({_oid(oid) for oid in catalog_oids}) == len(catalog_oids) == len(custody._ALLOCATION_CATALOGS),
+        "catalog_identity_changed",
+    )
+    await connection.execute("LOCK TABLE pg_catalog.pg_trigger IN SHARE MODE NOWAIT")
+    return catalog_oids
+
+
 @asynccontextmanager
 async def cms_reverse_hook_custody(
-    connection, *, inventory, storage_binding, policy, cms_profile, source_document, deadline
+    connection, *, inventory, storage_binding, policy, cms_profile, source_document, deadline, history_bounds=None
 ):
     """Yield a same-task recheck; caller retains one <=3s clock through commit.
 
@@ -199,9 +235,13 @@ async def cms_reverse_hook_custody(
     after intentional changes. Exit only invalidates this local callback.
     """
     _deadline(deadline)
-    inventory, cms_profile, source_document = deepcopy((inventory, cms_profile, source_document))
+    inventory, cms_profile, source_document, history_bounds = deepcopy(
+        (inventory, cms_profile, source_document, history_bounds)
+    )
+    async with asyncio.timeout_at(deadline):
+        projected = await _history_projection(connection, inventory, storage_binding, history_bounds)
     function_oids, run_oid, retirement_oid, excluded_roles = _inputs(
-        inventory, storage_binding, policy, cms_profile, source_document
+        projected, storage_binding, policy, cms_profile, source_document
     )
     _deadline(deadline)
     task, has_scope = asyncio.current_task(), True
@@ -221,13 +261,7 @@ async def cms_reverse_hook_custody(
                 and actor_by_field["readonly"] == "off",
                 "original_admin_required",
             )
-            catalog_oids = await custody._lock_allocation_catalogs(connection)
-            _require(
-                type(catalog_oids) is list
-                and len({_oid(oid) for oid in catalog_oids}) == len(catalog_oids) == len(custody._ALLOCATION_CATALOGS),
-                "catalog_identity_changed",
-            )
-            await connection.execute("LOCK TABLE pg_catalog.pg_trigger IN SHARE MODE NOWAIT")
+            catalog_oids = await _catalog_locks(connection)
             before = await _bindings(connection, function_oids, catalog_oids)
             dynamic_relations = await _dynamic_relations(connection, inventory, storage_binding, policy, cms_profile)
             expected = _expected_hooks(inventory, function_oids, dynamic_relations)
@@ -241,6 +275,7 @@ async def cms_reverse_hook_custody(
                     await _original(connection, task, actor_by_field, deadline)
                     current = await _bindings(connection, function_oids, catalog_oids)
                     _require(current == before, "bindings_changed")
+                    await _history_projection(connection, inventory, storage_binding, history_bounds)
                     await _original(connection, task, actor_by_field, deadline)
 
             yield recheck

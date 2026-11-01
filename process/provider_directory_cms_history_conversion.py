@@ -124,6 +124,19 @@ def _bounds(dataset_ids):
     return ",".join("E'" + key.replace("\\", "\\\\").replace("'", "''") + "'" for key in dataset_ids)
 
 
+def cms_history_bound_statements(catalog_schema, history_dataset_ids):
+    """Render only the two fixed heap bounds, without an allocation or caller SQL."""
+    _require(type(history_dataset_ids) is dict and set(history_dataset_ids) == set(ROOTS), "roots_required")
+    additions, validations = [], []
+    for root in ROOTS:
+        relation = storage_relation(catalog_schema, root)
+        literals = _bounds(history_dataset_ids[root])
+        expression = "dataset_id IN (" + literals + ")" if literals else "false"
+        additions.append(f"ALTER TABLE {relation} ADD CONSTRAINT {_BOUND} CHECK ({expression}) NOT VALID")
+        validations.append(f"ALTER TABLE {relation} VALIDATE CONSTRAINT {_BOUND}")
+    return {"add": tuple(additions), "validate": tuple(validations)}
+
+
 def _request(request):
     _require(type(request) is dict and set(request) == _REQUEST_FIELDS, "request_required")
     request = deepcopy(request)
@@ -165,11 +178,10 @@ def _heap_plan(request, root):
     history = storage_relation(schema, history_name)
     literals = _bounds(entry["dataset_ids"])
     bound = "dataset_id IN (" + literals + ")" if literals else "false"
+    prework = cms_history_bound_statements(schema, {name: request["heaps"][name]["dataset_ids"] for name in ROOTS})
+    position = ROOTS.index(root)
     return {
-        "prework": (
-            f"ALTER TABLE {old_relation} ADD CONSTRAINT {_BOUND} CHECK ({bound}) NOT VALID",
-            f"ALTER TABLE {old_relation} VALIDATE CONSTRAINT {_BOUND}",
-        ),
+        "prework": (prework["add"][position], prework["validate"][position]),
         "foreign_keys": tuple(
             f"ALTER TABLE {old_relation} DROP CONSTRAINT {storage_identifier(name)}"
             for name in sorted(old["foreign_keys"])

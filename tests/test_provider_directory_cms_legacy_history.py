@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import provider_directory_cms_legacy_history as history
+from tests.test_provider_directory_cms_history_bounds import _expectations
 
 
 def _catalog():
@@ -96,3 +97,81 @@ async def test_shared_scan_refuses_incomplete_copy_before_relationships(monkeypa
     with pytest.raises(ValueError, match="row_count_changed"):
         await history._scan_history(None, None, schema="example", expected=_catalog(), datasets=["one"])
     relationships.assert_not_awaited()
+
+
+@pytest.mark.parametrize("fault", ["oid", "datasets", "partial"])
+async def test_explicit_history_expectation_mismatch_refuses_before_session_io(fault):
+    expected = _catalog()
+    checked = _expectations()
+    for root, entry in checked.items():
+        entry["old_oid"] = expected["roots"][root]["oid"]
+    if fault == "oid":
+        checked[history.WITNESS]["old_oid"] = 999
+    elif fault == "datasets":
+        checked[history.WITNESS]["dataset_ids"] = []
+        checked[history.RELATIONSHIP]["dataset_ids"] = []
+        for entry in checked.values():
+            entry["native"]["constraint"]["columns"] = []
+    else:
+        checked.pop(history.RELATIONSHIP)
+    with pytest.raises(ValueError, match="history_bounds_changed|expectations_required"):
+        await history.read_cms_legacy_history(
+            None,
+            None,
+            None,
+            catalog_schema="example",
+            expected_catalog=expected,
+            dataset_ids=["one"],
+            expected_history_bounds=checked,
+        )
+
+
+async def test_explicit_history_scan_preserves_each_sealed_bound_and_both_layout_checks(monkeypatch):
+    expected = _catalog()
+    checked = _expectations()
+    for root, entry in checked.items():
+        entry["old_oid"] = expected["roots"][root]["oid"]
+    checked[history.RELATIONSHIP]["dataset_ids"] = ["two"]
+    roots = AsyncMock()
+    scanner = AsyncMock(return_value={"dataset_rows": {}, "content": {}})
+    monkeypatch.setattr(history, "_roots", roots)
+    monkeypatch.setattr(history, "_scan_relations", scanner)
+    connection, session = object(), object()
+    await history._scan_history(
+        connection,
+        session,
+        schema="example",
+        expected=expected,
+        datasets=["one", "two"],
+        expected_history_bounds=checked,
+    )
+    assert roots.await_count == 2
+    assert all(call.kwargs == {"expected_history_bounds": checked} for call in roots.await_args_list)
+    assert scanner.await_args.kwargs["datasets_by_root"] == {history.WITNESS: ["one"], history.RELATIONSHIP: ["two"]}
+
+
+async def test_root_layout_forwards_explicit_expectations_without_replacing_native_identity(monkeypatch):
+    from types import SimpleNamespace
+
+    expected = _catalog()
+    checked = _expectations()
+    for root, entry in checked.items():
+        entry["old_oid"] = expected["roots"][root]["oid"]
+    rows = [
+        dict(
+            name=root,
+            nspname="example",
+            schema_oid=52,
+            relkind="p" if root == history.RESOURCE else "r",
+            leaf=True,
+            **proof,
+        )
+        for root, proof in expected["roots"].items()
+    ]
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=rows))
+    authenticate = AsyncMock()
+    monkeypatch.setattr(history.layout, "require_cms_canonical_layout", authenticate)
+    await history._roots(connection, "example", expected, expected_history_bounds=checked)
+    authenticate.assert_awaited_once_with(
+        connection, catalog_schema="example", storage_class=history.layout.CONTRACT, expected_history_bounds=checked
+    )

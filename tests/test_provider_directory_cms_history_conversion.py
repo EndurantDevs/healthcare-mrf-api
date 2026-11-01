@@ -9,6 +9,26 @@ from process import provider_directory_cms_history_conversion as history
 from process.provider_directory_cms_canonical_layout import _LAYOUTS
 
 
+@pytest.mark.parametrize("datasets", [[], ["one"], ["quote'", "slash\\value"]])
+def test_fixed_prework_sql_is_the_existing_conversion_plan_without_candidate_parents(datasets):
+    request = _request(same_schema=True)
+    for heap in request["heaps"].values():
+        heap["dataset_ids"] = datasets
+    statements = history.cms_history_bound_statements("catalog", {root: datasets for root in history.ROOTS})
+    plan = history.plan_cms_history_conversion(request)
+    assert plan["prework"] == tuple(
+        statement for pair in zip(statements["add"], statements["validate"], strict=True) for statement in pair
+    )
+    assert all(statement.endswith("NOT VALID") for statement in statements["add"])
+    assert all("VALIDATE CONSTRAINT cms_history_bound" in statement for statement in statements["validate"])
+
+
+@pytest.mark.parametrize("datasets", [{}, {"unknown": []}, {root: ["later", "earlier"] for root in history.ROOTS}])
+def test_prework_renderer_refuses_unknown_heaps_and_noncanonical_dataset_sets(datasets):
+    with pytest.raises(ValueError, match="roots_required|bounds_required"):
+        history.cms_history_bound_statements("catalog", datasets)
+
+
 @pytest.mark.parametrize(
     "schema, rendered", [("mrf", "mrf"), ("catalog", "catalog"), ("MixedCase", '"MixedCase"'), ("select", '"select"')]
 )
