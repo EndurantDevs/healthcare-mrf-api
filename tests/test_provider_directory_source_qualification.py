@@ -3,6 +3,7 @@
 
 import asyncio
 import importlib
+import ssl
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -18,6 +19,29 @@ from process.provider_directory_source_selection import qualify_stale_isolated_s
 directory = importlib.import_module("process.provider_directory_fhir")
 _REAL_SOURCE_FETCH = directory._fetch_source_json
 CAPABILITY = {"resourceType": "CapabilityStatement", "rest": [{"resource": [{"type": "Practitioner"}]}]}
+
+
+@pytest.mark.asyncio
+async def test_stale_same_collection_source_opens_verified_qualification_session(monkeypatch):
+    source_record = _source()
+    source_record["metadata_json"]["provider_directory_pagination_same_collection"] = True
+    monkeypatch.setenv(directory.SOURCE_HTTP_KEEPALIVE_ENV, "false")
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_TLS_VERIFY", "false")
+    monkeypatch.setattr(directory, "_fetch_source_json", _REAL_SOURCE_FETCH)
+    calls = []
+
+    async def fetch(session, url, **options):
+        calls.append(url)
+        assert session is directory._SOURCE_HTTP_SESSION.get()
+        assert session.connector._ssl.verify_mode == ssl.CERT_REQUIRED
+        assert options["preserve_url_bytes"] is True and options["allow_redirects"] is False
+        payload = CAPABILITY if "/metadata" in url else {"resourceType": "Bundle", "type": "searchset", "entry": []}
+        return 200, payload, None, 1
+
+    monkeypatch.setattr(directory, "_fetch_json_with_source_session", fetch)
+    qualified = await qualify_stale_isolated_source(directory, [source_record], _task(), timeout=3, run_id=None)
+    assert qualified == [{**source_record, "last_validated_status": "valid"}]
+    assert len(calls) == 2 and directory._SOURCE_HTTP_SESSION.get() is None
 
 
 def _source():

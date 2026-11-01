@@ -17,7 +17,7 @@ from process import registry_membership_refresh_runtime as runtime
 from process import registry_source_office_custody as office_custody
 from process import registry_source_recipe_composition as composition
 from process import registry_verified_witness_offices as offices
-from tests.test_verified_inventory_v2 import context
+from tests.test_verified_inventory_v2 import context, rows
 
 
 @pytest.mark.parametrize("aliases", [False, True])
@@ -118,6 +118,7 @@ async def test_compact_v2_preserves_direct_origin(monkeypatch):
 
 async def test_independent_v2_reuse_follows_declared_source_not_publication_fence(monkeypatch):
     previous = SimpleNamespace(generation_id=UUID(int=1))
+    recipe, _, _ = rows()
     address_inputs = (object(), ("reader",))
     monkeypatch.setattr(office_records, "verify_initial_source_office_receipt", lambda candidate: {"revision": 5})
     monkeypatch.setattr(office_custody, "_office_inputs", lambda candidate: address_inputs)
@@ -136,7 +137,7 @@ async def test_independent_v2_reuse_follows_declared_source_not_publication_fenc
         expected={"revision": 4},
         control_schema="registry",
         office_authority=None,
-        inventory=(object(), (SimpleNamespace(source_pin=object()),), ()),
+        inventory=(object(), (recipe,), ()),
     )
     read_context = stage.await_args.kwargs["read_context"]
     assert read_context.source_manifest is previous

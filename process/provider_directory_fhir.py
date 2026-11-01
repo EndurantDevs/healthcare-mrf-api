@@ -1503,6 +1503,8 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         CARESOURCE_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
         christus.API_BASE,
+        "https://api.capitalbluecrossfhir.com/r4/public-ma",
+        "https://api.capitalbluecrossfhir.com/r4/public-chip",
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
@@ -17349,9 +17351,11 @@ def _source_contract_metadata_keys(
     *,
     artifact: bool,
 ) -> tuple[str, ...]:
-    """Preserve legacy tuples while extending only shaped v3 identities."""
+    """Preserve legacy tuples while binding explicit traversal controls."""
 
     base_keys = ARTIFACT_SOURCE_CONTRACT_METADATA_KEYS if artifact else TWIN_ROOT_ACQUISITION_METADATA_KEYS
+    if "provider_directory_pagination_same_collection" in metadata:
+        base_keys += ("provider_directory_pagination_same_collection",)
     is_subset_shape = bool(
         metadata.get(CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD) == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
         and metadata.get(CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD) == SERVER_ISSUED_SUBSET_SEMANTICS
@@ -40205,6 +40209,11 @@ def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list
     return [seed_row_by_field] if _is_seed_row_query_match(seed_row_by_field, source_query) else []
 
 
+def _capital_blue_cross_product_seed_rows() -> list[dict[str, Any]]:
+    """Use the product metadata through the existing supplemental catalog loader."""
+    return source_selection.capital_blue_cross_product_seed_rows(sys.modules[__name__])
+
+
 @dataclass(frozen=True)
 class _ReviewedCandidateSeed:
     row_id: str
@@ -40516,6 +40525,7 @@ def _seed_rows_from_supplemental_catalogs(
         ("anthem", anthem.API_BASE, anthem.seed_rows),
         ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
         ("pacificsource", pacificsource.API_BASE, pacificsource.seed_rows),
+        ("capital_blue_cross_products", "capital-blue-cross-public-directory", _capital_blue_cross_product_seed_rows),
         ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
         ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
         ("mvp_health_care", mvp.API_BASE, mvp.seed_rows),
@@ -42270,14 +42280,13 @@ async def _probe_source(
 
 
 def _source_probe_hard_timeout_seconds(source: dict[str, Any], *, timeout: int) -> int:
+    """Use the common source qualification deadline policy."""
     return source_selection.source_probe_hard_timeout_seconds(sys.modules[__name__], source, timeout=timeout)
 
 
 def _probe_flush_every() -> int:
-    try:
-        return max(1, int(os.getenv("HLTHPRT_PROVIDER_DIRECTORY_PROBE_FLUSH_EVERY", "50")))
-    except ValueError:
-        return 50
+    """Use the common bounded source probe update policy."""
+    return source_selection.probe_flush_every()
 
 
 async def _run_source_probe_batch(
@@ -42293,6 +42302,10 @@ async def _run_source_probe_batch(
     capability_rows: list[dict[str, Any]] = []
     source_updates: list[dict[str, Any]] = []
     valid_source_ids: set[str] = set()
+    has_ordinary_sources = any(
+        not source_selection.requires_verified_session(sys.modules[__name__], source_record)
+        for source_record in source_rows
+    )
     probe_counts_by_name = {"valid": 0, "probed": 0}
     total_sources = len(source_rows)
     report_every = max(1, total_sources // 20)
@@ -42334,9 +42347,13 @@ async def _run_source_probe_batch(
                 timeout=timeout,
             )
             try:
-                probe_map, capability_payload = await asyncio.wait_for(
-                    _probe_source(source_row, timeout=timeout, run_id=run_id),
-                    timeout=hard_timeout,
+                probe_map, capability_payload = await source_selection.probe_with_deadline(
+                    sys.modules[__name__],
+                    source_row,
+                    isolate_tls=has_ordinary_sources,
+                    timeout=timeout,
+                    run_id=run_id,
+                    hard_timeout=hard_timeout,
                 )
             except TimeoutError:
                 probe_map = {
@@ -42758,32 +42775,16 @@ def _synthetic_position_page_guard_completeness(
 
 
 def _pagination_host_key(url_or_host: str | None) -> str | None:
-    text = _clean_text(url_or_host)
-    if not text:
-        return None
-    parsed = urllib.parse.urlsplit(text if "://" in text else f"https://{text}")
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
-        return None
-    try:
-        port = parsed.port or 443
-    except ValueError:
-        return None
-    return f"{parsed.hostname.lower()}:{port}"
+    """Use the common HTTPS origin parser."""
+    return source_selection.pagination_host_key(sys.modules[__name__], url_or_host)
 
 
 def _pagination_allowed_hosts(
     source_record: dict[str, Any],
     current_url: str,
 ) -> set[str]:
-    api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    allowed_hosts = {
-        host_key for candidate_url in (api_base, current_url) if (host_key := _pagination_host_key(candidate_url))
-    }
-    configured_hosts = _string_list(_source_metadata(source_record).get("provider_directory_pagination_allowed_hosts"))
-    for configured_host in configured_hosts:
-        if host_key := _pagination_host_key(configured_host):
-            allowed_hosts.add(host_key)
-    return allowed_hosts
+    """Use the common source policy without changing existing callers."""
+    return source_selection.pagination_allowed_hosts(sys.modules[__name__], source_record, current_url)
 
 
 def _is_trusted_fhir_pagination_url(
@@ -42791,15 +42792,8 @@ def _is_trusted_fhir_pagination_url(
     current_url: str,
     next_url: str,
 ) -> bool:
-    parsed_next = urllib.parse.urlsplit(next_url)
-    next_host_key = _pagination_host_key(next_url)
-    return bool(
-        next_host_key
-        and next_host_key in _pagination_allowed_hosts(source_record, current_url)
-        and parsed_next.username is None
-        and parsed_next.password is None
-        and not parsed_next.fragment
-    )
+    """Apply the shared source continuation policy."""
+    return source_selection.is_trusted_fhir_pagination_url(sys.modules[__name__], source_record, current_url, next_url)
 
 
 def _is_idaho_medicaid_query_valid(
@@ -58061,26 +58055,8 @@ def _uses_uhc_official_file_connector(source: Mapping[str, Any]) -> bool:
 
 
 def _resource_endpoint_signature(source: dict[str, Any]) -> tuple[tuple[str, str], ...]:
-    signature_items = tuple(
-        (field, _clean_text(source.get(field)) or "") for field in sorted(RESOURCE_ENDPOINT_FIELDS.values())
-    )
-    connector_contract = _alohr_graphql_acquisition_contract(source)
-    if connector_contract is not None:
-        signature_items += (
-            (
-                "connector_acquisition_contract",
-                _stable_identity_json(connector_contract),
-            ),
-        )
-    census_contract = current_version_census_contract(source)
-    if census_contract is not None:
-        signature_items += (
-            (
-                "current_version_census_identity",
-                _stable_identity_json(census_contract.identity()),
-            ),
-        )
-    return signature_items
+    """Keep alias grouping bound to each source's effective continuation policy."""
+    return source_selection.resource_endpoint_signature(sys.modules[__name__], source)
 
 
 def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[tuple[str, str], ...]]:
@@ -58560,6 +58536,8 @@ def _pagination_checkpoint_scope_identity(
         "source_ids": sorted(set(source_ids)),
         "resource_group": _resource_import_group_key(source_record),
     }
+    if _source_metadata(source_record).get("provider_directory_pagination_same_collection") is True:
+        scope_payload_dict["pagination_same_collection"] = True
     if last_updated_partition_config:
         scope_payload_dict["last_updated_partition_config"] = last_updated_partition_config
     if census_contract is not None:
@@ -67752,6 +67730,10 @@ async def _import_resources(
         provider_directory_endpoint_scope,
     )
     source_groups = _group_resource_import_sources(source_records, linked_resource_limit=linked_resource_limit)
+    has_ordinary_sources = any(
+        not source_selection.requires_verified_session(sys.modules[__name__], source_record)
+        for source_record in source_records
+    )
     total_groups = len(source_groups)
     completed_groups = 0
     report_every = max(1, total_groups // 20)
@@ -68381,9 +68363,20 @@ async def _import_resources(
         """Run one import coroutine under the shared concurrency limit."""
         async with semaphore:
             prepared_source_lists = [source_records]
-            async with _provider_directory_import_progress_scope(
-                lambda: (completed_groups / max(total_groups, 1)) * 100,
-                lambda: clear_partial_progress(id(prepared_source_lists[0])),
+            async with (
+                _provider_directory_import_progress_scope(
+                    lambda: (completed_groups / max(total_groups, 1)) * 100,
+                    lambda: clear_partial_progress(id(prepared_source_lists[0])),
+                ),
+                source_selection.verified_session_scope(
+                    sys.modules[__name__],
+                    source_records,
+                    enabled=has_ordinary_sources,
+                    request_concurrency=max(
+                        resource_scan_concurrency,
+                        min(100, max(1, linked_resource_concurrency)) if linked_resource_limit > 0 else 1,
+                    ),
+                ),
             ):
                 checkpoint_guard_context = _resource_group_pagination_checkpoint_context(
                     source_records,
@@ -70197,19 +70190,15 @@ async def process_provider_directory_fhir_data(
         probe_source_rows = _source_rows_allowed_for_probe(source_rows)
         metrics_by_key["manual_only_sources_skipped_before_probe"] = len(source_rows) - len(probe_source_rows)
         if not seed_only and probe and probe_source_rows:
-            has_capped_sources = any(
-                capped_partition.enabled(sys.modules[__name__], source_record) for source_record in probe_source_rows
+            probed, valid, valid_source_ids = await source_selection.probe_sources_with_session(
+                sys.modules[__name__],
+                probe_source_rows,
+                census_contract=census_contract,
+                proxy_run=proxy_run,
+                timeout=timeout,
+                concurrency=concurrency,
+                run_id=run_id,
             )
-            async with _source_http_session_scope(
-                force=census_contract is not None or bool(proxy_run.bindings) or has_capped_sources,
-                require_verified_tls=census_contract is not None or has_capped_sources,
-            ):
-                probed, valid, valid_source_ids = await _run_source_probe_batch(
-                    probe_source_rows,
-                    timeout=timeout,
-                    concurrency=concurrency,
-                    run_id=run_id,
-                )
             metrics_by_key["sources_probed"] = probed
             metrics_by_key["valid_capability_sources"] = valid
         if not seed_only and import_resources and source_rows:
