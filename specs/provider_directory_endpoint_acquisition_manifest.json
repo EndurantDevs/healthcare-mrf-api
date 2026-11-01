@@ -16,6 +16,7 @@
     "verification_snapshot": "specs/provider_directory_endpoint_verification.json",
     "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
+      "bcbs-alabama": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-01", "method": "rest", "limitation": "The carrier-native public directory supports eight anonymous collections with server-issued ct continuations. Seven nonempty collections and an empty Endpoint collection were observed in bounded reads. Requests are paced above the reported one-per-second limit; page size is capped at the verified 100. Native commercial POS/EPO/PPO, Federal Employee Program and Blue Advantage plans were observed; Blue Secure equivalence, complete product membership, terminal acquisition, publication and search readiness remain unverified. This directory is independent of the Alabama HIE. The provider-directory route does not require the patient authorization flow."},
       "iowa-medicaid": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition is configured for all eight Plan-Net collections at the CMS-listed R4 base, using stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. Resource population and publication readiness require separate verification. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections, and bounded ID-only searches succeeded. Repeated sampled windows agreed and adjacent sampled windows did not overlap; the samples did not establish exhaustive traversal. Searches omitted totals."},
       "pennsylvania-medicaid": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition is configured for all eight Plan-Net collections at the CMS-listed R4 base, using stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. Resource population and publication readiness require separate verification. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections, and bounded ID-only searches succeeded. Repeated sampled windows agreed and adjacent sampled windows did not overlap; the samples did not establish exhaustive traversal. Searches omitted totals."},
       "san-bernardino-county-dbh": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition is configured for all eight resource families at the Netsmart R4 base. It ignores advertised next links and advances a stable _id-sorted _offset page index by one after each full page; short pages terminate traversal and repeated pages fail closed. Bounded source observations (2026-10-10): Anonymous R4 metadata declared all eight configured collections. Bounded ID-only Location searches found that _offset values 0, 1 and 2 returned distinct sampled pages, consistent with the maintained page-index rule. These samples did not establish exhaustive traversal, population adequacy or publication readiness."},
@@ -610,6 +611,28 @@
           "OrganizationAffiliation": "https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc/OrganizationAffiliation"
         }
       }
+    },
+    {
+      "entry_id": "bcbs-alabama",
+      "display_name": "Blue Cross and Blue Shield of Alabama",
+      "owner_id": "bcbs-alabama",
+      "source_ids": [
+        "pdfhir_e0153166e75593bd07cb0525"
+      ],
+      "canonical_base": "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
     }
   ]
 }

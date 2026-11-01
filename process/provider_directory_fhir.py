@@ -84,6 +84,7 @@ from db.models import (
     db,
 )
 from db.plan_release_storage import storage_relation
+from process import provider_directory_bcbs_alabama as alabama_directory
 from process import provider_directory_bulk_parallel as bulk_parallel
 from process import provider_directory_christus as christus
 from process import provider_directory_cms_desired_fence as cms_desired_fence
@@ -40512,6 +40513,7 @@ def _seed_rows_from_supplemental_catalogs(
     supplemental_rows.extend(remote_rows)
     metrics_by_name["catalogs"].update(remote_metrics_by_catalog)
     for name, base, seed_loader in (
+        ("bcbs_alabama", alabama_directory.API_BASE, partial(alabama_directory.seed_rows, sys.modules[__name__])),
         ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
         ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
         ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
@@ -40964,7 +40966,7 @@ async def _fetch_json_with_source_session(
     *,
     timeout: int,
     allow_redirects: bool = True,
-    preserve_url_bytes: bool = False,
+    preserve_url_bytes: bool = True,
     proxy_options: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
@@ -57668,16 +57670,7 @@ def _source_resource_fetch_order(
     requested_resources: list[str],
 ) -> list[str]:
     """Return the requested resources in the order appropriate for one source."""
-    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
-    if api_base != CIGNA_PROVIDER_DIRECTORY_BASE:
-        return list(requested_resources)
-    foundational_resources = [
-        resource_type for resource_type in requested_resources if resource_type != "PractitionerRole"
-    ]
-    practitioner_role_resources = [
-        resource_type for resource_type in requested_resources if resource_type == "PractitionerRole"
-    ]
-    return foundational_resources + practitioner_role_resources
+    return bulk_parallel.resource_fetch_order(sys.modules[__name__], source, requested_resources)
 
 
 def _has_parallel_resource_transport(

@@ -4,6 +4,13 @@
   "campaign_id": "provider-directory-canonical-acquisition-2026-07-10-v2",
   "checked_at": null,
   "entries": {
+    "bcbs-alabama": {
+      "terminal_status": null,
+      "run_id": null,
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "proof_state": "not_recorded"
+    },
     "iowa-medicaid": {
       "terminal_status": null,
       "run_id": null,

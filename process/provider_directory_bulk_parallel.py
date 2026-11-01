@@ -181,3 +181,32 @@ def effective_resource_concurrency(directory, source_record, options):
     except RuntimeError:
         return 1
     return min(requested, len(resources))
+
+
+def resource_fetch_order(directory, source_record, requested_resources):
+    """Return the requested resources in the order appropriate for one source."""
+    configured_order = directory._source_metadata(source_record).get("provider_directory_resource_fetch_order")
+    if configured_order is not None:
+        if (
+            not isinstance(configured_order, list)
+            or any(
+                not isinstance(resource, str) or resource not in directory.DEFAULT_RESOURCES
+                for resource in configured_order
+            )
+            or len(configured_order) != len(set(configured_order))
+        ):
+            raise ValueError("provider_directory_resource_fetch_order_invalid")
+        priority_by_resource = {resource: index for index, resource in enumerate(configured_order)}
+        requested_resources = sorted(
+            requested_resources, key=lambda resource: priority_by_resource.get(resource, len(priority_by_resource))
+        )
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if api_base != directory.CIGNA_PROVIDER_DIRECTORY_BASE:
+        return list(requested_resources)
+    foundational_resources = [
+        resource_type for resource_type in requested_resources if resource_type != "PractitionerRole"
+    ]
+    practitioner_role_resources = [
+        resource_type for resource_type in requested_resources if resource_type == "PractitionerRole"
+    ]
+    return foundational_resources + practitioner_role_resources
