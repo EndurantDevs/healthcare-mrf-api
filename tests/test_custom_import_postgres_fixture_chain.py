@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from asyncpg.exceptions import CheckViolationError, LockNotAvailableError
+from sqlalchemy.exc import DBAPIError
 
 from tests import custom_import_postgres_support as support
 
@@ -230,6 +232,52 @@ def _fake_fixture_engine(monkeypatch, connection):
     monkeypatch.setattr(support, "_database_url", lambda: object())
     monkeypatch.setattr(support.uuid, "uuid4", lambda: SimpleNamespace(hex="0123456789abcdef"))
     return engine
+
+
+@pytest.mark.asyncio
+async def test_publication_fixture_retries_rolled_back_setup_lock_once(monkeypatch):
+    failure = DBAPIError("synthetic fixture setup", None, LockNotAvailableError("synthetic lock"))
+    connection = SimpleNamespace(
+        execute=AsyncMock(), scalar=AsyncMock(return_value=None), run_sync=AsyncMock(side_effect=[failure, None])
+    )
+    engine = _fake_fixture_engine(monkeypatch, connection)
+    transactions = []
+
+    @asynccontextmanager
+    async def transaction():
+        transactions.append("begin")
+        try:
+            yield connection
+        except DBAPIError:
+            transactions.append("rollback")
+            raise
+        else:
+            transactions.append("commit")
+
+    engine.begin = transaction
+    async with support.isolated_publication_case():
+        assert transactions == ["begin", "commit", "begin", "rollback", "begin", "commit"]
+        assert connection.run_sync.await_count == 2
+    assert transactions[-2:] == ["begin", "commit"]
+    engine.dispose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,attempts", [(CheckViolationError("synthetic constraint"), 1), (LockNotAvailableError("synthetic lock"), 2)]
+)
+async def test_publication_fixture_propagates_nonlock_or_repeated_setup_failure(monkeypatch, error, attempts):
+    failure = DBAPIError("synthetic fixture setup", None, error)
+    connection = SimpleNamespace(
+        execute=AsyncMock(), scalar=AsyncMock(return_value=None), run_sync=AsyncMock(side_effect=failure)
+    )
+    engine = _fake_fixture_engine(monkeypatch, connection)
+    with pytest.raises(DBAPIError) as caught:
+        async with support.isolated_publication_case():
+            pytest.fail("failed setup must not enter the test body")
+    assert caught.value is failure
+    assert connection.run_sync.await_count == attempts
+    engine.dispose.assert_awaited_once()
 
 
 @pytest.mark.asyncio

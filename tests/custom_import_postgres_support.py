@@ -20,6 +20,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -322,18 +323,26 @@ async def isolated_publication_case(
         async with raw_engine.begin() as connection:
             await connection.execute(text(f"CREATE SCHEMA {quoted_schema}"))
         is_schema_created = True
-        async with raw_engine.begin() as connection:
-            # Cutover reviews other installations; their fixture teardown must wait for this transaction.
-            await connection.scalar(
-                text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"), {"lock_name": _FIXTURE_DDL_LOCK_NAME}
-            )
-            await connection.run_sync(
-                _install_custom_import_migrations,
-                schema_name,
-                is_segmented_capture_enabled,
-                is_snapshot_storage_enabled,
-                migration_through,
-            )
+        for attempt in range(2):
+            try:
+                async with raw_engine.begin() as connection:
+                    # Cutover reviews other installations; their fixture teardown must wait for this transaction.
+                    await connection.scalar(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
+                        {"lock_name": _FIXTURE_DDL_LOCK_NAME},
+                    )
+                    await connection.run_sync(
+                        _install_custom_import_migrations,
+                        schema_name,
+                        is_segmented_capture_enabled,
+                        is_snapshot_storage_enabled,
+                        migration_through,
+                    )
+                break
+            except DBAPIError as error:
+                # Retry only rolled-back fixture setup, before any test body runs.
+                if attempt or getattr(error.orig, "sqlstate", None) != "55P03":
+                    raise
         yield IsolatedPublicationCase(
             engine=engine,
             sessions=sessions,
