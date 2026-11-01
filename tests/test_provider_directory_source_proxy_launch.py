@@ -18,6 +18,7 @@ from tests.test_provider_directory_source_worker_launch import (
     IMAGE,
     RUN_ID,
     SPEC,
+    _canceled_route_parent,
     _source_route_config,
     _source_route_run,
 )
@@ -656,6 +657,25 @@ async def test_intermediate_retry_cannot_replace_proxy_binding(monkeypatch, bind
         await source.require_fhir_source_route_ancestry(
             SimpleNamespace(all=AsyncMock(return_value=lineage_rows)), request.fhir_source_launch
         )
+    SourceProxyConfig.bind.assert_not_called()
+
+
+@pytest.mark.usefixtures("enabled_proxy")
+@pytest.mark.asyncio
+async def test_unstarted_canceled_parent_preserves_root_proxy_cooldowns(monkeypatch):
+    request, lineage_rows = _retry_lineage(monkeypatch)
+    _insert_retry_parent(request, lineage_rows, None, None)
+    canceled_parent = lineage_rows[-1]
+    canceled_parent.update(_canceled_route_parent(canceled_parent["run_id"]))
+    lineage_rows[0]["params"]["allow_retained_pagination_reset"] = False
+    cooldowns = _cooldowns([("synthetic-egress", "2026-12-01T00:00:00Z")])
+    lineage_rows[1]["source_http_proxy_cooldowns"] = cooldowns
+    connection = SimpleNamespace(all=AsyncMock(return_value=lineage_rows))
+    updated = await source.require_fhir_source_route_ancestry(connection, request.fhir_source_launch)
+    assert json.loads(updated.proxy_cooldowns_json) == cooldowns
+    lineage_rows[1]["source_http_proxy_binding"] = None
+    with pytest.raises(ValueError, match="route_changed"):
+        await source.require_fhir_source_route_ancestry(connection, request.fhir_source_launch)
     SourceProxyConfig.bind.assert_not_called()
 
 

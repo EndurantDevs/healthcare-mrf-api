@@ -435,6 +435,39 @@ def _is_admissible_route_root(lineage_record, launch):
     )
 
 
+def _is_unstarted_canceled_route_parent(lineage_record, current_params):
+    """Retain a removed queued attempt only when the successor cannot reset data."""
+    from api.control_workers import _kubernetes_namespace
+
+    signal = lineage_record.get("cancel_signal")
+    if type(signal) is not dict:
+        return False
+    kubernetes = signal.get("kubernetes")
+    return (
+        type(current_params) is dict
+        and current_params.get("allow_retained_pagination_reset") is False
+        and {"started_at", "finished_at", "phase_detail"}.issubset(lineage_record)
+        and lineage_record["status"] == "canceled"
+        and lineage_record.get("started_at") is None
+        and lineage_record.get("finished_at") is not None
+        and lineage_record.get("phase_detail") == "canceled before start"
+        and lineage_record.get("source_http_proxy_binding") is None
+        and lineage_record.get("source_http_proxy_cooldowns") is None
+        and signal.get("redis") is True
+        and signal.get("removed") is True
+        and signal.get("deleted_job_key") is True
+        and type(signal.get("deleted_keys")) is int
+        and signal["deleted_keys"] == 1
+        and signal.get("queue") == _QUEUE
+        and signal.get("job_id") == "provider_directory_start_" + lineage_record["run_id"]
+        and type(kubernetes) is dict
+        and kubernetes.get("enabled") is True
+        and type(kubernetes.get("deleted")) is int
+        and kubernetes == {"enabled": True, "namespace": _kubernetes_namespace(), "deleted": 0, "items": []}
+        and not {"error", "errors", "identity_mismatch", "identity_unavailable"}.intersection(signal)
+    )
+
+
 async def _source_route_lineage(connection, root_run_id):
     """Read only native ancestry and its bounded nonsecret transport audit fields."""
     from sqlalchemy import text
@@ -445,7 +478,8 @@ async def _source_route_lineage(connection, root_run_id):
     run_relation = storage_relation(str(ImportRun.__table__.schema), "import_run")
     return await connection.all(
         text(
-            "SELECT run_id,importer,status,retry_of_run_id,params,"
+            "SELECT run_id,importer,status,retry_of_run_id,params,started_at,finished_at,phase_detail,"
+            "metrics->'cancel_signal' AS cancel_signal,"
             "metrics->'audit'->'source_http_proxy'->'binding' AS source_http_proxy_binding,"
             "metrics->'audit'->'source_http_proxy'->'cooldowns' AS source_http_proxy_cooldowns FROM "
             + run_relation
@@ -465,6 +499,7 @@ async def require_fhir_source_route_ancestry(connection, launch):
     if len(lineage_rows) > 64 or len(runs_by_id) != len(lineage_rows):
         raise ValueError("fhir_source_worker_route_changed")
     current_id = launch.run_id
+    current_params = runs_by_id.get(current_id, {}).get("params")
     seen_run_ids = set()
     ancestors = []
     while current_id not in seen_run_ids and len(seen_run_ids) <= 64:
@@ -472,7 +507,7 @@ async def require_fhir_source_route_ancestry(connection, launch):
         lineage_record = runs_by_id.get(current_id)
         if lineage_record is None:
             break
-        if current_id != launch.run_id:
+        if current_id != launch.run_id and lineage_record["status"] != "canceled":
             ancestors.append(lineage_record)
         params = lineage_record["params"]
         if not (
@@ -493,8 +528,12 @@ async def require_fhir_source_route_ancestry(connection, launch):
         if not (
             type(parent_id) is str
             and params.get("retry_of_run_id") == parent_id
-            and lineage_record["status"]
-            in ({"queued", "starting", "running", "finalizing"} if current_id == launch.run_id else {"failed"})
+            and (
+                lineage_record["status"] in {"queued", "starting", "running", "finalizing"}
+                if current_id == launch.run_id
+                else lineage_record["status"] == "failed"
+                or _is_unstarted_canceled_route_parent(lineage_record, current_params)
+            )
             and (current_id != launch.run_id or parent_id == launch.retry_of_run_id)
         ):
             break
