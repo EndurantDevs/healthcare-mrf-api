@@ -123,6 +123,13 @@
       "checked_at": null,
       "proof_state": "not_recorded"
     },
+    "florida-blue": {
+      "terminal_status": null,
+      "run_id": null,
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "proof_state": "not_recorded"
+    },
     "hap": {
       "terminal_status": null,
       "run_id": null,

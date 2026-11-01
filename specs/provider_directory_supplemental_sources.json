@@ -1,0 +1,65 @@
+[
+  {
+    "id": "florida-blue-provider-directory",
+    "org_name": "Florida Blue",
+    "plan_name": "Florida Blue Provider Directory",
+    "api_base": "https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir",
+    "auth_type": "none",
+    "requires_registration": false,
+    "fhir_version": "4.0.1",
+    "source": "florida-blue-provider-directory",
+    "source_detail": "official public Provider Directory FHIR API",
+    "source_url": "https://developer.bcbsfl.com/interop/interop-developer-portal/product/758/api/749",
+    "metadata_json": {
+      "provider_directory_confirmed_base": "https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir",
+      "provider_directory_confirmed_metadata_url": "https://apigw.bcbsfl.com/interop/interop-developer-portal/cms/iop/v1/pd/R4/metadata",
+      "provider_directory_supported_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ],
+      "provider_directory_fully_enumerable_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ],
+      "provider_directory_expected_nonempty_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService"
+      ],
+      "provider_directory_resource_page_count_caps": {
+        "InsurancePlan": 100,
+        "PractitionerRole": 100,
+        "Practitioner": 100,
+        "Organization": 100,
+        "Location": 100,
+        "HealthcareService": 100,
+        "OrganizationAffiliation": 100
+      },
+      "provider_directory_resource_fetch_order": [
+        "PractitionerRole",
+        "HealthcareService",
+        "Practitioner",
+        "Location",
+        "Organization",
+        "InsurancePlan",
+        "OrganizationAffiliation"
+      ],
+      "provider_directory_request_interval_seconds": 0.1,
+      "provider_directory_coverage_mode": "full",
+      "provider_directory_acquisition_enabled": true
+    }
+  }
+]
