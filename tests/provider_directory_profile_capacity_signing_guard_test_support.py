@@ -8,16 +8,17 @@ import datetime
 import os
 from dataclasses import dataclass
 
+from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_capacity_signing_guard as guard_contract
-from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_selection as selection
 from tests.test_provider_directory_profile_capacity_runtime import (
     _limits_payload,
 )
 
-
 SYNTHETIC_PROFILE_SOURCE_ID = "synthetic_profile_source"
+# Freeze only the signed golden input; ordinary selection fixtures track the current catalog.
+GOLDEN_PROFILE_INPUT_DIGEST = "aa5d5fb5268a3657f56ed591fe966413f43ad22249f85c4de4a9bab9d6bb7e18"
 
 
 def _utc(value: datetime.datetime) -> str:
@@ -36,8 +37,11 @@ def _validated_request(raw_request: dict[str, object]):
             os.environ["HLTHPRT_IMPORT_NODE_ID"] = previous_node_id
 
 
-def synthetic_profile_execution() -> selection.ProviderDirectoryProfileExecution:
-    """Build the neutral exact selection used by the cross-repository golden."""
+def synthetic_profile_execution(
+    *,
+    frozen_profile_input_digest: str | None = None,
+) -> selection.ProviderDirectoryProfileExecution:
+    """Build a neutral selection, optionally binding the signed golden input."""
 
     computed = selection._computed_selection_from_rows(
         _synthetic_profile_catalog(),
@@ -46,14 +50,14 @@ def synthetic_profile_execution() -> selection.ProviderDirectoryProfileExecution
         dataset_rows=[_synthetic_profile_dataset_row()],
     )
     identity_by_field = {**computed.identity_payload, "authority_revision": 7}
+    if frozen_profile_input_digest is not None:
+        identity_by_field["profile_input_digest"] = frozen_profile_input_digest
     attestation_by_field = {
         **identity_by_field,
         "proof_id": selection._proof_id(identity_by_field),
     }
     return selection.ProviderDirectoryProfileExecution(
-        attestation=selection.validated_profile_selection_attestation(
-            attestation_by_field
-        ),
+        attestation=selection.validated_profile_selection_attestation(attestation_by_field),
         generation=11,
     )
 
@@ -89,9 +93,7 @@ def _synthetic_profile_source_rows() -> list[dict[str, object]]:
                 "org_name": "Synthetic dataset variant",
                 "plan_name": None,
             }
-            for source_id, endpoint_id in (
-                profile_artifact.configured_dataset_scoped_profile_endpoints()
-            )
+            for source_id, endpoint_id in (profile_artifact.configured_dataset_scoped_profile_endpoints())
         ],
     ]
 
@@ -120,13 +122,11 @@ def synthetic_profile_task(
 ) -> dict[str, object]:
     """Return the complete neutral execution document frozen cross-repository."""
 
-    execution = synthetic_profile_execution()
+    execution_by_field = capacity_attestation["lease"]["signing_preflight_guard"]["healthcare_request"][
+        "profile_execution"
+    ]
     return {
-        **selection._GLOBAL_PROFILE_PARAMS,
-        "provider_directory_profile_generation": execution.generation,
-        "provider_directory_profile_selection_attestation": (
-            execution.attestation.payload
-        ),
+        **execution_by_field,
         "provider_directory_profile_capacity_attestation": capacity_attestation,
     }
 
@@ -146,9 +146,7 @@ def _execution_by_field(
     return {
         **selection._GLOBAL_PROFILE_PARAMS,
         "provider_directory_profile_generation": execution.generation,
-        "provider_directory_profile_selection_attestation": (
-            execution.attestation.payload
-        ),
+        "provider_directory_profile_selection_attestation": (execution.attestation.payload),
         "provider_directory_profile_capacity_attestation": {},
     }
 
@@ -259,9 +257,7 @@ def _control_plane_receipt(
     }
     receipt_by_field = {
         "contract_id": guard_contract.CONTROL_PLANE_PREFLIGHT_CONTRACT_ID,
-        "request_contract_id": (
-            guard_contract.CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID
-        ),
+        "request_contract_id": (guard_contract.CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID),
         "request_sha256": preflight.preflight_domain_sha256(
             guard_contract.CONTROL_PLANE_REQUEST_DIGEST_DOMAIN,
             request_by_field,
@@ -370,9 +366,7 @@ def _healthcare_receipt(
             "projected_logical_bytes": 1,
             "projection_hash": "88" * 32,
         },
-        "runtime_observation": {
-            "contract_id": "healthporta.provider-directory-profile-runtime-observation.v1"
-        },
+        "runtime_observation": {"contract_id": "healthporta.provider-directory-profile-runtime-observation.v1"},
         "serving_generation_preflight": serving_by_field,
         "serving_generation_preflight_sha256": preflight.preflight_domain_sha256(
             preflight.CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN,
@@ -416,9 +410,7 @@ def _guard_payload(
         "healthcare_receipt": healthcare_receipt_by_field,
         "healthcare_receipt_sha256": healthcare_receipt_by_field["receipt_sha256"],
         "capacity_limits_sha256": validated_healthcare_request.limits_sha256,
-        "storage_observation_sha256": import_receipt_by_field[
-            "storage_observation_sha256"
-        ],
+        "storage_observation_sha256": import_receipt_by_field["storage_observation_sha256"],
         "held_followup_preimage_sha256": followup_by_field["followup_preimage_sha256"],
     }
 

@@ -12,6 +12,15 @@ from process import provider_directory_generic_source_policy as source_policy
 QUALIFICATION_API_BASE = contextvars.ContextVar("provider_directory_qualification_api_base", default=None)
 
 
+def is_anonymous_source_url(url: str) -> bool:
+    """Reject URL user information before selecting the anonymous HTTP session."""
+    try:
+        parsed_url = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return parsed_url.username is None and parsed_url.password is None
+
+
 class QualificationURLRejected(ValueError):
     """A qualification request would leave the selected endpoint scope."""
 
@@ -59,6 +68,42 @@ async def resolve_probe_credentials(credential_lookup, *args, **kwargs):
     if QUALIFICATION_API_BASE.get() is None:
         return credential_lookup(*args, **kwargs)
     return await asyncio.to_thread(credential_lookup, *args, **kwargs)
+
+
+async def probe_declared_collection(directory, source_record, *, timeout, run_id):
+    """Probe an explicitly configured collection when metadata is unavailable."""
+    metadata = source_record.get("metadata_json") if isinstance(source_record.get("metadata_json"), dict) else {}
+    resource_type = metadata.get("provider_directory_probe_resource")
+    if (
+        not isinstance(resource_type, str)
+        or resource_type not in directory.RESOURCE_ENDPOINT_FIELDS
+        or directory.current_version_census_contract(source_record) is not None
+    ):
+        return None
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    resource_probe = await directory._probe_resource_access(
+        source_record, api_base, {}, timeout=timeout, resource_type=resource_type
+    )
+    if resource_probe is None:
+        return None
+    status = resource_probe["status"]
+    error = resource_probe.get("error")
+    if status == "reachable":
+        status = "valid" if resource_probe.get("search_bundle_valid") is True else "resource_error"
+        if status != "valid":
+            error = "resource search did not return a valid search Bundle"
+    credential = await resolve_probe_credentials(
+        directory._credential_request_options_for_source, source_record, resource_probe["url"]
+    )
+    return {
+        **resource_probe,
+        "status": status,
+        "error": error,
+        "api_base": api_base,
+        "run_id": run_id,
+        "credential": credential["descriptor"],
+        "resource_probe": resource_probe,
+    }, None
 
 
 def open_token_request(directory, request, *, timeout):
