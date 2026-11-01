@@ -683,6 +683,67 @@ async def test_original_transaction_and_actor_are_retained(case, field, value):
 
 
 @pytest.mark.asyncio
+async def test_actor_only_recheck_uses_immutable_projection_and_fresh_query(case, monkeypatch):
+    preparation = await _prepare(case)
+    assert writers.json.loads(preparation._actor) == writers.json.loads(preparation.native)["actor"]
+    with pytest.raises(AttributeError):
+        preparation._actor = "{}"
+    decoder = Mock(wraps=writers.json.loads)
+    monkeypatch.setattr(writers.json, "loads", decoder)
+    case.connection.fetchrow.reset_mock()
+
+    assert await writers._original(case.connection, preparation, actor_only=True) is None
+
+    decoder.assert_called_once_with(preparation._actor)
+    case.connection.fetchrow.assert_awaited_once_with(writers._ACTOR_SQL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("transaction", "2/2"), ("backend", 92), ("current", "other")])
+async def test_actor_only_recheck_refuses_changed_actor(case, field, value):
+    preparation = await _prepare(case)
+    case.state.actor[field] = value
+    with pytest.raises(ValueError, match="original_admin_changed"):
+        await writers._original(case.connection, preparation, actor_only=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_acquisition_rechecks_actor_after_closure(case, monkeypatch, changed):
+    preparation = await _prepare(case)
+    closure = writers._closure
+    original = AsyncMock(wraps=writers._original)
+
+    async def checked_closure(*arguments):
+        result = await closure(*arguments)
+        if changed:
+            case.state.actor["current"] = "changed"
+        return result
+
+    monkeypatch.setattr(writers, "_closure", checked_closure)
+    monkeypatch.setattr(writers, "_original", original)
+    if changed:
+        with pytest.raises(ValueError, match="original_admin_changed"):
+            await _acquire(case, preparation)
+    else:
+        await _acquire(case, preparation)
+    assert case.state.locks is True
+    assert original.await_count == 2
+    assert original.await_args.kwargs == {"actor_only": True}
+
+
+@pytest.mark.asyncio
+async def test_full_expected_catalog_returns_independent_copies(case):
+    preparation = await _prepare(case)
+    first = await writers._original(case.connection, preparation)
+    first["actor"]["current"] = "changed"
+    first["family"].clear()
+    second = await writers._original(case.connection, preparation)
+    assert second == writers.json.loads(preparation.native)
+    assert writers.json.loads(preparation._actor) == second["actor"]
+
+
+@pytest.mark.asyncio
 async def test_replacement_connection_and_child_task_cannot_borrow_fence(case):
     fence = await _acquire(case, await _prepare(case))
     with pytest.raises(ValueError, match="original_scope_required"):
