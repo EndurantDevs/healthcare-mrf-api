@@ -5,7 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -772,6 +772,98 @@ async def test_route_keeps_image_and_secret_across_valid_later_retries(monkeypat
     lineage_rows[1]["params"] = {**lineage_rows[1]["params"], "source_ids": ["other-source"]}
     with pytest.raises(ValueError, match="route_changed"):
         await source.require_fhir_source_route_ancestry(connection, launch)
+
+
+def _canceled_route_parent(run_id):
+    return {
+        "status": "canceled",
+        "started_at": None,
+        "finished_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "phase_detail": "canceled before start",
+        "cancel_signal": {
+            "redis": True,
+            "removed": True,
+            "deleted_job_key": True,
+            "deleted_keys": 1,
+            "queue": source._QUEUE,
+            "job_id": "provider_directory_start_" + run_id,
+            "kubernetes": {"enabled": True, "namespace": workers._kubernetes_namespace(), "deleted": 0, "items": []},
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "mutation_value"),
+    [
+        ((), None),
+        (("status",), "canceling"),
+        (("started_at",), datetime(2025, 12, 31, tzinfo=UTC)),
+        (("finished_at",), None),
+        (("phase_detail",), "canceled active worker"),
+        (("source_http_proxy_binding",), {}),
+        (("source_http_proxy_cooldowns",), {}),
+        (("cancel_signal",), None),
+        (("cancel_signal", "redis"), False),
+        (("cancel_signal", "removed"), False),
+        (("cancel_signal", "deleted_job_key"), False),
+        (("cancel_signal", "deleted_keys"), True),
+        (("cancel_signal", "queue"), "other"),
+        (("cancel_signal", "job_id"), "other"),
+        (("cancel_signal", "error"), "unavailable"),
+        (("cancel_signal", "identity_mismatch"), True),
+        (("cancel_signal", "kubernetes"), None),
+        (("cancel_signal", "kubernetes", "enabled"), False),
+        (("cancel_signal", "kubernetes", "enabled"), 1),
+        (("cancel_signal", "kubernetes", "namespace"), "other"),
+        (("cancel_signal", "kubernetes", "deleted"), False),
+        (("cancel_signal", "kubernetes", "items"), [{"deleted": True}]),
+        (("cancel_signal", "kubernetes", "errors"), ["unavailable"]),
+    ],
+)
+async def test_route_retry_requires_unstarted_cancellation_proof(monkeypatch, path, mutation_value):
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    monkeypatch.setenv(source.ROUTES_ENV, json.dumps([_source_route_config()]))
+    recorded_run = _source_route_run()
+    root_id = _source_route_config()["root_run_id"]
+    parent_id = "run_" + "e" * 32
+    recorded_run["params"].update(retry_of_run_id=parent_id, allow_retained_pagination_reset=False)
+    launch = source.admit_fhir_source_worker_launch(recorded_run)
+    parent_by_field = {
+        **_canceled_route_parent(parent_id),
+        "run_id": parent_id,
+        "retry_of_run_id": root_id,
+        "params": {**recorded_run["params"], "retry_of_run_id": root_id},
+    }
+    lineage_rows = [
+        {"run_id": RUN_ID, "status": "queued", "retry_of_run_id": parent_id, "params": recorded_run["params"]},
+        parent_by_field,
+        {"run_id": root_id, "status": "failed", "retry_of_run_id": None, "params": recorded_run["params"]},
+    ]
+    if path:
+        target_by_field = parent_by_field
+        for key in path[:-1]:
+            target_by_field = target_by_field[key]
+        target_by_field[path[-1]] = mutation_value
+    connection = SimpleNamespace(all=AsyncMock(return_value=lineage_rows))
+    if path:
+        with pytest.raises(ValueError, match="fhir_source_worker_route_changed"):
+            await source.require_fhir_source_route_ancestry(connection, launch)
+    else:
+        assert await source.require_fhir_source_route_ancestry(connection, launch) is launch
+        assert "metrics->'cancel_signal' AS cancel_signal" in str(connection.all.await_args.args[0])
+        for reset_policy in (None, True, 0, "false"):
+            recorded_run["params"]["allow_retained_pagination_reset"] = reset_policy
+            with pytest.raises(ValueError, match="fhir_source_worker_route_changed"):
+                await source.require_fhir_source_route_ancestry(connection, launch)
+        recorded_run["params"]["allow_retained_pagination_reset"] = False
+        lineage_rows[-1].update(_canceled_route_parent(root_id))
+        with pytest.raises(ValueError, match="fhir_source_worker_route_changed"):
+            await source.require_fhir_source_route_ancestry(connection, launch)
+        lineage_rows[-1]["status"] = "failed"
+        del parent_by_field["started_at"]
+        with pytest.raises(ValueError, match="fhir_source_worker_route_changed"):
+            await source.require_fhir_source_route_ancestry(connection, launch)
 
 
 @pytest.mark.asyncio
