@@ -6,6 +6,13 @@
   "entries": {
     "vsp-provider-directory": {"terminal_status": null, "run_id": null, "access_verification": "not_recorded", "checked_at": null, "proof_state": "not_recorded"},
     "anthem-provider-directory": {"terminal_status": null, "run_id": null, "access_verification": "not_recorded", "checked_at": null, "proof_state": "not_recorded"},
+    "bcbs-alabama": {
+      "terminal_status": null,
+      "run_id": null,
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "proof_state": "not_recorded"
+    },
     "iowa-medicaid": {
       "terminal_status": null,
       "run_id": null,

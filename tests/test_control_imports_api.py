@@ -4744,9 +4744,9 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (48, 34, 35)
+    ) == (49, 35, 36)
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 34
+    assert len(runnable_items) == 35
     assert {entry["entry_id"] for entry in runnable_items if not entry["profile_enabled"]} == {"vsp-provider-directory"}
     assert all(entry["supported_resources"] == entry["resources"] for entry in runnable_items)
     assert len(nonrunnable_items) == 14
