@@ -38,6 +38,11 @@ from process.registry_publication_ptg_runtime import (
     RegistryPublicationSQLLimits,
 )
 from process.registry_source_recipe_store import decode_registry_source_recipes
+from process.registry_source_witness_runtime import (
+    RegistrySourceWitnessConfig,
+    install_source_witness_runtime,
+    parse_source_witness_config,
+)
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_PUBLICATION_WORKER"
 MAX_CONFIG_BYTES = 16 * 1024
@@ -75,6 +80,7 @@ class RegistryPublicationWorkerConfig:
     operation_seconds: int = 3600
     sql_limits: RegistryPublicationSQLLimits = field(default_factory=RegistryPublicationSQLLimits)
     custody_url: object | None = field(default=None, repr=False)
+    source_witness: RegistrySourceWitnessConfig | None = field(default=None, repr=False)
 
     def __post_init__(self):
         """Validate immutable SQL limits and deadline for direct and parsed callers."""
@@ -82,6 +88,16 @@ class RegistryPublicationWorkerConfig:
             _invalid()
         if type(self.operation_seconds) is not int or not 1 <= self.operation_seconds <= 86400:
             _invalid()
+        if self.source_witness is not None:
+            if (
+                type(self.source_witness) is not RegistrySourceWitnessConfig
+                or self.custody_url is None
+                or type(self.initial_address_sources) is not RegistryCompositionAddressSources
+                or not self.initial_address_sources.compact
+                or self.initial_address_sources.source_witness_runtime is not None
+            ):
+                _invalid()
+            self.source_witness.__post_init__()
         _verify_custody_config(self)
 
 
@@ -241,6 +257,7 @@ def parse_registry_publication_worker_config(encoded):
                 "operation_seconds",
                 "sql_limits",
                 "custody_dsn",
+                "source_witness",
             }
         ):
             _invalid()
@@ -263,6 +280,9 @@ def parse_registry_publication_worker_config(encoded):
             else RegistryPublicationSQLLimits(),
             custody_url=_custody_config_url(configured_by_name["custody_dsn"])
             if "custody_dsn" in configured_by_name
+            else None,
+            source_witness=parse_source_witness_config(configured_by_name["source_witness"])
+            if "source_witness" in configured_by_name
             else None,
         )
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError, ArgumentError:
@@ -683,6 +703,7 @@ def _address_preparer(config, consumer, pool, identity, role, *, sessions=None):
     ):
         """Return only a committed independently sealed artifact or the verified retained-only inputs."""
         runtime_roles = _custody_runtime_roles(config, identity, consumer)
+        source_runtime = _configured_source_witness_runtime(config, consumer, identity)
         _final_roles(identity["custody_owner_role"], runtime_roles)
         schema = consumer.control_schema
         async with _address_preparation_snapshot(pool, sessions, consumer) as (
@@ -695,6 +716,8 @@ def _address_preparer(config, consumer, pool, identity, role, *, sessions=None):
             address_sources = await _registered_address_sources(
                 custodian, (request_id, approved_revision, expected_head), address_sources, schema
             )
+            if source_runtime is not None:
+                address_sources = replace(address_sources, source_witness_runtime=source_runtime)
             await _require_execution_address_reads(custodian, address_sources, consumer)
             artifact = await prepare_registry_composition_address_artifact(
                 custodian,
@@ -721,6 +744,34 @@ def _address_preparer(config, consumer, pool, identity, role, *, sessions=None):
     return prepare
 
 
+def _configured_source_witness_runtime(config, consumer, identity):
+    """Read only the operator's unserialized capability; no recipe selects factory or actors."""
+    from process.registry_cms_source_consumer import RegistryCMSSourceConsumerConfig
+    from process.registry_ptg_source_consumer import RegistryPTGSourceConsumerConfig
+    from process.registry_source_recipe_composition import SourceWitnessRuntime
+
+    runtime = getattr(getattr(config, "initial_address_sources", None), "source_witness_runtime", None)
+    if runtime is None:
+        return None
+    if type(runtime) is not SourceWitnessRuntime:
+        raise ValueError("registry_source_witness_runtime_invalid")
+    runtime.__post_init__()
+    required = set(_custody_actor_roles(config, consumer)) | {
+        config.custody_url.username,
+        identity["custody_owner_role"],
+    }
+    for current in (config.consumer, consumer):
+        if type(current) is RegistryPublicationConsumerConfig:
+            required.add(current.queue_owner_role)
+        elif type(current) in {RegistryCMSSourceConsumerConfig, RegistryPTGSourceConsumerConfig}:
+            required.add(current.owner_role)
+        else:
+            raise ValueError("registry_source_witness_worker_unsupported")
+    if not required <= set(runtime.runtime_roles):
+        raise ValueError("registry_source_witness_runtime_census_differs")
+    return runtime
+
+
 async def _custody_runtime(config, stack, consumer, execution_connection, *, backend_verifier=None):
     """Install only the qualified independent preparation and sealing callbacks."""
     if config.custody_url is None:
@@ -734,6 +785,7 @@ async def _custody_runtime(config, stack, consumer, execution_connection, *, bac
     _verify_custody_config(config, consumer)
     schema = consumer.control_schema
     identity = await _custody_identity(execution_connection, schema, consumer.execution_role)
+    source_runtime = _configured_source_witness_runtime(config, consumer, identity)
     await _q_reach_closed(
         execution_connection,
         identity,
@@ -768,6 +820,7 @@ async def _custody_runtime(config, stack, consumer, execution_connection, *, bac
                 runtime_roles=runtime_roles,
                 authorize=is_authorized,
                 pre_enrolled_only=pre_enrolled_only,
+                **({"source_witness_runtime": source_runtime} if source_runtime is not None else {}),
             )
             async with custodian.transaction(isolation="repeatable_read", readonly=True):
                 verified = await verify_network_candidate_custody(
@@ -844,6 +897,7 @@ def _ptg_custody_runtime(config, stack, consumer, identity, *, backend_verifier=
         registry_company_approval_transaction,
     )
 
+    source_witness_runtime = _configured_source_witness_runtime(config, consumer, identity)
     sessions = _worker_sessions(config, stack, config.custody_url, backend_verifier=backend_verifier)
     schema, role = consumer.control_schema, config.custody_url.username
 
@@ -869,6 +923,7 @@ def _ptg_custody_runtime(config, stack, consumer, identity, *, backend_verifier=
                 office_store=config.ptg.store,
                 office_read_budget=config.ptg.read_budget,
                 pre_enrolled_only=pre_enrolled_only,
+                **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
             )
         async with sessions() as session, session.begin():
             await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
@@ -995,6 +1050,9 @@ async def run_registry_publication_worker(config, *, membership_refresh_request_
     if type(config) is not RegistryPublicationWorkerConfig:
         _invalid()
     async with AsyncExitStack() as stack:
+        config = await install_source_witness_runtime(
+            config, stack, membership_refresh_request_id=membership_refresh_request_id
+        )
         if membership_refresh_request_id is None:
             authorize = await stack.enter_async_context(
                 RegistryPublicationAuthorityClient(config.app_origin, config.service_token)

@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import io
 import json
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from uuid import UUID, uuid5
 
 from db.registry_schema import registry_schema
@@ -15,6 +15,8 @@ from process.network_fhir_membership_source import (
     FHIRMembershipBatchBoundsError,
     PinnedFHIRMembershipSource,
     RetainedFHIRSuccessorReads,
+    _reviewed_descriptor,
+    fhir_normalized_capture,
     fhir_physical_source,
     read_fhir_membership_batch,
     read_fhir_membership_fact_batch,
@@ -100,6 +102,111 @@ class SourceRecipeReadContext:
     verified_office_inputs: object = None
     source_manifest: object = None
     office_matches: object = None
+    source_witness_runtime: object = None
+
+
+@dataclass(frozen=True, repr=False)
+class SourceWitnessRuntime:
+    """Unserialized installed Source capability and independently configured capture census."""
+
+    source_export: object
+    source_profiles: tuple
+    capture_owner_role: str
+    runtime_roles: tuple[str, ...]
+
+    def __post_init__(self):
+        if not callable(self.source_export):
+            raise RegistrySourceCompositionError("registry_source_witness_runtime_invalid")
+        validate_source_witness_configuration(self.source_profiles, self.capture_owner_role, self.runtime_roles)
+
+
+def validate_source_witness_configuration(source_profiles, capture_owner_role, runtime_roles):
+    """Keep installed capabilities and server configuration under the same closed profile contract."""
+    from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
+
+    if (
+        type(source_profiles) is not tuple
+        or not source_profiles
+        or any(type(profile) is not FHIRCatalogSourceReadProfile for profile in source_profiles)
+        or len({profile.schema_name for profile in source_profiles}) != len(source_profiles)
+        or type(runtime_roles) is not tuple
+        or not 1 <= len(runtime_roles) <= 32
+        or any(type(role) is not str for role in runtime_roles)
+        or tuple(sorted(set(runtime_roles))) != runtime_roles
+        or capture_owner_role in runtime_roles
+    ):
+        raise RegistrySourceCompositionError("registry_source_witness_runtime_invalid")
+    for profile in source_profiles:
+        profile.__post_init__()
+    for role in (capture_owner_role, *runtime_roles):
+        _identifier(role)
+
+
+async def _approved_source_witness_capture(connection, recipe, approved, control_schema):
+    """Authenticate the whole capture against protected approval before using its chosen labels."""
+    from process.network_approved_source_bindings import (
+        APPROVED_NETWORK_BINDINGS_SQL,
+        require_approved_network_source_bindings,
+    )
+    from process.network_fhir_source_witness_contract import validate_capture
+
+    capture = validate_capture(recipe.source_pin.source_witness_capture)
+    _reviewed_descriptor(recipe.source_pin, approved, recipe.binding_coordinates, True)
+    if approved is None:
+        raise RegistrySourceCompositionError("registry_source_witness_approval_unavailable")
+    await require_approved_network_source_bindings(
+        connection, approved, recipe.binding_coordinates, control_schema=control_schema
+    )
+    selected = await connection.fetchval(
+        "WITH "
+        + APPROVED_NETWORK_BINDINGS_SQL.format(
+            namespace=_identifier(registry_schema() if control_schema is None else control_schema)
+        )
+        + " SELECT count(*)>0 AND coalesce(bool_and(record_json->'source_scope_json'="
+        "jsonb_build_object('organization_id',record_json->>'source_key','capture_sha256',$8::text)),false)"
+        " FROM approved_network_bindings",
+        approved.approved_revision,
+        *recipe.binding_coordinates.sql_parameters,
+        capture.capture_sha256,
+    )
+    if selected is not True:
+        raise RegistrySourceCompositionError("registry_source_witness_approval_unavailable")
+    return capture
+
+
+async def require_source_witness_read(connection, recipe, approved, control_schema, runtime):
+    """Fresh Source replay, never a producer cache, admits one exact approved capture."""
+    from process.network_fhir_source_witness_capture import (
+        pin_source_fhir_witness_read,
+        verify_source_fhir_witness_capture,
+    )
+    from process.network_fhir_source_witness_contract import SourceWitnessCaptureAnchor
+
+    if type(runtime) is not SourceWitnessRuntime:
+        raise RegistrySourceCompositionError("registry_source_composition_source_witness_custody_unavailable")
+    runtime.__post_init__()
+    capture = await _approved_source_witness_capture(connection, recipe, approved, control_schema)
+    if (capture.owner_role, capture.runtime_roles) != (runtime.capture_owner_role, runtime.runtime_roles):
+        raise RegistrySourceCompositionError("registry_source_witness_runtime_census_differs")
+    profiles = [profile for profile in runtime.source_profiles if profile.schema_name == capture.origin.schema_name]
+    if len(profiles) != 1:
+        raise RegistrySourceCompositionError("registry_source_witness_profile_unavailable")
+    try:
+        from directory_membership_runtime import FHIRSourceMembershipInput
+    except ImportError:
+        raise RegistrySourceCompositionError("registry_source_witness_factory_unavailable") from None
+    # Protected approval authenticates these expected labels; the original factory still proves every Source byte.
+    expected_origin = FHIRSourceMembershipInput(**asdict(capture.origin))
+    anchor = SourceWitnessCaptureAnchor(capture.capture_id, capture.release_id, capture.observed_at)
+    await verify_source_fhir_witness_capture(
+        runtime.source_export,
+        connection,
+        source_profile=profiles[0],
+        reviewed_origin=expected_origin,
+        capture=capture,
+        expected_anchor=anchor,
+    )
+    return await pin_source_fhir_witness_read(connection, capture)
 
 
 async def _read_recipe_page(
@@ -148,10 +255,10 @@ async def _read_recipe_page(
 async def _read_fhir_recipe_page(connection, recipe, cursor, limit, options_by_name, office_source, capture_facts):
     if capture_facts:
         options_by_name.pop("approved_only", None)
-        if recipe.source_pin.retained_capture is not None:
+        if fhir_normalized_capture(recipe.source_pin) is not None:
             options_by_name["retained_read"] = office_source
         reader = read_fhir_membership_fact_batch
-    elif recipe.source_pin.retained_capture is not None:
+    elif fhir_normalized_capture(recipe.source_pin) is not None:
         options_by_name.pop("approved_only", None)
         return await read_retained_fhir_membership_batch(
             connection, recipe.source_pin, office_source, after_resource=cursor, limit=limit, **options_by_name
@@ -244,6 +351,7 @@ async def require_registry_source_recipe_custody(
     aca_reads_by_oid=None,
     *,
     retained_fhir_reads=None,
+    source_witness_runtime=None,
 ):
     """Recheck CMS retained custody once before paging its complete recipe."""
     source_pin = recipe.source_pin
@@ -266,6 +374,8 @@ async def require_registry_source_recipe_custody(
         return verified
     if type(source_pin) is not PinnedFHIRMembershipSource:
         return
+    if source_pin.source_witness_capture is not None:
+        return await require_source_witness_read(connection, recipe, approved, control_schema, source_witness_runtime)
     if source_pin.retained_capture is not None:
         original = await _retained_recipe_read(connection, source_pin.retained_capture, retained_fhir_reads)
         if source_pin.retained_successor is None:
@@ -283,6 +393,9 @@ async def require_registry_source_recipe_custody(
 
 async def _require_fhir_custody(connection, source):
     """Authenticate each flat original or successor capture with its own native receipt."""
+    if source.source_witness_capture is not None:
+        # Source replay and final independent custody are wired by the publication owner.
+        raise RegistrySourceCompositionError("registry_source_composition_source_witness_custody_unavailable")
     if source.retained_capture is not None:
         return await _retained_recipe_read(connection, source.retained_capture, None)
     if source.retained_epoch is not None:
@@ -465,6 +578,10 @@ async def stage_registry_source_recipes(
     """
     contribution_revision, inventory = _source_stage_options(contribution_options)
     read_context = SourceRecipeReadContext() if read_context is None else read_context
+    if any(getattr(recipe.source_pin, "source_witness_capture", None) is not None for recipe in recipes) and not (
+        inventory and read_context.verified_office_inputs is not None
+    ):
+        raise RegistrySourceCompositionError("registry_source_witness_verified_inventory_required")
     if inventory and read_context.verified_office_inputs is not None:
         from process.registry_verified_witness_stage import stage_verified_witness_inventory
 
@@ -474,9 +591,7 @@ async def stage_registry_source_recipes(
             approved,
             request_id=request_id,
             control_schema=control_schema,
-            retained_fhir_reads=read_context.retained_fhir_reads,
-            verified_office_inputs=read_context.verified_office_inputs,
-            source_manifest=read_context.source_manifest,
+            read_context=read_context,
         )
     await _require_source_stage_scope(connection, approved, request_id, contribution_revision)
     recipes, recipe_sha256 = _source_stage_recipes(recipes, inventory)

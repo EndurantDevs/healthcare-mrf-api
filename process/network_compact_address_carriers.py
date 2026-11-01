@@ -397,7 +397,7 @@ async def _candidate_source_recipes(connection, target, candidate, schema):
     return _decode_source_inventory_recipes(entries), reference.root.recipes_sha256, reference
 
 
-async def _fill_fhir_preservation(connection, target, schema):
+async def _fill_fhir_preservation(connection, target, schema, *, source_witness_runtime=None):
     """Reconstruct historical carry in this phase, after current source selection."""
     from process.registry_fhir_serving_preservation import (
         carry_fhir_preservation_addresses,
@@ -413,7 +413,11 @@ async def _fill_fhir_preservation(connection, target, schema):
     preservation, primary = None, None
     try:
         preservation = await rederive_fhir_serving_preservation(
-            connection, target, dict(candidate), control_schema=schema
+            connection,
+            target,
+            dict(candidate),
+            control_schema=schema,
+            **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
         )
         await carry_fhir_preservation_addresses(connection, preservation, "pg_temp", writing=True)
     except BaseException as error:
@@ -495,11 +499,12 @@ def _receipt(receipt_by_field, proof, counts, oids):
 
 @asynccontextmanager
 async def rederive_compact_address_carrier_projection(
-    connection, receipt, *, runtime_roles, control_schema=None, office_authority=None
+    connection, receipt, *, runtime_roles, control_schema=None, office_authority=None, **source_options
 ):
     """Yield native-proven carrier SQL using `(approved_revision,)` arguments.
     Compare complete heaps with direct-pair precedence; preserve original source aliases.
     """
+    _require(set(source_options) <= {"source_witness_runtime"}, "source_runtime_invalid")
     _require(type(receipt) is CompactAddressCarrierReceipt, "receipt_invalid")
     receipt = parse_compact_address_carrier_receipt(receipt.as_dict())
     _require(
@@ -530,7 +535,7 @@ async def rederive_compact_address_carrier_projection(
             physical,
             inventory=inventory is not None,
         )
-        await _fill_fhir_preservation(connection, receipt.target, schema)
+        await _fill_fhir_preservation(connection, receipt.target, schema, **source_options)
         base, addresses, bindings = _projection_sql(physical, schema)
         await _base_parity(connection, base)
         counts = await connection.fetchrow(
@@ -555,9 +560,11 @@ async def rederive_compact_address_carrier_projection(
 
 
 async def prepare_compact_address_carriers(
-    connection, copy_target, base_source, approved, recipes, *, runtime_roles, control_schema, office_authority=None
+    connection, copy_target, base_source, approved, recipes, *, runtime_roles, control_schema, **source_options
 ):
     """Merge only selected source rows after the caller prepares direct manual rows."""
+    _require(set(source_options) <= {"source_witness_runtime", "office_authority"}, "source_runtime_invalid")
+    office_authority = source_options.pop("office_authority", None)
     async with connection.transaction():
         receipt_by_field, physical, native_recipes, inventory = await _projection(
             connection,
@@ -593,7 +600,7 @@ async def prepare_compact_address_carriers(
                 physical,
                 inventory=inventory is not None,
             )
-            await _fill_fhir_preservation(connection, copy_target, control_schema)
+            await _fill_fhir_preservation(connection, copy_target, control_schema, **source_options)
             base, addresses, bindings = _projection_sql(physical, control_schema)
             await _base_parity(connection, base)
             carrier_rows = await _materialize(connection, copy_target, physical, addresses, bindings, approved)
@@ -611,7 +618,7 @@ async def prepare_compact_address_carriers(
 
 
 async def verify_compact_address_carriers(
-    connection, receipt, *, runtime_roles, control_schema=None, office_authority=None
+    connection, receipt, *, runtime_roles, control_schema=None, office_authority=None, source_witness_runtime=None
 ):
     """Verify every expected carrier row/binding; the parent rejects unrelated rows."""
     async with rederive_compact_address_carrier_projection(
@@ -620,6 +627,7 @@ async def verify_compact_address_carriers(
         runtime_roles=runtime_roles,
         control_schema=control_schema,
         office_authority=office_authority,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     ) as projection:
         namespace = _identifier(receipt.target.schema_name)
         if receipt.materialized_address_rows:

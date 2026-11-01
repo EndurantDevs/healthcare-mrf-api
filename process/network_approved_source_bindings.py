@@ -152,7 +152,8 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
           CASE WHEN field.key='company_key' THEN 512 ELSE 128 END
         OR btrim(field.value#>>'{{}}',$8)<>field.value#>>'{{}}' OR field.value#>>'{{}}' ~ '[[:cntrl:]]')))
     WHEN 'fhir' THEN
-      ((SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
+      ($6<>'registry-source-fhir-witness-v1'
+      AND (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
         =ARRAY['alias_scope','legacy_uuid','organization_id']::text[]
       AND jsonb_typeof(scope->'organization_id')='string'
       AND scope->>'organization_id' ~ '^[A-Za-z0-9.-]{{1,64}}$'
@@ -162,12 +163,13 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
       AND jsonb_typeof(scope->'alias_scope')='string' AND octet_length(scope->>'alias_scope') BETWEEN 1 AND 512
       AND btrim(scope->>'alias_scope',$8)=scope->>'alias_scope' AND scope->>'alias_scope' !~ '[[:cntrl:]]'
       ) OR (
-      $6='registry-retained-normalized-fhir-v1'
+      $6 IN ('registry-retained-normalized-fhir-v1','registry-source-fhir-witness-v1')
       AND $3<>'cms-npd'
       AND (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
         =ARRAY['capture_sha256','organization_id']::text[]
       AND jsonb_typeof(scope->'organization_id')='string'
       AND scope->>'organization_id' ~ '^[A-Za-z0-9.-]{{1,64}}$'
+      AND ($6<>'registry-source-fhir-witness-v1' OR scope->>'organization_id'=record_json->>'source_key')
       AND jsonb_typeof(scope->'capture_sha256')='string'
       AND scope->>'capture_sha256' ~ '^[0-9a-f]{{64}}$') OR (
       $6='registry-retained-normalized-fhir-v1' AND $3<>'cms-npd'

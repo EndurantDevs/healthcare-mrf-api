@@ -12,6 +12,7 @@ from process.network_fhir_membership_source import (
     PinnedFHIRMembershipSource,
     _require_source_recipe,
     _reviewed_descriptor,
+    fhir_normalized_capture,
     fhir_physical_source,
     read_fhir_source_witness_page_v2,
 )
@@ -26,6 +27,7 @@ from process.registry_source_contribution_store import (
 from process.registry_source_recipe_composition import (
     _STAGE_COUNTER_FIELDS,
     RegistrySourceCompositionError,
+    SourceRecipeReadContext,
     _create_source_stage_tables,
     _finish_source_stage,
     _require_recipe_custody,
@@ -34,7 +36,12 @@ from process.registry_source_recipe_composition import (
     _source_stage_result,
     _source_stage_table_names,
 )
-from process.registry_verified_witness_offices import WitnessOfficeSource, prepare_witness_office_mapping_v2
+from process.registry_verified_witness_offices import (
+    WitnessOfficeSource,
+    _prepare_source_witness_mapping,
+    _WitnessOfficeContext,
+    prepare_witness_office_mapping_v2,
+)
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
@@ -43,7 +50,8 @@ def _require_witness_scope(recipes, approved, office_inputs):
         type(approved) is not ApprovedMembershipSource
         or not recipes
         or not all(
-            type(recipe.source_pin) is PinnedFHIRMembershipSource and recipe.source_pin.retained_capture is not None
+            type(recipe.source_pin) is PinnedFHIRMembershipSource
+            and fhir_normalized_capture(recipe.source_pin) is not None
             for recipe in recipes
         )
         or type(office_inputs) is not tuple
@@ -60,10 +68,22 @@ def _require_witness_scope(recipes, approved, office_inputs):
         _identifier(role)
 
 
-async def _authorize_witness_recipe(connection, recipe, approved, control_schema, retained_reads):
-    read = await _require_recipe_custody(
-        connection, recipe, approved, control_schema, retained_fhir_reads=retained_reads
-    )
+async def _authorize_witness_recipe(
+    connection, recipe, approved, control_schema, retained_reads, *, source_witness_runtime=None
+):
+    if recipe.source_pin.source_witness_capture is not None:
+        read = await _require_recipe_custody(
+            connection,
+            recipe,
+            approved,
+            control_schema,
+            retained_fhir_reads=None,
+            source_witness_runtime=source_witness_runtime,
+        )
+    else:
+        read = await _require_recipe_custody(
+            connection, recipe, approved, control_schema, retained_fhir_reads=retained_reads
+        )
     await _require_source_recipe(
         connection,
         recipe.source_pin,
@@ -85,7 +105,7 @@ async def _native_witness_headers(connection, recipe):
         physical.dataset_id,
     )
     counts_by_kind = {resource["resource_type"]: resource["rows"] for resource in resources}
-    expected_by_kind = dict(physical.retained_capture.origin.resource_counts)
+    expected_by_kind = dict(fhir_normalized_capture(physical).origin.resource_counts)
     if any(counts_by_kind.get(kind, 0) != count for kind, count in expected_by_kind.items()) or any(
         count and kind not in expected_by_kind for kind, count in counts_by_kind.items()
     ):
@@ -133,9 +153,13 @@ async def _capture_witness_facts(connection, recipe, approved, control_schema, f
         cursor = page.next_resource
 
 
-async def _stage_witness_source(connection, recipe, approved, control_schema, tables, retained_reads, artifact):
+async def _stage_witness_source(
+    connection, recipe, approved, control_schema, tables, retained_reads, artifact, *, source_witness_runtime=None
+):
     fact_table, member_table = tables
-    read = await _authorize_witness_recipe(connection, recipe, approved, control_schema, retained_reads)
+    read = await _authorize_witness_recipe(
+        connection, recipe, approved, control_schema, retained_reads, source_witness_runtime=source_witness_runtime
+    )
     expected_headers = await _native_witness_headers(connection, recipe)
     await _create_source_stage_tables(connection, member_table, None)
     if artifact is None:
@@ -152,7 +176,9 @@ async def _stage_witness_source(connection, recipe, approved, control_schema, ta
         raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
     if artifact is not None:
         descriptor = anchored_source_fact_descriptor(descriptor, artifact)
-    await _authorize_witness_recipe(connection, recipe, approved, control_schema, retained_reads)
+    await _authorize_witness_recipe(
+        connection, recipe, approved, control_schema, retained_reads, source_witness_runtime=source_witness_runtime
+    )
     if await _native_witness_headers(connection, recipe) != expected_headers:
         raise RegistrySourceCompositionError("registry_source_composition_accounting_invalid")
     return WitnessOfficeSource(recipe, descriptor, member_table)
@@ -182,20 +208,31 @@ def _witness_commitments(recipes, witness_sources, derivations, context):
     return descriptors, generations
 
 
-async def _finish_witness_inventory(connection, recipes, approved, tables, witness_sources, office_inputs, scope):
+async def _finish_witness_inventory(
+    connection, recipes, approved, tables, witness_sources, office_inputs, scope, *, source_witness_runtime=None
+):
     """Bind full derivations and all counters before the final serving page can survive the savepoint."""
     control_schema, recipe_sha256 = scope
     raw_table, page_table, fact_table = tables
     await connection.execute(f"ALTER TABLE pg_temp.{_identifier(raw_table)} ADD COLUMN page_key text NOT NULL")
-    matches, derivations, context = await prepare_witness_office_mapping_v2(
-        connection,
-        *office_inputs,
-        witness_sources,
-        raw_table,
-        approved=approved,
-        control_schema=control_schema,
-        recipes_sha256=recipe_sha256,
-    )
+    if source_witness_runtime is None:
+        matches, derivations, context = await prepare_witness_office_mapping_v2(
+            connection,
+            *office_inputs,
+            witness_sources,
+            raw_table,
+            approved=approved,
+            control_schema=control_schema,
+            recipes_sha256=recipe_sha256,
+        )
+    else:
+        matches, derivations, context = await _prepare_source_witness_mapping(
+            connection,
+            *office_inputs,
+            witness_sources,
+            raw_table,
+            _WitnessOfficeContext(approved, control_schema, recipe_sha256, source_witness_runtime),
+        )
     descriptors, generations = _witness_commitments(recipes, witness_sources, derivations, context)
     own = sum(descriptor["fact_rows"] for descriptor in descriptors if descriptor["fact_candidate_id"] is None)
     if await connection.fetchval(f"SELECT count(*) FROM pg_temp.{_identifier(fact_table)}") != own:
@@ -238,22 +275,22 @@ async def stage_verified_witness_inventory(
     *,
     request_id,
     control_schema,
-    retained_fhir_reads,
-    verified_office_inputs,
-    source_manifest=None,
+    read_context=None,
+    **legacy_options,
 ):
     """Use the exact supplied predecessor for reproducible fresh/reuse decisions; never select the current head."""
+    read_context = _witness_read_context(read_context, legacy_options)
     recipes, recipe_sha256 = _source_stage_recipes(recipes, True)
-    _require_witness_scope(recipes, approved, verified_office_inputs)
+    _require_witness_scope(recipes, approved, read_context.verified_office_inputs)
     await _require_source_stage_scope(connection, approved, request_id, 2)
     control_schema = registry_schema() if control_schema is None else control_schema
     _identifier(control_schema)
-    retained_reads = {} if retained_fhir_reads is None else retained_fhir_reads
+    retained_reads = {} if read_context.retained_fhir_reads is None else read_context.retained_fhir_reads
     stage_id = uuid5(request_id, recipe_sha256 + ":" + approved.generation_id).hex
     tables = _source_stage_table_names(stage_id, recipes)
     async with connection.transaction():
         retained = await retained_source_contributions(
-            connection, source_manifest, control_schema, selected_recipes=recipes, witnesses=True
+            connection, read_context.source_manifest, control_schema, selected_recipes=recipes, witnesses=True
         )
         await _create_source_stage_tables(connection, tables[0], tables[2])
         witness_sources = []
@@ -269,6 +306,7 @@ async def stage_verified_witness_inventory(
                     (tables[2], member_table),
                     retained_reads,
                     retained.get(capture),
+                    source_witness_runtime=read_context.source_witness_runtime,
                 )
             )
         return await _finish_witness_inventory(
@@ -277,6 +315,21 @@ async def stage_verified_witness_inventory(
             approved,
             tables,
             witness_sources,
-            verified_office_inputs,
+            read_context.verified_office_inputs,
             (control_schema, recipe_sha256),
+            source_witness_runtime=read_context.source_witness_runtime,
         )
+
+
+def _witness_read_context(read_context, legacy_options):
+    if read_context is not None:
+        if type(read_context) is SourceRecipeReadContext and not legacy_options:
+            return read_context
+    elif set(legacy_options) <= {
+        "retained_fhir_reads",
+        "verified_office_inputs",
+        "source_manifest",
+        "source_witness_runtime",
+    } and {"retained_fhir_reads", "verified_office_inputs"} <= set(legacy_options):
+        return SourceRecipeReadContext(**legacy_options)
+    raise RegistrySourceCompositionError("registry_source_composition_verified_inventory_unbound")

@@ -35,6 +35,15 @@ from process.network_fhir_source_epoch import (
     require_retained_cms_fhir_source_epoch,
     validate_retained_cms_fhir_source_epoch,
 )
+from process.network_fhir_source_witness_contract import (
+    PRODUCER as SOURCE_WITNESS_PRODUCER,
+)
+from process.network_fhir_source_witness_contract import (
+    SourceWitnessCapture,
+    SourceWitnessCaptureAnchor,
+    SourceWitnessContractError,
+    require_capture_anchor,
+)
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, copy_network_membership_batch
 
@@ -67,6 +76,8 @@ class PinnedFHIRMembershipSource:
     retained_epoch: RetainedCMSFHIRSourceEpoch | None = None
     retained_successor: PinnedFHIRMembershipSource | None = None
     retained_capture: RetainedFHIRCapture | None = None
+    source_witness_capture: SourceWitnessCapture | None = None
+    source_witness_anchor: SourceWitnessCaptureAnchor | None = None
 
     def __post_init__(self):
         _identifier(self.schema_name)
@@ -95,6 +106,7 @@ class PinnedFHIRMembershipSource:
         _validate_epoch_coordinates(self)
         _validate_successor_coordinates(self)
         _validate_retained_capture(self)
+        _validate_source_witness(self)
 
     @property
     def coordinates(self):
@@ -116,22 +128,29 @@ class PinnedFHIRMembershipSource:
             coordinates_by_name.pop("retained_capture")
         else:
             coordinates_by_name["retained_capture"] = self.retained_capture.as_dict()
+        if self.source_witness_capture is None:
+            coordinates_by_name.pop("source_witness_capture")
+            coordinates_by_name.pop("source_witness_anchor")
+        else:
+            coordinates_by_name["source_witness_capture"] = self.source_witness_capture.as_dict()
         return coordinates_by_name
 
     @property
     def read_schema_name(self):
         """Read closed retained tables while keeping original source provenance."""
         physical = fhir_physical_source(self)
-        if physical.retained_capture is not None:
-            return physical.retained_capture.schema_name
+        capture = fhir_normalized_capture(physical)
+        if capture is not None:
+            return capture.schema_name
         return physical.retained_epoch.schema_name if physical.retained_epoch is not None else physical.schema_name
 
     @property
     def read_resource_table_oid(self):
         """Bind the exact physical resource heap selected by retained custody."""
         physical = fhir_physical_source(self)
-        if physical.retained_capture is not None:
-            return dict(physical.retained_capture.relation_oids)["provider_directory_dataset_resource"]
+        capture = fhir_normalized_capture(physical)
+        if capture is not None:
+            return dict(capture.relation_oids)["provider_directory_dataset_resource"]
         if physical.retained_epoch is None:
             return physical.resource_table_oid
         return dict(physical.retained_epoch.relation_oids)["provider_directory_dataset_resource"]
@@ -202,6 +221,11 @@ def fhir_physical_source(source):
     return source.retained_successor or source
 
 
+def fhir_normalized_capture(source):
+    """Select the distinct normalized capture without converting its provenance."""
+    return source.retained_capture or source.source_witness_capture
+
+
 def with_fhir_successor(source, successor):
     """Replace a flat accepted capture without extending its original enrollment anchor."""
     if type(successor) is not PinnedFHIRMembershipSource or successor.retained_successor is not None:
@@ -270,6 +294,47 @@ def _validate_retained_capture(source_pin):
         raise FHIRMembershipSourceError("FHIR retained capture coordinates are invalid")
 
 
+def _validate_source_witness(source_pin):
+    """Bind Source provenance and independently issued Core coordinates as one closed pin."""
+    capture, anchor = source_pin.source_witness_capture, source_pin.source_witness_anchor
+    if capture is None and anchor is None:
+        return
+    if (
+        type(capture) is not SourceWitnessCapture
+        or type(anchor) is not SourceWitnessCaptureAnchor
+        or source_pin.retained_capture is not None
+        or source_pin.retained_epoch is not None
+        or source_pin.custody_owner_role is not None
+        or source_pin.retained_successor is not None
+    ):
+        raise FHIRMembershipSourceError("FHIR Source witness coordinates are invalid")
+    try:
+        require_capture_anchor(capture, anchor)
+    except SourceWitnessContractError:
+        raise FHIRMembershipSourceError("FHIR Source witness coordinates are invalid") from None
+    origin = capture.origin
+    if (
+        source_pin.schema_name,
+        source_pin.source_id,
+        source_pin.endpoint_id,
+        source_pin.dataset_id,
+        source_pin.dataset_sha256,
+        source_pin.resource_table_oid,
+        source_pin.release_id,
+        source_pin.as_of,
+    ) != (
+        origin.schema_name,
+        origin.source_id,
+        origin.endpoint_id,
+        origin.dataset_id,
+        origin.dataset_sha256,
+        origin.resource_parent_oid,
+        capture.release_id,
+        origin.semantic_projection_as_of,
+    ):
+        raise FHIRMembershipSourceError("FHIR Source witness coordinates are invalid")
+
+
 @dataclass(frozen=True)
 class FHIRResourceDisposition:
     """One retained resource position, independently of its membership fanout."""
@@ -332,7 +397,7 @@ def _reviewed_descriptor(source, approved_source, coordinates, approved_only=Fal
     if type(source) is not PinnedFHIRMembershipSource or type(approved_only) is not bool:
         raise FHIRMembershipSourceError("Pinned FHIR source is invalid")
     if approved_source is None and coordinates is None:
-        if approved_only or source.retained_capture is not None:
+        if approved_only or fhir_normalized_capture(source) is not None:
             raise FHIRMembershipSourceError("Reviewed FHIR source coordinates are invalid")
         return None
     if (
@@ -347,6 +412,11 @@ def _reviewed_descriptor(source, approved_source, coordinates, approved_only=Fal
     if source.retained_capture is not None and (
         coordinates.producer_id != RETAINED_FHIR_PRODUCER
         or coordinates.edition_id != source.retained_capture.capture_id
+    ):
+        raise FHIRMembershipSourceError("Reviewed FHIR source coordinates are invalid")
+    if source.source_witness_capture is not None and (
+        coordinates.producer_id != SOURCE_WITNESS_PRODUCER
+        or coordinates.edition_id != source.source_witness_capture.capture_id
     ):
         raise FHIRMembershipSourceError("Reviewed FHIR source coordinates are invalid")
     return {**asdict(coordinates), "alias_scope": source.alias_scope, "source_key_kind": "organization_resource_id"}
@@ -498,6 +568,14 @@ async def _require_flat_pinned_source(connection, source_pin, descriptor, retain
         raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
     if api_read:
         return await _require_api_epoch_pinned_source(connection, source_pin, descriptor, retained_read)
+    if source_pin.source_witness_capture is not None:
+        from process.network_fhir_source_witness_capture import SourceWitnessRead
+
+        if type(retained_read) is not SourceWitnessRead or descriptor is None:
+            raise FHIRMembershipSourceError("Pinned FHIR Source witness read is unavailable")
+        require_capture_anchor(source_pin.source_witness_capture, source_pin.source_witness_anchor)
+        await retained_read.verify(connection, source_pin.source_witness_capture)
+        return
     if source_pin.retained_capture is not None:
         from process.network_fhir_retained_capture import RetainedFHIRRead, pin_retained_fhir_read
 
@@ -923,7 +1001,7 @@ def _extraction_sql(source_pin, registry_namespace, reviewed, approved_only=Fals
         "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL "
         "AND legacy.network_id IS NOT NULL AND legacy.resource_type='Organization'"
     )
-    is_retained = fhir_physical_source(source_pin).retained_capture is not None
+    is_retained = fhir_normalized_capture(fhir_physical_source(source_pin)) is not None
     if is_retained:
         complete_key = "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL"
     witness_fields = _source_witness_fields(source_pin, reviewed)
@@ -1018,7 +1096,7 @@ def _source_witness_fields(source_pin, reviewed):
     for resource in ("plan", "location", "network", "page", "provider"):
         witness_by_field[resource + "_witness_join"] = ""
         witness_by_field[resource + "_payload_sha256"] = resource + ".acquired_resource_sha256"
-        if fhir_physical_source(source_pin).retained_capture is not None:
+        if fhir_normalized_capture(fhir_physical_source(source_pin)) is not None:
             witness_by_field[resource + "_payload_sha256"] = resource + ".payload_hash"
         if source_pin.source_id == "cms-npd":
             witness_by_field[resource + "_witness_join"] = (
@@ -1092,7 +1170,7 @@ async def read_retained_fhir_membership_batch(
     binding_coordinates=None,
 ):
     """Replay only an approved normalized capture using its transaction-local admission."""
-    if type(source_pin) is not PinnedFHIRMembershipSource or source_pin.retained_capture is None:
+    if type(source_pin) is not PinnedFHIRMembershipSource or fhir_normalized_capture(source_pin) is None:
         raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
     return await _read_fhir_membership_page(
         connection,
@@ -1158,7 +1236,11 @@ async def _read_fhir_membership_page(
         physical.alias_scope,
         physical.as_of,
         _generation_id(source_pin, approved_source, binding_coordinates, approved_only),
-        *((source_pin.retained_capture.capture_sha256,) if physical.retained_capture is not None else ()),
+        *(
+            (fhir_normalized_capture(source_pin).capture_sha256,)
+            if fhir_normalized_capture(physical) is not None
+            else ()
+        ),
     )
     return _fhir_batch(source_pin, batch, approved_source, binding_coordinates, approved_only)
 
@@ -1452,7 +1534,7 @@ def fhir_source_witness_binding_v2(source_pin):
 
 def _source_witness_sql_v2(source_pin):
     """Render native witnesses without consulting approved mappings or mutable aliases."""
-    is_retained = fhir_physical_source(source_pin).retained_capture is not None
+    is_retained = fhir_normalized_capture(fhir_physical_source(source_pin)) is not None
     provider_fields = _provider_identity_fields(source_pin, False)
     complete_key = "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL"
     if not is_retained:
@@ -1517,8 +1599,8 @@ def _witness_query_arguments(source_pin, after_resource, limit):
             separators=(",", ":"),
         ),
     )
-    if physical.retained_capture is not None:
-        arguments += (source_pin.retained_capture.capture_sha256,)
+    if fhir_normalized_capture(physical) is not None:
+        arguments += (fhir_normalized_capture(source_pin).capture_sha256,)
     return arguments
 
 

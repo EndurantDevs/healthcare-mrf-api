@@ -193,25 +193,33 @@ def _location_query(source):
 
 async def _verify_source_page(connection, recipe, context):
     """Full source admission precedes this call; every page retains fresh native custody."""
-    source = recipe.source_pin
-    if source.retained_capture is not None:
+    source_pin = recipe.source_pin
+    if source_pin.source_witness_capture is not None:
+        from process.network_fhir_source_witness_capture import SourceWitnessRead
+        from process.network_fhir_source_witness_contract import require_capture_anchor
+
+        if type(context.retained_read) is not SourceWitnessRead:
+            raise ValueError("registry_fact_office_read_unavailable")
+        require_capture_anchor(source_pin.source_witness_capture, source_pin.source_witness_anchor)
+        await context.retained_read.verify(connection, source_pin.source_witness_capture)
+    elif source_pin.retained_capture is not None:
         from process.network_fhir_membership_source import RetainedFHIRSuccessorReads
         from process.network_fhir_retained_capture import RetainedFHIRRead
 
         reads = context.retained_read
-        if source.retained_successor is None:
+        if source_pin.retained_successor is None:
             if type(reads) is not RetainedFHIRRead:
                 raise ValueError("registry_fact_office_read_unavailable")
-            await reads.verify(connection, source.retained_capture)
+            await reads.verify(connection, source_pin.retained_capture)
         else:
             if type(reads) is not RetainedFHIRSuccessorReads:
                 raise ValueError("registry_fact_office_read_unavailable")
-            await reads.original.verify(connection, source.retained_capture)
-            await reads.physical.verify(connection, source.retained_successor.retained_capture)
+            await reads.original.verify(connection, source_pin.retained_capture)
+            await reads.physical.verify(connection, source_pin.retained_successor.retained_capture)
     else:
         from process.network_fhir_source_epoch import require_retained_cms_fhir_source_epoch
 
-        for pin in (replace(source, retained_successor=None), source.retained_successor):
+        for pin in (replace(source_pin, retained_successor=None), source_pin.retained_successor):
             if pin is not None:
                 await require_retained_cms_fhir_source_epoch(connection, pin, pin.retained_epoch, verify_content=False)
 

@@ -15,7 +15,7 @@ from uuid import UUID
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import ApprovedMembershipSource, pin_retained_approved_membership_source
 from process.network_custom_address_source import _require_transaction
-from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_normalized_capture
 from process.network_initial_cms_office_bindings import _capture_offices as capture_cms_offices
 from process.network_initial_cms_office_bindings import (
     copy_initial_cms_office_bindings,
@@ -111,7 +111,7 @@ def validate_initial_source_recipes(recipes, *, inventory=False) -> tuple:
             if type(source_pin) in {PinnedACAMembershipSource, PinnedPTGOfficeMembershipSource}:
                 continue
             if type(source_pin) is PinnedFHIRMembershipSource and (
-                source_pin.retained_epoch is not None or source_pin.retained_capture is not None
+                source_pin.retained_epoch is not None or fhir_normalized_capture(source_pin) is not None
             ):
                 continue
             if (
@@ -1057,7 +1057,8 @@ def _witness_office_receipt(candidate, recipes, approved, address_source, stage)
         or type(stage.office_matches) is not _OfficeMatches
         or not recipes
         or not all(
-            type(recipe.source_pin) is PinnedFHIRMembershipSource and recipe.source_pin.retained_capture is not None
+            type(recipe.source_pin) is PinnedFHIRMembershipSource
+            and fhir_normalized_capture(recipe.source_pin) is not None
             for recipe in recipes
         )
     ):

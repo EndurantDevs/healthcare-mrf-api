@@ -11,7 +11,7 @@ from uuid import UUID
 
 from process.network_address_projection import _identifier
 from process.network_compact_layout import CompactAddressRelation
-from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_normalized_capture
 from process.network_membership_candidate_lifecycle import (
     _control_namespace,
     _locked_candidate,
@@ -71,7 +71,7 @@ def source_inventory_record(entry):
     (recipe,) = decode_registry_source_recipes(singleton)
     scope_key = scope_value = None
     if type(recipe.source_pin) is PinnedFHIRMembershipSource:
-        capture = recipe.source_pin.retained_capture
+        capture = fhir_normalized_capture(recipe.source_pin)
         scope_key, scope_value = (
             ("alias_scope", recipe.source_pin.alias_scope)
             if capture is None

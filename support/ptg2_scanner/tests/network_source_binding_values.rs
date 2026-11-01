@@ -78,6 +78,66 @@ fn encode(rows: &[Value]) -> EncodedSourceBindingBatch {
     bindings::encode_network_source_binding_batch(&serde_json::to_vec(rows).unwrap()).unwrap()
 }
 
+fn source_witness() -> Value {
+    let mut input = fhir();
+    input["producer_id"] = json!("registry-source-fhir-witness-v1");
+    input["edition_id"] = json!("01234567-89ab-cdef-8123-456789abcde0");
+    input["source_key"] = json!("Organization-1.v2");
+    input["source_scope_json"] = json!({
+        "organization_id": "Organization-1.v2", "capture_sha256": "a".repeat(64)
+    });
+    input
+}
+
+#[test]
+fn source_witness_scope_preserves_distinct_provenance() {
+    let input = source_witness();
+    let output = encode(std::slice::from_ref(&input));
+    assert_eq!(output.rows[0].source_scope_json, input["source_scope_json"]);
+    assert_eq!(
+        output.rows[0].producer_id,
+        "registry-source-fhir-witness-v1"
+    );
+    assert_eq!(output.rows[0].edition_id, input["edition_id"]);
+    let mut reader = input;
+    reader["producer_id"] = json!("registry-retained-normalized-fhir-v1");
+    assert_ne!(
+        output.rows[0].binding_key,
+        encode(&[reader]).rows[0].binding_key
+    );
+}
+
+#[test]
+fn source_witness_scope_rejects_mixed_or_unbound_coordinates() {
+    let input = source_witness();
+    for (field, value, code) in [
+        ("source_id", "cms-npd", "invalid_scope"),
+        ("source_key", "other-organization", "invalid_scope"),
+        ("edition_id", "not-a-capture-id", "invalid_scope"),
+        ("dataset_schema", "invalid.schema", "invalid_schema"),
+        ("producer_id", "other-producer", "invalid_scope"),
+    ] {
+        let mut wrong = input.clone();
+        wrong[field] = json!(value);
+        reject(&[wrong], code);
+    }
+    for scope in [
+        fhir()["source_scope_json"].clone(),
+        json!({"organization_id": "Organization-1.v2", "capture_sha256": "A".repeat(64)}),
+        json!({"organization_id": "Organization-1.v2", "capture_sha256": "a".repeat(64),
+            "legacy_uuid": "01234567-89ab-cdef-8123-456789abcde0"}),
+        json!({"insurance_plan_id": "plan-one", "capture_sha256": "a".repeat(64), "product_network_id": 42}),
+    ] {
+        let mut wrong = input.clone();
+        wrong["source_scope_json"] = scope;
+        reject(&[wrong], "invalid_scope");
+    }
+    let mut late_invalid = input.clone();
+    late_invalid["binding_id"] = json!("01234567-89ab-cdef-8123-456789abcde1");
+    late_invalid["source_scope_json"]["capture_sha256"] = json!("bad");
+    reject(&[input, late_invalid], "invalid_scope");
+}
+
 fn reject(rows: &[Value], code: &str) {
     let error = bindings::encode_network_source_binding_batch(&serde_json::to_vec(rows).unwrap())
         .unwrap_err();

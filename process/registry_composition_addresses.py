@@ -3,7 +3,7 @@
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from uuid import UUID, uuid5
 
 from process.network_address_projection import PinnedAddressSource, _identifier
@@ -65,8 +65,14 @@ class RegistryCompositionAddressSources:
     em_provider_inputs: EMProviderInputs | None = None
     compact: bool = False
     prepared_address_artifact: CustomAddressSourceReceipt | None = None
+    source_witness_runtime: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
+        if self.source_witness_runtime is not None:
+            from process.registry_source_recipe_composition import SourceWitnessRuntime
+
+            if type(self.source_witness_runtime) is not SourceWitnessRuntime:
+                raise RegistryCompositionError("registry_source_witness_runtime_invalid")
         if type(self.compact) is not bool:
             raise RegistryCompositionError("registry_composition_address_sources_invalid")
         if type(self.base_source) is not PinnedAddressSource or (
@@ -95,6 +101,11 @@ class RegistryCompositionAddressSources:
                     else validate_initial_source_recipes(recipes)
                 )
                 object.__setattr__(self, name, recipes)
+        if not self.compact and any(
+            getattr(recipe.source_pin, "source_witness_capture", None) is not None
+            for recipe in self.introduced_source_recipes
+        ):
+            raise RegistryCompositionError("registry_source_witness_verified_inventory_required")
 
     @property
     def introduced_source_recipes(self):
@@ -264,6 +275,7 @@ async def _prepare_inventory_artifact(
                 office_authority=inputs.office_context,
                 retained_fhir_reads=inputs.retained_fhir_reads,
                 office_matches=source_stage.office_matches,
+                source_witness_runtime=inputs.source_witness_runtime,
             ),
             (
                 recipes,
@@ -366,10 +378,10 @@ class RegistryAddressArtifactCustody:
 
 def _retained_fhir_only(recipes):
     """Recognize the existing no-custom path without treating an empty recipe set as FHIR."""
-    from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+    from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_normalized_capture
 
     return bool(recipes) and all(
-        type(recipe.source_pin) is PinnedFHIRMembershipSource and recipe.source_pin.retained_capture is not None
+        type(recipe.source_pin) is PinnedFHIRMembershipSource and fhir_normalized_capture(recipe.source_pin) is not None
         for recipe in recipes
     )
 
@@ -596,7 +608,9 @@ async def _verify_compact_preparation_origin(connection, sources, source_manifes
         await _artifact_dependency_identity(connection, sources.npi_source, custody.runtime_roles)
 
 
-async def _prepare_preservation(connection, source_manifest, recipes, approved_revision, scope, *, inventory=False):
+async def _prepare_preservation(
+    connection, source_manifest, recipes, approved_revision, scope, *, inventory=False, source_witness_runtime=None
+):
     """Keep both independent preparation paths on the same public native derivation."""
     if source_manifest is None:
         return None
@@ -612,6 +626,7 @@ async def _prepare_preservation(connection, source_manifest, recipes, approved_r
         approved_revision=approved_revision,
         control_schema=control_schema,
         inventory=inventory,
+        **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     )
 
 
@@ -676,6 +691,11 @@ async def _prepare_selected_address_artifact(
         recipes,
         approved.approved_revision,
         (request_id, expected_head, custody.control_schema),
+        **(
+            {"source_witness_runtime": address_sources.source_witness_runtime}
+            if address_sources.source_witness_runtime is not None
+            else {}
+        ),
     )
     if (
         approved.total_rows == 0

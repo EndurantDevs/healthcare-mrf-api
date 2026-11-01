@@ -231,7 +231,9 @@ async def _publication_address_sources(connection, expected_head, config, initia
             ):
                 raise ValueError("registry_publication_replacement_source_mismatch")
             address_sources = replace(
-                address_sources, replacement_source_recipes=initial_address_sources.replacement_source_recipes
+                address_sources,
+                replacement_source_recipes=initial_address_sources.replacement_source_recipes,
+                source_witness_runtime=initial_address_sources.source_witness_runtime,
             )
     else:
         address_sources = initial_address_sources
@@ -284,6 +286,7 @@ async def _ordinary_publication(
         writer_roles=config.writer_roles,
         control_schema=config.control_schema,
     )
+    runtime = address_sources.source_witness_runtime
     return await complete_queued_registry_publication(
         connection,
         request_record["request_id"],
@@ -293,6 +296,7 @@ async def _ordinary_publication(
         authorize=authorize,
         writer_context=config,
         seal_candidate=config.seal_candidate,
+        **({"source_witness_runtime": runtime} if runtime is not None else {}),
     )
 
 

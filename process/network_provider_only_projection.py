@@ -20,6 +20,7 @@ from process.network_approved_source_bindings import (
 from process.network_fhir_membership_source import (
     FHIRMembershipBatchBoundsError,
     PinnedFHIRMembershipSource,
+    fhir_normalized_capture,
     fhir_physical_source,
     read_fhir_source_witness_page_v2,
 )
@@ -188,7 +189,7 @@ async def prepare_provider_only_projection(connection, copy_target, recipes, sta
 
 def _source_query(recipe, fact_relation, control_schema, *, descriptor_version=None):
     source = recipe.source_pin
-    capture = source.retained_capture
+    capture = fhir_normalized_capture(source)
     scope_key = "alias_scope" if capture is None else "capture_sha256"
     organization = (
         " AND record_json->'source_scope_json'->>'organization_id'=record_json->>'source_key'"
@@ -205,7 +206,7 @@ def _source_query(recipe, fact_relation, control_schema, *, descriptor_version=N
 
 
 def _source_arguments(recipe, approved, *, descriptor_version=None):
-    capture = recipe.source_pin.retained_capture
+    capture = fhir_normalized_capture(recipe.source_pin)
     scope = recipe.source_pin.alias_scope if capture is None else capture.capture_sha256
     return (
         approved.approved_revision,
@@ -290,10 +291,9 @@ async def _rebuild_source(
 async def _source_witness_census_v2(connection, source_pin):
     physical = fhir_physical_source(source_pin)
     membership_kinds = ("PractitionerRole", "OrganizationAffiliation")
-    if physical.retained_capture is not None:
-        count = sum(
-            amount for kind, amount in physical.retained_capture.origin.resource_counts if kind in membership_kinds
-        )
+    capture = fhir_normalized_capture(physical)
+    if capture is not None:
+        count = sum(amount for kind, amount in capture.origin.resource_counts if kind in membership_kinds)
     else:
         count = await connection.fetchval(
             f"SELECT count(*) FROM {_identifier(physical.read_schema_name)}.provider_directory_dataset_resource "

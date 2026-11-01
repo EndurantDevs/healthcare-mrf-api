@@ -73,9 +73,20 @@ async def _retained_source_stage(connection, copy_target, candidate, control_sch
     return RegistrySourceRecipeStage(name, receipt["source_rows"], 0, generation)
 
 
+def _source_stage_context(office_authority):
+    """Preserve office-only private callers while accepting the independent Source context."""
+    return (
+        office_authority
+        if type(office_authority) is SourceRecipeReadContext
+        else SourceRecipeReadContext(office_authority)
+    )
+
+
 async def _independent_source_stage(
     connection, copy_target, candidate, approved, *, expected, control_schema, office_authority, inventory=None
 ):
+    """Rebuild selected Source facts with independent runtime, office and predecessor context."""
+    read_context = _source_stage_context(office_authority)
     recipes = verify_registry_source_recipes(candidate) if inventory is None else inventory[1]
     if not recipes:
         generations = candidate.get("source_generations", {}) if inventory is not None else {}
@@ -128,9 +139,7 @@ async def _independent_source_stage(
         control_schema=control_schema,
         contribution_revision=2 if inventory is not None or expected is None else expected["revision"],
         **{"inventory": True} if inventory is not None else {},
-        read_context=SourceRecipeReadContext(
-            source_manifest=previous, office_authority=office_authority, verified_office_inputs=verified_inputs
-        ),
+        read_context=replace(read_context, source_manifest=previous, verified_office_inputs=verified_inputs),
     )
 
 
@@ -262,6 +271,7 @@ async def verify_independent_source_contributions(
     office_authority=None,
     inventory_entries=None,
     preservation=None,
+    source_witness_runtime=None,
 ):
     """Authenticate current Source facts and mappings before adding independently proved carry."""
     expected = verify_registry_source_contributions(candidate)
@@ -280,7 +290,7 @@ async def verify_independent_source_contributions(
         approved,
         expected=expected,
         control_schema=control_schema,
-        office_authority=office_authority,
+        office_authority=SourceRecipeReadContext(office_authority, source_witness_runtime=source_witness_runtime),
         **({"inventory": inventory} if inventory is not None else {}),
     )
     commands = None
