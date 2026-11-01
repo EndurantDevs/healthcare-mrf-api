@@ -1539,10 +1539,19 @@ def _ordinary_recipe_execution(monkeypatch, *, head, address_sources, failure=No
 
 
 @pytest.mark.parametrize(
-    "phase,head", [("initial_source_recipes", 0), ("replacement_source_recipes", 7), (None, 7), (None, 0)]
+    "phase,head,compact",
+    [
+        ("initial_source_recipes", 0, False),
+        ("replacement_source_recipes", 7, False),
+        ("replacement_source_recipes", 7, True),
+        (None, 7, False),
+        (None, 0, False),
+    ],
 )
-async def test_ordinary_recipe_dispatch_preserves_retained_custody_and_fresh_authority(monkeypatch, phase, head):
-    sources = _ordinary_recipe_sources(phase=phase)
+async def test_ordinary_recipe_dispatch_preserves_retained_custody_and_fresh_authority(
+    monkeypatch, phase, head, compact
+):
+    sources = replace(_ordinary_recipe_sources(phase=phase), compact=compact)
     execution = _ordinary_recipe_execution(monkeypatch, head=head, address_sources=sources)
     result = await consumer._ordinary_publication(
         execution.connection, execution.request, execution.authorize, execution.config, sources
@@ -1556,7 +1565,9 @@ async def test_ordinary_recipe_dispatch_preserves_retained_custody_and_fresh_aut
     assert composed["approved_revision"] == 1 and composed["expected_head"] == head
     if head:
         execution.resolve.assert_awaited_once_with(execution.connection, generation_id=head, control_schema="registry")
-        execution.retained.assert_awaited_once_with(execution.connection, execution.source_pin, "registry")
+        execution.retained.assert_awaited_once_with(
+            execution.connection, execution.source_pin, "registry", **({"compact_upgrade": True} if compact else {})
+        )
         assert execution.transactions == [{"isolation": "repeatable_read", "readonly": True}]
         assert composed["source_manifest"] is execution.source_pin
         if phase is None:
@@ -1589,8 +1600,9 @@ async def test_ordinary_recipe_wrong_head_refuses_before_approval(monkeypatch, p
 
 
 @pytest.mark.parametrize("damage", ["base_generation", "npi", "office_store", "office_budget", "provider_inputs"])
-async def test_ordinary_replacement_cannot_change_retained_address_authority(monkeypatch, damage):
-    address_sources = _ordinary_recipe_sources(phase="replacement_source_recipes")
+@pytest.mark.parametrize("compact", [False, True])
+async def test_ordinary_replacement_cannot_change_retained_address_authority(monkeypatch, damage, compact):
+    address_sources = replace(_ordinary_recipe_sources(phase="replacement_source_recipes"), compact=compact)
     execution = _ordinary_recipe_execution(monkeypatch, head=7, address_sources=address_sources)
     changes_by_name = {
         "base_generation": {"base_source": replace(address_sources.base_source, generation_id="c" * 64)},

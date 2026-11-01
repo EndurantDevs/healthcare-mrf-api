@@ -897,6 +897,12 @@ async def test_bootstrap_retained_source_successor_and_rollback_preview(
         assert address_sources.npi_source == PinnedAddressSource(
             bootstrap_address.schema_name, "npi", bootstrap_address.generation_id
         )
+        upgraded = await execution._source_rollback_address_sources(
+            publisher, first, case.control_schema, compact_upgrade=True
+        )
+        assert upgraded.base_source == bootstrap_address
+        assert upgraded.npi_source == address_sources.npi_source and upgraded.compact is True
+        assert address_sources.compact is False
         preview_by_name = await _bootstrap_rollback_preview(case, publisher, first, current)
         assert preview_by_name["operation"] == "prepare_source_rollback"
         assert (preview_by_name["additions"], preview_by_name["removals"], preview_by_name["changes"]) == (0, 0, 0)

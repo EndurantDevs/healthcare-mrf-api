@@ -246,6 +246,10 @@ def _authority_document(authority):
 
 
 def _descriptor(binding):
+    from process import network_bootstrap_address_artifact as bootstrap
+
+    if type(binding) is dict and binding.get("contract") == bootstrap.CONTRACT:
+        return bootstrap._descriptor(binding)
     _require(
         type(binding) is dict
         and set(binding)
@@ -332,14 +336,22 @@ def _descriptor_origin(binding):
     _roles(tuple(binding["runtime_roles"]))
 
 
-async def capture_network_address_artifact(connection, source, *, runtime_roles):
-    """Capture actual current origin under native locks; this descriptor grants no authority."""
-    _require(type(source) is PinnedAddressSource and source.table_name == _TABLE, "source_invalid")
+async def _require_capture_snapshot(connection):
     _require(connection.is_in_transaction(), "transaction_required")
     _require(
         await connection.fetchval("SHOW transaction_isolation") in {"repeatable read", "serializable"},
         "snapshot_required",
     )
+
+
+async def capture_network_address_artifact(connection, source, *, runtime_roles):
+    """Capture actual current origin under native locks; this descriptor grants no authority."""
+    from process import network_bootstrap_address_artifact as bootstrap
+
+    _require(type(source) is PinnedAddressSource and source.table_name == _TABLE, "source_invalid")
+    if bootstrap.is_bootstrap_source(source):
+        return await bootstrap.capture_bootstrap_address_artifact(connection, source, runtime_roles=runtime_roles)
+    await _require_capture_snapshot(connection)
     runtime_roles = _roles(runtime_roles)
     session = _CatalogSession(connection)
     _require(
@@ -396,8 +408,14 @@ async def verify_network_address_artifact(connection, descriptor, *, runtime_rol
     Current singleton/alias generations may advance after that independent seal.
     API mode checks metadata only; consuming queries must independently verify their physical identities.
     """
+    from process import network_bootstrap_address_artifact as bootstrap
+
     await _require_api_read_context(connection, api_read)
     descriptor = _descriptor(descriptor)
+    if descriptor["contract"] == bootstrap.CONTRACT:
+        return await bootstrap.verify_bootstrap_address_artifact(
+            connection, descriptor, runtime_roles=runtime_roles, api_read=api_read
+        )
     runtime_roles = _roles(runtime_roles)
     _require(connection.is_in_transaction(), "transaction_required")
     _require(descriptor["runtime_roles"] == list(runtime_roles), "roles_changed")

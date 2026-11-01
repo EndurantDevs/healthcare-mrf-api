@@ -431,7 +431,23 @@ async def _finish_source_rollback_preview(
         return result_by_name
 
 
-async def _source_rollback_address_sources(connection, source_pin, control_schema):
+def _compact_address_sources(candidate, address_pin):
+    from process import network_bootstrap_address_artifact as bootstrap_artifact
+    from process.network_compact_custom_preparation import compact_custom_receipt
+
+    custom = compact_custom_receipt(candidate)
+    npi_source = None if custom is None else custom.npi_source
+    descriptor = _document(candidate["validation_json"])["serving_readiness"]["address_artifact"]
+    if descriptor.get("contract") == bootstrap_artifact.CONTRACT:
+        descriptor = bootstrap_artifact._descriptor(descriptor)
+        receipt = bootstrap_sources._decode(_json(descriptor["bootstrap_receipt"]))
+        if receipt.address_source != address_pin or npi_source not in (None, receipt.npi_source):
+            raise ValueError("registry_source_rollback_address_changed")
+        npi_source = receipt.npi_source
+    return RegistryCompositionAddressSources(address_pin, npi_source, compact=True)
+
+
+async def _source_rollback_address_sources(connection, source_pin, control_schema, *, compact_upgrade=False):
     """Recover only the NPI pin authenticated by the retained address recipe."""
     address_sources = RegistryCompositionAddressSources(
         PinnedAddressSource(source_pin.schema_name, "entity_address_unified", source_pin.manifest_sha256)
@@ -451,16 +467,14 @@ async def _source_rollback_address_sources(connection, source_pin, control_schem
         _publication_readiness(dict(candidate))
         address_pin = PinnedAddressSource(**_document(candidate["validation_json"])["address_source"])
         if source_pin.compact_layout is not None:
-            from process.network_compact_custom_preparation import compact_custom_receipt
-
-            custom = compact_custom_receipt(candidate)
-            npi_source = None if custom is None else custom.npi_source
-            return RegistryCompositionAddressSources(address_pin, npi_source, compact=True)
+            return _compact_address_sources(candidate, address_pin)
         document = await connection.fetchval(
             "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
             address_pin.schema_name,
         )
         if document is None:
+            if compact_upgrade:
+                raise ValueError("registry_publication_compact_bootstrap_required")
             return address_sources
         metadata = _document(document)
         bootstrap = isinstance(metadata, dict) and metadata.get("component") == "network_bootstrap_sources"
@@ -469,7 +483,11 @@ async def _source_rollback_address_sources(connection, source_pin, control_schem
             raise ValueError("registry_source_rollback_address_changed")
         if bootstrap:
             await bootstrap_sources.verify_network_bootstrap_sources(connection, receipt)
+            if compact_upgrade:
+                return RegistryCompositionAddressSources(receipt.address_source, receipt.npi_source, compact=True)
         else:
+            if compact_upgrade:
+                raise ValueError("registry_publication_compact_bootstrap_required")
             await verify_retained_custom_address_source(connection, receipt)
         return RegistryCompositionAddressSources(address_sources.base_source, receipt.npi_source)
 

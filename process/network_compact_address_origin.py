@@ -2,14 +2,42 @@
 """Resolve current addresses or an exact independently sealed retained origin."""
 
 from process.network_address_artifact import capture_network_address_artifact
-from process.network_address_projection import PinnedAddressSource
+from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_compact_layout import CompactAddressRelation
-from process.network_compact_readiness import _require
+from process.network_compact_readiness import _require, is_compact_candidate
 from process.network_membership_validation import _json_object
 from process.registry_retained_generation import resolve_registry_retained_generation
 
 
+async def _is_legacy_bootstrap_origin(connection, candidate, address_source, control_schema):
+    from process.network_serving_read import resolve_network_serving_manifest
+
+    locator = _json_object(candidate["source_generations"]).get("retained_network_source")
+    if locator is None or not address_source.schema_name.startswith("network_bootstrap_"):
+        return False
+    rows = await connection.fetch(
+        f"SELECT m.generation_id,c.validation_json FROM {_identifier(control_schema)}.network_serving_manifest m "
+        f"JOIN {_identifier(control_schema)}.network_membership_candidate c USING(candidate_id) "
+        "WHERE m.manifest_sha256=$1 LIMIT 2",
+        locator,
+    )
+    _require(len(rows) == 1)
+    if is_compact_candidate(rows[0]):
+        return False
+    manifest = await resolve_network_serving_manifest(
+        connection, generation_id=rows[0]["generation_id"], control_schema=control_schema
+    )
+    _require(manifest.manifest_sha256 == locator)
+    if manifest.compact_layout is not None:
+        return False
+    _require(PinnedAddressSource(**_json_object(rows[0]["validation_json"])["address_source"]) == address_source)
+    # The legacy head locates the original bootstrap; fresh native capture authorizes its reuse.
+    return True
+
+
 async def _retained_origin(connection, candidate, address_source, roles, control_schema):
+    if await _is_legacy_bootstrap_origin(connection, candidate, address_source, control_schema):
+        return None
     retained = await resolve_registry_retained_generation(connection, candidate, control_schema=control_schema)
     if retained is None:
         return None
