@@ -309,6 +309,84 @@ def _resource_edges(source_row, resource_payload, is_normalized, source_uri):
             )
 
 
+_EMPTY_OUTPUT_BYTES = len(b'{"organizations":[],"edges":[]}')
+
+
+def _extraction_input(resource_rows, profile, source_uri, max_rows, max_input_bytes, max_output_bytes):
+    if profile not in PROFILES or type(resource_rows) not in {list, tuple}:
+        _fail()
+    _bound(max_rows, MAX_ROWS)
+    _bound(max_input_bytes, MAX_BYTES)
+    _bound(max_output_bytes, MAX_BYTES)
+    if len(resource_rows) > max_rows or len(_json_bytes(resource_rows)) > max_input_bytes:
+        _fail("input_bounds")
+    return _source_uri(source_uri)
+
+
+def _output_bounds(resource_index, input_rows, edges, used_bytes, resource_edges, resource_bytes, maximum):
+    error = FHIRCatalogExtractionError("registry_fhir_catalog_output_bounds")
+    error.bounds = {
+        "limit": "edges" if edges > MAX_EDGES else "bytes",
+        "resource_index": resource_index,
+        "input_rows": input_rows,
+        "edges": edges,
+        "output_bytes": used_bytes,
+        "resource_edges": resource_edges,
+        "resource_output_bytes": resource_bytes,
+        "max_edges": MAX_EDGES,
+        "max_output_bytes": maximum,
+    }
+    raise error
+
+
+def _extract_catalog_rows(
+    resource_rows, profile, source_uri, max_output_bytes, identities, input_rows, resource_offset=0
+):
+    organizations, edges = [], []
+    used_bytes = _EMPTY_OUTPUT_BYTES
+    for resource_index, source_row in enumerate(resource_rows, resource_offset):
+        resource_type, resource_id, resource_payload = _resource(source_row, profile)
+        if (resource_type, resource_id) in identities:
+            _fail("duplicate_resource")
+        identities.add((resource_type, resource_id))
+        is_normalized = profile != "raw_fhir"
+        resource_edges, resource_bytes = 0, _EMPTY_OUTPUT_BYTES
+        if resource_type == "Organization":
+            observation = _organization(source_row, resource_payload, is_normalized)
+            organizations.append(observation)
+            observation_bytes = len(_json_bytes(asdict(observation)))
+            used_bytes += observation_bytes + (len(organizations) > 1)
+            resource_bytes += observation_bytes
+        else:
+            for edge in _resource_edges(source_row, resource_payload, is_normalized, source_uri):
+                edge_bytes = len(_json_bytes(asdict(edge)))
+                used_bytes += edge_bytes + bool(edges)
+                resource_bytes += edge_bytes + bool(resource_edges)
+                resource_edges += 1
+                if len(edges) >= MAX_EDGES or used_bytes > max_output_bytes:
+                    _output_bounds(
+                        resource_index,
+                        input_rows,
+                        len(edges) + 1,
+                        used_bytes,
+                        resource_edges,
+                        resource_bytes,
+                        max_output_bytes,
+                    )
+                edges.append(edge)
+        if used_bytes > max_output_bytes:
+            _output_bounds(
+                resource_index,
+                input_rows,
+                len(edges),
+                used_bytes,
+                resource_edges,
+                resource_bytes,
+                max_output_bytes,
+            )
+    return FHIRCatalogBatch(tuple(organizations), tuple(edges), len(resource_rows), used_bytes)
+
+
 def extract_fhir_catalog_batch(
     resource_rows,
     *,
@@ -319,35 +397,44 @@ def extract_fhir_catalog_batch(
     max_output_bytes=DEFAULT_BYTES,
 ):
     """Extract source facts only; hashes, local references and names grant no authority."""
-    if profile not in PROFILES or type(resource_rows) not in {list, tuple}:
-        _fail()
-    _bound(max_rows, MAX_ROWS)
-    _bound(max_input_bytes, MAX_BYTES)
-    _bound(max_output_bytes, MAX_BYTES)
-    if len(resource_rows) > max_rows or len(_json_bytes(resource_rows)) > max_input_bytes:
-        _fail("input_bounds")
-    source_uri = _source_uri(source_uri)
+    source_uri = _extraction_input(resource_rows, profile, source_uri, max_rows, max_input_bytes, max_output_bytes)
+    return _extract_catalog_rows(resource_rows, profile, source_uri, max_output_bytes, set(), len(resource_rows))
+
+
+def iter_fhir_catalog_batches(
+    resource_rows,
+    *,
+    profile,
+    source_uri=None,
+    max_rows=MAX_ROWS,
+    max_input_bytes=DEFAULT_BYTES,
+    max_output_bytes=DEFAULT_BYTES,
+):
+    """Split a validated input page at resource boundaries, preserving every bounded resource."""
+    source_uri = _extraction_input(resource_rows, profile, source_uri, max_rows, max_input_bytes, max_output_bytes)
     organizations, edges, identities = [], [], set()
-    used_bytes = len(b'{"organizations":[],"edges":[]}')
-    for source_row in resource_rows:
-        resource_type, resource_id, resource_payload = _resource(source_row, profile)
-        if (resource_type, resource_id) in identities:
-            _fail("duplicate_resource")
-        identities.add((resource_type, resource_id))
-        is_normalized = profile != "raw_fhir"
-        if resource_type == "Organization":
-            observation = _organization(source_row, resource_payload, is_normalized)
-            organizations.append(observation)
-            used_bytes += len(_json_bytes(asdict(observation))) + (len(organizations) > 1)
-        else:
-            for edge in _resource_edges(source_row, resource_payload, is_normalized, source_uri):
-                used_bytes += len(_json_bytes(asdict(edge))) + bool(edges)
-                if len(edges) >= MAX_EDGES or used_bytes > max_output_bytes:
-                    _fail("output_bounds")
-                edges.append(edge)
-        if used_bytes > max_output_bytes:
-            _fail("output_bounds")
-    return FHIRCatalogBatch(tuple(organizations), tuple(edges), len(resource_rows), used_bytes)
+    source_rows, used_bytes = 0, _EMPTY_OUTPUT_BYTES
+    for resource_index, source_row in enumerate(resource_rows):
+        resource = _extract_catalog_rows(
+            (source_row,), profile, source_uri, max_output_bytes, identities, len(resource_rows), resource_index
+        )
+        combined_bytes = (
+            used_bytes
+            + resource.output_bytes
+            - _EMPTY_OUTPUT_BYTES
+            + bool(organizations and resource.organizations)
+            + bool(edges and resource.edges)
+        )
+        if source_rows and (len(edges) + len(resource.edges) > MAX_EDGES or combined_bytes > max_output_bytes):
+            yield FHIRCatalogBatch(tuple(organizations), tuple(edges), source_rows, used_bytes)
+            organizations, edges, source_rows = [], [], 0
+            combined_bytes = resource.output_bytes
+        organizations.extend(resource.organizations)
+        edges.extend(resource.edges)
+        source_rows += resource.source_rows
+        used_bytes = combined_bytes
+    if source_rows:
+        yield FHIRCatalogBatch(tuple(organizations), tuple(edges), source_rows, used_bytes)
 
 
 _PAGE_SQL = """WITH page AS MATERIALIZED (
