@@ -22,22 +22,18 @@ def _capacity_receipt_material(
     max_build_deadline: datetime.datetime,
     request_nonce: str,
 ) -> tuple[dict[str, object], ...]:
-    timing = support._GuardTiming(
-        observed_at, issued_at, expires_at, max_build_deadline, request_nonce
+    timing = support._GuardTiming(observed_at, issued_at, expires_at, max_build_deadline, request_nonce)
+    execution = support.synthetic_profile_execution(
+        frozen_profile_input_digest=support.GOLDEN_PROFILE_INPUT_DIGEST,
     )
-    execution = support.synthetic_profile_execution()
     execution_by_field = support._execution_by_field(execution)
     limits_by_field = support._limits_payload()
     storage_by_field = support._storage_observation(timing)
     import_request_by_field = support._control_plane_request(
         execution_by_field, limits_by_field, storage_by_field, timing
     )
-    execution_request = support._execution_request(
-        execution_by_field, limits_by_field, timing
-    )
-    execution_identity_by_field = preflight.profile_execution_identity_payload(
-        execution_request
-    )
+    execution_request = support._execution_request(execution_by_field, limits_by_field, timing)
+    execution_identity_by_field = preflight.profile_execution_identity_payload(execution_request)
     followup_by_field = support._held_followup(execution, timing)
     import_receipt_by_field = support._control_plane_receipt(
         import_request_by_field,
@@ -50,9 +46,7 @@ def _capacity_receipt_material(
     healthcare_request_by_field = support._healthcare_request(
         execution_by_field, limits_by_field, import_receipt_by_field, timing
     )
-    validated_healthcare_request = support._validated_request(
-        healthcare_request_by_field
-    )
+    validated_healthcare_request = support._validated_request(healthcare_request_by_field)
     healthcare_receipt_by_field = support._healthcare_receipt(
         validated_healthcare_request,
         import_receipt_by_field,

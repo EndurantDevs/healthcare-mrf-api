@@ -420,16 +420,17 @@ def resource_scan_types(directory, source_record, resource_types, options):
 
 
 async def resource_scan_estimates(directory, source_record):
-    """Use published header counts only as estimates for download ordering."""
-    endpoint_id = directory._clean_text(source_record.get("_endpoint_id"))
-    if endpoint_id is None:
-        return {}
-    header_by_field = await current_endpoint_dataset_record(
-        directory, endpoint_id, exclude_dataset_id=source_record.get("_endpoint_dataset_id") or ""
+    """Prefer published counts to reviewed seed estimates for download ordering."""
+    count_by_resource = directory._json_object(
+        directory._source_metadata(source_record).get("provider_directory_resource_count_estimates")
     )
-    if header_by_field.get("status") != directory.ENDPOINT_DATASET_PUBLISHED:
-        return {}
-    count_by_resource = directory._json_object(header_by_field.get("resource_counts"))
+    endpoint_id = directory._clean_text(source_record.get("_endpoint_id"))
+    if endpoint_id is not None:
+        header_by_field = await current_endpoint_dataset_record(
+            directory, endpoint_id, exclude_dataset_id=source_record.get("_endpoint_dataset_id") or ""
+        )
+        if header_by_field.get("status") == directory.ENDPOINT_DATASET_PUBLISHED:
+            count_by_resource = directory._json_object(header_by_field.get("resource_counts"))
     return {
         resource: count
         for resource, count in count_by_resource.items()

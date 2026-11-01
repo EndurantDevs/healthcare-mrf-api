@@ -353,6 +353,16 @@ async def test_projection_response_is_closed_and_self_hashed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_projection_matches_cross_repository_golden(monkeypatch):
+    from tests import provider_directory_profile_capacity_signing_guard_test_support as signing
+    from tests import test_provider_directory_profile_capacity_preflight as preflight_support
+
+    monkeypatch.setattr(
+        preflight_support,
+        "synthetic_profile_execution",
+        lambda: signing.synthetic_profile_execution(
+            frozen_profile_input_digest=signing.GOLDEN_PROFILE_INPUT_DIGEST,
+        ),
+    )
     observed = await _project_with_stubs(monkeypatch)
     expected_bytes = (
         contract.canonical_preflight_json(
