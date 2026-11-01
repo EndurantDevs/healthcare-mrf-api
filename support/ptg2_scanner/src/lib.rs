@@ -3,6 +3,8 @@
 pub mod address_canon;
 pub mod address_evidence_alias;
 pub mod canonical_network_values;
+#[cfg(feature = "python")]
+mod catalog_observation;
 pub mod cms_mlr_registry;
 pub mod cms_planfinder_registry;
 pub mod company_group_assertions;
@@ -125,6 +127,7 @@ mod python_api {
     include!("python_registry.rs");
     include!("python_entity_address_rows.rs");
     include!("python_retained_fhir_capture.rs");
+    include!("python_catalog_observation.rs");
 
     #[pyfunction]
     fn encode_network_membership_batch(
@@ -639,6 +642,7 @@ mod python_api {
             crate::registry_ptg_capture_input::encode_registry_ptg_capture_batch_py,
             m
         )?)?;
+        m.add_function(wrap_pyfunction!(encode_catalog_observation_page, m)?)?;
         m.add_function(wrap_pyfunction!(encode_network_membership_batch, m)?)?;
         m.add_function(wrap_pyfunction!(partition_network_membership_commands, m)?)?;
         m.add_function(wrap_pyfunction!(encode_cms_mlr_observations, m)?)?;

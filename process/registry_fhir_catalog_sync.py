@@ -312,6 +312,8 @@ async def _discover_catalog_sources(source_connection, grant, *, exports_by_prof
     for profile in grant.source_profiles:
         report = current_fhir_catalog_report()
         profile_index = report.add_profile(profile) if report else None
+        if report:
+            report.progress("discovery")
         export = exports_by_profile.get(canonical_json(profile.document())) if exports_by_profile is not None else None
         if export is None and source_connection is None:
             raise ValueError("registry_fhir_catalog_source_reader_required")
@@ -335,6 +337,7 @@ async def _discover_catalog_sources(source_connection, grant, *, exports_by_prof
                         for disposition in page
                     ),
                 )
+                report.progress("discovery")
             for disposition in page:
                 (accepted if disposition.status == "accepted" else unavailable).append(disposition)
             if len(accepted) > 1000:
