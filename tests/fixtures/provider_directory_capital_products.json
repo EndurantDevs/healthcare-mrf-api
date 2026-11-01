@@ -1,0 +1,12 @@
+{
+  "Medicare": {
+    "source_id": "pdfhir_a756316e811afc3e5c1b9330",
+    "base": "https://api.capitalbluecrossfhir.com/r4/public-ma",
+    "next": "https://api.capitalbluecrossfhir.com/r4/public-ma/Location?_count=100&_after=1700000000000%20synthetic%2Bcursor%2Fvalue%3D&_offset=100"
+  },
+  "CHIP": {
+    "source_id": "pdfhir_5c4da9c19d969edfdebc9ce1",
+    "base": "https://api.capitalbluecrossfhir.com/r4/public-chip",
+    "next": "https://api.capitalbluecrossfhir.com/r4/public-chip/Location?_count=100&_after=1700000000000%20synthetic%2Bcursor%2Fvalue%3D&_offset=100"
+  }
+}

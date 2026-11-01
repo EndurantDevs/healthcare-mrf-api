@@ -1492,6 +1492,8 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         CARESOURCE_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
         christus.API_BASE,
+        "https://api.capitalbluecrossfhir.com/r4/public-ma",
+        "https://api.capitalbluecrossfhir.com/r4/public-chip",
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
@@ -17342,9 +17344,11 @@ def _source_contract_metadata_keys(
     *,
     artifact: bool,
 ) -> tuple[str, ...]:
-    """Preserve legacy tuples while extending only shaped v3 identities."""
+    """Preserve legacy tuples while binding explicit traversal controls."""
 
     base_keys = ARTIFACT_SOURCE_CONTRACT_METADATA_KEYS if artifact else TWIN_ROOT_ACQUISITION_METADATA_KEYS
+    if "provider_directory_pagination_same_collection" in metadata:
+        base_keys += ("provider_directory_pagination_same_collection",)
     is_subset_shape = bool(
         metadata.get(CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD) == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
         and metadata.get(CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD) == SERVER_ISSUED_SUBSET_SEMANTICS
@@ -40204,6 +40208,11 @@ def _health_partners_plans_seed_rows(*, source_query: str | None = None) -> list
     return [seed_row_by_field] if _is_seed_row_query_match(seed_row_by_field, source_query) else []
 
 
+def _capital_blue_cross_product_seed_rows() -> list[dict[str, Any]]:
+    """Use the product metadata through the existing supplemental catalog loader."""
+    return source_selection.capital_blue_cross_product_seed_rows(sys.modules[__name__])
+
+
 @dataclass(frozen=True)
 class _ReviewedCandidateSeed:
     row_id: str
@@ -40513,6 +40522,7 @@ def _seed_rows_from_supplemental_catalogs(
     metrics_by_name["catalogs"].update(remote_metrics_by_catalog)
     for name, base, seed_loader in (
         ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
+        ("capital_blue_cross_products", "capital-blue-cross-public-directory", _capital_blue_cross_product_seed_rows),
         ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
         ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
         (
@@ -41473,13 +41483,21 @@ async def _fetch_source_json_unpaced(
             allow_redirects=False,
             preserve_url_bytes=True,
         )
+    is_same_collection_paging = (
+        _source_metadata(source_record).get("provider_directory_pagination_same_collection") is True
+    )
     pinned_session = _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.get()
+    if pinned_session is None and is_same_collection_paging:
+        pinned_session = _rest_page_prefetch_session(source_record, url)
+        if pinned_session is None:
+            raise RuntimeError("provider_directory_pagination_anonymous_session_required")
     if pinned_session is not None:
         return await _fetch_json_with_source_session(
             pinned_session,
             url,
             timeout=timeout,
-            allow_redirects=True,
+            allow_redirects=not is_same_collection_paging,
+            **({"preserve_url_bytes": True} if is_same_collection_paging else {}),
         )
     options = await source_selection.resolve_probe_credentials(
         _credential_request_options_for_source, source_record, url
@@ -42883,32 +42901,16 @@ def _synthetic_position_page_guard_completeness(
 
 
 def _pagination_host_key(url_or_host: str | None) -> str | None:
-    text = _clean_text(url_or_host)
-    if not text:
-        return None
-    parsed = urllib.parse.urlsplit(text if "://" in text else f"https://{text}")
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
-        return None
-    try:
-        port = parsed.port or 443
-    except ValueError:
-        return None
-    return f"{parsed.hostname.lower()}:{port}"
+    """Use the common HTTPS origin parser."""
+    return source_selection.pagination_host_key(sys.modules[__name__], url_or_host)
 
 
 def _pagination_allowed_hosts(
     source_record: dict[str, Any],
     current_url: str,
 ) -> set[str]:
-    api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    allowed_hosts = {
-        host_key for candidate_url in (api_base, current_url) if (host_key := _pagination_host_key(candidate_url))
-    }
-    configured_hosts = _string_list(_source_metadata(source_record).get("provider_directory_pagination_allowed_hosts"))
-    for configured_host in configured_hosts:
-        if host_key := _pagination_host_key(configured_host):
-            allowed_hosts.add(host_key)
-    return allowed_hosts
+    """Use the common source policy without changing existing callers."""
+    return source_selection.pagination_allowed_hosts(sys.modules[__name__], source_record, current_url)
 
 
 def _is_trusted_fhir_pagination_url(
@@ -42916,15 +42918,8 @@ def _is_trusted_fhir_pagination_url(
     current_url: str,
     next_url: str,
 ) -> bool:
-    parsed_next = urllib.parse.urlsplit(next_url)
-    next_host_key = _pagination_host_key(next_url)
-    return bool(
-        next_host_key
-        and next_host_key in _pagination_allowed_hosts(source_record, current_url)
-        and parsed_next.username is None
-        and parsed_next.password is None
-        and not parsed_next.fragment
-    )
+    """Apply the shared source continuation policy."""
+    return source_selection.is_trusted_fhir_pagination_url(sys.modules[__name__], source_record, current_url, next_url)
 
 
 def _is_idaho_medicaid_query_valid(
@@ -58661,6 +58656,8 @@ def _pagination_checkpoint_scope_identity(
         "source_ids": sorted(set(source_ids)),
         "resource_group": _resource_import_group_key(source_record),
     }
+    if _source_metadata(source_record).get("provider_directory_pagination_same_collection") is True:
+        scope_payload_dict["pagination_same_collection"] = True
     if last_updated_partition_config:
         scope_payload_dict["last_updated_partition_config"] = last_updated_partition_config
     if census_contract is not None:
