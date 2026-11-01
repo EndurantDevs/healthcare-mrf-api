@@ -3,6 +3,7 @@
 
 import asyncio
 import contextvars
+import os
 import posixpath
 import urllib.parse
 import urllib.request
@@ -10,6 +11,15 @@ import urllib.request
 from process import provider_directory_generic_source_policy as source_policy
 
 QUALIFICATION_API_BASE = contextvars.ContextVar("provider_directory_qualification_api_base", default=None)
+
+
+def is_anonymous_source_url(url: str) -> bool:
+    """Reject URL user information before selecting the anonymous HTTP session."""
+    try:
+        parsed_url = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return parsed_url.username is None and parsed_url.password is None
 
 
 class QualificationURLRejected(ValueError):
@@ -46,9 +56,9 @@ def require_qualification_url(directory, url):
 
 
 def open_source_request(directory, request, *, timeout):
-    """Refuse qualification redirects while retaining ordinary source transport."""
+    """Refuse qualification and continuation redirects before contacting another destination."""
     context = directory._ssl_context()
-    if QUALIFICATION_API_BASE.get() is None:
+    if QUALIFICATION_API_BASE.get() is None and not directory._has_fhir_continuation_query(request.full_url):
         return directory.christus.open_source_request(request, timeout=timeout, context=context)
     opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context), _NoQualificationRedirects())
     return opener.open(request, timeout=timeout)
@@ -59,6 +69,57 @@ async def resolve_probe_credentials(credential_lookup, *args, **kwargs):
     if QUALIFICATION_API_BASE.get() is None:
         return credential_lookup(*args, **kwargs)
     return await asyncio.to_thread(credential_lookup, *args, **kwargs)
+
+
+def declared_probe_target(directory, source_record):
+    """Share the fetchable collection and resolved base across request and deadline budgets."""
+    resource_type = directory._source_metadata(source_record).get("provider_directory_probe_resource")
+    if (
+        not isinstance(resource_type, str)
+        or resource_type not in directory.RESOURCE_ENDPOINT_FIELDS
+        or directory.current_version_census_contract(source_record) is not None
+    ):
+        return None
+    resource_url = directory._resource_start_url(source_record, resource_type, page_count=1)
+    if resource_url is None:
+        return None
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    api_base = api_base or directory._resource_or_metadata_parent_base(resource_url)
+    return (resource_type, api_base) if api_base is not None else None
+
+
+async def probe_declared_collection(directory, source_record, *, timeout, run_id):
+    """Probe an explicitly configured collection when metadata is unavailable."""
+    probe_target = declared_probe_target(directory, source_record)
+    if probe_target is None:
+        return None
+    resource_type, api_base = probe_target
+    timeout = directory._source_resource_timeout(
+        {**source_record, "canonical_api_base": api_base}, resource_type, timeout
+    )
+    resource_probe = await directory._probe_resource_access(
+        source_record, api_base, {}, timeout=timeout, resource_type=resource_type
+    )
+    if resource_probe is None:
+        return None
+    status = resource_probe["status"]
+    error = resource_probe.get("error")
+    if status == "reachable":
+        status = "valid" if resource_probe.get("search_bundle_valid") is True else "resource_error"
+        if status != "valid":
+            error = "resource search did not return a valid search Bundle"
+    credential = await resolve_probe_credentials(
+        directory._credential_request_options_for_source, source_record, resource_probe["url"]
+    )
+    return {
+        **resource_probe,
+        "status": status,
+        "error": error,
+        "api_base": api_base,
+        "run_id": run_id,
+        "credential": credential["descriptor"],
+        "resource_probe": resource_probe,
+    }, None
 
 
 def open_token_request(directory, request, *, timeout):
@@ -131,9 +192,37 @@ def resource_import_selection_metrics(source_count: int) -> dict[str, int]:
     }
 
 
+def source_probe_hard_timeout_seconds(directory, source_record, *, timeout):
+    """Bound the shared probe above its request budget unless explicitly overridden."""
+    if directory._uses_uhc_official_file_connector(source_record):
+        return max(timeout + 1, 35)
+    request_count = max(1, len(directory._candidate_metadata_urls(source_record))) * 2
+    probe_target = declared_probe_target(directory, source_record)
+    if probe_target is not None:
+        resource_type, api_base = probe_target
+        timeout = directory._source_resource_timeout(
+            {**source_record, "canonical_api_base": api_base}, resource_type, timeout
+        )
+        request_count = 1
+    env_value = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PROBE_HARD_TIMEOUT")
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            return max(timeout + 1, (timeout * request_count) + 2)
+    return max(timeout + 1, (timeout * request_count) + 2)
+
+
 def _qualification_probe_timeout_seconds(directory, source_record, *, timeout):
     """Keep the qualification deadline above its synchronous request budget."""
+    target = declared_probe_target(directory, source_record)
     request_count = max(1, len(directory._candidate_metadata_urls(source_record))) * 2
+    if target is not None:
+        resource_type, api_base = target
+        timeout = directory._source_resource_timeout(
+            {**source_record, "canonical_api_base": api_base}, resource_type, timeout
+        )
+        request_count = 1
     return max(
         directory._source_probe_hard_timeout_seconds(source_record, timeout=timeout),
         timeout * request_count + 2,
