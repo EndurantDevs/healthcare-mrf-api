@@ -1456,6 +1456,17 @@ using the previous published snapshot's resource counts as estimates. Unknown
 sizes keep their existing relative order; the role collection remains a serial
 tail. Counts influence scheduling only, never completion or validation.
 
+Optional source metadata `provider_directory_resource_fetch_order` supplies a
+unique list of directory resource names for the initial order and unknown-size
+ties. Published counts still take precedence. This scheduling hint never adds
+resources or changes completion requirements. Source metadata
+`provider_directory_request_interval_seconds` paces all its cursor chains
+together; eight chains do not authorize eight simultaneous sends past a
+source's rate limit. The Alabama carrier directory uses a 1.1-second interval,
+100-row pages, and source-issued `ct` links. Its anonymous directory access
+does not use patient authorization credentials. Issued URL bytes are retained
+by the common asynchronous transport.
+
 Request concurrency starts at the configured transport allowance. A throttling
 or unavailable response (`429`, `503`, `504`), or a transport timeout, halves
 that origin's allowance down to one, without resetting or restarting any
