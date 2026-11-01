@@ -1315,6 +1315,7 @@ REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES = {
 }
 SIMPRA_PROVIDER_DIRECTORY_BASE = "https://data.healthlx.com:8004/SIMPRA"
 CAPITAL_BLUE_CROSS_PROVIDER_DIRECTORY_BASE = "https://providerdirectory-api.capbluecross.com/r4"
+FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE = "https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir"
 REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE = "healthporta-reviewed-provider-directory-candidate"
 IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE = "https://api-idmedicaid.safhir.io/v1/api/provider-directory"
 IDAHO_MEDICAID_PAGINATION_HOST = "api-ida-prd.safhir.io"
@@ -1492,6 +1493,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         CARESOURCE_PROVIDER_DIRECTORY_BASE,
         CIGNA_PROVIDER_DIRECTORY_BASE,
         christus.API_BASE,
+        FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE,
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
@@ -3321,45 +3323,8 @@ def _candidate_base_urls(source_record: dict[str, Any]) -> list[str]:
     return candidates
 
 
-def _candidate_metadata_urls(
-    source_record: dict[str, Any],
-) -> list[tuple[str, str]]:
-    census_contract = current_version_census_contract(source_record)
-    if census_contract is not None:
-        api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-        if api_base is None:
-            return []
-        return [
-            (api_base, f"{api_base}/metadata?_format=json"),
-            (api_base, f"{api_base}/metadata"),
-        ]
-    metadata_url_pairs: list[tuple[str, str]] = []
-    seen_metadata_urls: set[str] = set()
-    metadata = _source_metadata(source_record)
-    for explicit_url in (
-        metadata.get("provider_directory_confirmed_metadata_url"),
-        metadata.get("metadata_url"),
-    ):
-        metadata_url = _clean_text(explicit_url)
-        if not metadata_url or metadata_url in seen_metadata_urls:
-            continue
-        metadata_base = _provider_directory_base_from_metadata_url(metadata_url)
-        api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-        candidate_base = _canonical_base(metadata_base or api_base)
-        if not candidate_base:
-            continue
-        metadata_url_pairs.append((candidate_base, metadata_url))
-        seen_metadata_urls.add(metadata_url)
-    for api_base in _candidate_base_urls(source_record):
-        for candidate_url in (
-            f"{api_base}/metadata?_format=json",
-            f"{api_base}/metadata",
-        ):
-            if candidate_url in seen_metadata_urls:
-                continue
-            metadata_url_pairs.append((api_base, candidate_url))
-            seen_metadata_urls.add(candidate_url)
-    return metadata_url_pairs
+def _candidate_metadata_urls(source_record: dict[str, Any]) -> list[tuple[str, str]]:
+    return source_selection.candidate_metadata_urls(sys.modules[__name__], source_record)
 
 
 def _is_placeholder_url(value: str | None) -> bool:
@@ -40515,6 +40480,7 @@ def _seed_rows_from_supplemental_catalogs(
         ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
         ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
         ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
+        ("configured_sources", "provider-directory-supplemental-sources", source_selection.configured_seed_rows),
         (
             "provider_directory_blockers",
             PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
@@ -57668,6 +57634,10 @@ def _source_resource_fetch_order(
     requested_resources: list[str],
 ) -> list[str]:
     """Return the requested resources in the order appropriate for one source."""
+    configured_order = _string_list(_source_metadata(source).get("provider_directory_resource_fetch_order"))
+    if configured_order:
+        rank_by_resource = {resource: index for index, resource in enumerate(configured_order)}
+        return sorted(requested_resources, key=lambda resource: rank_by_resource.get(resource, len(rank_by_resource)))
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     if api_base != CIGNA_PROVIDER_DIRECTORY_BASE:
         return list(requested_resources)

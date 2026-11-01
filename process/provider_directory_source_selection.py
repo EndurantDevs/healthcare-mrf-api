@@ -3,9 +3,11 @@
 
 import asyncio
 import contextvars
+import json
 import posixpath
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from process import provider_directory_generic_source_policy as source_policy
 
@@ -213,3 +215,57 @@ async def qualify_stale_isolated_source(directory, source_rows, task, *, timeout
     ):
         return [{**source_record, "last_validated_status": "valid"}]
     return source_rows
+
+
+def candidate_metadata_urls(directory, source_record):
+    """Resolve probe URLs without replacing an explicitly confirmed acquisition base."""
+    census_contract = directory.current_version_census_contract(source_record)
+    if census_contract is not None:
+        api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+        if api_base is None:
+            return []
+        return [
+            (api_base, f"{api_base}/metadata?_format=json"),
+            (api_base, f"{api_base}/metadata"),
+        ]
+    metadata_url_pairs: list[tuple[str, str]] = []
+    seen_metadata_urls: set[str] = set()
+    metadata = directory._source_metadata(source_record)
+    for explicit_url in (
+        metadata.get("provider_directory_confirmed_metadata_url"),
+        metadata.get("metadata_url"),
+    ):
+        metadata_url = directory._clean_text(explicit_url)
+        if not metadata_url or metadata_url in seen_metadata_urls:
+            continue
+        metadata_base = directory._provider_directory_base_from_metadata_url(metadata_url)
+        api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+        confirmed_base = directory._canonical_base(metadata.get("provider_directory_confirmed_base"))
+        candidate_base = (
+            api_base
+            if api_base and confirmed_base == api_base
+            else directory._canonical_base(metadata_base or api_base)
+        )
+        if not candidate_base:
+            continue
+        metadata_url_pairs.append((candidate_base, metadata_url))
+        seen_metadata_urls.add(metadata_url)
+    for api_base in directory._candidate_base_urls(source_record):
+        for candidate_url in (
+            f"{api_base}/metadata?_format=json",
+            f"{api_base}/metadata",
+        ):
+            if candidate_url in seen_metadata_urls:
+                continue
+            metadata_url_pairs.append((api_base, candidate_url))
+            seen_metadata_urls.add(candidate_url)
+    return metadata_url_pairs
+
+
+def configured_seed_rows():
+    """Load baked public source metadata through the existing seed pipeline."""
+    path = Path(__file__).resolve().parents[1] / "specs/provider_directory_supplemental_sources.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise ValueError("provider_directory_configured_sources_invalid")
+    return rows

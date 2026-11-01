@@ -7,17 +7,49 @@ from __future__ import annotations
 import datetime
 import os
 from dataclasses import dataclass
+from unittest.mock import patch
 
+from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_capacity_signing_guard as guard_contract
-from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_selection as selection
 from tests.test_provider_directory_profile_capacity_runtime import (
     _limits_payload,
 )
 
-
 SYNTHETIC_PROFILE_SOURCE_ID = "synthetic_profile_source"
+# The signed cross-repository golden predates later source registrations.
+GOLDEN_PROFILE_SOURCE_IDS = (
+    "cms-npd",
+    "pdfhir_d68a896335981928bdbbb80e",
+    "pdfhir_0f81c146991b27031b1ec366",
+    "pdfhir_3e8f8d73e9f63b41f4f3fca5",
+    "pdfhir_d6b52e94ddf5ca7b9faafe17",
+    "pdfhir_b627b38e07cae99151baa4b7",
+    "pdfhir_b674847fc79d2b2ea1f4e986",
+    "pdfhir_46bcb068e81b0bc844e327e9",
+    "pdfhir_8ee2865f928f1d67b8a86090",
+    "pdfhir_46d7d27acc677651b0d3516e",
+    "pdfhir_eee751f2c17d5c473daf3060",
+    "pdfhir_384bff82e94cf93d2aec8af2",
+    "pdfhir_00a3d35311756763d420b0d6",
+    "pdfhir_b6fdc036a4686d0ab69f6f3a",
+    "pdfhir_56521fb2d273045f2c3b73dc",
+    "pdfhir_fa3c581c79ffdfa5b73b43b9",
+    "pdfhir_59350503a7be3498a85d8cf2",
+    "pdfhir_75511676b61b2bddb6f94322",
+    "pdfhir_0661ff143952c214d680d95d",
+    "pdfhir_6843a6194d9793a0a6cc36b4",
+    "pdfhir_5fd73a1218a9b5b73066d000",
+    "pdfhir_29c125ae13aeffa0afe0e121",
+    "pdfhir_0c52480afd14b4c89386df94",
+    "pdfhir_e3d82f2cd0a10ab4463dbdda",
+    "pdfhir_569c8c60329e96aefd3e5983",
+    "pdfhir_1ceb7c0986c320b7eb924881",
+    "pdfhir_2b088f28554b9e51505b455e",
+    "pdfhir_2754e999dd691175821ec26e",
+    "pdfhir_72257bf04f7fb816c0ad6fb9",
+)
 
 
 def _utc(value: datetime.datetime) -> str:
@@ -39,21 +71,22 @@ def _validated_request(raw_request: dict[str, object]):
 def synthetic_profile_execution() -> selection.ProviderDirectoryProfileExecution:
     """Build the neutral exact selection used by the cross-repository golden."""
 
-    computed = selection._computed_selection_from_rows(
-        _synthetic_profile_catalog(),
-        node_id="dev-node",
-        source_rows=_synthetic_profile_source_rows(),
-        dataset_rows=[_synthetic_profile_dataset_row()],
-    )
+    with patch.object(
+        profile_artifact, "configured_profile_source_ids", return_value=tuple(sorted(GOLDEN_PROFILE_SOURCE_IDS))
+    ):
+        computed = selection._computed_selection_from_rows(
+            _synthetic_profile_catalog(),
+            node_id="dev-node",
+            source_rows=_synthetic_profile_source_rows(),
+            dataset_rows=[_synthetic_profile_dataset_row()],
+        )
     identity_by_field = {**computed.identity_payload, "authority_revision": 7}
     attestation_by_field = {
         **identity_by_field,
         "proof_id": selection._proof_id(identity_by_field),
     }
     return selection.ProviderDirectoryProfileExecution(
-        attestation=selection.validated_profile_selection_attestation(
-            attestation_by_field
-        ),
+        attestation=selection.validated_profile_selection_attestation(attestation_by_field),
         generation=11,
     )
 
@@ -89,9 +122,7 @@ def _synthetic_profile_source_rows() -> list[dict[str, object]]:
                 "org_name": "Synthetic dataset variant",
                 "plan_name": None,
             }
-            for source_id, endpoint_id in (
-                profile_artifact.configured_dataset_scoped_profile_endpoints()
-            )
+            for source_id, endpoint_id in (profile_artifact.configured_dataset_scoped_profile_endpoints())
         ],
     ]
 
@@ -124,9 +155,7 @@ def synthetic_profile_task(
     return {
         **selection._GLOBAL_PROFILE_PARAMS,
         "provider_directory_profile_generation": execution.generation,
-        "provider_directory_profile_selection_attestation": (
-            execution.attestation.payload
-        ),
+        "provider_directory_profile_selection_attestation": (execution.attestation.payload),
         "provider_directory_profile_capacity_attestation": capacity_attestation,
     }
 
@@ -146,9 +175,7 @@ def _execution_by_field(
     return {
         **selection._GLOBAL_PROFILE_PARAMS,
         "provider_directory_profile_generation": execution.generation,
-        "provider_directory_profile_selection_attestation": (
-            execution.attestation.payload
-        ),
+        "provider_directory_profile_selection_attestation": (execution.attestation.payload),
         "provider_directory_profile_capacity_attestation": {},
     }
 
@@ -259,9 +286,7 @@ def _control_plane_receipt(
     }
     receipt_by_field = {
         "contract_id": guard_contract.CONTROL_PLANE_PREFLIGHT_CONTRACT_ID,
-        "request_contract_id": (
-            guard_contract.CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID
-        ),
+        "request_contract_id": (guard_contract.CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID),
         "request_sha256": preflight.preflight_domain_sha256(
             guard_contract.CONTROL_PLANE_REQUEST_DIGEST_DOMAIN,
             request_by_field,
@@ -370,9 +395,7 @@ def _healthcare_receipt(
             "projected_logical_bytes": 1,
             "projection_hash": "88" * 32,
         },
-        "runtime_observation": {
-            "contract_id": "healthporta.provider-directory-profile-runtime-observation.v1"
-        },
+        "runtime_observation": {"contract_id": "healthporta.provider-directory-profile-runtime-observation.v1"},
         "serving_generation_preflight": serving_by_field,
         "serving_generation_preflight_sha256": preflight.preflight_domain_sha256(
             preflight.CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN,
@@ -416,9 +439,7 @@ def _guard_payload(
         "healthcare_receipt": healthcare_receipt_by_field,
         "healthcare_receipt_sha256": healthcare_receipt_by_field["receipt_sha256"],
         "capacity_limits_sha256": validated_healthcare_request.limits_sha256,
-        "storage_observation_sha256": import_receipt_by_field[
-            "storage_observation_sha256"
-        ],
+        "storage_observation_sha256": import_receipt_by_field["storage_observation_sha256"],
         "held_followup_preimage_sha256": followup_by_field["followup_preimage_sha256"],
     }
 

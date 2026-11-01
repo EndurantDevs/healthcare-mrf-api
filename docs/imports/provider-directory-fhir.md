@@ -1990,6 +1990,23 @@ must never be reported as a completed UHC Profile import.
 The official-file, Flex-cohort, formulary, and release boundaries are recorded
 in [Provider-directory and formulary source acceptance](provider-directory-formulary-source-acceptance.md).
 
+Florida Blue's official Provider Directory OAS
+(`https://developer.bcbsfl.com/interop/interop-developer-portal/product/758/api/749`)
+declares anonymous access to seven collections at
+`https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir`.
+The maintained source uses issued opaque next links, durable checkpoints,
+100-row pages and shared pacing below the documented 12 requests per second.
+Source metadata prioritizes the largest observed collections without changing
+the requested resource set or splitting a cursor chain. `Endpoint` is excluded;
+an explicit zero `OrganizationAffiliation` total is allowed. The separate
+metadata service
+(`https://developer.bcbsfl.com/interop/interop-developer-portal/product/758/api/461`)
+advertises a broader capability set and does not change the confirmed directory
+base, resource scope or anonymous access. Existing Availity and other catalog
+aliases retain their separate endpoint and product contracts. Native plan,
+role and affiliation references remain the membership evidence; bounded probes
+do not establish complete acquisition, publication or Profile/API readiness.
+
 Capital Blue Cross publishes seven populated Plan-Net collections and an empty
 `Endpoint` collection at `https://providerdirectory-api.capbluecross.com/r4`.
 US-dev probes succeed over normal verified TLS, but broad exact census requests
