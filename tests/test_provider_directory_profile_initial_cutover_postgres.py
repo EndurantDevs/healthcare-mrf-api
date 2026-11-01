@@ -7,6 +7,7 @@ This exercises production cutover operations, not Linux runtime admission.
 import asyncio
 import importlib
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -19,6 +20,8 @@ from db.connection import Database
 from process import provider_directory_profile_capacity as capacity
 from process import provider_directory_profile_initial as initial
 from process import provider_directory_profile_initial_contract as contract
+from process import provider_directory_profile_selection as selection
+from tests import test_provider_directory_profile_capacity_preflight_postgres as ordinary_fixture
 from tests import test_provider_directory_profile_initial_migration as fixture
 from tests.test_provider_directory_profile_control_capacity import _control_wal_plan_input
 from tests.test_provider_directory_profile_failed_cleanup_postgres import _server_tablespace
@@ -473,3 +476,197 @@ async def _seed_legacy_snapshot(database, schema, state, selection, synthetic_pr
             metrics=json.dumps({fhir.PROFILE_SELECTION_RESULT_METRIC: {**legacy_result, "unexpected": True}}),
         )
     return legacy_result
+
+
+async def _seed_ordinary_undated_targets(database, execution):
+    """Retain a populated pre-singleton publication with its original date absent."""
+    from tests.provider_profile_detail_load_postgres_support import _seed_projected_profile
+
+    async with database.transaction() as session:
+        await _seed_projected_profile(session, "mrf")
+    await database.status(
+        "UPDATE mrf.provider_directory_profile SET source_ids=ARRAY[:source]",
+        source=ordinary_fixture._ORDINARY_SOURCE_ID,
+    )
+    await database.status(
+        "INSERT INTO mrf.provider_directory_profile_evidence "
+        "(evidence_key,npi,fact_type,fact_key,value_json,source_id,endpoint_id,dataset_id,resource_type,resource_id) "
+        "VALUES(:key,1000000004,'language',:key,'{\"code\":\"en\"}',:source,'synthetic-endpoint',"
+        "'synthetic-dataset','Practitioner','synthetic-practitioner')",
+        key="a" * 32,
+        source=ordinary_fixture._ORDINARY_SOURCE_ID,
+    )
+    legacy_result_by_field = selection.profile_selection_result(
+        replace(execution, generation=1),
+        profile_generation_id="pdprofile_" + "1" * 32,
+        profile_as_of="2026-07-22",
+        profile_rows=1,
+        profile_source_evidence_rows=1,
+    )
+    legacy_result_by_field.pop("profile_as_of")
+    await database.status(
+        "INSERT INTO mrf.import_run(run_id,engine,importer,status,finished_at,metrics) "
+        "VALUES(:run,'test-engine','provider-directory-fhir','succeeded',now()-interval '1 day',CAST(:metrics AS jsonb))",
+        run="run_" + uuid4().hex,
+        metrics=json.dumps({fhir.PROFILE_SELECTION_RESULT_METRIC: legacy_result_by_field}),
+    )
+
+
+async def _ordinary_initial_inputs(monkeypatch, tmp_path, ordinary, baseline):
+    """Register the actual ordinary vector, then bind its explicit date to native capacity."""
+    with monkeypatch.context() as seed:
+        seed.setattr(ordinary_fixture, "_ordinary_legacy_incumbent", _seed_ordinary_undated_targets)
+        await ordinary_fixture._ordinary_execution_inputs(monkeypatch, tmp_path, ordinary, baseline)
+    catalog_by_field = fhir._provider_directory_profile_selection_catalog()
+    selection_request = await selection.current_profile_selection_request(
+        catalog_by_field, desired_profile_as_of="2026-08-09", desired_cms_dataset=None, expected_cms_incumbent=None
+    )
+    attestation = selection.validated_profile_selection_attestation(
+        await selection.attest_profile_selection(selection_request, catalog_by_field)
+    )
+    assert attestation.desired_cms_dataset is None and attestation.desired_profile_as_of == "2026-08-09"
+    assert [pair["source_id"] for pair in attestation.pairs] == [ordinary_fixture._ORDINARY_SOURCE_ID]
+    async with ordinary.transaction():
+        target_by_field = (await initial.capture_targets(fhir, "mrf")).payload
+    assert target_by_field["resolution"] == "legacy_as_of_unknown"
+    assert target_by_field["profile_rows"] == target_by_field["evidence_rows"] == 1
+    assert target_by_field["historical_publication"]["profile_as_of"] is None
+    assert "profile_as_of" not in target_by_field["historical_publication"]["result"]
+    prior_rows_by_kind = await _ordinary_initial_target_rows(ordinary)
+    execution = selection.ProviderDirectoryProfileExecution(attestation, 1, capacity_attestation={})
+    task_by_field, run_id = await ordinary_fixture._ordinary_signed_request(
+        monkeypatch, ordinary, baseline, execution, prior_rows_by_kind["profile"]
+    )
+    receipt_by_field = task_by_field["provider_directory_profile_capacity_attestation"]["lease"][
+        "signing_preflight_guard"
+    ]["healthcare_receipt"]
+    assert receipt_by_field["profile_materialization"] == contract.MATERIALIZATION
+    assert receipt_by_field["serving_generation_preflight"] == target_by_field
+    return task_by_field, run_id, target_by_field, prior_rows_by_kind
+
+
+async def _ordinary_initial_target_rows(database):
+    return await database.scalar(
+        "SELECT jsonb_build_object("
+        "'profile',(SELECT jsonb_agg(to_jsonb(p) ORDER BY npi) FROM mrf.provider_directory_profile p),"
+        "'evidence',(SELECT jsonb_agg(to_jsonb(e) ORDER BY evidence_key) "
+        "FROM mrf.provider_directory_profile_evidence e))"
+    )
+
+
+async def _ordinary_initial_rollback(monkeypatch, ordinary, task_by_field, run_id):
+    original = fhir._apply_locked_provider_directory_artifact_bundle
+    sentinel = RuntimeError("synthetic initial cutover rollback")
+
+    async def fail_after_cutover(*args, **kwargs):
+        await original(*args, **kwargs)
+        assert await ordinary.scalar("SELECT count(*) FROM mrf.provider_directory_profile_initial_receipt") == 1
+        assert await ordinary.scalar("SELECT count(*) FROM mrf.provider_directory_profile_serving_generation") == 1
+        raise sentinel
+
+    with monkeypatch.context() as failure:
+        failure.setattr(fhir, "_apply_locked_provider_directory_artifact_bundle", fail_after_cutover)
+        with pytest.raises(RuntimeError, match="synthetic initial cutover rollback") as raised:
+            await fhir.process_data({"context": {}, "control_run_id": run_id}, task_by_field)
+        assert raised.value is sentinel
+
+
+async def _ordinary_initial_reader_fence(monkeypatch, ordinary, task_by_field, run_id, record_property):
+    from process import entity_address_cutover_contract as cutover
+
+    original = cutover.lock_live_serving_relations
+    started = asyncio.Event()
+    wait_seconds = []
+
+    async def observed_lock(*args):
+        started.set()
+        begin = asyncio.get_running_loop().time()
+        try:
+            await original(*args)
+        except TimeoutError as error:
+            assert error.sqlstate == "55P03"
+            wait_seconds.append(asyncio.get_running_loop().time() - begin)
+            raise
+
+    with monkeypatch.context() as observer:
+        observer.setattr(cutover, "lock_live_serving_relations", observed_lock)
+        reads = await _hold_initial_reader_through_cutover(ordinary, task_by_field, run_id, started)
+    assert len(wait_seconds) == fhir.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS
+    assert all(0.08 <= seconds < 0.5 for seconds in wait_seconds)
+    record_property("native_live_reader_lock_seconds", wait_seconds)
+    record_property("native_reader_observations_during_build", reads)
+
+
+async def _hold_initial_reader_through_cutover(ordinary, task_by_field, run_id, started):
+    async with ordinary.engine.connect() as reader, reader.begin():
+        await reader.execute(text("SET TRANSACTION READ ONLY"))
+        await reader.execute(text("SET LOCAL statement_timeout='100ms'"))
+        query = text("SELECT generation_id FROM mrf.provider_directory_profile WHERE npi=1000000004")
+        assert await reader.scalar(query) == "pdprofile_" + "1" * 32
+        owner = asyncio.create_task(fhir.process_data({"context": {}, "control_run_id": run_id}, task_by_field))
+        waiting = asyncio.create_task(started.wait())
+        try:
+            reads = await _read_initial_incumbent_during_build(reader, query, owner, waiting)
+            with pytest.raises(TimeoutError, match="serving_relation_lock_timeout"):
+                await asyncio.wait_for(owner, 10)
+            assert await reader.scalar(query) == "pdprofile_" + "1" * 32
+            return reads
+        finally:
+            for pending in (owner, waiting):
+                pending.cancel()
+            await asyncio.gather(owner, waiting, return_exceptions=True)
+
+
+async def _read_initial_incumbent_during_build(reader, query, owner, waiting):
+    """Keep the original reader pinned through genuine build and precutover work."""
+    deadline = asyncio.get_running_loop().time() + 120
+    reads = 0
+    while not waiting.done():
+        completed_tasks, _ = await asyncio.wait((owner, waiting), timeout=1, return_when=asyncio.FIRST_COMPLETED)
+        if owner in completed_tasks:
+            await owner
+            pytest.fail("initial publication bypassed the live reader")
+        assert asyncio.get_running_loop().time() < deadline
+        assert await reader.scalar(query) == "pdprofile_" + "1" * 32
+        reads += 1
+    return reads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["commit", "rollback", "reader"])
+async def test_ordinary_initial_full_swap_from_undated_legacy(monkeypatch, tmp_path, outcome, record_property):
+    """Real ordinary preflight, signed admission and worker preserve unknown legacy time."""
+    async with asynccontextmanager(ordinary_fixture._ordinary_execution_database)(monkeypatch) as fixture_values:
+        administrator, ordinary, baseline = fixture_values
+        task_by_field, run_id, target_by_field, prior_rows_by_kind = await _ordinary_initial_inputs(
+            monkeypatch, tmp_path, ordinary, baseline
+        )
+        source_before = await ordinary_fixture._ordinary_input_state(ordinary)
+        if outcome == "commit":
+            await ordinary_fixture._ordinary_execution_success(ordinary, task_by_field, run_id)
+            receipt_by_field = await ordinary.scalar(
+                "SELECT payload FROM mrf.provider_directory_profile_initial_receipt"
+            )
+            assert receipt_by_field["initial_target_state_sha256"] == contract.target_state_sha256(target_by_field)
+            assert (
+                str(
+                    await ordinary.scalar("SELECT profile_as_of FROM mrf.provider_directory_profile_serving_generation")
+                )
+                == "2026-08-09"
+            )
+            assert await ordinary.scalar("SELECT count(*) FROM mrf.provider_directory_profile_initial_receipt") == 1
+        else:
+            if outcome == "rollback":
+                await _ordinary_initial_rollback(monkeypatch, ordinary, task_by_field, run_id)
+            else:
+                await _ordinary_initial_reader_fence(monkeypatch, ordinary, task_by_field, run_id, record_property)
+            assert await _ordinary_initial_target_rows(ordinary) == prior_rows_by_kind
+            async with ordinary.transaction():
+                assert (await initial.capture_targets(fhir, "mrf")).payload == target_by_field
+            assert await ordinary.scalar("SELECT count(*) FROM mrf.provider_directory_profile_initial_receipt") == 0
+            assert await ordinary.scalar("SELECT count(*) FROM mrf.provider_directory_profile_serving_generation") == 0
+        assert await ordinary.scalar("SELECT count(*) FROM mrf.provider_directory_cms_serving_receipt") == 0
+        assert (
+            await ordinary.scalar("SELECT count(*) FROM mrf.provider_directory_profile_capacity_lease_consumption") == 1
+        )
+        await ordinary_fixture._assert_ordinary_execution_released(administrator, ordinary, baseline, source_before)

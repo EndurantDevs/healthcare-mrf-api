@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Exact desired CMS selection, date identity, and legacy-lane safety."""
+"""Exact dated ordinary and CMS selections, with legacy-lane safety."""
 
 from __future__ import annotations
 
@@ -35,6 +35,10 @@ def _desired(*, current=False, day="2026-09-29", incumbent=True):
         "expected_cms_incumbent": _pair("cms-current", current=True) if incumbent else None,
         "desired_profile_as_of": day,
     }
+
+
+def _ordinary_desired(*, day="2026-09-29"):
+    return {"desired_profile_as_of": day, "desired_cms_dataset": None, "expected_cms_incumbent": None}
 
 
 def _rows(pair):
@@ -75,7 +79,8 @@ def _selection_rows(desired=None):
     current_rows = [_rows(payer_pair_map)]
     if desired["expected_cms_incumbent"] is not None:
         current_rows.append(_rows(desired["expected_cms_incumbent"]))
-    return catalog_map, sources, current_rows, _rows(desired["desired_cms_dataset"])
+    candidate = desired["desired_cms_dataset"]
+    return catalog_map, sources, current_rows, _rows(candidate) if candidate is not None else None
 
 
 def _computed(desired=None):
@@ -144,13 +149,125 @@ def test_first_cms_publication_is_explicit_and_cannot_be_a_purge():
         contract.validated_profile_selection_attestation(payload)
 
 
-def test_same_byte_current_date_refresh_changes_all_desired_identity_hashes():
-    earlier = _proof(_desired(current=True, day="2026-09-29"))
-    later = _proof(_desired(current=True, day="2026-09-30"))
+@pytest.mark.parametrize("ordinary", [False, True])
+def test_same_byte_current_date_refresh_changes_all_desired_identity_hashes(ordinary):
+    earlier = _proof(_ordinary_desired() if ordinary else _desired(current=True))
+    later = _proof(_ordinary_desired(day="2026-09-30") if ordinary else _desired(current=True, day="2026-09-30"))
     assert earlier.pairs == later.pairs
     assert earlier.desired_cms_dataset == earlier.expected_cms_incumbent
     for name in ("selection_fingerprint", "profile_input_digest", "proof_id"):
         assert getattr(earlier, name) != getattr(later, name)
+
+
+def test_ordinary_date_preserves_the_complete_current_vector():
+    desired = _ordinary_desired()
+    catalog, source_rows, dataset_rows, _candidate = _selection_rows(desired)
+    catalog["items"].append({"runnable": True, "profile_enabled": True, "source_ids": ["pdfhir_synthetic_second"]})
+    source_rows.append(
+        {"source_id": "pdfhir_synthetic_second", "endpoint_id": "second-endpoint", "org_name": "Second payer"}
+    )
+    dataset_rows.append(
+        _rows(
+            {
+                **_pair("second-current", current=True),
+                "source_id": "pdfhir_synthetic_second",
+                "endpoint_id": "second-endpoint",
+            }
+        )
+    )
+    current = snapshot._computed_selection_from_rows(
+        catalog, node_id="synthetic-node", source_rows=source_rows, dataset_rows=dataset_rows
+    )
+    dated = snapshot._computed_desired_selection_from_rows(
+        catalog,
+        node_id="synthetic-node",
+        source_rows=source_rows,
+        dataset_rows=dataset_rows,
+        desired_dataset_row=None,
+        desired_selection=desired,
+    )
+    assert len(dated.request_projection) == 2
+    assert dated.request_projection == current.request_projection
+    for name in ("pairs", "source_context_digest", "operation"):
+        assert dated.identity_payload[name] == current.identity_payload[name]
+    assert _proof(desired).desired_cms_dataset is None
+    assert selection._validated_request(selection._expected_request(dated, "synthetic-node")) == {
+        "contract_id": contract.PROFILE_SELECTION_DESIRED_REQUEST_CONTRACT_ID,
+        "node_id": "synthetic-node",
+        "catalog_digest": catalog["catalog_digest"],
+        "selection_fingerprint": dated.identity_payload["selection_fingerprint"],
+        "datasets": list(current.request_projection),
+        **desired,
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"desired_profile_as_of": None},
+        {"desired_profile_as_of": "2026-9-29"},
+        {"desired_profile_as_of": "2026-02-30"},
+        {"expected_cms_incumbent": _pair("cms-current", current=True)},
+    ],
+)
+def test_ordinary_date_requires_a_canonical_date_without_an_incumbent(change):
+    with pytest.raises(contract.ProviderDirectoryProfileSelectionError):
+        contract._validated_desired_selection({**_ordinary_desired(), **change})
+
+
+@pytest.mark.parametrize("mutation", ["cms", "unpublished", "duplicate_source", "date"])
+def test_ordinary_dated_proof_cannot_bypass_selection_guards(mutation):
+    payload = deepcopy(_proof(_ordinary_desired()).payload)
+    if mutation == "cms":
+        payload["pairs"].insert(0, _pair("cms-current", current=True))
+    elif mutation == "unpublished":
+        payload["pairs"][0].update(publication_status="validated", is_current=False)
+    elif mutation == "duplicate_source":
+        payload["pairs"].append({**payload["pairs"][0], "dataset_id": "payer-other"})
+    else:
+        payload["desired_profile_as_of"] = "2026-09-30"
+    payload["proof_id"] = contract._proof_id(payload)
+    with pytest.raises(contract.ProviderDirectoryProfileSelectionError):
+        contract.validated_profile_selection_attestation(payload)
+
+
+def test_ordinary_dated_snapshot_refuses_a_current_cms_pair():
+    catalog, sources, rows, _candidate = _selection_rows()
+    with pytest.raises(contract.ProviderDirectoryProfileSelectionDrift, match="cms_requires_desired_dataset"):
+        snapshot._computed_desired_selection_from_rows(
+            catalog,
+            node_id="synthetic-node",
+            source_rows=sources,
+            dataset_rows=rows,
+            desired_dataset_row=None,
+            desired_selection=_ordinary_desired(),
+        )
+
+
+@pytest.mark.parametrize("exact_readiness", [False, True])
+@pytest.mark.asyncio
+async def test_ordinary_dated_read_preserves_current_readiness_and_locks(monkeypatch, exact_readiness):
+    desired = _ordinary_desired()
+    catalog, sources, rows, _candidate = _selection_rows(desired)
+    lock = AsyncMock()
+    dataset_read = AsyncMock(return_value=rows)
+    cms_read = AsyncMock(side_effect=AssertionError("ordinary selection must not read a CMS candidate"))
+    monkeypatch.setattr(snapshot, "_lock_profile_selection_tables", lock)
+    monkeypatch.setattr(snapshot, "_selection_source_rows", AsyncMock(return_value=sources))
+    monkeypatch.setattr(snapshot, "_selection_dataset_rows", dataset_read)
+    monkeypatch.setattr(snapshot.db, "first", cms_read)
+    monkeypatch.setattr(snapshot.db, "all", cms_read)
+    result = await snapshot._compute_desired_selection(
+        catalog,
+        node_id="synthetic-node",
+        lock_selection=exact_readiness,
+        desired_selection=desired,
+        exact_readiness=exact_readiness,
+    )
+    assert result.request_projection == _computed(desired).request_projection
+    dataset_read.assert_awaited_once_with(exact_readiness=exact_readiness)
+    assert lock.await_count == int(exact_readiness)
+    cms_read.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -232,10 +349,11 @@ def test_legacy_default_cannot_accept_a_validated_desired_pair_or_new_fields():
         contract.validated_profile_selection_attestation(payload)
 
 
+@pytest.mark.parametrize("desired", [_desired(), _ordinary_desired()])
 @pytest.mark.asyncio
-async def test_registry_current_recheck_recomputes_desired_lane_and_rejects_drift(monkeypatch):
-    proof = _proof()
-    computed = _computed()
+async def test_registry_current_recheck_recomputes_desired_lane_and_rejects_drift(monkeypatch, desired):
+    proof = _proof(desired)
+    computed = _computed(desired)
     desired_read = AsyncMock(return_value=computed)
     monkeypatch.setattr(selection, "_compute_desired_selection", desired_read)
     monkeypatch.setattr(selection, "configured_node_id", lambda: "synthetic-node")
@@ -256,14 +374,15 @@ async def test_registry_current_recheck_recomputes_desired_lane_and_rejects_drif
     )
     await selection._assert_registered_current_in_transaction(proof, {})
     assert desired_read.call_args.kwargs["lock_selection"] is True
-    assert desired_read.call_args.kwargs["desired_selection"] == _desired()
+    assert desired_read.call_args.kwargs["desired_selection"] == desired
     desired_read.side_effect = contract.ProviderDirectoryProfileSelectionDrift("changed")
     with pytest.raises(contract.ProviderDirectoryProfileSelectionStale):
         await selection._assert_registered_current_in_transaction(proof, {})
 
 
-def test_desired_result_and_capacity_date_binding(monkeypatch):
-    proof = _proof()
+@pytest.mark.parametrize("desired", [_desired(), _ordinary_desired()])
+def test_desired_result_and_capacity_date_binding(monkeypatch, desired):
+    proof = _proof(desired)
     execution = contract.ProviderDirectoryProfileExecution(proof, 1)
     selection_result_map = contract.profile_selection_result(
         execution,
@@ -294,7 +413,8 @@ def test_desired_result_and_capacity_date_binding(monkeypatch):
         contract.validated_profile_execution(task_map)
 
 
-def test_capacity_preflight_binds_desired_proof_and_date(monkeypatch):
+@pytest.mark.parametrize("ordinary", [False, True])
+def test_capacity_preflight_binds_desired_proof_and_date(monkeypatch, ordinary):
     from process import provider_directory_profile_capacity_preflight_contract as preflight
 
     from .test_provider_directory_profile_capacity_preflight import _request_payload
@@ -304,7 +424,7 @@ def test_capacity_preflight_binds_desired_proof_and_date(monkeypatch):
     for day in ("2026-09-29", "2026-09-30"):
         payload = _request_payload()
         payload["profile_execution"]["provider_directory_profile_selection_attestation"] = _proof(
-            _desired(current=True, day=day)
+            _ordinary_desired(day=day) if ordinary else _desired(current=True, day=day)
         ).payload
         request_maps.append(preflight.validated_capacity_preflight_request(payload))
     first_identity = preflight.profile_execution_identity_payload(request_maps[0])
@@ -313,3 +433,42 @@ def test_capacity_preflight_binds_desired_proof_and_date(monkeypatch):
     for name in ("selection_proof_id", "selection_fingerprint", "profile_input_digest"):
         assert first_identity[name] != later_identity[name]
     assert request_maps[0].request_sha256 != request_maps[1].request_sha256
+
+
+@pytest.mark.parametrize("mode", ["publish", "purge", "legacy"])
+def test_initial_preflight_requires_a_dated_ordinary_publish(monkeypatch, mode):
+    from process import provider_directory_profile_capacity_preflight_contract as preflight
+    from process import provider_directory_profile_initial_contract as initial
+
+    from .test_provider_directory_profile_capacity_preflight import _request_payload
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "synthetic-node")
+    request_map = _request_payload()
+    request_map.update(contract_id=initial.REQUEST_CONTRACT, profile_materialization=initial.MATERIALIZATION)
+    desired = _ordinary_desired()
+    catalog, source_rows, dataset_rows, _candidate = _selection_rows(desired)
+    if mode == "legacy":
+        computed = snapshot._computed_selection_from_rows(
+            catalog, node_id="synthetic-node", source_rows=source_rows, dataset_rows=dataset_rows
+        )
+    else:
+        computed = snapshot._computed_desired_selection_from_rows(
+            catalog,
+            node_id="synthetic-node",
+            source_rows=source_rows,
+            dataset_rows=[] if mode == "purge" else dataset_rows,
+            desired_dataset_row=None,
+            desired_selection=desired,
+        )
+    proof_by_field = {**computed.identity_payload, "authority_revision": 1}
+    proof_by_field["proof_id"] = contract._proof_id(proof_by_field)
+    request_map["profile_execution"]["provider_directory_profile_selection_attestation"] = proof_by_field
+    if mode != "publish":
+        with pytest.raises(preflight.ProviderDirectoryProfileCapacityPreflightError, match="explicit_date_required"):
+            preflight.validated_capacity_preflight_request(request_map)
+        return
+    request = preflight.validated_capacity_preflight_request(request_map)
+    assert request.execution.attestation.desired_profile_as_of == "2026-09-29"
+    assert request.execution.attestation.desired_cms_dataset is None
+    assert initial.initial_profile_for_request(request)
+    assert preflight.profile_execution_identity_payload(request)["materialization_mode"] == "full_swap"

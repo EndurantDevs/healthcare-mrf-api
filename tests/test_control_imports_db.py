@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 from copy import deepcopy
+from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select, text, update
@@ -19,10 +21,19 @@ from tests.control_imports_cancel_race_support import (
     finish_cancel_race_run,
     insert_queued_cancel_race_run,
 )
-from tests.test_provider_directory_source_worker_launch import JOB_ID, ORDINARY_IMAGE, RUN_ID, SPEC
+from tests.test_provider_directory_source_worker_launch import (
+    JOB_ID,
+    ORDINARY_IMAGE,
+    PROFILE_IMAGE,
+    RUN_ID,
+    SPEC,
+    _signed_profile_run,
+)
 from tests.test_provider_directory_source_worker_launch import (
     original_job_before_default_change as original_job_before_default_change,
 )
+from tests.test_provider_directory_source_worker_launch import secret_selection as secret_selection
+from tests.test_provider_directory_source_worker_launch import source_runtime_mount as source_runtime_mount
 
 pytestmark = [
     pytest.mark.asyncio(loop_scope="module"),
@@ -496,5 +507,62 @@ async def test_native_original_and_retry_keep_reviewed_runtime(monkeypatch, orig
         )
         assert refused["status"] == "failed"
         assert len(api_calls) == 1
+    finally:
+        await _drop_import_run_schema()
+
+
+async def test_native_profile_uses_persisted_job(monkeypatch, secret_selection, source_runtime_mount):
+    """Verify the stored signed Profile when creating or reusing its ordinary Job."""
+    await _reset_import_run_schema()
+    try:
+        database_identity_by_field = {
+            "database_system_identifier": str(await db.scalar("SELECT system_identifier FROM pg_control_system()")),
+            "database_oid": int(await db.scalar("SELECT oid FROM pg_database WHERE datname=current_database()")),
+            "database_name": str(await db.scalar("SELECT current_database()")),
+        }
+        recorded_run = _signed_profile_run(monkeypatch, database_identity_by_field)
+        await _persist_source_run(recorded_run)
+        monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+        monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+        observed_jobs, kubernetes_methods = [], []
+
+        def kubernetes(method, path, body=None):
+            kubernetes_methods.append(method)
+            if method == "POST":
+                observed_jobs.append({**body, "status": {"active": 1}})
+            return {"items": observed_jobs}
+
+        monkeypatch.setattr(workers, "_kubernetes_request", kubernetes)
+        original_runs = (await db.execute(select(ImportRun.__table__))).mappings().all()
+        ensure_request_by_field = {
+            "run_id": RUN_ID,
+            "importer": "provider-directory-fhir",
+            "params": {"import_resources": True},
+        }
+        assert (await workers.guarded_ensure_worker(ensure_request_by_field))["status"] == "started"
+        from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME
+
+        advanced_time = VALIDATION_TIME + timedelta(seconds=304)
+        monkeypatch.setattr(source, "datetime", SimpleNamespace(now=lambda _zone: advanced_time))
+        assert (await workers.guarded_ensure_worker(ensure_request_by_field))["status"] == "already_running"
+        assert kubernetes_methods.count("POST") == len(observed_jobs) == 1
+        existing_job = observed_jobs.pop()
+        assert (await workers.guarded_ensure_worker(ensure_request_by_field))["status"] == "failed"
+        assert kubernetes_methods.count("POST") == 1
+        observed_jobs.append(existing_job)
+        worker_container = observed_jobs[0]["spec"]["template"]["spec"]["containers"][0]
+        assert worker_container["image"] == PROFILE_IMAGE
+        assert worker_container["command"] == workers._worker_command(workers._worker_python(), SPEC)
+        assert "SOURCE_USER" not in {entry["name"] for entry in worker_container["env"]}
+        assert {entry["name"]: entry.get("value") for entry in worker_container["env"]}[
+            "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"
+        ] == JOB_ID
+        assert (await db.execute(select(ImportRun.__table__))).mappings().all() == original_runs
+        changed_params = deepcopy(recorded_run["params"])
+        changed_params["provider_directory_profile_generation"] += 1
+        await db.execute(update(ImportRun).where(ImportRun.run_id == RUN_ID).values(params=changed_params))
+        prior_kubernetes_methods = list(kubernetes_methods)
+        assert (await workers.guarded_ensure_worker(ensure_request_by_field))["status"] == "failed"
+        assert kubernetes_methods == prior_kubernetes_methods
     finally:
         await _drop_import_run_schema()

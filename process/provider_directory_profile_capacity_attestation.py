@@ -16,6 +16,14 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from process.provider_directory_profile_capacity_attestation_contract import (
+    _ATTESTATION_ID_FIELDS,
+    _BASE64URL_SIGNATURE,
+    _ENVELOPE_FIELDS,
+    _LEGACY_V2_SIGNED_BODY_FIELDS,
+    _MAX_OID,
+    _MAX_SIGNED_BIGINT,
+    _SIGNED_BODY_FIELDS,
+    _STORAGE_CLASSES,
     CAPACITY_ATTESTATION_ID_DOMAIN,
     CAPACITY_LEASE_CONTRACT_ID,
     CAPACITY_LEASE_DIGEST_DOMAIN,
@@ -40,40 +48,32 @@ from process.provider_directory_profile_capacity_attestation_contract import (
     DatabaseCapacityVolume,
     ProviderDirectoryCapacityLeaseError,
     VerifiedDatabaseCapacityLease,
-    _ATTESTATION_ID_FIELDS,
-    _BASE64URL_SIGNATURE,
-    _ENVELOPE_FIELDS,
-    _MAX_OID,
-    _MAX_SIGNED_BIGINT,
-    _LEGACY_V2_SIGNED_BODY_FIELDS,
-    _SIGNED_BODY_FIELDS,
-    _STORAGE_CLASSES,
+    _assert_tablespace_volume_binding,
     _database_name_value,
     _database_system_identifier,
     _domain_bytes,
     _domain_hash,
     _error,
-    _assert_tablespace_volume_binding,
     _exact_mapping,
     _hex_digest,
     _integer,
     _opaque_id,
-    _parse_capacity_tablespace_list,
-    _parse_capacity_volume_list,
     _parse_capacity_deployment_witness,
     _parse_capacity_runtime_witness,
+    _parse_capacity_tablespace_list,
+    _parse_capacity_volume_list,
     _text,
     _timestamp,
     _validation_time,
     canonical_capacity_lease_json,
     capacity_runtime_witness_sha256,
 )
+from process.provider_directory_profile_capacity_consumption import (
+    capacity_lease_consumption_values,
+)
 from process.provider_directory_profile_capacity_signing_guard import (
     ProfileCapacitySigningGuardError,
     validated_capacity_signing_guard_fields,
-)
-from process.provider_directory_profile_capacity_consumption import (
-    capacity_lease_consumption_values,
 )
 from process.provider_directory_profile_capacity_trust_validation import (
     assert_capacity_trust_binding,
@@ -91,19 +91,13 @@ def _assert_colocated_volume_accounting(
         volume_groups[volume.volume_digest].append(volume)
     for colocated_volumes in volume_groups.values():
         available_bytes = {entry.available_bytes for entry in colocated_volumes}
-        remaining_bytes = {
-            entry.available_after_all_reservations_bytes
-            for entry in colocated_volumes
-        }
+        remaining_bytes = {entry.available_after_all_reservations_bytes for entry in colocated_volumes}
         if len(available_bytes) != 1 or len(remaining_bytes) != 1:
             raise _error("colocation_mismatch", "volumes")
         physical_delta = (
-            colocated_volumes[0].available_bytes
-            - colocated_volumes[0].available_after_all_reservations_bytes
+            colocated_volumes[0].available_bytes - colocated_volumes[0].available_after_all_reservations_bytes
         )
-        class_reservations = sum(
-            entry.reserved_bytes for entry in colocated_volumes
-        )
+        class_reservations = sum(entry.reserved_bytes for entry in colocated_volumes)
         if class_reservations > physical_delta:
             raise _error("reservation_unaccounted", "volumes")
 
@@ -118,12 +112,8 @@ def _parse_capacity_lease_identity(
     if signature_algorithm != CAPACITY_LEASE_SIGNATURE_ALGORITHM:
         raise _error("unsupported_algorithm", "signature_algorithm")
     return {
-        "attestation_id": _hex_digest(
-            lease_body["attestation_id"], field="attestation_id"
-        ),
-        "attestor_id": _opaque_id(
-            lease_body["attestor_id"], field="attestor_id"
-        ),
+        "attestation_id": _hex_digest(lease_body["attestation_id"], field="attestation_id"),
+        "attestor_id": _opaque_id(lease_body["attestor_id"], field="attestor_id"),
         "attestor_release_digest": _hex_digest(
             lease_body["attestor_release_digest"],
             field="attestor_release_digest",
@@ -133,21 +123,15 @@ def _parse_capacity_lease_identity(
             field="capacity_geometry_hash",
         ),
         "contract_id": contract_id,
-        "database_name": _database_name_value(
-            lease_body["database_name"], field="database_name"
-        ),
+        "database_name": _database_name_value(lease_body["database_name"], field="database_name"),
         "database_oid": _integer(
             lease_body["database_oid"],
             field="database_oid",
             minimum=1,
             maximum=_MAX_OID,
         ),
-        "database_system_identifier": _database_system_identifier(
-            lease_body["database_system_identifier"]
-        ),
-        "environment_id": _opaque_id(
-            lease_body["environment_id"], field="environment_id"
-        ),
+        "database_system_identifier": _database_system_identifier(lease_body["database_system_identifier"]),
+        "environment_id": _opaque_id(lease_body["environment_id"], field="environment_id"),
         "key_id": _opaque_id(lease_body["key_id"], field="key_id"),
         "nonce": _hex_digest(lease_body["nonce"], field="nonce"),
         "reservation_id": _opaque_id(
@@ -167,22 +151,14 @@ def _parse_capacity_lease_fields(
     parsed_by_field = {
         **_parse_capacity_lease_identity(lease_body),
         **_parse_capacity_runtime_evidence(lease_body),
-        "expires_at": _timestamp(
-            lease_body["expires_at"], field="expires_at"
-        ),
-        "issued_at": _timestamp(
-            lease_body["issued_at"], field="issued_at"
-        ),
+        "expires_at": _timestamp(lease_body["expires_at"], field="expires_at"),
+        "issued_at": _timestamp(lease_body["issued_at"], field="issued_at"),
         "max_build_deadline": _timestamp(
             lease_body["max_build_deadline"],
             field="max_build_deadline",
         ),
-        "observed_at": _timestamp(
-            lease_body["observed_at"], field="observed_at"
-        ),
-        "tablespaces": _parse_capacity_tablespace_list(
-            lease_body["tablespaces"]
-        ),
+        "observed_at": _timestamp(lease_body["observed_at"], field="observed_at"),
+        "tablespaces": _parse_capacity_tablespace_list(lease_body["tablespaces"]),
         "volumes": _parse_capacity_volume_list(lease_body["volumes"]),
     }
     return parsed_by_field
@@ -206,12 +182,8 @@ def _parse_capacity_signing_guard_fields(
 def _parse_capacity_runtime_evidence(
     lease_body: Mapping[str, Any],
 ) -> dict[str, Any]:
-    runtime_witness = _parse_capacity_runtime_witness(
-        lease_body["runtime_witness"]
-    )
-    deployment_witness = _parse_capacity_deployment_witness(
-        lease_body["deployment_witness"]
-    )
+    runtime_witness = _parse_capacity_runtime_witness(lease_body["runtime_witness"])
+    deployment_witness = _parse_capacity_deployment_witness(lease_body["deployment_witness"])
     supplied_digest = _hex_digest(
         lease_body["runtime_witness_sha256"],
         field="runtime_witness_sha256",
@@ -233,20 +205,17 @@ def _assert_temporal_validity(
     lease_fields: Mapping[str, Any],
     *,
     now: datetime.datetime,
+    require_fresh_observation: bool = True,
 ) -> None:
+    if type(require_fresh_observation) is not bool:
+        raise _error("invalid_type", "require_fresh_observation")
     observed_at = lease_fields["observed_at"]
     issued_at = lease_fields["issued_at"]
     expires_at = lease_fields["expires_at"]
     build_deadline = lease_fields["max_build_deadline"]
-    future_skew = datetime.timedelta(
-        seconds=CAPACITY_LEASE_MAX_FUTURE_SKEW_SECONDS
-    )
-    observation_age = datetime.timedelta(
-        seconds=CAPACITY_LEASE_MAX_OBSERVATION_AGE_SECONDS
-    )
-    maximum_validity = datetime.timedelta(
-        seconds=CAPACITY_LEASE_MAX_VALIDITY_SECONDS
-    )
+    future_skew = datetime.timedelta(seconds=CAPACITY_LEASE_MAX_FUTURE_SKEW_SECONDS)
+    observation_age = datetime.timedelta(seconds=CAPACITY_LEASE_MAX_OBSERVATION_AGE_SECONDS)
+    maximum_validity = datetime.timedelta(seconds=CAPACITY_LEASE_MAX_VALIDITY_SECONDS)
     if observed_at > issued_at or issued_at - observed_at > observation_age:
         raise _error("invalid_interval", "observed_at")
     if issued_at > now + future_skew:
@@ -259,7 +228,7 @@ def _assert_temporal_validity(
         raise _error("invalid_interval", "max_build_deadline")
     if now >= build_deadline:
         raise _error("deadline_reached", "max_build_deadline")
-    if now - observed_at > observation_age + future_skew:
+    if require_fresh_observation and now - observed_at > observation_age + future_skew:
         raise _error("stale", "observed_at")
 
 
@@ -278,11 +247,7 @@ def _decode_signature(candidate: Any) -> tuple[str, bytes]:
         )
     except (ValueError, TypeError) as exc:
         raise _error("invalid_value", "signature") from exc
-    canonical_signature = (
-        base64.urlsafe_b64encode(signature_bytes)
-        .rstrip(b"=")
-        .decode("ascii")
-    )
+    canonical_signature = base64.urlsafe_b64encode(signature_bytes).rstrip(b"=").decode("ascii")
     if len(signature_bytes) != 64 or canonical_signature != signature_text:
         raise _error("invalid_value", "signature")
     return signature_text, signature_bytes
@@ -303,16 +268,10 @@ def capacity_attestation_id(
 
 def _assert_attestation_id(lease_body: Mapping[str, Any]) -> None:
     attestation_identity_map = {
-        field_name: field_content
-        for field_name, field_content in lease_body.items()
-        if field_name != "attestation_id"
+        field_name: field_content for field_name, field_content in lease_body.items() if field_name != "attestation_id"
     }
-    expected_attestation_id = capacity_attestation_id(
-        attestation_identity_map
-    )
-    if not hmac.compare_digest(
-        lease_body["attestation_id"], expected_attestation_id
-    ):
+    expected_attestation_id = capacity_attestation_id(attestation_identity_map)
+    if not hmac.compare_digest(lease_body["attestation_id"], expected_attestation_id):
         raise _error("identity_mismatch", "attestation_id")
 
 
@@ -358,12 +317,8 @@ def _build_verified_capacity_lease(
                 trust_key.public_key,
             )
         ).hexdigest(),
-        tablespace_identity_hash=_identity_hash(
-            CAPACITY_TABLESPACE_IDENTITY_DOMAIN, lease_body["tablespaces"]
-        ),
-        volume_identity_hash=_identity_hash(
-            CAPACITY_VOLUME_IDENTITY_DOMAIN, lease_body["volumes"]
-        ),
+        tablespace_identity_hash=_identity_hash(CAPACITY_TABLESPACE_IDENTITY_DOMAIN, lease_body["tablespaces"]),
+        volume_identity_hash=_identity_hash(CAPACITY_VOLUME_IDENTITY_DOMAIN, lease_body["volumes"]),
         validated_at=validated_at,
     )
 
@@ -377,8 +332,9 @@ def verify_database_capacity_lease(
     expected_database_system_identifier: str,
     expected_database_oid: int,
     expected_database_name: str,
+    require_fresh_observation: bool = True,
 ) -> VerifiedDatabaseCapacityLease:
-    """Verify one private, exclusive, proof-bound PostgreSQL capacity lease."""
+    """Verify a signed lease; active-Job reuse alone may skip observation freshness."""
 
     closed_envelope = _exact_mapping(envelope, _ENVELOPE_FIELDS, field="envelope")
     raw_lease_body = closed_envelope["lease"]
@@ -405,7 +361,7 @@ def verify_database_capacity_lease(
     _assert_attestation_id(lease_body)
     _assert_tablespace_volume_binding(lease_fields["tablespaces"], lease_fields["volumes"])
     _assert_colocated_volume_accounting(lease_fields["volumes"])
-    _assert_temporal_validity(lease_fields, now=validated_at)
+    _assert_temporal_validity(lease_fields, now=validated_at, require_fresh_observation=require_fresh_observation)
     assert_capacity_trust_binding(
         lease_fields,
         trust=trust,
@@ -441,9 +397,7 @@ def assert_database_capacity_lease_reservation(
         raise _error("invalid_type", "lease")
     if set(required_bytes_by_storage_class) != set(_STORAGE_CLASSES):
         raise _error("invalid_fields", "required_bytes_by_storage_class")
-    signed_reservation_by_class = (
-        lease.reservation_bytes_by_storage_class
-    )
+    signed_reservation_by_class = lease.reservation_bytes_by_storage_class
     for storage_class in _STORAGE_CLASSES:
         required_bytes = _integer(
             required_bytes_by_storage_class[storage_class],
@@ -460,13 +414,9 @@ def assert_database_capacity_lease_reservation(
         maximum=_MAX_SIGNED_BIGINT,
     )
     remaining_by_volume = {
-        volume.volume_digest: volume.available_after_all_reservations_bytes
-        for volume in lease.volumes
+        volume.volume_digest: volume.available_after_all_reservations_bytes for volume in lease.volumes
     }
-    if any(
-        remaining_bytes < minimum_remaining
-        for remaining_bytes in remaining_by_volume.values()
-    ):
+    if any(remaining_bytes < minimum_remaining for remaining_bytes in remaining_by_volume.values()):
         raise _error("remaining_capacity_too_small", "volumes")
     build_seconds = _integer(
         required_build_seconds,
@@ -474,27 +424,39 @@ def assert_database_capacity_lease_reservation(
         minimum=1,
         maximum=CAPACITY_LEASE_MAX_VALIDITY_SECONDS,
     )
-    projected_completion = max(lease.validated_at, lease.issued_at) + (
-        datetime.timedelta(seconds=build_seconds)
-    )
+    projected_completion = max(lease.validated_at, lease.issued_at) + (datetime.timedelta(seconds=build_seconds))
     if projected_completion > lease.max_build_deadline:
         raise _error("deadline_too_short", "max_build_deadline")
+
+
 __all__ = (
-    "CAPACITY_ATTESTATION_ID_DOMAIN", "CAPACITY_LEASE_CONTRACT_ID",
-    "CAPACITY_LEASE_DIGEST_DOMAIN", "CAPACITY_LEASE_MAX_FUTURE_SKEW_SECONDS",
+    "CAPACITY_ATTESTATION_ID_DOMAIN",
+    "CAPACITY_LEASE_CONTRACT_ID",
+    "CAPACITY_LEASE_DIGEST_DOMAIN",
+    "CAPACITY_LEASE_MAX_FUTURE_SKEW_SECONDS",
     "CAPACITY_LEASE_MAX_OBSERVATION_AGE_SECONDS",
-    "CAPACITY_LEASE_MAX_VALIDITY_SECONDS", "CAPACITY_LEASE_PUBLIC_KEY_DOMAIN",
-    "CAPACITY_LEASE_SIGNATURE_ALGORITHM", "CAPACITY_LEASE_SIGNATURE_DOMAIN",
+    "CAPACITY_LEASE_MAX_VALIDITY_SECONDS",
+    "CAPACITY_LEASE_PUBLIC_KEY_DOMAIN",
+    "CAPACITY_LEASE_SIGNATURE_ALGORITHM",
+    "CAPACITY_LEASE_SIGNATURE_DOMAIN",
     "CAPACITY_RUNTIME_WITNESS_DOMAIN",
-    "CAPACITY_TABLESPACE_IDENTITY_DOMAIN", "CAPACITY_VOLUME_IDENTITY_DOMAIN",
-    "CapacityLeaseConsumptionBinding", "CapacityLeaseTrust",
-    "CapacityLeaseDeploymentWitness", "CapacityLeaseRuntimeWitness",
+    "CAPACITY_TABLESPACE_IDENTITY_DOMAIN",
+    "CAPACITY_VOLUME_IDENTITY_DOMAIN",
+    "CapacityLeaseConsumptionBinding",
+    "CapacityLeaseTrust",
+    "CapacityLeaseDeploymentWitness",
+    "CapacityLeaseRuntimeWitness",
     "CapacityLeaseTrustKey",
-    "CapacityLeaseTrustTablespace", "CapacityLeaseTrustVolume",
-    "DatabaseCapacityTablespace", "DatabaseCapacityVolume",
-    "ProviderDirectoryCapacityLeaseError", "VerifiedDatabaseCapacityLease",
+    "CapacityLeaseTrustTablespace",
+    "CapacityLeaseTrustVolume",
+    "DatabaseCapacityTablespace",
+    "DatabaseCapacityVolume",
+    "ProviderDirectoryCapacityLeaseError",
+    "VerifiedDatabaseCapacityLease",
     "assert_database_capacity_lease_reservation",
-    "canonical_capacity_lease_json", "capacity_attestation_id",
+    "canonical_capacity_lease_json",
+    "capacity_attestation_id",
     "capacity_runtime_witness_sha256",
-    "capacity_lease_consumption_values", "verify_database_capacity_lease",
+    "capacity_lease_consumption_values",
+    "verify_database_capacity_lease",
 )
