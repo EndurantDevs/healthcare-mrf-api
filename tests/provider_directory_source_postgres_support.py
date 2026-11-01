@@ -125,7 +125,13 @@ async def _migrate_source_component_baseline(baseline, bootstrap, migration_pref
 
 async def _close_source_component_baseline(admin, baseline):
     """Require a disconnected, database-local template before preventing new connections."""
-    assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", baseline.name)
+    for attempt in range(121):  # Autovacuum may outlive migration engine disposal.
+        if not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", baseline.name):
+            break
+        if attempt < 120:
+            await asyncio.sleep(0.5)
+    else:
+        raise AssertionError("source template database still has connections")
     for role in (baseline.owner, baseline.builder):
         assert not await admin.fetchval(
             "SELECT EXISTS(SELECT FROM pg_database WHERE datdba=$1::regrole) "
