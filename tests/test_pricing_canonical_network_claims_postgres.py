@@ -1,29 +1,53 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Real migrated, published heap and claims SQL; clinical code mapping is synthetic."""
 
+import asyncio
+import importlib
 import json
+import os
+import secrets
 from types import SimpleNamespace
-from uuid import UUID
+from unittest.mock import AsyncMock
+from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import MetaData, text
+from sqlalchemy import MetaData, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.endpoint import pricing
 from api.network_address_scope import network_address_read_scope
+from db.connection import Database
+from process import native_publication_read_access
 from process.network_membership_candidate_indexes import prepare_network_candidate_indexes
 from process.network_serving_read import resolve_network_serving_manifest
+from tests.claims_pricing_contract_fakes import AsyncTransaction
+from tests.signed_request_reader_postgres_support import native_reader_witness
 from tests.test_network_address_projection_postgres import projection_db as projection_db
 from tests.test_network_membership_candidate_indexes_postgres import _project_validated
 from tests.test_network_membership_publication_postgres import _candidate_writer_roles, _publish
 from tests.test_network_membership_serving_indexes_postgres import _full_source, _prepare
 from tests.test_network_membership_validation_postgres import _batch
 from tests.test_network_membership_validation_postgres import validation_db as validation_db
-from tests.test_network_serving_routes_postgres import _reader_engine
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_pricing_procedure_fast_path import _resolve_single_internal_code
 
 pytestmark = pytest.mark.asyncio
+claims_pricing = importlib.import_module("process.claims_pricing")
+
+CLAIMS_READ_COLUMNS = {
+    "pricing_provider": ("city", "npi", "provider_name", "provider_type", "state", "year", "zip5"),
+    "pricing_provider_procedure": (
+        "npi",
+        "procedure_code",
+        "total_allowed_amount",
+        "total_beneficiaries",
+        "total_services",
+        "total_submitted_charges",
+        "year",
+    ),
+}
 
 
 async def _seed_claim_offices(fixture, second_selected):
@@ -127,34 +151,71 @@ async def claims_offices(validation_db, serving_schema, monkeypatch, request):
     fixture = validation_db
     await _seed_claim_offices(fixture, request.param)
     _, _, parent_engine = serving_schema
-    tables = await _seed_provider_claims(fixture, parent_engine, monkeypatch)
-    reader_engine = None
-    try:
-        async with _candidate_writer_roles(fixture):
+    async with _candidate_writer_roles(fixture):
+        database = Database()
+        try:
             async with fixture.connection.transaction():
                 await _publish(fixture)
+            # Claims must be absent when the network fixture grants its broad metadata reads.
+            tables = await _seed_provider_claims(fixture, parent_engine, monkeypatch)
+            reader = fixture.writer_roles["reader"]
+            password = secrets.token_hex(32)
+            await fixture.connection.execute(f"ALTER ROLE \"{reader}\" LOGIN PASSWORD '{password}'")
             for table in tables:
+                columns = ",".join(CLAIMS_READ_COLUMNS[table.name])
                 await fixture.connection.execute(
-                    f'GRANT SELECT ON "{fixture.control_schema}"."{table.name}" TO "{fixture.writer_roles["reader"]}"'
+                    f'GRANT SELECT ({columns}) ON "{fixture.control_schema}"."{table.name}" TO "{reader}"'
                 )
-            reader_engine = _reader_engine(parent_engine, fixture.writer_roles["reader"])
+            for key, environment_value in {
+                "HOST": parent_engine.url.host,
+                "PORT": parent_engine.url.port,
+                "USER": parent_engine.url.username,
+                "DATABASE": parent_engine.url.database,
+                "READER_USER": reader,
+                "READER_PASSWORD": password,
+            }.items():
+                if environment_value is not None:
+                    monkeypatch.setenv("HLTHPRT_DB_" + key, str(environment_value))
             async with fixture.observer.transaction(readonly=True):
                 pin = await resolve_network_serving_manifest(fixture.observer, control_schema=fixture.control_schema)
-            try:
-                yield SimpleNamespace(fixture=fixture, pin=pin, engine=reader_engine, second_selected=request.param)
-            finally:
-                await reader_engine.dispose()
-                reader_engine = None
+            yield SimpleNamespace(fixture=fixture, pin=pin, database=database, second_selected=request.param)
+        finally:
+            await database.disconnect()
+
+
+async def test_claims_fixture_preserves_default_port_when_source_dsn_omits_it(monkeypatch):
+    module = importlib.import_module(__name__)
+    fixture = SimpleNamespace(
+        connection=SimpleNamespace(transaction=AsyncTransaction, execute=AsyncMock()),
+        observer=SimpleNamespace(transaction=lambda **_options: AsyncTransaction()),
+        writer_roles={"reader": "synthetic_reader"},
+        control_schema="synthetic_control",
+    )
+    for name in ("_seed_claim_offices", "_publish", "resolve_network_serving_manifest"):
+        monkeypatch.setattr(module, name, AsyncMock())
+    monkeypatch.setattr(module, "_seed_provider_claims", AsyncMock(return_value=[]))
+    monkeypatch.setattr(module, "_candidate_writer_roles", lambda _fixture: AsyncTransaction())
+    monkeypatch.setattr(secrets, "token_hex", lambda _size: "synthetic-reader-password")
+    monkeypatch.setenv("HLTHPRT_DB_PORT", "5432")
+    parent = SimpleNamespace(url=make_url("postgresql://writer@database.example.test/synthetic"))
+    stream = claims_offices.__wrapped__(fixture, (None, None, parent), monkeypatch, SimpleNamespace(param=False))
+    try:
+        context = await anext(stream)
+        assert context.fixture is fixture
+        assert os.environ["HLTHPRT_DB_PORT"] == "5432"
+        assert os.environ["HLTHPRT_DB_HOST"] == "database.example.test"
+        assert os.environ["HLTHPRT_DB_USER"] == "writer"
+        assert os.environ["HLTHPRT_DB_DATABASE"] == "synthetic"
+        assert os.environ["HLTHPRT_DB_READER_PASSWORD"] == "synthetic-reader-password"
     finally:
-        if reader_engine is not None:
-            await reader_engine.dispose()
+        await stream.aclose()
 
 
 async def _claims(context, *, selected_network_ids=(42,), import_context=None, **filters):
-    async with async_sessionmaker(context.engine)() as session, session.begin():
+    async with context.database.reader_session() as session:
         if hasattr(context, "zip_schema"):
             await session.execute(text(f'SET LOCAL search_path TO "{context.zip_schema}", public'))
-        assert await session.scalar(text("SELECT current_user")) == context.fixture.writer_roles["reader"]
+        await native_reader_witness(session, context.fixture.writer_roles["reader"])
         document = SimpleNamespace(
             args={
                 "code": "99213",
@@ -297,3 +358,205 @@ async def test_native_import_relation_intersects_exact_network_offices_before_co
     assert hidden["pagination"]["total"] == 0 and hidden["items"] == []
     beyond = await _claims(claims_offices, import_context=imported, offset="1")
     assert beyond["pagination"]["total"] == 1 and beyond["items"] == []
+
+
+@pytest.fixture
+async def publication_claims(claims_offices, serving_schema, monkeypatch):
+    context = claims_offices
+    fixture = context.fixture
+    schema = fixture.control_schema
+    engine = serving_schema[2]
+    context.classes = claims_pricing._staging_classes(uuid4().hex[:8], schema)
+    context.names = tuple(getattr(claims_pricing, name).__main_table__ for name in context.classes)
+    async with engine.begin() as connection:
+        for class_name, staged in context.classes.items():
+            live = getattr(claims_pricing, class_name).__table__.to_metadata(MetaData(), schema=schema)
+            await connection.run_sync(live.create, checkfirst=True)
+            await connection.run_sync(staged.__table__.create)
+            await connection.execute(
+                staged.__table__.insert().from_select([column.name for column in live.columns], select(live))
+            )
+            target = f'"{schema}"."{live.name}"'
+            auditor = fixture.writer_roles["loader"]
+            await connection.execute(text(f'GRANT SELECT ON {target} TO "{auditor}" WITH GRANT OPTION'))
+            await connection.execute(text(f'GRANT MAINTAIN,UPDATE ON {target} TO "{auditor}"'))
+    publisher = Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
+    monkeypatch.setattr(claims_pricing, "db", publisher)
+    return context
+
+
+async def _state(context):
+    fixture = context.fixture
+    return await fixture.connection.fetchval(
+        """SELECT jsonb_agg(jsonb_build_array(c.oid,c.relname,c.relowner,c.relacl::text,
+          (SELECT jsonb_agg(jsonb_build_array(a.attnum,a.attname,a.attacl::text) ORDER BY a.attnum)
+           FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped)) ORDER BY c.relname)
+          FROM pg_class c WHERE c.relnamespace=$1::regnamespace AND c.relkind='r'""",
+        fixture.control_schema,
+    )
+
+
+async def _reads(context):
+    connection = context.fixture.connection
+    grants_by_table = {}
+    for name in context.names:
+        oid = await connection.fetchval("SELECT to_regclass($1)::oid", f"{context.fixture.control_schema}.{name}")
+        rows = await connection.fetch(native_publication_read_access._READS_SQL, oid)
+        grants_by_table[name] = sorted((tuple(row) for row in rows), key=repr)
+    return grants_by_table
+
+
+async def _publish_claims(context):
+    await claims_pricing._publish_by_table_rename(context.classes, context.fixture.control_schema)
+
+
+async def _assert_reader_denials(context):
+    reader = await context.database._connect_reader()
+    schema = context.fixture.control_schema
+    async with reader.engine.connect() as connection:
+        connection = await connection.execution_options(postgresql_readonly=False)
+        for statement in (
+            f'SELECT provider_key FROM "{schema}".pricing_provider',
+            f'SELECT reported_code FROM "{schema}".pricing_provider_procedure',
+            f'INSERT INTO "{schema}".pricing_provider(npi,year) VALUES(3333333333,2023)',
+            f"UPDATE \"{schema}\".pricing_provider SET city='Forbidden'",
+            f'DELETE FROM "{schema}".pricing_provider_procedure',
+            f'TRUNCATE "{schema}".pricing_provider_procedure',
+            f'CREATE TABLE "{schema}".forbidden(id int)',
+        ):
+            with pytest.raises(DBAPIError) as denied:
+                async with connection.begin():
+                    await connection.execute(text(statement))
+            assert denied.value.orig.sqlstate == "42501"
+
+
+async def test_refresh_preserves_exact_reads_and_native_page_hydration(publication_claims):
+    context = publication_claims
+    fixture = context.fixture
+    before = await _reads(context)
+    original_page = await _claims(context)
+    original_oids = await fixture.connection.fetch(
+        "SELECT oid FROM pg_class WHERE relnamespace=$1::regnamespace AND relname=ANY($2::text[]) ORDER BY relname",
+        fixture.control_schema,
+        list(context.names),
+    )
+    await _publish_claims(context)
+    assert await _reads(context) == before
+    current_oids = await fixture.connection.fetch(
+        "SELECT oid FROM pg_class WHERE relnamespace=$1::regnamespace AND relname=ANY($2::text[]) ORDER BY relname",
+        fixture.control_schema,
+        list(context.names),
+    )
+    assert len(current_oids) == 8 and all(old != new for old, new in zip(original_oids, current_oids, strict=True))
+    assert await _claims(context) == original_page
+    page = await _claims(context, selected_network_ids=(42, 88), offset="1")
+    assert page["pagination"]["total"] == 2 and page["items"][0]["npi"] == 1111111111
+    assert page["items"][0]["locations"] and page["items"][0]["provider_name"] == "Selected Provider"
+    for name in context.names:
+        relation = f"{fixture.control_schema}.{name}"
+        assert not await fixture.connection.fetchval(
+            "SELECT has_table_privilege($1,$2,'UPDATE')", fixture.writer_roles["loader"], relation
+        )
+        assert not await fixture.connection.fetchval(
+            "SELECT has_table_privilege($1,$2,'SELECT')", fixture.writer_roles["reader"], relation
+        )
+    await _assert_reader_denials(context)
+
+
+async def test_reader_contention_defers_publication_without_losing_stages(publication_claims, monkeypatch):
+    context = publication_claims
+    fixture = context.fixture
+    for name in (
+        "_ensure_live_code_tables",
+        "_materialize_code_and_crosswalk_rows",
+        "_materialize_procedure_provider_counts",
+        "_materialize_procedure_taxonomy_signals",
+        "_materialize_cost_level_rows",
+        "_collect_cost_level_diagnostics",
+        "_build_staging_indexes",
+    ):
+        monkeypatch.setattr(claims_pricing, name, AsyncMock())
+    before = await _state(context)
+    reads = await _reads(context)
+    page = await _claims(context)
+    async with context.database.reader_session() as reader:
+        await native_reader_witness(reader, fixture.writer_roles["reader"])
+        await reader.execute(text(f'SELECT npi FROM "{fixture.control_schema}".pricing_provider_procedure'))
+        with pytest.raises(claims_pricing.Retry) as deferred:
+            await claims_pricing._materialize_and_publish_claims(context.classes, fixture.control_schema)
+        assert claims_pricing.postgres_sqlstate(deferred.value.__cause__) == "55P03"
+        assert deferred.value.defer_score == claims_pricing.CLAIMS_FINISH_RETRY_SECONDS * 1000
+        assert await _state(context) == before
+        assert await _reads(context) == reads
+    await claims_pricing._materialize_and_publish_claims(context.classes, fixture.control_schema)
+    assert await _state(context) != before
+    assert await _reads(context) == reads
+    assert await _claims(context) == page
+    await _assert_reader_denials(context)
+
+
+@pytest.mark.parametrize("revocation", ["one_column", "all_claims_reads"])
+async def test_refresh_preserves_revocation_and_cannot_provision_missing_reads(publication_claims, revocation):
+    context = publication_claims
+    fixture = context.fixture
+    for name, columns in CLAIMS_READ_COLUMNS.items():
+        if revocation == "one_column" and name != "pricing_provider":
+            continue
+        selected = "provider_name" if revocation == "one_column" else ",".join(columns)
+        await fixture.connection.execute(
+            f'REVOKE SELECT({selected}) ON "{fixture.control_schema}"."{name}" FROM "{fixture.writer_roles["reader"]}"'
+        )
+    before = await _reads(context)
+    await _publish_claims(context)
+    assert await _reads(context) == before
+    with pytest.raises(DBAPIError) as denied:
+        await _claims(context)
+    assert denied.value.orig.sqlstate == "42501"
+    await _assert_reader_denials(context)
+
+
+@pytest.mark.parametrize("failure", ["foreign_grantor", "foreign_stage_owner", "cancel", "rename_dependency"])
+async def test_late_failure_rolls_back_every_heap_and_acl(publication_claims, monkeypatch, failure):
+    context = publication_claims
+    fixture = context.fixture
+    last_name = context.names[-1]
+    stage = list(context.classes.values())[-1].__tablename__
+    live_relation = f'"{fixture.control_schema}"."{last_name}"'
+    expected = RuntimeError
+    if failure == "foreign_grantor":
+        async with fixture.connection.transaction():
+            await fixture.connection.execute(f'SET LOCAL ROLE "{fixture.writer_roles["loader"]}"')
+            await fixture.connection.execute(f'GRANT SELECT ON {live_relation} TO "{fixture.writer_roles["reader"]}"')
+    elif failure == "foreign_stage_owner":
+        await fixture.connection.execute(
+            f'ALTER TABLE "{fixture.control_schema}"."{stage}" OWNER TO "{fixture.writer_roles["loader"]}"'
+        )
+    elif failure == "rename_dependency":
+        await fixture.connection.execute(
+            f'CREATE VIEW "{fixture.control_schema}".held_claims AS SELECT * FROM {live_relation}'
+        )
+        expected = DBAPIError
+    else:
+        preserve = claims_pricing.preserve_publication_reads
+
+        async def cancel_after_grants(connection, **names):
+            await preserve(connection, **names)
+            if names["live_table"] == last_name:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(claims_pricing, "preserve_publication_reads", cancel_after_grants)
+        expected = asyncio.CancelledError
+    try:
+        before = await _state(context)
+        with pytest.raises(expected):
+            await _publish_claims(context)
+        assert await _state(context) == before
+        page = await _claims(context)
+        assert page["pagination"]["total"] == 1 and page["items"][0]["npi"] == 1111111111
+    finally:
+        if failure == "foreign_grantor":
+            async with fixture.connection.transaction():
+                await fixture.connection.execute(f'SET LOCAL ROLE "{fixture.writer_roles["loader"]}"')
+                await fixture.connection.execute(
+                    f'REVOKE SELECT ON {live_relation} FROM "{fixture.writer_roles["reader"]}"'
+                )
