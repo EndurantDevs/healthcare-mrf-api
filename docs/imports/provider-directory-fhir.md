@@ -467,6 +467,20 @@ If a candidate publishes a valid CapabilityStatement, that resolved base is
 persisted back to `provider_directory_source.api_base` and used for the same
 run's resource fetches.
 
+For a reviewed REST source without metadata, source metadata can explicitly set
+`provider_directory_probe_resource` to a supported collection. The probe reuses
+the normal credential checks and requests one resource through the shared HTTP
+client. Only a valid search Bundle admits the source; no CapabilityStatement is
+invented. The collection request and its normal hard deadline honor the resource
+timeout floor. Endpoint-only sources retain the base derived from their configured
+resource URL. This option does not override census contracts or establish complete
+acquisition or publication.
+
+PacificSource full acquisition uses the existing durable checkpoint path. Its
+Practitioner and Location collections exceed the non-checkpointed full-refresh
+page ceiling; bounded direct fetches do not establish complete acquisition.
+Checkpointed scans keep source-issued cursors and do not use that page ceiling.
+
 The importer can also consume a pinned `provider-directory-db`
 `retest_results.json` snapshot as a supplemental source list:
 `--retest-results-path /path/to/retest_results.json` or

@@ -259,12 +259,16 @@ def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contract
     profile_spec = matrix.load_matrix_source_spec()
     selections = matrix.resolve_matrix_source_selection(manifest, profile_spec)
 
-    assert len(profile_spec["source_ids"]) == 30
-    assert len(selections) == 28
+    assert len(profile_spec["source_ids"]) == 31
+    assert len(selections) == 29
     assert selections[0].source_id == "cms-npd"
     molina = next(selection for selection in selections if selection.entry_id == "molina")
     assert molina.resource_profile == "R8"
     assert molina.resources == tuple(profile_spec["verification_matrix"]["resource_profiles"]["R8"]["resources"])
+    pacificsource = next(selection for selection in selections if selection.entry_id == "pacificsource")
+    assert pacificsource.source_id == "pdfhir_19526dc970938f7a212516fa"
+    assert pacificsource.resource_profile == "R8"
+    assert pacificsource.resources == molina.resources
     michigan = next(selection for selection in selections if selection.entry_id == "michigan")
     assert michigan.resource_profile == "M5"
     assert michigan.resources == (
