@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 from dataclasses import replace
 
 import asyncpg
@@ -15,6 +16,11 @@ from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catal
 from process.registry_fhir_catalog_worker import run_fhir_catalog_sync
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
 from tests.fhir_catalog_sync_integration_support import adopt_existing_network, import_source, native_catalog_case
+
+pytestmark = pytest.mark.skipif(
+    not os.getenv("NETWORK_REGISTRY_TEST_DSN"),
+    reason="NETWORK_REGISTRY_TEST_DSN must select an owned PostgreSQL fixture",
+)
 
 
 def _decoded(value):

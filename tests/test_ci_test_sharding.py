@@ -335,6 +335,44 @@ def test_new_cms_anchor_moves_only_its_exact_forty_eight_shard_case(shard_count)
     assert SHARDER.TEST_PROCESS_TIMEOUT_SECONDS == "295s"
 
 
+@pytest.mark.parametrize("shard_count", (1, 2, 4, 6, 8, 16, 32, 48))
+def test_catalog_reader_proofs_move_only_the_two_exact_cases(shard_count) -> None:
+    module = "tests/test_registry_fhir_catalog_metadata_reader_postgres.py"
+    destination_by_nodeid = {
+        module + "::test_metadata_execution_reader_successor_preserves_incumbent": 2,
+        module + "::test_api_reader_successor_preserves_incumbent": 8,
+    }
+    neighbors = [
+        *(node + "[variant]" for node in destination_by_nodeid),
+        *(node.replace("tests/", "other/", 1) for node in destination_by_nodeid),
+        *(node.replace("::test_", "::TestReader::test_") for node in destination_by_nodeid),
+        *(f"tests/test_unrelated.py::test_case[{index}]" for index in range(5000)),
+    ]
+    nodeids = [*destination_by_nodeid, *neighbors, *SHARDER.EXCLUSIVE_REGISTRY_TEST_SHARDS]
+    shards = [
+        SHARDER.select_nodeids(nodeids, shard_count=shard_count, shard_index=index) for index in range(shard_count)
+    ]
+    assert sorted(node for shard in shards for node in shard) == sorted(nodeids)
+    assert all(shard == sorted(shard) for shard in shards)
+    assert len(SHARDER.EXCLUSIVE_REGISTRY_TEST_SHARDS) == 21
+    for node in [*destination_by_nodeid, *neighbors]:
+        digest = int.from_bytes(hashlib.sha256(node.encode()).digest(), byteorder="big")
+        expected = 21 + digest % (shard_count - 21) if shard_count in (32, 48) else digest % shard_count
+        if shard_count == 48:
+            if node in destination_by_nodeid:
+                expected = destination_by_nodeid[node]
+            elif expected == 21:
+                module_digest = int.from_bytes(
+                    hashlib.sha256(node.split("::", 1)[0].encode()).digest(), byteorder="big"
+                )
+                expected = (1, 6, 10, 16)[module_digest % 4]
+        assert SHARDER.shard_index_for_nodeid(node, shard_count) == expected
+    if shard_count in (32, 48):
+        for index, node in enumerate(SHARDER.EXCLUSIVE_REGISTRY_TEST_SHARDS):
+            assert node in shards[index]
+    assert SHARDER.TEST_PROCESS_TIMEOUT_SECONDS == "295s"
+
+
 def test_anchor_collisions_keep_module_fixtures_together() -> None:
     """Fixed natural collisions exercise every destination without splitting a module."""
     destination_by_nodeid = {

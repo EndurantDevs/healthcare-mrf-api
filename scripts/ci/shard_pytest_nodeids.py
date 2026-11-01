@@ -159,12 +159,22 @@ def collect_nodeids(pytest_arguments: Sequence[str]) -> list[str]:
 
 
 def _registry_shard_index(nodeid: str, shard_count: int) -> int:
-    """Isolate the new anchor while preserving all other registry hash buckets."""
+    """Balance exact expensive cases while preserving the other registry hash buckets."""
     if shard_count == 48 and nodeid == (
         "tests/test_registry_cms_refresh_anchors_postgres.py"
         "::test_cms_anchor_uses_genuine_accepted_notification_and_original_native_evidence"
     ):
         return 21
+    # Keep newly enrolled reader proofs within existing native process budgets.
+    if shard_count == 48 and nodeid == (
+        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py"
+        "::test_metadata_execution_reader_successor_preserves_incumbent"
+    ):
+        return 2
+    if shard_count == 48 and nodeid == (
+        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent"
+    ):
+        return 8
     exclusive = EXCLUSIVE_REGISTRY_TEST_SHARDS.get(nodeid)
     if exclusive is not None:
         return exclusive
