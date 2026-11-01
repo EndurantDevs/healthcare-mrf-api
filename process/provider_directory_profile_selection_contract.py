@@ -182,13 +182,19 @@ def configured_node_id() -> str:
 
 
 def _validated_desired_selection(payload) -> dict[str, Any]:
-    """Bind an exact CMS replacement or current-dataset date refresh."""
+    """Bind an explicit snapshot date and an optional exact CMS replacement."""
     date_text = _required_text(payload, "desired_profile_as_of", limit=10)
     try:
         if datetime.date.fromisoformat(date_text).isoformat() != date_text:
             raise ValueError
     except ValueError as exc:
         raise ProviderDirectoryProfileSelectionError("Profile selection desired_profile_as_of is invalid") from exc
+    if payload.get("desired_cms_dataset") is None:
+        if payload.get("expected_cms_incumbent") is not None:
+            raise ProviderDirectoryProfileSelectionError(
+                "Profile selection CMS incumbent requires a desired CMS dataset"
+            )
+        return {"desired_profile_as_of": date_text, "desired_cms_dataset": None, "expected_cms_incumbent": None}
     desired = _validated_pair(payload.get("desired_cms_dataset"), allow_desired=True)
     if desired["source_id"] != "cms-npd":
         raise ProviderDirectoryProfileSelectionError("Profile selection desired CMS source is invalid")
@@ -289,7 +295,8 @@ def _normalized_attestation_pairs(
         for raw_pair in raw_pairs
     ]
     if desired and (
-        normalized_pairs.count(desired["desired_cms_dataset"]) != 1
+        (desired["desired_cms_dataset"] is None and any(pair["source_id"] == "cms-npd" for pair in normalized_pairs))
+        or (desired["desired_cms_dataset"] is not None and normalized_pairs.count(desired["desired_cms_dataset"]) != 1)
         or len({pair["source_id"] for pair in normalized_pairs}) != len(normalized_pairs)
     ):
         raise ProviderDirectoryProfileSelectionError("Profile selection desired CMS vector is invalid")

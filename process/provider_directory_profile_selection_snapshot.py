@@ -450,30 +450,36 @@ def _computed_desired_selection_from_rows(
     node_id: str,
     source_rows: list[Mapping[str, Any]],
     dataset_rows: list[Mapping[str, Any]],
-    desired_dataset_row: Mapping[str, Any],
+    desired_dataset_row: Mapping[str, Any] | None,
     desired_selection: Mapping[str, Any],
     include_input_proof: bool = True,
 ) -> _ComputedProfileSelection:
-    """Replace only CMS in the full current vector using an exact desired tuple."""
+    """Bind a dated current vector, replacing CMS only with an exact desired tuple."""
     desired_selection = _validated_desired_selection(desired_selection)
     desired = desired_selection["desired_cms_dataset"]
-    incumbent = _cms_incumbent_pair(dataset_rows, desired["endpoint_id"])
-    if incumbent != desired_selection["expected_cms_incumbent"]:
-        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_incumbent_changed")
-    if _cms_dataset_pair(desired_dataset_row, allow_desired=True) != desired:
-        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_desired_cms_changed")
     source_groups = _catalog_source_groups(catalog_map)
-    if ("cms-npd",) not in source_groups:
-        raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_not_enabled")
+    if desired is not None:
+        incumbent = _cms_incumbent_pair(dataset_rows, desired["endpoint_id"])
+        if incumbent != desired_selection["expected_cms_incumbent"]:
+            raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_incumbent_changed")
+        if _cms_dataset_pair(desired_dataset_row, allow_desired=True) != desired:
+            raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_desired_cms_changed")
+        if ("cms-npd",) not in source_groups:
+            raise ProviderDirectoryProfileSelectionDrift("provider_directory_profile_selection_cms_not_enabled")
     source_by_id, source_ids_by_endpoint = _source_selection_indexes(source_rows)
     _assert_dataset_variant_registry_coordinates(source_by_id)
     dataset_by_group = _dataset_selection_by_group(
         dataset_rows, source_groups, source_ids_by_endpoint, _dataset_scoped_variant_source_groups()
     )
-    dataset_by_group[("cms-npd",)] = desired_dataset_row
+    if desired is not None:
+        dataset_by_group[("cms-npd",)] = desired_dataset_row
     selection_records = _selection_records(
         source_groups, dataset_by_group, source_by_id, desired, include_input_proof=include_input_proof
     )
+    if desired is None and any(pair["source_id"] == "cms-npd" for pair in selection_records.pairs):
+        raise ProviderDirectoryProfileSelectionDrift(
+            "provider_directory_profile_selection_cms_requires_desired_dataset"
+        )
     identity = _selection_identity(str(catalog_map["catalog_digest"]), node_id, selection_records)
     identity.update(
         {
@@ -502,23 +508,26 @@ async def _compute_desired_selection(
     if lock_selection:
         await _lock_profile_selection_tables()
     desired = desired_selection["desired_cms_dataset"]
-    desired_dataset_row = await db.first(
-        f"SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "
-        "status, is_current, resource_count, validated_at, published_at, superseded_at, publication_metadata_json "
-        f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE dataset_id=:dataset_id;",
-        dataset_id=desired["dataset_id"],
-    )
+    desired_dataset_row = None
+    if desired is not None:
+        desired_dataset_row = await db.first(
+            f"SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "
+            "status, is_current, resource_count, validated_at, published_at, superseded_at, publication_metadata_json "
+            f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE dataset_id=:dataset_id;",
+            dataset_id=desired["dataset_id"],
+        )
     current_rows = await _selection_dataset_rows(exact_readiness=exact_readiness)
-    incumbent_rows = await db.all(
-        "SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "
-        "status, is_current, resource_count, validated_at, published_at, superseded_at, publication_metadata_json "
-        f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE endpoint_id=:endpoint_id AND is_current=true;",
-        endpoint_id=desired["endpoint_id"],
-    )
-    current_rows = [
-        current_row for current_row in current_rows if current_row.get("endpoint_id") != desired["endpoint_id"]
-    ]
-    current_rows.extend(_row_mapping(incumbent_row) for incumbent_row in incumbent_rows)
+    if desired is not None:
+        incumbent_rows = await db.all(
+            "SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "
+            "status, is_current, resource_count, validated_at, published_at, superseded_at, publication_metadata_json "
+            f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE endpoint_id=:endpoint_id AND is_current=true;",
+            endpoint_id=desired["endpoint_id"],
+        )
+        current_rows = [
+            current_row for current_row in current_rows if current_row.get("endpoint_id") != desired["endpoint_id"]
+        ]
+        current_rows.extend(_row_mapping(incumbent_row) for incumbent_row in incumbent_rows)
     return _computed_desired_selection_from_rows(
         catalog_map,
         node_id=node_id,
