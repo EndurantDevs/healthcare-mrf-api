@@ -110,6 +110,66 @@ async def test_metadata_owner_that_is_a_reader_cannot_escape_source_census(monke
     verifier.assert_not_awaited()
 
 
+def test_worker_refuses_a_duck_runtime_before_reading_its_actors():
+    config = _config(_runtime())
+    invalid = SimpleNamespace(
+        **(vars(config) | {"initial_address_sources": SimpleNamespace(source_witness_runtime=object())})
+    )
+    with pytest.raises(ValueError, match="registry_source_witness_runtime_invalid"):
+        worker._configured_source_witness_runtime(invalid, config.consumer, {})
+
+
+def test_worker_refuses_an_unsupported_consumer_with_otherwise_valid_actors():
+    runtime = _runtime()
+    config = _config(runtime)
+    unsupported = SimpleNamespace(**vars(config.consumer))
+    with pytest.raises(ValueError, match="registry_source_witness_worker_unsupported"):
+        worker._configured_source_witness_runtime(
+            config, unsupported, {"custody_owner_role": "protected_control_owner"}
+        )
+    runtime.source_export.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preparation_forwards_only_the_configured_source_runtime_before_input_refusal(monkeypatch):
+    from process import registry_candidate_composition as preparation
+    from tests.test_registry_publication_address_preparation import _PreparationConnection
+
+    runtime = _runtime()
+    config = _config(runtime)
+    connection = _PreparationConnection()
+    identity_by_name = {"schema_owner_role": "protected_control_owner", "custody_owner_role": "protected_control_owner"}
+    registered = _sources(None)
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    verify_inputs = AsyncMock(side_effect=ValueError("unit_native_input_refused"))
+    materialize = AsyncMock(side_effect=AssertionError("refused inputs must not materialize"))
+    monkeypatch.setattr(worker, "_custody_identity", AsyncMock(return_value=identity_by_name))
+    monkeypatch.setattr(custody, "_q_reach_closed", AsyncMock())
+    monkeypatch.setattr(worker, "_registered_address_sources", AsyncMock(return_value=registered))
+    monkeypatch.setattr(worker, "_require_execution_address_reads", verify_inputs)
+    monkeypatch.setattr(preparation, "prepare_registry_composition_address_artifact", materialize)
+    callback = worker._address_preparer(
+        config, config.consumer, SimpleNamespace(acquire=acquire), identity_by_name, config.custody_url.username
+    )
+    with pytest.raises(ValueError, match="unit_native_input_refused"):
+        await callback(
+            request_id="00000000-0000-0000-0000-000000000001",
+            approved_revision=1,
+            source_manifest=None,
+            expected_head=0,
+            address_sources=registered,
+        )
+    assert verify_inputs.await_args.args[1].source_witness_runtime is runtime
+    assert registered.source_witness_runtime is None
+    assert not connection.active and not connection.committed
+    materialize.assert_not_awaited()
+    runtime.source_export.assert_not_called()
+
+
 @pytest.mark.parametrize("parser,factory", WORKERS[1:])
 def test_source_consumer_uses_its_actual_owner_and_notification_actors(parser, factory):
     parsed = parser(json.dumps(_configured(factory)[0]))

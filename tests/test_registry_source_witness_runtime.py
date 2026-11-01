@@ -8,7 +8,7 @@ import json
 import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
@@ -131,6 +131,53 @@ async def test_installer_owns_original_factory_without_opening_a_capture(monkeyp
     assert events == ["source open", "source close"]
     factory.assert_called_once_with()
     exported.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ("custody_url", "initial_address_sources", "compact"))
+async def test_installer_rechecks_required_inputs_before_opening_source(monkeypatch, missing):
+    events, config = [], _config()
+    exported, factory = _factory(monkeypatch, events)
+    values = vars(config) | {missing: None}
+    if missing == "compact":
+        values = vars(config) | {"initial_address_sources": replace(config.initial_address_sources, compact=False)}
+    async with AsyncExitStack() as stack:
+        with pytest.raises(ValueError, match="registry_source_witness_worker_config_invalid"):
+            await install_source_witness_runtime(SimpleNamespace(**values), stack)
+        assert not stack._exit_callbacks
+    factory.assert_not_called()
+    exported.assert_not_called()
+    assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mixed", (False, True))
+async def test_installer_refuses_unparsed_or_conflicting_settings_before_source(monkeypatch, mixed):
+    events, config = [], _config()
+    exported, factory = _factory(monkeypatch, events)
+    changes = (
+        {"initial_address_sources": _sources(_runtime())}
+        if mixed
+        else {"source_witness": _document()["source_witness"]}
+    )
+    async with AsyncExitStack() as stack:
+        with pytest.raises(ValueError, match="registry_source_witness_worker_config_invalid"):
+            await install_source_witness_runtime(SimpleNamespace(**(vars(config) | changes)), stack)
+        assert not stack._exit_callbacks
+    factory.assert_not_called()
+    exported.assert_not_called()
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_installer_refuses_noncallable_factory_attribute_without_opening_resources(monkeypatch):
+    module = ModuleType("directory_membership_runtime")
+    module.membership_source_export_runtime = object()
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    async with AsyncExitStack() as stack:
+        with pytest.raises(ValueError, match="registry_source_witness_factory_unavailable"):
+            await install_source_witness_runtime(_config(), stack)
+        assert not stack._exit_callbacks
 
 
 @pytest.mark.asyncio
