@@ -231,12 +231,20 @@ async def test_initial_inventory_consumes_genuine_bootstrap_and_custody_without_
 
 
 @pytest.mark.parametrize("runtime_role", ["loader", "publisher"])
-async def test_initial_inventory_rejects_source_loader_runtime_actor(initial_worker, runtime_role):
-    """Legacy input readers stay valid, but actual direct or aliased writers must refuse."""
+async def test_initial_inventory_rejects_snapshot_writer_runtime_actor(initial_worker, runtime_role):
+    """Actual heap writers and aliases of the protected snapshot owner must refuse."""
     worker = initial_worker
     connection = worker.fixture.connection
     unsafe_actor = worker.fixture.roles[runtime_role]
-    assert await connection.fetchval("SELECT pg_has_role($1,$2,'USAGE')", unsafe_actor, worker.fixture.roles["loader"])
+    if runtime_role == "loader":
+        await connection.execute(
+            f'GRANT UPDATE ON "{worker.bootstrap.address_source.schema_name}".npi TO "{unsafe_actor}"'
+        )
+        assert await connection.fetchval(
+            "SELECT has_table_privilege($1,$2::oid,'UPDATE')", unsafe_actor, dict(worker.bootstrap.relation_oids)["npi"]
+        )
+    else:
+        assert await connection.fetchval("SELECT pg_has_role($1,$2,'SET')", unsafe_actor, worker.bootstrap.owner_role)
     queued = await _enqueue(worker, _command(worker.bootstrap))
     before = await _snapshot(worker)
     async with _consumer(worker) as (arguments, _calls):
@@ -250,6 +258,37 @@ async def test_initial_inventory_rejects_source_loader_runtime_actor(initial_wor
     assert await _head(worker) is None
     assert await _snapshot(worker) == before
     assert (await _status(worker, queued))["result"] in (None, {"error": {"code": "registry_publication_rejected"}})
+
+
+async def test_initial_inventory_accepts_legacy_sequence_owner_as_reader(initial_worker):
+    """Publish ordinary inventory when an actual reader also owns the mutable parent's sequence."""
+    worker = initial_worker
+    connection, loader = worker.fixture.connection, worker.fixture.roles["loader"]
+    sequence = await connection.fetchval(
+        "SELECT pg_get_serial_sequence($1,'npi')", worker.fixture.source_schema + ".npi"
+    )
+    assert await connection.fetchval(
+        "SELECT c.relowner=r.oid FROM pg_class c JOIN pg_roles r ON r.rolname=$2 WHERE c.oid=$1::regclass",
+        sequence,
+        loader,
+    )
+    sequence_before = await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
+    inventory_before = await _snapshot(worker)
+    await _enqueue(worker, _command(worker.bootstrap))
+    async with _consumer(worker) as (arguments, _calls):
+        arguments["config"] = replace(
+            arguments["config"], reader_roles=tuple(sorted((*arguments["config"].reader_roles, loader)))
+        )
+        async with _custodian(worker, arguments) as (arguments, custodian):
+            arguments["initial_address_sources"] = _sources(worker)
+            completed = await consume_registry_publication_once(**arguments)
+            assert completed["state"] == "completed"
+            assert completed["result"]["generation_id"] == await _head(worker)
+            await _assert_initial_manifest(worker, completed["result"], custodian)
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        assert await bootstrap.verify_network_bootstrap_sources(connection, worker.bootstrap) == worker.bootstrap
+    assert await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == sequence_before
+    assert await _snapshot(worker) == inventory_before
 
 
 async def _assert_initial_manifest(worker, result_by_name, custodian):
