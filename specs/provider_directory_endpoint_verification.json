@@ -74,6 +74,13 @@
       "checked_at": null,
       "proof_state": "not_recorded"
     },
+    "mvp-health-care": {
+      "terminal_status": null,
+      "run_id": null,
+      "access_verification": "not_recorded",
+      "checked_at": null,
+      "proof_state": "not_recorded"
+    },
     "michigan": {
       "terminal_status": null,
       "run_id": null,

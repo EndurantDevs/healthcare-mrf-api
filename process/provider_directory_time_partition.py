@@ -24,6 +24,8 @@ from process.provider_directory_time_partition_primitives import (
 
 class CountKind(str, Enum):
     EXACT = "exact"
+    OVERFLOW = "overflow"
+    SPLIT = "split"
     ERROR = "error"
     UNKNOWN = "unknown"
 
@@ -57,6 +59,14 @@ class CountObservation:
                 raise PartitionPlanError("an exact count cannot be negative")
             if self.detail is not None:
                 raise PartitionPlanError("an exact count cannot include an error detail")
+        elif self.kind is CountKind.OVERFLOW:
+            if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count <= 0:
+                raise PartitionPlanError("an overflow lower bound must be a positive integer")
+            if self.detail is not None:
+                raise PartitionPlanError("an overflow observation cannot include an error detail")
+        elif self.kind is CountKind.SPLIT:
+            if self.count is not None or self.detail != "timeout":
+                raise PartitionPlanError("an uncounted split requires a timeout reason and no count")
         elif self.count is not None:
             raise PartitionPlanError("an error or unknown count cannot include a count")
 
@@ -64,6 +74,16 @@ class CountObservation:
     def exact(cls, count: int) -> CountObservation:
         """Create a successful authoritative count observation."""
         return cls(CountKind.EXACT, count=count)
+
+    @classmethod
+    def overflow(cls, lower_bound: int) -> CountObservation:
+        """Retain a certified lower bound without inventing an exact count."""
+        return cls(CountKind.OVERFLOW, count=lower_bound)
+
+    @classmethod
+    def split(cls, reason: str = "timeout") -> CountObservation:
+        """Subdivide a timed-out count only under a caller's exhaustive contract."""
+        return cls(CountKind.SPLIT, detail=reason)
 
     @classmethod
     def error(cls, detail: str) -> CountObservation:
@@ -96,6 +116,8 @@ class TimeWindow:
     state: WindowState = WindowState.NEEDS_COUNT
     count: int | None = None
     passes: dict[int, WindowPass] = field(default_factory=dict)
+    overflow_lower_bound: int | None = None
+    split_reason: str | None = None
 
     def __post_init__(self) -> None:
         self.start = _primitives.validate_utc_instant(self.start, "window start")
@@ -252,6 +274,16 @@ class PartitionPlan:
         """Apply one authoritative count outcome and split when necessary."""
         self._require_active()
         window = self._window(window_id)
+        if window.overflow_lower_bound is not None or window.split_reason is not None:
+            previous = (
+                CountObservation.overflow(window.overflow_lower_bound)
+                if window.overflow_lower_bound is not None
+                else CountObservation.split(window.split_reason)
+            )
+            if observation == previous:
+                return
+            self._fail("contradictory_count", "count observation contradicts the recorded split", window_id)
+            return
         if window.count is not None:
             if observation == CountObservation.exact(window.count):
                 return
@@ -259,6 +291,16 @@ class PartitionPlan:
             return
         if window.state is not WindowState.NEEDS_COUNT:
             raise PartitionPlanError(f"window {window_id!r} does not accept a count")
+        if observation.kind is CountKind.OVERFLOW:
+            if observation.count <= self.config.ceiling:
+                raise PartitionPlanError("overflow lower bound must exceed the ceiling")
+            window.overflow_lower_bound = observation.count
+            self._split_or_fail(window)
+            return
+        if observation.kind is CountKind.SPLIT:
+            window.split_reason = observation.detail
+            self._split_or_fail(window)
+            return
         if observation.kind is CountKind.ERROR:
             detail = observation.detail or "authoritative count request failed"
             self._fail("count_error", detail, window_id)
@@ -270,6 +312,9 @@ class PartitionPlan:
         window.count = observation.count
         if observation.count <= self.config.ceiling:
             window.state = WindowState.READY
+            overflow_failure = self._overflow_count_failure()
+            if overflow_failure is not None:
+                self._fail("overflow_count_mismatch", "leaf counts contradict the certified overflow", overflow_failure)
             return
         self._split_or_fail(window)
 
@@ -387,19 +432,37 @@ class PartitionPlan:
         if window.end - window.start < 2 * self.config.minimum_width:
             self._fail(
                 "minimum_width_overflow",
-                "window exceeds the ceiling and cannot be split above the minimum width",
+                (
+                    "timed-out count cannot be split above the minimum width"
+                    if window.split_reason is not None
+                    else "window exceeds the ceiling and cannot be split above the minimum width"
+                ),
                 window.window_id,
             )
             return
-        duration_microseconds = _primitives.timedelta_microseconds(window.end - window.start)
-        boundary_microseconds = _primitives.timedelta_microseconds(self.config.boundary_precision)
-        midpoint_units = (duration_microseconds // boundary_microseconds) // 2
-        midpoint = window.start + datetime.timedelta(microseconds=midpoint_units * boundary_microseconds)
+        midpoint = self._split_midpoint(window)
         left = TimeWindow(f"{window.window_id}.0", window.start, midpoint)
         right = TimeWindow(f"{window.window_id}.1", midpoint, window.end)
         window.state = WindowState.SPLIT
         self.windows[left.window_id] = left
         self.windows[right.window_id] = right
+
+    def _split_midpoint(self, window: TimeWindow) -> datetime.datetime:
+        duration_microseconds = _primitives.timedelta_microseconds(window.end - window.start)
+        boundary_microseconds = _primitives.timedelta_microseconds(self.config.boundary_precision)
+        midpoint_units = (duration_microseconds // boundary_microseconds) // 2
+        return window.start + datetime.timedelta(microseconds=midpoint_units * boundary_microseconds)
+
+    def _overflow_count_failure(self) -> str | None:
+        leaves = self.leaf_windows()
+        for window in self.windows.values():
+            if window.overflow_lower_bound is None or window.state is not WindowState.SPLIT:
+                continue
+            descendants = [leaf for leaf in leaves if leaf.window_id.startswith(window.window_id + ".")]
+            if descendants and all(leaf.count is not None for leaf in descendants):
+                if sum(leaf.count for leaf in descendants) < window.overflow_lower_bound:
+                    return window.window_id
+        return None
 
     def _fingerprints(
         self,
@@ -446,6 +509,8 @@ class PartitionPlan:
         if "root" not in self.windows or not self.windows:
             raise PartitionPlanError("checkpoint is missing the root window")
         leaves = self.leaf_windows()
+        if not leaves:
+            raise PartitionPlanError("checkpoint has no leaf windows")
         root = self.windows["root"]
         if leaves[0].start != root.start or leaves[-1].end != root.end:
             raise PartitionPlanError("checkpoint leaves do not cover the root window")
@@ -453,6 +518,7 @@ class PartitionPlan:
             if previous.end != current.start:
                 raise PartitionPlanError("checkpoint leaf windows are not contiguous")
         for window in self.windows.values():
+            self._validate_split_evidence(window)
             if not _primitives.is_partition_boundary_aligned(
                 window.start,
                 self.config.boundary_precision,
@@ -477,6 +543,46 @@ class PartitionPlan:
             if 2 in window.passes and window.passes.get(1) != window.passes[2]:
                 raise PartitionPlanError("checkpoint twin passes differ")
         self._validate_checkpoint_duplicates(leaves)
+        if self._overflow_count_failure() is not None and (
+            self.failure is None or self.failure.code != "overflow_count_mismatch"
+        ):
+            raise PartitionPlanError("checkpoint leaf counts contradict the certified overflow")
+
+    def _validate_split_evidence(self, window: TimeWindow) -> None:
+        lower_bound, reason = window.overflow_lower_bound, window.split_reason
+        if lower_bound is None and reason is None:
+            return
+        if lower_bound is not None and (
+            isinstance(lower_bound, bool)
+            or not isinstance(lower_bound, int)
+            or lower_bound <= self.config.ceiling
+            or reason is not None
+        ):
+            raise PartitionPlanError("checkpoint overflow lower bound is invalid")
+        if reason is not None and reason != "timeout":
+            raise PartitionPlanError("checkpoint uncounted split reason is invalid")
+        if window.count is not None or window.passes:
+            raise PartitionPlanError("checkpoint uncounted split contains an exact count or passes")
+        if (
+            self.failure is not None
+            and self.failure.code == "minimum_width_overflow"
+            and self.failure.window_id == window.window_id
+            and window.state is WindowState.NEEDS_COUNT
+            and window.end - window.start < 2 * self.config.minimum_width
+        ):
+            return
+        left = self.windows.get(window.window_id + ".0")
+        right = self.windows.get(window.window_id + ".1")
+        if (
+            window.state is not WindowState.SPLIT
+            or left is None
+            or right is None
+            or left.start != window.start
+            or left.end != self._split_midpoint(window)
+            or left.end != right.start
+            or right.end != window.end
+        ):
+            raise PartitionPlanError("checkpoint uncounted split geometry is invalid")
 
     @staticmethod
     def _validate_checkpoint_duplicates(leaves: tuple[TimeWindow, ...]) -> None:
@@ -513,6 +619,10 @@ class PartitionPlan:
             "end": _primitives.format_utc_instant(window.end),
             "state": window.state.value,
             "count": window.count,
+            **(
+                {"overflow_lower_bound": window.overflow_lower_bound} if window.overflow_lower_bound is not None else {}
+            ),
+            **({"split_reason": window.split_reason} if window.split_reason is not None else {}),
             "passes": {
                 str(pass_number): window_pass.resource_fingerprints
                 for pass_number, window_pass in sorted(window.passes.items())
@@ -530,6 +640,8 @@ class PartitionPlan:
             end=parse_utc_instant(fields["end"]),
             state=WindowState(fields["state"]),
             count=fields["count"],
+            overflow_lower_bound=fields.get("overflow_lower_bound"),
+            split_reason=fields.get("split_reason"),
             passes=passes_by_number,
         )
 

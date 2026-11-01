@@ -34,8 +34,8 @@ from tests.test_provider_directory_profile_capacity_attestation import (
 
 UTC = datetime.timezone.utc
 EXECUTION_V2_FIXTURE = Path(__file__).resolve().parent / "fixtures/provider_directory_profile_execution_v2_golden.json"
-EXECUTION_V2_CANONICAL_SHA256 = "b91ade02dc7e2d35a7684148d128e9044f58939e9d8fa07336012d12062a7547"
-EXECUTION_V2_FILE_SHA256 = "850c3b4dfc3c8ec3552b8c5ebdc13c388dc63525f3cfcba1b7e49f745919f48c"
+EXECUTION_V2_CANONICAL_SHA256 = "0b33ba66c33ca5541eda58a86d5ab0126d19d301b428324ee172285510745acc"
+EXECUTION_V2_FILE_SHA256 = "05b69014effcb688085f3fa29e7cbab5a92cb5d7aa982c618d447851de616a04"
 
 
 def _active_key(
