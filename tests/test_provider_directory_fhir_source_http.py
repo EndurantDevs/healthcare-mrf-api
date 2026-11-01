@@ -21,6 +21,40 @@ async def _start_test_server(app: web.Application) -> TestServer:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", [False, True])
+async def test_ordinary_source_preserves_issued_cursor_bytes(monkeypatch, pinned):
+    issued_path = "/Practitioner?ct=opaque%2Fvalue%2Btail%3D&ordered=a%26b"
+    observed_paths = []
+
+    async def page(request):
+        observed_paths.append(request.raw_path)
+        return web.json_response({"resourceType": "Bundle", "type": "searchset", "entry": []})
+
+    app = web.Application()
+    app.router.add_get("/Practitioner", page)
+    server = await _start_test_server(app)
+    monkeypatch.setattr(
+        importer, "_credential_request_options_for_source", lambda *_: {"headers": {}, "query_params": {}}
+    )
+    source_by_field = {"source_id": "synthetic-directory", "api_base": str(server.make_url("/"))}
+    try:
+        async with importer._source_http_session_scope(force=True):
+            token = importer._SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.set(
+                importer._SOURCE_HTTP_SESSION.get() if pinned else None
+            )
+            try:
+                fetch_result = await importer._fetch_source_json_unpaced(
+                    source_by_field, str(server.make_url("/"))[:-1] + issued_path, timeout=2
+                )
+            finally:
+                importer._SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.reset(token)
+    finally:
+        await server.close()
+    assert fetch_result[0] == 200 and fetch_result[2] is None
+    assert observed_paths == [issued_path]
+
+
+@pytest.mark.asyncio
 async def test_source_http_session_reuses_anonymous_connections_and_redirects(
     monkeypatch,
 ):

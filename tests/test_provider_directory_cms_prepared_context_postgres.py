@@ -131,7 +131,7 @@ async def native_case():
         if native is not None:
             await native.close()
         if has_attempted_database:
-            await admin.execute(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
+            await admin.execute(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)', timeout=30)
             assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_database WHERE datname=$1)", database_name)
             assert not await admin.fetchval(
                 "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", database_name
