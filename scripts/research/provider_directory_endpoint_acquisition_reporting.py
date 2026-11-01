@@ -12,22 +12,37 @@ try:
     from scripts.provider_directory_support_contract import RESOURCE_TYPES
     from scripts.provider_directory_verification_contract import VerificationUpdateError
     from scripts.research.provider_directory_endpoint_acquisition_support import (
+        CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES,
+        CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES,
         RUN_ID_PATTERN,
     )
 except ModuleNotFoundError:
     scripts_dir = str(Path(__file__).resolve().parents[1])
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
+    from provider_directory_endpoint_acquisition_support import (
+        CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES,
+        CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES,
+        RUN_ID_PATTERN,
+    )
     from provider_directory_support_contract import RESOURCE_TYPES
     from provider_directory_verification_contract import VerificationUpdateError
-    from provider_directory_endpoint_acquisition_support import RUN_ID_PATTERN
 
-SENSITIVE_TEXT_PATTERN = re.compile(
-    r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)"
-)
+SENSITIVE_TEXT_PATTERN = re.compile(r"(?i)(?:bearer\s+\S+|token|secret|password|authorization|api[_-]?key|credential)")
 SOURCE_ID_PATTERN = re.compile(r"pdfhir_[0-9a-f]{24}")
 RAW_RUN_STATUSES = frozenset(
-    {"queued", "starting", "running", "finalizing", "canceling", "succeeded", "failed", "canceled", "cancelled", "dead_letter"}
+    {
+        "queued",
+        "starting",
+        "running",
+        "finalizing",
+        "canceling",
+        "succeeded",
+        "failed",
+        "canceled",
+        "cancelled",
+        "dead_letter",
+    }
 )
 RESOURCE_STAT_FIELDS = frozenset(
     {
@@ -44,6 +59,11 @@ RESOURCE_STAT_FIELDS = frozenset(
         "caresource_opaque_cursor_unique_candidate_rows",
         "caresource_opaque_cursor_verified_sources",
         "collection_complete_sources",
+        "last_updated_capped_sources",
+        "last_updated_capped_verified_sources",
+        "last_updated_capped_versioned_sources",
+        *CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES,
+        *CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES,
         "last_updated_completeness_verified_sources",
         "last_updated_exact_leaf_count_sum",
         "last_updated_partition_sources",
@@ -73,6 +93,8 @@ ALWAYS_PRESERVED_RESOURCE_STAT_FIELDS = frozenset(
         "sources_failed",
     }
 )
+
+
 def _safe_timestamp(value: Any) -> str | None:
     if not isinstance(value, str) or SENSITIVE_TEXT_PATTERN.search(value):
         return None
@@ -93,8 +115,7 @@ def _safe_count(value: Any) -> int | None:
 
 def _safe_source_ids(value: Any) -> list[str] | None:
     if not isinstance(value, list) or not all(
-        isinstance(source_id, str) and SOURCE_ID_PATTERN.fullmatch(source_id)
-        for source_id in value
+        isinstance(source_id, str) and SOURCE_ID_PATTERN.fullmatch(source_id) for source_id in value
     ):
         return None
     return value
@@ -113,11 +134,14 @@ def _safe_resource_outcomes(metrics_by_name: dict[str, Any]) -> dict[str, Any]:
             and (
                 field_name in ALWAYS_PRESERVED_RESOURCE_STAT_FIELDS
                 or field_value != 0
+                or (
+                    resource_outcome_by_field.get("last_updated_capped_sources") not in (None, 0)
+                    and field_name in CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES + CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES
+                )
             )
         }
         for resource_type, resource_outcome_by_field in raw_outcome_by_resource.items()
-        if resource_type in RESOURCE_TYPES
-        and isinstance(resource_outcome_by_field, dict)
+        if resource_type in RESOURCE_TYPES and isinstance(resource_outcome_by_field, dict)
     }
 
 
@@ -143,11 +167,7 @@ def run_summary(run_record: dict[str, Any]) -> dict[str, Any]:
     status = run_record.get("status")
     run_summary_dict = {
         "run_id": _safe_run_id(run_record.get("run_id")),
-        "status": (
-            status
-            if isinstance(status, str) and status in RAW_RUN_STATUSES
-            else None
-        ),
+        "status": (status if isinstance(status, str) and status in RAW_RUN_STATUSES else None),
         "created_at": _safe_timestamp(run_record.get("created_at")),
         "finished_at": _safe_timestamp(run_record.get("finished_at")),
         "retry_of_run_id": _safe_run_id(params_by_name.get("retry_of_run_id")),
@@ -160,9 +180,7 @@ def run_summary(run_record: dict[str, Any]) -> dict[str, Any]:
         "resource_outcomes": resource_outcomes,
     }
     run_summary_dict = {
-        field_name: field_value
-        for field_name, field_value in run_summary_dict.items()
-        if field_value not in (None, {})
+        field_name: field_value for field_name, field_value in run_summary_dict.items() if field_value not in (None, {})
     }
     terminal_error = _terminal_error_summary(run_record.get("error"))
     if terminal_error:
@@ -209,8 +227,7 @@ def validate_verification_update_metadata(
     ):
         raise VerificationUpdateError("report verification_update argv is invalid")
     expected_terminal_ids = {
-        entry_id for entry_id in selected
-        if report_entries[entry_id].get("status") in terminal_statuses
+        entry_id for entry_id in selected if report_entries[entry_id].get("status") in terminal_statuses
     }
     if set(terminal) != expected_terminal_ids:
         raise VerificationUpdateError("report verification_update terminal identities do not agree")
@@ -229,29 +246,16 @@ def validate_operator_attestation(
     if not isinstance(observation, dict) or observation.get("method") != "operator-attested-read-only-export":
         return
     if not isinstance(report.get("verification_update"), dict):
-        raise VerificationUpdateError(
-            "operator-attested reports require verification update metadata"
-        )
+        raise VerificationUpdateError("operator-attested reports require verification update metadata")
     if observation.get("environment") != environment:
         raise VerificationUpdateError("report observation environment does not match")
     operator_input_sha256 = observation.get("operator_input_sha256")
-    if not isinstance(operator_input_sha256, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", operator_input_sha256
-    ):
+    if not isinstance(operator_input_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", operator_input_sha256):
         raise VerificationUpdateError("report operator input identity is invalid")
-    if any(
-        report_entries[entry_id].get("access_verification") != "not_verified"
-        for entry_id in selected_entry_ids
-    ):
+    if any(report_entries[entry_id].get("access_verification") != "not_verified" for entry_id in selected_entry_ids):
         raise VerificationUpdateError("operator-attested reports cannot claim verified access")
     nonterminal_entry_ids = {
-        entry_id for entry_id in selected_entry_ids
-        if report_entries[entry_id].get("status") not in terminal_statuses
+        entry_id for entry_id in selected_entry_ids if report_entries[entry_id].get("status") not in terminal_statuses
     }
-    if any(
-        type(report_entries[entry_id].get("plan_bound")) is not bool
-        for entry_id in nonterminal_entry_ids
-    ):
-        raise VerificationUpdateError(
-            "operator-attested observations require plan binding state"
-        )
+    if any(type(report_entries[entry_id].get("plan_bound")) is not bool for entry_id in nonterminal_entry_ids):
+        raise VerificationUpdateError("operator-attested observations require plan binding state")
