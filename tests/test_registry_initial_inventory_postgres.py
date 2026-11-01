@@ -146,7 +146,7 @@ async def _custodian(worker, arguments):
                 f'GRANT "{parent}" TO "{role}" WITH ADMIN FALSE, '
                 f"INHERIT {str(inherit).upper()}, SET {str(assume).upper()}"
             )
-        config = replace(arguments["config"], reader_roles=worker.bootstrap.runtime_roles)
+        config = arguments["config"]
         reader_roles = (config.execution_role, config.physical_owner_role) + config.loader_roles + config.reader_roles
         worker.custody_readers = tuple(sorted(set(reader_roles)))
         for reader in worker.custody_readers:
@@ -197,6 +197,7 @@ async def test_initial_inventory_consumes_genuine_bootstrap_and_custody_without_
 
     monkeypatch.setattr(bootstrap, "verify_network_bootstrap_sources", verify)
     async with _consumer(worker) as (arguments, calls), _custodian(worker, arguments) as (arguments, custodian):
+        assert set(worker.bootstrap.runtime_roles) > set(arguments["config"].reader_roles)
         arguments["initial_address_sources"] = _sources(worker)
         access_before = await _access_snapshot(worker)
         completed = await consume_registry_publication_once(**arguments)
@@ -227,6 +228,28 @@ async def test_initial_inventory_consumes_genuine_bootstrap_and_custody_without_
         await _assert_initial_manifest(worker, result_by_name, custodian)
         _assert_existing_access(access_before, await _access_snapshot(worker))
     assert await _snapshot(worker) == before
+
+
+@pytest.mark.parametrize("runtime_role", ["loader", "publisher"])
+async def test_initial_inventory_rejects_source_loader_runtime_actor(initial_worker, runtime_role):
+    """Legacy input readers stay valid, but actual direct or aliased writers must refuse."""
+    worker = initial_worker
+    connection = worker.fixture.connection
+    unsafe_actor = worker.fixture.roles[runtime_role]
+    assert await connection.fetchval("SELECT pg_has_role($1,$2,'USAGE')", unsafe_actor, worker.fixture.roles["loader"])
+    queued = await _enqueue(worker, _command(worker.bootstrap))
+    before = await _snapshot(worker)
+    async with _consumer(worker) as (arguments, _calls):
+        arguments["config"] = replace(
+            arguments["config"], reader_roles=tuple(sorted((*arguments["config"].reader_roles, unsafe_actor)))
+        )
+        async with _custodian(worker, arguments) as (arguments, _custodian_role):
+            arguments["initial_address_sources"] = _sources(worker)
+            with pytest.raises(ValueError, match="request_refused"):
+                await consume_registry_publication_once(**arguments)
+    assert await _head(worker) is None
+    assert await _snapshot(worker) == before
+    assert (await _status(worker, queued))["result"] in (None, {"error": {"code": "registry_publication_rejected"}})
 
 
 async def _assert_initial_manifest(worker, result_by_name, custodian):

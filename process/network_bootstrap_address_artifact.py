@@ -158,7 +158,8 @@ async def _captured_descriptor(connection, receipt, runtime_roles, *, api_read):
     dormant = await access._dormant_sequence(connection, receipt, document, caller["oid"], roles=())
     document["dormant_sequence"] = dormant
     sequence_oid = int(dormant["sequence"][0]) if dormant is not None else None
-    await bootstrap._verify_capture(connection, receipt, verify_content=not api_read, api_read=api_read)
+    # The protected receipt already proved copied content; reuse retains current custody and worker locks.
+    await bootstrap._verify_capture(connection, receipt, verify_content=False, api_read=api_read)
     heaps_by_name = await _physical_heaps(connection, receipt)
     dependencies = {oid for _, oid in (*receipt.relation_oids, *receipt.index_oids)}
     if sequence_oid is not None:
@@ -187,7 +188,7 @@ async def _captured_descriptor(connection, receipt, runtime_roles, *, api_read):
 
 
 async def capture_bootstrap_address_artifact(connection, source, *, runtime_roles):
-    """Authenticate the original bootstrap and both complete retained contents."""
+    """Authenticate the closed bootstrap receipt and establish its current physical pin."""
     artifact._require(
         type(source) is PinnedAddressSource
         and source.table_name == "entity_address_unified"

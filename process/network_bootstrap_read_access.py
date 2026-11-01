@@ -353,9 +353,9 @@ async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_a
         _require(pin in (receipt.address_source, receipt.npi_source))
         roles = await bootstrap_read_roles(connection, receipt, api_read=api_read)
         _require(set(required_roles) <= set(roles))
-        actors = sorted(set((*roles, *runtime_actors))) if runtime_actors else ()
+        actors = sorted(set(runtime_actors))
         sequence_oid = None
-        if actors:
+        if actors or api_read:
             caller = await connection.fetchval("SELECT current_user::text")
             caller_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", caller)
             native = await connection.fetchrow(_NATIVE_SQL, receipt.schema_oid)
