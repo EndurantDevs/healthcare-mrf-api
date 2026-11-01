@@ -2,6 +2,7 @@
 """Protected custom office artifacts from actual approved records and full addresses."""
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import os
@@ -1830,10 +1831,20 @@ async def bootstrap_access_fixture(bootstrap_db, request):
     password = uuid4().hex
     for role in (reader, stranger):
         await fixture.connection.execute(f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+    history_names = set()
     try:
-        yield SimpleNamespace(fixture=fixture, receipt=receipt, reader=reader, stranger=stranger, password=password)
+        yield SimpleNamespace(
+            fixture=fixture,
+            receipt=receipt,
+            reader=reader,
+            stranger=stranger,
+            password=password,
+            history_names=history_names,
+        )
     finally:
         await fixture.connection.execute("RESET ROLE")
+        for namespace in sorted(history_names):
+            await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE')
         await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{bootstrap_access._namespace(receipt)}" CASCADE')
         for role in (stranger, reader):
             await fixture.connection.execute(f'DROP OWNED BY "{role}"')
@@ -1878,9 +1889,9 @@ async def test_bootstrap_access_exact_successor_preserves_receipt_and_old_reader
     original_native = bootstrap_access._native
     native_receipts = []
 
-    async def observe_native(connection, receipt, reader_oid):
+    async def observe_native(connection, receipt, reader_oid, *, api_read=False):
         native_receipts.append(receipt)
-        return await original_native(connection, receipt, reader_oid)
+        return await original_native(connection, receipt, reader_oid, api_read=api_read)
 
     monkeypatch.setattr(bootstrap_access, "_native", observe_native)
     original = await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", receipt.schema_oid)
@@ -1906,6 +1917,247 @@ async def test_bootstrap_access_exact_successor_preserves_receipt_and_old_reader
     async with connection.transaction(isolation="repeatable_read", readonly=True):
         await connection.execute(f'SET LOCAL ROLE "{receipt.runtime_roles[0]}"')
         assert await verify_network_bootstrap_sources(connection, receipt) == receipt
+
+
+async def _renew_bootstrap_access(fixture, proof, *, expected_proof=None, expected_roles=None):
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    expected_proof = expected_proof or bootstrap_access._digest(proof)
+    fixture.history_names.add(bootstrap_access._history_namespace(expected_proof))
+    if expected_roles is None:
+        reader_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", fixture.reader)
+        expected_roles = bootstrap_access._digest(
+            json.loads(await connection.fetchval(bootstrap_access._ROLE_SQL, reader_oid))
+        )
+    async with connection.transaction(isolation="repeatable_read"):
+        return await bootstrap_access.renew_bootstrap_read_access(
+            connection, receipt, expected_proof_sha256=expected_proof, expected_roles_sha256=expected_roles
+        )
+
+
+async def _bootstrap_access_safe_graph_change(fixture):
+    proof = await _change_bootstrap_access(fixture)
+    await fixture.fixture.connection.execute(f'GRANT "{fixture.reader}" TO "{fixture.stranger}"')
+    return proof
+
+
+async def test_bootstrap_access_renewal_keeps_v1_readers_history_and_exact_acl(bootstrap_access_fixture):
+    fixture = bootstrap_access_fixture
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    proof = await _bootstrap_access_safe_graph_change(fixture)
+    original_document = await connection.fetchval(
+        "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
+        bootstrap_access._namespace(receipt),
+    )
+    before_acl = await bootstrap_access._acl(connection, receipt)
+    before_roles = await connection.fetchval(bootstrap_access._ROLE_SQL, proof["reader_oid"])
+    with pytest.raises(bootstrap_access.BootstrapReadAccessError):
+        await _verify_bootstrap_access(fixture)
+    renewed = await _renew_bootstrap_access(fixture, proof)
+    assert renewed == {**proof, "roles_sha256": bootstrap_access._digest(json.loads(before_roles))}
+    assert renewed != proof
+    assert await _renew_bootstrap_access(fixture, proof) == renewed
+    assert await _renew_bootstrap_access(fixture, renewed) == renewed
+    assert await bootstrap_access._acl(connection, receipt) == before_acl
+    assert await connection.fetchval(bootstrap_access._ROLE_SQL, proof["reader_oid"]) == before_roles
+    history_name = bootstrap_access._history_namespace(bootstrap_access._digest(proof))
+    assert await bootstrap_access._proof(connection, receipt, namespace=history_name) == proof
+    assert (
+        await connection.fetchval(
+            "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1", history_name
+        )
+        == original_document
+    )
+    assert await bootstrap_access._proof(connection, receipt) == renewed
+    assert (
+        await connection.fetchval(
+            "SELECT count(*) FROM pg_namespace WHERE nspname=ANY($1::text[])", sorted(fixture.history_names)
+        )
+        == 1
+    )
+    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
+        assert await _verify_bootstrap_access(fixture, reader) == receipt
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        await connection.execute(f'SET LOCAL ROLE "{receipt.runtime_roles[0]}"')
+        assert await verify_network_bootstrap_sources(connection, receipt) == receipt
+
+
+@pytest.mark.parametrize("drift", ["predecessor", "roles", "native", "acl", "unsafe_graph", "reader_oid", "content"])
+async def test_bootstrap_access_renewal_refuses_unreviewed_drift(bootstrap_access_fixture, drift):
+    fixture = bootstrap_access_fixture
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    proof = await _bootstrap_access_safe_graph_change(fixture)
+    schema = '"' + receipt.address_source.schema_name + '"'
+    expected_by_field = {"expected_proof": "0" * 64} if drift == "predecessor" else {}
+    if drift == "roles":
+        expected_by_field["expected_roles"] = "0" * 64
+    statements_by_drift = {
+        "native": (f"ALTER INDEX {schema}.npi_pkey SET (fillfactor=80)",),
+        "acl": (f'GRANT UPDATE ON {schema}.npi TO "{fixture.reader}"',),
+        "unsafe_graph": (f'GRANT "{receipt.owner_role}" TO "{fixture.stranger}"',),
+        "reader_oid": (
+            f'DROP OWNED BY "{fixture.reader}"',
+            f'DROP ROLE "{fixture.reader}"',
+            f"CREATE ROLE \"{fixture.reader}\" LOGIN PASSWORD '{fixture.password}'",
+        ),
+        "content": (f"UPDATE {schema}.npi SET provider_first_name='Changed'",),
+    }
+    for statement in statements_by_drift.get(drift, ()):
+        await connection.execute(statement)
+    if drift == "reader_oid":
+        await bootstrap_access._grant(connection, receipt, fixture.reader)
+    before_acl = await bootstrap_access._acl(connection, receipt)
+    with pytest.raises(ValueError):
+        await _renew_bootstrap_access(fixture, proof, **expected_by_field)
+    assert await bootstrap_access._proof(connection, receipt) == proof
+    assert await bootstrap_access._acl(connection, receipt) == before_acl
+    for namespace in fixture.history_names:
+        assert await connection.fetchval("SELECT to_regnamespace($1)", namespace) is None
+
+
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+async def test_bootstrap_access_renewal_rolls_back_history_and_comment(bootstrap_access_fixture, monkeypatch, failure):
+    from process import network_bootstrap_sources as bootstrap
+
+    fixture = bootstrap_access_fixture
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    proof = await _bootstrap_access_safe_graph_change(fixture)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_verify = bootstrap.verify_network_bootstrap_sources
+
+    async def interrupted(*args, **kwargs):
+        await original_verify(*args, **kwargs)
+        if failure == "error":
+            raise RuntimeError("injected_after_complete_verification")
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(bootstrap, "verify_network_bootstrap_sources", interrupted)
+    async with connection.transaction(isolation="repeatable_read"):
+        await connection.execute("CREATE TEMP TABLE renewal_marker(value int) ON COMMIT DROP")
+        pending = asyncio.create_task(_renew_bootstrap_access(fixture, proof))
+        if failure == "cancel":
+            await asyncio.wait_for(entered.wait(), 5)
+            pending.cancel()
+        with pytest.raises(RuntimeError if failure == "error" else asyncio.CancelledError):
+            await pending
+        assert await bootstrap_access._proof(connection, receipt) == proof
+        for namespace in fixture.history_names:
+            assert await connection.fetchval("SELECT to_regnamespace($1)", namespace) is None
+        await connection.execute("INSERT INTO renewal_marker VALUES(1)")
+
+
+async def test_bootstrap_access_renewal_locks_exact_comment_until_commit(bootstrap_access_fixture):
+    fixture = bootstrap_access_fixture
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    proof = await _bootstrap_access_safe_graph_change(fixture)
+    administrator = await connection.fetchval("SELECT session_user")
+    async with _bootstrap_access_login(administrator) as other:
+        async with connection.transaction(isolation="repeatable_read"):
+            renewed = await _renew_bootstrap_access(fixture, proof)
+            assert await bootstrap_access._proof(other, receipt) == proof
+            async with other.transaction(isolation="repeatable_read"):
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await bootstrap_access.renew_bootstrap_read_access(
+                        other,
+                        receipt,
+                        expected_proof_sha256=bootstrap_access._digest(proof),
+                        expected_roles_sha256=renewed["roles_sha256"],
+                    )
+            await other.execute("SET lock_timeout='100ms'")
+            literal = await other.fetchval("SELECT quote_literal($1::text)", json.dumps(proof))
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await other.execute(f'COMMENT ON SCHEMA "{bootstrap_access._namespace(receipt)}" IS {literal}')
+        assert await bootstrap_access._proof(other, receipt) == renewed
+
+
+async def test_bootstrap_access_renewal_requires_genuine_original_admin(bootstrap_access_fixture):
+    fixture = bootstrap_access_fixture
+    proof = await _bootstrap_access_safe_graph_change(fixture)
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    _, roles_sha256 = await bootstrap_access._reader(connection, receipt, fixture.reader)
+    for actor in (fixture.reader, fixture.fixture.roles["publisher"]):
+        async with connection.transaction(isolation="repeatable_read"):
+            await connection.execute(f'SET LOCAL ROLE "{actor}"')
+            with pytest.raises(bootstrap_access.BootstrapReadAccessError):
+                await bootstrap_access.renew_bootstrap_read_access(
+                    connection,
+                    receipt,
+                    expected_proof_sha256=bootstrap_access._digest(proof),
+                    expected_roles_sha256=roles_sha256,
+                )
+    assert await bootstrap_access._proof(connection, receipt) == proof
+
+
+async def test_bootstrap_access_renewal_retains_exact_raw_predecessor(bootstrap_access_fixture):
+    fixture = bootstrap_access_fixture
+    proof = await _bootstrap_access_safe_graph_change(fixture)
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    raw = json.dumps(proof, indent=2) + "\n"
+    literal = await connection.fetchval("SELECT quote_literal($1::text)", raw)
+    await connection.execute(f'COMMENT ON SCHEMA "{bootstrap_access._namespace(receipt)}" IS {literal}')
+    expected_sha256 = hashlib.sha256(raw.encode()).hexdigest()
+    renewed = await _renew_bootstrap_access(fixture, proof, expected_proof=expected_sha256)
+    assert await _renew_bootstrap_access(fixture, proof, expected_proof=expected_sha256) == renewed
+    history_name = bootstrap_access._history_namespace(expected_sha256)
+    assert (
+        await connection.fetchval(
+            "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1", history_name
+        )
+        == raw
+    )
+
+
+async def test_bootstrap_access_api_mode_is_metadata_only_and_requires_readonly_snapshot(bootstrap_access_fixture):
+    fixture = bootstrap_access_fixture
+    proof = await _change_bootstrap_access(fixture)
+
+    class MetadataOnly:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        async def execute(self, query, *arguments):
+            assert not query.lstrip().upper().startswith("LOCK ")
+            assert fixture.receipt.address_source.schema_name not in query
+            return await self.connection.execute(query, *arguments)
+
+    async with _bootstrap_access_login(fixture.reader, fixture.password) as connection:
+        with pytest.raises(ValueError, match="transaction_required"):
+            await bootstrap_access.bootstrap_read_roles(connection, fixture.receipt, api_read=True)
+        async with connection.transaction(isolation="repeatable_read"):
+            with pytest.raises(ValueError, match="read_snapshot_required"):
+                await bootstrap_access.bootstrap_read_roles(connection, fixture.receipt, api_read=True)
+        async with connection.transaction(isolation="repeatable_read", readonly=True):
+            roles = await bootstrap_access.bootstrap_pin_read_roles(
+                MetadataOnly(connection),
+                fixture.receipt.address_source,
+                (),
+                runtime_actors=(fixture.stranger,),
+                api_read=True,
+            )
+            assert roles == tuple(sorted((*fixture.receipt.runtime_roles, proof["reader"])))
+
+
+@pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
+async def test_bootstrap_access_api_mode_checks_output_actor_dormant_sequence(bootstrap_access_fixture):
+    fixture = bootstrap_access_fixture
+    connection, receipt = fixture.fixture.connection, fixture.receipt
+    await _change_bootstrap_access(fixture)
+    sequence = await connection.fetchval(
+        "SELECT pg_get_serial_sequence($1,'npi')", fixture.fixture.source_schema + ".npi"
+    )
+    assert not await connection.fetchval(
+        "SELECT has_table_privilege($1::name,$2::oid,'SELECT')", fixture.stranger, receipt.relation_oids[0][1]
+    )
+    await connection.execute(f'GRANT USAGE ON SEQUENCE {sequence} TO "{fixture.stranger}"')
+    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            with pytest.raises(NetworkCustomAddressSourceError, match="Retained bootstrap read access differs"):
+                await bootstrap_access.bootstrap_pin_read_roles(
+                    reader, receipt.address_source, (), runtime_actors=(fixture.stranger,), api_read=True
+                )
 
 
 async def test_bootstrap_access_revoke_keeps_proof_and_restores_original_acl(bootstrap_access_fixture):

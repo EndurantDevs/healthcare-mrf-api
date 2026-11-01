@@ -326,10 +326,14 @@ def _decode(document):
         raise NetworkBootstrapSourceError("Retained bootstrap receipt is invalid") from None
 
 
-async def _verify_capture(connection, receipt, *, verify_content):
+async def _verify_capture(connection, receipt, *, verify_content, api_read=False):
     """Check native custody; fresh uncommitted copies already proved content parity."""
+    from process.network_address_artifact import _require_api_read_context
     from process.network_bootstrap_read_access import bootstrap_read_roles
 
+    await _require_api_read_context(connection, api_read)
+    if api_read and verify_content:
+        raise NetworkBootstrapSourceError("API bootstrap verification cannot scan retained content")
     await _transaction(connection)
     if type(receipt) is not NetworkBootstrapSourceReceipt:
         raise NetworkBootstrapSourceError("An immutable bootstrap receipt is required")
@@ -356,7 +360,7 @@ async def _verify_capture(connection, receipt, *, verify_content):
     ):
         raise NetworkBootstrapSourceError("Retained native bootstrap identities differ")
     try:
-        read_roles = await bootstrap_read_roles(connection, receipt)
+        read_roles = await bootstrap_read_roles(connection, receipt, api_read=api_read)
         await _closed(connection, receipt.schema_oid, receipt.owner_oid, read_roles, None)
         for parent in receipt.parent_receipts:
             pin = receipt.address_source if parent.table_name == "entity_address_unified" else receipt.npi_source

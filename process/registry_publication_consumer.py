@@ -220,7 +220,14 @@ async def _publication_address_sources(connection, expected_head, config, initia
             source_pin = await resolve_network_serving_manifest(
                 connection, generation_id=expected_head, control_schema=config.control_schema
             )
-        address_sources = await _source_rollback_address_sources(connection, source_pin, config.control_schema)
+        compact_upgrade = (
+            initial_address_sources is not None
+            and bool(initial_address_sources.replacement_source_recipes)
+            and initial_address_sources.compact
+        )
+        address_sources = await _source_rollback_address_sources(
+            connection, source_pin, config.control_schema, **({"compact_upgrade": True} if compact_upgrade else {})
+        )
         if initial_address_sources is not None and initial_address_sources.replacement_source_recipes:
             if (
                 initial_address_sources.base_source != address_sources.base_source
