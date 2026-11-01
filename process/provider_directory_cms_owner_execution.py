@@ -251,7 +251,7 @@ async def _execute(connection, inventory, binding, policy, profile, plan, deadli
 
 @asynccontextmanager
 async def cms_common_owner_custody(
-    connection, *, inventory, storage_binding, policy, cms_profile, source_document, deadline
+    connection, *, inventory, storage_binding, policy, cms_profile, source_document, deadline, history_bounds=None
 ):
     """Retain original catalog/actor custody across explicit local data phases.
 
@@ -269,6 +269,7 @@ async def cms_common_owner_custody(
             cms_profile=cms_profile,
             source_document=source_document,
             deadline=deadline,
+            **({"history_bounds": history_bounds} if history_bounds is not None else {}),
         ) as recheck,
     ):
         database = await connection.fetchrow(_DATABASE_SQL, storage_binding.database_oid)

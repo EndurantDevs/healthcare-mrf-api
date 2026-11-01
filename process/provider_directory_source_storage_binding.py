@@ -339,7 +339,7 @@ _ADMISSION_RIGHTS_SQL = """SELECT relation.oid,
  ON relation.relname=rights.root WHERE relation.scope='admission'"""
 
 
-def _isolated_catalog_sql():
+def _isolated_catalog_sql(*, include_history_bound_identity=False):
     """Evaluate existing catalog contracts together, without retaining observations."""
     from process.plan_release_storage_catalog import CATALOG_SQL
     from process.provider_directory_generic_source_provision import _FHIR_PHYSICAL_SQL, _ISOLATED_TEMPLATE_SQL
@@ -351,6 +351,12 @@ def _isolated_catalog_sql():
     physical = _FHIR_PHYSICAL_SQL.replace("$1::oid[]", "ARRAY(SELECT oid::oid FROM catalog)")
     layouts = _PRIVATE_LAYOUT_SQL.replace("$2::text[]", "$6::text[]")
     layouts = layouts.replace("$1::text[]", "ARRAY[$2::text,$1::text]")
+    if include_history_bound_identity:
+        layouts = layouts.replace(
+            "coalesce((to_jsonb(k)->>'conenforced')::boolean,true))",
+            "coalesce((to_jsonb(k)->>'conenforced')::boolean,true)) "
+            "|| CASE WHEN k.conname='cms_history_bound' THEN jsonb_build_array(k.oid::bigint) ELSE '[]'::jsonb END",
+        )
     return f"""WITH relation_groups(scope,names) AS (
  SELECT 'private',array_agg(quote_ident($1::text)||'.'||quote_ident(root) ORDER BY ordinal)
  FROM unnest($6::text[]) WITH ORDINALITY roots(root,ordinal)
@@ -388,14 +394,14 @@ def _isolated_native_checks_sql():
  '[]'::jsonb) FROM catalog relation WHERE scope='private' AND relname=ANY($7::text[])) AS checkpoints"""
 
 
-async def _isolated_catalog_rows(connection, policy, catalog_schema, roles_by_name):
+async def _isolated_catalog_rows(connection, policy, catalog_schema, roles_by_name, *, expected_history_bounds=None):
     from process.provider_directory_generic_source_provision import ISOLATED_FHIR_ROOTS
     from process.provider_directory_generic_source_storage import _json
     from process.provider_directory_source_checkpoint_catalog import CHECKPOINT_LAYOUTS
 
     evidence_by_field = dict(
         await connection.fetchrow(
-            _isolated_catalog_sql(),
+            _isolated_catalog_sql(include_history_bound_identity=expected_history_bounds is not None),
             policy.schema,
             catalog_schema,
             roles_by_name[policy.owner_role]["oid"],
@@ -452,7 +458,30 @@ def _require_isolated_relation_layouts(policy, roles_by_name, relation_rows, che
             _require(checkpoints.get(relation["oid"]), "checkpoint_native_contract_changed")
 
 
-def _isolated_inventory(policy, catalog_schema, roles_by_name, evidence):
+def _isolated_bounded_template(private_layout, canonical_layout, expected_bound):
+    """Project only the authenticated old canonical CHECK; private copies stay unbounded."""
+    from process.provider_directory_generic_source_storage import _json
+
+    _require(
+        all(constraint[0] != "cms_history_bound" for constraint in _json(private_layout["constraints"])),
+        "private_history_bound",
+    )
+    if expected_bound is None or canonical_layout["oid"] != expected_bound["old_oid"]:
+        return canonical_layout
+    constraints = _json(canonical_layout["constraints"])
+    bound_constraints = [constraint for constraint in constraints if constraint[0] == "cms_history_bound"]
+    _require(
+        len(bound_constraints) == 1
+        and bound_constraints[0][1] == "c"
+        and bound_constraints[0][3:] == [True, False, False, True, expected_bound["native"]["constraint"]["oid"]],
+        "history_bound_changed",
+    )
+    return dict(
+        canonical_layout, constraints=[constraint for constraint in constraints if constraint[0] != "cms_history_bound"]
+    )
+
+
+def _isolated_inventory(policy, catalog_schema, roles_by_name, evidence, *, expected_history_bounds=None):
     """Verify and return the physical inventory for one isolated source schema."""
     from process.provider_directory_generic_source_provision import (
         ISOLATED_FHIR_ROOTS,
@@ -460,6 +489,11 @@ def _isolated_inventory(policy, catalog_schema, roles_by_name, evidence):
         _fhir_physical_rows,
     )
     from process.provider_directory_generic_source_storage import _require as require_storage
+
+    if expected_history_bounds is not None:
+        from process.provider_directory_cms_history_bounds import require_cms_history_expectations
+
+        expected_history_bounds = require_cms_history_expectations(expected_history_bounds)
 
     roots = list(ISOLATED_FHIR_ROOTS)
     relation_rows = [
@@ -484,9 +518,14 @@ def _isolated_inventory(policy, catalog_schema, roles_by_name, evidence):
     layout_by_key = {(relation["nspname"], relation["relname"]): relation for relation in evidence["layouts"]}
     _require(len(layout_by_key) == 2 * len(roots), "template_missing")
     for root in roots:
+        canonical_layout = layout_by_key[catalog_schema, root]
+        if expected_history_bounds is not None:
+            canonical_layout = _isolated_bounded_template(
+                layout_by_key[policy.schema, root], canonical_layout, expected_history_bounds.get(root)
+            )
         _require(
             _isolated_layout_shape(layout_by_key[policy.schema, root], template=False)
-            == _isolated_layout_shape(layout_by_key[catalog_schema, root], template=True),
+            == _isolated_layout_shape(canonical_layout, template=True),
             "template_layout_changed",
         )
     relation_oids = {relation["oid"] for relation in relation_rows}
@@ -648,20 +687,10 @@ async def _require_source_storage_publisher(connection, policy, publication):
     return task, identity
 
 
-async def capture_isolated_source_storage_custody(
-    connection,
-    policy,
-    *,
-    catalog_schema,
-    migration_role,
-    namespace_owner_role,
-    publication,
+async def _isolated_storage_identity(
+    connection, policy, catalog_schema, migration_role, namespace_owner_role, publication
 ):
-    """Attest the fixed private storage and canonical rights; never grant activation."""
-    import asyncio
-
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
-    from process.provider_directory_source_callable_custody import _READ_IDENTITY_SQL
 
     _require(type(policy) is GenericSourcePolicy and connection.is_in_transaction() is True, "transaction_required")
     for schema in (catalog_schema, policy.schema):
@@ -676,18 +705,73 @@ async def capture_isolated_source_storage_custody(
         coordinates is not None and coordinates["namespace_owner_oid"] == roles_by_name[namespace_owner_role]["oid"],
         "storage_identity_changed",
     )
-    evidence = await _isolated_catalog_rows(connection, policy, catalog_schema, roles_by_name)
+    return task, identity, roles_by_name, coordinates
+
+
+async def _isolated_canonical_authority(connection, policy, catalog_schema, catalog_oid, roles, evidence, bounds):
+    authority_by_field = dict(
+        admission=_isolated_admission_rights(catalog_schema, evidence),
+        metadata=await _isolated_metadata_custody(connection, catalog_schema, catalog_oid, roles, policy),
+    )
+    if bounds is not None:
+        authority_by_field["history_bounds"] = bounds
+    return authority_by_field
+
+
+async def _require_isolated_bound_proof(connection, catalog_schema, expected, owner_oid):
+    """Bind optional canonical history proof to the issued namespace owner."""
+    if expected is not None:
+        from process.provider_directory_cms_history_bounds import require_cms_source_history_bounds
+
+        await require_cms_source_history_bounds(
+            connection, catalog_schema=catalog_schema, expected=expected, owner_oid=owner_oid
+        )
+
+
+async def capture_isolated_source_storage_custody(
+    connection,
+    policy,
+    *,
+    catalog_schema,
+    migration_role,
+    namespace_owner_role,
+    publication,
+    expected_history_bounds=None,
+):
+    """Attest the fixed private storage and canonical rights; never grant activation."""
+    import asyncio
+
+    from process.provider_directory_source_callable_custody import _READ_IDENTITY_SQL
+
+    if expected_history_bounds is not None:
+        from process.provider_directory_cms_history_bounds import require_cms_history_expectations
+
+        expected_history_bounds = require_cms_history_expectations(expected_history_bounds)
+    task, identity, roles_by_name, coordinates = await _isolated_storage_identity(
+        connection, policy, catalog_schema, migration_role, namespace_owner_role, publication
+    )
+    await _require_isolated_bound_proof(
+        connection, catalog_schema, expected_history_bounds, coordinates["namespace_owner_oid"]
+    )
+    evidence = await _isolated_catalog_rows(
+        connection, policy, catalog_schema, roles_by_name, expected_history_bounds=expected_history_bounds
+    )
     custody_by_field = dict(
         version=1,
         coordinates=dict(catalog_schema=catalog_schema, storage_schema=policy.schema, **dict(coordinates)),
         roles=roles_by_name,
-        inventory=_isolated_inventory(policy, catalog_schema, roles_by_name, evidence),
+        inventory=_isolated_inventory(
+            policy, catalog_schema, roles_by_name, evidence, expected_history_bounds=expected_history_bounds
+        ),
         application_checks=_isolated_application_checks(evidence),
-        canonical_authority=dict(
-            admission=_isolated_admission_rights(catalog_schema, evidence),
-            metadata=await _isolated_metadata_custody(
-                connection, catalog_schema, coordinates["catalog_schema_oid"], roles_by_name, policy
-            ),
+        canonical_authority=await _isolated_canonical_authority(
+            connection,
+            policy,
+            catalog_schema,
+            coordinates["catalog_schema_oid"],
+            roles_by_name,
+            evidence,
+            expected_history_bounds,
         ),
     )
     await _isolated_access_closure(

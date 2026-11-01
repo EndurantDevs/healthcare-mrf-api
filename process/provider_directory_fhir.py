@@ -60543,7 +60543,7 @@ def _endpoint_dataset_candidate_upsert_sql() -> str:
         ) VALUES (
             :dataset_id, :endpoint_id, :import_run_id,
             :acquisition_root_run_id, :previous_dataset_id, :status,
-            false, 0, now(), CAST(:publication_metadata_json AS jsonb),
+            false, 0, now() AT TIME ZONE 'UTC', CAST(:publication_metadata_json AS jsonb),
             :completion_proof_required_version
         )
         ON CONFLICT (dataset_id) DO UPDATE SET
@@ -65569,7 +65569,7 @@ def _store_validated_endpoint_dataset_sql() -> str:
            SET previous_dataset_id = :previous_dataset_id,
                dataset_hash = :dataset_hash, status = :status,
                is_current = false, resource_count = :resource_count,
-               validated_at = CASE WHEN :marks_validated THEN now() ELSE NULL END,
+               validated_at = CASE WHEN :marks_validated THEN now() AT TIME ZONE 'UTC' ELSE NULL END,
                published_at = NULL, superseded_at = NULL,
                publication_metadata_json = CAST(:publication_metadata_json AS jsonb),
                publication_metadata_summary_json =
