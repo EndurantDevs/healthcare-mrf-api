@@ -262,6 +262,9 @@ def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contract
     assert len(profile_spec["source_ids"]) == 29
     assert len(selections) == 27
     assert selections[0].source_id == "cms-npd"
+    molina = next(selection for selection in selections if selection.entry_id == "molina")
+    assert molina.resource_profile == "R8"
+    assert molina.resources == tuple(profile_spec["verification_matrix"]["resource_profiles"]["R8"]["resources"])
     michigan = next(selection for selection in selections if selection.entry_id == "michigan")
     assert michigan.resource_profile == "M5"
     assert michigan.resources == (

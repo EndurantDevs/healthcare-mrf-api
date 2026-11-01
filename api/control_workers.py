@@ -1027,6 +1027,8 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
 
     raw_job_records = body.get("items") if isinstance(body, dict) else []
     jobs = [job_record for job_record in raw_job_records if isinstance(job_record, dict)]
+    if any(_has_broad_proxy_pool_reference(job) for job in jobs):
+        return {**state_base_dict, "job_status": "purpose_mismatch"}
     from api.provider_directory_cms_registry_worker import (
         authorized_cms_registry_worker_launch,
         is_cms_registry_job_matching,
@@ -1218,12 +1220,7 @@ def _worker_job_environment(
         env_list.append({"name": "HLTHPRT_PTG_CANDIDATE_AUDIT_JOB_TIMEOUT", "value": "385"})
     target_job_id = _single_job_worker_target(spec, launch_request)
     if target_job_id:
-        env_list.append(
-            {
-                "name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID",
-                "value": target_job_id,
-            }
-        )
+        env_list.append({"name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", "value": target_job_id})
     if spec.worker_class == "process.PTGHuge":
         env_list.append(
             {
@@ -1245,6 +1242,7 @@ def _worker_job_environment(
             }
         )
     env_list.extend(_worker_job_secret_env(spec.worker_class, launch_request=launch_request))
+    env_list.extend(provider_directory_source_worker.source_proxy_environment(spec, launch_request, env_list))
     from api.plan_pricing_worker_policy import pricing_worker_policy_environment
 
     env_list.extend(pricing_worker_policy_environment(launch_request))
@@ -1424,6 +1422,8 @@ def _worker_job_manifest(
     }
     if fhir_launch is not None and fhir_launch.retry_of_run_id:
         annotations_by_key["healthporta.com/source-root-run-id"] = fhir_launch.root_run_id
+    annotations_by_key.update(provider_directory_source_worker.fresh_route_annotations(spec, launch_request))
+    annotations_by_key.update(provider_directory_source_worker.source_proxy_annotations(spec, launch_request))
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1441,8 +1441,43 @@ def _worker_job_env_from() -> list[dict[str, Any]]:
     for name in _csv(os.getenv("HLTHPRT_WORKER_JOB_ENV_FROM_CONFIGMAP", "")):
         env_from_list.append({"configMapRef": {"name": name}})
     for name in _csv(os.getenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "")):
+        _reject_broad_proxy_pool_secret(name)
         env_from_list.append({"secretRef": {"name": name}})
     return env_from_list
+
+
+def _reject_broad_proxy_pool_secret(secret_name):
+    """Keep the configured pool available only through its explicit Source keyref."""
+    pool_secret = os.getenv(provider_directory_source_worker.PROXY_POOL_SECRET_ENV, "").strip()
+    if pool_secret and secret_name == pool_secret:
+        raise ValueError("worker_proxy_pool_broad_secret_forbidden")
+
+
+def _has_broad_proxy_pool_reference(job):
+    """Refuse inherited pool env or mounted pool data before reusing any worker Job."""
+    pool_secret = os.getenv(provider_directory_source_worker.PROXY_POOL_SECRET_ENV, "").strip()
+    if not pool_secret:
+        return False
+    try:
+        pod = job["spec"]["template"]["spec"]
+        containers = [*pod.get("containers", []), *pod.get("initContainers", []), *pod.get("ephemeralContainers", [])]
+        if any(
+            reference.get("secretRef", {}).get("name") == pool_secret
+            for container in containers
+            for reference in container.get("envFrom", [])
+        ):
+            return True
+        for volume in pod.get("volumes", []):
+            if volume.get("secret", {}).get("secretName") == pool_secret:
+                return True
+            if any(
+                reference.get("secret", {}).get("name") == pool_secret
+                for reference in volume.get("projected", {}).get("sources", [])
+            ):
+                return True
+        return False
+    except KeyError, AttributeError, TypeError:
+        return True
 
 
 def _worker_job_secret_env(
@@ -1493,7 +1528,9 @@ def _is_admitted_importer_selected(selection_spec, worker_class, launch_request)
 
     from api.provider_directory_cms_registry_worker import is_cms_registry_secret_selected
 
-    if selection_spec.get("purposes") == [provider_directory_source_worker.PURPOSE]:
+    if selection_spec.get("purposes") == [
+        provider_directory_source_worker.PURPOSE
+    ] or provider_directory_source_worker.requires_source_proxy_admission(selection_spec):
         return provider_directory_source_worker.is_fhir_source_secret_selected(
             selection_spec, worker_class, launch_request
         )
@@ -1692,6 +1729,7 @@ def _worker_job_secret_source(
     mount_spec: dict[str, Any],
     secret_name: str,
 ) -> dict[str, Any] | None:
+    _reject_broad_proxy_pool_secret(secret_name)
     secret_source_by_field: dict[str, Any] = {"secretName": secret_name}
     if bool(mount_spec.get("optional", False)):
         secret_source_by_field["optional"] = True

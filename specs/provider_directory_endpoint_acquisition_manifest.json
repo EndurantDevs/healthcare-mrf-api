@@ -229,8 +229,8 @@
       "canonical_base": "https://api.interop.molinahealthcare.com/providerdirectory",
       "classification": "acquisition",
       "launch_mode": "create",
-      "resource_profile": "M5",
-      "resources": ["Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole"]
+      "resource_profile": "R8",
+      "resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation", "Endpoint"]
     },
     {
       "entry_id": "michigan",

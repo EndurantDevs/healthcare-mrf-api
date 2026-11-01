@@ -167,7 +167,9 @@ async def guarded_ensure(worker_payload, *, run_id, importer, selected_specs):
             from api.provider_directory_source_worker import require_fhir_source_route_ancestry
 
             try:
-                await require_fhir_source_route_ancestry(connection, worker_payload.fhir_source_launch)
+                worker_payload.fhir_source_launch = await require_fhir_source_route_ancestry(
+                    connection, worker_payload.fhir_source_launch
+                )
             except ValueError:
                 return workers._failed_worker_admission(worker_payload, "FHIR source worker route has changed")
         launch = asyncio.create_task(asyncio.to_thread(workers.ensure_worker, worker_payload))
