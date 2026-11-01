@@ -232,6 +232,14 @@ def test_literal_unicode_search_and_continuation():
     assert catalog._literal_pattern(query.plan_search) == "%gold\\\\plan%"
 
 
+@pytest.mark.parametrize(
+    ("text", "pattern"),
+    [(None, None), ("Example PPO", "%example%ppo%"), ("100%  Gold_Plan\\", "%100\\%%gold\\_plan\\\\%")],
+)
+def test_human_search_matches_ordered_literal_terms(text, pattern):
+    assert catalog._literal_pattern(text) == pattern
+
+
 @pytest.mark.asyncio
 async def test_unattached_metadata_never_pins_or_reads_directory_tables(page_boundary):
     connection, _, snapshot = page_boundary
@@ -320,7 +328,7 @@ async def test_policy_and_same_edge_parameters(page_boundary):
     connection.fetchrow.return_value = {"total": 0, "rows_json": "[]"}
     await catalog.read_fhir_catalog(
         connection,
-        catalog.FHIRCatalogQuery(company_id=COMPANY, plan_search="Gold"),
+        catalog.FHIRCatalogQuery(company_id=COMPANY, plan_search="Gold Plan", search="Example PPO"),
         excluded_network_ids=(8,),
         organization_policy=policy,
         control_schema="sample_control",
@@ -328,8 +336,9 @@ async def test_policy_and_same_edge_parameters(page_boundary):
     sql, *parameters = connection.fetchrow.call_args.args
     assert parameters[1] == (8,)
     assert str(parameters[2][0]) == COMPANY and str(parameters[3][0]) == GROUP
-    assert parameters[7] == "%gold%"
+    assert parameters[7] == "%gold%plan%" and parameters[9] == "%example%ppo%"
     assert "edge.company_id=$5" in sql and "edge.plan_search LIKE $8" in sql
+    assert "edge.company_search LIKE $10" in sql and "edge.plan_search LIKE $10" in sql
     assert "DISTINCT ON (network_id,visible_document)" in sql
 
 

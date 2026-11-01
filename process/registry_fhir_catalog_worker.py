@@ -4,6 +4,7 @@
 import asyncio
 import json
 import os
+import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 
@@ -37,6 +38,7 @@ class RegistryFHIRCatalogSyncConfig:
     loader_role: str
     reader_roles: tuple[str, ...]
     operation_seconds: int = 4200
+    source_endpoint_ids: tuple[str, ...] | None = None
 
 
 @dataclass(repr=False)
@@ -68,7 +70,7 @@ def _validated_fhir_catalog_sync_config(encoded):
         if type(encoded) is not str or not 0 < len(encoded.encode()) <= 1048576:
             _invalid()
         document = json.loads(encoded, object_pairs_hook=unique_json_fields, parse_constant=lambda _value: _invalid())
-        if type(document) is not dict or set(document) != _FIELDS:
+        if type(document) is not dict or not _FIELDS <= document.keys() <= _FIELDS | {"source_endpoint_ids"}:
             _invalid()
         urls = tuple(
             None
@@ -99,7 +101,20 @@ def _validated_fhir_catalog_sync_config(encoded):
         seconds = document["operation_seconds"]
         if type(seconds) is not int or not 60 <= seconds <= 86400:
             _invalid()
-        return RegistryFHIRCatalogSyncConfig(*urls, consumer, grant, loader, tuple(readers), seconds)
+        endpoints = document.get("source_endpoint_ids")
+        if endpoints is not None and (
+            urls[0] is not None
+            or type(endpoints) is not list
+            or not 1 <= len(endpoints) <= 1000
+            or any(
+                type(endpoint) is not str or re.fullmatch(r"[0-9a-f]{64}", endpoint) is None for endpoint in endpoints
+            )
+            or sorted(set(endpoints)) != endpoints
+        ):
+            _invalid()
+        return RegistryFHIRCatalogSyncConfig(
+            *urls, consumer, grant, loader, tuple(readers), seconds, None if endpoints is None else tuple(endpoints)
+        )
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError:
         _invalid()
 
@@ -117,6 +132,8 @@ async def run_fhir_catalog_sync(config, *, source_export=None):
     if type(config) is not RegistryFHIRCatalogSyncConfig:
         _invalid()
     with fhir_catalog_run_reporting() as report:
+        if config.source_endpoint_ids is not None:
+            report.select_endpoints(config.source_endpoint_ids)
         async with asyncio.timeout(config.operation_seconds):
             if source_export is None:
                 result = await reconcile_fhir_catalog(config)
@@ -168,7 +185,8 @@ async def fhir_catalog_sync_startup(ctx):
     owned = _OwnedCatalogSourceRuntime(AsyncExitStack(), ctx)
     ctx[_SOURCE_RUNTIME_CONTEXT_KEY] = owned
     try:
-        factory = await owned.resources.enter_async_context(catalog_source_export_runtime())
+        options = {"endpoint_ids": config.source_endpoint_ids} if config.source_endpoint_ids is not None else {}
+        factory = await owned.resources.enter_async_context(catalog_source_export_runtime(**options))
         parse_fhir_catalog_sync_config(encoded, source_export=factory)
         owned.factory = factory
         ctx["registry_fhir_catalog_source_export"] = factory
