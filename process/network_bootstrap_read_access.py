@@ -148,7 +148,7 @@ _SERIAL_SQL = """SELECT d.oid,seq.oid AS sequence_oid,
 
 
 async def _dormant_sequence(connection, receipt, document, reader_oid, *, roles=None):
-    """The copied NPI serial default is dormant: no reader may execute its sequence."""
+    """Attest the copied serial dependency; retained reads never evaluate its default."""
     own_objects = {str(oid) for _, oid in (*receipt.relation_oids, *receipt.index_oids)}
     external_dependencies = [
         row
@@ -164,25 +164,23 @@ async def _dormant_sequence(connection, receipt, document, reader_oid, *, roles=
     _require(serial is not None and serial["safe"] is True)
     if roles is None:
         roles = json.loads(await connection.fetchval(_ROLE_SQL, reader_oid))["roles"]
-    await _component_read_only(connection, receipt, roles, sequence_oid=serial["sequence_oid"])
+    await _component_read_only(connection, receipt, roles)
     return {"sequence": json.loads(serial["sequence"]), "nextval": json.loads(serial["nextval"])}
 
 
-async def _component_read_only(connection, receipt, roles, *, sequence_oid=None):
+async def _component_read_only(connection, receipt, roles):
     """Every connected actor must preserve the retained source's owner and read boundary."""
     unsafe = await connection.fetchval(
         "SELECT EXISTS(SELECT FROM pg_roles r CROSS JOIN (SELECT $2::oid AS owner_oid) s "
         "WHERE r.oid=ANY($1::oid[]) AND ("
         + _NATIVE_RUNTIME_ROLE_UNSAFE_SQL
-        + " OR has_schema_privilege(r.oid,$5::oid,'CREATE,USAGE WITH GRANT OPTION') "
+        + " OR has_schema_privilege(r.oid,$4::oid,'CREATE,USAGE WITH GRANT OPTION') "
         "OR EXISTS(SELECT FROM unnest($3::oid[]) source(oid) WHERE "
         "has_table_privilege(r.oid,source.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN,SELECT WITH GRANT OPTION') "
-        "OR has_any_column_privilege(r.oid,source.oid,'INSERT,UPDATE,REFERENCES')) "
-        "OR ($4::oid IS NOT NULL AND has_sequence_privilege(r.oid,$4::oid,'SELECT,USAGE,UPDATE'))))",
+        "OR has_any_column_privilege(r.oid,source.oid,'INSERT,UPDATE,REFERENCES'))))",
         [int(role[0]) for role in roles],
         receipt.owner_oid,
         [oid for _, oid in receipt.relation_oids],
-        sequence_oid,
         receipt.schema_oid,
     )
     _require(unsafe is False)
@@ -354,14 +352,12 @@ async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_a
         roles = await bootstrap_read_roles(connection, receipt, api_read=api_read)
         _require(set(required_roles) <= set(roles))
         actors = sorted(set(runtime_actors))
-        sequence_oid = None
         if actors or api_read:
             caller = await connection.fetchval("SELECT current_user::text")
             caller_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", caller)
             native = await connection.fetchrow(_NATIVE_SQL, receipt.schema_oid)
             _require(native["safe"] is True)
-            dormant = await _dormant_sequence(connection, receipt, json.loads(native["document"]), caller_oid, roles=())
-            sequence_oid = int(dormant["sequence"][0]) if dormant is not None else None
+            await _dormant_sequence(connection, receipt, json.loads(native["document"]), caller_oid, roles=())
             if api_read:
                 actors = sorted(set((*actors, caller)))
         for actor in actors:
@@ -380,7 +376,6 @@ async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_a
                 connection,
                 receipt,
                 [role for role in component["roles"] if int(role[0]) in reachable],
-                sequence_oid=sequence_oid,
             )
         return roles
     except NetworkBootstrapSourceError as error:

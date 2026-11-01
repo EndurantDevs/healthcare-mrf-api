@@ -1,8 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Genuine restricted bootstrap artifact reads on the existing isolated native fixture."""
 
+import asyncio
 import copy
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import asyncpg
@@ -10,6 +12,7 @@ import pytest
 
 from process import network_address_artifact as artifact
 from process import network_bootstrap_address_artifact as bootstrap_artifact
+from process import network_bootstrap_read_access as access
 from process import network_bootstrap_sources as bootstrap
 from process.network_custom_address_source import NetworkCustomAddressSourceError
 from tests.test_network_custom_address_source_postgres import (
@@ -205,23 +208,141 @@ async def test_full_verification_rejects_changed_content_in_either_heap(bootstra
             await transaction.rollback()
 
 
-@pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
-async def test_nonreader_sequence_reach_and_wrong_generation_are_refused(bootstrap_access_fixture):
-    fixture = bootstrap_access_fixture
-    await _change_bootstrap_access(fixture)
-    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
-        descriptor = await _capture(fixture, reader)
-        assert descriptor["dormant_sequence_oid"] is not None
-        sequence = await fixture.fixture.connection.fetchval(
-            "SELECT $1::oid::regclass::text", descriptor["dormant_sequence_oid"]
+@asynccontextmanager
+async def _external_sequence_owner(fixture):
+    administrator = fixture.fixture.connection
+    parent_table = f'"{fixture.fixture.source_schema}".npi'
+    original_owner = fixture.fixture.roles["loader"]
+    sequence = await administrator.fetchval("SELECT pg_get_serial_sequence($1,'npi')", parent_table)
+    try:
+        # Ownership follows the original table; the retained heap stays protected.
+        await administrator.execute(f'ALTER TABLE {parent_table} OWNER TO "{fixture.stranger}"')
+        await administrator.execute(f'GRANT USAGE ON SCHEMA "{fixture.fixture.source_schema}" TO "{fixture.stranger}"')
+        await administrator.execute(
+            f'GRANT "{fixture.stranger}" TO "{fixture.reader}" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE'
         )
-        await fixture.fixture.connection.execute(f'GRANT USAGE ON SEQUENCE {sequence} TO "{fixture.stranger}"')
-        try:
-            with pytest.raises(NetworkCustomAddressSourceError):
-                await _verify(fixture, reader, descriptor)
-        finally:
-            await fixture.fixture.connection.execute(f'REVOKE USAGE ON SEQUENCE {sequence} FROM "{fixture.stranger}"')
-        assert await _verify(fixture, reader, descriptor)
+        assert await administrator.fetchval(
+            "SELECT relowner=$2::regrole FROM pg_class WHERE oid=$1::regclass", sequence, fixture.stranger
+        )
+        await _change_bootstrap_access(fixture)
+        async with _bootstrap_access_login(fixture.stranger, fixture.password) as sequence_owner:
+            yield sequence_owner, sequence
+    finally:
+        await administrator.execute(f'REVOKE "{fixture.stranger}" FROM "{fixture.reader}"')
+        await administrator.execute(f'ALTER TABLE {parent_table} OWNER TO "{original_owner}"')
+        await administrator.execute(
+            f'REVOKE USAGE ON SCHEMA "{fixture.fixture.source_schema}" FROM "{fixture.stranger}"'
+        )
+
+
+async def _copy_retained_npi(fixture, reader):
+    schema_name = fixture.receipt.address_source.schema_name
+    async with reader.transaction(isolation="repeatable_read"):
+        content = await bootstrap._content(reader, schema_name, "npi")
+        await reader.execute(
+            f'CREATE TEMP TABLE copied_npi(LIKE "{schema_name}".npi INCLUDING DEFAULTS) ON COMMIT DROP'
+        )
+        await bootstrap._copy_native_batch(
+            reader, f'SELECT * FROM "{schema_name}".npi', (), "pg_temp", "copied_npi", content[0]
+        )
+        assert await bootstrap._content(reader, "pg_temp", "copied_npi") == content
+        return content
+
+
+async def _change_sequence_state(connection, sequence_oid, state, *, owner=None):
+    try:
+        if owner is not None:
+            assert await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", owner)
+            assert not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'USAGE')", owner)
+            assert not await connection.fetchval("SELECT has_sequence_privilege($1::oid,'USAGE,UPDATE')", sequence_oid)
+            await connection.execute(f'SET ROLE "{owner}"')
+            assert await connection.fetchval("SELECT current_user<>session_user AND current_user::text=$1", owner)
+        await connection.fetchval("SELECT nextval($1::oid::regclass)", sequence_oid)
+        assert await connection.fetchval("SELECT setval($1::oid::regclass,$2,true)", sequence_oid, state) == state
+    finally:
+        if owner is not None:
+            await connection.execute("RESET ROLE")
+
+
+async def _drop_sequence(connection, sequence):
+    async with connection.transaction():
+        await connection.execute("SET LOCAL lock_timeout='1000ms'")
+        await connection.execute(f"DROP SEQUENCE {sequence} CASCADE")
+
+
+async def _assert_sequence_drop_blocked(fixture, reader, sequence_owner, sequence):
+    administrator = fixture.fixture.connection
+    reader_pid = await reader.fetchval("SELECT pg_backend_pid()")
+    owner_pid = await sequence_owner.fetchval("SELECT pg_backend_pid()")
+    npi_oid = dict(fixture.receipt.relation_oids)["npi"]
+    drop_task = asyncio.create_task(_drop_sequence(sequence_owner, sequence))
+    try:
+        pending_lock = None
+        for _ in range(50):
+            pending_lock = await administrator.fetchrow(
+                "SELECT mode,pg_blocking_pids(pid) AS blockers FROM pg_locks "
+                "WHERE pid=$1 AND NOT granted AND relation=$2::oid",
+                owner_pid,
+                npi_oid,
+            )
+            if pending_lock:
+                break
+            await asyncio.sleep(0.01)
+        assert pending_lock and pending_lock["mode"] == "AccessExclusiveLock"
+        assert reader_pid in pending_lock["blockers"]
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            await asyncio.wait_for(drop_task, 3)
+    finally:
+        if not drop_task.done():
+            drop_task.cancel()
+        await asyncio.gather(drop_task, return_exceptions=True)
+
+
+async def _assert_cascade_refusal(fixture, reader, sequence_owner, sequence, descriptor):
+    receipt = fixture.receipt
+    npi_oid = dict(receipt.relation_oids)["npi"]
+    async with reader.transaction(isolation="repeatable_read"):
+        assert await _verify(fixture, reader, descriptor, api_read=False)
+        original_shape = await bootstrap._shape(reader, npi_oid)
+        original_content = await bootstrap._content(reader, receipt.address_source.schema_name, "npi")
+        await _assert_sequence_drop_blocked(fixture, reader, sequence_owner, sequence)
+    await _drop_sequence(sequence_owner, sequence)
+    assert await fixture.fixture.connection.fetchval("SELECT to_regclass($1)", sequence) is None
+    async with reader.transaction(isolation="repeatable_read", readonly=True):
+        assert await bootstrap._content(reader, receipt.address_source.schema_name, "npi") == original_content
+        assert await bootstrap._shape(reader, npi_oid) != original_shape
+        with pytest.raises(bootstrap.NetworkBootstrapSourceError):
+            await bootstrap.verify_network_bootstrap_sources(reader, receipt)
+    for api_read in (True, False):
+        with pytest.raises(NetworkCustomAddressSourceError, match="[Bb]ootstrap"):
+            await _verify(fixture, reader, descriptor, api_read=api_read)
+
+
+@pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
+async def test_sequence_ownership_keeps_read_boundary(bootstrap_access_fixture):
+    fixture = bootstrap_access_fixture
+    administrator = fixture.fixture.connection
+    async with (
+        _external_sequence_owner(fixture) as (sequence_owner, sequence),
+        _bootstrap_access_login(fixture.reader, fixture.password) as reader,
+    ):
+        descriptor = await _capture(fixture, reader)
+        sequence_oid = descriptor["dormant_sequence_oid"]
+        assert sequence_oid is not None
+        original_acl = await access._acl(administrator, fixture.receipt)
+        assert not await reader.fetchval(
+            "SELECT has_table_privilege($1,$2::oid,'SELECT')", fixture.stranger, descriptor["heaps"]["npi"]["oid"]
+        )
+        sequence_state = await administrator.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
+        original_content = await _copy_retained_npi(fixture, reader)
+        assert await administrator.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == sequence_state
+        for ordinal, (connection, owner) in enumerate(((sequence_owner, None), (reader, fixture.stranger))):
+            await _change_sequence_state(connection, sequence_oid, 7654321 + ordinal, owner=owner)
+            assert await administrator.fetchval(f"SELECT last_value FROM {sequence}") == 7654321 + ordinal
+            assert await _copy_retained_npi(fixture, reader) == original_content
+            assert await _verify(fixture, reader, descriptor)
+            assert await _verify(fixture, reader, descriptor, api_read=False)
+            assert await _capture(fixture, reader) == descriptor
         async with reader.transaction(isolation="repeatable_read"):
             with pytest.raises(artifact.NetworkAddressArtifactError, match="source_generation_changed"):
                 await artifact.capture_network_address_artifact(
@@ -229,3 +350,5 @@ async def test_nonreader_sequence_reach_and_wrong_generation_are_refused(bootstr
                     replace(fixture.receipt.address_source, generation_id="f" * 64),
                     runtime_roles=(fixture.reader,),
                 )
+        await _assert_cascade_refusal(fixture, reader, sequence_owner, sequence, descriptor)
+        assert await access._acl(administrator, fixture.receipt) == original_acl
