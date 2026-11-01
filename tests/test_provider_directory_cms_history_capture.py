@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import provider_directory_cms_history_capture as capture
+from tests.test_provider_directory_cms_history_bounds import _expectations
 from tests.test_provider_directory_cms_history_conversion import _request
 
 
@@ -163,6 +164,63 @@ async def test_capture_preserves_two_heap_identity_and_data(history_case, monkey
     actual["dataset_rows"][capture.history.ROOTS[0]]["retained-one"] = 99
     actual["request"]["heaps"][capture.history.ROOTS[0]]["dataset_ids"].append("later")
     assert (case.storage, family_entries, case.parents, scanned_by_field) == before
+
+
+async def test_prework_scan_needs_no_candidate_parent_or_protected_history_record(history_case, monkeypatch):
+    case = history_case
+    scanned_by_field = {key: deepcopy(case.record[key]) for key in ("dataset_rows", "content")}
+    monkeypatch.setattr(capture.scans, "_scan_history", AsyncMock(return_value=scanned_by_field))
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=[{"dataset_id": "retained-one"}]))
+    actual = await capture.scan_cms_history_prework_data(connection, object(), storage=case.storage, family=case.family)
+    assert actual == {
+        **scanned_by_field,
+        "history_dataset_ids": {root: ["retained-one"] for root in capture.history.ROOTS},
+    }
+    assert connection.fetch.await_count == 1
+
+
+async def test_explicit_capture_keeps_sealed_bounds_and_recaptures_complete_data_each_time(history_case, monkeypatch):
+    case = history_case
+    checked = _expectations(["retained-one", "retained-two"])
+    scanned_by_field = {key: deepcopy(case.record[key]) for key in ("dataset_rows", "content")}
+    later_by_field = deepcopy(scanned_by_field)
+    root = capture.history.ROOTS[0]
+    later_by_field["dataset_rows"][root]["retained-one"] = 3
+    later_by_field["content"][root].update(rows=3, bytes=96, sha256="b" * 64)
+    reader = AsyncMock(side_effect=[scanned_by_field, later_by_field])
+    monkeypatch.setattr(capture.scans, "_scan_history", reader)
+    connection = SimpleNamespace(
+        fetch=AsyncMock(return_value=[dict(oid=oid, name=name) for oid, name in case.index_names.items()]),
+        fetchval=AsyncMock(return_value="501"),
+    )
+    session = object()
+    capture_arguments_by_field = dict(
+        storage=case.storage, family=case.family, parents=case.parents, expected_history_bounds=checked
+    )
+    first = await capture.capture_cms_history_data(connection, session, **capture_arguments_by_field)
+    second = await capture.capture_cms_history_data(connection, session, **capture_arguments_by_field)
+    assert first == case.record
+    assert second["dataset_rows"] == later_by_field["dataset_rows"] and second["content"] == later_by_field["content"]
+    assert first["request"] == second["request"]
+    assert reader.await_count == 2
+    assert all(call.kwargs["expected_history_bounds"] == checked for call in reader.await_args_list)
+    assert all("SELECT DISTINCT dataset_id" not in call.args[0] for call in connection.fetch.await_args_list)
+    assert checked == _expectations(["retained-one", "retained-two"])
+
+
+async def test_explicit_capture_refuses_wrong_old_oid_before_data_reads(history_case):
+    case = history_case
+    checked = _expectations(["retained-one", "retained-two"])
+    checked[capture.history.ROOTS[0]]["old_oid"] = 999
+    with pytest.raises(ValueError, match="history_bounds_changed"):
+        await capture.capture_cms_history_data(
+            object(),
+            object(),
+            storage=case.storage,
+            family=case.family,
+            parents=case.parents,
+            expected_history_bounds=checked,
+        )
 
 
 async def test_converted_read_uses_planned_heap_identities_and_copies_accepted_content(history_case, monkeypatch):

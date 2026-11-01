@@ -518,6 +518,36 @@ async def test_missing_genuine_source_field_refuses_before_catalog_io(authentica
     authenticated.connection.execute.assert_not_awaited()
 
 
+@pytest.mark.parametrize("bounded", [False, True])
+def test_admission_projection_preserves_validated_history_without_expanding_its_scope(authenticated, bounded):
+    from tests.test_provider_directory_cms_history_bounds import _expectations
+
+    source_custody = deepcopy(authenticated.source_custody)
+    authority_by_kind = source_custody["canonical_authority"]
+    if bounded:
+        authority_by_kind["history_bounds"] = _expectations([])
+    original = deepcopy(source_custody)
+    assert custody._allocation_admission_relations(source_custody) == list(authority_by_kind["admission"].values())
+    assert source_custody == original
+
+
+@pytest.mark.parametrize("fault", ["pending", "shape", "unknown"])
+def test_admission_projection_refuses_unissued_history_or_unknown_fields(authenticated, fault):
+    from tests.test_provider_directory_cms_history_bounds import _expectations
+
+    authority_by_kind = authenticated.source_custody["canonical_authority"]
+    authority_by_kind["history_bounds"] = _expectations([])
+    if fault == "pending":
+        next(iter(authority_by_kind["history_bounds"].values()))["native"]["constraint"]["validated"] = False
+    elif fault == "shape":
+        authority_by_kind["history_bounds"] = {}
+    else:
+        authority_by_kind["unissued"] = True
+    with pytest.raises(ValueError, match="cms_history_bounds|allocation_source_metadata_required"):
+        custody._allocation_admission_relations(authenticated.source_custody)
+    authenticated.connection.execute.assert_not_awaited()
+
+
 def _versioned_evidence(authenticated, monkeypatch, version):
     from process import provider_directory_cms_dependency_policy as dependencies
     from process import provider_directory_cms_preparation_policy as stable

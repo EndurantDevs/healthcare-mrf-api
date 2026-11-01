@@ -17,6 +17,7 @@ from db import migration_cms_retirement_resolution as retirement
 from db import migration_cms_snapshot_allocator as allocator
 from db import migration_cms_terminal_resolution as terminal
 from db import migration_generic_source_candidates as copy_guard
+from process import provider_directory_cms_canonical_writer_fence as writers
 from process import provider_directory_cms_owner_execution as execution
 from process import provider_directory_cms_routine_bodies as bodies
 from process import provider_directory_cms_routine_settings as settings
@@ -120,6 +121,37 @@ def test_thirteen_source_bodies_change_only_prosrc_and_matching_declaration(body
     metadata = {signature.split("(")[0] for signature in METADATA_FUNCTIONS}
     assert len(metadata) == 5 and not metadata.intersection(changed_names)
     assert _postimage(after) == after
+
+
+def test_creator_predicate_accepts_only_the_complete_current_postimage(body_rows):
+    current = _postimage(body_rows)
+    before = deepcopy(current)
+    writers._require_creator_bodies({"arguments": _ARGUMENTS}, current)
+    assert current == before
+
+
+@pytest.mark.parametrize("name", _NAMES)
+@pytest.mark.parametrize("fault", ["missing", "duplicate", "old", "body", "declaration"])
+def test_creator_predicate_preserves_postimage_refusals(body_rows, name, fault):
+    current = _postimage(body_rows)
+    index = next(index for index, row in enumerate(current) if row["native"]["definition"]["proname"] == name)
+    if fault == "missing":
+        current.pop(index)
+    elif fault == "duplicate":
+        current.append(deepcopy(current[index]))
+    elif fault == "old":
+        allowed, target = bodies._targets(_SCHEMA, _PREPARATION)[name]
+        predecessor = next(body for body in allowed if body != target)
+        current[index]["native"]["definition"]["prosrc"] = predecessor
+        current[index]["native"]["body"] = current[index]["native"]["body"].replace(target, predecessor, 1)
+    elif fault == "body":
+        current[index]["native"]["definition"]["prosrc"] = "unknown body"
+    else:
+        current[index]["native"]["body"] = "unknown declaration"
+    before = deepcopy(current)
+    with pytest.raises(ValueError):
+        writers._require_creator_bodies({"arguments": _ARGUMENTS}, current)
+    assert current == before
 
 
 @pytest.mark.parametrize("name", _NAMES)

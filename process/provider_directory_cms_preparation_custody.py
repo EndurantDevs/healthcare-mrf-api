@@ -805,19 +805,26 @@ def _allocation_admission_relations(source_custody):
         "allocation_source_custody_required",
     )
     authority_by_kind = source_custody["canonical_authority"]
+    expected_fields = {"admission", "metadata"}
+    if "history_bounds" in authority_by_kind:
+        expected_fields.add("history_bounds")
     _require(
-        set(authority_by_kind) == {"admission", "metadata"}
+        set(authority_by_kind) == expected_fields
         and type(authority_by_kind["metadata"]) is dict
         and set(authority_by_kind["metadata"])
         == {signature.replace("character varying", "varchar") for signature in METADATA_FUNCTIONS},
         "allocation_source_metadata_required",
     )
+    if "history_bounds" in authority_by_kind:
+        from process.provider_directory_cms_history_bounds import require_cms_history_expectations
+
+        require_cms_history_expectations(authority_by_kind["history_bounds"])
     admission_by_name = source_custody["canonical_authority"].get("admission")
     _require(
         type(admission_by_name) is dict and admission_by_name.keys() == _CATALOG_ROOTS, "allocation_admission_required"
     )
     _require(
-        all(type(row) is dict and row.get("relname") == name for name, row in admission_by_name.items()),
+        all(type(relation) is dict and relation.get("relname") == name for name, relation in admission_by_name.items()),
         "allocation_admission_required",
     )
     return list(admission_by_name.values())

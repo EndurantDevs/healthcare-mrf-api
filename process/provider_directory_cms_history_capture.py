@@ -9,6 +9,7 @@ the eventual outer commit. No DDL, record write or commit occurs here.
 from copy import deepcopy
 
 from db.plan_release_storage import storage_relation
+from process import provider_directory_cms_history_bounds as bounds
 from process import provider_directory_cms_history_conversion as history
 from process import provider_directory_cms_history_record as records
 from process import provider_directory_cms_legacy_history as scans
@@ -76,11 +77,11 @@ async def _index_names(connection, entries):
     return names_by_oid
 
 
-async def capture_cms_history_data(connection, session, *, storage, family, parents):
-    """Capture complete bounds and ordered native bytes from the two fixed legacy heaps.
+async def scan_cms_history_prework_data(connection, session, *, storage, family, expected_history_bounds=None):
+    """Read complete fixed history without inventing an allocation or conversion authority.
 
-    The fixed issuer supplies the authenticated family from the common history
-    fence, not a caller OID selection. All output is data pending protected CAS.
+    The caller authenticates the family and holds the original-Admin history
+    fence throughout the scan. Finalization must capture its own fresh history.
     """
     roots_by_name = _old_roots(family)
     catalog_by_field = dict(
@@ -89,12 +90,42 @@ async def capture_cms_history_data(connection, session, *, storage, family, pare
         roots={root: {"oid": entry["oid"], "owner": entry["relowner"]} for root, entry in roots_by_name.items()},
     )
     schema = storage["catalog_schema"]
-    bounds_sql = " UNION ".join(
-        "SELECT DISTINCT dataset_id FROM ONLY " + storage_relation(schema, root) for root in history.ROOTS
+    checked = (
+        None if expected_history_bounds is None else bounds.require_cms_history_expectations(expected_history_bounds)
     )
-    datasets = sorted({bound_row["dataset_id"] for bound_row in await connection.fetch(bounds_sql)})
+    if checked is None:
+        bounds_sql = " UNION ".join(
+            "SELECT DISTINCT dataset_id FROM ONLY " + storage_relation(schema, root) for root in history.ROOTS
+        )
+        datasets = sorted({bound_row["dataset_id"] for bound_row in await connection.fetch(bounds_sql)})
+    else:
+        datasets = sorted({key for entry in checked.values() for key in entry["dataset_ids"]})
     expected, datasets = scans._request(schema, catalog_by_field, datasets)
-    scanned = await scans._scan_history(connection, session, schema=schema, expected=expected, datasets=datasets)
+    checked = scans._history_bounds(checked, expected, datasets)
+    options = {} if checked is None else {"expected_history_bounds": checked}
+    scanned = await scans._scan_history(
+        connection, session, schema=schema, expected=expected, datasets=datasets, **options
+    )
+    _require(scans._history_bounds(expected_history_bounds, expected, datasets) == checked, "inputs_changed")
+    return {
+        **scanned,
+        "history_dataset_ids": {
+            root: list(datasets if checked is None else checked[root]["dataset_ids"]) for root in history.ROOTS
+        },
+    }
+
+
+async def capture_cms_history_data(connection, session, *, storage, family, parents, expected_history_bounds=None):
+    """Capture fresh complete history and its genuine allocated conversion plan."""
+    roots_by_name = _old_roots(family)
+    scanned = await scan_cms_history_prework_data(
+        connection,
+        session,
+        storage=storage,
+        family=family,
+        expected_history_bounds=expected_history_bounds,
+    )
+    schema = storage["catalog_schema"]
     index_names = await _index_names(connection, [*(roots_by_name[root] for root in history.ROOTS), *parents.values()])
     request_by_field = dict(
         database_oid=storage["database_oid"],
@@ -107,7 +138,7 @@ async def capture_cms_history_data(connection, session, *, storage, family, pare
             root: dict(
                 old=_identity(roots_by_name[root], index_names, schema, root),
                 parent=_identity(parents[root], index_names, schema, root),
-                dataset_ids=list(datasets),
+                dataset_ids=scanned["history_dataset_ids"][root],
             )
             for root in history.ROOTS
         },
