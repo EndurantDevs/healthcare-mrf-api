@@ -92,6 +92,7 @@ from process import provider_directory_fhir_response as fhir_response
 from process import provider_directory_molina as molina
 from process import provider_directory_mvp as mvp
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
+from process import provider_directory_pacificsource as pacificsource
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_artifact_custody as profile_artifact_custody
 from process import provider_directory_profile_artifact_layout as profile_artifact_layout
@@ -432,6 +433,7 @@ from process.provider_directory_source_coverage import (
     acquisition_coverage_blocked_reason,
     michigan_provider_directory_metadata,
 )
+from process.provider_directory_source_selection import is_anonymous_source_url as _is_anonymous_source_url
 from process.provider_directory_source_selection import (
     resource_import_selection_metrics as _resource_import_selection_metrics,
 )
@@ -1410,6 +1412,7 @@ UHC_PRACTITIONER_ROLE_REVERSE_LOOKUP_PARAMS = {
     "Practitioner": "practitioner",
 }
 SOURCE_RESOURCE_TIMEOUT_MIN_SECONDS = {
+    **{(pacificsource.API_BASE, resource_type): 90 for resource_type in pacificsource.RESOURCES},
     **{(UHC_PROVIDER_DIRECTORY_BASE, resource_type): 60 for resource_type in DEFAULT_RESOURCES},
     (
         REVIEWED_PRACTITIONER_ROLE_TIMEOUT_BASE,
@@ -1503,6 +1506,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         MICHIGAN_PROVIDER_DIRECTORY_BASE,
         MISSOURI_PROVIDER_DIRECTORY_BASE,
         MOLINA_PROVIDER_DIRECTORY_BASE,
+        pacificsource.API_BASE,
         NEBRASKA_DHHS_PROVIDER_DIRECTORY_BASE,
         PENNSYLVANIA_MEDICAID_PROVIDER_DIRECTORY_BASE,
         SAN_BERNARDINO_COUNTY_PROVIDER_DIRECTORY_BASE,
@@ -40520,6 +40524,7 @@ def _seed_rows_from_supplemental_catalogs(
     metrics_by_name["catalogs"].update(remote_metrics_by_catalog)
     for name, base, seed_loader in (
         ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
+        ("pacificsource", pacificsource.API_BASE, pacificsource.seed_rows),
         ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
         ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
         ("mvp_health_care", mvp.API_BASE, mvp.seed_rows),
@@ -40760,14 +40765,6 @@ def _source_http_client_session(
     )
 
 
-def _is_anonymous_source_url(url: str) -> bool:
-    try:
-        parsed_url = urllib.parse.urlsplit(url)
-    except ValueError:
-        return False
-    return parsed_url.username is None and parsed_url.password is None
-
-
 @contextlib.asynccontextmanager
 async def _source_http_session_scope(
     *,
@@ -40990,15 +40987,16 @@ async def _fetch_json_with_source_session(
             if any(key.lower() == "proxy-authorization" for key in extra_headers):
                 raise ValueError("source_proxy_origin_header_forbidden")
             headers_by_name.update(extra_headers)
-        request_url = (
-            URL(url, encoded=True) if preserve_url_bytes or request_options or christus.is_request_url(url) else url
-        )
+        is_continuation = _has_fhir_continuation_query(url)
+        is_encoded = preserve_url_bytes or request_options or christus.is_request_url(url) or is_continuation
+        request_url = URL(url, encoded=True) if is_encoded else url
         async with session.get(
             request_url,
             headers=headers_by_name,
             timeout=request_timeout,
             allow_redirects=allow_redirects
             and not christus.is_request_url(url)
+            and not is_continuation
             and source_selection.QUALIFICATION_API_BASE.get() is None
             and not request_options,
             **request_options,
@@ -42144,14 +42142,12 @@ async def _probe_resource_access(
     capability_payload: dict[str, Any],
     *,
     timeout: int,
+    resource_type: str | None = None,
 ) -> dict[str, Any] | None:
-    """Probe one capability-advertised resource admitted by the source."""
+    """Probe one capability-advertised or explicitly configured collection."""
     if _uses_alohr_graphql_connector(source_record):
         return None
-    resource_type = _resource_access_probe_type(
-        source_record,
-        capability_payload,
-    )
+    resource_type = resource_type or _resource_access_probe_type(source_record, capability_payload)
     if not resource_type:
         return None
     resource_probe_source_map, resource_url = _resource_access_probe_url(
@@ -42381,6 +42377,11 @@ async def _probe_source(
     )
     if missing_credential_result:
         return missing_credential_result
+    collection_probe = await source_selection.probe_declared_collection(
+        sys.modules[__name__], source_record, timeout=timeout, run_id=run_id
+    )
+    if collection_probe is not None:
+        return collection_probe
     best_probe: dict[str, Any] | None = None
     best_payload: dict[str, Any] | None = None
     for candidate_base, metadata_url in metadata_urls:
@@ -42401,17 +42402,7 @@ async def _probe_source(
 
 
 def _source_probe_hard_timeout_seconds(source: dict[str, Any], *, timeout: int) -> int:
-    if _uses_uhc_official_file_connector(source):
-        return max(timeout + 1, 35)
-    candidate_count = max(1, len(_candidate_metadata_urls(source)))
-    request_count = candidate_count * 2
-    env_value = os.getenv("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PROBE_HARD_TIMEOUT")
-    if env_value:
-        try:
-            return max(1, int(env_value))
-        except ValueError:
-            return max(timeout + 1, (timeout * request_count) + 2)
-    return max(timeout + 1, (timeout * request_count) + 2)
+    return source_selection.source_probe_hard_timeout_seconds(sys.modules[__name__], source, timeout=timeout)
 
 
 def _probe_flush_every() -> int:
@@ -42538,9 +42529,6 @@ async def _run_source_probe_batch(
                 update_map["fhir_version"] = _clean_text(capability_payload.get("fhirVersion")) or update_map.get(
                     "fhir_version"
                 )
-                if probe_map["status"] == "valid":
-                    probe_counts_by_name["valid"] += 1
-                    valid_source_ids.add(source_row["source_id"])
             else:
                 capability_rows.append(
                     {
@@ -42556,11 +42544,9 @@ async def _run_source_probe_batch(
                         "run_id": run_id,
                     }
                 )
-                if probe_map["status"] == "valid" and (
-                    _uses_alohr_graphql_connector(source_row) or _uses_uhc_official_file_connector(source_row)
-                ):
-                    probe_counts_by_name["valid"] += 1
-                    valid_source_ids.add(source_row["source_id"])
+            if probe_map["status"] == "valid":
+                probe_counts_by_name["valid"] += 1
+                valid_source_ids.add(source_row["source_id"])
             source_updates.append(update_map)
             probe_counts_by_name["probed"] += 1
             await _flush_probe_rows()
