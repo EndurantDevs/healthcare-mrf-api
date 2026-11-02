@@ -164,6 +164,10 @@ def test_raw_parent_fields_omitted_by_fixed_projection_stay_exact(structure_case
 @pytest.mark.asyncio
 async def test_scope_recheck_and_failures_never_commit_or_reopen(monkeypatch, owner_case, fault):
     case = owner_case
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    # Exercise custody and error propagation independently of elapsed host time.
+    monkeypatch.setattr(loop, "time", lambda: started_at)
     recheck = AsyncMock()
 
     @asynccontextmanager
@@ -190,7 +194,7 @@ async def test_scope_recheck_and_failures_never_commit_or_reopen(monkeypatch, ow
         policy=case.policy,
         cms_profile=case.profile,
         source_document=case.source,
-        deadline=asyncio.get_running_loop().time() + 2,
+        deadline=started_at + 2,
     )
     if fault:
         with pytest.raises((RuntimeError, ValueError)) as caught:
