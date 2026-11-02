@@ -111,7 +111,8 @@ def _error_response(status: int):
 
 def _log_failure(failure: BaseException) -> None:
     logger.warning(
-        "Billing search request failed",
+        "Billing search request failed (%s)",
+        type(failure).__name__,
         extra={"billing_search_failure_class": type(failure).__name__},
     )
 

@@ -465,6 +465,7 @@ async def test_service_failures_have_closed_status_and_rollback(
     assert str(failure) not in http_response.body.decode("utf-8")
     assert str(failure) not in caplog.text
     assert caplog.records[-1].billing_search_failure_class == type(failure).__name__
+    assert type(failure).__name__ in caplog.text
     assert session.begin_count == 1
     assert session.active is False
     assert session.events[-1] == ("transaction_exit", type(failure).__name__)

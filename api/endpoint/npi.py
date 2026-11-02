@@ -79,6 +79,7 @@ from api.provider_geo_sql import (
     build_imported_geo_statements,
     build_native_nearby_count_sql,
     build_native_nearby_sql,
+    canonical_zip_anchor_statement,
     native_geo_entity_scope,
     nearby_batch_identities,
 )
@@ -10495,9 +10496,8 @@ async def get_near_npi(
 
         # If only zip was provided, resolve to coordinates before constructing geo SQL.
         if not has_coordinates and zip_codes and zip_codes[0]:
-            zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
             async with _provider_list_connection(db, import_context, request_session) as conn_zip:
-                zip_rows = await conn_zip.all(text(zip_sql), zip_code=zip_codes[0])
+                zip_rows = await conn_zip.all(canonical_zip_anchor_statement(), zip_code=zip_codes[0])
             for coordinate_record in zip_rows:
                 try:
                     in_long = float(coordinate_record["intptlon"])

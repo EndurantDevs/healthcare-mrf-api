@@ -19,8 +19,9 @@ def _install_near_connection(monkeypatch, check, state):
     class Connection:
         async def all(self, statement, **_parameters):
             sql = str(statement)
-            if "from zcta5" in sql:
+            if "from tiger.zcta5" in sql.lower():
                 check("zip")
+                state.zip_statements.append(statement)
                 return [state.zip_record]
             state.query_parameters.append(_parameters)
             if "COUNT(DISTINCT" in sql:
@@ -76,6 +77,7 @@ def near_snapshot(monkeypatch):
         failure=None,
         zip_record={"intptlat": "41.0", "intptlon": "-87.0"},
         query_parameters=[],
+        zip_statements=[],
         total_count=1,
     )
     location_by_field = {
@@ -159,6 +161,18 @@ async def test_near_snapshot_covers_zip_filters_page_count_metadata_and_encoding
     )
     assert near_snapshot.entered == near_snapshot.exited == 1 and not near_snapshot.active
     assert request.ctx.sa_session is prior_session
+
+
+async def test_near_zip_anchor_uses_the_canonical_relation_instead_of_search_path(near_snapshot):
+    request = SimpleNamespace(args={"zip_codes": "60001,60002", "limit": "1"}, app=SimpleNamespace())
+    reply = await npi.get_near_npi(request)
+    assert len(json.loads(reply.body)) == 1
+    (statement,) = near_snapshot.zip_statements
+    assert [relation.fullname for relation in statement.get_final_froms()] == ["tiger.zcta5"]
+    assert all(
+        parameters["in_lat"] == 41.0 and parameters["in_long"] == -87.0 for parameters in near_snapshot.query_parameters
+    )
+    assert near_snapshot.entered == near_snapshot.exited == 1
 
 
 async def test_near_pagination_keeps_cursor_and_encoding_inside_snapshot(near_snapshot):
