@@ -194,15 +194,11 @@ def test_import_run_cursor_rejects_invalid_and_normalizes_aware_time():
 
     with pytest.raises(ValueError, match="invalid cursor"):
         control_imports._decode_import_run_cursor("not-json")
-    blank_payload = json.dumps(
-        {"created_at": "2026-07-21T00:00:00", "run_id": " "}
-    ).encode()
+    blank_payload = json.dumps({"created_at": "2026-07-21T00:00:00", "run_id": " "}).encode()
     blank_cursor = base64.urlsafe_b64encode(blank_payload).decode().rstrip("=")
     with pytest.raises(ValueError, match="invalid cursor"):
         control_imports._decode_import_run_cursor(blank_cursor)
-    aware_payload = json.dumps(
-        {"created_at": "2026-07-21T01:00:00+01:00", "run_id": "offset"}
-    ).encode()
+    aware_payload = json.dumps({"created_at": "2026-07-21T01:00:00+01:00", "run_id": "offset"}).encode()
     aware_cursor = base64.urlsafe_b64encode(aware_payload).decode().rstrip("=")
     decoded_time, _run_id = control_imports._decode_import_run_cursor(aware_cursor)
     assert decoded_time == dt.datetime(2026, 7, 21)
@@ -233,16 +229,10 @@ async def test_worker_state_helpers_cover_unsupported_error_and_failed_items(
     assert control_imports._failed_worker_state_item({"items": None}) is None
     assert control_imports._failed_worker_state_item({"items": ["invalid"]}) is None
     failed_item_by_field = {"job_status": "failed", "job_name": "coverage-job"}
-    assert control_imports._failed_worker_state_item(
-        {"items": [failed_item_by_field]}
-    ) == failed_item_by_field
-    error = control_imports._worker_job_failure_error(
-        {**failed_item_by_field, "failure": {"exitCode": 17}}
-    )
+    assert control_imports._failed_worker_state_item({"items": [failed_item_by_field]}) == failed_item_by_field
+    error = control_imports._worker_job_failure_error({**failed_item_by_field, "failure": {"exitCode": 17}})
     assert error["exitCode"] == 17
-    assert "exitCode" not in control_imports._worker_job_failure_error(
-        failed_item_by_field
-    )
+    assert "exitCode" not in control_imports._worker_job_failure_error(failed_item_by_field)
 
     class TruthyBlank:
         def __bool__(self):
@@ -291,9 +281,7 @@ def test_acquisition_scope_rejects_source_and_discovered_endpoint_edges():
     )
 
     params = _acquisition_params()
-    metrics_by_name = {
-        "active_source_groups": ["invalid", {}, {"api_base": "http://bad"}]
-    }
+    metrics_by_name = {"active_source_groups": ["invalid", {}, {"api_base": "http://bad"}]}
     assert (
         control_imports._provider_directory_acquisition_scope(
             params,
@@ -319,7 +307,8 @@ def test_acquisition_scope_rejects_source_and_discovered_endpoint_edges():
 @pytest.mark.asyncio
 async def test_health_helpers_report_success_and_invalid_sysconf(monkeypatch):
     monkeypatch.setattr(control_imports.db, "execute", AsyncMock())
-    assert await control_imports._database_check() == {"ok": True}
+    monkeypatch.setattr(control_imports.mrf_acquisition, "acquisition_dataset", AsyncMock(side_effect=ValueError))
+    assert await control_imports._database_check() == {"ok": True, "mrf_acquisition_dataset": None}
 
     redis_client = Mock()
     monkeypatch.setattr(control_imports, "_redis_client", lambda: redis_client)
@@ -412,14 +401,11 @@ async def test_table_bootstrap_only_creates_indexes_for_new_table(
     database.connect.assert_awaited_once()
     assert connection.execute.await_count == (3 if table_exists else 4)
     index_statements = [
-        str(call.args[0])
-        for call in connection.execute.await_args_list
-        if "CREATE INDEX" in str(call.args[0])
+        str(call.args[0]) for call in connection.execute.await_args_list if "CREATE INDEX" in str(call.args[0])
     ]
-    assert index_statements == ([] if table_exists else [
-        'CREATE INDEX IF NOT EXISTS "valid_idx" '
-        'ON "mrf"."import_run" (run_id)'
-    ])
+    assert index_statements == (
+        [] if table_exists else ['CREATE INDEX IF NOT EXISTS "valid_idx" ON "mrf"."import_run" (run_id)']
+    )
 
 
 def test_toc_preview_rejects_non_objects_and_skips_malformed_plans(monkeypatch):

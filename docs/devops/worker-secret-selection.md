@@ -56,6 +56,23 @@ workers. An unset or blank value uses `HLTHPRT_WORKER_JOB_IMAGE`. Authorized
 source-worker launch images retain priority. Other importers continue to use
 their configured images.
 
+For non-dry-run discovery, set the required
+`HLTHPRT_MRF_ACQUISITION_CONTROL_RELATION` on the API and discovery workers.
+Its value is an unquoted lowercase `schema.table` name, for example
+`discovery_control.reservations`; each identifier accepts letters, digits and
+underscores, starts with a letter or underscore, and is at most 63 characters.
+There is no default. Keep the deployment value in deployment configuration,
+not in run parameters or reservation receipts.
+
+Process workers inherit this setting. The Kubernetes launcher forwards the
+API's configured value only to `mrf-source-discovery` Jobs. Configure the same
+relation for any independently started discovery worker. Admission resolves
+its actual PostgreSQL OID and checks read permission, then matches the complete
+native dataset identity against the reservation. Execution rechecks that
+identity under its dataset lock before mutable work. Missing or invalid
+configuration refuses acquisition; dry runs and other importers do not require
+this setting.
+
 ## Protected source-profile maintenance
 
 Set `HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE` to an independently managed,

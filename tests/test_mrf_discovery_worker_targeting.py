@@ -23,6 +23,7 @@ def test_process_worker_runs_targeted_mrf_discovery_job_once(monkeypatch, tmp_pa
 
     monkeypatch.setenv("HLTHPRT_WORKER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("HLTHPRT_WORKER_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("HLTHPRT_MRF_ACQUISITION_CONTROL_RELATION", "discovery_control.reservations")
 
     def fake_popen(cmd, *, env, **_kwargs):
         captured_by_key["cmd"] = cmd
@@ -38,6 +39,7 @@ def test_process_worker_runs_targeted_mrf_discovery_job_once(monkeypatch, tmp_pa
     assert launch_result["status"] == "started"
     assert captured_by_key["cmd"][-2:] == ["worker-once", "process.MRFSourceDiscovery"]
     assert captured_by_key["env"]["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "job_discovery"
+    assert captured_by_key["env"]["HLTHPRT_MRF_ACQUISITION_CONTROL_RELATION"] == "discovery_control.reservations"
 
 
 @pytest.mark.parametrize("discovery_image", [None, "", "  ", "example/discovery@sha256:" + "a" * 64])
@@ -52,6 +54,7 @@ def test_kubernetes_worker_runs_targeted_mrf_discovery_job_once(monkeypatch, dis
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", "ghcr.io/example/healthcare-mrf-api:test")
+    monkeypatch.setenv("HLTHPRT_MRF_ACQUISITION_CONTROL_RELATION", "discovery_control.reservations")
     if discovery_image is None:
         monkeypatch.delenv("HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE", raising=False)
     else:
@@ -73,6 +76,26 @@ def test_kubernetes_worker_runs_targeted_mrf_discovery_job_once(monkeypatch, dis
     assert container["command"][-2:] == ["worker-once", "process.MRFSourceDiscovery"]
     environment_by_name = {entry["name"]: entry["value"] for entry in container["env"]}
     assert environment_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "job_discovery"
+    assert environment_by_name["HLTHPRT_MRF_ACQUISITION_CONTROL_RELATION"] == "discovery_control.reservations"
+
+
+@pytest.mark.parametrize("importer", ["mrf-source-discovery", "mrf"])
+@pytest.mark.parametrize("configured", [None, "", "discovery_control.reservations"])
+def test_control_relation_environment_is_scoped_to_discovery(monkeypatch, importer, configured):
+    setting = "HLTHPRT_MRF_ACQUISITION_CONTROL_RELATION"
+    if configured is None:
+        monkeypatch.delenv(setting, raising=False)
+    else:
+        monkeypatch.setenv(setting, configured)
+    spec = control_workers._BY_IMPORTER_ROLE[(importer, "start")]
+    environment, _ = control_workers._worker_job_environment(spec, {"importer": importer})
+    control_entries = [entry for entry in environment if entry["name"] == setting]
+    expected = (
+        [{"name": setting, "value": configured}]
+        if importer == "mrf-source-discovery" and configured is not None
+        else []
+    )
+    assert control_entries == expected
 
 
 @pytest.mark.parametrize("importer,specialized", [("mrf", False), ("mrf-source-discovery", True)])

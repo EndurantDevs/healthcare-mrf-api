@@ -28,6 +28,7 @@ from api import (
     registry_aca_source_worker,
 )
 from db.models import db
+from process import mrf_discovery_acquisition_guard as mrf_acquisition
 from process.control_lifecycle import _SOURCE_PROFILE_IMPORTERS_BY_MODULE, acquire_control_run_worker_action_lock
 from process.ptg_parts.ptg_source_attempt_actions import (
     PTGSourceAttemptIdentityError,
@@ -376,6 +377,24 @@ def _bind_admitted_job(payload: dict[str, Any], admitted_run: dict[str, Any]) ->
             payload.code_calibration_job = identity
 
 
+async def _mrf_worker_selection_failure(worker_payload, selected_specs, importer, run_id):
+    selects_mrf = any(mrf_acquisition.IMPORTER in spec.importers for spec in selected_specs)
+    if not selects_mrf and importer != mrf_acquisition.IMPORTER:
+        return None
+    if not run_id or not selects_mrf or importer not in ("", mrf_acquisition.IMPORTER):
+        return _failed_worker_admission(worker_payload, "MRF acquisition worker requires its admitted run")
+    from api.control_imports import get_import_run
+
+    admitted = await get_import_run(run_id)
+    try:
+        if admitted is None or admitted.get("importer") != mrf_acquisition.IMPORTER:
+            raise ValueError("mrf_acquisition_not_admitted")
+        await mrf_acquisition.require_acquisition(admitted, require_local=True)
+    except ValueError, RuntimeError:
+        return _failed_worker_admission(worker_payload, "MRF acquisition worker is not admitted")
+    return None
+
+
 async def guarded_ensure_worker(
     worker_payload: dict[str, Any],
 ) -> dict[str, Any]:
@@ -385,6 +404,8 @@ async def guarded_ensure_worker(
     importer = str(worker_payload.get("importer") or "").strip()
     run_id = str(worker_payload.get("run_id") or "").strip()
     selected_specs = _resolve_specs(worker_payload)
+    if failure := await _mrf_worker_selection_failure(worker_payload, selected_specs, importer, run_id):
+        return failure
     selects_ptg = any("ptg" in spec.importers for spec in selected_specs)
     if failure := _nucc_worker_selection_failure(worker_payload, selected_specs, importer, run_id):
         return failure
@@ -1226,6 +1247,14 @@ def _is_code_calibration_job(spec, payload):
     )
 
 
+def _discovery_acquisition_environment(spec: WorkerSpec) -> list[dict[str, str]]:
+    if spec.importers != (mrf_acquisition.IMPORTER,):
+        return []
+    setting = mrf_acquisition.CONTROL_RELATION_ENV
+    value = os.getenv(setting)
+    return [] if value is None else [{"name": setting, "value": value}]
+
+
 def _worker_job_environment(
     spec: WorkerSpec,
     launch_request: dict[str, Any],
@@ -1238,6 +1267,7 @@ def _worker_job_environment(
         {"name": "HLTHPRT_ACTIVE_WORKER_CLASS", "value": spec.worker_class},
         {"name": "HLTHPRT_ACTIVE_WORKER_QUEUE", "value": spec.queue},
     ]
+    env_list.extend(_discovery_acquisition_environment(spec))
     import_id = str(launch_request.get("import_id") or "").strip()
     if import_id:
         env_list.append({"name": "HLTHPRT_IMPORT_ID_OVERRIDE", "value": import_id})
