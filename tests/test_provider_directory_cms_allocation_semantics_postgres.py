@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Real generic allocator shape checks; no CMS issuer or live authority proof."""
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -58,14 +59,23 @@ async def _native_allocations(monkeypatch):
             async with _publisher_reader(catalog, url, name, publisher) as connection:
                 yield SimpleNamespace(catalog=catalog, owner=owner, publisher=connection)
     finally:
-        if has_attempted_database:
-            assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", name)
-            await admin.execute('DROP DATABASE IF EXISTS "' + name + '"')
-            assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_database WHERE datname=$1)", name)
-        for role in reversed(roles):
-            await admin.execute('DROP ROLE IF EXISTS "' + role + '"')
-            assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role)
-        await admin.close()
+        try:
+            if has_attempted_database:
+                await _wait_for_database_backends(admin, name)
+                assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", name)
+                await admin.execute('DROP DATABASE IF EXISTS "' + name + '"')
+                assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_database WHERE datname=$1)", name)
+            for role in reversed(roles):
+                await admin.execute('DROP ROLE IF EXISTS "' + role + '"')
+                assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role)
+        finally:
+            await admin.close()
+
+
+async def _wait_for_database_backends(admin, name):
+    async with asyncio.timeout(3):
+        while await admin.fetchval("SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", name):
+            await asyncio.sleep(0.01)
 
 
 @asynccontextmanager

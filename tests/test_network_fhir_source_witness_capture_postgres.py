@@ -320,6 +320,7 @@ async def _assert_explicit_native_limits_reuse_codec(case, module, monkeypatch):
 
 
 async def test_genuine_source_witness_capture_closes_and_replays_with_original_authority(monkeypatch, record_property):
+    """Require genuine Source authority, closed custody, rollback and retained replay after successor publication."""
     async with source_witness_case(monkeypatch) as case:
         from process import network_fhir_source_witness_capture as capture_module
         from process.network_fhir_source_witness_contract import CAPTURE_CONTRACT, TABLES, validate_capture
@@ -357,8 +358,15 @@ async def test_genuine_source_witness_capture_closes_and_replays_with_original_a
         assert case.old_capture.as_dict() == old
         async with case.reader.transaction(isolation="repeatable_read", readonly=True):
             assert await require_retained_fhir_capture(case.reader, case.old_capture) == case.old_capture
+        replayed_count = await _assert_retained_replay_after_successor(
+            case, capture_module, capture, case.anchors_by_id[str(arguments["capture_id"])], monkeypatch
+        )
+        assert replayed_count == resource_count
         record_property("component", "genuine Source Publisher to independent closed Core witness custody")
         record_property("rows", str(resource_count))
+        record_property(
+            "successor_replay", "edition 2 current; original edition-1 origin, identity and rows; Source EOF and exit"
+        )
         record_property(
             "origin", "all25 actual Source metadata/header facts; Reader capture retained only as regression"
         )
@@ -500,6 +508,7 @@ def _forged_source_roots(origin, resources):
 
 
 async def _assert_resource_forgery_refuses(case, module, capture, anchor, *, forge_source_declaration):
+    from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
     from process.network_fhir_source_witness_contract import SourceWitnessContractError
 
     with pytest.raises(_RollbackTamper):
@@ -512,13 +521,24 @@ async def _assert_resource_forgery_refuses(case, module, capture, anchor, *, for
                 capture = replace(capture, origin=replace(capture.origin, **roots_by_field))
                 reviewed_origin = replace(case.origin, **roots_by_field)
             forged = await _rewrite_local_receipt(case, module, capture)
-            with pytest.raises(SourceWitnessContractError) as refused:
+            error_type = RetainedFHIRCaptureError if forge_source_declaration else SourceWitnessContractError
+            error_message = (
+                "^retained_fhir_capture_unavailable$"
+                if forge_source_declaration
+                else "^source_fhir_witness_contract_invalid$"
+            )
+            with pytest.raises(error_type, match=error_message) as refused:
                 await _fresh_source_verify(
                     case, module, forged, anchor, reviewed_origin=reviewed_origin, connection=case.writer
                 )
-            assert "_verify_source_rows" in _traceback_functions(refused.value)
-            if not forge_source_declaration:
-                assert "_compare_source_page" in _traceback_functions(refused.value)
+            refused_frames = _traceback_functions(refused.value)
+            assert "_verify_source_rows" in refused_frames
+            if forge_source_declaration:
+                _assert_original_source_refusal(refused.value)
+                assert {"_verify_origin", "_require_header_fields"} <= set(refused_frames)
+                assert "_compare_source_page" not in refused_frames
+            else:
+                assert "_compare_source_page" in refused_frames
             raise _RollbackTamper
 
 
@@ -695,6 +715,74 @@ async def test_fixed_source_constructor_capture_and_fresh_reader_replay_refuse_l
             "limits",
             "LOCAL corrected M1 only; no Source changes/grants, M2/provider-serving/runtime or representative performance",
         )
+
+
+async def _publish_current_successor(case):
+    """Publish edition 2 through ordinary Source admission and prove it supersedes edition 1."""
+    from tests import generic_source_successor_postgres_support as successor_fixture
+
+    successor = await successor_fixture.publish_edition(case.fixture, 2)
+    assert (successor.origin.source_id, successor.origin.endpoint_id) == (
+        case.origin.source_id,
+        case.origin.endpoint_id,
+    )
+    assert successor.origin.dataset_id != case.origin.dataset_id
+    assert successor.origin.dataset_sha256 != case.origin.dataset_sha256
+    headers = await case.fixture.admin.fetch(
+        f'SELECT dataset_id,is_current,status FROM "{case.origin.schema_name}".provider_directory_endpoint_dataset '
+        "WHERE endpoint_id=$1",
+        case.origin.endpoint_id,
+    )
+    assert {row["dataset_id"]: (row["is_current"], row["status"]) for row in headers} == {
+        case.origin.dataset_id: (False, "superseded"),
+        successor.origin.dataset_id: (True, "published"),
+    }
+
+
+async def _assert_retained_replay_after_successor(case, module, capture, anchor, monkeypatch):
+    """Replay the reviewed retained origin after genuine publication advances the current edition."""
+    original_origin, original_capture = asdict(case.origin), capture.as_dict()
+    original_reader_capture = case.old_capture.as_dict()
+    resources_sql = (
+        f'SELECT * FROM "{capture.schema_name}".provider_directory_dataset_resource '
+        'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C"'
+    )
+    async with case.reader.transaction(isolation="repeatable_read", readonly=True):
+        original_rows = await case.reader.fetch(resources_sql)
+        assert await assert_independent_derived_rows(case.reader, capture) == len(original_rows)
+    await _publish_current_successor(case)
+
+    original_identity, original_finish = module._export_identity, module._finish_source_replay
+    exports, eof_scopes = [], []
+
+    def observe_identity(export, reviewed, expected_identity=None):
+        identity = original_identity(export, reviewed, expected_identity)
+        assert identity == expected_identity == capture.source_database
+        assert asdict(export["origin"]) == original_origin
+        exports.append(export)
+        return identity
+
+    async def observe_eof(connection, replay):
+        result = await original_finish(connection, replay)
+        assert replay.total == len(original_rows)
+        scope = await source_scope(exports[-1])
+        assert not scope.streams_by_token
+        eof_scopes.append(scope)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "_export_identity", observe_identity)
+        patch.setattr(module, "_finish_source_replay", observe_eof)
+        assert await _fresh_source_verify(case, module, capture, anchor) == capture
+    assert len(exports) == len(eof_scopes) == 1
+    assert not eof_scopes[0].is_active and not eof_scopes[0].streams_by_token
+    assert asdict(case.origin) == original_origin and capture.as_dict() == original_capture
+    assert case.old_capture.as_dict() == original_reader_capture
+    async with case.reader.transaction(isolation="repeatable_read", readonly=True):
+        assert await case.reader.fetch(resources_sql) == original_rows
+        assert await assert_independent_derived_rows(case.reader, capture) == len(original_rows)
+        assert await require_retained_fhir_capture(case.reader, case.old_capture) == case.old_capture
+    return len(original_rows)
 
 
 async def test_original_legacy_source_capture_preserves_absence_and_requires_complete_fresh_replay(monkeypatch):

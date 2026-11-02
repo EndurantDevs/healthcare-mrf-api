@@ -115,6 +115,49 @@ def test_direct_config_cannot_mix_installed_capability_with_another_server_profi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ("custody", "addresses", "compact"))
+async def test_installer_rechecks_required_worker_inputs_before_factory(monkeypatch, missing):
+    events = []
+    exported, factory = _factory(monkeypatch, events)
+    configured = _config()
+    addresses = SimpleNamespace(compact=missing != "compact", source_witness_runtime=None)
+    config = SimpleNamespace(
+        source_witness=configured.source_witness,
+        custody_url=None if missing == "custody" else configured.custody_url,
+        initial_address_sources=None if missing == "addresses" else addresses,
+    )
+    resources = AsyncMock()
+    with pytest.raises(ValueError, match="^registry_source_witness_worker_config_invalid$"):
+        await install_source_witness_runtime(config, resources)
+    assert events == []
+    factory.assert_not_called()
+    exported.assert_not_called()
+    resources.enter_async_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ("untyped_profile", "installed_runtime"))
+async def test_installer_refuses_conflicting_authority_before_factory(monkeypatch, conflict):
+    events = []
+    exported, factory = _factory(monkeypatch, events)
+    configured = _config()
+    config = SimpleNamespace(
+        custody_url=configured.custody_url,
+        source_witness=_document()["source_witness"] if conflict == "untyped_profile" else configured.source_witness,
+        initial_address_sources=_sources(_runtime())
+        if conflict == "installed_runtime"
+        else configured.initial_address_sources,
+    )
+    resources = AsyncMock()
+    with pytest.raises(ValueError, match="^registry_source_witness_worker_config_invalid$"):
+        await install_source_witness_runtime(config, resources)
+    assert events == []
+    factory.assert_not_called()
+    exported.assert_not_called()
+    resources.enter_async_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_installer_owns_original_factory_without_opening_a_capture(monkeypatch):
     events, config = [], _config()
     exported, factory = _factory(monkeypatch, events)
@@ -195,6 +238,21 @@ async def test_missing_membership_package_never_uses_catalog_or_opens_worker_poo
     monkeypatch.setattr(worker.asyncpg, "create_pool", pool)
     with pytest.raises(ValueError, match="registry_source_witness_factory_unavailable"):
         await worker.run_registry_publication_worker(_config())
+    pool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_noncallable_installed_factory_never_opens_worker_pools(monkeypatch):
+    events = []
+    exported, factory = _factory(monkeypatch, events)
+    monkeypatch.setattr(sys.modules["directory_membership_runtime"], "membership_source_export_runtime", None)
+    pool = AsyncMock(side_effect=AssertionError("worker pool must remain closed"))
+    monkeypatch.setattr(worker.asyncpg, "create_pool", pool)
+    with pytest.raises(ValueError, match="^registry_source_witness_factory_unavailable$"):
+        await worker.run_registry_publication_worker(_config())
+    assert events == []
+    factory.assert_not_called()
+    exported.assert_not_called()
     pool.assert_not_awaited()
 
 

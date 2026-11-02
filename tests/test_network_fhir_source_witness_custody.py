@@ -2,7 +2,11 @@
 """Pure scope and refusal checks; guard doubles never confer Source or candidate custody."""
 
 import builtins
-from dataclasses import replace
+import sys
+from contextlib import asynccontextmanager
+from dataclasses import asdict, make_dataclass, replace
+from datetime import datetime
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
@@ -18,9 +22,82 @@ from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from tests.test_network_fhir_source_witness_contract import captured
 from tests.test_network_fhir_source_witness_recipe import _LEGACY_COORDINATES, _reader_recipe, _source_recipe
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_derived_replay_reduces_oversized_pages_without_advancing_or_dropping_rows(monkeypatch):
+    capture = captured()
+    resource_rows = [{"resource_type": "Location", "resource_id": f"office-{index:03}"} for index in range(300)]
+    pages = [resource_rows[:250], resource_rows[250:]]
+    oversized_by_field = {"count": 300, "bytes": capture_reads._MAX_PAGE_BYTES}
+    resources = AsyncMock(
+        side_effect=[
+            ("oversized", (), oversized_by_field),
+            ("oversized", (), oversized_by_field),
+            ("first", (1,), {"count": 250, "bytes": capture_reads._MAX_PAGE_BYTES // 2}),
+            ("last", (2,), {"count": 50, "bytes": capture_reads._MAX_PAGE_BYTES // 2}),
+            ("end", (), {"count": 0, "bytes": 0}),
+        ]
+    )
+    connection = SimpleNamespace(fetch=AsyncMock(side_effect=pages), fetchval=AsyncMock(return_value=0))
+    expected = Mock(return_value={table: [] for table in capture_reads.TABLES[1:3]})
+    actual = AsyncMock(return_value=[])
+    plan = AsyncMock()
+    monkeypatch.setattr(capture_reads.retained, "_resources", resources)
+    monkeypatch.setattr(capture_reads, "_expected_entity_rows", expected)
+    monkeypatch.setattr(capture_reads, "_actual_entity_rows", actual)
+    monkeypatch.setattr(capture_reads, "_verify_plan_rows", plan)
+    observed_at = datetime.fromisoformat(capture.observed_at)
+
+    await capture_reads._verify_derived(
+        connection, capture.schema_name, capture.origin, capture.release_id, observed_at
+    )
+
+    assert [call.args[3] for call in resources.await_args_list] == [1000, 500, 250, 250, 250]
+    assert [call.args[2] for call in resources.await_args_list] == [
+        None,
+        None,
+        None,
+        ("Location", "office-249"),
+        ("Location", "office-299"),
+    ]
+    assert [call.args for call in connection.fetch.await_args_list] == [("first", 1), ("last", 2)]
+    assert [resource_row for call in expected.call_args_list for resource_row in call.args[2]] == resource_rows
+    assert [call.args for call in actual.await_args_list] == [
+        (connection, capture.schema_name, table, capture.origin.source_id, page, capture.release_id)
+        for page in pages
+        for table in capture_reads.TABLES[1:3]
+    ]
+    assert connection.fetchval.await_count == 2
+    plan.assert_awaited_once_with(connection, capture.schema_name, capture.origin, capture.release_id, observed_at)
+
+
+async def test_derived_replay_refuses_an_oversized_single_row_before_fetching(monkeypatch):
+    capture = captured()
+    resources = AsyncMock(return_value=("oversized", (), {"count": 1, "bytes": capture_reads._MAX_PAGE_BYTES}))
+    connection = SimpleNamespace(fetch=AsyncMock())
+    plan = AsyncMock()
+    monkeypatch.setattr(capture_reads.retained, "_resources", resources)
+    monkeypatch.setattr(capture_reads, "_verify_plan_rows", plan)
+
+    with pytest.raises(witness.SourceWitnessContractError, match="^source_fhir_witness_contract_invalid$"):
+        await capture_reads._verify_derived(
+            connection,
+            capture.schema_name,
+            capture.origin,
+            capture.release_id,
+            datetime.fromisoformat(capture.observed_at),
+        )
+
+    limits = [call.args[3] for call in resources.await_args_list]
+    assert limits[0] == 1000 and limits[-1] == 1 and len(limits) <= 11
+    assert all(smaller < larger for larger, smaller in zip(limits, limits[1:]))
+    assert all(call.args[2] is None for call in resources.await_args_list)
+    connection.fetch.assert_not_awaited()
+    plan.assert_not_awaited()
 
 
 def _profile(schema_name="source_example"):
@@ -265,3 +342,118 @@ async def test_missing_installed_source_adapter_has_no_reader_fallback(
     with pytest.raises(composition.RegistrySourceCompositionError, match="factory_unavailable"):
         await composition.require_source_witness_read(connection, recipe, approved, "control_example", runtime)
     runtime.source_export.assert_not_called()
+
+
+@pytest.fixture
+def retained_replay(monkeypatch):
+    """Model the installed adapter and native row IO; no native custody is issued."""
+    capture = captured()
+    origin_type = make_dataclass("MembershipInput", [], bases=(witness.SourceWitnessOrigin,), frozen=True)
+    case = SimpleNamespace(
+        origin=origin_type(**asdict(capture.origin)),
+        anchor=witness.SourceWitnessCaptureAnchor(capture.capture_id, capture.release_id, capture.observed_at),
+        identity=capture.source_database,
+        profile=_profile(),
+        events=[],
+        pages=([{"fixture": "page one"}], [{"fixture": "page two"}]),
+        stream_error=None,
+        is_current=False,
+    )
+    case.exported_origin, case.exported_identity = case.origin, case.identity
+
+    async def pages():
+        try:
+            for page in case.pages:
+                yield page
+            if case.stream_error is not None:
+                raise case.stream_error
+            case.events.append("source.eof")
+        finally:
+            case.events.append("source.closed")
+
+    @asynccontextmanager
+    async def source_export(runtime, *, source_profile, origin):
+        assert runtime is case.runtime and source_profile is case.profile
+        assert origin is case.origin and not case.is_current
+        case.events.append("source.retained")
+        yield dict(
+            contract=witness.CONTRACT,
+            origin=case.exported_origin,
+            database_identity=case.exported_identity,
+            resources=pages,
+        )
+        case.events.append("source.exit")
+
+    case.runtime = SimpleNamespace(config=SimpleNamespace(publisher_role="source_publisher"))
+    adapter = SimpleNamespace(
+        CatalogSnapshotRuntime=type(case.runtime),
+        FHIRSourceMembershipInput=origin_type,
+        open_membership_source_export=source_export,
+    )
+    monkeypatch.setitem(sys.modules, "directory_membership_runtime", adapter)
+    case.factory = partial(source_export, case.runtime)
+    case.compare, case.finish = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(capture_reads, "_compare_source_page", case.compare)
+    monkeypatch.setattr(capture_reads, "_finish_source_replay", case.finish)
+    return case
+
+
+async def _replay(case, *, reviewed_origin=None):
+    return await capture_reads._verify_source_rows(
+        case.factory,
+        None,
+        source_profile=case.profile,
+        reviewed_origin=reviewed_origin if reviewed_origin is not None else case.origin,
+        expected_anchor=case.anchor,
+        expected_identity=case.identity,
+    )
+
+
+async def test_retained_replay_passes_bound_origin_and_finishes_after_eof(retained_replay):
+    case = retained_replay
+
+    async def finish(_connection, replay):
+        assert case.events[-2:] == ["source.eof", "source.closed"]
+        assert replay.origin == witness.source_origin(case.origin)
+        assert [call.args[2] for call in case.compare.await_args_list] == list(case.pages)
+        case.events.append("candidate.checked")
+
+    case.finish.side_effect = finish
+    assert await _replay(case) == case.identity
+    case.finish.assert_awaited_once()
+    assert case.events == ["source.retained", "source.eof", "source.closed", "candidate.checked", "source.exit"]
+
+
+@pytest.mark.parametrize("fault", ["origin", "database", "identity"])
+async def test_retained_replay_rejects_mismatched_export_before_rows(retained_replay, fault):
+    case = retained_replay
+    if fault == "origin":
+        case.exported_origin = replace(case.origin, header_oid=case.origin.header_oid + 1)
+    elif fault == "database":
+        case.exported_identity = replace(case.identity, database_oid=case.identity.database_oid + 1)
+    else:
+        case.exported_identity = replace(case.identity, postmaster_started="2026-01-03T00:00:00.000000+00:00")
+    with pytest.raises(ValueError):
+        await _replay(case)
+    case.compare.assert_not_awaited()
+    case.finish.assert_not_awaited()
+    assert case.events == ["source.retained"]
+
+
+async def test_retained_replay_requires_installed_origin_type(retained_replay):
+    case = retained_replay
+    with pytest.raises(ValueError):
+        await _replay(case, reviewed_origin=witness.source_origin(case.origin))
+    assert case.events == []
+    case.compare.assert_not_awaited()
+    case.finish.assert_not_awaited()
+
+
+async def test_retained_replay_stream_failure_does_not_finish(retained_replay):
+    case = retained_replay
+    case.stream_error = RuntimeError("fixture source interruption")
+    with pytest.raises(RuntimeError, match="fixture source interruption"):
+        await _replay(case)
+    assert case.compare.await_count == len(case.pages)
+    assert case.events == ["source.retained", "source.closed"]
+    case.finish.assert_not_awaited()
