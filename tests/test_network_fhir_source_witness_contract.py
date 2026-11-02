@@ -243,6 +243,19 @@ def test_database_identity_invalid_fields_refuse(changes):
         witness.database_identity(database_fields() | changes)
 
 
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2026-13-01T00:00:00.000000+00:00",
+        "2026-01-32T00:00:00.000000+00:00",
+    ],
+)
+def test_malformed_canonical_timestamps_refuse(timestamp):
+    assert len(timestamp) == 32
+    with pytest.raises(witness.SourceWitnessContractError, match="^source_fhir_witness_contract_invalid$"):
+        witness.database_identity(database_fields() | {"postmaster_started": timestamp})
+
+
 def test_capture_keeps_source_database_and_target_oids_separate():
     capture = captured()
     assert witness.validate_capture(capture) is capture
