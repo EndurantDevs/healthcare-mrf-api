@@ -1390,7 +1390,7 @@ async def test_get_near_npi_honors_zip_radius_and_specialization(monkeypatch, ra
     class RecordingConnection:
         async def all(self, sql, **params):
             sql_text = str(sql)
-            if "from zcta5" in sql_text:
+            if "from tiger.zcta5" in sql_text.lower():
                 captured_query_map["zip_code"] = params["zip_code"]
                 return [{"intptlat": "41.0", "intptlon": "-87.0"}]
             captured_query_map["sql"] = sql_text

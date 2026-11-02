@@ -7,11 +7,12 @@ import math
 from urllib.parse import parse_qs
 
 from sanic.exceptions import InvalidUsage, ServiceUnavailable
-from sqlalchemy import Float, String, and_, case, cast, column, func, literal, or_, select, table, text
+from sqlalchemy import Float, String, and_, case, cast, column, func, literal, or_, select, table
 
 from api.custom_import_provider_service_sql import ProviderServiceImportQuery
 from api.network_address_scope import current_network_address_scope, scoped_address_parameters
 from api.network_read_execution import execute_network_read
+from api.provider_geo_sql import canonical_zip_anchor_statement
 
 
 def _canonical_network_procedure_clause(
@@ -78,7 +79,7 @@ async def _canonical_procedure_zip_anchor(session, zip5):
     """Use the same first-ZIP ZCTA point as the nearby selected-office query."""
     result = await execute_network_read(
         session,
-        text("select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"),
+        canonical_zip_anchor_statement(),
         {"zip_code": zip5},
     )
     row = result.mappings().first()
