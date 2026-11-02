@@ -219,8 +219,8 @@ async def _source_capture_for_workers(
 
 
 @asynccontextmanager
-async def _publication_case(monkeypatch):
-    async with source_witness_case(monkeypatch) as case, AsyncExitStack() as stack:
+async def _publication_case(monkeypatch, *, legacy=False):
+    async with source_witness_case(monkeypatch, legacy=legacy) as case, AsyncExitStack() as stack:
         serving = await stack.enter_async_context(_registry_on_source(case.fixture, monkeypatch))
         custom = await stack.enter_async_context(aclosing(custom_db.__wrapped__(serving)))
         fixture = await anext(custom)
@@ -990,3 +990,28 @@ async def test_source_witness_introduction_preserves_retained_generation(monkeyp
             "limits",
             "Local queued G1-to-G2 adoption and reviewed source rollback; same physical Source, distinct recipes; no automatic refresh",
         )
+
+
+async def test_legacy_source_witness_publication_keeps_api_readers_pinned_through_rollback(monkeypatch):
+    from process.network_fhir_source_witness_contract import OBSERVED_LEGACY_PROFILE
+
+    original_replay = capture_module._verify_source_rows
+    replay_actors = []
+
+    async def observe_completed_replay(factory, connection, **arguments):
+        capture = await original_replay(factory, connection, **arguments)
+        replay_actors.append(await connection.fetchval("SELECT session_user"))
+        return capture
+
+    monkeypatch.setattr(capture_module, "_verify_source_rows", observe_completed_replay)
+    async with _publication_case(monkeypatch, legacy=True) as context:
+        context.replay_actors = replay_actors
+        assert asdict(context.case.constructed_origin) == asdict(context.case.origin)
+        origin = context.capture.origin
+        assert origin.admission_profile == OBSERVED_LEGACY_PROFILE
+        assert origin.proof_sha256 is origin.admission_metadata_sha256 is None
+        assert origin.semantic_projection_as_of is origin.descriptor_counts is None
+        assert context.recipe.source_pin.as_of == context.capture.observed_at[:10]
+        await _assert_publications_keep_pinned_readers(context)
+        assert context.worker.roles_by_kind["execution"] in replay_actors
+        assert await context.operator.connection.fetchval("SELECT session_user") in replay_actors

@@ -46,14 +46,14 @@ def _coordinates(pin, producer, edition):
     return RegistryNetworkSourceCoordinates("fhir", pin.source_id, pin.schema_name, pin.dataset_id, producer, edition)
 
 
-def _source_recipe():
+def _source_recipe(*, legacy=False):
     """Keep the expected Core anchor explicit and separate from the synthetic capture."""
     anchor = witness.SourceWitnessCaptureAnchor(
         "00000000-0000-0000-0000-000000000001",
         "registry-source-witness:00000000-0000-0000-0000-000000000001",
         "2026-01-02T00:00:00.000000+00:00",
     )
-    capture = captured()
+    capture = captured(legacy=legacy)
     origin = capture.origin
     pin = fhir.PinnedFHIRMembershipSource(
         origin.schema_name,
@@ -64,7 +64,7 @@ def _source_recipe():
         capture.release_id,
         origin.resource_parent_oid,
         "medical",
-        origin.semantic_projection_as_of,
+        witness.source_witness_membership_date(capture, anchor),
         source_witness_capture=capture,
         source_witness_anchor=anchor,
     )
@@ -415,3 +415,18 @@ async def test_final_composition_refuses_source_receipt_even_with_cached_reads(c
     connection.fetchval.assert_not_awaited()
     connection.fetchrow.assert_not_awaited()
     connection.execute.assert_not_awaited()
+
+
+def test_observed_legacy_recipe_roundtrips_with_anchored_date_and_null_source_metadata():
+    recipe = _source_recipe(legacy=True)
+    serialized = canonical_registry_source_recipes((recipe,))
+    assert decode_registry_source_recipes(serialized) == (recipe,)
+    pin = recipe.source_pin
+    assert pin.as_of == "2026-01-02"
+    assert pin.source_witness_capture.origin.semantic_projection_as_of is None
+    for incorrect in ("2026-01-01", "2026-01-03"):
+        with pytest.raises(ValueError):
+            replace(pin, as_of=incorrect)
+    document = json.loads(serialized)
+    for field in ("proof_sha256", "admission_metadata_sha256", "semantic_projection_as_of", "descriptor_counts"):
+        assert document[0]["source_pin"]["source_witness_capture"]["origin"][field] is None

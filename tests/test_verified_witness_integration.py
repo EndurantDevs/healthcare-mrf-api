@@ -32,16 +32,26 @@ async def test_global_policy_keeps_legacy_distinction_and_explicit_v2_alias_iden
         {},
         source_aliases=aliases,
     )
+    hydration_sql = " ".join(connection.execute.await_args_list[0].args[0].split())
+    assert 'FROM pg_temp."winners" winner JOIN LATERAL (' in hydration_sql
+    staged_sql, address_sql = hydration_sql.split(") input ON true JOIN LATERAL (", 1)
+    assert "SELECT staged.page_key,staged.office,staged.canonical" in staged_sql
+    assert "WHERE staged.page_key=winner.page_key AND staged.ordinal=winner.ordinal OFFSET 0" in staged_sql
+    assert 'FROM "addresses"."entity_address_unified" source_address' in address_sql
+    assert "WHERE source_address.location_key=winner.location_key OFFSET 0" in address_sql
+    assert "to_jsonb(address) AS address" in hydration_sql
     query = connection.execute.await_args.args[0]
     location_clause, source_clause = query.split("ambiguous_sources AS MATERIALIZED")
-    expected = "jsonb_build_array(office->>'provider_system',office->>'provider_id'"
-    assert (
-        (expected + "))>1") in location_clause
-        if aliases
-        else (expected + ",office->>'location_id'))>1") in location_clause
-    )
-    assert "office->>'location_id' AS location_id" in source_clause
-    assert "count(DISTINCT office->>'location_key')>1" in source_clause
+    assert query.startswith("WITH identities AS MATERIALIZED")
+    assert "SELECT ctid AS row_id,office->>'provider_system' AS provider_system" in location_clause
+    assert "SELECT location_key FROM identities" in location_clause
+    expected = "jsonb_build_array(provider_system,provider_id"
+    assert (expected + "))>1") in location_clause if aliases else (expected + ",location_id))>1") in location_clause
+    assert "SELECT provider_system,provider_id,location_id FROM identities" in source_clause
+    assert "count(DISTINCT location_key)>1" in source_clause
+    assert 'DELETE FROM pg_temp."matches" matched USING identities identity' in source_clause
+    assert "WHERE matched.ctid=identity.row_id AND (EXISTS(" in source_clause
+    assert "matched.office" not in source_clause
 
 
 @pytest.mark.parametrize("flag", [None, 1, "true"])

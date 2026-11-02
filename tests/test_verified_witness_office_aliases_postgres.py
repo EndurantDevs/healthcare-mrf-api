@@ -207,28 +207,59 @@ async def _assert_alias_bindings(reader, stage, network_ids):
 
 async def _assert_pruning_mechanisms(reader):
     """Synthetic encoded rows qualify native predicate mechanics only, not Source admission or correspondence."""
-    name = "witness_alias_pruning_" + uuid4().hex
-    await reader.execute(f"CREATE TEMP TABLE {_identifier(name)}(office jsonb NOT NULL) ON COMMIT DROP")
+    table_name = "witness_alias_pruning_" + uuid4().hex
+    await reader.execute(f"CREATE TEMP TABLE {_identifier(table_name)}(office jsonb NOT NULL) ON COMMIT DROP")
     first_by_field = dict(
         provider_system="npi", provider_id="1234567893", location_id=str(UUID(int=1)), location_key="1" * 64
     )
     alias_by_field = {**first_by_field, "location_id": str(UUID(int=2))}
+    unrelated_by_field = {
+        **first_by_field,
+        "provider_id": "1999999984",
+        "location_id": str(UUID(int=3)),
+        "location_key": "3" * 64,
+    }
+    null_provider_by_field = {**first_by_field, "provider_system": None}
+    null_key_by_field = {**first_by_field, "location_key": None}
+    null_provider_other_key_by_field = {**null_provider_by_field, "location_key": "2" * 64}
     cases = [
-        (True, [first_by_field, alias_by_field], 2),
-        (False, [first_by_field, alias_by_field], 0),
-        (True, [first_by_field, {**alias_by_field, "provider_id": "1000000004"}], 0),
-        (True, [first_by_field, {**first_by_field, "location_key": "2" * 64}], 0),
+        (True, [first_by_field, alias_by_field], [first_by_field, alias_by_field]),
+        (False, [first_by_field, alias_by_field], []),
+        (True, [first_by_field, first_by_field], [first_by_field, first_by_field]),
+        (False, [first_by_field, first_by_field], [first_by_field, first_by_field]),
+        (True, [first_by_field, {**alias_by_field, "provider_id": "1000000004"}], []),
+        (True, [first_by_field, {**first_by_field, "location_key": "2" * 64}], []),
+        (True, [null_provider_by_field, first_by_field], []),
+        (True, [null_key_by_field, first_by_field], [null_key_by_field, first_by_field]),
+        (
+            True,
+            [null_provider_by_field, null_provider_other_key_by_field],
+            [null_provider_by_field, null_provider_other_key_by_field],
+        ),
+        (
+            True,
+            [first_by_field, {**first_by_field, "location_key": "2" * 64}, unrelated_by_field],
+            [unrelated_by_field],
+        ),
     ]
-    for source_aliases, documents, expected in cases:
-        await reader.execute(f"TRUNCATE pg_temp.{_identifier(name)}")
+    for source_aliases, documents, expected_offices in cases:
+        await reader.execute(f"TRUNCATE pg_temp.{_identifier(table_name)}")
         await reader.copy_records_to_table(
-            name,
+            table_name,
             schema_name="pg_temp",
             columns=("office",),
             records=[(json.dumps(document),) for document in documents],
         )
-        await legacy._prune_verified_offices(reader, name, source_aliases)
-        assert await reader.fetchval(f"SELECT count(*) FROM pg_temp.{_identifier(name)}") == expected
+        await legacy._prune_verified_offices(reader, table_name, source_aliases)
+        actual_offices = [
+            json.loads(matched_office_row["office"])
+            for matched_office_row in await reader.fetch(
+                f"SELECT office::text AS office FROM pg_temp.{_identifier(table_name)}"
+            )
+        ]
+        assert sorted(json.dumps(office, sort_keys=True) for office in actual_offices) == sorted(
+            json.dumps(office, sort_keys=True) for office in expected_offices
+        )
     assert inspect.signature(legacy._finish_verified_office_matches).parameters["source_aliases"].default is False
 
 

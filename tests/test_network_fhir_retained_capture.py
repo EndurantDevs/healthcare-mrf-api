@@ -498,11 +498,16 @@ async def test_reference_derived_batches_verify_in_owner_task_before_drained_cop
     assert events == ["verify", "copy"] * 3
 
 
-def test_registered_native_capture_caller_matches_reference_rows_and_roots():
+@pytest.mark.parametrize("observed_legacy", [False, True])
+def test_registered_native_capture_caller_matches_reference_rows_and_roots(observed_legacy):
     from process import network_fhir_retained_native as native
     from tests.test_network_fhir_retained_native import _decode
 
     origin, observed = retained().origin, datetime(2026, 1, 1, tzinfo=UTC)
+    if observed_legacy:
+        from tests.test_network_fhir_source_witness_contract import captured
+
+        origin = captured(legacy=True).origin
     resource_rows = []
     for kind, identity, fields in [
         ("Location", "site-one", {"latitude": 1.5}),
@@ -749,3 +754,8 @@ async def test_resource_verify_reduces_page_without_skipping():
     reader.fetch.assert_awaited_once()
     assert reader.fetch.await_args.args[1:] == (origin.dataset_id,)
     assert '"capture_example".' in reader.fetch.await_args.args[0]
+
+
+def test_resource_hash_selection_never_downgrades_unknown_profile():
+    with pytest.raises(RetainedFHIRCaptureError):
+        capture._resource_hash_contract(SimpleNamespace(admission_profile="unknown"))
