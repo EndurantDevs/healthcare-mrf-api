@@ -101,6 +101,8 @@ from process.ptg_allowed_amount_blank import (
     allowed_amount_blank_metrics,
 )
 from process.ptg_frozen_control import normalize_protected_rate_params
+from process.ptg_parts.cigna_toc_collection import COLLECTION_PROOF_PARAM
+from process.ptg_parts.cigna_toc_dispatch import restore_collection_retry_proof, validated_collection_dispatch
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_PROTECTED_FIELDS,
     protected_frozen_tuple_presence,
@@ -1406,16 +1408,10 @@ def normalize_run(import_run: Any) -> dict[str, Any]:
     )
 
 
-def _params_for_import_run_storage(
-    importer: str,
-    params_by_name: dict[str, Any],
-) -> dict[str, Any]:
+def _params_for_import_run_storage(importer: str, params_by_name: dict[str, Any]) -> dict[str, Any]:
     """Remove importer-specific ephemeral values from persisted API state."""
 
-    ephemeral_param_names = _EPHEMERAL_PARAM_NAMES_BY_IMPORTER.get(
-        importer,
-        frozenset(),
-    )
+    ephemeral_param_names = _EPHEMERAL_PARAM_NAMES_BY_IMPORTER.get(importer, frozenset())
     return {name: param_value for name, param_value in params_by_name.items() if name not in ephemeral_param_names}
 
 
@@ -1425,10 +1421,8 @@ def _params_for_import_run_response(
 ) -> dict[str, Any]:
     """Project private multipart coordinates to an opaque public run marker."""
 
-    stored_params_by_name = _params_for_import_run_storage(
-        importer,
-        params_by_name,
-    )
+    stored_params_by_name = _params_for_import_run_storage(importer, params_by_name)
+    stored_params_by_name.pop(COLLECTION_PROOF_PARAM, None)
     if importer != "ptg":
         return stored_params_by_name
     stored_params_by_name.pop(INVALID_PRICE_EXCLUSION_POLICY_FIELD, None)
@@ -1470,11 +1464,11 @@ def _import_param_views(
 ) -> _ImportParamViews:
     """Build separate persisted and one-shot enqueue parameter mappings."""
 
+    collection_proof = validated_collection_dispatch(importer, params_by_name)
+    if collection_proof is not None:
+        params_by_name = {**params_by_name, COLLECTION_PROOF_PARAM: collection_proof}
     if importer != "ptg":
-        return _ImportParamViews(
-            persisted_by_name=dict(params_by_name),
-            enqueue_by_name=dict(params_by_name),
-        )
+        return _ImportParamViews(persisted_by_name=dict(params_by_name), enqueue_by_name=dict(params_by_name))
     if _PTG_FULL_REBUILD_SCOPE_PARAM in params_by_name:
         raise ValueError("PTG full rebuild scope is internal and cannot be supplied")
     if _PTG_FULL_REBUILD_MARKER_PARAM in params_by_name:
@@ -4977,6 +4971,10 @@ def _retry_child_params(
     retry_params_by_name: dict[str, Any],
 ) -> dict[str, Any]:
     current_params_by_name = current_run_map.get("params") if isinstance(current_run_map.get("params"), dict) else {}
+    if COLLECTION_PROOF_PARAM in retry_params_by_name and retry_params_by_name[
+        COLLECTION_PROOF_PARAM
+    ] != current_params_by_name.get(COLLECTION_PROOF_PARAM):
+        raise ValueError("Cigna collection retry cannot replace expected archive proof")
     from process.provider_directory_serving_recovery import OPERATION_PARAM, is_recovery_request
 
     if OPERATION_PARAM in current_params_by_name:
@@ -5033,6 +5031,7 @@ async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[s
     current = await get_import_run(run_id)
     if not current:
         return None
+    current = await restore_collection_retry_proof(current, lambda: npi_execution.read_control_run(db, run_id))
     if str(current.get("importer") or "") == "ptg":
         await require_not_wave_owned_run(db, run_id)
     retry_params = payload.get("retry_params") if isinstance(payload.get("retry_params"), dict) else {}

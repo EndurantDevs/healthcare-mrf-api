@@ -15,6 +15,7 @@ from process import registry_required_target_coverage as coverage
 from process.network_approved_catalog_evidence import ApprovedNetworkCatalogEvidenceRecord
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_plan_release_serving import PLAN_RELEASE_ID, _binding_row
+from tests.test_plan_release_supporting_metadata import commitment_page
 
 REFERENCE = {
     "healthporta_plan_id": "hpplan_" + "1" * 26,
@@ -71,6 +72,11 @@ class Driver:
     async def fetch(self, sql, *parameters):
         self.calls.append((sql, parameters))
         self.tasks.append(asyncio.current_task())
+        if "supporting_commitments AS MATERIALIZED" in sql:
+            import json
+
+            requested_ids = {entry["plan_release_id"] for entry in json.loads(parameters[0])}
+            return commitment_page([binding for binding in self.rows if binding["plan_release_id"] in requested_ids])
         if "AS storage_present" in sql:
             return []
         if self.failure:

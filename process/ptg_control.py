@@ -22,31 +22,11 @@ from process.live_progress import (
 from process.ptg import (
     PTG2FullRebuildFreshnessError,
     full_rebuild_failure_metrics,
+)
+from process.ptg import (
     main as ptg_main,
 )
-from process.ptg_parts.canonical import normalize_tic_source_url
-from process.ptg_parts.frozen_rate_binding import (
-    protected_frozen_tuple_presence,
-)
-from process.ptg_parts.ptg_source_worker_admission import (
-    guard_ptg_worker_start,
-)
-from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_exception
-from process.ptg_frozen_control import (
-    protected_rate_main_kwargs,
-    validated_worker_rate_params,
-)
-from process.ptg_singleton_direct_control import (
-    protected_singleton_direct_presence,
-)
-from process.ptg_control_failures import ptg_failure_error
 from process.ptg_allowed_amount_blank_evidence import load_blank_failure_metrics
-from process.ptg_control_runtime import (
-    PTG_CONTROL_HEARTBEAT_SOURCE,
-    _stale_ptg_job_result,
-    _start_threaded_ptg_heartbeat,
-    _stop_threaded_ptg_heartbeat,
-)
 from process.ptg_control_environment import (
     PTG2_RUST_WORKERS_ENV,
     _optional_int,
@@ -54,6 +34,29 @@ from process.ptg_control_environment import (
     _string_list,
     assert_expected_ptg_lane,
 )
+from process.ptg_control_failures import ptg_failure_error
+from process.ptg_control_runtime import (
+    PTG_CONTROL_HEARTBEAT_SOURCE,
+    _stale_ptg_job_result,
+    _start_threaded_ptg_heartbeat,
+    _stop_threaded_ptg_heartbeat,
+)
+from process.ptg_frozen_control import (
+    protected_rate_main_kwargs,
+    validated_worker_rate_params,
+)
+from process.ptg_parts.canonical import normalize_tic_source_url
+from process.ptg_parts.cigna_toc_dispatch import validated_collection_dispatch
+from process.ptg_parts.frozen_rate_binding import (
+    protected_frozen_tuple_presence,
+)
+from process.ptg_parts.ptg_source_worker_admission import (
+    guard_ptg_worker_start,
+)
+from process.ptg_singleton_direct_control import (
+    protected_singleton_direct_presence,
+)
+from process.ptg_wave_claims import claim_wave_job_start, reconcile_wave_claim_exception
 from process.ptg_wave_worker_claim_adapter import (
     exact_wave_claim_values as _exact_wave_claim_values,
 )
@@ -86,9 +89,7 @@ def _resolve_retained_direct_source_url(
         source_index_url=source_index_url,
     )
     if resolved_url == baseline_url:
-        raise ValueError(
-            "direct source index context did not resolve the direct URL"
-        )
+        raise ValueError("direct source index context did not resolve the direct URL")
     resolved_params_by_name["in_network_url"] = resolved_url
     return resolved_params_by_name
 
@@ -136,9 +137,7 @@ def _retained_direct_replay_url(params_by_name: dict[str, Any]) -> str:
         or type(params_by_name.get("max_files")) is not int
         or params_by_name["max_files"] != 1
     ):
-        raise ValueError(
-            "direct source index context requires retained direct replay"
-        )
+        raise ValueError("direct source index context requires retained direct replay")
     return direct_url
 
 
@@ -147,15 +146,9 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
     bind_status_event_loop()
     task_payload = task if isinstance(task, dict) else {}
     run_id = str(task_payload.get("run_id") or "").strip()
-    params_by_name = (
-        task_payload.get("params")
-        if isinstance(task_payload.get("params"), dict)
-        else task_payload
-    )
+    params_by_name = task_payload.get("params") if isinstance(task_payload.get("params"), dict) else task_payload
     params_by_name = dict(params_by_name)
-    attempt_started_at = dt.datetime.now(dt.UTC).isoformat(
-        timespec="microseconds"
-    )
+    attempt_started_at = dt.datetime.now(dt.UTC).isoformat(timespec="microseconds")
     attempt_id = f"{run_id}:{uuid.uuid4().hex}" if run_id else None
     claim_attempt_token = uuid.uuid4().hex
     try:
@@ -177,11 +170,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 run_id=run_id,
                 claim_attempt_token=claim_attempt_token,
             )
-        if not (
-            reconciliation is not None
-            and reconciliation.status == "claimed"
-            and reconciliation.same_attempt
-        ):
+        if not (reconciliation is not None and reconciliation.status == "claimed" and reconciliation.same_attempt):
             raise
     admission_failure = await guard_ptg_worker_start(
         task_payload,
@@ -253,20 +242,15 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         full_rebuild_scope_digest = _full_rebuild_scope_digest(
             params_by_name,
         )
-        full_rebuild_proof_metrics_by_name = (
-            _full_rebuild_proof_metrics_by_name(full_rebuild_scope_digest)
-        )
-        should_reuse_raw_artifacts = bool(
-            params_by_name.get("reuse_raw_artifacts", True)
-        )
-        should_keep_partial_artifacts = params_by_name.get(
-            "keep_partial_artifacts"
-        )
+        full_rebuild_proof_metrics_by_name = _full_rebuild_proof_metrics_by_name(full_rebuild_scope_digest)
+        should_reuse_raw_artifacts = bool(params_by_name.get("reuse_raw_artifacts", True))
+        should_keep_partial_artifacts = params_by_name.get("keep_partial_artifacts")
         if full_rebuild_scope_digest is not None:
             should_reuse_raw_artifacts = False
             should_keep_partial_artifacts = False
         await raise_if_cancelled(ctx, task_payload)
         _assert_expected_lane(params_by_name)
+        collection_proof = validated_collection_dispatch("ptg", params_by_name)
         with _ptg_lane_environment(params_by_name):
             import_result = await ptg_main(
                 test_mode=bool(
@@ -275,46 +259,44 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                         params_by_name.get("test", False),
                     )
                 ),
-                toc_urls=_string_list(
-                    params_by_name.get("toc_urls")
-                    or params_by_name.get("toc_url")
-                ),
+                toc_urls=_string_list(params_by_name.get("toc_urls") or params_by_name.get("toc_url")),
                 toc_list=params_by_name.get("toc_list"),
                 in_network_url=params_by_name.get("in_network_url"),
-                **({"in_network_urls": params_by_name["in_network_urls"]} if "in_network_urls" in params_by_name else {}),
+                **(
+                    {"in_network_urls": params_by_name["in_network_urls"]}
+                    if "in_network_urls" in params_by_name
+                    else {}
+                ),
                 allowed_url=params_by_name.get("allowed_url"),
                 **protected_rate_main_kwargs(params_by_name),
+                **(
+                    {
+                        "cigna_toc_collection_proof": collection_proof,
+                        "source_file_import_id": params_by_name["source_file_import_id"],
+                    }
+                    if collection_proof is not None
+                    else {}
+                ),
                 provider_ref_url=params_by_name.get("provider_ref_url"),
                 import_id=params_by_name.get("import_id"),
                 source_key=params_by_name.get("source_key"),
                 import_month=params_by_name.get("import_month"),
                 max_files=_optional_int(params_by_name.get("max_files")),
                 max_items=_optional_int(params_by_name.get("max_items")),
-                plan_ids=_string_list(
-                    params_by_name.get("plan_ids")
-                    or params_by_name.get("plan_id")
-                ),
-                plan_name_contains=_string_list(
-                    params_by_name.get("plan_name_contains")
-                ),
+                plan_ids=_string_list(params_by_name.get("plan_ids") or params_by_name.get("plan_id")),
+                plan_name_contains=_string_list(params_by_name.get("plan_name_contains")),
                 plan_market_types=_string_list(
-                    params_by_name.get("plan_market_types")
-                    or params_by_name.get("plan_market_type")
+                    params_by_name.get("plan_market_types") or params_by_name.get("plan_market_type")
                 ),
-                file_url_contains=_string_list(
-                    params_by_name.get("file_url_contains")
-                ),
+                file_url_contains=_string_list(params_by_name.get("file_url_contains")),
                 source_network_names=_string_list(
-                    params_by_name.get("source_network_names")
-                    or params_by_name.get("source_network_name")
+                    params_by_name.get("source_network_names") or params_by_name.get("source_network_name")
                 ),
                 reuse_raw_artifacts=should_reuse_raw_artifacts,
                 keep_partial_artifacts=should_keep_partial_artifacts,
                 control_run_id=run_id,
                 control_attempt_id=attempt_id,
-                control_attempt_started_at=(
-                    attempt_started_at if run_id else None
-                ),
+                control_attempt_started_at=(attempt_started_at if run_id else None),
                 **(
                     {"full_rebuild_scope_digest": full_rebuild_scope_digest}
                     if full_rebuild_scope_digest is not None
@@ -331,11 +313,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             status="canceled",
             phase_detail="ptg import canceled",
             progress_message="canceled",
-            **(
-                {"metrics": failure_metrics_by_name}
-                if failure_metrics_by_name
-                else {}
-            ),
+            **({"metrics": failure_metrics_by_name} if failure_metrics_by_name else {}),
             attempt_id=attempt_id,
             attempt_started_at=attempt_started_at if run_id else None,
         )
@@ -352,11 +330,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             phase_detail="ptg import interrupted",
             progress_message="interrupted",
             error={"code": "import_interrupted", "message": "worker task was cancelled"},
-            **(
-                {"metrics": failure_metrics_by_name}
-                if failure_metrics_by_name
-                else {}
-            ),
+            **({"metrics": failure_metrics_by_name} if failure_metrics_by_name else {}),
             attempt_id=attempt_id,
             attempt_started_at=attempt_started_at if run_id else None,
         )
@@ -396,20 +370,14 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
             if full_rebuild_proof_metrics_by_name
             else ptg_failure_error(exc)
         )
-        failure_metrics_by_name.update(
-            await load_blank_failure_metrics(params_by_name, failure_error_by_name)
-        )
+        failure_metrics_by_name.update(await load_blank_failure_metrics(params_by_name, failure_error_by_name))
         await mark_control_run(
             run_id,
             status="failed",
             phase_detail="ptg import failed",
             progress_message="failed",
             error=failure_error_by_name,
-            **(
-                {"metrics": failure_metrics_by_name}
-                if failure_metrics_by_name
-                else {}
-            ),
+            **({"metrics": failure_metrics_by_name} if failure_metrics_by_name else {}),
             attempt_id=attempt_id,
             attempt_started_at=attempt_started_at if run_id else None,
         )
@@ -432,10 +400,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
         phase_detail="ptg import succeeded",
         progress_message="succeeded",
         metrics=result_metrics_by_name or None,
-        snapshot_id=(
-            str(result_metrics_by_name.get("snapshot_id") or "").strip()
-            or None
-        ),
+        snapshot_id=(str(result_metrics_by_name.get("snapshot_id") or "").strip() or None),
         attempt_id=attempt_id,
         attempt_started_at=attempt_started_at if run_id else None,
     )
@@ -453,7 +418,10 @@ async def _claim_exact_wave_worker_start(
     """Bind a released wave job to its attested Pod before source admission."""
 
     claim_field_map = _exact_wave_claim_values(
-        ctx, params_by_name, run_id=run_id, claim_attempt_token=claim_attempt_token,
+        ctx,
+        params_by_name,
+        run_id=run_id,
+        claim_attempt_token=claim_attempt_token,
     )
     if claim_field_map is None:
         return
@@ -471,7 +439,10 @@ async def _reconcile_exact_wave_claim_exception(
 
     try:
         claim_field_map = _exact_wave_claim_values(
-            ctx, params_by_name, run_id=run_id, claim_attempt_token=claim_attempt_token,
+            ctx,
+            params_by_name,
+            run_id=run_id,
+            claim_attempt_token=claim_attempt_token,
         )
     except Exception:
         return None
@@ -535,9 +506,7 @@ def _full_rebuild_scope_digest(
     """Validate the opaque rebuild scope accepted from the control API."""
 
     if _FULL_REBUILD_TOKEN_PARAM in params:
-        raise ValueError(
-            "PTG workers accept only an internal full rebuild scope"
-        )
+        raise ValueError("PTG workers accept only an internal full rebuild scope")
     if _FULL_REBUILD_SCOPE_PARAM not in params:
         return None
     scope_digest = params[_FULL_REBUILD_SCOPE_PARAM]
