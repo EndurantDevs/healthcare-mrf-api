@@ -1017,23 +1017,17 @@ async def test_legacy_source_witness_publication_keeps_api_readers_pinned_throug
         assert await context.operator.connection.fetchval("SELECT session_user") in replay_actors
 
 
-async def _additional_source_capture(context, monkeypatch):
-    """Parameterize the existing single-Source fixture; all admission/capture code is genuine."""
+async def _stage_additional_source(fixture, monkeypatch):
+    """Create an independent Source candidate through the genuine writer transaction."""
     from tests import generic_source_successor_postgres_support as source
-    from tests.source_witness_capture_postgres_support import (
-        constructed_source_origin,
-        reviewed_source_origin,
-        source_modules,
-    )
 
-    case, fixture = context.case, context.case.fixture
     source_id, endpoint = "generic-second-source", "generic-second-endpoint"
     dataset, root = "generic-second-edition-1", "generic-second-root-1"
     database, directory = fixture.component.database, source.directory
     with monkeypatch.context() as selected:
         selected.setattr(source, "SOURCE", source_id)
-        rows = source._edition_rows(1, dataset)
-    kinds = tuple(sorted({row["resource_type"] for row in rows}))
+        resource_rows = source._edition_rows(1, dataset)
+    kinds = tuple(sorted({resource_row["resource_type"] for resource_row in resource_rows}))
     candidate = directory.EndpointDatasetCandidate(
         endpoint_id=endpoint,
         dataset_id=dataset,
@@ -1070,16 +1064,33 @@ async def _additional_source_capture(context, monkeypatch):
         for kind in kinds:
             await directory._upsert_dataset_resource_rows_on_connection(
                 connection,
-                [row for row in rows if row["resource_type"] == kind],
+                [resource_row for resource_row in resource_rows if resource_row["resource_type"] == kind],
                 persist_content_proof=True,
                 resource_hash_contract=candidate.resource_hash_contract,
                 semantic_projection_as_of=candidate.semantic_projection_as_of,
             )
+    return candidate, resource_rows
+
+
+async def _additional_source_capture(context, monkeypatch):
+    """Parameterize the existing single-Source fixture; all admission/capture code is genuine."""
+    from tests import generic_source_successor_postgres_support as source
+    from tests.source_witness_capture_postgres_support import (
+        constructed_source_origin,
+        reviewed_source_origin,
+        source_modules,
+    )
+
+    case, fixture = context.case, context.case.fixture
+    candidate, resource_rows = await _stage_additional_source(fixture, monkeypatch)
+    source_id, dataset = candidate.source_ids[0], candidate.dataset_id
+    database, directory = fixture.component.database, source.directory
+    kinds = candidate.expected_resources
     validated = await directory._validate_endpoint_dataset_candidate(
         candidate,
         {
             kind: {
-                "rows_fetched": sum(row["resource_type"] == kind for row in rows),
+                "rows_fetched": sum(resource_row["resource_type"] == kind for resource_row in resource_rows),
                 "complete": True,
             }
             for kind in kinds
@@ -1099,11 +1110,11 @@ async def _additional_source_capture(context, monkeypatch):
         origin = await reviewed_source_origin(case.source_runtime, case.source_profile, candidate, catalog, producer)
     assert await constructed_source_origin(case.source_export, case.source_profile, origin) == origin
     second = SimpleNamespace(**{**vars(case), "origin": origin})
-    arguments = {
+    capture_arguments_by_name = {
         **capture_arguments(second),
         "runtime_roles": context.runtime.runtime_roles,
     }
-    capture = await _capture(second, capture_module, arguments)
+    capture = await _capture(second, capture_module, capture_arguments_by_name)
     anchor = second.anchors_by_id[capture.capture_id]
     recipe = _source_recipe(capture, anchor)
     approved, network = await _approve_mapping(context.serving, recipe, capture, organization="network-one")
@@ -1116,13 +1127,54 @@ async def _additional_source_capture(context, monkeypatch):
     )
 
 
-async def test_distinct_source_addition_retains_prior_capture_and_readers(monkeypatch, record_property):
-    from process.network_approved_membership_source import pin_retained_approved_membership_source
-    from process.network_approved_source_bindings import ApprovedNetworkSourceBindingError
+async def _assert_source_addition_readers(context, second, other, source_composition, retained_network):
+    """Keep prior API readers pinned through adding a distinct Source and rolling back."""
     from process.registry_source_recipe_store import (
         canonical_registry_source_recipes,
         resolve_retained_registry_source_recipes,
     )
+
+    schema = context.worker.fixture.control_schema
+    async with _login(context.worker, "api") as reader:
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            original = await _membership_snapshot(reader, second)
+            assert all(len(family) == 2 for family in original)
+            assert {membership[0] for membership in original[0]} == {retained_network, context.network_id}
+            await _assert_stale_head_refusal(context, second.generation_id)
+            third = await _publish_once(context, head=second.generation_id, sources=source_composition)
+            assert await _membership_snapshot(reader, second) == original
+            assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == second
+    async with _login(context.worker, "api") as reader:
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            current = await _membership_snapshot(reader, third)
+            assert all(len(family) == 3 for family in current)
+            for before, after in zip(original, current, strict=True):
+                assert tuple(membership for membership in after if membership[0] != other.network) == before
+            introduced_rows = [membership for membership in current[0] if membership[0] == other.network]
+            assert len(introduced_rows) == 1
+            assert introduced_rows[0][1:4] == (
+                "npi",
+                "1234567893",
+                str(registry_location_id(other.capture.origin.source_id, "office-one")),
+            )
+            actual_recipes = await resolve_retained_registry_source_recipes(
+                reader, third, control_schema=schema, api_read=True
+            )
+            assert canonical_registry_source_recipes(actual_recipes) == canonical_registry_source_recipes(
+                source_composition.replacement_source_recipes
+            )
+            restored = await _publish_source_rollback(context, second, third, require_witness_replay=False)
+            assert await _membership_snapshot(reader, third) == current
+            assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == third
+    async with _login(context.worker, "api") as reader:
+        async with reader.transaction(isolation="repeatable_read", readonly=True):
+            assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == restored
+            assert await _membership_snapshot(reader, restored) == original
+
+
+async def test_distinct_source_addition_retains_prior_capture_and_readers(monkeypatch, record_property):
+    from process.network_approved_membership_source import pin_retained_approved_membership_source
+    from process.network_approved_source_bindings import ApprovedNetworkSourceBindingError
 
     async with _publication_case(monkeypatch) as context:
         context.replay_actors = []
@@ -1138,15 +1190,20 @@ async def test_distinct_source_addition_retains_prior_capture_and_readers(monkey
         second = await _publish_once(context, head=first.generation_id, sources=a_sources)
         other = await _additional_source_capture(context, monkeypatch)
         context.approved = other.approved
-        a, b = context.capture, other.capture
+        prior_capture, additional_capture = context.capture, other.capture
         assert all(
-            getattr(a.origin, field) != getattr(b.origin, field)
+            getattr(prior_capture.origin, field) != getattr(additional_capture.origin, field)
             for field in ("source_id", "endpoint_id", "dataset_id", "root_run_id", "resource_leaf_oid")
         )
-        assert a.capture_id != b.capture_id and a.capture_sha256 != b.capture_sha256
-        assert a.owner_role == b.owner_role == context.runtime.capture_owner_role
-        assert a.runtime_roles == b.runtime_roles == context.runtime.runtime_roles
-        sources = replace(a_sources, replacement_source_recipes=(*a_sources.replacement_source_recipes, other.recipe))
+        assert (
+            prior_capture.capture_id != additional_capture.capture_id
+            and prior_capture.capture_sha256 != additional_capture.capture_sha256
+        )
+        assert prior_capture.owner_role == additional_capture.owner_role == context.runtime.capture_owner_role
+        assert prior_capture.runtime_roles == additional_capture.runtime_roles == context.runtime.runtime_roles
+        source_composition = replace(
+            a_sources, replacement_source_recipes=(*a_sources.replacement_source_recipes, other.recipe)
+        )
         schema = context.worker.fixture.control_schema
         async with _login(context.worker, "execution") as execution:
             async with execution.transaction(isolation="repeatable_read", readonly=True):
@@ -1157,41 +1214,7 @@ async def test_distinct_source_addition_retains_prior_capture_and_readers(monkey
                     await recipes.require_source_witness_read(
                         execution, context.recipe, historical, schema, context.runtime
                     )
-        async with _login(context.worker, "api") as reader:
-            async with reader.transaction(isolation="repeatable_read", readonly=True):
-                original = await _membership_snapshot(reader, second)
-                assert all(len(family) == 2 for family in original)
-                assert {row[0] for row in original[0]} == {retained_network, context.network_id}
-                await _assert_stale_head_refusal(context, second.generation_id)
-                third = await _publish_once(context, head=second.generation_id, sources=sources)
-                assert await _membership_snapshot(reader, second) == original
-                assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == second
-        async with _login(context.worker, "api") as reader:
-            async with reader.transaction(isolation="repeatable_read", readonly=True):
-                current = await _membership_snapshot(reader, third)
-                assert all(len(family) == 3 for family in current)
-                for before, after in zip(original, current, strict=True):
-                    assert tuple(row for row in after if row[0] != other.network) == before
-                introduced = [row for row in current[0] if row[0] == other.network]
-                assert len(introduced) == 1
-                assert introduced[0][1:4] == (
-                    "npi",
-                    "1234567893",
-                    str(registry_location_id(b.origin.source_id, "office-one")),
-                )
-                actual_recipes = await resolve_retained_registry_source_recipes(
-                    reader, third, control_schema=schema, api_read=True
-                )
-                assert canonical_registry_source_recipes(actual_recipes) == canonical_registry_source_recipes(
-                    sources.replacement_source_recipes
-                )
-                restored = await _publish_source_rollback(context, second, third, require_witness_replay=False)
-                assert await _membership_snapshot(reader, third) == current
-                assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == third
-        async with _login(context.worker, "api") as reader:
-            async with reader.transaction(isolation="repeatable_read", readonly=True):
-                assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == restored
-                assert await _membership_snapshot(reader, restored) == original
+        await _assert_source_addition_readers(context, second, other, source_composition, retained_network)
         record_property("membership_and_provider_only_counts", "1 -> 2 -> 3 -> 2")
         record_property("distinct_sources_and_captures", "2")
         record_property("current_approval_remains_strict", "true")
