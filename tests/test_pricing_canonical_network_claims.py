@@ -329,8 +329,13 @@ async def test_canonical_zip_uses_nearby_zcta_anchor_before_count_and_page(canon
     historical.assert_not_awaited()
     assert len(request.ctx.sa_session.executions) == 3
     (lookup, parameters), _ = request.ctx.sa_session.executions[0]
-    assert str(lookup) == "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
+    assert [relation.fullname for relation in lookup.get_final_froms()] == ["tiger.zcta5"]
     assert parameters == {"zip_code": "10001"}
+    lookup_sql = str(
+        lookup.params(**parameters).compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+    )
+    assert "WHERE tiger.zcta5.zcta5ce = '10001'" in lookup_sql
+    assert lookup_sql.endswith("LIMIT 1")
     for (statement, *_), _ in request.ctx.sa_session.executions[1:]:
         compiled = statement.compile(dialect=postgresql.dialect())
         assert "ST_DWithin(" in str(compiled) and "EXISTS (SELECT" in str(compiled)

@@ -10,16 +10,25 @@ from typing import Any
 from uuid import UUID
 
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import BigInteger, column, select, table, text
+from sqlalchemy import BigInteger, bindparam, column, select, table, text
 
 from api.custom_import_provider_sql import ProviderImportQuery
 from api.provider_list_sql import _provider_list_connection, _provider_list_parameters
+from db.tiger_models import Zip_zcta5
 
 _IMPORT_RELATION = "custom_import_provider_relation"
 _NATIVE_GEO_RELATION = "native_eligible_geo"
 _PAGE_LIMIT_PARAMETER = "__custom_import_geo_page_limit"
 _CURSOR_NPI_PARAMETER = "__custom_import_geo_cursor_npi"
 _CURSOR_ADDRESS_KEY_PARAMETER = "__custom_import_geo_cursor_address_key"
+
+
+def canonical_zip_anchor_statement():
+    """Resolve the first ZIP against the canonical relation, independent of search_path."""
+    zip_table = Zip_zcta5.__table__
+    return (
+        select(zip_table.c.intptlat, zip_table.c.intptlon).where(zip_table.c.zcta5ce == bindparam("zip_code")).limit(1)
+    )
 
 
 @dataclass(frozen=True, slots=True)

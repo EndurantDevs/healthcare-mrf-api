@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import MetaData, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from api import provider_geo_sql
 from api.endpoint import pricing
 from api.network_address_scope import network_address_read_scope
 from process.network_membership_candidate_indexes import prepare_network_candidate_indexes
@@ -234,6 +235,8 @@ async def zip_claims_offices(claims_offices, serving_schema, monkeypatch, reques
     context = claims_offices
     fixture = context.fixture
     schema = fixture.control_schema
+    canonical_table = provider_geo_sql.Zip_zcta5.__table__.to_metadata(MetaData(), schema=schema)
+    monkeypatch.setattr(provider_geo_sql, "Zip_zcta5", SimpleNamespace(__table__=canonical_table))
     await fixture.connection.execute(
         f'CREATE TABLE "{schema}".zcta5 (zcta5ce text PRIMARY KEY, intptlat text, intptlon text)'
     )
