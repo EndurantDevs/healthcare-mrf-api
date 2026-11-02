@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
 
 import asyncpg
+import pytest
 from sqlalchemy.engine import make_url
 
 from process import provider_directory_cms_serving as source_serving
@@ -295,7 +296,10 @@ async def _publish_initial_manifest(case, *, serving_custody):
 @asynccontextmanager
 async def native_catalog_case(settings, tmp_path, *, organization_maps=True, serving_custody=False):
     """Create one exact owned native Source/registry fixture with registered cleanup."""
-    base = make_url(os.environ["NETWORK_REGISTRY_TEST_DSN"]).set(drivername="postgresql+asyncpg")
+    dsn = os.getenv("NETWORK_REGISTRY_TEST_DSN")
+    if not dsn:
+        pytest.skip("NETWORK_REGISTRY_TEST_DSN must explicitly select an isolated database")
+    base = make_url(dsn).set(drivername="postgresql+asyncpg")
     async with (
         imported._owned_database(base) as (owned, actor_admin),
         _catalog_metadata_actors(actor_admin, serving_custody) as actors,

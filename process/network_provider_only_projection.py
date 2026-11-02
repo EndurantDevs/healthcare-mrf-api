@@ -38,6 +38,7 @@ from process.registry_source_contribution_store import (
     copy_fhir_fact_page,
     copy_fhir_source_witness_page_v2,
     create_contribution_stage,
+    create_witness_mapping_workspace,
     decode_fhir_source_witness_page_v2,
     map_fhir_facts,
     map_fhir_source_witnesses_v2,
@@ -238,10 +239,18 @@ async def append_provider_only_source(connection, copy_target, recipe, descripto
             connection, [descriptor], control_schema=_control_namespace(control_schema)[1:-1]
         )
         fact_relation = artifacts[native["recipe_sha256"]].relation
-    mapper = map_fhir_source_witnesses_v2 if native.get("descriptor_version") == 2 else map_fhir_facts
-    actual = await mapper(
-        connection, recipe, approved, fact_relation, "unused_provider_only", control_schema, insert=False
-    )
+    mapping_table = "provider_only_map_" + uuid4().hex
+    workspace_name = None
+    try:
+        if native.get("descriptor_version") == 2:
+            workspace_name = await create_witness_mapping_workspace(connection, mapping_table)
+        mapper = map_fhir_source_witnesses_v2 if native.get("descriptor_version") == 2 else map_fhir_facts
+        actual = await mapper(connection, recipe, approved, fact_relation, mapping_table, control_schema, insert=False)
+    finally:
+        if workspace_name is not None:
+            await drain_operation(
+                connection.execute(f"DROP TABLE pg_temp.{_identifier(workspace_name)}"), preserve_cancellation=True
+            )
     _require(actual == native)
     await _append(
         connection,
@@ -405,6 +414,7 @@ async def verify_provider_only_projection(
     async with _expected_evidence(connection) as (name, expected):
         facts = name + "_facts"
         fact_relation = "pg_temp." + _identifier(facts)
+        workspace_name = None
         try:
             await create_contribution_stage(connection, facts)
             async for recipe, descriptor in source_entries:
@@ -419,16 +429,20 @@ async def verify_provider_only_projection(
                 await _rebuild_source(
                     connection, recipe, facts, approved, control_schema, office_authority, descriptor_version=version
                 )
+                if version == 2 and workspace_name is None:
+                    workspace_name = await create_witness_mapping_workspace(connection, name)
                 mapper = map_fhir_source_witnesses_v2 if version == 2 else map_fhir_facts
-                rebuilt = await mapper(
-                    connection, recipe, approved, fact_relation, "unused_provider_only", control_schema, insert=False
-                )
+                rebuilt = await mapper(connection, recipe, approved, fact_relation, name, control_schema, insert=False)
                 _require(rebuilt == native)
                 await _append(
                     connection, expected, fact_relation, recipe, approved, control_schema, descriptor_version=version
                 )
             return await _expected_receipt(connection, copy_target, expected, source_count, identities.hexdigest())
         finally:
+            if workspace_name is not None:
+                await drain_operation(
+                    connection.execute(f"DROP TABLE pg_temp.{_identifier(workspace_name)}"), preserve_cancellation=True
+                )
             await drain_operation(
                 connection.execute(f"DROP TABLE IF EXISTS {fact_relation}"), preserve_cancellation=True
             )

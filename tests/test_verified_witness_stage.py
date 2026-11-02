@@ -147,13 +147,22 @@ async def test_per_recipe_maps_actual_witness_contract_and_keeps_original_anchor
         if reuse
         else None
     )
-    result = await stage._stage_witness_source(
-        object(), recipe, APPROVED, "synthetic", ("facts", "members"), {}, artifact
+    connection = SimpleNamespace(execute=AsyncMock())
+    staged_source = await stage._stage_witness_source(
+        connection, recipe, APPROVED, "synthetic", ("facts", "members"), {}, artifact
     )
-    assert result.table_name == "members"
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert statements[0].startswith("CREATE TEMP TABLE")
+    assert statements[1] == f'DROP TABLE pg_temp."{store.witness_mapping_workspace_name("members")}"'
+    assert staged_source.table_name == "members"
     assert mapper.await_args.args[3] == (artifact.relation if reuse else 'pg_temp."facts"')
     assert authorizer.await_count == 2 and capture.await_count == (0 if reuse else 1)
-    assert result.descriptor["fact_candidate_id"] == (str(UUID(int=9)) if reuse else None)
+    assert staged_source.descriptor["fact_candidate_id"] == (str(UUID(int=9)) if reuse else None)
+    connection.execute.reset_mock()
+    mapper.side_effect = RuntimeError("mapping failed")
+    with pytest.raises(RuntimeError, match="mapping failed"):
+        await stage._stage_witness_source(connection, recipe, APPROVED, "synthetic", ("facts", "members"), {}, artifact)
+    assert connection.execute.await_args.args[0] == statements[1]
 
 
 async def test_source_authorization_is_required_before_census_or_fact_reuse(monkeypatch):

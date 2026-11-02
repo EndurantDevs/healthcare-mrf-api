@@ -4,6 +4,7 @@
 import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
+from time import monotonic
 
 from process.control_cancel import ImportCancelledError
 from process.live_progress import current_live_progress_context, enqueue_live_progress
@@ -32,6 +33,8 @@ class FHIRCatalogRunReport:
         }
         self._reserved_bytes = len(fhir_catalog_json_bytes(self.document)) + _ROW_RESERVE
         self._rows_by_generation = {}
+        self._observed_rows = 0
+        self._last_observation_progress = 0.0
         self.audit = {"fhir_catalog_sync": self.document}
 
     def add_profile(self, profile):
@@ -140,21 +143,45 @@ class FHIRCatalogRunReport:
             row["outcome"] = "prepared"
         self.progress("preparing")
 
-    def progress(self, phase):
+    def observation_progress(self, dataset_id, rows):
+        """Count inspected resource pages without treating them as admitted source rows."""
+        self._observed_rows += rows
+        now = monotonic()
+        if rows and now - self._last_observation_progress < 2.0:
+            return
+        self._last_observation_progress = now
+        self.progress(self.document["phase"], dataset_id=dataset_id)
+
+    def progress(self, phase, *, dataset_id=None):
         """Use existing attempt-fenced dashboard progress with fixed aggregate fields."""
         self.document["phase"] = phase
         if not current_live_progress_context().get("run_id"):
             return
-        rows = self.document["sources"]
-        done = sum(row["outcome"] not in {"not_started", "preparing"} for row in rows)
+        source_outcomes = self.document["sources"]
+        done = sum(source_outcome["outcome"] not in {"not_started", "preparing"} for source_outcome in source_outcomes)
+        total = len(source_outcomes) if self.document["inventory_complete"] else None
+        message = (
+            f"FHIR catalog: {phase}; {len(source_outcomes)} sources inspected; {done} source outcomes recorded; "
+            f"{self._observed_rows} resource rows scanned"
+        )
+        if dataset_id is not None:
+            message += f"; observing {dataset_id}"
+        # shortcut: delayed callbacks may show older diagnostic counts; add ordering if observed.
         enqueue_live_progress(
             importer="registry-fhir-catalog-sync",
             status="running",
             phase=phase,
+            stage_id=phase,
+            source="fhir-catalog-progress",
             unit="source",
+            basis="semantic_work",
+            denominator_state="known" if total is not None else "unknown",
             done=done,
-            total=len(rows) if self.document["inventory_complete"] else None,
-            message=f"FHIR catalog: {phase}; {done} source outcomes recorded",
+            total=total,
+            pct=100 * done / total if total else None,
+            counters={"sources_inspected": len(source_outcomes), "resource_rows_scanned": self._observed_rows},
+            file_name=dataset_id or "",
+            message=message,
         )
 
     def publication_started(self):

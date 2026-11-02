@@ -113,8 +113,13 @@ async def test_worker_result_uses_existing_control_metrics_without_sealed_accoun
     from tests.test_registry_fhir_catalog_reporting import disposition
 
     config = control.RegistryFHIRCatalogSyncConfig(None, None, None, None, None, None, None, "example", ())
+    events = []
+    monkeypatch.setattr(reporting, "current_live_progress_context", lambda: {"run_id": "synthetic-run"})
+    monkeypatch.setattr(reporting, "enqueue_live_progress", lambda **payload: events.append(payload))
 
     async def reconcile(_config):
+        assert len(events) == 1 and events[0]["phase"] == "discovery"
+        assert events[0]["denominator_state"] == "unknown"
         report = reporting.current_fhir_catalog_report()
         report.add_sources((disposition(),), generations=("a" * 64,))
         report.inventory_ready({"a" * 64: object()}, None)
