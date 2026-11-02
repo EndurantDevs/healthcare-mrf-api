@@ -296,6 +296,8 @@ class RegistryNetworkCatalogLegacyBatchSelector:
             raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
 
 
+# A scalar lookup keeps the one-office stop local to each page network; EXISTS
+# can instead build an all-network alternative before returning the first item.
 _BASE_SQL = """
 WITH approved AS MATERIALIZED (
   SELECT record_kind,record_key,record_revision,record_json
@@ -366,14 +368,14 @@ WITH approved AS MATERIALIZED (
   SELECT jsonb_build_object('network_id',page.network_id,'display_name',page.record_json->'display_name',
     'aliases',page.record_json->'aliases','archived',page.record_json->'archived',
     'revision',page.record_revision,
-    'directory_available',EXISTS(SELECT 1 FROM {candidate}.network_membership membership
+    'directory_available',coalesce((SELECT true FROM {candidate}.network_membership membership
       JOIN {candidate}.provider_location_binding location
         ON (location.provider_system,location.provider_id,location.location_id)=
           (membership.provider_system,membership.provider_id,membership.location_id)
       JOIN {addresses} address
         ON (address.location_key,address.entity_type,address.entity_id)=
           (location.location_key,location.entity_type,location.entity_id)
-      WHERE membership.network_id=page.network_id),
+      WHERE membership.network_id=page.network_id LIMIT 1),false),
     'priceable',NULL,'benefit_codes',(SELECT to_jsonb(benefit_codes) FROM declared_benefits
       WHERE network_id=page.network_id),
     'companies',coalesce((SELECT jsonb_agg(document ORDER BY document->>'company_id')
@@ -418,7 +420,7 @@ def catalog_directory_relation(manifest, *, first_parameter):
         if len(matches) != 1:
             raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
         relations.append(matches[0])
-    # The enclosing EXISTS proves this network's exact office membership.
+    # The bounded lookup proves this network's exact office membership.
     addresses, parameters = compact_address_native_sql(
         manifest.compact_layout, first_parameter=first_parameter, visible_membership_sql="TRUE"
     )

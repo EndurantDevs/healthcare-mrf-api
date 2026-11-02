@@ -2150,6 +2150,48 @@ async def test_native_privileged_directory_corruption_requires_full_validation(c
             )
 
 
+@pytest.mark.parametrize(
+    "relation,column,replacement",
+    [
+        ("network_membership", "network_id", 2147483647),
+        ("provider_location_binding", "provider_system", "npi"),
+        ("provider_location_binding", "provider_id", "different-provider"),
+        ("network_membership", "location_id", UUID("11111111-1111-4111-8111-111111111111")),
+        ("provider_location_binding", "location_key", "f" * 64),
+        ("provider_location_binding", "entity_type", "different-kind"),
+        ("provider_location_binding", "entity_id", "different-entity"),
+    ],
+)
+async def test_directory_boolean_keeps_every_office_identity(catalog_db, relation, column, replacement):
+    """Multiple matching offices stay boolean; each broken identity still removes availability."""
+    fixture, extra_location = catalog_db, uuid4()
+    namespace = catalog._identifier(fixture.manifest.schema_name)
+    before = await _page(fixture)
+    assert [network["directory_available"] for network in before["items"]] == [True, False, False]
+    async with fixture.connection.transaction():
+        await fixture.connection.execute(
+            f"INSERT INTO {namespace}.provider_location_binding "
+            "(provider_system,provider_id,location_id,location_key,entity_type,entity_id) "
+            f"SELECT provider_system,provider_id,$1,location_key,entity_type,entity_id "
+            f"FROM {namespace}.provider_location_binding LIMIT 1",
+            extra_location,
+        )
+        await fixture.connection.execute(
+            f"INSERT INTO {namespace}.network_membership "
+            "(network_id,provider_system,provider_id,location_id,evidence_id) "
+            f"SELECT network_id,provider_system,provider_id,$1,evidence_id "
+            f"FROM {namespace}.network_membership LIMIT 1",
+            extra_location,
+        )
+    assert await _page(fixture) == before
+    await fixture.connection.execute(
+        f"UPDATE {namespace}.{catalog._identifier(relation)} SET {catalog._identifier(column)}=$1", replacement
+    )
+    after = await _page(fixture)
+    expected_items = tuple({**network, "directory_available": False} for network in before["items"])
+    assert after == {**before, "items": expected_items}
+
+
 @pytest.mark.parametrize("loss", ["canonical_not_null", "index_definition", "runtime_write"])
 async def test_native_catalog_checks_current_column_indexes_and_write_closure(catalog_db, loss):
     """Retained full proof does not excuse native readiness or ordinary writer drift."""
