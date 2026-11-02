@@ -1249,10 +1249,9 @@ async def _witness_mapping_passes(
         source_binding,
     )
     insert_sql = f"""INSERT INTO pg_temp.{_identifier(raw_table)}
-      SELECT status.network_id,edges.fact_json->>'provider_system',edges.fact_json->>'provider_id',
-        (edges.fact_json->>'location_id')::uuid,
-        encode(sha256(convert_to(jsonb_set(edges.fact_json->'evidence_basis','{{6}}',to_jsonb(status.network_id))::text,'UTF8')),'hex')
-      FROM edge_status status JOIN edges USING(ordinal) WHERE status.accepted AND status.has_location
+      SELECT status.network_id,status.provider_system,status.provider_id,status.raw_location_id::uuid,
+        encode(sha256(convert_to(jsonb_set(status.evidence_basis,'{{6}}',to_jsonb(status.network_id))::text,'UTF8')),'hex')
+      FROM edge_status status WHERE status.accepted AND status.has_location
         AND NOT EXISTS(SELECT 1 FROM invalid) RETURNING 1"""
     query = WITNESS_MAP_SQL_V2.format(
         bindings=APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema)),
