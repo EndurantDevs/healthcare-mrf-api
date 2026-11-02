@@ -761,15 +761,20 @@ async def test_connection_proxy_helpers(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_acquire_driver_avoids_managed_transaction_and_invalidates_on_error():
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+async def test_acquire_driver_keeps_cleanup_for_pooled_and_detached_calls(detached, failure):
     driver_connection = SimpleNamespace()
+    raw_connection = SimpleNamespace(driver_connection=driver_connection, detach=MagicMock())
+    raw_connection.detach.side_effect = lambda: setattr(raw_connection, "driver_connection", None)
 
     class FakeConnection:
         def __init__(self):
             self.invalidated = False
+            self.closed = False
 
         async def get_raw_connection(self):
-            return SimpleNamespace(driver_connection=driver_connection)
+            return raw_connection
 
         async def invalidate(self):
             self.invalidated = True
@@ -781,17 +786,23 @@ async def test_acquire_driver_avoids_managed_transaction_and_invalidates_on_erro
             return connection
 
         async def __aexit__(self, exc_type, exc, tb):
+            connection.closed = True
             return False
 
     engine = SimpleNamespace(connect=lambda: ConnectContext())
     database = Database(engine=engine)
-
-    with pytest.raises(RuntimeError, match="copy failed"):
-        async with database.acquire_driver() as acquired:
+    if failure is None:
+        async with database.acquire_driver(detached=detached) as acquired:
             assert acquired is driver_connection
-            raise RuntimeError("copy failed")
-
-    assert connection.invalidated
+            assert raw_connection.detach.call_count == int(detached)
+    else:
+        with pytest.raises(failure, match="copy failed"):
+            async with database.acquire_driver(detached=detached) as acquired:
+                assert acquired is driver_connection
+                assert raw_connection.detach.call_count == int(detached)
+                raise failure("copy failed")
+    assert connection.invalidated is (failure is not None)
+    assert connection.closed
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ from api.control_workers import (
     exact_worker_presence,
 )
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
+from process import mrf_discovery_acquisition_guard as mrf_acquisition
 from process import npi_isolated_execution as npi_execution
 from process.control_lifecycle import (
     _SOURCE_PROFILE_IMPORTERS_BY_MODULE,
@@ -1098,6 +1099,7 @@ async def node_health() -> dict[str, Any]:
         "node_id": os.getenv("HLTHPRT_IMPORT_NODE_ID"),
         "status": "degraded" if failing_checks else "ok",
         "checks": health_checks_by_name,
+        "mrf_acquisition_dataset": health_checks_by_name["database"].get("mrf_acquisition_dataset"),
         "failing_checks": failing_checks,
         "time": dt.datetime.now(dt.UTC).isoformat(),
         "features": {
@@ -1187,11 +1189,7 @@ def _ram_status() -> dict[str, int | None]:
 
 
 async def _database_check() -> dict[str, Any]:
-    try:
-        await db.execute(text("SELECT 1"))
-        return {"ok": True}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+    return await mrf_acquisition.database_health(db)
 
 
 def _redis_check() -> dict[str, Any]:
@@ -3544,9 +3542,9 @@ async def create_import_run(
         importer, request_payload_map.get("params") if request_payload_map.get("params") is not None else {}
     )
     _validate_registry_cms_source_params(importer, request_payload_map.get("params"))
-    raw_params_by_name = (
-        request_payload_map.get("params") if isinstance(request_payload_map.get("params"), dict) else {}
-    )
+    raw_params_by_name = request_payload_map.get("params")
+    raw_params_by_name = raw_params_by_name if isinstance(raw_params_by_name, dict) else {}
+    await mrf_acquisition.require_acquisition(dict(request_payload_map, importer=importer, params=raw_params_by_name))
     from process.provider_directory_serving_recovery import is_recovery_request
 
     is_recovery_request(importer, raw_params_by_name)
@@ -5047,4 +5045,6 @@ async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[s
         "import_id": current.get("import_id"),
         "retry_of_run_id": run_id,
     }
+    if current["importer"] == mrf_acquisition.IMPORTER:
+        child_run_payload_map["run_id"] = payload.get("run_id")
     return await create_import_run(child_run_payload_map)

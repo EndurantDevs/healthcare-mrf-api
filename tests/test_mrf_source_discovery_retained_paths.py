@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import datetime as dt
 import json
 from types import SimpleNamespace
@@ -771,3 +772,145 @@ def test_issuer_monthly_toc_defaults_and_deduplicates(monkeypatch, offsets):
     assert target.url == "https://adapter.example.invalid/landing/2026-01-01_Example_index.json"
     assert target.metadata["issuer_slug"] == "Example"
     assert target.metadata["month_start"] == "2026-01-01"
+
+
+def _install_blocked_probe(monkeypatch, driver, events_by_name, child_tasks):
+    """Block metadata persistence until the test releases cancellation cleanup."""
+    original_worker = discovery._file_probe_worker
+    http_session = _Session(_Response())
+    probe_targets = [
+        {"mrf_file_id": f"file-{number}", "url": f"https://example.invalid/{number}"} for number in range(10)
+    ]
+
+    async def worker(context, http):
+        child_tasks.add(asyncio.current_task())
+        await original_worker(context, http)
+
+    async def blocked_metadata(_rows):
+        child_tasks.add(asyncio.current_task())
+        assert driver.locked
+        events_by_name["writing"].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events_by_name["draining"].set()
+            await events_by_name["finish"].wait()
+            assert driver.locked
+            events_by_name["settled"].set()
+
+    monkeypatch.setattr(discovery, "_file_probe_worker", worker)
+    monkeypatch.setattr(discovery, "_update_mrf_file_probe_metadata", blocked_metadata)
+    monkeypatch.setattr(discovery, "_load_file_probe_targets", AsyncMock(return_value=probe_targets))
+    monkeypatch.setattr(
+        discovery,
+        "_head_url",
+        AsyncMock(return_value={"status": "ok", "etag": "synthetic", "checked_at": dt.datetime(2026, 1, 1)}),
+    )
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", Mock(return_value=http_session))
+    monkeypatch.setattr(discovery, "_tcp_connector", Mock(return_value=None))
+    monkeypatch.setattr(discovery, "push_objects", AsyncMock())
+    monkeypatch.setattr(discovery, "WRITE_BATCH_SIZE", 1)
+    return http_session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_again", [False, True])
+async def test_probe_cancellation_drains_blocked_metadata_writer_before_guard_unlock(monkeypatch, cancel_again):
+    """Keep the dataset lock until cancelled probe writers finish draining."""
+    from process import mrf_discovery_acquisition_guard as guard
+    from tests.test_mrf_discovery_acquisition_guard import Driver, bind_driver
+
+    driver = Driver()
+    bind_driver(monkeypatch, driver)
+    monkeypatch.setenv(guard.CONTROL_RELATION_ENV, "discovery_control.reservations")
+    events_by_name = {name: asyncio.Event() for name in ("writing", "draining", "finish", "settled")}
+    child_tasks = set()
+    http_session = _install_blocked_probe(monkeypatch, driver, events_by_name, child_tasks)
+
+    async def command(crawl=False, dry_run=False, run_id=None):
+        async with guard.acquisition_command(command, {"crawl": crawl, "dry_run": dry_run, "run_id": run_id}):
+            await discovery._probe_mrf_file_heads(file_types=(), limit=None, run_id=run_id, concurrency=1)
+
+    task = asyncio.create_task(command(crawl=True, run_id=driver.local["run_id"]))
+    try:
+        await asyncio.wait_for(events_by_name["writing"].wait(), timeout=1)
+        task.cancel()
+        await asyncio.wait_for(events_by_name["draining"].wait(), timeout=1)
+        assert driver.locked and not task.done() and not http_session.exited
+        if cancel_again:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert driver.locked and not task.done()
+        events_by_name["finish"].set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        assert events_by_name["settled"].is_set() and all(child.done() for child in child_tasks)
+        assert not driver.locked and http_session.exited
+    finally:
+        events_by_name["finish"].set()
+        task.cancel()
+        for child in child_tasks:
+            child.cancel()
+        await asyncio.gather(task, *child_tasks, return_exceptions=True)
+
+
+def _install_failed_probe(monkeypatch, fault):
+    """Fail one child while its sibling's cancellation cleanup remains blocked."""
+    events_by_name = {name: asyncio.Event() for name in ("worker", "writer", "draining", "finish")}
+    child_tasks = set()
+    failures_by_name = {
+        "worker": ValueError("synthetic worker failure"),
+        "writer": RuntimeError("synthetic writer failure"),
+    }
+    first_failure = "writer" if fault == "multiple" else fault
+
+    async def child(name):
+        child_tasks.add(asyncio.current_task())
+        events_by_name[name].set()
+        try:
+            if name == first_failure:
+                await events_by_name["writer" if name == "worker" else "worker"].wait()
+                raise failures_by_name[name]
+            await asyncio.Event().wait()
+        finally:
+            if name != first_failure:
+                events_by_name["draining"].set()
+                await events_by_name["finish"].wait()
+                if fault == "multiple":
+                    raise failures_by_name[name]
+
+    http = _Session(_Response())
+    monkeypatch.setattr(discovery, "_file_probe_worker", lambda _context, _http: child("worker"))
+    monkeypatch.setattr(discovery, "_file_probe_writer", lambda _context: child("writer"))
+    monkeypatch.setattr(discovery, "_load_file_probe_targets", AsyncMock(return_value=[{"url": URL}]))
+    monkeypatch.setattr(discovery.aiohttp, "ClientSession", Mock(return_value=http))
+    monkeypatch.setattr(discovery, "_tcp_connector", Mock(return_value=None))
+    return events_by_name, child_tasks, failures_by_name, http
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["worker", "writer", "multiple"])
+async def test_probe_failure_preserves_original_cause_only_after_sibling_drain(monkeypatch, fault):
+    """Unwrap one genuine child failure while retaining complete multiple-failure groups."""
+    events_by_name, child_tasks, failures_by_name, http = _install_failed_probe(monkeypatch, fault)
+    task = asyncio.create_task(discovery._probe_mrf_file_heads(file_types=(), limit=None, run_id=None, concurrency=1))
+    try:
+        await asyncio.wait_for(events_by_name["draining"].wait(), timeout=1)
+        assert not task.done() and not http.exited
+        events_by_name["finish"].set()
+        if fault == "multiple":
+            with pytest.raises(ExceptionGroup) as raised:
+                await asyncio.wait_for(task, timeout=1)
+            assert set(raised.value.exceptions) == set(failures_by_name.values())
+        else:
+            with pytest.raises(type(failures_by_name[fault])) as raised:
+                await asyncio.wait_for(task, timeout=1)
+            assert raised.value is failures_by_name[fault]
+            assert str(raised.value) == "synthetic " + fault + " failure"
+        assert all(child.done() for child in child_tasks) and http.exited
+    finally:
+        events_by_name["finish"].set()
+        task.cancel()
+        for child in child_tasks:
+            child.cancel()
+        await asyncio.gather(task, *child_tasks, return_exceptions=True)

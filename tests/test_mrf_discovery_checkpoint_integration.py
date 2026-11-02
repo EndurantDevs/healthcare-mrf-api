@@ -11,6 +11,17 @@ from process import mrf_source_discovery as discovery
 from process.mrf_discovery_checkpoints import SourceBatchSummary, source_set_sha256
 
 
+@pytest.fixture(autouse=True)
+def admitted_acquisition(monkeypatch):
+    """These checkpoint fakes run after the separately tested admission boundary."""
+
+    @asynccontextmanager
+    async def admitted(*args):
+        yield
+
+    monkeypatch.setattr(discovery, "acquisition_command", admitted)
+
+
 def _completed_summary() -> SourceBatchSummary:
     source_digest = source_set_sha256(["source_alpha"])
     return SourceBatchSummary(
@@ -29,12 +40,17 @@ def _completed_summary() -> SourceBatchSummary:
 
 def _install_retry_discovery_fakes(monkeypatch) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Install the isolated retry dependencies and return their observations."""
-    source_records = [{
-        "source_id": "source_alpha", "payer_id": "payer_alpha", "status": "active",
-        "index_url": "https://example.test/index.json",
-        "metadata_json": {"discovery_run_id": "run_root"},
-    }]
+    source_records = [
+        {
+            "source_id": "source_alpha",
+            "payer_id": "payer_alpha",
+            "status": "active",
+            "index_url": "https://example.test/index.json",
+            "metadata_json": {"discovery_run_id": "run_root"},
+        }
+    ]
     captured_by_key: dict[str, Any] = {}
+
     class FakeCheckpointStore:
         async def resume_batch(self, root_run_id, owner_run_id, retry_of_run_id):
             captured_by_key["resume"] = (root_run_id, owner_run_id, retry_of_run_id)
@@ -106,10 +122,7 @@ async def test_retry_uses_frozen_source_set_and_publishes_exact_proof(monkeypatc
     assert discovery_summary["source_set_count"] == 1
     assert discovery_summary["completed_source_count"] == 1
     assert discovery_summary["failed_source_count"] == 0
-    assert (
-        discovery_summary["source_set_sha256"]
-        == discovery_summary["completed_source_set_sha256"]
-    )
+    assert discovery_summary["source_set_sha256"] == discovery_summary["completed_source_set_sha256"]
     assert discovery_summary["plans"] == 2
     assert discovery_summary["files"] == 3
 
@@ -150,7 +163,4 @@ async def test_unbounded_discovery_rejects_empty_source_set(monkeypatch):
             run_id="run_empty",
         )
 
-    assert (
-        captured_by_key["failure"]["error_dict"]["code"]
-        == "source_discovery_failed"
-    )
+    assert captured_by_key["failure"]["error_dict"]["code"] == "source_discovery_failed"
