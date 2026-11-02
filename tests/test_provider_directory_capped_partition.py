@@ -3,6 +3,7 @@
 
 import asyncio
 import copy
+import dataclasses
 import json
 import urllib.parse
 
@@ -19,6 +20,7 @@ from tests.test_process_provider_directory_fhir_unit import (
     _last_updated_partition_test_source as source,
 )
 from tests.test_process_provider_directory_fhir_unit import (
+    _LastUpdatedPartitionFetchHarness,
     _PartitionResumeRecorder,
     importer,
     unit_source_factory,
@@ -321,3 +323,147 @@ def test_tls_error_text_is_not_a_timeout_split_hint():
 def test_capped_limit_requires_integer_headroom(limit):
     with pytest.raises(ValueError, match="must_exceed"):
         capped.search_limit({"versioned_search_limit": limit}, 2)
+
+
+@pytest.mark.parametrize("phase", ["before-acquisition", "after-twin-passes"])
+@pytest.mark.parametrize("status", [401, 503])
+@pytest.mark.asyncio
+async def test_metadata_outage_never_promotes_previously_staged_rows(monkeypatch, unit_source_factory, phase, status):
+    collection = Collection()
+
+    async def fetch(record, url, *, timeout):
+        if url.endswith("/metadata") and (phase == "before-acquisition" or collection.metadata_reads == 1):
+            return status, {importer.SOURCE_RETRY_AFTER_FIELD: "60"}, None, 1
+        return await collection.fetch(record, url, timeout=timeout)
+
+    result, staged, written = await run_fetch(monkeypatch, capped_source(), fetch)
+    assert not result.complete and "versioning_metadata_unavailable" in result.error
+    assert len(staged) == (0 if phase == "before-acquisition" else 6)
+    assert written == []
+    assert result.next_url_remaining is (status == 503)
+    assert bool(result.retry_not_before) is (status == 503)
+
+
+@pytest.mark.parametrize("phase", ["metadata", "tails", "post-census"])
+@pytest.mark.asyncio
+async def test_deadline_retains_proof_and_resumes_without_restarting_chunks(monkeypatch, unit_source_factory, phase):
+    collection = Collection()
+    monotonic_values = [0.0]
+    persisted_resumes = []
+    fingerprints_by_window_and_pass = {}
+    directory_source = capped_source()
+    config, _ = importer._last_updated_partition_config(directory_source, "Practitioner")
+    harness = _LastUpdatedPartitionFetchHarness(directory_source, fingerprints_by_window_and_pass)
+    prepare = importer._prepare_partition_state
+    monkeypatch.setattr(importer, "_last_updated_partition_monotonic", lambda: monotonic_values[0])
+
+    async def prepared(*args, **kwargs):
+        state = await prepare(*args, **kwargs)
+        if phase == "metadata":
+            monotonic_values[0] = 2.0
+        return state
+
+    async def fetch(record, url, *, timeout):
+        response = await collection.fetch(record, url, timeout=timeout)
+        if phase == "tails" and url.endswith("/metadata"):
+            monotonic_values[0] = 2.0
+        return response
+
+    async def save(_context, _resource_type, config, plan, **fields):
+        resume = importer._last_updated_partition_resume_from_checkpoint(
+            importer._last_updated_partition_checkpoint_payload(config, plan, fields["census"]), config
+        )
+        resume = dataclasses.replace(
+            resume, pages_processed=fields["pages_processed"], rows_processed=fields["rows_processed"]
+        )
+        persisted_resumes.append(resume)
+        if phase == "post-census" and plan.status is importer.PlanStatus.SUCCEEDED:
+            monotonic_values[0] = 2.0
+
+    monkeypatch.setattr(importer, "_prepare_partition_state", prepared)
+    initial = importer.LastUpdatedPartitionResume(importer._new_last_updated_partition_plan(config))
+    harness._install_importer_mocks(monkeypatch, fetch, initial, save)
+    fetch_result = await harness._fetch_resource_rows(config, deadline_seconds=1)
+    assert fetch_result.deadline_reached and fetch_result.next_url_remaining and not fetch_result.complete
+    assert harness.written_resource_ids == [] and persisted_resumes
+    retained = copy.deepcopy(fingerprints_by_window_and_pass)
+    retained_rows = set(harness.staged_resources_by_id)
+    assert len(retained_rows) == (6 if phase == "post-census" else 0)
+    assert not importer._is_last_updated_partition_census_complete(persisted_resumes[-1].census)
+    monotonic_values[0] = 0.0
+    monkeypatch.setattr(importer, "_prepare_partition_state", prepare)
+    harness._install_importer_mocks(monkeypatch, collection.fetch, persisted_resumes[-1], None)
+    fetch_result = await harness._fetch_resource_rows(config)
+    assert fetch_result.complete and fetch_result.rows_fetched == fetch_result.rows_written == 6
+    assert all(fingerprints_by_window_and_pass[key] == fingerprint for key, fingerprint in retained.items())
+    assert len(harness.staged_resources_by_id) == 6
+    assert harness.written_resource_ids == []
+
+
+@pytest.mark.asyncio
+async def test_resumed_leaf_sum_cannot_replace_the_frozen_census(monkeypatch, unit_source_factory):
+    collection = Collection()
+    recorder = _PartitionResumeRecorder()
+    fingerprints_by_window_and_pass = {}
+    with pytest.raises(asyncio.CancelledError):
+        await run_fetch(
+            monkeypatch,
+            capped_source(),
+            collection.fetch,
+            save_plan_callback=recorder._save_and_interrupt,
+            fingerprints_by_window_and_pass=fingerprints_by_window_and_pass,
+        )
+    recorder.persisted_resume.census.capped["count_pre"] += 1
+    fetch_result, _staged, written = await run_fetch(
+        monkeypatch,
+        capped_source(),
+        collection.fetch,
+        partition_resume=recorder.persisted_resume,
+        fingerprints_by_window_and_pass=fingerprints_by_window_and_pass,
+    )
+    assert not fetch_result.complete and "capped_leaf_census_changed" in fetch_result.error
+    assert written == []
+
+
+@pytest.mark.asyncio
+async def test_statistics_require_the_complete_capped_proof_without_synthetic_root_totals(
+    monkeypatch, unit_source_factory
+):
+    fetch_result, _staged, _written = await run_fetch(monkeypatch, capped_source(), Collection().fetch)
+    stats = importer._empty_resource_stats()
+    importer._record_last_updated_partition_stats(stats, fetch_result)
+    assert stats["last_updated_capped_sources"] == stats["last_updated_capped_verified_sources"] == 1
+    assert stats["last_updated_capped_versioned_sources"] == stats["last_updated_completeness_verified_sources"] == 1
+    assert stats["last_updated_capped_count_pre"] == stats["last_updated_capped_count_post"] == 6
+    assert all(stats[f"last_updated_capped_{field}"] == 0 for field in capped.TAIL_FIELDS)
+    assert stats["last_updated_unfiltered_pre"] == stats["last_updated_unfiltered_post"] == 0
+    assert stats["last_updated_ranged_root_pre"] == stats["last_updated_ranged_root_post"] == 0
+    assert stats["last_updated_staged_candidate_count"] == 6
+    incomplete = copy.deepcopy(fetch_result)
+    incomplete.fetch_diagnostic["capped_search"]["count_post"] = None
+    incomplete.fetch_diagnostic["capped_search"]["after_end_post"] = None
+    stats = importer._empty_resource_stats()
+    importer._record_last_updated_partition_stats(stats, incomplete)
+    assert stats["last_updated_capped_sources"] == 1
+    assert stats["last_updated_completeness_verified_sources"] == stats["last_updated_staged_candidate_count"] == 0
+    assert "last_updated_capped_verified_sources" not in stats
+
+
+@pytest.mark.parametrize("proof", [None, [], {}, {"contract": capped.CONTRACT}])
+def test_checkpoint_requires_the_closed_capped_proof_schema(proof):
+    config, _ = importer._last_updated_partition_config(capped_source(), "Practitioner")
+    plan = importer._new_last_updated_partition_plan(config)
+    census = importer.LastUpdatedCompletenessCensus(capped=proof)
+    checkpoint = json.loads(importer._last_updated_partition_checkpoint_payload(config, plan, census))
+    if proof is None:
+        checkpoint["control"]["census"].update(unfiltered_pre=6, ranged_root_pre=6)
+    with pytest.raises(RuntimeError, match="checkpoint_invalid"):
+        importer._last_updated_partition_resume_from_checkpoint(json.dumps(checkpoint), config)
+
+
+@pytest.mark.parametrize("details", [None, [], "SearchTooCostly"])
+def test_malformed_overflow_details_cannot_authorize_an_uncounted_split(details):
+    outcome = overflow()
+    outcome["issue"][0]["details"] = details
+    url = source()["api_base"] + "/Practitioner?_summary=count&_lastUpdated=ge2024-01-01&_lastUpdated=lt2024-01-03"
+    assert capped.split_observation(importer, capped_source(), url, 413, outcome, None) is None
