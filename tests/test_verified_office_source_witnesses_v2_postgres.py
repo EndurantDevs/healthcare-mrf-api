@@ -648,6 +648,83 @@ async def _assert_bounded_replay(reader, recipe, approved, control, documents, d
     await _assert_cancelled_page_rolls_back(reader, recipe, approved, control, repeated)
 
 
+async def _mapped_page_plan(reader, recipe, approved, control):
+    statements = []
+
+    class ObservedPage:
+        def __getattr__(self, name):
+            return getattr(reader, name)
+
+        async def fetchrow(self, query, *arguments):
+            if "edge_status" in query and "inserted_rows" in query and arguments[-1] == 0:
+                statements.append((query, arguments))
+            return await reader.fetchrow(query, *arguments)
+
+    descriptor = await _map(ObservedPage(), recipe, approved, control, table="witness_replay")
+    assert len(statements) == 1
+    savepoint = reader.transaction()
+    await savepoint.start()
+    try:
+        query, arguments = statements[0]
+        plan = json.loads(await reader.fetchval("EXPLAIN (ANALYZE,FORMAT JSON) " + query, *arguments))
+    finally:
+        await savepoint.rollback()
+    return descriptor, plan
+
+
+def _assert_direct_insert_plan(plan):
+    pending_nodes = [plan[0]["Plan"]]
+    while pending_nodes:
+        node = pending_nodes.pop()
+        if node.get("Subplan Name") == "CTE inserted":
+            break
+        pending_nodes.extend(node.get("Plans", []))
+    assert node.get("Subplan Name") == "CTE inserted" and node["Actual Rows"] == 1000
+    pending_nodes = [node]
+    status_scans = []
+    while pending_nodes:
+        node = pending_nodes.pop()
+        assert node.get("CTE Name") != "edges"
+        if node.get("CTE Name") == "edge_status":
+            status_scans.append(node["Actual Loops"])
+        pending_nodes.extend(node.get("Plans", []))
+    assert status_scans == [1]
+
+
+async def _assert_high_acceptance_insert(reader, recipe, approved, control, documents):
+    edge = next(
+        document for document in documents if document["kind"] == "edge" and document["resource_id"] == "A-accepted"
+    )
+    header = next(
+        document
+        for document in documents
+        if document["kind"] == "resource" and document["resource_id"] == edge["resource_id"]
+    )
+    network_id = await reader.fetchval("SELECT min(network_id) FROM pg_temp.witness_members")
+    evidence_id = await reader.fetchval(
+        "SELECT encode(sha256(convert_to(jsonb_set($1::jsonb,'{6}',to_jsonb($2::integer))::text,'UTF8')),'hex')",
+        json.dumps(edge["evidence_basis"]),
+        network_id,
+    )
+    rejected_by_field = {**edge, "provider_unresolved": True, "location_id": "invalid-uuid", "evidence_basis": {}}
+    await _replace_facts(reader, recipe, [*[edge] * 1000, rejected_by_field, header])
+    await reader.execute("DELETE FROM pg_temp.witness_members")
+    descriptor, plan = await _mapped_page_plan(reader, recipe, approved, control)
+    assert (descriptor["membership_rows"], descriptor["unresolved_rows"], descriptor["unresolved_raw_source_rows"]) == (
+        1000,
+        1,
+        1,
+    )
+    members = await reader.fetch(
+        "SELECT network_id,provider_system,provider_id,location_id::text,evidence_id FROM pg_temp.witness_members"
+    )
+    assert len(members) == 1000
+    assert {tuple(member) for member in members} == {
+        (network_id, edge["provider_system"], edge["provider_id"], edge["location_id"], evidence_id)
+    }
+    _assert_direct_insert_plan(plan)
+
+
 async def _assert_byte_pages(reader, recipe, document):
     # Exercise the page boundary separately from the producer's closed fact schema.
     wide_by_field = {**document, "padding": "x" * 1_048_576}
@@ -725,6 +802,7 @@ async def test_bounded_mapping_preserves_replay_and_rolls_back_late_failure(monk
                 _, documents, _ = await _extract(reader, recipe, approved, control, limit=2, target="witness_facts")
                 descriptor = await _map(reader, recipe, approved, control)
                 await _assert_bounded_replay(reader, recipe, approved, control, documents, descriptor)
+                await _assert_high_acceptance_insert(reader, recipe, approved, control, documents)
                 await _assert_byte_pages(reader, recipe, documents[0])
                 await _assert_native_scans_are_bounded(reader, recipe, documents[0])
                 assert await _identity(reader, fixture) == original_identity

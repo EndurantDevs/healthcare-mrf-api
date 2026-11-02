@@ -49,6 +49,8 @@ WITNESS_MAP_SQL_V2 = """WITH {bindings},{page}, edges AS MATERIALIZED (
  OR payload_sha256 IS DISTINCT FROM fact_json->'payload_sha256'
 ), mapped AS MATERIALIZED (
  SELECT edges.ordinal,edges.header_tid,edges.omission_reason,approved.network_id,
+ edges.fact_json->>'provider_system' AS provider_system,edges.fact_json->>'provider_id' AS provider_id,
+ edges.fact_json->>'location_id' AS raw_location_id,edges.fact_json->'evidence_basis' AS evidence_basis,
  (edges.fact_json->>'provider_only')::boolean AS provider_only,
  edges.fact_json->>'location_id' IS NOT NULL AS has_location,
  edges.malformed OR (edges.fact_json->>'provider_unresolved')::boolean
