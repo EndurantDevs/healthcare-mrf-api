@@ -940,7 +940,7 @@ def test_closed_sql_limits_reject_invalid_values_before_resources(field, value):
         worker.RegistryPublicationSQLLimits(**configured["sql_limits"])
 
 
-@pytest.mark.parametrize("value", [None, [], {}, {"work_mem": "16MB"}])
+@pytest.mark.parametrize("value", [None, [], {}, {"work_mem": "16MB"}, {"jit": "off"}])
 def test_closed_sql_limits_reject_partial_or_arbitrary_guc_blocks(value):
     configured = configuration()
     configured["sql_limits"] = value
@@ -967,6 +967,7 @@ def test_sql_limits_default_explicit_and_eight_positional_compatibility():
     assert explicit.sql_limits.statement_timeout_ms == 1000
     options = worker._pool_options(explicit.execution_url, 1, explicit.sql_limits)
     assert options["server_settings"] == explicit.sql_limits.server_settings()
+    assert options["server_settings"]["jit"] == "off"
     assert "temp_file_limit" not in options["server_settings"]
     assert options["timeout"] == 5 and options["command_timeout"] == 6
     assert options["init"] == explicit.sql_limits.verify

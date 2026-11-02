@@ -69,6 +69,7 @@ class RegistryPublicationSQLLimits:
             lock_timeout=f"{self.lock_timeout_ms}ms",
             max_parallel_workers_per_gather="0",
             max_parallel_maintenance_workers="0",
+            jit="off",
         )
 
     async def verify(self, connection):

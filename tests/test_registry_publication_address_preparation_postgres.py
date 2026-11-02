@@ -141,6 +141,7 @@ async def _publication_runtime(prepared):
             stack.push_async_callback(pool.close)
             pools.append(pool)
         async with pools[1].acquire() as executing:
+            assert await executing.fetchval("SHOW jit") == "off"
             config = await worker._custody_runtime(settings, stack, fixture.config, executing)
         api = await asyncpg.connect(dsn, user=fixture.config.api_role, password=fixture.password)
         stack.push_async_callback(api.close)
@@ -196,6 +197,7 @@ async def test_fenced_address_preparation_opens_native_repeatable_snapshot(addre
         async with worker._address_preparation_snapshot(None, sessions, config) as (driver, authority):
             await _require_transaction(driver)
             assert await driver.fetchval("SHOW transaction_isolation") == "repeatable read"
+            assert await driver.fetchval("SHOW jit") == "off"
             assert await driver.fetchval("SELECT current_user") == prepared.roles_by_kind["custodian"]
             session, store, budget = authority
             assert store is runtime.store and budget is runtime.read_budget
