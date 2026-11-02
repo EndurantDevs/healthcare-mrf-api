@@ -183,3 +183,14 @@ def test_resource_priority_rejects_invalid_configuration(order):
     source["metadata_json"]["provider_directory_resource_fetch_order"] = order
     with pytest.raises(ValueError, match="fetch_order_invalid"):
         importer._source_resource_fetch_order(source, list(mvp.RESOURCES))
+
+
+@pytest.mark.asyncio
+async def test_capped_transport_rejects_authenticated_reinterpretation_before_http(monkeypatch):
+    source = importer._source_row_from_seed(mvp.seed_rows()[0])
+    source["auth_type"] = "oauth2"
+    fetch = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_json_with_source_session", fetch)
+    with _source_http_test_session(), pytest.raises(RuntimeError, match="capped_search_anonymous_required"):
+        await importer._fetch_source_json_unpaced(source, mvp.API_BASE + "/Practitioner?_count=100", timeout=60)
+    fetch.assert_not_awaited()
