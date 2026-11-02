@@ -18,7 +18,7 @@ from process import network_fhir_retained_capture as retained
 from process.registry_generic_accepted_capture import _admitted_summary, _current_header
 from tests import generic_source_successor_postgres_support as source
 
-SOURCE_PRODUCER_SHA256 = "b6496fea2e8f695b09464de5cd1180c932dfdde9cccb2d5fd1a221c57128a211"
+SOURCE_PRODUCER_SHA256 = "4034c0d36ea824c992cf8c316735e048467be54418a74a240ff21cbf24ec1e91"
 _RESOURCE_FIELDS = (
     "dataset_id",
     "resource_type",
@@ -141,16 +141,24 @@ async def constructed_source_origin(source_export, profile, reviewed_origin):
 
 
 @asynccontextmanager
-async def source_witness_case(monkeypatch):
+async def source_witness_case(monkeypatch, *, legacy=False):
     """Use the existing owned native fixture and original capture Writer, without extra grants."""
     catalog, producer = source_modules()
+    if legacy:
+        from tests.source_witness_legacy_postgres_support import install_original_legacy_seed, reviewed_legacy_origin
+
+        seeded = install_original_legacy_seed(monkeypatch)
     async with source.native_generic_source(monkeypatch) as fixture, AsyncExitStack() as cleanup:
-        old_capture = await source.publish_edition(fixture, 1)
+        old_capture = None if legacy else await source.publish_edition(fixture, 1)
         profile = configure_original_runtime(fixture.component, monkeypatch)
         source_export = await cleanup.enter_async_context(producer.membership_source_export_runtime())
         runtime = source_export.args[0]
         assert runtime.config.publisher_role == fixture.component.publisher
-        origin = await reviewed_source_origin(runtime, profile, fixture.candidates[-1], catalog, producer)
+        if legacy:
+            assert seeded == [True]
+            origin = await reviewed_legacy_origin(runtime, profile, catalog, producer)
+        else:
+            origin = await reviewed_source_origin(runtime, profile, fixture.candidates[-1], catalog, producer)
         constructed = await constructed_source_origin(source_export, profile, origin)
         connections_by_kind = {}
         for kind, role in (("writer", fixture.component.retained_publisher), ("reader", fixture.component.reader)):

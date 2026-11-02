@@ -753,7 +753,10 @@ async def _finish_verified_office_matches(
       SELECT input.page_key,input.office,input.canonical,winner.location_key,
         to_jsonb(address) AS address,1::bigint AS matches
       FROM pg_temp.{_identifier(winners_name)} winner
-      JOIN pg_temp.{_identifier(input_name)} input USING(page_key,ordinal)
+      JOIN LATERAL (
+        SELECT staged.page_key,staged.office,staged.canonical FROM pg_temp.{_identifier(input_name)} staged
+        WHERE staged.page_key=winner.page_key AND staged.ordinal=winner.ordinal OFFSET 0
+      ) input ON true
       JOIN LATERAL (
         SELECT * FROM {address_relation} source_address
         WHERE source_address.location_key=winner.location_key OFFSET 0
@@ -791,21 +794,26 @@ async def _finish_verified_office_matches(
 
 async def _prune_verified_offices(connection, result_name, source_aliases):
     """Keep same-provider source aliases only under the explicit v2 matching policy."""
-    identity_sql = "office->>'provider_system',office->>'provider_id'"
+    identity_sql = "provider_system,provider_id"
     if not source_aliases:
-        identity_sql += ",office->>'location_id'"
-    await connection.execute(f"""WITH ambiguous_locations AS MATERIALIZED (
-      SELECT office->>'location_key' AS location_key FROM pg_temp.{_identifier(result_name)}
+        identity_sql += ",location_id"
+    # Keep JSON out of aggregate/join workfiles; row IDs stay local to this statement's private temp relation.
+    await connection.execute(f"""WITH identities AS MATERIALIZED (
+      SELECT ctid AS row_id,office->>'provider_system' AS provider_system,office->>'provider_id' AS provider_id,
+        office->>'location_id' AS location_id,office->>'location_key' AS location_key
+      FROM pg_temp.{_identifier(result_name)}
+    ), ambiguous_locations AS MATERIALIZED (
+      SELECT location_key FROM identities
       GROUP BY 1 HAVING count(DISTINCT jsonb_build_array({identity_sql}))>1
     ), ambiguous_sources AS MATERIALIZED (
-      SELECT office->>'provider_system' AS provider_system,office->>'provider_id' AS provider_id,
-        office->>'location_id' AS location_id FROM pg_temp.{_identifier(result_name)}
-      GROUP BY 1,2,3 HAVING count(DISTINCT office->>'location_key')>1
-    ) DELETE FROM pg_temp.{_identifier(result_name)} matched WHERE EXISTS(
-      SELECT FROM ambiguous_locations WHERE location_key=matched.office->>'location_key'
+      SELECT provider_system,provider_id,location_id FROM identities
+      GROUP BY 1,2,3 HAVING count(DISTINCT location_key)>1
+    ) DELETE FROM pg_temp.{_identifier(result_name)} matched USING identities identity
+    WHERE matched.ctid=identity.row_id AND (EXISTS(
+      SELECT FROM ambiguous_locations WHERE location_key=identity.location_key
     ) OR EXISTS(SELECT FROM ambiguous_sources WHERE
       (provider_system,provider_id,location_id)=
-      (matched.office->>'provider_system',matched.office->>'provider_id',matched.office->>'location_id'))""")
+      (identity.provider_system,identity.provider_id,identity.location_id)))""")
 
 
 async def prepare_verified_retained_office_mapping(

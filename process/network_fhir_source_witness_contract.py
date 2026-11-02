@@ -18,6 +18,7 @@ from process.network_fhir_retained_capture_contract import TABLES as RETAINED_TA
 from process.registry_fhir_catalog_extraction import fhir_source_uri
 
 CONTRACT = "fhir-source-membership-witness-v1"
+OBSERVED_LEGACY_PROFILE = "observed-legacy-normalized-v1"
 CAPTURE_CONTRACT = "registry-source-fhir-witness-capture-v1"
 PRODUCER = "registry-source-fhir-witness-v1"
 SCHEMA_PREFIX = "registry_fhir_witness_"
@@ -87,10 +88,10 @@ class SourceWitnessOrigin:
     metadata_bytes: int
     metadata_text_sha256: str
     summary_sha256: str
-    proof_sha256: str
+    proof_sha256: str | None
     resource_counts: tuple[tuple[str, int], ...]
     resource_hashes: tuple[tuple[str, str], ...]
-    descriptor_counts: tuple[tuple[str, int], ...]
+    descriptor_counts: tuple[tuple[str, int], ...] | None
     admission_profile: str
     admission_metadata_sha256: str | None
     semantic_projection_as_of: str | None
@@ -111,7 +112,6 @@ class SourceWitnessOrigin:
             "dataset_sha256",
             "metadata_text_sha256",
             "summary_sha256",
-            "proof_sha256",
             "native_catalog_sha256",
         ):
             require(is_sha256(getattr(self, name)))
@@ -128,8 +128,17 @@ class SourceWitnessOrigin:
             text(alias, 64)
         require(type(self.source_uri) is str and fhir_source_uri(self.source_uri) is not None)
         _origin_families(self)
-        require(self.source_id != "cms-npd" and self.admission_profile == SEMANTIC_PROFILE)
+        require(self.source_id != "cms-npd")
         require(type(self.unresolved_plan_network_count) is int and self.unresolved_plan_network_count >= 0)
+        if self.admission_profile == OBSERVED_LEGACY_PROFILE:
+            require(
+                self.proof_sha256 is None
+                and self.admission_metadata_sha256 is None
+                and self.semantic_projection_as_of is None
+                and self.descriptor_counts is None
+            )
+            return
+        require(self.admission_profile == SEMANTIC_PROFILE and is_sha256(self.proof_sha256))
         require(is_sha256(self.admission_metadata_sha256) and self.descriptor_counts == self.resource_counts)
         require(
             type(self.semantic_projection_as_of) is str
@@ -138,7 +147,7 @@ class SourceWitnessOrigin:
 
 
 def _origin_families(origin):
-    for name in ("resource_counts", "resource_hashes", "descriptor_counts"):
+    for name in ("resource_counts", "resource_hashes"):
         pairs = getattr(origin, name)
         require(type(pairs) is tuple and all(type(pair) is tuple and len(pair) == 2 for pair in pairs))
     families = tuple(name for name, _ in origin.resource_counts)
@@ -150,9 +159,12 @@ def _origin_families(origin):
         and sum(count for _, count in origin.resource_counts) > 0
     )
     require(tuple(name for name, _ in origin.resource_hashes) == families)
-    require(tuple(name for name, _ in origin.descriptor_counts) == families)
     require(all(is_sha256(root) for _, root in origin.resource_hashes))
-    require(all(type(count) is int and count >= 0 for _, count in origin.descriptor_counts))
+    if origin.descriptor_counts is not None:
+        pairs = origin.descriptor_counts
+        require(type(pairs) is tuple and all(type(pair) is tuple and len(pair) == 2 for pair in pairs))
+        require(tuple(name for name, _ in pairs) == families)
+        require(all(type(count) is int and count >= 0 for _, count in pairs))
 
 
 def source_origin(value):
@@ -165,7 +177,8 @@ def source_origin(value):
     require(type(value) is dict and set(value) == set(SourceWitnessOrigin.__dataclass_fields__))
     origin_by_field = dict(value)
     for name in ("resource_counts", "resource_hashes", "descriptor_counts"):
-        origin_by_field[name] = _pairs(origin_by_field[name])
+        if name != "descriptor_counts" or origin_by_field[name] is not None:
+            origin_by_field[name] = _pairs(origin_by_field[name])
     require(type(origin_by_field["source_aliases"]) in {list, tuple})
     origin_by_field["source_aliases"] = tuple(origin_by_field["source_aliases"])
     return SourceWitnessOrigin(**origin_by_field)
@@ -258,6 +271,14 @@ def require_capture_anchor(capture, expected_anchor):
     return capture
 
 
+def source_witness_membership_date(capture, expected_anchor):
+    """Bind legacy evaluation to the independent Core observation, preserving absent Source dates."""
+    capture = require_capture_anchor(capture, expected_anchor)
+    if capture.origin.admission_profile == OBSERVED_LEGACY_PROFILE:
+        return datetime.fromisoformat(capture.observed_at).date().isoformat()
+    return capture.origin.semantic_projection_as_of
+
+
 def capture_digest(capture):
     """Bind all explicit provenance and custody fields except the digest itself."""
     require(type(capture) is SourceWitnessCapture)
@@ -274,6 +295,8 @@ def _decode_capture(document):
     require(type(origin) is dict and type(source_database) is dict)
     require(type(origin.get("source_aliases")) is list)
     for name in ("resource_counts", "resource_hashes", "descriptor_counts"):
+        if name == "descriptor_counts" and origin.get(name) is None:
+            continue
         require(type(origin.get(name)) is list and all(type(pair) is list for pair in origin[name]))
     require(type(source_database.get("postmaster_started")) is str)
     capture_by_field["origin"] = source_origin(origin)
