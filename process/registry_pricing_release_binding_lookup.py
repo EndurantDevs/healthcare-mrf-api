@@ -17,7 +17,13 @@ from api.plan_release_serving import (
     normalize_plan_release_id,
 )
 from api.plan_release_source_binding_custody import require_source_binding_custody_fetch
-from api.plan_release_source_bindings import _HEADER_SQL, SourceBindingAdmission, storage_admissions
+from api.plan_release_source_bindings import (
+    _HEADER_SQL,
+    SourceBindingAdmission,
+    required_registry_schema,
+    storage_admissions,
+)
+from api.plan_release_supporting_metadata import require_supporting_metadata_fetch
 from process.network_approved_catalog_evidence import (
     MAX_NETWORKS,
     ApprovedNetworkCatalogEvidenceResourceLimit,
@@ -89,6 +95,14 @@ async def _fetch_admitted_binding_rows(
     try:
         for identity in source_ids:
             await require_source_binding_custody_fetch(connection.fetch, PTG2_SCHEMA, admissions[identity])
+        if source_ids:
+            await require_supporting_metadata_fetch(
+                connection.fetch,
+                PTG2_SCHEMA,
+                required_registry_schema(),
+                [admissions[identity] for identity in source_ids],
+                max_bytes=max_report_bytes,
+            )
     except _OPTIONAL_STORAGE_ERRORS as error:
         raise ValueError("plan_release_source_binding_storage_missing") from error
     binding_rows = []

@@ -12,6 +12,7 @@ from api import plan_release_source_binding_custody as custody
 from api import plan_release_source_bindings as source
 from api.plan_release_pricing_projection import plan_release_binding_set_sql, source_plan_release_serving_sql
 from tests.test_plan_release_serving_resolution import PLAN_RELEASE_ID, SERVING_REVISION_ID, _binding_row
+from tests.test_plan_release_supporting_metadata import commitment_page
 
 
 @pytest.fixture(autouse=True)
@@ -135,6 +136,8 @@ class ReaderSession:
     async def execute(self, statement, parameters=None):
         sql = str(statement)
         self.calls.append((sql, parameters))
+        if "supporting_commitments AS MATERIALIZED" in sql:
+            return commitment_page(self.rows)
         return self.headers if "AS storage_present" in sql else self.rows
 
 
@@ -148,7 +151,9 @@ async def test_guard_and_pricing_load_recheck_the_current_tuple_in_one_snapshot(
     full = await serving.resolve_plan_release_serving(session, PLAN_RELEASE_ID, projection_only=True)
     assert full == guard
     assert len([sql for sql, _ in session.calls if "AS storage_present" in sql]) == 2
-    sql, parameters = session.calls[-1]
+    sql, parameters = next(
+        (sql, parameters) for sql, parameters in reversed(session.calls) if "hp_plan_current_release" in sql
+    )
     assert "hp_plan_current_release" in sql
     assert parameters["serving_revision_id"] == SERVING_REVISION_ID
     assert parameters["binding_set_digest"] == "a" * 64
@@ -240,7 +245,7 @@ async def test_internal_admission_is_preserved_for_later_full_read(monkeypatch):
     selected = await serving.resolve_plan_release_serving(session, PLAN_RELEASE_ID, projection_only=True)
     assert selected.serving_revision_id == SERVING_REVISION_ID
     assert len([sql for sql, _ in session.calls if "AS storage_present" in sql]) == 2
-    assert "hp_plan_current_release" in session.calls[-1][0]
+    assert any("hp_plan_current_release" in sql for sql, _ in session.calls)
 
 
 @pytest.mark.asyncio
