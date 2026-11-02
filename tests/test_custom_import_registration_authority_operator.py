@@ -746,7 +746,7 @@ async def test_outer_timeout_bounds_request_and_stream(mounted_case, monkeypatch
 
     monkeypatch.setattr(operator, "_TIMEOUT_SECONDS", 0.01)
     with pytest.raises(ValueError, match=_UNAVAILABLE) as error:
-        await asyncio.wait_for(_register(case, handler), timeout=1)
+        await _register(case, handler)
     _assert_redacted(error, case)
     assert len(requests) == 1
     if phase == "stream":

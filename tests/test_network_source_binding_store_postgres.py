@@ -1,18 +1,37 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Real native COPY, scoped source CAS and atomic durable batch acceptance."""
 
+import hashlib
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from process import network_source_binding_store as store
+from process import registry_fhir_catalog_fingerprints as catalog_fingerprints
+from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_source_binding_store import NetworkSourceBindingBatchCommand, apply_network_source_binding_batch
+from process.registry_fhir_catalog_extraction import FHIRCatalogOrganization
+from process.registry_fhir_catalog_projection import (
+    BINDING_COLUMNS,
+    NETWORK_COLUMNS,
+    SourceCatalogContext,
+    format_fhir_catalog_projection,
+)
+from process.registry_publication_execution import _command_actor
 from process.registry_record_store import RegistryAddressUnavailable, RegistryRecordConflict
+from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_network_source_binding_schema_postgres import network_binding_db
 from tests.test_registry_approval_store_postgres import _CountedConnection
+from tests.test_registry_fhir_catalog_custody_postgres import (
+    freeze_metadata,
+    metadata_custody,
+    seed_observations,
+    source_descriptor,
+)
 from tests.test_registry_record_store_postgres import _actor, record_db
 
 pytestmark = pytest.mark.asyncio
@@ -446,3 +465,378 @@ async def test_empty_and_malformed_control_inputs_are_rejected(network_binding_d
     with pytest.raises(ValueError, match="uuid_invalid"):
         await _apply(connection, schema, command, replace(actor, user_id=str(actor.user_id)))
     assert await _state(connection, schema) == (0, 0, 0, 0, 0)
+
+
+async def _source_batch_networks(engine, schema, actor, count):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from process.registry_record_store import apply_registry_record_command
+    from tests.test_registry_approval_store_postgres import _create
+
+    records = []
+    async with async_sessionmaker(engine)() as session, session.begin():
+        for _ in range(count):
+            records.append(await apply_registry_record_command(session, _create("network"), actor, schema=schema))
+    return records
+
+
+async def _source_batch_catalog(fixture, networks):
+    """Build genuine source metadata through its bounded projector and custody sealer."""
+
+    snapshot = await seed_observations(fixture, len(networks))
+    await fixture.connection.copy_records_to_table(
+        "network_registry_identity",
+        schema_name=fixture.control_schema,
+        columns=("network_id",),
+        records=[(network_record["record_id"],) for network_record in networks],
+    )
+    for offset in range(0, len(networks), 500):
+        organizations = tuple(
+            FHIRCatalogOrganization(
+                f"organization-{ordinal:04d}",
+                f"organization-{ordinal:04d}",
+                (),
+                False,
+                "active",
+                (),
+                hashlib.sha256(f"organization-{ordinal:04d}".encode()).hexdigest(),
+            )
+            for ordinal in range(offset, min(offset + 500, len(networks)))
+        )
+        context = SourceCatalogContext(
+            RegistryNetworkSourceCoordinates(**source_descriptor()["coordinates"]),
+            snapshot["source_vector_json"][0]["source_generation"],
+            snapshot["metadata_generation"],
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "raw_fhir",
+            legacy_aliases=tuple(
+                (network_record.resource_id, str(uuid4()), "example-scope") for network_record in organizations
+            ),
+        )
+        projection = format_fhir_catalog_projection(
+            organizations,
+            (),
+            tuple(
+                (network_record.resource_id, networks[offset + index]["record_id"])
+                for index, network_record in enumerate(organizations)
+            ),
+            context,
+        )
+        for table, columns, projection_rows in (
+            ("registry_fhir_catalog_network", NETWORK_COLUMNS, projection.network_rows),
+            ("registry_fhir_catalog_binding", BINDING_COLUMNS, projection.binding_rows),
+        ):
+            await fixture.connection.copy_records_to_table(
+                table,
+                schema_name=fixture.target.schema_name,
+                columns=columns,
+                records=projection_rows,
+            )
+    return await freeze_metadata(fixture, snapshot=snapshot)
+
+
+async def _source_batch_drafts(connection, schema, actor, networks, coordinates_by_field):
+    references = []
+    for offset in range(0, len(networks), 100):
+        projection_rows = [
+            _row(
+                network_record["record_id"],
+                **coordinates_by_field,
+                source_key=f"organization-{offset + index:04d}",
+                source_scope_json={"organization_id": f"organization-{offset + index:04d}", "capture_sha256": "a" * 64},
+            )
+            for index, network_record in enumerate(networks[offset : offset + 100])
+        ]
+        command_by_field = _command(projection_rows)
+        receipt = await _apply(connection, schema, command_by_field, actor)
+        references.append(
+            {
+                "idempotency_key": command_by_field.idempotency_key,
+                "request_sha256": store._metadata(command_by_field, actor)[3],
+                "custom_revision": receipt["custom_revision"],
+            }
+        )
+    return references
+
+
+@pytest.fixture
+async def source_batch_case(serving_schema, metadata_custody, request):
+    connection, schema, engine = serving_schema
+    actor = _actor()
+    networks = await _source_batch_networks(engine, schema, actor, getattr(request, "param", 3))
+    snapshot = await _source_batch_catalog(metadata_custody, networks)
+    snapshot["published_at"] = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    await connection.execute(
+        f'INSERT INTO "{schema}".registry_fhir_catalog_snapshot '
+        f'SELECT * FROM jsonb_populate_record(NULL::"{schema}".registry_fhir_catalog_snapshot,$1::jsonb)',
+        json.dumps(snapshot, default=str),
+    )
+    coordinates_by_field = {
+        "source_system": "fhir",
+        "source_id": "sample-fhir",
+        "dataset_schema": "sample_source",
+        "dataset_id": "dataset-one",
+        "producer_id": "registry-source-fhir-witness-v1",
+        "edition_id": str(uuid4()),
+    }
+    references = await _source_batch_drafts(connection, schema, actor, networks, coordinates_by_field)
+    heads = await connection.fetchrow(f'SELECT * FROM "{schema}".registry_revision_control')
+    command_by_field = {
+        "operation": "publish_source_binding_batch",
+        "batch_references": references,
+        "source_coordinates": coordinates_by_field,
+        "metadata_generation": snapshot["metadata_generation"],
+        "selection_count": None,
+        "selection_sha256": None,
+        "expected_draft_revision": heads["draft_revision"],
+        "expected_approved_revision": 0,
+        "expected_serving_generation": 0,
+        "reason": "Review complete Source coverage",
+        "idempotency_key": uuid4().hex,
+    }
+    return SimpleNamespace(
+        connection=connection,
+        schema=schema,
+        engine=engine,
+        actor=actor,
+        networks=networks,
+        command=command_by_field,
+        snapshot=snapshot,
+    )
+
+
+async def _seed_source_batch_catalog_aliases(case):
+    from process.registry_fhir_catalog_identity import ALIAS_SCOPE
+
+    await case.connection.copy_records_to_table(
+        "network_registry_alias",
+        schema_name=case.schema,
+        columns=("source_system", "source_id", "alias_type", "alias_value", "scope_key", "network_id", "evidence_id"),
+        records=[
+            (
+                "fhir",
+                "sample-fhir",
+                "fhir_organization",
+                f"organization-{index:04d}",
+                ALIAS_SCOPE,
+                network["record_id"],
+                "synthetic-review",
+            )
+            for index, network in enumerate(case.networks)
+        ],
+    )
+
+
+async def test_source_batch_approval_retains_catalog_serving_maps(source_batch_case):
+    """A real saved batch leaves pending catalog reads on the last-serving maps."""
+    from process import registry_source_binding_publication as source_batch
+    from process.registry_approval_store import approve_registry_records
+
+    case = source_batch_case
+    serving_revision = case.command["expected_approved_revision"]
+    await _seed_source_batch_catalog_aliases(case)
+    async with case.connection.transaction(isolation="repeatable_read", readonly=True):
+        serving_fingerprints = await catalog_fingerprints.approved_fhir_catalog_fingerprints(
+            case.connection, (serving_revision,), control_schema=case.schema
+        )
+        compact, resolved = await source_batch.resolve_source_batch(
+            case.connection, case.command, case.actor, control_schema=case.schema, allow_unbound=True
+        )
+    assert compact["selection_count"] == len(resolved.selection) == 6
+    assert {
+        selected_version["record_id"]
+        for selected_version in resolved.selection
+        if selected_version["record_kind"] == "network"
+    } == {network["record_id"] for network in case.networks}
+    assert sum(selected_version["record_kind"] == "network_binding" for selected_version in resolved.selection) == 3
+    async with case.connection.transaction():
+        queued = await source_batch.enqueue_source_batch(
+            case.connection, compact, case.actor, "b" * 64, control_schema=case.schema
+        )
+    request_query = f'SELECT * FROM "{case.schema}".registry_publication_request WHERE request_id=$1'
+    request_id = UUID(queued["request_id"])
+    queued_record = await case.connection.fetchrow(request_query, request_id)
+    command, actor, _, _ = _command_actor(queued_record)
+    assert command == resolved and actor == case.actor
+    async with case.connection.transaction():
+        approved = await approve_registry_records(case.connection, command, actor, control_schema=case.schema)
+    assert approved == {
+        "approved_revision": case.command["expected_draft_revision"] + 1,
+        "previous_approved_revision": serving_revision,
+        "selected_count": 6,
+        "replayed": False,
+    }
+    async with case.connection.transaction():
+        replay = await approve_registry_records(case.connection, command, actor, control_schema=case.schema)
+    assert replay == {**approved, "replayed": True}
+    async with case.connection.transaction(isolation="repeatable_read", readonly=True):
+        selected_revision, selected_fingerprints = await catalog_fingerprints.select_fhir_catalog_mapping(
+            case.connection,
+            approved["approved_revision"],
+            SimpleNamespace(approved_custom_revision=serving_revision),
+            control_schema=case.schema,
+        )
+        assert (selected_revision, selected_fingerprints) == (serving_revision, serving_fingerprints[serving_revision])
+        assert tuple(
+            await case.connection.fetchrow(
+                f'SELECT draft_revision,approved_revision FROM "{case.schema}".registry_revision_control'
+            )
+        ) == (approved["approved_revision"], approved["approved_revision"])
+        assert await case.connection.fetchval(f'SELECT count(*) FROM "{case.schema}".registry_approval_history') == 1
+        assert source_batch.stored_source_batch(await case.connection.fetchrow(request_query, request_id)) == (
+            compact,
+            resolved,
+        )
+
+
+@pytest.mark.parametrize("source_batch_case", [1301], indirect=True)
+async def test_source_batch_saved_chunks_freeze_complete_selection_and_one_approval(source_batch_case):
+    """A full Source resolves real draft history into one bounded native approval."""
+    from process import registry_source_binding_publication as source_batch
+    from process.registry_approval_store import approve_registry_records
+    from process.registry_publication_execution import _command_actor
+
+    case = source_batch_case
+    async with case.connection.transaction(isolation="repeatable_read", readonly=True):
+        compact, resolved = await source_batch.resolve_source_batch(
+            case.connection,
+            case.command,
+            case.actor,
+            control_schema=case.schema,
+            allow_unbound=True,
+        )
+    assert len(case.command["batch_references"]) == 14
+    assert compact["selection_count"] == len(resolved.selection) == 2602
+    assert {
+        selected_version["record_id"]
+        for selected_version in resolved.selection
+        if selected_version["record_kind"] == "network"
+    } == {selected_version["record_id"] for selected_version in case.networks}
+    async with case.connection.transaction():
+        queued = await source_batch.enqueue_source_batch(
+            case.connection,
+            compact,
+            case.actor,
+            "b" * 64,
+            control_schema=case.schema,
+        )
+    request_id = UUID(queued["request_id"])
+    selected_version = await case.connection.fetchrow(
+        f'SELECT * FROM "{case.schema}".registry_publication_request WHERE request_id=$1',
+        request_id,
+    )
+    command, actor, _, _ = _command_actor(selected_version)
+    assert command == resolved and actor == case.actor
+    async with case.connection.transaction():
+        approved = await approve_registry_records(case.connection, command, actor, control_schema=case.schema)
+    assert approved["selected_count"] == 2602
+    assert await case.connection.fetchval(f'SELECT count(*) FROM "{case.schema}".registry_approval_history') == 1
+    assert await case.connection.fetchval(f'SELECT count(*) FROM "{case.schema}".registry_approved_record') == 2602
+    assert await case.connection.fetchval(f'SELECT generation_id FROM "{case.schema}".network_serving_control') is None
+    async with case.connection.transaction():
+        replay = await source_batch.enqueue_source_batch(
+            case.connection,
+            compact,
+            case.actor,
+            "b" * 64,
+            control_schema=case.schema,
+        )
+    assert replay == {**queued, "replayed": True}
+    await _assert_queued_source_batch_pages(case, request_id, compact, resolved)
+
+
+async def _assert_queued_source_batch_pages(case, request_id, compact, resolved):
+    from process import registry_source_binding_publication as source_batch
+    from process.registry_publication_queue import read_registry_publication_request
+
+    seen_versions = []
+    for offset in range(0, compact["selection_count"], 100):
+        page = await source_batch.queued_source_batch_page(
+            case.connection,
+            request_id,
+            case.actor,
+            offset,
+            control_schema=case.schema,
+        )
+        seen_versions.extend(page["selection"])
+    assert seen_versions == list(resolved.selection)
+    status = await read_registry_publication_request(case.connection, request_id, control_schema=case.schema)
+    assert status["selection_count"] == 2602 and "selection" not in status
+    assert status["selection_sha256"] == compact["selection_sha256"]
+
+
+async def test_source_batch_complete_coverage_and_original_history_refuse_tamper(source_batch_case):
+    """Already approved targets reduce selections; stale or altered predecessors refuse."""
+    from process import registry_source_binding_publication as source_batch
+    from process.registry_approval_store import RegistryApprovalConflict, approve_registry_records
+    from tests.test_registry_approval_store_postgres import _command as approval_command
+
+    case = source_batch_case
+    async with case.connection.transaction():
+        await approve_registry_records(
+            case.connection,
+            await approval_command(case.connection, case.schema, case.networks[0]),
+            case.actor,
+            control_schema=case.schema,
+        )
+    approved_revision = await case.connection.fetchval(
+        f'SELECT approved_revision FROM "{case.schema}".registry_revision_control'
+    )
+    document_by_field = dict(
+        case.command, expected_draft_revision=approved_revision, expected_approved_revision=approved_revision
+    )
+    async with case.connection.transaction(isolation="repeatable_read", readonly=True):
+        compact, command = await source_batch.resolve_source_batch(
+            case.connection,
+            document_by_field,
+            case.actor,
+            control_schema=case.schema,
+            allow_unbound=True,
+        )
+    assert compact["selection_count"] == 5
+    assert not any(
+        selected_version["record_kind"] == "network" and selected_version["record_id"] == case.networks[0]["record_id"]
+        for selected_version in command.selection
+    )
+    await _assert_source_batch_reference_refusals(case, document_by_field, compact)
+    with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+        async with case.connection.transaction():
+            await case.connection.execute(
+                f"DELETE FROM \"{case.schema}\".registry_record_history WHERE record_kind='network_binding' "
+                "AND record_key=(SELECT min(record_key) FROM "
+                f"\"{case.schema}\".registry_record_history WHERE record_kind='network_binding')"
+            )
+            await source_batch.resolve_source_batch(
+                case.connection, document_by_field, case.actor, control_schema=case.schema, allow_unbound=True
+            )
+    with pytest.raises(RegistryApprovalConflict):
+        async with case.connection.transaction():
+            await case.connection.execute(
+                f'UPDATE "{case.schema}".registry_revision_control SET draft_revision=draft_revision+1'
+            )
+            await source_batch.enqueue_source_batch(
+                case.connection, compact, case.actor, "b" * 64, control_schema=case.schema
+            )
+    assert await case.connection.fetchval(f'SELECT count(*) FROM "{case.schema}".registry_publication_request') == 0
+    assert await case.connection.fetchval(f'SELECT count(*) FROM "{case.schema}".registry_approval_history') == 1
+
+
+async def _assert_source_batch_reference_refusals(case, document_by_field, compact):
+    from process import registry_source_binding_publication as source_batch
+
+    for changed in (
+        dict(
+            document_by_field,
+            batch_references=[dict(document_by_field["batch_references"][0], request_sha256="0" * 64)],
+        ),
+        dict(
+            document_by_field,
+            source_coordinates=dict(document_by_field["source_coordinates"], source_id="other-source"),
+        ),
+        dict(document_by_field, selection_count=4, selection_sha256=compact["selection_sha256"]),
+    ):
+        with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+            async with case.connection.transaction(isolation="repeatable_read", readonly=True):
+                await source_batch.resolve_source_batch(
+                    case.connection, changed, case.actor, control_schema=case.schema, allow_unbound=True
+                )

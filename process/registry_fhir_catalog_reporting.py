@@ -81,6 +81,7 @@ class FHIRCatalogRunReport:
                 "outcome": "not_started" if disposition.status == "accepted" else "unavailable",
                 "count_scope": "source_organization_projection",
                 "catalog_network_count": None,
+                "network_status": None,
                 "counts": dict.fromkeys(_COUNTERS),
             }
             self._add_row(outcome_by_field)
@@ -119,6 +120,7 @@ class FHIRCatalogRunReport:
                         "outcome": "carried",
                         "count_scope": "source_organization_projection",
                         "catalog_network_count": None,
+                        "network_status": None,
                         "counts": dict.fromkeys(_COUNTERS),
                     }
                 )
@@ -141,6 +143,8 @@ class FHIRCatalogRunReport:
                     raise ValueError("registry_fhir_catalog_source_report_counter_invalid")
                 row["counts"][key] = value
             row["outcome"] = "prepared"
+            if row["counts"]["networks"] is not None:
+                row["network_status"] = "no_networks" if row["counts"]["networks"] == 0 else "networks_found"
         self.progress("preparing")
 
     def observation_progress(self, dataset_id, rows):

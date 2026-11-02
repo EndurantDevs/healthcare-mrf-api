@@ -106,6 +106,7 @@ def test_empty_source_counts_require_projection_and_publication_stays_separate()
     )
     row = report.document["sources"][0]
     assert row["outcome"] == "prepared" and row["counts"]["networks"] == 0
+    assert row["network_status"] == "no_networks"
     assert row["count_scope"] == "source_organization_projection" and row["catalog_network_count"] is None
     report.failed(RuntimeError("private connection string must not be copied"))
     assert row["outcome"] == "prepared" and report.document["run_state"] == "failed"

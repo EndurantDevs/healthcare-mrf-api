@@ -91,10 +91,13 @@ async def test_verified_location_page_uses_physical_dataset_and_schema(monkeypat
         True,
     )
     connection = SimpleNamespace(
-        copy_records_to_table=AsyncMock(return_value="COPY 0"), fetchrow=AsyncMock(return_value={"offices_json": "[]"})
+        execute=AsyncMock(return_value="CREATE INDEX"),
+        copy_records_to_table=AsyncMock(return_value="COPY 0"),
+        fetchrow=AsyncMock(return_value={"offices_json": "[]"}),
     )
     monkeypatch.setattr(offices, "_canonicalize", AsyncMock(return_value="[]"))
     await offices._stage_verified_retained_page(connection, batch, None, "unit_inputs", "unit_source", {})
+    connection.execute.assert_awaited_once_with('CREATE INDEX ON pg_temp."unit_source"(page_key)')
     arguments = connection.fetchrow.await_args.args
     assert physical.read_schema_name in arguments[0] and original.read_schema_name not in arguments[0]
     assert arguments[1:] == ("[]", original.source_id, physical.dataset_id)

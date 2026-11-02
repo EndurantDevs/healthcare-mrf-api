@@ -4,7 +4,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
@@ -22,7 +22,7 @@ from tests.test_verified_inventory_v2 import context
 
 @pytest.mark.parametrize("aliases", [False, True])
 async def test_global_policy_keeps_legacy_distinction_and_explicit_v2_alias_identity(monkeypatch, aliases):
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(execute=AsyncMock(), transaction=Mock(return_value=AsyncMock()))
     monkeypatch.setattr(cms, "_verified_office_match_keys", AsyncMock(return_value="winners"))
     await cms._finish_verified_office_matches(
         connection,
@@ -40,18 +40,15 @@ async def test_global_policy_keeps_legacy_distinction_and_explicit_v2_alias_iden
     assert 'FROM "addresses"."entity_address_unified" source_address' in address_sql
     assert "WHERE source_address.location_key=winner.location_key OFFSET 0" in address_sql
     assert "to_jsonb(address) AS address" in hydration_sql
-    query = connection.execute.await_args.args[0]
-    location_clause, source_clause = query.split("ambiguous_sources AS MATERIALIZED")
-    assert query.startswith("WITH identities AS MATERIALIZED")
-    assert "SELECT ctid AS row_id,office->>'provider_system' AS provider_system" in location_clause
-    assert "SELECT location_key FROM identities" in location_clause
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    identity_query = next(statement for statement in statements if statement.startswith("INSERT INTO"))
+    assert "SELECT ctid AS row_id,page_key,office->>'provider_system' AS provider_system" in identity_query
     expected = "jsonb_build_array(provider_system,provider_id"
-    assert (expected + "))>1") in location_clause if aliases else (expected + ",location_id))>1") in location_clause
-    assert "SELECT provider_system,provider_id,location_id FROM identities" in source_clause
-    assert "count(DISTINCT location_key)>1" in source_clause
-    assert 'DELETE FROM pg_temp."matches" matched USING identities identity' in source_clause
-    assert "WHERE matched.ctid=identity.row_id AND (EXISTS(" in source_clause
-    assert "matched.office" not in source_clause
+    assert (expected + ")::text") in identity_query if aliases else (expected + ",location_id)::text") in identity_query
+    assert "office->>'location_id' AS location_id" in identity_query
+    assert "office->>'location_key' AS location_key" in identity_query
+    assert any('provider_identity text COLLATE "C"' in statement for statement in statements)
+    assert statements[-1].startswith("DROP TABLE")
 
 
 @pytest.mark.parametrize("flag", [None, 1, "true"])

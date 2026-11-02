@@ -2,7 +2,7 @@
 """Connected metadata projection, sealing, replay and retained-row regression."""
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -14,6 +14,7 @@ from sqlalchemy.schema import CreateTable
 
 from db.models.network_registry import NetworkRegistryAlias, NetworkRegistryIdentity
 from db.registry_fhir_catalog import table_sql
+from process import registry_fhir_catalog_sync as sync
 from process.registry_fhir_catalog_custody import FHIRCatalogTarget
 from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
 from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
@@ -109,10 +110,8 @@ def _edition_descriptor(edition):
     return source
 
 
-async def _staged_source(fixture, catalog_target, edition, network_names):
-    """Use extraction output; native Source admission is covered by its own fixture."""
-    source_descriptor = _edition_descriptor(edition)
-    generation = fhir_catalog_source_generation(source_descriptor)
+def _catalog_resource_rows(network_names):
+    """Build Organization and InsurancePlan resources for the staged-source fixture."""
     resource_rows = [source_row("Organization", "insurer", {"name": "Example Insurance"})]
     for resource_id, name in network_names.items():
         resource_rows.append(source_row("Organization", resource_id, {"name": name, "type_codes": [{"code": "ntwk"}]}))
@@ -127,6 +126,14 @@ async def _staged_source(fixture, catalog_target, edition, network_names):
                 },
             )
         )
+    return resource_rows
+
+
+async def _staged_source(fixture, catalog_target, edition, network_names, *, source_descriptor=None):
+    """Use extraction output; native Source admission is covered by its own fixture."""
+    source_descriptor = source_descriptor or _edition_descriptor(edition)
+    generation = fhir_catalog_source_generation(source_descriptor)
+    resource_rows = _catalog_resource_rows(network_names)
     extracted = extract_fhir_catalog_batch(resource_rows, profile="published_normalized")
     observations = [
         (generation, "Organization", observation.resource_id, "organization", 0, canonical_json(asdict(observation)))
@@ -152,8 +159,9 @@ async def _staged_source(fixture, catalog_target, edition, network_names):
     await fixture.connection.execute(
         f'INSERT INTO "{catalog_target.schema_name}".registry_fhir_catalog_source '
         "(source_generation,source_id,descriptor_json,profile,source_rows,observation_rows,accepted_at) "
-        "VALUES($1,'alias-a',$2::jsonb,'published_normalized',$3,$4,$5)",
+        "VALUES($1,$2,$3::jsonb,'published_normalized',$4,$5,$6)",
         generation,
+        source_descriptor["coordinates"]["source_id"],
         canonical_json(source_descriptor),
         len(resource_rows),
         len(observations),
@@ -162,8 +170,8 @@ async def _staged_source(fixture, catalog_target, edition, network_names):
     return FHIRCatalogSourceDisposition(
         source_descriptor["endpoint_id"],
         edition,
-        ("alias-a", "alias-b"),
-        2,
+        tuple(source_descriptor["source_aliases"]),
+        len(source_descriptor["source_aliases"]),
         "accepted",
         None,
         source_descriptor,
@@ -485,3 +493,123 @@ async def test_projection_sealing_replay_and_disappearance_preserve_identity(met
     refreshed_target = await _refresh_cached_catalog(fixture, grant, second, company_archived)
     await _assert_cached_identity(fixture, first, second, refreshed_target, bindings)
     await _assert_cached_organizations(fixture, refreshed_target, company_archived)
+
+
+async def _approve_pending_catalog_network(fixture, network_id):
+    """Add a reviewed name and binding for a source identity already present in the sealed catalog."""
+    pending_binding = str(uuid4())
+    network_by_field = {
+        "network_id": network_id,
+        "display_name": "Pending approved name",
+        "aliases": [],
+        "archived": False,
+        "revision": 1,
+    }
+    binding_by_field = {
+        "binding_id": pending_binding,
+        "binding_key": "b" * 64,
+        "network_id": network_id,
+        "archived": False,
+        "revision": 1,
+        "source_system": "fhir",
+        "source_id": "alias-a",
+        "source_key": "network-new",
+        "producer_id": "registry-source-fhir-witness-v1",
+        "source_scope_json": {"organization_id": "network-new", "capture_sha256": "c" * 64},
+    }
+    namespace = '"' + fixture.control_schema + '"'
+    await fixture.connection.execute(
+        f"INSERT INTO {namespace}.registry_approved_record "
+        "SELECT 7,record_kind,record_key,record_revision,custom_revision,record_json "
+        f"FROM {namespace}.registry_approved_record WHERE approved_revision=6"
+    )
+    await fixture.connection.copy_records_to_table(
+        "registry_approved_record",
+        schema_name=fixture.control_schema,
+        columns=("approved_revision", "record_kind", "record_key", "record_revision", "custom_revision", "record_json"),
+        records=[
+            (7, "network", str(network_id), 1, 6, canonical_json(network_by_field)),
+            (7, "network_binding", pending_binding, 1, 6, canonical_json(binding_by_field)),
+        ],
+    )
+    assert (
+        await fixture.connection.fetchval(
+            f"SELECT network_id FROM {namespace}.network_registry_alias WHERE source_system='fhir' "
+            "AND source_id='alias-a' AND alias_type='fhir_organization' AND alias_value='network-new' "
+            "AND scope_key='fhir-catalog/v1'"
+        )
+        == network_id
+    )
+    return pending_binding
+
+
+async def _unrelated_catalog_source(fixture, target):
+    """Stage the same Organization key under a separate source and endpoint identity."""
+    new_descriptor = _edition_descriptor("unrelated-edition")
+    new_descriptor["coordinates"]["source_id"] = "alias-unrelated"
+    new_descriptor.update(endpoint_id="endpoint-unrelated", source_aliases=["alias-unrelated"])
+    return await _staged_source(
+        fixture,
+        target,
+        "unrelated-edition",
+        {"network-old": "Unrelated source network"},
+        source_descriptor=new_descriptor,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_approved_maps_do_not_block_unrelated_source_projection(metadata_custody):
+    """Exercise extraction through sealing; native Source admission remains the staged-source fixture boundary."""
+    fixture = metadata_custody
+    grant = await _registry(fixture)
+    grant = replace(grant, company_crosswalks=(*grant.company_crosswalks, ("alias-unrelated", "insurer", COMPANY)))
+    first = await _initial_catalog(fixture, grant)
+    prior_bindings = await _catalog_bindings(fixture, fixture.target)
+    pending_id = next(
+        catalog_row["network_id"] for catalog_row in first.networks if catalog_row["display_name"] == "New network"
+    )
+    pending_binding = await _approve_pending_catalog_network(fixture, pending_id)
+    catalog_target = await _new_catalog_target(fixture)
+    source_disposition = await _unrelated_catalog_source(fixture, catalog_target)
+    head_by_field = {"approved_revision": 7}
+    manifest = SimpleNamespace(generation_id=9, manifest_sha256="f" * 64, approved_custom_revision=6)
+    async with fixture.connection.transaction():
+        snapshot, current = await sync._catalog_snapshot_inputs(
+            fixture.connection, grant, head_by_field, manifest, first.sealed, [source_disposition]
+        )
+    snapshot["schema_name"] = catalog_target.schema_name
+    assert snapshot["metadata_approved_revision"] == 6 and head_by_field["approved_revision"] == 7
+    assert snapshot["network_generation"] == 9
+    assert snapshot["mapping_sha256"] == first.snapshot["mapping_sha256"]
+    assert snapshot["membership_mapping_sha256"] == first.snapshot["membership_mapping_sha256"]
+    generation = fhir_catalog_source_generation(source_disposition.descriptor)
+    assert list(current) == [generation]
+    await _copy_catalog(fixture, first.sealed, catalog_target, snapshot)
+    projected = await _project(fixture, catalog_target, source_disposition, snapshot, grant)
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT bool_and(company_id=$1) FROM "{catalog_target.schema_name}".registry_fhir_catalog_relationship '
+            "WHERE source_id='alias-unrelated'",
+            UUID(COMPANY),
+        )
+        is True
+    )
+    sealed = await _seal_catalog(fixture, catalog_target, snapshot)
+    assert projected["created_networks"] == 1
+    networks = await _catalog_networks(fixture, catalog_target)
+    assert all(catalog_row in networks for catalog_row in first.networks)
+    assert any(
+        catalog_row["display_name"] == "Unrelated source network" and catalog_row["network_id"] != 7
+        for catalog_row in networks
+    )
+    assert all(catalog_row["display_name"] != "Pending approved name" for catalog_row in networks)
+    bindings = await _catalog_bindings(fixture, catalog_target)
+    assert {(catalog_row["binding_id"], catalog_row["network_id"]) for catalog_row in prior_bindings} <= {
+        (catalog_row["binding_id"], catalog_row["network_id"]) for catalog_row in bindings
+    }
+    assert all(str(catalog_row["binding_id"]) != pending_binding for catalog_row in bindings)
+    assert any(json.loads(catalog_row["document_json"])["source_id"] == "alias-unrelated" for catalog_row in bindings)
+    assert sealed["metadata_approved_revision"] == 6
+    assert sealed["accounting_json"]["registry_fhir_catalog_source"]["rows"] == 2
+    assert sealed["accounting_json"]["registry_fhir_catalog_network"]["rows"] == 3
+    assert await _catalog_networks(fixture, fixture.target) == first.networks

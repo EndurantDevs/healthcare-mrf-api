@@ -2,9 +2,12 @@
 """Explicit queue families fail closed before a protected claim can run."""
 
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
@@ -12,6 +15,7 @@ import asyncpg
 import pytest
 
 from process import registry_publication_queue as queue
+from process import registry_source_binding_publication as source_batch
 from process.registry_approval_store import RegistryApprovalCommand, RegistryApprovalConflict
 from process.registry_publication_queue import claim_registry_publication_request
 from process.registry_record_store import RegistryActor
@@ -57,6 +61,7 @@ async def test_omitted_family_cannot_fall_back_to_unfiltered_claim():
                 "prepare_source_rollback",
                 "publish_source_rollback",
                 "publish_initial_inventory",
+                "publish_source_binding_batch",
             ),
         ),
         ("office", False, ("prepare_ptg_office_capture", "approve_ptg_office_capture")),
@@ -246,6 +251,138 @@ async def test_publication_selection_is_bounded_before_canonical_sql_or_queue_wr
     connection.fetchrow.assert_not_awaited()
 
 
+def _source_batch_command(**changes):
+    return {
+        "operation": source_batch.OPERATION,
+        "batch_references": [{"idempotency_key": "draft-one", "request_sha256": "b" * 64, "custom_revision": 3}],
+        "source_coordinates": {
+            "source_system": "fhir",
+            "source_id": "sample-source",
+            "dataset_schema": "sample_data",
+            "dataset_id": "dataset-one",
+            "producer_id": "registry-source-fhir-witness-v1",
+            "edition_id": str(UUID(int=12)),
+        },
+        "metadata_generation": "a" * 64,
+        "selection_count": None,
+        "selection_sha256": None,
+        "expected_draft_revision": 3,
+        "expected_approved_revision": 0,
+        "expected_serving_generation": 1,
+        "reason": "Review the complete source",
+        "idempotency_key": "publish-source",
+        **changes,
+    }
+
+
+def _source_batch_request(count=2602):
+    selected, digest = source_batch.selection_identity(
+        [{"record_kind": "network", "record_id": number + 1, "revision": 1} for number in range(count)]
+    )
+    compact = _source_batch_command(selection_count=count, selection_sha256=digest)
+    stored = {key: value for key, value in compact.items() if key != "idempotency_key"} | {"selection": selected}
+    actor_by_name = {
+        "kind": "platform_admin",
+        "user_id": str(UUID(int=22)),
+        "client_id": "system",
+        "impersonator_id": None,
+    }
+    metadata = queue.publication_request_metadata(stored, actor_by_name, "c" * 64, compact["idempotency_key"])
+    return {**metadata, "idempotency_key": compact["idempotency_key"], "session_token_sha256": "c" * 64}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"selection_count": 5001, "selection_sha256": "d" * 64},
+        {"selection_count": True, "selection_sha256": "d" * 64},
+        {"selection_count": 1},
+        {"operation": "other"},
+        {"extra": 1},
+        {"batch_references": []},
+        {"batch_references": [{"idempotency_key": "draft", "request_sha256": "b" * 64, "custom_revision": 4}]},
+    ],
+)
+def test_source_batch_reference_refuses_invalid_or_unbounded_commands(change):
+    with pytest.raises(ValueError):
+        source_batch.validated_source_batch_command(_source_batch_command(**change), allow_unbound=True)
+
+
+def test_source_batch_reference_keeps_draft_chunks_ordered_and_old_selection_cap():
+    compact = _source_batch_command()
+    first = compact["batch_references"][0]
+    compact["batch_references"] = [
+        dict(first, custom_revision=2),
+        dict(first, idempotency_key="draft-two", request_sha256="c" * 64),
+    ]
+    assert source_batch.validated_source_batch_command(compact, allow_unbound=True) == compact
+    for references in (list(reversed(compact["batch_references"])), [first, first]):
+        with pytest.raises(ValueError):
+            source_batch.validated_source_batch_command(dict(compact, batch_references=references), allow_unbound=True)
+
+
+@pytest.mark.asyncio
+async def test_source_batch_authorizes_complete_vector_in_existing_hundred_record_pages():
+    request = _source_batch_request()
+    calls = []
+
+    async def authority(**arguments):
+        page = arguments["selection"]
+        assert len(page) <= 100 and arguments["session_token_sha256"] == "c" * 64
+        calls.extend(page)
+        return {
+            "authorized": True,
+            "actor": arguments["actor"],
+            "policy_revision": 7,
+            "selection_sha256": hashlib.sha256(
+                json.dumps(page, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+
+    assert await source_batch.authorize_source_batch(authority, request) == 7
+    compact, command = source_batch.stored_source_batch(request)
+    assert calls == list(command.selection) and len(calls) == compact["selection_count"] == 2602
+    pages = [source_batch.source_batch_page(compact, command, offset) for offset in range(0, 2602, 100)]
+    assert len(pages) == 27 and len(pages[-1]["selection"]) == 2 and pages[-1]["next_offset"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["denied", "digest", "policy", "timeout"])
+async def test_source_batch_late_authority_failure_never_returns_partial_acceptance(damage):
+    calls = []
+
+    async def authority(**arguments):
+        calls.append(arguments["selection"])
+        page = arguments["selection"]
+        if len(calls) == 2 and damage == "timeout":
+            raise TimeoutError
+        return {
+            "authorized": len(calls) != 2 or damage != "denied",
+            "actor": arguments["actor"],
+            "policy_revision": 8 if len(calls) == 2 and damage == "policy" else 7,
+            "selection_sha256": "0" * 64
+            if len(calls) == 2 and damage == "digest"
+            else hashlib.sha256(json.dumps(page, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        }
+
+    with pytest.raises((ValueError, TimeoutError)):
+        await source_batch.authorize_source_batch(authority, _source_batch_request(201))
+    assert len(calls) == 2
+
+
+def test_source_batch_stored_reference_and_selection_are_both_request_bound():
+    request = _source_batch_request(101)
+    compact, command = source_batch.stored_source_batch(request)
+    assert len(command.selection) == compact["selection_count"] == 101
+    for field in ("request_sha256", "actor_key", "session_token_sha256"):
+        with pytest.raises(ValueError):
+            source_batch.stored_source_batch(dict(request, **{field: "0" * 64}))
+    stored = json.loads(request["command_json"])
+    stored["selection"][0]["revision"] = 2
+    with pytest.raises(ValueError):
+        source_batch.stored_source_batch(dict(request, command_json=json.dumps(stored)))
+
+
 class _EnqueueRace:
     """Model the same-key insertion winner and transaction cleanup for each outcome."""
 
@@ -338,3 +475,269 @@ async def test_enqueue_race_preserves_exact_replay_head_check_and_transaction_fa
         assert race.events == ["begin", "rollback"]
         assert race.lookups == (2 if outcome in {"different_request", "missing_winner"} else 1)
     assert asdict(command) == before
+
+
+def test_source_batch_references_require_distinct_request_hashes():
+    compact = _source_batch_command()
+    first = compact["batch_references"][0]
+    compact["batch_references"] = [
+        dict(first, custom_revision=2),
+        dict(first, idempotency_key="draft-two"),
+    ]
+    with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+        source_batch.validated_source_batch_command(compact, allow_unbound=True)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"expected_draft_revision": True},
+        {"expected_approved_revision": 4},
+        {"expected_serving_generation": -1},
+        {"selection_count": 0, "selection_sha256": "a" * 64},
+        {"selection_count": 1, "selection_sha256": "A" * 64},
+        {"selection_count": None, "selection_sha256": "a" * 64},
+        {"metadata_generation": "not-a-digest"},
+        {"reason": " trailing "},
+        {"batch_references": None},
+    ],
+)
+def test_source_batch_scalar_guards_refuse_malformed_compact_references(change):
+    with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+        source_batch.validated_source_batch_command(_source_batch_command(**change), allow_unbound=True)
+
+
+@pytest.mark.parametrize(
+    "selected",
+    [
+        [],
+        [{"record_kind": "network", "record_id": number + 1, "revision": 1} for number in range(5001)],
+        [{"record_kind": "network", "record_id": True, "revision": 1}],
+        [{"record_kind": "network", "record_id": 1, "revision": True}],
+        [{"record_kind": "provider", "record_id": str(UUID(int=1)), "revision": 1}],
+        [{"record_kind": "network_binding", "record_id": str(UUID(int=0)), "revision": 1}],
+        [{"record_kind": "network", "record_id": 1, "revision": 1}] * 2,
+    ],
+)
+def test_source_batch_selection_rejects_invalid_keys_duplicates_and_count(selected):
+    with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+        source_batch.selection_identity(selected)
+
+
+@pytest.mark.parametrize("offset", [None, True, -1, 1, 99, 101, 5000])
+def test_source_batch_page_rejects_noncanonical_or_outside_offsets(offset):
+    compact, command = source_batch.stored_source_batch(_source_batch_request(101))
+    with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+        source_batch.source_batch_page(compact, command, offset)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("selection_count", 100),
+        ("selection_sha256", "a" * 64),
+        ("metadata_generation", "d" * 64),
+        ("expected_draft_revision", 4),
+    ],
+)
+def test_source_batch_stored_scalar_changes_cannot_reuse_request_hash(field, value):
+    request = _source_batch_request(101)
+    stored = json.loads(request["command_json"])
+    stored[field] = value
+    with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+        source_batch.stored_source_batch(dict(request, command_json=json.dumps(stored)))
+
+
+@pytest.mark.asyncio
+async def test_source_batch_authority_pages_share_one_real_deadline(monkeypatch):
+    original_timeout = asyncio.timeout
+    requested_budgets, page_lengths = [], []
+    cancelled_pages = []
+
+    def short_timeout(seconds):
+        requested_budgets.append(seconds)
+        return original_timeout(0.05)
+
+    async def authority(**arguments):
+        page = arguments["selection"]
+        page_lengths.append(len(page))
+        if len(page_lengths) == 2:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled_pages.append(len(page_lengths))
+        return {
+            "authorized": True,
+            "actor": arguments["actor"],
+            "policy_revision": 7,
+            "selection_sha256": hashlib.sha256(
+                json.dumps(page, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+
+    monkeypatch.setattr(source_batch.asyncio, "timeout", short_timeout)
+    with pytest.raises(TimeoutError):
+        await source_batch.authorize_source_batch(authority, _source_batch_request(201))
+    assert requested_budgets == [15] and page_lengths == [100, 100] and cancelled_pages == [2]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "preview",
+        "selection",
+        "request-id",
+        "queue",
+        "actor",
+        "hash",
+        "query",
+        "queue-offset",
+        "request-extra",
+        "unknown-field",
+        "queue-unbound",
+    ],
+)
+def test_source_batch_http_parser_keeps_command_actor_and_status_modes_closed(case):
+    from api.endpoint.registry_publication import _source_batch_body
+
+    body_by_field = _source_batch_command()
+    actor_by_field = {"kind": "platform_admin", "user_id": str(UUID(int=22)), "client_id": "system"}
+    body_by_field.update(actor=actor_by_field, session_token_sha256="c" * 64)
+    operation = "preview"
+    if case in {"selection", "request-id", "request-extra"}:
+        operation = "selection"
+        body_by_field["offset"] = 100
+    if case in {"request-id", "request-extra"}:
+        body_by_field = {
+            "request_id": str(UUID(int=23)),
+            "offset": 0,
+            "actor": actor_by_field,
+            "session_token_sha256": "c" * 64,
+        }
+    if case in {"queue", "queue-offset", "queue-unbound"}:
+        operation = "queue"
+        body_by_field.update(selection_count=1, selection_sha256="d" * 64)
+    changes_by_case = {
+        "actor": {"actor": {**actor_by_field, "kind": "service"}},
+        "hash": {"session_token_sha256": "C" * 64},
+        "queue-offset": {"offset": 0},
+        "request-extra": {"extra": 1},
+        "unknown-field": {"selection": []},
+        "queue-unbound": {"selection_count": None, "selection_sha256": None},
+    }
+    body_by_field.update(changes_by_case.get(case, {}))
+    request = SimpleNamespace(
+        body=json.dumps(body_by_field).encode(), args={}, query_string="unexpected=1" if case == "query" else ""
+    )
+    if case not in {"preview", "selection", "request-id", "queue"}:
+        with pytest.raises(ValueError):
+            _source_batch_body(request, operation)
+        return
+    compact, actor, session_hash, offset = _source_batch_body(request, operation)
+    assert actor.kind == "platform_admin" and actor.user_id == UUID(int=22) and session_hash == "c" * 64
+    assert offset == (100 if case == "selection" else 0)
+    if case == "request-id":
+        assert compact == {"request_id": str(UUID(int=23))}
+    else:
+        assert compact["operation"] == source_batch.OPERATION and "actor" not in compact
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "completed",
+        "queued",
+        "rejected",
+        "count",
+        "previous",
+        "generation",
+        "extra",
+        "counter-negative",
+        "counter-total",
+        "pending-result",
+        "policy-type",
+    ],
+)
+def test_source_batch_status_result_keeps_completion_heads_and_counters_bound(case):
+    compact, command = source_batch.stored_source_batch(_source_batch_request(101))
+    result_by_field = {
+        "approved_revision": 4,
+        "previous_approved_revision": 0,
+        "selected_count": 101,
+        "serving_generation": 2,
+        "policy_revision": 7,
+        "source_selection": {"mapped_rows": 1, "omitted_rows": 0},
+    }
+    changes_by_case = {
+        "count": {"selected_count": 100},
+        "previous": {"previous_approved_revision": 1},
+        "generation": {"serving_generation": 0},
+        "extra": {"selection": []},
+        "counter-negative": {"source_selection": {"mapped_rows": -1, "omitted_rows": 0}},
+        "counter-total": {"source_selection": {"mapped_rows": 2**53 - 1, "omitted_rows": 1}},
+        "policy-type": {"policy_revision": True},
+    }
+    result_by_field.update(changes_by_case.get(case, {}))
+    state = "completed"
+    if case == "queued":
+        state, result_by_field = "queued", None
+    if case == "rejected":
+        state, result_by_field = "rejected", {"error": {"code": "registry_publication_rejected"}}
+    if case == "pending-result":
+        state = "running"
+    if case in {"completed", "queued", "rejected"}:
+        queue._source_batch_result(result_by_field, compact, command, state)
+    else:
+        with pytest.raises(ValueError):
+            queue._source_batch_result(result_by_field, compact, command, state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remaining", [0, 1])
+async def test_source_batch_receipt_budget_refuses_before_history_fetch(remaining):
+    compact = _source_batch_command()
+    reference = compact["batch_references"][0]
+    records = [
+        {"record_kind": "network_binding", "record_id": str(UUID(int=number)), "revision": 1} for number in (1, 2)
+    ]
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(
+            return_value={
+                "request_sha256": reference["request_sha256"],
+                "receipt": json.dumps({"custom_revision": 3, "records": records}),
+            }
+        ),
+        fetch=AsyncMock(),
+    )
+    with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+        await source_batch._one_batch_history(
+            connection,
+            '"registry"',
+            compact,
+            RegistryActor("platform_admin", UUID(int=22), "system"),
+            reference,
+            remaining_records=remaining,
+        )
+    connection.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate", [False, True])
+async def test_source_batch_history_applies_remaining_budget_to_each_reference(monkeypatch, duplicate):
+    compact = _source_batch_command(
+        batch_references=[
+            {"idempotency_key": "first", "request_sha256": "a" * 64, "custom_revision": 2},
+            {"idempotency_key": "second", "request_sha256": "b" * 64, "custom_revision": 3},
+        ]
+    )
+    first_records = [{"binding_id": str(UUID(int=number))} for number in (1, 2)]
+    second_records = [{"binding_id": str(UUID(int=1 if duplicate else 3))}]
+    load = AsyncMock(side_effect=[first_records, second_records])
+    monkeypatch.setattr(source_batch, "_one_batch_history", load)
+    arguments = (object(), '"registry"', compact, RegistryActor("platform_admin", UUID(int=22), "system"))
+    if duplicate:
+        with pytest.raises(ValueError, match="registry_source_batch_invalid"):
+            await source_batch._binding_history(*arguments)
+    else:
+        assert await source_batch._binding_history(*arguments) == first_records + second_records
+    assert [call.kwargs["remaining_records"] for call in load.await_args_list] == [5000, 4998]

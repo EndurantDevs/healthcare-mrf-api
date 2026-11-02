@@ -113,7 +113,9 @@ async def test_real_member_copy_is_drained_before_cancellation_returns(monkeypat
         await finish.wait()
         return "COPY 1"
 
-    connection = SimpleNamespace(copy_records_to_table=AsyncMock(side_effect=copy_members), fetchrow=AsyncMock())
+    connection = SimpleNamespace(
+        execute=AsyncMock(), copy_records_to_table=AsyncMock(side_effect=copy_members), fetchrow=AsyncMock()
+    )
     member = _member()
     source = _source().recipe.source_pin
     operation = asyncio.create_task(
@@ -220,6 +222,7 @@ async def test_all_recipes_share_one_global_pruning_pass(monkeypatch):
 async def test_shared_page_renders_the_retained_source_sql_before_location_read(monkeypatch):
     source = _source().recipe.source_pin
     connection = SimpleNamespace(
+        execute=AsyncMock(),
         copy_records_to_table=AsyncMock(side_effect=["COPY 1", "COPY 0"]),
         fetchrow=AsyncMock(return_value={"offices_json": "[]"}),
     )
@@ -232,3 +235,50 @@ async def test_shared_page_renders_the_retained_source_sql_before_location_read(
     assert f'"{source.read_schema_name}".provider_directory_dataset_resource' in connection.fetchrow.await_args.args[0]
     assert "{source}" not in connection.fetchrow.await_args.args[0]
     assert proofs_by_key == {"page": (0, None)}
+    connection.execute.assert_awaited_once_with('CREATE INDEX ON pg_temp."members"(page_key)')
+    connection.copy_records_to_table.side_effect = ["COPY 1", "COPY 0"]
+    await legacy._stage_verified_member_page(
+        connection, source, [member], json.dumps([member]).encode(), "next", "inputs", "members", proofs_by_key
+    )
+    assert connection.execute.await_count == 1
+
+
+async def test_member_prune_materializes_only_page_identity_before_exact_uuid_comparison():
+    connection = SimpleNamespace(execute=AsyncMock())
+    assert mapping._prune_unmatched_members is legacy._prune_unmatched_members
+    await legacy._prune_unmatched_members(connection, "members", "matches", {"first": (0, None), "empty": (0, None)})
+    cleanup, *pages = connection.execute.await_args_list
+    assert "page_key IS NULL OR NOT(page_key=ANY($1::text[]))" in cleanup.args[0]
+    assert cleanup.args[1] == ["first", "empty"]
+    assert [page.args[1] for page in pages] == ["first", "empty"]
+    statement = pages[0].args[0]
+    projection, deletion = statement.split(") DELETE FROM", 1)
+    assert projection.startswith("WITH matched_keys AS MATERIALIZED (")
+    assert "office->>'provider_system' AS provider_system" in projection
+    assert "office->>'provider_id' AS provider_id" in projection
+    assert "office->>'location_id' AS location_id" in projection
+    assert 'FROM pg_temp."matches" WHERE page_key=$1' in projection
+    assert 'pg_temp."members" member WHERE member.page_key=$1 AND NOT EXISTS' in deletion
+    assert "(matched.provider_system,matched.provider_id,matched.location_id::uuid)" in deletion
+    assert "=(member.provider_system,member.provider_id,member.location_id)" in deletion
+    assert "office" not in deletion and "DISTINCT" not in statement
+
+
+async def test_global_pruning_freezes_all_identities_before_any_page_delete():
+    connection = SimpleNamespace(execute=AsyncMock(), transaction=Mock(return_value=AsyncMock()))
+    await legacy._prune_verified_offices(connection, "matches", True, {"first": None, "second": None})
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert statements[0].startswith("CREATE TEMP TABLE")
+    assert all(statement.startswith("CREATE INDEX") for statement in statements[1:4])
+    assert statements[4].startswith("INSERT INTO")
+    assert all(statement.startswith('DELETE FROM pg_temp."matches"') for statement in statements[5:7])
+    assert statements[7].startswith("DROP TABLE")
+    assert not any(statement.startswith("UPDATE") for statement in statements)
+    assert 'provider_identity text COLLATE "C"' in statements[0]
+    assert "jsonb_build_array(provider_system,provider_id)::text" in statements[4]
+    assert "ORDER BY provider_identity LIMIT 1" in statements[5]
+    assert "ORDER BY provider_identity DESC LIMIT 1" in statements[5]
+    assert "ORDER BY location_key LIMIT 1" in statements[5]
+    assert "ORDER BY location_key DESC LIMIT 1" in statements[5]
+    assert "(other.provider_system,other.provider_id,other.location_id)=" in statements[5]
+    assert all("ctid=ANY(ARRAY(" in statement for statement in statements[5:7])

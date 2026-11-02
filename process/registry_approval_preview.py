@@ -21,7 +21,15 @@ from process.registry_record_store import RegistryActor, _validated_actor
 from process.registry_source_observation_store import _namespace
 
 
-async def _preview_document(connection, namespace, staging, command):
+async def _preview_document(connection, namespace, staging, command, *, summary_only=False):
+    projected_records_sql = (
+        "summary_json::text"
+        if summary_only
+        else """CASE WHEN octet_length(summary_json::text)+records_bytes<=1048576
+          THEN jsonb_set(summary_json,'{records}',
+            (SELECT jsonb_agg(record_json ORDER BY record_kind,record_key) FROM changes))::text
+          ELSE NULL END"""
+    )
     return await connection.fetchval(
         f"""WITH changes AS MATERIALIZED (
           SELECT selected.record_kind,selected.record_key,
@@ -56,23 +64,28 @@ async def _preview_document(connection, namespace, staging, command):
             sum(octet_length(record_json::text))+2*(count(*)-1) AS records_bytes
           FROM changes
         )
-        SELECT CASE WHEN octet_length(summary_json::text)+records_bytes<=1048576
-          THEN jsonb_set(summary_json,'{{records}}',
-            (SELECT jsonb_agg(record_json ORDER BY record_kind,record_key) FROM changes))::text
-          ELSE NULL END FROM summary""",
+        SELECT {projected_records_sql} FROM summary""",
         command.expected_draft_revision,
         command.expected_approved_revision,
     )
 
 
 async def preview_registry_approval(
-    connection, command: RegistryApprovalCommand, actor: RegistryActor, *, control_schema=None, office_authority=None
+    connection,
+    command: RegistryApprovalCommand,
+    actor: RegistryActor,
+    *,
+    control_schema=None,
+    office_authority=None,
+    summary_only=False,
 ):
     """Compare exact selected versions without changing durable registry data.
 
     The caller verifies live authorization on each request and owns the outer
     transaction. Identity-only previews do not infer bindings or membership.
     """
+    if type(summary_only) is not bool:
+        raise ValueError("registry_approval_preview_invalid")
     _, selection_json = _validated_command(command)
     _validated_actor(actor)
     namespace = _namespace(control_schema)
@@ -97,7 +110,7 @@ async def preview_registry_approval(
             raise RegistryApprovalConflict("registry_approval_revision_conflict")
         staging = await _stage_selection(connection, selection_json)
         await _validate_selected_history(connection, namespace, staging, control["draft_revision"])
-        preview_json = await _preview_document(connection, namespace, staging, command)
+        preview_json = await _preview_projection(connection, namespace, staging, command, summary_only)
         diagnostics = await approved_membership_diagnostics(
             connection, namespace, staging, command.expected_approved_revision
         )
@@ -115,14 +128,24 @@ async def preview_registry_approval(
         await connection.execute(f"DROP TABLE {staging}")
         if office_authority is not None:
             await require_ptg_office_authority(connection, namespace[1:-1], office_authority)
-        if preview_json is None:
-            raise ValueError("registry_approval_preview_too_large")
-        preview = json.loads(preview_json)
-        _merge_preview_diagnostics(preview, diagnostics, source_selection)
-        _merge_company_group_diagnostics(preview, company_groups)
-        if len(json.dumps(preview, sort_keys=True).encode()) > 1048576:
-            raise ValueError("registry_approval_preview_too_large")
-        return preview
+        return _decoded_preview(preview_json, diagnostics, source_selection, company_groups)
+
+
+async def _preview_projection(connection, namespace, staging, command, summary_only):
+    if summary_only:
+        return await _preview_document(connection, namespace, staging, command, summary_only=True)
+    return await _preview_document(connection, namespace, staging, command)
+
+
+def _decoded_preview(preview_json, diagnostics, source_selection, company_groups):
+    if preview_json is None:
+        raise ValueError("registry_approval_preview_too_large")
+    preview = json.loads(preview_json)
+    _merge_preview_diagnostics(preview, diagnostics, source_selection)
+    _merge_company_group_diagnostics(preview, company_groups)
+    if len(json.dumps(preview, sort_keys=True).encode()) > 1048576:
+        raise ValueError("registry_approval_preview_too_large")
+    return preview
 
 
 def _merge_preview_diagnostics(preview, diagnostics, source_selection):

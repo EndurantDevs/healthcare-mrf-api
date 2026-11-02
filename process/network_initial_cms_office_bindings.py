@@ -655,6 +655,8 @@ async def _stage_verified_member_page(
         raise InitialCMSOfficeBindingError("initial_retained_mapping_accounting_invalid")
     if key in proofs_by_page or len(proofs_by_page) >= MAX_INPUT_BYTES // 512:
         raise InitialCMSOfficeBindingError("initial_cms_office_page_accounting_invalid")
+    if not proofs_by_page:
+        await connection.execute(f"CREATE INDEX ON pg_temp.{_identifier(source_table)}(page_key)")
     copied = await drain_operation(
         connection.copy_records_to_table(
             source_table,
@@ -692,18 +694,16 @@ async def _stage_verified_member_page(
         (key, ordinal, json.dumps(office), json.dumps(canonical[ordinal - 1]))
         for ordinal, office in enumerate(offices, 1)
     ]
-    if (
-        await drain_operation(
-            connection.copy_records_to_table(
-                input_name,
-                schema_name="pg_temp",
-                columns=("page_key", "ordinal", "office", "canonical"),
-                records=office_inputs,
-            ),
-            preserve_cancellation=True,
-        )
-        != f"COPY {len(office_inputs)}"
-    ):
+    copied = await drain_operation(
+        connection.copy_records_to_table(
+            input_name,
+            schema_name="pg_temp",
+            columns=("page_key", "ordinal", "office", "canonical"),
+            records=office_inputs,
+        ),
+        preserve_cancellation=True,
+    )
+    if copied != f"COPY {len(office_inputs)}":
         raise InitialCMSOfficeBindingError("initial_retained_mapping_accounting_invalid")
     proofs_by_page[key] = (0, None)
 
@@ -789,31 +789,91 @@ async def _finish_verified_office_matches(
             key,
             json.dumps(verified_offices),
         )
-    await _prune_verified_offices(connection, result_name, source_aliases)
+    await _prune_verified_offices(connection, result_name, source_aliases, proofs_by_page)
 
 
-async def _prune_verified_offices(connection, result_name, source_aliases):
-    """Keep same-provider source aliases only under the explicit v2 matching policy."""
-    identity_sql = "provider_system,provider_id"
-    if not source_aliases:
-        identity_sql += ",location_id"
-    # Keep JSON out of aggregate/join workfiles; row IDs stay local to this statement's private temp relation.
-    await connection.execute(f"""WITH identities AS MATERIALIZED (
-      SELECT ctid AS row_id,office->>'provider_system' AS provider_system,office->>'provider_id' AS provider_id,
-        office->>'location_id' AS location_id,office->>'location_key' AS location_key
-      FROM pg_temp.{_identifier(result_name)}
-    ), ambiguous_locations AS MATERIALIZED (
-      SELECT location_key FROM identities
-      GROUP BY 1 HAVING count(DISTINCT jsonb_build_array({identity_sql}))>1
-    ), ambiguous_sources AS MATERIALIZED (
-      SELECT provider_system,provider_id,location_id FROM identities
-      GROUP BY 1,2,3 HAVING count(DISTINCT location_key)>1
-    ) DELETE FROM pg_temp.{_identifier(result_name)} matched USING identities identity
-    WHERE matched.ctid=identity.row_id AND (EXISTS(
-      SELECT FROM ambiguous_locations WHERE location_key=identity.location_key
-    ) OR EXISTS(SELECT FROM ambiguous_sources WHERE
-      (provider_system,provider_id,location_id)=
-      (identity.provider_system,identity.provider_id,identity.location_id)))""")
+async def _verified_office_identities(connection, result_name, source_aliases):
+    """Index narrow global identities before population; keep result row IDs until pruning finishes."""
+    name = "office_prune_" + uuid4().hex
+    relation = "pg_temp." + _identifier(name)
+    await drain_operation(
+        connection.execute(f"""CREATE TEMP TABLE {relation}(
+          row_id tid NOT NULL,page_key text,provider_system text,provider_id text,location_id text,
+          location_key text,provider_identity text COLLATE "C" NOT NULL
+        ) ON COMMIT DROP"""),
+        preserve_cancellation=True,
+    )
+    for columns in (
+        "page_key",
+        "location_key,provider_identity",
+        "provider_system,provider_id,location_id,location_key",
+    ):
+        await drain_operation(connection.execute(f"CREATE INDEX ON {relation}({columns})"), preserve_cancellation=True)
+    identity_fields = "provider_system,provider_id" + ("" if source_aliases else ",location_id")
+    await drain_operation(
+        connection.execute(f"""INSERT INTO {relation}(row_id,page_key,provider_system,provider_id,location_id,
+          location_key,provider_identity) SELECT row_id,page_key,provider_system,provider_id,location_id,
+          location_key,jsonb_build_array({identity_fields})::text FROM (
+          SELECT ctid AS row_id,page_key,office->>'provider_system' AS provider_system,
+            office->>'provider_id' AS provider_id,office->>'location_id' AS location_id,
+            office->>'location_key' AS location_key FROM pg_temp.{_identifier(result_name)}
+        ) identities"""),
+        preserve_cancellation=True,
+    )
+    return relation
+
+
+async def _prune_verified_offices(connection, result_name, source_aliases, proofs_by_page):
+    """Prune each page against an immutable copy of the complete global identities."""
+    async with connection.transaction():
+        relation = await _verified_office_identities(connection, result_name, source_aliases)
+        extrema_queries = []
+        for field, equality in (
+            ("provider_identity", "other.location_key=identity.location_key"),
+            (
+                "location_key",
+                "(other.provider_system,other.provider_id,other.location_id)="
+                "(identity.provider_system,identity.provider_id,identity.location_id)",
+            ),
+        ):
+            query = f"SELECT {field} FROM {relation} other WHERE {equality} AND {field} IS NOT NULL ORDER BY {field}"
+            extrema_queries.append(f"({query} LIMIT 1)<>({query} DESC LIMIT 1)")
+        for key in proofs_by_page:
+            await drain_operation(
+                connection.execute(
+                    f"DELETE FROM pg_temp.{_identifier(result_name)} WHERE ctid=ANY(ARRAY("
+                    f"SELECT row_id FROM {relation} identity WHERE page_key=$1 "
+                    f"AND coalesce(({extrema_queries[0]}) OR ({extrema_queries[1]}),false)))",
+                    key,
+                ),
+                preserve_cancellation=True,
+            )
+        await drain_operation(connection.execute(f"DROP TABLE {relation}"), preserve_cancellation=True)
+
+
+async def _prune_unmatched_members(connection, source_table, result_name, proofs_by_page):
+    """Prune authenticated pages with bounded workfiles after global office ambiguity checks."""
+    await drain_operation(
+        connection.execute(
+            f"DELETE FROM pg_temp.{_identifier(source_table)} WHERE page_key IS NULL OR NOT(page_key=ANY($1::text[]))",
+            list(proofs_by_page),
+        ),
+        preserve_cancellation=True,
+    )
+    for key in proofs_by_page:
+        await drain_operation(
+            connection.execute(
+                f"""WITH matched_keys AS MATERIALIZED (
+          SELECT office->>'provider_system' AS provider_system,office->>'provider_id' AS provider_id,
+            office->>'location_id' AS location_id FROM pg_temp.{_identifier(result_name)} WHERE page_key=$1
+        ) DELETE FROM pg_temp.{_identifier(source_table)} member WHERE member.page_key=$1 AND NOT EXISTS(
+          SELECT FROM matched_keys matched
+          WHERE (matched.provider_system,matched.provider_id,matched.location_id::uuid)
+            =(member.provider_system,member.provider_id,member.location_id))""",
+                key,
+            ),
+            preserve_cancellation=True,
+        )
 
 
 async def prepare_verified_retained_office_mapping(
@@ -833,10 +893,7 @@ async def prepare_verified_retained_office_mapping(
         await _verify_retained_office_read(connection, batch.source, retained_read)
         await _stage_verified_retained_page(connection, batch, cursor, input_name, source_table, proofs_by_page)
     await _finish_verified_office_matches(connection, input_name, result_name, address_source, proofs_by_page)
-    await connection.execute(f"""DELETE FROM pg_temp.{_identifier(source_table)} member WHERE NOT EXISTS(
-      SELECT FROM pg_temp.{_identifier(result_name)} matched WHERE matched.page_key=member.page_key
-      AND (matched.office->>'provider_system',matched.office->>'provider_id',(matched.office->>'location_id')::uuid)
-        =(member.provider_system,member.provider_id,member.location_id))""")
+    await _prune_unmatched_members(connection, source_table, result_name, proofs_by_page)
     matches = _OfficeMatches(
         result_name,
         await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + result_name),

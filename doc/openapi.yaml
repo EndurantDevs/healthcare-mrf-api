@@ -8336,6 +8336,61 @@ paths:
         verified. Imported unresolved rows contribute to unresolved_count. Omitted
         rows are intentional source-binding exclusions. These counts describe this
         selection and do not establish overall network coverage.
+  /registry/publication/source-batch/{operation}:
+    post:
+      operationId: requestRegistrySourceBatchPublication
+      summary: Review or queue one complete source binding selection
+      description: Resolves immutable saved binding batches for one exact FHIR source edition and
+        published metadata generation. Requires control authentication, an explicit actor and session hash,
+        and a JSON body of at most 65536 bytes; query parameters and duplicate fields are refused.
+        Selection returns at most 100 canonical network or network_binding revisions per page, with
+        offset, next_offset, selection_count and selection_sha256. The complete vector is bounded to
+        5000 entries and 1048576 canonical JSON bytes. Preview returns summary counts and an empty
+        records array with the same selection commitment. Queue requires the reviewed non-null count
+        and digest, retains the complete vector and returns one idempotent publication request receipt.
+        Stale heads, changed selections and incomplete source maps are refused. Existing publication
+        selection and authority page limits remain 100. Queueing does not establish publication;
+        poll the existing publication request status route. Selection can also page the retained
+        vector using request_id, including after completion, for the original actor or a platform admin.
+      security:
+      - RegistryControlBearer: []
+      - RegistryControlHeader: []
+      parameters:
+      - name: operation
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [selection, preview, queue]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - $ref: '#/components/schemas/RegistrySourceBatchPublicationCommand'
+              - $ref: '#/components/schemas/RegistrySourceBatchSelectionRequest'
+      responses:
+        '200':
+          description: One bounded selection page, summary preview or durable queue receipt.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/DirectoryCacheControl'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/RegistrySourceBatchSelectionPage'
+                - $ref: '#/components/schemas/RegistrySourceBatchPreview'
+                - $ref: '#/components/schemas/RegistrySourceBatchQueueReceipt'
+        '400':
+          $ref: '#/components/responses/RegistryInvalidRequest'
+        '403':
+          $ref: '#/components/responses/RegistryControlDenied'
+        '409':
+          $ref: '#/components/responses/RegistryConflict'
+        '503':
+          $ref: '#/components/responses/RegistryUnavailable'
   /registry/publication/initial-inventory:
     post:
       operationId: queueRegistryInitialInventory
@@ -8528,6 +8583,12 @@ paths:
         integer counts verified against the retained imported-source selection.
         Omitted rows were excluded by approved source bindings; this is not a measure
         of unmatched providers or overall network coverage.
+        Source batch requests return operation publish_source_binding_batch, command_sha256,
+        selection_count and selection_sha256 without the expanded selection. Page the retained
+        vector through the source-batch selection operation with request_id. Completed results
+        include approved_revision, previous_approved_revision, selected_count, serving_generation
+        and policy_revision, with optional source_selection counters. The count and commitment
+        remain bound to the original saved selection.
         Reactivation requests return operation reactivate_generation and command_sha256
         in place of selection. Completed reactivation results contain operation,
         previous_generation_id, generation_id, approved_custom_revision,
@@ -19553,6 +19614,130 @@ components:
         session_token_sha256:
           type: string
           pattern: ^[0-9a-f]{64}$
+    RegistrySourceBatchPublicationCommand:
+      type: object
+      additionalProperties: false
+      required:
+      - operation
+      - batch_references
+      - source_coordinates
+      - metadata_generation
+      - selection_count
+      - selection_sha256
+      - expected_draft_revision
+      - expected_approved_revision
+      - expected_serving_generation
+      - reason
+      - idempotency_key
+      - actor
+      - session_token_sha256
+      description: Selection and preview accept selection_count and selection_sha256 both null to
+        resolve the complete saved vector, or both bound to its exact count and digest. Queue requires
+        both non-null. Offset is allowed only for selection. Approved revision cannot exceed draft
+        revision. Reasons, idempotency keys and source coordinates must be nonblank and trimmed.
+      properties:
+        operation: {type: string, enum: [publish_source_binding_batch]}
+        batch_references:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: Saved batches from this actor, with distinct idempotency keys and request hashes,
+            ordered by strictly increasing custom_revision no greater than expected_draft_revision.
+          items:
+            type: object
+            additionalProperties: false
+            required: [idempotency_key, request_sha256, custom_revision]
+            properties:
+              idempotency_key: {type: string, minLength: 1, maxLength: 128}
+              request_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+              custom_revision: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775806}
+        source_coordinates:
+          type: object
+          additionalProperties: false
+          required: [source_system, source_id, dataset_schema, dataset_id, producer_id, edition_id]
+          description: All six coordinates must match every saved binding. Text coordinates other than
+            dataset_schema and source_system are limited to 128 UTF-8 bytes without control characters.
+          properties:
+            source_system: {type: string, enum: [fhir]}
+            source_id: {type: string, minLength: 1, maxLength: 128}
+            dataset_schema: {type: string, pattern: '^[A-Za-z_][A-Za-z0-9_]{0,62}$'}
+            dataset_id: {type: string, minLength: 1, maxLength: 128}
+            producer_id: {type: string, minLength: 1, maxLength: 128}
+            edition_id: {type: string, minLength: 1, maxLength: 128}
+        metadata_generation: {type: string, pattern: '^[0-9a-f]{64}$'}
+        selection_count: {type: integer, minimum: 1, maximum: 5000, nullable: true}
+        selection_sha256: {type: string, pattern: '^[0-9a-f]{64}$', nullable: true}
+        expected_draft_revision: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
+        expected_approved_revision: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
+        expected_serving_generation: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+        idempotency_key: {type: string, minLength: 1, maxLength: 128}
+        actor: {$ref: '#/components/schemas/RegistryControlActor'}
+        session_token_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 4900
+          multipleOf: 100
+          default: 0
+          description: Selection only; must be less than the complete selection count.
+    RegistrySourceBatchSelectionRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, actor, session_token_sha256]
+      description: Selection operation only. Reads the original frozen vector without resolving current
+        draft records. The actor must own the request or be a platform admin; offset must be below its count.
+      properties:
+        request_id: {type: string, format: uuid}
+        actor: {$ref: '#/components/schemas/RegistryControlActor'}
+        session_token_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        offset: {type: integer, minimum: 0, maximum: 4900, multipleOf: 100, default: 0}
+    RegistrySourceBatchSelectionPage:
+      type: object
+      additionalProperties: false
+      required: [operation, expected_draft_revision, expected_approved_revision, expected_serving_generation,
+        selection_count, selection_sha256, selection, offset, next_offset]
+      properties:
+        operation: {type: string, enum: [publish_source_binding_batch]}
+        expected_draft_revision: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
+        expected_approved_revision: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
+        expected_serving_generation: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
+        selection_count: {type: integer, minimum: 1, maximum: 5000}
+        selection_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        selection:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: Canonical order by record_kind and string-form record_id. Network IDs are positive
+            int32 values; network_binding IDs are canonical nonzero UUIDs. Revisions are positive.
+          items:
+            allOf:
+            - $ref: '#/components/schemas/RegistryPublicationSelection'
+            - type: object
+              properties:
+                record_kind: {type: string, enum: [network, network_binding]}
+                revision: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775806}
+        offset: {type: integer, minimum: 0, maximum: 4900, multipleOf: 100}
+        next_offset: {type: integer, minimum: 100, maximum: 4900, multipleOf: 100, nullable: true}
+    RegistrySourceBatchPreview:
+      type: object
+      required: [operation, selection_count, selection_sha256, records]
+      description: Existing approval summary and diagnostics with an empty records array. Selection
+        commitment covers the complete vector; imported source counts describe only this selection.
+      properties:
+        operation: {type: string, enum: [publish_source_binding_batch]}
+        selection_count: {type: integer, minimum: 1, maximum: 5000}
+        selection_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        records: {type: array, maxItems: 0, items: {type: object}}
+    RegistrySourceBatchQueueReceipt:
+      type: object
+      additionalProperties: false
+      required: [request_id, state, created_at, replayed]
+      properties:
+        request_id: {type: string, format: uuid}
+        state: {type: string, enum: [queued, running, completed, rejected]}
+        created_at: {type: string, format: date-time}
+        replayed: {type: boolean}
     RegistryInitialInventoryCommand:
       type: object
       additionalProperties: false
