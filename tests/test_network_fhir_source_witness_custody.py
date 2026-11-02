@@ -457,3 +457,50 @@ async def test_retained_replay_stream_failure_does_not_finish(retained_replay):
     assert case.compare.await_count == len(case.pages)
     assert case.events == ["source.retained", "source.closed"]
     case.finish.assert_not_awaited()
+
+
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.parametrize("changed_capture", [False, True])
+async def test_retained_approval_keeps_full_capture_binding_and_strict_default(
+    monkeypatch, protected_selection, retained, changed_capture
+):
+    connection, recipe, approved, current_guard = protected_selection
+    retained_guard = AsyncMock()
+    monkeypatch.setattr(bindings, "require_retained_approved_network_source_bindings", retained_guard)
+    if changed_capture:
+        capture = replace(recipe.source_pin.source_witness_capture, observed_at="2026-01-03T00:00:00.000000+00:00")
+        capture = replace(capture, capture_sha256=witness.capture_digest(capture))
+        recipe = _with_capture(recipe, capture)
+    options = {"retained_approval": True} if retained else {}
+    if changed_capture:
+        with pytest.raises(composition.RegistrySourceCompositionError, match="approval_unavailable"):
+            await composition._approved_source_witness_capture(
+                connection, recipe, approved, "control_example", **options
+            )
+    else:
+        assert (
+            await composition._approved_source_witness_capture(
+                connection, recipe, approved, "control_example", **options
+            )
+            == recipe.source_pin.source_witness_capture
+        )
+    selected, unused = (retained_guard, current_guard) if retained else (current_guard, retained_guard)
+    selected.assert_awaited_once_with(
+        connection, approved, recipe.binding_coordinates, control_schema="control_example"
+    )
+    unused.assert_not_awaited()
+    assert connection.fetchval.await_args.args[-1] == recipe.source_pin.source_witness_capture.capture_sha256
+
+
+@pytest.mark.parametrize("mode", [None, 1, "previous"])
+async def test_retained_approval_mode_is_not_truthy_input(monkeypatch, protected_selection, mode):
+    connection, recipe, approved, current_guard = protected_selection
+    retained_guard = AsyncMock()
+    monkeypatch.setattr(bindings, "require_retained_approved_network_source_bindings", retained_guard)
+    with pytest.raises(composition.RegistrySourceCompositionError, match="approval_invalid"):
+        await composition._approved_source_witness_capture(
+            connection, recipe, approved, "control_example", retained_approval=mode
+        )
+    current_guard.assert_not_awaited()
+    retained_guard.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()

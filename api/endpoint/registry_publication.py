@@ -363,18 +363,22 @@ async def publication_state(request):
         return _error(503)
 
 
-async def _checked_preview(driver, command, actor, expected_head, office_authority=None):
+async def _checked_preview(driver, command, actor, expected_head, office_authority=None, *, summary_only=False):
     current_head = await driver.fetchval(
         f"SELECT coalesce(generation_id,0) FROM {_namespace(None)}.network_serving_control WHERE id=1"
     )
     if current_head is None or current_head != expected_head:
         raise RegistryApprovalConflict("registry_queue_revision_conflict")
+    if summary_only:
+        return await preview_registry_approval(
+            driver, command, actor, office_authority=office_authority, summary_only=True
+        )
     if office_authority is None:
         return await preview_registry_approval(driver, command, actor)
     return await preview_registry_approval(driver, command, actor, office_authority=office_authority)
 
 
-async def _configured_preview(request, service, command, actor, expected_head):
+async def _configured_preview(request, service, command, actor, expected_head, *, summary_only=False):
     """Own one genuine fenced source session; never accept a request-supplied authority."""
     control_schema = _namespace(None)[1:-1]
     if (
@@ -399,7 +403,124 @@ async def _configured_preview(request, service, command, actor, expected_head):
         if expected_by_name != actual_by_name or actual_by_name["control_oid"] is None or not all(original_roles):
             raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
         authority = (session, service.store, RegistryPTGGraphReadBudget(16 * 1024 * 1024))
+        if summary_only:
+            return await _checked_preview(driver, command, actor, expected_head, authority, summary_only=True)
         return await _checked_preview(driver, command, actor, expected_head, authority)
+
+
+def _source_batch_body(request, operation):
+    from process.registry_source_binding_publication import validated_source_batch_command
+
+    if request.query_string or request.args or not request.body or len(request.body) > 65536:
+        raise ValueError("registry_publication_request_invalid")
+    document = json.loads(request.body, object_pairs_hook=_unique_object)
+    if type(document) is not dict:
+        raise ValueError("registry_publication_request_invalid")
+    actor_document = document.pop("actor", None)
+    if type(actor_document) is not dict or set(actor_document) - {"impersonator_id"} != {
+        "kind",
+        "user_id",
+        "client_id",
+    }:
+        raise ValueError("registry_publication_actor_invalid")
+    actor = RegistryActor(
+        actor_document["kind"],
+        _uuid(actor_document["user_id"]),
+        actor_document["client_id"],
+        _uuid(actor_document["impersonator_id"]) if actor_document.get("impersonator_id") is not None else None,
+    )
+    _validated_actor(actor)
+    session_hash = document.pop("session_token_sha256", None)
+    if type(session_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", session_hash) is None:
+        raise ValueError("registry_session_hash_invalid")
+    if operation != "selection" and "offset" in document:
+        raise ValueError("registry_publication_request_invalid")
+    offset = document.pop("offset", 0)
+    if operation == "selection" and "request_id" in document:
+        if set(document) != {"request_id"}:
+            raise ValueError("registry_publication_request_invalid")
+        return document, actor, session_hash, offset
+    return (
+        validated_source_batch_command(document, allow_unbound=operation in {"selection", "preview"}),
+        actor,
+        session_hash,
+        offset,
+    )
+
+
+async def _source_batch_selection(request, document, actor, offset):
+    from process.registry_source_binding_publication import (
+        queued_source_batch_page,
+        resolve_source_batch,
+        source_batch_page,
+    )
+
+    async with request.ctx.sa_session.begin():
+        await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        driver = await _driver(request.ctx.sa_session)
+        if "request_id" in document:
+            return await queued_source_batch_page(driver, _uuid(document["request_id"]), actor, offset)
+        compact, command = await resolve_source_batch(driver, document, actor, allow_unbound=True)
+        return source_batch_page(compact, command, offset)
+
+
+async def _source_batch_preview(request, document, actor):
+    from process.registry_source_binding_publication import resolve_source_batch
+
+    async with request.ctx.sa_session.begin():
+        await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        compact, command = await resolve_source_batch(
+            await _driver(request.ctx.sa_session), document, actor, allow_unbound=True
+        )
+    service = getattr(request.app.ctx, "registry_ptg_scope_engine", None)
+    if service is not None:
+        preview_by_field = await _configured_preview(
+            request, service, command, actor, compact["expected_serving_generation"], summary_only=True
+        )
+    else:
+        async with request.ctx.sa_session.begin():
+            preview_by_field = await _checked_preview(
+                await _driver(request.ctx.sa_session),
+                command,
+                actor,
+                compact["expected_serving_generation"],
+                summary_only=True,
+            )
+    preview_by_field.update(
+        operation=compact["operation"],
+        selection_count=compact["selection_count"],
+        selection_sha256=compact["selection_sha256"],
+    )
+    return preview_by_field
+
+
+@blueprint.post("/source-batch/<operation>")
+async def request_source_batch_publication(request, operation):
+    """One compact reference resolves a complete reviewed Source selection."""
+    from process.registry_source_binding_publication import enqueue_source_batch
+
+    require_registry_auth(request)
+    try:
+        if operation not in {"selection", "preview", "queue"}:
+            raise ValueError("registry_publication_operation_invalid")
+        document, actor, session_hash, offset = _source_batch_body(request, operation)
+        if operation == "selection":
+            result = await _source_batch_selection(request, document, actor, offset)
+        elif operation == "queue":
+            async with request.ctx.sa_session.begin():
+                await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+                result = await enqueue_source_batch(
+                    await _driver(request.ctx.sa_session), document, actor, session_hash
+                )
+        else:
+            result = await _source_batch_preview(request, document, actor)
+        return response.json(result, headers=_HEADERS)
+    except RegistryRecordConflict:
+        return _error(409)
+    except ValueError, TypeError, KeyError:
+        return _error(400)
+    except RegistryImportedSelectionUnavailable, asyncpg.PostgresError, SQLAlchemyError:
+        return _error(503)
 
 
 @blueprint.post("/<operation>")

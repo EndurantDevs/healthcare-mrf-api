@@ -95,6 +95,11 @@ def _command_actor(request_record):
     if _validated_actor(actor) != actor_by_name:
         raise ValueError("registry_publication_actor_invalid")
     command_by_name = _document(request_record["command_json"])
+    if type(command_by_name) is dict and command_by_name.get("operation") == "publish_source_binding_batch":
+        from process.registry_source_binding_publication import stored_source_batch
+
+        _compact, command = stored_source_batch(request_record)
+        return command, actor, _wire_actor(actor_by_name), command_by_name
     if type(command_by_name) is not dict or set(command_by_name) != {
         "expected_draft_revision",
         "expected_approved_revision",
@@ -117,6 +122,11 @@ def _command_actor(request_record):
 async def _fresh_authority(authorize, request_record):
     if not callable(authorize):
         raise ValueError("registry_publication_authority_required")
+    source_command = _document(request_record["command_json"])
+    if type(source_command) is dict and source_command.get("operation") == "publish_source_binding_batch":
+        from process.registry_source_binding_publication import authorize_source_batch
+
+        return await authorize_source_batch(authorize, request_record)
     command, _actor, actor_by_name, _command_by_name = _command_actor(request_record)
     receipt_by_name = await authorize(
         session_token_sha256=request_record["session_token_sha256"],

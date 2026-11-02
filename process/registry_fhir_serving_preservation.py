@@ -311,13 +311,21 @@ async def _coverage(
     for recipe in recipes:
         if type(recipe.source_pin) is not PinnedFHIRMembershipSource:
             continue
-        await require_registry_source_recipe_custody(
-            connection,
-            recipe,
-            approved,
-            control_schema,
-            **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
-        )
+        if side == "previous" and recipe.source_pin.source_witness_capture is not None:
+            from process.registry_source_recipe_composition import require_source_witness_read
+
+            # _preservation_baseline authenticates the prior manifest and its exact retained approval.
+            await require_source_witness_read(
+                connection, recipe, approved, control_schema, source_witness_runtime, retained_approval=True
+            )
+        else:
+            await require_registry_source_recipe_custody(
+                connection,
+                recipe,
+                approved,
+                control_schema,
+                **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
+            )
         await require_retained_approved_network_source_bindings(
             connection, approved, recipe.binding_coordinates, control_schema=control_schema
         )

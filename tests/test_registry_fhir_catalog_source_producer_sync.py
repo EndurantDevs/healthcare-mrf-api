@@ -104,12 +104,14 @@ async def test_reconciliation_failure_preserves_error_and_releases_lock(reconcil
 @pytest.mark.asyncio
 async def test_reconciliation_reports_publication_only_after_preparation(reconciliation_case):
     case, events = reconciliation_case
-    sync.prepare_fhir_catalog_snapshot.return_value = ({"sealed": True}, None, {"accepted_sources": 1})
+    accounting_by_phase = {"accepted_sources": 1, "publication_approved_revision": 7, "mapping_approved_revision": 6}
+    sync.prepare_fhir_catalog_snapshot.return_value = ({"sealed": True}, None, accounting_by_phase)
     sync._publish_catalog_snapshot.return_value = {"state": "completed"}
     with reporting.fhir_catalog_run_reporting() as report:
         result = await sync.reconcile_fhir_catalog(case.config, source_export=case.factory)
         assert report.document["publication_state"] == "in_progress"
-    assert result == {"state": "completed", "accepted_sources": 1}
+    assert result == {"state": "completed", **accounting_by_phase}
+    assert sync._publish_catalog_snapshot.await_args.kwargs["expected_approved_revision"] == 7
     assert events == ["opened"] * 4 + ["closed"] * 4
 
 
@@ -246,7 +248,7 @@ def source_case():
 def _preparation(monkeypatch, case):
     selected = snapshot(case.config.grant, (case.accepted.descriptor,))
     current_by_generation = {sync.fhir_catalog_source_generation(case.accepted.descriptor): case.accepted}
-    monkeypatch.setattr(sync, "_catalog_registry_head", AsyncMock(return_value=({}, None, None)))
+    monkeypatch.setattr(sync, "_catalog_registry_head", AsyncMock(return_value=({"approved_revision": 6}, None, None)))
     monkeypatch.setattr(sync, "_retained_catalog_sources", AsyncMock(return_value=[]))
     monkeypatch.setattr(sync, "_catalog_snapshot_inputs", AsyncMock(return_value=(selected, current_by_generation)))
     monkeypatch.setattr(sync, "_reusable_catalog_snapshot", AsyncMock(return_value=None))
@@ -345,7 +347,7 @@ async def test_partial_success_and_nonfailed_retained_or_manual_paths_still_prep
         sync.fhir_catalog_source_generation(accepted_source.descriptor): accepted_source
         for accepted_source in current_sources + retained_sources
     }
-    sync._catalog_registry_head.return_value = ({}, None, previous)
+    sync._catalog_registry_head.return_value = ({"approved_revision": 6}, None, previous)
     sync._retained_catalog_sources.return_value = retained_sources
     sync._catalog_snapshot_inputs.return_value = (expected, by_generation)
     selected, original, accounting = await sync.prepare_fhir_catalog_snapshot(

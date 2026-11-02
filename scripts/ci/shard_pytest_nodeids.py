@@ -161,6 +161,16 @@ def collect_nodeids(pytest_arguments: Sequence[str]) -> list[str]:
 def _registry_shard_index(nodeid: str, shard_count: int) -> int:
     """Place expensive proofs without changing the remaining registry hash buckets."""
     if shard_count == 48 and nodeid == (
+        "tests/test_network_fhir_source_witness_publication_postgres.py"
+        "::test_distinct_source_addition_retains_prior_capture_and_readers"
+    ):
+        return 29
+    if shard_count == 48 and nodeid == (
+        "tests/test_registry_fhir_catalog_metadata_reader_postgres.py"
+        "::test_metadata_execution_reader_successor_preserves_incumbent"
+    ):
+        return 33
+    if shard_count == 48 and nodeid == (
         "tests/test_registry_cms_refresh_anchors_postgres.py"
         "::test_cms_anchor_uses_genuine_accepted_notification_and_original_native_evidence"
     ):
@@ -171,8 +181,17 @@ def _registry_shard_index(nodeid: str, shard_count: int) -> int:
         "::test_inaccessible_public_view_does_not_hide_unsafe_callbacks",
         "tests/test_registry_execution_catalog_postgres.py"
         "::test_inaccessible_public_view_keeps_complete_metadata_and_transition_census",
+        "tests/test_registry_execution_catalog_postgres.py"
+        "::test_public_view_external_return_rule_is_not_a_self_dependency",
+        "tests/test_registry_execution_catalog_postgres.py"
+        "::test_public_view_rights_refuse_without_schema_usage[public]",
     ):
         return 2
+    if shard_count == 48 and nodeid == (
+        "tests/test_verified_witness_custom_publication_postgres.py"
+        "::test_source_v2_manual_commands_preserve_custody_and_replay"
+    ):
+        return 6
     if shard_count == 48 and nodeid == (
         "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent"
     ):

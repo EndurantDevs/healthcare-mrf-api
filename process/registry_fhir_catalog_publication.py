@@ -10,7 +10,10 @@ from process.network_membership_publication import lock_publication_controls
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_fhir_catalog_custody import verify_fhir_catalog_snapshot
-from process.registry_fhir_catalog_fingerprints import require_fhir_catalog_membership_reuse
+from process.registry_fhir_catalog_fingerprints import (
+    require_fhir_catalog_mapping_revision,
+    require_fhir_catalog_membership_reuse,
+)
 from process.registry_publication_execution import (
     locked_publication_request_transaction,
     publication_request,
@@ -73,9 +76,11 @@ def validated_fhir_catalog_command(command):
     return dict(command)
 
 
-def _metadata(command):
+def _metadata(command, *, split_revision=False):
     actor_by_field = {"kind": "catalog_source_service", "standing_grant_sha256": command["standing_grant_sha256"]}
     key = "fhir-catalog:" + command["metadata_generation"]
+    if split_revision:
+        key += ":approved:" + str(command["expected_approved_revision"])
     return actor_by_field, key, publication_request_metadata(command, actor_by_field, NO_USER_SESSION, key)
 
 
@@ -84,14 +89,16 @@ async def enqueue_fhir_catalog_publication(connection, command, *, authorize_met
     if not connection.is_in_transaction():
         raise ValueError("registry_fhir_catalog_transaction_required")
     command = validated_fhir_catalog_command(command)
-    actor, key, metadata = _metadata(command)
     namespace = source_observation_namespace(control_schema)
     snapshot = await _snapshot(connection, namespace, command)
     await _authority(authorize_metadata, command, snapshot, connection)
+    actor, key, metadata = _metadata(
+        command, split_revision=command["expected_approved_revision"] != snapshot["metadata_approved_revision"]
+    )
     existing = await existing_publication_request(connection, namespace, metadata, key)
     if existing is not None:
         return existing
-    row = await connection.fetchrow(
+    request_row = await connection.fetchrow(
         f"INSERT INTO {namespace}.registry_publication_request "
         "(request_id,actor_key,session_token_sha256,actor_json,command_json,idempotency_key,request_sha256) "
         "VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7) "
@@ -104,9 +111,9 @@ async def enqueue_fhir_catalog_publication(connection, command, *, authorize_met
         key,
         metadata["request_sha256"],
     )
-    if row is None:
+    if request_row is None:
         return await existing_publication_request(connection, namespace, metadata, key)
-    return queued_publication_receipt(row, False)
+    return queued_publication_receipt(request_row, False)
 
 
 async def _authority(authorize, command, snapshot, connection):
@@ -125,7 +132,11 @@ async def _authority(authorize, command, snapshot, connection):
 
 def _validated_request(record):
     command = validated_fhir_catalog_command(publication_document(record["command_json"]))
-    actor, key, metadata = _metadata(command)
+    legacy_key = "fhir-catalog:" + command["metadata_generation"]
+    split_key = legacy_key + ":approved:" + str(command["expected_approved_revision"])
+    if record["idempotency_key"] not in (legacy_key, split_key):
+        raise ValueError("registry_fhir_catalog_request_invalid")
+    actor, key, metadata = _metadata(command, split_revision=record["idempotency_key"] == split_key)
     if record["session_token_sha256"] != NO_USER_SESSION or record["idempotency_key"] != key:
         raise ValueError("registry_fhir_catalog_request_invalid")
     if publication_document(record["actor_json"]) != actor or any(
@@ -176,16 +187,26 @@ async def _snapshot(connection, namespace, command):
         f"SELECT * FROM {namespace}.registry_fhir_catalog_snapshot WHERE metadata_generation=$1",
         command["metadata_generation"],
     )
-    if row is None or any(
-        row[field] != command[expected]
-        for field, expected in (
-            ("network_generation", "expected_serving_generation"),
-            ("metadata_approved_revision", "expected_approved_revision"),
-            ("standing_grant_sha256", "standing_grant_sha256"),
+    if (
+        row is None
+        or type(row["metadata_approved_revision"]) is not int
+        or not (0 <= row["metadata_approved_revision"] <= command["expected_approved_revision"])
+        or any(
+            row[field] != command[expected]
+            for field, expected in (
+                ("network_generation", "expected_serving_generation"),
+                ("standing_grant_sha256", "standing_grant_sha256"),
+            )
         )
     ):
         raise RegistryApprovalConflict("registry_fhir_catalog_snapshot_changed")
     await verify_fhir_catalog_snapshot(connection, row)
+    try:
+        await require_fhir_catalog_mapping_revision(
+            connection, row, command["expected_approved_revision"], control_schema=namespace[1:-1]
+        )
+    except ValueError:
+        raise RegistryApprovalConflict("registry_fhir_catalog_snapshot_changed") from None
     return dict(row)
 
 
@@ -206,6 +227,9 @@ async def _compare_head(connection, namespace, command, snapshot):
     manifest = await resolve_network_serving_manifest(connection, generation_id=serving, control_schema=namespace[1:-1])
     if manifest.manifest_sha256 != snapshot["manifest_sha256"]:
         raise RegistryApprovalConflict("registry_fhir_catalog_source_changed")
+    await require_fhir_catalog_mapping_revision(
+        connection, snapshot, command["expected_approved_revision"], control_schema=namespace[1:-1]
+    )
     await require_fhir_catalog_membership_reuse(connection, manifest, snapshot, control_schema=namespace[1:-1])
 
 
