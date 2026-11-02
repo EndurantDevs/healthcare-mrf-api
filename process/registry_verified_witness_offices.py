@@ -25,6 +25,7 @@ from process.network_initial_cms_office_bindings import (
     _finish_verified_office_matches,
     _matched_page,
     _OfficeMatches,
+    _prune_unmatched_members,
     _stage_verified_member_page,
     _transaction_identity,
     _verified_member_input,
@@ -172,10 +173,7 @@ async def _bind_matches(connection, address_source, identity, names, scope, proo
     await _finish_verified_office_matches(
         connection, input_name, result_name, address_source, proofs, source_aliases=True
     )
-    await connection.execute(f"""DELETE FROM pg_temp.{_identifier(source_table)} member WHERE NOT EXISTS(
-      SELECT FROM pg_temp.{_identifier(result_name)} matched WHERE matched.page_key=member.page_key
-      AND (matched.office->>'provider_system',matched.office->>'provider_id',(matched.office->>'location_id')::uuid)
-        =(member.provider_system,member.provider_id,member.location_id))""")
+    await _prune_unmatched_members(connection, source_table, result_name, proofs)
     matches = _OfficeMatches(
         result_name,
         await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + result_name),

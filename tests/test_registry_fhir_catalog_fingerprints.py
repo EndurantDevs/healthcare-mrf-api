@@ -90,3 +90,91 @@ async def test_membership_reuse_requires_old_current_and_snapshot_commitments_to
         with pytest.raises(ValueError, match="registry_fhir_catalog_.*mapping_changed"):
             await operation
     connection.fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "active,serving,approved",
+    [(False, 6, 7), (True, True, 7), (True, 6, True), (True, -1, 7), (True, 7, 7), (True, 8, 7), (True, 6, 2**63)],
+)
+async def test_pending_mapping_proof_requires_transaction_and_ordered_integer_revisions(active, serving, approved):
+    connection = SimpleNamespace(is_in_transaction=Mock(return_value=active), fetchval=AsyncMock())
+    with pytest.raises(ValueError, match="membership_mapping_changed"):
+        await fingerprints.require_fhir_catalog_pending_mappings(
+            connection, serving, approved, control_schema="registry_example"
+        )
+    connection.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compatible", [True, False, None, 1])
+async def test_split_selection_requires_positive_add_only_proof(compatible):
+    connection = SimpleNamespace(
+        is_in_transaction=Mock(return_value=True),
+        fetch=AsyncMock(return_value=_family_rows(6) + _family_rows(7, metadata="c", membership="d")),
+        fetchval=AsyncMock(return_value=compatible),
+    )
+    operation = fingerprints.select_fhir_catalog_mapping(
+        connection, 7, SimpleNamespace(approved_custom_revision=6), control_schema="registry_example"
+    )
+    if compatible is True:
+        assert await operation == (6, {"metadata": "a" * 64, "membership": "b" * 64})
+    else:
+        with pytest.raises(ValueError, match="membership_mapping_changed"):
+            await operation
+    assert connection.fetchval.await_args.args[1:] == (
+        [6, 7],
+        sorted(set(fingerprints.METADATA_KINDS + fingerprints.MEMBERSHIP_KINDS)),
+        fingerprints._MAX_BYTES,
+        "fhir-catalog/v1",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attached", [False, True])
+async def test_unchanged_membership_keeps_current_metadata_mapping(attached):
+    rows = _family_rows(7, metadata="c")
+    manifest = SimpleNamespace(approved_custom_revision=6) if attached else None
+    connection = SimpleNamespace(
+        is_in_transaction=Mock(return_value=True),
+        fetch=AsyncMock(return_value=(_family_rows(6) if attached else []) + rows),
+        fetchval=AsyncMock(),
+    )
+    assert await fingerprints.select_fhir_catalog_mapping(
+        connection, 7, manifest, control_schema="registry_example"
+    ) == (7, {"metadata": "c" * 64, "membership": "b" * 64})
+    connection.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "unattached", "manifest_hash", "manifest_revision", "pending_proof"])
+async def test_mapping_revision_authenticates_pinned_manifest_independently(monkeypatch, damage):
+    snapshot_by_field = {"metadata_approved_revision": 6, "network_generation": 9, "manifest_sha256": "f" * 64}
+    if damage == "unattached":
+        snapshot_by_field["network_generation"] = None
+    resolver = AsyncMock(
+        return_value=SimpleNamespace(
+            approved_custom_revision=5 if damage == "manifest_revision" else 6,
+            manifest_sha256=("e" if damage == "manifest_hash" else "f") * 64,
+        )
+    )
+    monkeypatch.setattr(fingerprints, "resolve_network_serving_manifest", resolver)
+    connection = SimpleNamespace(
+        is_in_transaction=Mock(return_value=True), fetchval=AsyncMock(return_value=damage != "pending_proof")
+    )
+    operation = fingerprints.require_fhir_catalog_mapping_revision(
+        connection, snapshot_by_field, 7, control_schema="registry_example"
+    )
+    if damage is None:
+        await operation
+    else:
+        with pytest.raises(ValueError, match="mapping_(revision_)?changed"):
+            await operation
+    if damage == "unattached":
+        resolver.assert_not_awaited()
+    else:
+        resolver.assert_awaited_once_with(connection, generation_id=9, control_schema="registry_example")
+    if damage in {"unattached", "manifest_hash", "manifest_revision"}:
+        connection.fetchval.assert_not_awaited()
+    else:
+        assert connection.fetchval.await_args.args[1] == [6, 7]

@@ -380,8 +380,8 @@ async def test_full_response_size_and_sql_count_are_bounded_at_five_thousand(ser
     one_count = counted.statements
     assert len(json.dumps(preview, sort_keys=True).encode()) < 1048576
     selected_versions = tuple(
-        dict(row)
-        for row in await connection.fetch(
+        dict(history_row)
+        for history_row in await connection.fetch(
             f'SELECT record_kind,record_key AS record_id,revision FROM "{schema}".registry_record_history'
         )
     )
@@ -390,6 +390,13 @@ async def test_full_response_size_and_sql_count_are_bounded_at_five_thousand(ser
     with pytest.raises(ValueError, match="preview_too_large"):
         await _preview(counted, schema, command, actor)
     assert counted.statements == one_count == 8  # Includes one set-based company-group diagnostics cursor.
+    counted.statements = 0
+    async with connection.transaction():
+        summary = await preview_registry_approval(counted, command, actor, control_schema=schema, summary_only=True)
+    assert summary["selected_count"] == summary["additions_count"] == 5000
+    assert summary["records"] == [] and summary["unresolved_count"] == 0
+    assert len(json.dumps(summary, sort_keys=True).encode()) < 1048576
+    assert counted.statements == one_count
     assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".registry_approval_history') == 0
     assert tuple(
         await connection.fetchrow(f'SELECT draft_revision,approved_revision FROM "{schema}".registry_revision_control')

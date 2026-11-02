@@ -18,7 +18,10 @@ from process.registry_publication_consumer import RegistryPublicationConsumerCon
 
 
 @pytest.mark.parametrize("completed", [False, True])
-async def test_worker_enqueue_owns_repeatable_read_before_metadata_authorization(monkeypatch, completed):
+@pytest.mark.parametrize("approved_revision", [None, 7])
+async def test_worker_enqueue_owns_repeatable_read_before_metadata_authorization(
+    monkeypatch, completed, approved_revision
+):
     class Loader:
         active = False
         isolation = None
@@ -51,6 +54,7 @@ async def test_worker_enqueue_owns_repeatable_read_before_metadata_authorization
     async def enqueue(connection, command, *, authorize_metadata, control_schema):
         assert connection is loader and control_schema == "control_example"
         assert command["expected_metadata_generation"] is None
+        assert command["expected_approved_revision"] == (0 if approved_revision is None else approved_revision)
         await authorize_metadata(connection=connection, command=command, snapshot=snapshot_by_field)
         return {"request_id": str(identity), "state": "completed" if completed else "pending"}
 
@@ -64,8 +68,9 @@ async def test_worker_enqueue_owns_repeatable_read_before_metadata_authorization
     monkeypatch.setattr(worker, "enqueue_fhir_catalog_publication", AsyncMock(side_effect=enqueue))
     publish = AsyncMock(side_effect=consume)
     monkeypatch.setattr(worker, "consume_registry_publication_once", publish)
+    cas_by_field = {"expected_approved_revision": approved_revision}
     operation_result = await worker._publish_catalog_snapshot(
-        config, loader, snapshot_by_field, None, runtime, object(), object()
+        config, loader, snapshot_by_field, None, runtime, object(), object(), **cas_by_field
     )
     assert operation_result == {"state": "completed" if completed else "published", "request_id": str(identity)}
     assert publish.await_count == int(not completed)
@@ -154,6 +159,48 @@ def service_request():
         "result_json": None,
     }
     return selected, command_by_field, record_by_field
+
+
+@pytest.mark.parametrize("split_revision", [False, True])
+def test_service_request_validates_legacy_and_exact_split_revision_keys(split_revision):
+    _selected, command_by_field, record = service_request()
+    if split_revision:
+        command_by_field = {
+            **command_by_field,
+            "expected_approved_revision": command_by_field["expected_approved_revision"] + 1,
+        }
+    actor, key, metadata = publication._metadata(command_by_field, split_revision=split_revision)
+    record.update(
+        metadata, idempotency_key=key, actor_json=json.dumps(actor), command_json=json.dumps(command_by_field)
+    )
+    assert publication._validated_request(record) == command_by_field
+    assert key.endswith(":approved:" + str(command_by_field["expected_approved_revision"])) is split_revision
+
+
+@pytest.mark.parametrize("suffix", [":approved:0", ":approved:07", ":approved:7:extra", ":changed"])
+def test_service_request_refuses_noncanonical_or_wrong_revision_key(suffix):
+    _selected, command, record = service_request()
+    command["expected_approved_revision"] = 7
+    actor, key, metadata = publication._metadata(command, split_revision=True)
+    record.update(metadata, idempotency_key=key, actor_json=json.dumps(actor), command_json=json.dumps(command))
+    record["idempotency_key"] = "fhir-catalog:" + command["metadata_generation"] + suffix
+    with pytest.raises(ValueError, match="request_invalid"):
+        publication._validated_request(record)
+
+
+def test_split_revision_retries_keep_generation_but_bind_each_exact_approved_head():
+    _selected, command, record = service_request()
+    first_by_field = {**command, "expected_approved_revision": 7}
+    second_by_field = {**command, "expected_approved_revision": 8}
+    actor, key, metadata = publication._metadata(first_by_field, split_revision=True)
+    _, next_key, next_metadata = publication._metadata(second_by_field, split_revision=True)
+    assert key != next_key and metadata["request_sha256"] != next_metadata["request_sha256"]
+    assert publication._metadata(first_by_field, split_revision=True) == (actor, key, metadata)
+    record.update(
+        metadata, idempotency_key=next_key, actor_json=json.dumps(actor), command_json=json.dumps(second_by_field)
+    )
+    with pytest.raises(ValueError, match="request_invalid"):
+        publication._validated_request(record)
 
 
 @pytest.mark.asyncio

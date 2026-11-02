@@ -24,6 +24,7 @@ _CLAIM_OPERATIONS = {
         "publish_source_rollback",
         "publish_initial_inventory",
         "publish_fhir_catalog",
+        "publish_source_binding_batch",
     ),
     "office": ("prepare_ptg_office_capture", "approve_ptg_office_capture"),
 }
@@ -816,15 +817,45 @@ async def enqueue_registry_publication(
         raise ValueError("registry_queue_requires_caller_transaction")
     if type(session_token_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", session_token_sha256) is None:
         raise ValueError("registry_session_hash_invalid")
-    _reason, selection_json = _validated_command(command)
+    _validated_command(command)
     if len(command.selection) > 100:
         raise ValueError("registry_queue_selection_invalid")
+    return await _enqueue_validated_publication(
+        connection,
+        command,
+        actor,
+        session_token_sha256=session_token_sha256,
+        expected_serving_generation=expected_serving_generation,
+        control_schema=control_schema,
+    )
+
+
+async def _enqueue_validated_publication(
+    connection,
+    command,
+    actor,
+    *,
+    session_token_sha256,
+    expected_serving_generation,
+    control_schema=None,
+    command_document=None,
+):
+    """Share durable storage only after the ordinary or Source-reference guard."""
+    if not connection.is_in_transaction():
+        raise ValueError("registry_queue_requires_caller_transaction")
+    if type(session_token_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", session_token_sha256) is None:
+        raise ValueError("registry_session_hash_invalid")
+    _reason, selection_json = _validated_command(command)
     expected_generation = _head(expected_serving_generation)
     actor_document = _validated_actor(actor)
     namespace = _namespace(control_schema)
     async with connection.transaction():
         selection_json = await _canonical_selection(connection, selection_json)
-        metadata = _queue_metadata(command, actor_document, selection_json, session_token_sha256, expected_generation)
+        metadata = (
+            _queue_metadata(command, actor_document, selection_json, session_token_sha256, expected_generation)
+            if command_document is None
+            else _request_metadata(command_document, actor_document, session_token_sha256, command.idempotency_key)
+        )
         replay = await _existing_request(connection, namespace, metadata, command.idempotency_key)
         if replay is not None:
             return replay
@@ -857,9 +888,52 @@ async def enqueue_registry_publication(
         return _queued_receipt(inserted, False)
 
 
+def _source_batch_result(result_by_field, compact, command, state):
+    if state != "completed":
+        _reactivation_result(result_by_field, compact, state)
+        return
+    required_fields = {
+        "approved_revision",
+        "previous_approved_revision",
+        "selected_count",
+        "serving_generation",
+        "policy_revision",
+    }
+    if (
+        type(result_by_field) is not dict
+        or set(result_by_field) not in (required_fields, required_fields | {"source_selection"})
+        or result_by_field["selected_count"] != len(command.selection)
+    ):
+        raise ValueError("registry_source_batch_result_invalid")
+    for field in required_fields:
+        _head(result_by_field[field])
+    if (
+        not result_by_field["serving_generation"]
+        or result_by_field["previous_approved_revision"] != compact["expected_approved_revision"]
+        or result_by_field["previous_approved_revision"] >= result_by_field["approved_revision"]
+    ):
+        raise ValueError("registry_source_batch_result_invalid")
+    if "source_selection" in result_by_field:
+        counters = result_by_field["source_selection"]
+        if (
+            type(counters) is not dict
+            or set(counters) != {"mapped_rows", "omitted_rows"}
+            or any(type(count) is not int or not 0 <= count <= 2**53 - 1 for count in counters.values())
+            or sum(counters.values()) > 2**53 - 1
+        ):
+            raise ValueError("registry_source_batch_result_invalid")
+
+
 def _publication_operation_command(request_record, command_by_name, status_by_name):
     """Validate operation-specific identity and results before exposing their digest."""
     operation = command_by_name["operation"]
+    if operation == "publish_source_binding_batch":
+        from process.registry_source_binding_publication import stored_source_batch
+
+        compact, command = stored_source_batch(request_record)
+        status_by_name.update(selection_count=compact["selection_count"], selection_sha256=compact["selection_sha256"])
+        _source_batch_result(status_by_name["result"], compact, command, status_by_name["state"])
+        return compact
     if operation == "refresh_memberships":
         from process.registry_membership_refresh_queue import validated_membership_refresh_request_status
 

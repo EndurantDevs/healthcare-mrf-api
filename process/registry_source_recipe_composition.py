@@ -142,11 +142,12 @@ def validate_source_witness_configuration(source_profiles, capture_owner_role, r
         _identifier(role)
 
 
-async def _approved_source_witness_capture(connection, recipe, approved, control_schema):
+async def _approved_source_witness_capture(connection, recipe, approved, control_schema, *, retained_approval=False):
     """Authenticate the whole capture against protected approval before using its chosen labels."""
     from process.network_approved_source_bindings import (
         APPROVED_NETWORK_BINDINGS_SQL,
         require_approved_network_source_bindings,
+        require_retained_approved_network_source_bindings,
     )
     from process.network_fhir_source_witness_contract import validate_capture
 
@@ -154,9 +155,14 @@ async def _approved_source_witness_capture(connection, recipe, approved, control
     _reviewed_descriptor(recipe.source_pin, approved, recipe.binding_coordinates, True)
     if approved is None:
         raise RegistrySourceCompositionError("registry_source_witness_approval_unavailable")
-    await require_approved_network_source_bindings(
-        connection, approved, recipe.binding_coordinates, control_schema=control_schema
+    if type(retained_approval) is not bool:
+        raise RegistrySourceCompositionError("registry_source_witness_approval_invalid")
+    require_bindings = (
+        require_retained_approved_network_source_bindings
+        if retained_approval
+        else require_approved_network_source_bindings
     )
+    await require_bindings(connection, approved, recipe.binding_coordinates, control_schema=control_schema)
     selected = await connection.fetchval(
         "WITH "
         + APPROVED_NETWORK_BINDINGS_SQL.format(
@@ -174,7 +180,9 @@ async def _approved_source_witness_capture(connection, recipe, approved, control
     return capture
 
 
-async def require_source_witness_read(connection, recipe, approved, control_schema, runtime):
+async def require_source_witness_read(
+    connection, recipe, approved, control_schema, runtime, *, retained_approval=False
+):
     """Fresh Source replay, never a producer cache, admits one exact approved capture."""
     from process.network_fhir_source_witness_capture import (
         pin_source_fhir_witness_read,
@@ -185,7 +193,9 @@ async def require_source_witness_read(connection, recipe, approved, control_sche
     if type(runtime) is not SourceWitnessRuntime:
         raise RegistrySourceCompositionError("registry_source_composition_source_witness_custody_unavailable")
     runtime.__post_init__()
-    capture = await _approved_source_witness_capture(connection, recipe, approved, control_schema)
+    capture = await _approved_source_witness_capture(
+        connection, recipe, approved, control_schema, retained_approval=retained_approval
+    )
     if (capture.owner_role, capture.runtime_roles) != (runtime.capture_owner_role, runtime.runtime_roles):
         raise RegistrySourceCompositionError("registry_source_witness_runtime_census_differs")
     profiles = [profile for profile in runtime.source_profiles if profile.schema_name == capture.origin.schema_name]

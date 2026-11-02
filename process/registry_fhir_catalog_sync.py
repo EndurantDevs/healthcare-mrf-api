@@ -34,8 +34,8 @@ from process.registry_fhir_catalog_extraction import (
     iter_fhir_catalog_pages,
 )
 from process.registry_fhir_catalog_fingerprints import (
-    approved_fhir_catalog_fingerprints,
     require_fhir_catalog_membership_reuse,
+    select_fhir_catalog_mapping,
 )
 from process.registry_fhir_catalog_grant import (
     build_fhir_catalog_observation_verifier,
@@ -148,22 +148,27 @@ async def reconcile_fhir_catalog(config, *, source_export=None):
                     return {"state": "unchanged", **accounting}
                 if report := current_fhir_catalog_report():
                     report.publication_started()
+                cas_by_field = {"expected_approved_revision": accounting.get("publication_approved_revision")}
                 published = await _publish_catalog_snapshot(
-                    config, loader, snapshot, previous, runtime, lifecycle_pool, execution_pool
+                    config, loader, snapshot, previous, runtime, lifecycle_pool, execution_pool, **cas_by_field
                 )
                 return {**published, **accounting}
             finally:
                 await loader.execute("SELECT pg_advisory_unlock(hashtextextended($1,0))", lock_key)
 
 
-async def _publish_catalog_snapshot(config, loader, snapshot, previous, runtime, lifecycle_pool, execution_pool):
+async def _publish_catalog_snapshot(
+    config, loader, snapshot, previous, runtime, lifecycle_pool, execution_pool, *, expected_approved_revision=None
+):
     """Queue and consume only the exact sealed catalog candidate."""
     command_by_field = {
         "operation": OPERATION,
         "metadata_generation": snapshot["metadata_generation"],
         "expected_metadata_generation": previous["metadata_generation"] if previous else None,
         "expected_serving_generation": snapshot["network_generation"],
-        "expected_approved_revision": snapshot["metadata_approved_revision"],
+        "expected_approved_revision": snapshot["metadata_approved_revision"]
+        if expected_approved_revision is None
+        else expected_approved_revision,
         "standing_grant_sha256": config.grant.sha256,
     }
     async with loader.transaction(isolation="repeatable_read"):
@@ -269,7 +274,12 @@ async def _prepare_fhir_catalog_snapshot(
             )
             if report := current_fhir_catalog_report():
                 report.inventory_ready(current_by_generation, previous)
-            accounting_by_phase = {"accepted_sources": len(accepted), "unavailable_sources": len(unavailable)}
+            accounting_by_phase = {
+                "accepted_sources": len(accepted),
+                "unavailable_sources": len(unavailable),
+                "publication_approved_revision": head["approved_revision"],
+                "mapping_approved_revision": snapshot["metadata_approved_revision"],
+            }
             if previous and snapshot["metadata_generation"] == previous["metadata_generation"]:
                 return None, previous, accounting_by_phase
             if manifest is not None:
@@ -481,14 +491,13 @@ async def _catalog_snapshot_inputs(loader, grant, head, manifest, previous, acce
             "source_id": disposition.descriptor["coordinates"]["source_id"],
             "status": "last_good" if disposition.descriptor["profile"] == "retained_normalized" else "current",
         }
-    fingerprints_by_revision = await approved_fhir_catalog_fingerprints(
-        loader, (head["approved_revision"],), control_schema=grant.control_schema
+    mapping_revision, mapping = await select_fhir_catalog_mapping(
+        loader, head["approved_revision"], manifest, control_schema=grant.control_schema
     )
-    mapping = fingerprints_by_revision[head["approved_revision"]]
     inputs_by_field = {
         "network_generation": manifest.generation_id if manifest is not None else None,
         "manifest_sha256": manifest.manifest_sha256 if manifest is not None else None,
-        "metadata_approved_revision": head["approved_revision"],
+        "metadata_approved_revision": mapping_revision,
         "membership_mapping_sha256": mapping["membership"],
         "mapping_sha256": mapping["metadata"],
         "standing_grant_sha256": grant.sha256,

@@ -17,6 +17,7 @@ from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import PROJECTOR_VERSION, SNAPSHOT_COLUMNS
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_fhir_catalog_custody import verify_fhir_catalog_snapshot
+from process.registry_fhir_catalog_fingerprints import require_fhir_catalog_mapping_revision
 from process.registry_fhir_catalog_observation import CATALOG_OBSERVATION_CONTRACT
 from process.registry_fhir_catalog_publication import (
     OPERATION,
@@ -531,8 +532,13 @@ class _GrantCallbacks:
             stored["projector_version"] != PROJECTOR_VERSION
             or command["metadata_generation"] != stored["metadata_generation"]
             or command["expected_serving_generation"] != stored["network_generation"]
-            or command["expected_approved_revision"] != stored["metadata_approved_revision"]
         ):
+            _fail("snapshot_changed")
+        try:
+            await require_fhir_catalog_mapping_revision(
+                connection, stored, command["expected_approved_revision"], control_schema=self.grant.control_schema
+            )
+        except ValueError:
             _fail("snapshot_changed")
         vector = snapshot_inputs(stored)["source_vector_json"]
         descriptors = await _descriptors(connection, stored, vector)

@@ -383,7 +383,7 @@ async def _execute_publication_request(
         if operation == "publish_fhir_catalog":
             return await _execute_catalog_request(connection, config, request_record)
         options_by_name = dict(authorize=authorize, control_schema=config.control_schema)
-        if operation is None:
+        if operation in (None, "publish_source_binding_batch"):
             return await _ordinary_publication(
                 connection, request_record, authorize, config, initial_address_sources, plan_metadata_client
             )

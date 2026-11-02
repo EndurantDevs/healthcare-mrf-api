@@ -1015,3 +1015,184 @@ async def test_legacy_source_witness_publication_keeps_api_readers_pinned_throug
         await _assert_publications_keep_pinned_readers(context)
         assert context.worker.roles_by_kind["execution"] in replay_actors
         assert await context.operator.connection.fetchval("SELECT session_user") in replay_actors
+
+
+async def _additional_source_capture(context, monkeypatch):
+    """Parameterize the existing single-Source fixture; all admission/capture code is genuine."""
+    from tests import generic_source_successor_postgres_support as source
+    from tests.source_witness_capture_postgres_support import (
+        constructed_source_origin,
+        reviewed_source_origin,
+        source_modules,
+    )
+
+    case, fixture = context.case, context.case.fixture
+    source_id, endpoint = "generic-second-source", "generic-second-endpoint"
+    dataset, root = "generic-second-edition-1", "generic-second-root-1"
+    database, directory = fixture.component.database, source.directory
+    with monkeypatch.context() as selected:
+        selected.setattr(source, "SOURCE", source_id)
+        rows = source._edition_rows(1, dataset)
+    kinds = tuple(sorted({row["resource_type"] for row in rows}))
+    candidate = directory.EndpointDatasetCandidate(
+        endpoint_id=endpoint,
+        dataset_id=dataset,
+        acquisition_root_run_id=root,
+        source_ids=(source_id,),
+        selected_resources=kinds,
+        expected_resources=kinds,
+        import_run_id=root,
+        previous_dataset_id=None,
+        resource_hash_contract=directory.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of="2026-10-01",
+        proof_resource_scope=directory._provider_directory_proof_resource_scope(kinds),
+    )
+    async with (
+        source.source.source_transaction(database),
+        database.acquire() as connection,
+    ):
+        await database.status(
+            "INSERT INTO mrf.provider_directory_api_endpoint "
+            "(endpoint_id,canonical_api_base,credential_descriptor_hash,endpoint_signature_hash) "
+            "VALUES (:endpoint,:base,repeat('e',64),repeat('f',64))",
+            endpoint=endpoint,
+            base="https://second.example.test/fhir",
+        )
+        await database.status(
+            "INSERT INTO mrf.provider_directory_source "
+            "(source_id,org_name,endpoint_id,canonical_api_base,requires_registration,requires_api_key) "
+            "VALUES (:source,'Synthetic second Source',:endpoint,:base,false,false)",
+            source=source_id,
+            endpoint=endpoint,
+            base="https://second.example.test/fhir",
+        )
+        await directory._ensure_endpoint_dataset_candidate(candidate)
+        for kind in kinds:
+            await directory._upsert_dataset_resource_rows_on_connection(
+                connection,
+                [row for row in rows if row["resource_type"] == kind],
+                persist_content_proof=True,
+                resource_hash_contract=candidate.resource_hash_contract,
+                semantic_projection_as_of=candidate.semantic_projection_as_of,
+            )
+    validated = await directory._validate_endpoint_dataset_candidate(
+        candidate,
+        {
+            kind: {
+                "rows_fetched": sum(row["resource_type"] == kind for row in rows),
+                "complete": True,
+            }
+            for kind in kinds
+        },
+    )
+    assert validated["validated"] is True and validated["published"] is False
+    with source.artifacts.source_publication_request(directory, [{"source_id": source_id}], True):
+        await source.artifacts.publish_source_candidate(directory, candidate)
+    fixture.candidates.append(candidate)
+    assert fixture.commits[-1] == fixture.source_writer_rejections[-1] == dataset
+    assert fixture.captures[-1].origin.dataset_id == dataset
+    assert database._transaction_binding() is None and source.source._PUBLISHER.get() is None
+
+    catalog, producer = source_modules()
+    with monkeypatch.context() as selected:
+        selected.setattr(source, "SOURCE", source_id)
+        origin = await reviewed_source_origin(case.source_runtime, case.source_profile, candidate, catalog, producer)
+    assert await constructed_source_origin(case.source_export, case.source_profile, origin) == origin
+    second = SimpleNamespace(**{**vars(case), "origin": origin})
+    arguments = {
+        **capture_arguments(second),
+        "runtime_roles": context.runtime.runtime_roles,
+    }
+    capture = await _capture(second, capture_module, arguments)
+    anchor = second.anchors_by_id[capture.capture_id]
+    recipe = _source_recipe(capture, anchor)
+    approved, network = await _approve_mapping(context.serving, recipe, capture, organization="network-one")
+    return SimpleNamespace(
+        capture=capture,
+        anchor=anchor,
+        recipe=recipe,
+        network=network,
+        approved=approved,
+    )
+
+
+async def test_distinct_source_addition_retains_prior_capture_and_readers(monkeypatch, record_property):
+    from process.network_approved_membership_source import pin_retained_approved_membership_source
+    from process.network_approved_source_bindings import ApprovedNetworkSourceBindingError
+    from process.registry_source_recipe_store import (
+        canonical_registry_source_recipes,
+        resolve_retained_registry_source_recipes,
+    )
+
+    async with _publication_case(monkeypatch) as context:
+        context.replay_actors = []
+        retained_capture = await capture_retained_source_for_roles(context.case, context.runtime.runtime_roles)
+        retained, context.approved, retained_network = await _approved_capture_recipe(
+            context.case.fixture, context.serving, retained_capture
+        )
+        initial = RegistryCompositionAddressSources(
+            context.address, compact=True, initial_source_recipes=(retained,), source_witness_runtime=context.runtime
+        )
+        first = await _publish_once(context, sources=initial)
+        a_sources = replace(initial, initial_source_recipes=(), replacement_source_recipes=(retained, context.recipe))
+        second = await _publish_once(context, head=first.generation_id, sources=a_sources)
+        other = await _additional_source_capture(context, monkeypatch)
+        context.approved = other.approved
+        a, b = context.capture, other.capture
+        assert all(
+            getattr(a.origin, field) != getattr(b.origin, field)
+            for field in ("source_id", "endpoint_id", "dataset_id", "root_run_id", "resource_leaf_oid")
+        )
+        assert a.capture_id != b.capture_id and a.capture_sha256 != b.capture_sha256
+        assert a.owner_role == b.owner_role == context.runtime.capture_owner_role
+        assert a.runtime_roles == b.runtime_roles == context.runtime.runtime_roles
+        sources = replace(a_sources, replacement_source_recipes=(*a_sources.replacement_source_recipes, other.recipe))
+        schema = context.worker.fixture.control_schema
+        async with _login(context.worker, "execution") as execution:
+            async with execution.transaction(isolation="repeatable_read", readonly=True):
+                historical = await pin_retained_approved_membership_source(
+                    execution, approved_revision=second.approved_custom_revision, control_schema=schema
+                )
+                with pytest.raises(ApprovedNetworkSourceBindingError, match="binding_unavailable"):
+                    await recipes.require_source_witness_read(
+                        execution, context.recipe, historical, schema, context.runtime
+                    )
+        async with _login(context.worker, "api") as reader:
+            async with reader.transaction(isolation="repeatable_read", readonly=True):
+                original = await _membership_snapshot(reader, second)
+                assert all(len(family) == 2 for family in original)
+                assert {row[0] for row in original[0]} == {retained_network, context.network_id}
+                await _assert_stale_head_refusal(context, second.generation_id)
+                third = await _publish_once(context, head=second.generation_id, sources=sources)
+                assert await _membership_snapshot(reader, second) == original
+                assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == second
+        async with _login(context.worker, "api") as reader:
+            async with reader.transaction(isolation="repeatable_read", readonly=True):
+                current = await _membership_snapshot(reader, third)
+                assert all(len(family) == 3 for family in current)
+                for before, after in zip(original, current, strict=True):
+                    assert tuple(row for row in after if row[0] != other.network) == before
+                introduced = [row for row in current[0] if row[0] == other.network]
+                assert len(introduced) == 1
+                assert introduced[0][1:4] == (
+                    "npi",
+                    "1234567893",
+                    str(registry_location_id(b.origin.source_id, "office-one")),
+                )
+                actual_recipes = await resolve_retained_registry_source_recipes(
+                    reader, third, control_schema=schema, api_read=True
+                )
+                assert canonical_registry_source_recipes(actual_recipes) == canonical_registry_source_recipes(
+                    sources.replacement_source_recipes
+                )
+                restored = await _publish_source_rollback(context, second, third, require_witness_replay=False)
+                assert await _membership_snapshot(reader, third) == current
+                assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == third
+        async with _login(context.worker, "api") as reader:
+            async with reader.transaction(isolation="repeatable_read", readonly=True):
+                assert await resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == restored
+                assert await _membership_snapshot(reader, restored) == original
+        record_property("membership_and_provider_only_counts", "1 -> 2 -> 3 -> 2")
+        record_property("distinct_sources_and_captures", "2")
+        record_property("current_approval_remains_strict", "true")
+        record_property("pinned_readers_after_publication_and_rollback", "unchanged")
