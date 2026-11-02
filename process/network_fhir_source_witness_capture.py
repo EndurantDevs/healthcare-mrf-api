@@ -530,7 +530,7 @@ async def _verify_source_rows(
         hashlib.sha256(),
         dict.fromkeys(TABLES[1:3], 0),
     )
-    async with source_export(source_profile=source_profile, **_selection(reviewed_origin)) as export:
+    async with source_export(source_profile=source_profile, origin=reviewed_origin) as export:
         identity = _export_identity(export, reviewed, expected_identity)
         iterator = export["resources"]()
         try:
