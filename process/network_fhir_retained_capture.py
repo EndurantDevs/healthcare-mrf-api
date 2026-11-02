@@ -833,8 +833,19 @@ async def _derived(writer, schema, origin, release_id, resource_rows, observed_a
             await _copy_derived_batch(writer, schema, table, records, verify)
 
 
+def _resource_hash_contract(origin):
+    """Choose only declared supported profiles; unknown profiles cannot fall back to legacy hashing."""
+    from process.network_fhir_source_witness_contract import OBSERVED_LEGACY_PROFILE
+
+    if origin.admission_profile == SEMANTIC_PROFILE:
+        return SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
+    require(origin.admission_profile in {LEGACY_PROFILE, OBSERVED_LEGACY_PROFILE})
+    return LEGACY_RESOURCE_HASH_CONTRACT
+
+
 def _fold_rows(resource_rows, origin, hash_by_family, counts, root, total):
     """Use the original normalized payload and ordered dataset-root algorithms."""
+    hash_contract = _resource_hash_contract(origin)
     for resource_row in resource_rows:
         kind, identity, stored_hash = (
             resource_row["resource_type"],
@@ -859,9 +870,7 @@ def _fold_rows(resource_rows, origin, hash_by_family, counts, root, total):
         require(
             resource_payload_sha256_for_contract(
                 normalized_payload,
-                SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-                if origin.admission_profile == SEMANTIC_PROFILE
-                else LEGACY_RESOURCE_HASH_CONTRACT,
+                hash_contract,
                 resource_type=kind,
             )
             == stored_hash
@@ -914,9 +923,7 @@ def _prepare_native_resources(resource_rows, origin, release_id, observed_at, de
         "source_id": origin.source_id,
         "release_id": release_id,
         "observed_at_pg_micros": postgres_micros(observed_at) if derive else 0,
-        "hash_contract": SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-        if origin.admission_profile == SEMANTIC_PROFILE
-        else LEGACY_RESOURCE_HASH_CONTRACT,
+        "hash_contract": _resource_hash_contract(origin),
         "resource_types": [kind for kind, _ in origin.resource_counts],
         "derive": derive,
     }

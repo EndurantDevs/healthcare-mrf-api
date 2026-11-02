@@ -55,9 +55,19 @@ def database_fields():
     }
 
 
-def captured():
+def legacy_origin_fields():
+    return origin_fields() | {
+        "admission_profile": witness.OBSERVED_LEGACY_PROFILE,
+        "proof_sha256": None,
+        "admission_metadata_sha256": None,
+        "semantic_projection_as_of": None,
+        "descriptor_counts": None,
+    }
+
+
+def captured(*, legacy=False):
     capture = witness.SourceWitnessCapture(
-        witness.source_origin(origin_fields()),
+        witness.source_origin(legacy_origin_fields() if legacy else origin_fields()),
         witness.database_identity(database_fields()),
         CAPTURE_ID,
         witness.SCHEMA_PREFIX + UUID(CAPTURE_ID).hex,
@@ -429,3 +439,43 @@ def test_recomputed_capture_cannot_replace_independent_anchor(expected_anchor, c
     assert witness.validate_capture(forged) == forged
     with pytest.raises(ValueError):
         witness.require_capture_anchor(forged, expected_anchor)
+
+
+def test_observed_legacy_origin_preserves_absent_metadata_and_wire_shape():
+    origin = witness.source_origin(legacy_origin_fields())
+    assert len(asdict(origin)) == 25
+    assert asdict(origin) == legacy_origin_fields()
+    assert witness.validate_capture(captured(legacy=True).as_dict()) == captured(legacy=True)
+    with pytest.raises(ValueError):
+        replace(reader_capture().origin, admission_profile=witness.OBSERVED_LEGACY_PROFILE)
+
+
+@pytest.mark.parametrize(
+    "field", ["proof_sha256", "admission_metadata_sha256", "semantic_projection_as_of", "descriptor_counts"]
+)
+def test_observed_legacy_origin_rejects_mixed_modern_metadata(field):
+    with pytest.raises(ValueError):
+        witness.source_origin(legacy_origin_fields() | {field: origin_fields()[field]})
+    with pytest.raises(ValueError):
+        witness.source_origin(origin_fields() | {field: None})
+
+
+@pytest.mark.parametrize(
+    "field", ["root_run_id", "summary_sha256", "dataset_sha256", "resource_counts", "resource_hashes"]
+)
+def test_observed_legacy_origin_requires_original_roots_and_complete_families(field):
+    with pytest.raises(ValueError):
+        witness.source_origin(legacy_origin_fields() | {field: None})
+
+
+def test_legacy_membership_date_is_anchored_observation_utc_date():
+    capture = captured(legacy=True)
+    anchor = witness.SourceWitnessCaptureAnchor(capture.capture_id, capture.release_id, capture.observed_at)
+    assert witness.source_witness_membership_date(capture, anchor) == "2026-01-02"
+    assert witness.source_witness_membership_date(captured(), anchor) == "2026-01-01"
+    changed = replace(capture, observed_at="2026-01-03T00:00:00.000000+00:00")
+    changed = replace(changed, capture_sha256=witness.capture_digest(changed))
+    with pytest.raises(ValueError):
+        witness.source_witness_membership_date(changed, anchor)
+    with pytest.raises(ValueError):
+        witness.source_witness_membership_date(capture, None)

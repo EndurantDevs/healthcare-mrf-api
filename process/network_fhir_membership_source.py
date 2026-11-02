@@ -43,6 +43,7 @@ from process.network_fhir_source_witness_contract import (
     SourceWitnessCaptureAnchor,
     SourceWitnessContractError,
     require_capture_anchor,
+    source_witness_membership_date,
 )
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, copy_network_membership_batch
@@ -309,7 +310,7 @@ def _validate_source_witness(source_pin):
     ):
         raise FHIRMembershipSourceError("FHIR Source witness coordinates are invalid")
     try:
-        require_capture_anchor(capture, anchor)
+        membership_date = source_witness_membership_date(capture, anchor)
     except SourceWitnessContractError:
         raise FHIRMembershipSourceError("FHIR Source witness coordinates are invalid") from None
     origin = capture.origin
@@ -330,7 +331,7 @@ def _validate_source_witness(source_pin):
         origin.dataset_sha256,
         origin.resource_parent_oid,
         capture.release_id,
-        origin.semantic_projection_as_of,
+        membership_date,
     ):
         raise FHIRMembershipSourceError("FHIR Source witness coordinates are invalid")
 

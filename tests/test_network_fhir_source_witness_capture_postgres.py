@@ -695,3 +695,23 @@ async def test_fixed_source_constructor_capture_and_fresh_reader_replay_refuse_l
             "limits",
             "LOCAL corrected M1 only; no Source changes/grants, M2/provider-serving/runtime or representative performance",
         )
+
+
+async def test_original_legacy_source_capture_preserves_absence_and_requires_complete_fresh_replay(monkeypatch):
+    from process import network_fhir_source_witness_capture as module
+    from process.network_fhir_source_witness_contract import OBSERVED_LEGACY_PROFILE, source_witness_membership_date
+
+    async with source_witness_case(monkeypatch, legacy=True) as case:
+        capture, anchor = await _corrected_capture(case, module, monkeypatch)
+        assert capture.origin.admission_profile == OBSERVED_LEGACY_PROFILE
+        assert capture.origin.proof_sha256 is capture.origin.descriptor_counts is None
+        assert capture.origin.admission_metadata_sha256 is capture.origin.semantic_projection_as_of is None
+        assert capture.origin.unresolved_plan_network_count == 1
+        assert source_witness_membership_date(capture, anchor) == anchor.observed_at[:10]
+        assert await _assert_native_read_custody(case, module, capture) == sum(
+            dict(case.origin.resource_counts).values()
+        )
+        await _assert_source_guard_refusals(case, module)
+        await _assert_incomplete_source_rolls_back(case, module, monkeypatch)
+        await _assert_cancelled_copy_rolls_back(case, module, monkeypatch)
+        assert await _fresh_source_verify(case, module, capture, anchor) == capture

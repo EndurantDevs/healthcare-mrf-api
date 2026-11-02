@@ -11,7 +11,7 @@ from process import registry_source_contribution_store as facts
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_retained_capture_contract import registry_location_id
-from process.network_fhir_source_witness_contract import PRODUCER
+from process.network_fhir_source_witness_contract import PRODUCER, source_witness_membership_date
 from process.network_source_binding_store import apply_network_source_binding_batch
 from process.registry_source_recipe_composition import (
     RegistrySourceCompositionError,
@@ -46,7 +46,7 @@ def _source_recipe(capture, anchor):
         capture.release_id,
         origin.resource_parent_oid,
         PRODUCER,
-        origin.semantic_projection_as_of,
+        source_witness_membership_date(capture, anchor),
         source_witness_capture=capture,
         source_witness_anchor=anchor,
     )
@@ -201,8 +201,11 @@ async def _read_guards_refuse(case, recipe, approved, control, read):
         await require_registry_source_recipe_custody(case.reader, recipe, approved, control, retained_fhir_reads={})
 
 
-async def test_source_witness_capture_maps_only_approved_exact_offices_and_provider_only(monkeypatch, record_property):
-    async with source_witness_case(monkeypatch) as case:
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_source_witness_capture_maps_only_approved_exact_offices_and_provider_only(
+    monkeypatch, record_property, legacy
+):
+    async with source_witness_case(monkeypatch, legacy=legacy) as case:
         async with _registry_on_source(case.fixture, monkeypatch) as serving:
             await _registry_read_bootstrap(case, serving)
             capture = await _capture(case, source_capture, capture_arguments(case))
