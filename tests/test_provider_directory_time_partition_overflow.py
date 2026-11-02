@@ -200,3 +200,14 @@ def test_historical_checkpoint_bytes_do_not_gain_new_markers():
     }
     historical_bytes = json.dumps(checkpoint_by_field, sort_keys=True, separators=(",", ":"))
     assert PartitionPlan.from_json(historical_bytes).to_json() == historical_bytes
+
+
+@pytest.mark.parametrize("damage", ["unsupported-reason", "no-leaves"])
+def test_corrupt_timeout_checkpoint_cannot_claim_an_empty_complete_collection(damage):
+    checkpoint = split_plan(CountObservation.split()).to_dict()
+    if damage == "unsupported-reason":
+        checkpoint["windows"][0]["split_reason"] = "http_403"
+    else:
+        checkpoint["windows"] = checkpoint["windows"][:1]
+    with pytest.raises(PartitionPlanError, match="split reason|no leaf windows"):
+        PartitionPlan.from_dict(checkpoint)
