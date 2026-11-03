@@ -63,6 +63,7 @@ def test_catalog_image_without_generic(monkeypatch):
 
 
 def test_catalog_job_keeps_generic_launch(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "4200")
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", GENERIC_IMAGE)
     monkeypatch.setenv(IMAGE_ENV, CATALOG_IMAGE)
     monkeypatch.setenv("HLTHPRT_WORKER_JOB_PYTHON", "/opt/venv/bin/python")
@@ -81,6 +82,7 @@ def test_catalog_job_keeps_generic_launch(monkeypatch):
         catalog_spec(), {"importer": "registry-fhir-catalog-sync", "run_id": "run_catalog"}, {}
     )
     assert result["status"] == "started" and len(jobs) == 1
+    assert "activeDeadlineSeconds" not in jobs[0]["spec"]
     container = jobs[0]["spec"]["template"]["spec"]["containers"][0]
     assert container["image"] == CATALOG_IMAGE and container["workingDir"] == "/opt"
     assert container["command"] == [

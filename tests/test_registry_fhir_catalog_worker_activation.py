@@ -55,6 +55,42 @@ def test_native_reader_configuration_keeps_source_and_registry_roles(with_produc
         producer.assert_not_called()
 
 
+def test_server_configuration_can_disable_only_the_operation_deadline():
+    configured = _configuration()
+    configured["operation_seconds"] = None
+    parsed = worker.parse_fhir_catalog_sync_config(json.dumps(configured))
+    assert parsed.operation_seconds is None
+    assert parsed.consumer == worker.parse_publication_consumer_config(configured["consumer"])
+    assert parsed.grant.document() == configured["standing_grant"]
+
+
+@pytest.mark.asyncio
+async def test_unlimited_operation_finishes_and_remains_cancelable(monkeypatch):
+    configured = _configuration()
+    configured["operation_seconds"] = None
+    parsed = worker.parse_fhir_catalog_sync_config(json.dumps(configured))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def reconcile(_config):
+        entered.set()
+        await release.wait()
+        return {"state": "unchanged"}
+
+    monkeypatch.setattr(sync, "reconcile_fhir_catalog", reconcile)
+    task = asyncio.create_task(worker.run_fhir_catalog_sync(parsed))
+    await entered.wait()
+    release.set()
+    assert (await task)["state"] == "unchanged"
+
+    entered.clear()
+    release.clear()
+    task = asyncio.create_task(worker.run_fhir_catalog_sync(parsed))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 def test_four_role_configuration_requires_a_trusted_callable():
     encoded = json.dumps(_configuration(source_reader=False))
     with pytest.raises(ValueError, match="configuration_invalid"):

@@ -1374,13 +1374,13 @@ def _worker_job_spec(
     }
     active_deadline_seconds = int(os.getenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "0") or "0")
     if active_deadline_seconds > 0 and spec.worker_class == _PROVIDER_DIRECTORY_WORKER_CLASS:
-        active_deadline_seconds = max(
-            active_deadline_seconds,
-            _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS,
-        )
+        active_deadline_seconds = max(active_deadline_seconds, _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS)
     if _is_code_calibration_job(spec, launch_request):
         active_deadline_seconds = min(active_deadline_seconds, 415) if active_deadline_seconds > 0 else 415
-    if active_deadline_seconds > 0:
+    if active_deadline_seconds > 0 and (spec.worker_class, spec.importers) != (
+        "process.RegistryFHIRCatalogSync",
+        ("registry-fhir-catalog-sync",),
+    ):
         job_spec_dict["activeDeadlineSeconds"] = active_deadline_seconds
     replicas = _worker_start_replicas(spec)
     if replicas > 1:

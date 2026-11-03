@@ -262,6 +262,8 @@ def _preparation(monkeypatch, case):
         assert case.events == [("enter", read_profile()), ("exit",)]
         assert case.probe_events[-2:] == [("commit",), "release"]
         assert options == {"source_pool": None, "source_export": case.factory}
+        if report := reporting.current_fhir_catalog_report():
+            assert report.document["phase"] == "sealing"
 
     monkeypatch.setattr(sync, "_build_source_catalog_candidate", AsyncMock(side_effect=build))
     monkeypatch.setattr(sync, "_seal_catalog_snapshot", AsyncMock(side_effect=seal))
@@ -281,6 +283,7 @@ async def test_preparation_closes_source_before_sealing_and_records_inventory(mo
     assert accounting["accepted_sources"] == accounting["written"] == 1
     assert report.document["profiles"][0]["complete"] is True
     assert report.document["inventory_complete"] is True
+    assert report.document["phase"] == "sealing"
     source_case.factory.assert_called_once_with(source_profile=read_profile())
     source_case.export["inventory"].assert_called_once_with()
     source_case.loader.fetchrow.assert_not_awaited()

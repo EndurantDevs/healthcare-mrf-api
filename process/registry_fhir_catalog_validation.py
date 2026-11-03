@@ -437,9 +437,10 @@ SELECT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_network n
  WHERE i.network_id IS NULL OR n.metadata_generation<>$1
    OR n.archived IS DISTINCT FROM coalesce((a.record_json->>'archived')::boolean,false))
 OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_relationship r
- LEFT JOIN {namespace}.registry_fhir_catalog_network n USING(metadata_generation,network_id)
  LEFT JOIN source_bindings b USING(metadata_generation,network_id,binding_id,source_id)
- WHERE n.network_id IS NULL OR r.metadata_generation<>$1
+ WHERE NOT coalesce((SELECT true FROM {namespace}.registry_fhir_catalog_network n
+   WHERE n.metadata_generation=r.metadata_generation AND n.network_id=r.network_id LIMIT 1),false)
+   OR r.metadata_generation<>$1
    OR (r.source_id<>'registry-manual' AND (b.binding_id IS NULL OR b.matched_generation IS DISTINCT FROM r.source_generation))
    OR (r.source_id='registry-manual' AND (r.binding_id IS NOT NULL OR r.source_generation<>$4))
    OR (r.source_id='registry-manual' AND NOT EXISTS(SELECT FROM {control}.registry_approved_record a
