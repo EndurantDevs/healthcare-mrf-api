@@ -10,11 +10,21 @@ fn digest(value: Value) -> String {
 }
 
 fn row(tier: &str, network: i32) -> Value {
+    scoped_row(
+        tier,
+        network,
+        json!({"family":"ifp","market":"individual-exchange",
+        "product":"IEX","jurisdiction":"AZ"}),
+    )
+}
+
+fn scoped_row(tier: &str, network: i32, coordinates: Value) -> Value {
     let logical = digest(
         json!({"contract":"healthporta-uhc-logical-scope-v1","entry_id":"uhc-provider-files",
-        "family":"ifp","market":"individual-exchange","product":"IEX","jurisdiction":"AZ"}),
+        "family":coordinates["family"],"market":coordinates["market"],
+        "product":coordinates["product"],"jurisdiction":coordinates["jurisdiction"]}),
     );
-    let key = json!({"logical_scope_id":logical,"family":"ifp","market":"individual-exchange",
+    let key = json!({"logical_scope_id":logical,"family":coordinates["family"],"market":coordinates["market"],
         "plan_id_type":"hios","plan_id":"12345AZ001","plan_year":2026});
     let mut plan = key.clone();
     plan["contract"] = json!("healthporta-uhc-plan-key-v1");
@@ -24,8 +34,8 @@ fn row(tier: &str, network: i32) -> Value {
     network_key["network_tier"] = json!(tier);
     let network_key = digest(network_key);
     let mut scope = key;
-    scope["product"] = json!("IEX");
-    scope["jurisdiction"] = json!("AZ");
+    scope["product"] = coordinates["product"].clone();
+    scope["jurisdiction"] = coordinates["jurisdiction"].clone();
     scope["plan_key_id"] = json!(plan_id);
     json!({"binding_id":format!("01234567-89ab-cdef-8123-{network:012}"),
         "source_system":"fhir","source_id":"pdfhir_2754e999dd691175821ec26e","dataset_schema":"synthetic_source",
@@ -115,4 +125,27 @@ fn exact_fields_and_distinct_targets_are_required() {
     rebound["expected_revision"] = json!(1);
     rebound["expected_network_id"] = json!(43);
     assert!(encode(&serde_json::to_vec(&[rebound]).unwrap()).is_err());
+}
+
+#[test]
+fn community_state_plan_tier_requires_catalog_product_and_jurisdiction() {
+    let coordinates = json!({"family":"cs","market":"community-and-state",
+        "product":"AZDC","jurisdiction":null});
+    let valid = scoped_row("preferred", 42, coordinates.clone());
+    let result = encode(&serde_json::to_vec(std::slice::from_ref(&valid)).unwrap()).unwrap();
+    assert_eq!(result.row_count, 1);
+    assert_eq!(result.rows[0].source_scope_json, valid["source_scope_json"]);
+    for (field, value) in [
+        ("product", json!("UNKNOWN")),
+        ("jurisdiction", json!("AZ")),
+        ("market", json!("individual-exchange")),
+    ] {
+        let mut changed = coordinates.clone();
+        changed[field] = value;
+        let damaged = scoped_row("standard", 43, changed);
+        let error = encode(&serde_json::to_vec(&[valid.clone(), damaged]).unwrap()).unwrap_err();
+        assert_eq!(error.code, "invalid_scope");
+        assert_eq!(error.row_index, Some(1));
+        assert_eq!(error.field, Some("source_scope_json"));
+    }
 }

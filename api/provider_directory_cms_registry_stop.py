@@ -152,15 +152,23 @@ def require_worker_presence(presence):
 async def guarded_ensure(worker_payload, *, run_id, importer, selected_specs):
     """Hold the existing exact-run fence until native admission and launch settle."""
     from api import control_workers as workers
+    from api import provider_directory_source_publication as publication
 
     async with workers.db.acquire() as connection:
         await workers.acquire_control_run_worker_action_lock(connection, run_id)
-        failure = await workers._admit_worker_ensure(
-            worker_payload,
-            run_id=run_id,
-            importer=importer,
-            selected_specs=selected_specs,
-        )
+        if worker_payload.get("role") == publication.ROLE:
+            try:
+                await publication.admit_launch(connection, worker_payload)
+            except ValueError, RuntimeError, KeyError, TypeError, AttributeError, IndexError:
+                return workers._failed_worker_admission(worker_payload, "FHIR publication admission is unavailable")
+            failure = None
+        else:
+            failure = await workers._admit_worker_ensure(
+                worker_payload,
+                run_id=run_id,
+                importer=importer,
+                selected_specs=selected_specs,
+            )
         if failure is not None:
             return failure
         if worker_payload.fhir_source_launch is not None:

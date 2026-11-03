@@ -22,6 +22,7 @@ from typing import Any
 from api import (
     npi_source_worker,
     provider_directory_cms_registry_stop,
+    provider_directory_source_publication,
     provider_directory_source_worker,
     reference_source_worker,
     registry_aca_source_worker,
@@ -617,6 +618,15 @@ def _resolve_specs(launch_request: dict[str, Any]) -> list[WorkerSpec]:
     worker_class = str(launch_request.get("worker_class") or "").strip()
     queue = str(launch_request.get("queue") or "").strip()
     importer = str(launch_request.get("importer") or "").strip()
+    if launch_request.get("role") == provider_directory_source_publication.ROLE:
+        try:
+            return [
+                provider_directory_source_publication.selected_spec(
+                    _BY_WORKER_CLASS[_PROVIDER_DIRECTORY_WORKER_CLASS], launch_request
+                )
+            ]
+        except ValueError:
+            return []
     if importer in _SOURCE_PROFILE_IMPORTERS_BY_MODULE.values() and (
         launch_request.get("role") == "finish" or launch_request.get("status") == "finalizing"
     ):
@@ -678,6 +688,10 @@ def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, 
     fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
     ordinary_job_id = provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_request)
     npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
+    try:
+        provider_directory_source_publication.require_original_stopped(fhir_launch)
+    except ValueError, RuntimeError, _KubernetesApiError:
+        return {"status": "failed", "message": "FHIR publication requires the original worker to be stopped"}
     if spec.worker_class == "process.NPI" and npi_launch is None:
         return {"status": "failed", "message": "NPI source worker requires exact admitted job"}
     if (
@@ -1296,6 +1310,8 @@ def _worker_job_container(
         container_dict.update(
             image=fhir_launch.image, command=list(provider_directory_source_worker.COMMAND), workingDir="/app"
         )
+        if type(fhir_launch) is provider_directory_source_worker.FHIRSourcePublicationLaunch:
+            container_dict["args"] = ["publish"]
     npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
     if npi_launch is not None:
         container_dict.update(image=npi_launch.image, command=list(npi_source_worker.COMMAND), workingDir="/app")
@@ -1865,13 +1881,13 @@ def _single_job_worker_target(
     spec: WorkerSpec,
     launch_payload: dict[str, Any],
 ) -> str | None:
-    if not _uses_single_job_worker(spec):
-        return None
     source_job_id = _admitted_source_job_target(
         spec, launch_payload
     ) or provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_payload)
     if source_job_id is not None:
         return source_job_id
+    if not _uses_single_job_worker(spec):
+        return None
     queued_job_id = str(launch_payload.get("job_id") or "").strip()
     if queued_job_id:
         return queued_job_id

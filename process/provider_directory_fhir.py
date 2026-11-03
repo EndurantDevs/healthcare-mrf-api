@@ -423,10 +423,12 @@ from process.provider_directory_resource_hash import (
 from process.provider_directory_source_checkpoint_control import (
     RELEASE_BULK_CHECKPOINT_SQL,
     assert_bulk_checkpoint_guard_owner,
+    bulk_checkpoint_worker_guard,
     persist_control_progress,
     require_checkpoint_executor,
     source_checkpoint_transaction,
 )
+from process.provider_directory_source_checkpoint_control import BulkCheckpointProbes as _BulkCheckpointProbes
 from process.provider_directory_source_coverage import (
     INTEROPSTATION_MDHHS_PROVIDER_DIRECTORY_BASE,
     MICHIGAN_PROVIDER_DIRECTORY_BASE,
@@ -43219,39 +43221,10 @@ async def _assert_bulk_checkpoint_guard_owner(
 @contextlib.asynccontextmanager
 async def _bulk_checkpoint_worker_guard(
     identity: BulkExportCheckpointIdentity,
-) -> AsyncIterator[Callable[[], Awaitable[None]]]:
+) -> AsyncIterator[_BulkCheckpointProbes]:
     """Fence one checkpoint worker with a session advisory lock."""
-    if db.engine is None:
-        await db.connect()
-    assert db.engine is not None
-    async with db.engine.connect() as guard_connection:
-        autocommit_connection = await _bulk_guard_autocommit_connection(guard_connection)
-        lock_sql = db.text("SELECT pg_try_advisory_lock(hashtextextended(:checkpoint_id, 0));")
-        lock_acquired = await autocommit_connection.scalar(
-            lock_sql,
-            {"checkpoint_id": identity.checkpoint_id},
-        )
-        if lock_acquired is not True:
-            raise RuntimeError("bulk_export_checkpoint_worker_active")
-        connection_lock = asyncio.Lock()
-
-        async def ownership_probe() -> None:
-            """Serialize probes that share the advisory-lock connection."""
-            async with profile_scope_copy.source_read_transaction(sys.modules[__name__]), connection_lock:
-                await _assert_bulk_checkpoint_guard_owner(
-                    autocommit_connection,
-                    identity,
-                )
-
-        try:
-            yield ownership_probe
-        finally:
-            with contextlib.suppress(Exception):
-                async with connection_lock:
-                    await autocommit_connection.scalar(
-                        db.text("SELECT pg_advisory_unlock(hashtextextended(:checkpoint_id, 0));"),
-                        {"checkpoint_id": identity.checkpoint_id},
-                    )
+    async with bulk_checkpoint_worker_guard(sys.modules[__name__], identity) as probes:
+        yield probes
 
 
 def _bulk_checkpoint_primary_secret() -> str:
@@ -43327,10 +43300,7 @@ def _bulk_manifest_audit_payload(payload: dict[str, Any]) -> dict[str, Any]:
     def hashed_entries(field_name: str) -> list[dict[str, str]]:
         """Return URL-free identities for one manifest entry collection."""
         return [
-            {
-                "type": str(item["type"]),
-                "url_hash": hashlib.sha256(str(item["url"]).encode("utf-8")).hexdigest(),
-            }
+            {"type": str(item["type"]), "url_hash": hashlib.sha256(str(item["url"]).encode("utf-8")).hexdigest()}
             for item in payload.get(field_name, [])
             if isinstance(item, dict) and item.get("type") and item.get("url")
         ]
@@ -43339,6 +43309,9 @@ def _bulk_manifest_audit_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "transactionTime": payload.get("transactionTime"),
         "request_hash": hashlib.sha256(request_url.encode("utf-8")).hexdigest(),
+        "normalized_request_hash": hashlib.sha256(
+            _normalized_bulk_request_identity(request_url).encode("utf-8")
+        ).hexdigest(),
         "requiresAccessToken": payload.get("requiresAccessToken"),
         "output": hashed_entries("output"),
         "deleted": hashed_entries("deleted"),
@@ -47299,7 +47272,11 @@ async def _request_checkpointed_bulk_output(
             resume_offset=resume_offset,
             expected_etag=validator.etag if validator is not None else None,
             expected_content_length=(validator.content_length_bytes if validator is not None else None),
-            cancel_probe=options.ownership_probe,
+            cancel_probe=(
+                options.ownership_probe.stream_probe
+                if isinstance(options.ownership_probe, _BulkCheckpointProbes)
+                else options.ownership_probe
+            ),
         ),
     )
 
@@ -47318,9 +47295,12 @@ async def _persist_checkpointed_bulk_output_progress(
     output_id: str,
     base_rows_written: int,
     progress_by_name: dict[str, int],
+    ownership_probe: Callable[[], Awaitable[None]],
     attempt_rows_written: int,
     committed_bytes: int,
 ) -> None:
+    # Recheck after COPY (or skipped rows), inside the same payload transaction.
+    await ownership_probe()
     await _record_bulk_export_output_progress(
         identity,
         output_id,
@@ -47407,6 +47387,7 @@ async def _stream_one_checkpointed_bulk_output(
         output_id,
         base_rows_written,
         progress_by_name,
+        options.ownership_probe,
     )
     stream_result = await _request_checkpointed_bulk_output(
         session,
@@ -48251,6 +48232,17 @@ def _bulk_fetch_runtime_probes(
         fetch_options.cancel_task,
         deadline_at,
     )
+    if isinstance(ownership_probe, _BulkCheckpointProbes):
+        runtime_probe = _BulkCheckpointProbes(
+            runtime_probe,
+            partial(
+                _bulk_checkpoint_runtime_probe,
+                ownership_probe.stream_probe,
+                fetch_options.cancel_ctx,
+                fetch_options.cancel_task,
+                deadline_at,
+            ),
+        )
     return cancel_probe, runtime_probe
 
 
@@ -69843,7 +69835,7 @@ async def process_provider_directory_fhir_data(
     stale_cleanup_raw = task.get("stale_cleanup")
     should_cleanup_stale_rows = _is_bool_or_default(
         stale_cleanup_raw,
-        not test_mode and import_resources,
+        False,
     )
     resources = (
         list(census_request.resources) if census_request is not None else _selected_resources(task.get("resources"))

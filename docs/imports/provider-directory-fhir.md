@@ -9,6 +9,11 @@ Maintained endpoint support and configuration are listed in
 That generated matrix is deliberately separate from current runtime and import
 status, which is recorded in the endpoint-acquisition campaign report.
 
+Stale-row cleanup defaults to off for manual resource imports and the
+`monthly-full` preset. Enable it explicitly with `--stale-cleanup` when a
+completed source/resource scan supplies the required seen-row evidence.
+This option does not retire immutable editions or their retained inputs.
+
 ## Issued Source command lifecycle
 
 Protected Source work requires the deployment's issued transaction factory.
@@ -99,6 +104,41 @@ Acquisition success and source publication are reported separately. Publication
 failure leaves the incumbent serving; exact same-job recovery reuses the persisted
 candidate and does not fetch it again. API/search readiness still requires the
 existing Profile and Address follow-ups and live read verification.
+
+To finish publication after a successful acquisition, use the authenticated
+`POST /control/v1/workers/ensure` endpoint with the original run identifier:
+
+```json
+{
+  "importer": "provider-directory-fhir",
+  "run_id": "run_11111111111111111111111111111111",
+  "role": "source-publication"
+}
+```
+
+This mode is disabled by default. The server must configure
+`HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PUBLICATION_ROUTES_JSON` with an exact
+`root_run_id`, `source_id`, `endpoint_scope`, immutable `image`, and `secret_name`
+route. Its field format matches the acquisition routes above, but publication
+routes require a string root identifier; fresh-root routes with a null root are
+refused. The stored run must have succeeded without an error, retain one
+unchanged candidate handoff and its acquisition attempt, and report
+`source_publication.state=incomplete`. The original acquisition Job and Pods must
+be stopped before the separate publication Job can start.
+
+Admission reads the native run under its existing action fence and preserves
+the original run, queue-job identity, candidate and producer. The server selects
+the fixed `fhir-source-worker publish` command and supplies
+`HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PUBLICATION_HANDOFF_SHA256` and
+`HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PUBLICATION_ATTEMPT_ID` from the stored proof.
+The request cannot supply an image, credentials, command or replacement proof.
+The Source worker must independently verify its executor and original-producer
+manifests and retained data before publishing. Repeated ensure requests reuse a
+matching active publication Job; while publication remains incomplete, a terminal
+publication Job may be replaced without deleting the original acquisition Job.
+An accepted ensure response is
+worker-launch evidence; publication and downstream readiness require their own
+completed receipts and verification.
 
 This isolated route requires deferred typed materialization and disables direct
 artifact publication, bulk export, and `publish_source_dataset_only`. The legacy
@@ -873,6 +913,12 @@ capability ciphertext while retaining hashes and audit data. A retry can adopt
 an expired/retryable checkpoint only from its direct prior owner through the
 same root and candidate identity; a fresh run receives a different checkpoint
 and cannot adopt the old snapshot.
+
+While consuming bulk bytes, the worker checks cancellation, deadlines and its
+held checkpoint lock without reopening Source custody transactions for each
+chunk. Full ownership and custody checks remain at bounded writes, including a
+recheck after COPY before payload and byte-offset progress commit atomically.
+Cancellation, deadline expiry or loss of ownership or the lock rolls back that batch.
 
 The candidate is published only when every selected resource reports a
 complete, unbounded, error-free scan with no next page remaining. Publication

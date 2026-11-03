@@ -41,6 +41,14 @@ def _stage(recipes, *, inventory=True):
     )
 
 
+def _assert_location_index(connection, target):
+    """Verify candidate registration builds the index in its exact isolated schema."""
+    connection.execute.assert_awaited_once_with(
+        "CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
+        f'ON "{target.schema_name}".provider_location_binding USING hash(location_key)'
+    )
+
+
 @pytest.mark.parametrize("count", [101, 1000])
 async def test_source_stage_uses_inventory_recipe_commitment_and_preserves_singletons(monkeypatch, count):
     recipes = tuple(_example(index) for index in reversed(range(count)))
@@ -100,7 +108,7 @@ async def test_actual_registration_orchestration_finishes_inventory_before_candi
     address = PinnedAddressSource("address_fixture", "entity_address_unified", "b" * 64)
     artifact = CompactCompositionAddressSource(address, (), "c" * 64)
     approved = SimpleNamespace(approved_revision=7, generation_id="d" * 64)
-    inputs = composition._CompositionInputs(object(), None, approved, None, None)
+    inputs = composition._CompositionInputs(SimpleNamespace(execute=AsyncMock()), None, approved, None, None)
     calls, generations_by_name = [], {}
     monkeypatch.setattr(
         composition, "resolve_registered_office_summary_revision", AsyncMock(return_value=office_revision)
@@ -150,6 +158,7 @@ async def test_actual_registration_orchestration_finishes_inventory_before_candi
     assert len(generations_by_name) < 12
     assert not any(key.startswith("initial_source_recipe_") for key in generations_by_name)
     assert prepared[3] is stage
+    _assert_location_index(inputs.connection, prepared[0])
 
 
 async def test_registered_inventory_aggregate_resumes_descriptor_revision_two():

@@ -4,7 +4,7 @@
 import hashlib
 import json
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from uuid import UUID
 
 import pytest
@@ -339,6 +339,88 @@ def test_typed_office_summary_binds_the_registered_approval_and_address():
         verify_initial_source_office_receipt(candidate_by_field)
 
 
+@pytest.mark.parametrize(
+    "section,field,value",
+    [
+        ("context", "office_policy", "fhir-direct-network-office-v2"),
+        ("context", "canonicalizer_version", True),
+        ("address_identity", "schema_oid", True),
+        ("address_identity", "owner_oid", 0),
+        ("address_identity", "table_oid", 2**32),
+        ("summary", "typed_source_count", 0),
+    ],
+)
+def test_typed_office_summary_rejects_changed_policy_or_non_native_identity(section, field, value):
+    from process.registry_initial_source_composition import SUMMARY_KEY
+    from process.registry_source_inventory_reference import verify_source_recipe_metadata
+
+    _, _, candidate, _ = _registered_typed_resume()
+    root = verify_source_recipe_metadata(candidate).inventory.root
+    summary = candidate["validation_json"][SUMMARY_KEY]
+    assert validate_typed_summary(summary, root, offices=True) == summary
+    damaged = deepcopy(summary)
+    target = damaged if section == "summary" else damaged["context"]
+    if section == "address_identity":
+        target = target["address_identity"]
+    target[field] = value
+    with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+        validate_typed_summary(damaged, root, offices=True)
+
+
+@pytest.mark.parametrize(
+    "start,end,expected",
+    [
+        ("2026-02-30", None, False),
+        ("2026-01-01T25:00:00Z", None, False),
+        ("2026-01-01", "2025-12-31", False),
+        ("2026-01-01", "2026-01-01", True),
+    ],
+)
+def test_typed_membership_period_requires_real_dates_and_preserves_inclusive_boundaries(start, end, expected):
+    from datetime import date
+
+    from process.network_fhir_typed_source import _is_period_allowed
+
+    assert _is_period_allowed(start, end, date(2026, 1, 1)) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_failed_typed_workspace_invalidates_its_capability_and_terminates_after_failed_rollback(cancelled):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from process.network_fhir_typed_source import _workspace
+
+    transaction = SimpleNamespace(
+        start=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock(side_effect=RuntimeError("rollback failed"))
+    )
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        transaction=lambda: transaction,
+        execute=AsyncMock(),
+        fetchval=AsyncMock(side_effect=[101, 102, 103, 104, "1/2"]),
+        terminate=Mock(),
+    )
+    failure = asyncio.CancelledError() if cancelled else ValueError("consumer failed")
+    with pytest.raises(type(failure)) as raised:
+        async with _workspace(connection) as stage:
+            assert stage.connection is connection and stage.task is asyncio.current_task()
+            assert stage.virtual_xid == "1/2" and stage.oids == {
+                "cells": 101,
+                "addresses": 102,
+                "pairs": 103,
+                "checks": 104,
+            }
+            raise failure
+    assert raised.value is failure and stage.active is False
+    transaction.start.assert_awaited_once()
+    transaction.rollback.assert_awaited_once()
+    transaction.commit.assert_not_awaited()
+    connection.terminate.assert_called_once_with()
+
+
 def _registered_typed_resume(state="open"):
     from process.network_address_projection import PinnedAddressSource
     from process.registry_candidate_composition import _target
@@ -606,3 +688,168 @@ async def test_valid_canonical_address_collisions_still_refuse(monkeypatch, coll
     stage = SimpleNamespace(relation=lambda _kind: "pg_temp.addresses")
     with pytest.raises(TypedFHIRGraphError, match="canonical_collision"):
         await _canonical_address_records(connection, stage, address_rows, ",".join(ADDRESS_FIELDS))
+
+
+def _mixed_typed_summaries():
+    """Build both accounting formats through the actual inventory validators."""
+    from tests.test_registry_source_inventory_preparation import _derivation, _descriptor
+
+    typed, legacy = _recipe(), _example()
+    contribution, derivation = _metadata(typed)
+    legacy_contribution = _descriptor(legacy, anchored=True)
+    legacy_derivation = _derivation(legacy, legacy_contribution, facts=True)
+    preparation = SourceInventoryPreparation((typed, legacy))
+    contributions = sorted((contribution, legacy_contribution), key=lambda row: row["recipe_sha256"])
+    derivations = sorted((derivation, legacy_derivation), key=lambda row: row["recipe_sha256"])
+    for document in contributions:
+        preparation.add_contribution(document)
+    for document in derivations:
+        preparation.add_derivation(document)
+    reference, _ = preparation.finish()
+    return reference.root, contributions, derivations
+
+
+@pytest.mark.parametrize("offices", [False, True])
+@pytest.mark.parametrize("damage", ["boolean-version", "unknown-version", "empty", "count", "duplicate"])
+def test_mixed_summary_refuses_legacy_version_or_census_substitution(offices, damage):
+    root, contributions, derivations = _mixed_typed_summaries()
+    summary = typed_office_summary(root, derivations) if offices else typed_contribution_summary(root, contributions)
+    assert validate_typed_summary(summary, root, offices=offices) == summary
+    changed = deepcopy(summary)
+    legacy = changed["legacy"][0]
+    if damage == "duplicate":
+        changed["legacy"].append(deepcopy(legacy))
+    elif damage in {"boolean-version", "unknown-version"}:
+        legacy["version"] = True if damage == "boolean-version" else 99
+    else:
+        legacy["source_count"] = 0 if damage == "empty" else 2
+    with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+        validate_typed_summary(changed, root, offices=offices)
+    assert validate_typed_summary(summary, root, offices=offices) == summary
+
+
+@pytest.mark.parametrize(
+    "field,value", [("revision", True), ("inventory_entries_sha256", "0" * 64), ("source_count", 1)]
+)
+def test_typed_summary_cannot_rebind_its_inventory_root(field, value):
+    root, contributions, _ = _mixed_typed_summaries()
+    summary = typed_contribution_summary(root, contributions)
+    with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+        validate_typed_summary(summary | {field: value}, root)
+    for selected_root, offices in ((asdict(root), False), (root, 1)):
+        with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+            validate_typed_summary(summary, selected_root, offices=offices)
+
+
+def test_typed_summary_requires_complete_unique_inventory_documents():
+    root, contributions, derivations = _mixed_typed_summaries()
+    for summarize, documents in ((typed_contribution_summary, contributions), (typed_office_summary, derivations)):
+        summarize(root, documents)
+        for selected in ([], documents[:1], documents[::-1], [documents[0], documents[0]]):
+            with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+                summarize(root, selected)
+        with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+            summarize(asdict(root), documents)
+
+
+@pytest.mark.parametrize("legacy", [{}, None, [None] * 4])
+def test_typed_summary_refuses_a_noncanonical_or_unbounded_legacy_roster(legacy):
+    root, contributions, _ = _mixed_typed_summaries()
+    summary = typed_contribution_summary(root, contributions)
+    with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+        validate_typed_summary(summary | {"legacy": legacy}, root)
+
+
+def _two_typed_office_derivations():
+    """Bind distinct retained captures before comparing their office context."""
+    first = _recipe()
+    anchor = replace(first.source_pin.anchor, capture_id=str(UUID(int=6)))
+    capture = deepcopy(first.source_pin.capture)
+    capture.pop("capture_sha256")
+    capture.update(capture_id=anchor.capture_id, schema_name=PREFIX + UUID(anchor.capture_id).hex)
+    capture["capture_sha256"] = digest(capture)
+    second = replace(first, source_pin=replace(first.source_pin, capture=capture, anchor=anchor))
+    preparation, documents = SourceInventoryPreparation((first, second)), []
+    for recipe in (first, second):
+        contribution, derivation = _metadata(recipe)
+        preparation.add_contribution(contribution)
+        preparation.add_derivation(derivation)
+        documents.append(derivation)
+    reference, _ = preparation.finish()
+    return reference.root, sorted(documents, key=lambda row: row["recipe_sha256"])
+
+
+@pytest.mark.parametrize(
+    "field", ["approved_revision", "approved_generation_sha256", "address_source", "address_identity"]
+)
+def test_typed_office_inventory_requires_one_current_approval_and_native_address_context(field):
+    root, documents = _two_typed_office_derivations()
+    assert typed_office_summary(root, documents)["typed_source_count"] == 2
+    second = documents[1]
+    if field == "approved_revision":
+        second[field] += 1
+    elif field == "approved_generation_sha256":
+        second[field] = "0" * 64
+    elif field == "address_source":
+        second[field]["generation_id"] = "0" * 64
+    else:
+        second[field]["table_oid"] += 1
+    validate_typed_derivation(second)
+    with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+        typed_office_summary(root, documents)
+
+
+@pytest.mark.parametrize("start,end", [("2026/10/01", None), (None, "2026-10-01 trailing")])
+def test_typed_period_refuses_noncanonical_dates(start, end):
+    from process.network_fhir_typed_source import _is_period_allowed
+
+    assert not _is_period_allowed(start, end, "2026-10-01")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_canonicalization_bounds_pages_and_reuses_exact_existing_addresses(monkeypatch, oversized):
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from process.network_fhir_typed_contract import ADDRESS_FIELDS, TypedFHIRGraphError
+    from process.network_fhir_typed_source import _canonicalize
+
+    native = Mock(side_effect=AssertionError("known address was recanonicalized"))
+    monkeypatch.setitem(sys.modules, "ptg2_address_canon", SimpleNamespace(canonicalize_batch=native))
+    address_by_field = {"resource_id": "location-one", "raw_key": "raw-one", **dict.fromkeys(ADDRESS_FIELDS)}
+    sizes = [9 * 1024**2] * 11 if oversized else [9 * 1024**2, 1, 0]
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=sizes),
+        fetch=AsyncMock(side_effect=[[address_by_field], [address_by_field], []]),
+        copy_records_to_table=AsyncMock(),
+    )
+    stage = SimpleNamespace(relation=lambda kind: "pg_temp." + kind, names={"addresses": "addresses"})
+    if oversized:
+        with pytest.raises(TypedFHIRGraphError, match="canonical_bounds"):
+            await _canonicalize(connection, stage)
+        connection.fetch.assert_not_awaited()
+        assert connection.fetchval.await_args.args[-1] == 1
+    else:
+        await _canonicalize(connection, stage)
+        assert [call.args[-2:] for call in connection.fetchval.await_args_list] == [
+            ("", 1000),
+            ("", 500),
+            ("location-one", 500),
+        ]
+    native.assert_not_called()
+    connection.copy_records_to_table.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_absent_optional_references_and_empty_projection_do_not_invent_rows():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from process.network_fhir_typed_source import _project_page, _refs
+
+    assert _refs({}, "network") == _refs({"network": None}, "network") == []
+    connection = SimpleNamespace(execute=AsyncMock())
+    await _project_page(connection, object(), [])
+    connection.execute.assert_not_awaited()

@@ -514,3 +514,85 @@ fn python_entity_rows_preserve_binary_copy_defaults_and_reject_bad_inputs() {
         assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
     });
 }
+
+/// Build a fully committed scope so printable rejection cannot hide a digest failure.
+fn python_plan_tier_input(plan_id: &str, tier: &str) -> Vec<u8> {
+    let logical = serde_json::json!({"contract":"healthporta-uhc-logical-scope-v1",
+        "entry_id":"uhc-provider-files","family":"ifp","market":"individual-exchange",
+        "product":"IEX","jurisdiction":"AZ"});
+    let logical = registry_bytes_digest(&serde_json::to_vec(&logical).unwrap());
+    let key = serde_json::json!({"logical_scope_id":logical,"family":"ifp",
+        "market":"individual-exchange","plan_id_type":"hios","plan_id":plan_id,"plan_year":2026});
+    let mut plan = key.clone();
+    plan["contract"] = serde_json::json!("healthporta-uhc-plan-key-v1");
+    let plan_key = registry_bytes_digest(&serde_json::to_vec(&plan).unwrap());
+    let mut network = key.clone();
+    network["contract"] = serde_json::json!("healthporta-uhc-network-key-v1");
+    network["network_tier"] = serde_json::json!(tier);
+    let network_key = registry_bytes_digest(&serde_json::to_vec(&network).unwrap());
+    let mut scope = key;
+    scope["product"] = serde_json::json!("IEX");
+    scope["jurisdiction"] = serde_json::json!("AZ");
+    scope["plan_key_id"] = serde_json::json!(plan_key);
+    let row = serde_json::json!({
+        "binding_id":"01234567-89ab-cdef-8123-456789abcdef","source_system":"fhir",
+        "source_id":"pdfhir_2754e999dd691175821ec26e","dataset_schema":"synthetic_source",
+        "dataset_id":"edition-one","producer_id":"registry-source-fhir-witness-v1",
+        "edition_id":"01234567-89ab-cdef-8123-456789abcde0",
+        "source_key":format!("UHCPlanTier/{network_key}"),
+        "source_scope_json":{"kind":"uhc_plan_tier_v1","plan_scope":scope,"network_tier":tier,
+            "network_key_id":network_key,"plan_resource_id":format!("uhcplan-{}",&plan_key[..48]),
+            "capture_sha256":"a".repeat(64)},
+        "network_id":42,"evidence_id":"synthetic-evidence","evidence_sha256":"b".repeat(64),
+        "operation":"bind","expected_revision":0,"expected_network_id":null});
+    serde_json::to_vec(&[row]).unwrap()
+}
+
+#[test]
+fn python_plan_tier_binding_preserves_native_copy_and_count() {
+    let input = python_plan_tier_input("12345AZ001", "preferred");
+    let expected =
+        crate::network_source_binding_values::encode_network_source_binding_batch(&input).unwrap();
+    assert_eq!(expected.row_count, 1);
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let encoded = module
+            .getattr("encode_network_source_binding_batch")
+            .unwrap()
+            .call1((PyBytes::new(py, &input),))
+            .unwrap();
+        let (copy, count): (Py<PyBytes>, usize) = encoded.extract().unwrap();
+        assert_eq!(copy.bind(py).as_bytes(), expected.copy_bytes);
+        assert_eq!(count, expected.row_count);
+    });
+}
+
+#[test]
+fn python_plan_tier_binding_refuses_nonprintable_text_after_native_validation() {
+    Python::initialize();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+        ptg2_address_canon(&module).unwrap();
+        let encoder = module
+            .getattr("encode_network_source_binding_batch")
+            .unwrap();
+        for (plan_id, tier) in [
+            ("12345\u{200b}AZ001", "preferred"),
+            ("12345AZ001", "pre\u{200b}ferred"),
+        ] {
+            let input = python_plan_tier_input(plan_id, tier);
+            let core =
+                crate::network_source_binding_values::encode_network_source_binding_batch(&input)
+                    .unwrap();
+            assert_eq!(core.row_count, 1);
+            let error = encoder.call1((PyBytes::new(py, &input),)).unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                error.value(py).str().unwrap().to_str().unwrap(),
+                "Source binding plan identity is not printable"
+            );
+        }
+    });
+}

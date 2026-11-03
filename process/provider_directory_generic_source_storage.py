@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import time
+import urllib.parse
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -833,7 +834,7 @@ async def _locked_transition_candidate(
 
 
 async def _verify_transition_run(connection, catalog_schema, identity_by_field, source_ids):
-    """Require the exact latest failed child and no active same-root run."""
+    """Require the exact latest stopped run and no active same-root run."""
     root_run_id = identity_by_field["acquisition_root_run_id"]
     run_rows = await connection.fetch(
         "SELECT run_id,status,finished_at,retry_of_run_id,created_at,"
@@ -850,9 +851,12 @@ async def _verify_transition_run(connection, catalog_schema, identity_by_field, 
     _require(
         1 <= len(run_rows) <= 64
         and run_rows[0]["run_id"] == identity_by_field["failed_run_id"]
-        and run_rows[0]["status"] == "failed"
+        and run_rows[0]["status"] in {"failed", "canceled"}
         and run_rows[0]["finished_at"] is not None
-        and run_rows[0]["root_run_id"] == root_run_id
+        and (
+            run_rows[0]["root_run_id"] == root_run_id
+            or (run_rows[0]["run_id"] == root_run_id and run_rows[0]["root_run_id"] is None)
+        )
         and _json(run_rows[0]["source_ids"]) == source_ids
         and all(
             run_record["retry_of_run_id"] is None
@@ -877,7 +881,11 @@ async def _verify_transition_run(connection, catalog_schema, identity_by_field, 
         _require(lineage_cursor in run_ids and lineage_cursor not in seen_run_ids, "transition_run_changed")
         seen_run_ids.add(lineage_cursor)
         lineage_cursor = parents_by_id[lineage_cursor]
-    return sorted(run_ids)
+    return {
+        "lineage_run_ids": sorted(run_ids),
+        "ancestor_run_ids": sorted(seen_run_ids | {root_run_id}),
+        "status": run_rows[0]["status"],
+    }
 
 
 def _is_resumable_transition_checkpoint(checkpoint):
@@ -902,23 +910,207 @@ def _is_resumable_transition_checkpoint(checkpoint):
         return False
 
 
-async def _verify_transition_inputs(connection, policy, candidate_by_field, identity_by_field, expected_counts):
-    """Compare completed or resumable checkpoints with every active detached input row."""
+def _is_bulk_transition_request(directory, checkpoint, audit):
+    """Keep canonical commitments and the two historical submitted query orderings."""
+    if "normalized_request_hash" not in audit and audit["request_hash"] == checkpoint["start_url_hash"]:
+        return True
+    for should_omit_format in (False, True):
+        request = directory._bulk_export_start_url(
+            {
+                "api_base": checkpoint["canonical_api_base"],
+                "metadata_json": {"provider_directory_bulk_export_omit_output_format": should_omit_format},
+            },
+            checkpoint["resource_type"],
+        )
+        if hashlib.sha256(request.encode()).hexdigest() != checkpoint["start_url_hash"]:
+            continue
+        if "normalized_request_hash" in audit:
+            return (
+                audit["normalized_request_hash"]
+                == hashlib.sha256(directory._normalized_bulk_request_identity(request).encode()).hexdigest()
+            )
+        parsed = urllib.parse.urlsplit(request)
+        reversed_query = urllib.parse.urlencode(
+            list(reversed(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)))
+        )
+        reversed_request = urllib.parse.urlunsplit(parsed._replace(query=reversed_query))
+        return audit["request_hash"] in {
+            checkpoint["start_url_hash"],
+            hashlib.sha256(reversed_request.encode()).hexdigest(),
+        }
+    return False
+
+
+def _validate_bulk_transition_checkpoint(checkpoint, identity_by_field, lineage_run_ids):
+    """Retain the exact export identity and its URL-free manifest evidence."""
+    directory = import_module("process.provider_directory_fhir")
+    checkpoint_identity_by_field = {
+        field: checkpoint[field]
+        for field in (
+            "canonical_api_base",
+            "resource_type",
+            "source_scope_hash",
+            "strategy_version",
+            "acquisition_root_run_id",
+            "endpoint_id",
+            "dataset_id",
+            "start_url_hash",
+        )
+    }
+    audit = _json(checkpoint["manifest_json"])
+    _require(
+        all(
+            checkpoint[field] == identity_by_field[field]
+            for field in ("acquisition_root_run_id", "endpoint_id", "dataset_id")
+        )
+        and (
+            checkpoint["owner_run_id"] == identity_by_field["failed_run_id"]
+            or (checkpoint["state"] == "complete" and checkpoint["owner_run_id"] in lineage_run_ids)
+        )
+        and checkpoint["checkpoint_id"] == directory._identity_hash(checkpoint_identity_by_field)
+        and checkpoint["strategy_version"] == directory.BULK_EXPORT_CHECKPOINT_STRATEGY_VERSION
+        and directory._is_safe_bulk_https_url(checkpoint["canonical_api_base"])
+        and directory._canonical_base(checkpoint["canonical_api_base"]) == checkpoint["canonical_api_base"]
+        and all(
+            type(checkpoint[field]) is str and re.fullmatch(r"[0-9a-f]{64}", checkpoint[field])
+            for field in ("source_scope_hash", "start_url_hash", "manifest_hash")
+        )
+        and checkpoint["state"] in {"manifest_ready", "streaming", "retryable", "complete"}
+        and (checkpoint["state"] == "complete") == (checkpoint["completed_at"] is not None)
+        and checkpoint["failed_at"] is None
+        and (checkpoint["error"] is None or type(checkpoint["error"]) is str)
+        and not directory._is_bulk_export_error_terminal(checkpoint["error"])
+        and type(audit) is dict
+        and type(audit.get("requiresAccessToken")) is bool
+        and type(audit.get("request_hash")) is str
+        and re.fullmatch(r"[0-9a-f]{64}", audit["request_hash"])
+        and _is_bulk_transition_request(directory, checkpoint, audit)
+        and type(audit.get("output")) is list
+        and bool(audit["output"]),
+        "transition_bulk_checkpoint_changed",
+    )
+    try:
+        directory._validated_bulk_transaction_time(audit.get("transactionTime"))
+    except ValueError:
+        _require(False, "transition_bulk_checkpoint_changed")
+    return audit["output"]
+
+
+def _validate_bulk_transition_outputs(checkpoint, outputs, manifest_outputs, expected_count):
+    """Keep every committed byte and require the original immutable file proofs."""
+    directory = import_module("process.provider_directory_fhir")
+    manifest_outputs = [
+        entry for entry in manifest_outputs if type(entry) is dict and entry.get("type") == checkpoint["resource_type"]
+    ]
+    _require(
+        len(outputs) == len(manifest_outputs)
+        and [output["output_index"] for output in outputs] == list(range(len(outputs)))
+        and len({output["output_id"] for output in outputs}) == len(outputs)
+        and type(checkpoint["rows_written"]) is int
+        and checkpoint["rows_written"] == expected_count,
+        "transition_bulk_output_changed",
+    )
+    for output, manifest_output in zip(outputs, manifest_outputs, strict=True):
+        _require(
+            type(manifest_output) is dict
+            and set(manifest_output) == {"type", "url_hash"}
+            and manifest_output["type"] == output["resource_type"] == checkpoint["resource_type"]
+            and manifest_output["url_hash"] == output["output_url_hash"]
+            and all(
+                type(output[field]) is str and re.fullmatch(r"[0-9a-f]{64}", output[field])
+                for field in ("output_id", "output_url_hash")
+            )
+            and output["checkpoint_id"] == checkpoint["checkpoint_id"]
+            and output["state"] in {"pending", "streaming", "complete"}
+            and (output["state"] == "complete") == (output["completed_at"] is not None)
+            and (checkpoint["state"] != "complete" or output["state"] == "complete")
+            and (output["state"] == "complete" or (output["has_output_url"] and output["has_etag"]))
+            and output["error"] is None
+            and type(output["rows_written"]) is int
+            and output["rows_written"] >= 0
+            and type(output["committed_bytes"]) is int
+            and output["rows_written"] <= output["committed_bytes"],
+            "transition_bulk_output_changed",
+        )
+        try:
+            directory._bulk_output_validator_proof(output)
+        except ValueError:
+            _require(False, "transition_bulk_output_changed")
+    _require(sum(output["rows_written"] for output in outputs) == expected_count, "transition_bulk_output_changed")
+
+
+async def _verify_bulk_transition_checkpoints(
+    connection, policy, checkpoints, identity_by_field, expected_counts, lineage_run_ids
+):
+    """Verify one bulk-only candidate, including selected resources not yet started."""
+    resources = {checkpoint["resource_type"] for checkpoint in checkpoints}
+    _require(
+        len(resources) == len(checkpoints)
+        and resources <= set(expected_counts)
+        and all(count == 0 or resource in resources for resource, count in expected_counts.items())
+        and len({(checkpoint["canonical_api_base"], checkpoint["source_scope_hash"]) for checkpoint in checkpoints})
+        == 1,
+        "transition_bulk_checkpoint_changed",
+    )
+    outputs = await connection.fetch(
+        "SELECT checkpoint_id,output_id,output_index,resource_type,output_url_hash,state,rows_written,"
+        "content_length_bytes,etag_hash,committed_bytes,validator_checked_at,completed_at,error,"
+        "output_url_ciphertext IS NOT NULL AS has_output_url,etag_ciphertext IS NOT NULL AS has_etag FROM "
+        + storage_relation(policy.schema, "provider_directory_bulk_output_checkpoint")
+        + " WHERE checkpoint_id=ANY($1::varchar[]) ORDER BY checkpoint_id,output_index FOR SHARE NOWAIT",
+        [checkpoint["checkpoint_id"] for checkpoint in checkpoints],
+    )
+    _require(
+        {output["checkpoint_id"] for output in outputs} == {checkpoint["checkpoint_id"] for checkpoint in checkpoints},
+        "transition_bulk_output_changed",
+    )
+    for checkpoint in checkpoints:
+        manifest_outputs = _validate_bulk_transition_checkpoint(checkpoint, identity_by_field, lineage_run_ids)
+        _validate_bulk_transition_outputs(
+            checkpoint,
+            [output for output in outputs if output["checkpoint_id"] == checkpoint["checkpoint_id"]],
+            manifest_outputs,
+            expected_counts[checkpoint["resource_type"]],
+        )
+
+
+async def _verify_transition_checkpoints(
+    connection, policy, identity_by_field, expected_counts, run_status, lineage_run_ids
+):
+    """Reject mixed checkpoint families before comparing their retained input census."""
     root_run_id = identity_by_field["acquisition_root_run_id"]
     dataset_id = identity_by_field["dataset_id"]
     checkpoint_rows = await connection.fetch(
         "SELECT resource_type,state,owner_run_id,dataset_id,rows_processed,pages_processed,completed_at,"
-        "canonical_api_base,start_url_hash,next_url FROM "
+        "canonical_api_base,start_url_hash,next_url,acquisition_root_run_id FROM "
         + storage_relation(policy.schema, "provider_directory_pagination_checkpoint")
-        + " WHERE acquisition_root_run_id=$1 FOR SHARE NOWAIT",
+        + " WHERE acquisition_root_run_id=$1 OR dataset_id=$2 FOR SHARE NOWAIT",
         root_run_id,
+        dataset_id,
     )
+    bulk_checkpoints = await connection.fetch(
+        "SELECT checkpoint_id,canonical_api_base,resource_type,source_scope_hash,strategy_version,"
+        "acquisition_root_run_id,owner_run_id,endpoint_id,dataset_id,start_url_hash,manifest_hash,manifest_json,"
+        "state,rows_written,completed_at,failed_at,error FROM "
+        + storage_relation(policy.schema, "provider_directory_bulk_acquisition_checkpoint")
+        + " WHERE acquisition_root_run_id=$1 OR dataset_id=$2 FOR SHARE NOWAIT",
+        root_run_id,
+        dataset_id,
+    )
+    _require(not (checkpoint_rows and bulk_checkpoints), "transition_checkpoint_changed")
+    if bulk_checkpoints:
+        await _verify_bulk_transition_checkpoints(
+            connection, policy, bulk_checkpoints, identity_by_field, expected_counts, lineage_run_ids
+        )
+        return
+    _require(run_status == "failed", "transition_run_changed")
     _require(
         len(checkpoint_rows) == len(expected_counts)
         and {checkpoint_record["resource_type"] for checkpoint_record in checkpoint_rows} == set(expected_counts)
         and all(
             _is_resumable_transition_checkpoint(checkpoint_record)
             and checkpoint_record["owner_run_id"] == identity_by_field["failed_run_id"]
+            and checkpoint_record["acquisition_root_run_id"] == root_run_id
             and checkpoint_record["dataset_id"] == dataset_id
             and checkpoint_record["rows_processed"] == expected_counts[checkpoint_record["resource_type"]]
             and checkpoint_record["pages_processed"] > 0
@@ -926,6 +1118,21 @@ async def _verify_transition_inputs(connection, policy, candidate_by_field, iden
         ),
         "transition_checkpoint_changed",
     )
+
+
+async def _verify_transition_inputs(
+    connection, policy, candidate_by_field, identity_by_field, expected_counts, run_evidence_by_field
+):
+    """Compare completed or resumable checkpoints with every active detached input row."""
+    await _verify_transition_checkpoints(
+        connection,
+        policy,
+        identity_by_field,
+        expected_counts,
+        run_evidence_by_field["status"],
+        run_evidence_by_field["ancestor_run_ids"],
+    )
+    dataset_id = identity_by_field["dataset_id"]
     resource_relation = storage_relation(policy.schema, candidate_by_field["tables"]["resource_input"]["name"])
     input_rows = await connection.fetch(
         "SELECT dataset_id,resource_type,count(*) AS total,"
@@ -984,7 +1191,7 @@ async def transition_isolated_loading_candidate_storage(
     new_storage,
     expected_resource_counts,
 ):
-    """Move one failed private intake to an admin-issued successor producer."""
+    """Move one verified stopped private intake to an admin-issued successor producer."""
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
     from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
 
@@ -1002,24 +1209,37 @@ async def transition_isolated_loading_candidate_storage(
         new_storage,
         expected_resource_counts,
     )
-    lineage_run_ids = await _verify_transition_run(
+    run_evidence_by_field = await _verify_transition_run(
         connection,
         old_binding.catalog_schema,
         identity_by_field,
         candidate_by_field["identity"]["metadata"]["source_ids"],
     )
-    await _verify_transition_inputs(connection, policy, candidate_by_field, identity_by_field, expected_resource_counts)
+    await _verify_transition_inputs(
+        connection,
+        policy,
+        candidate_by_field,
+        identity_by_field,
+        expected_resource_counts,
+        run_evidence_by_field,
+    )
     old_document_by_field = {**candidate_by_field, "storage": old_storage}
     successor_by_field = {**candidate_by_field, "storage": new_storage}
     receipt_by_field = {
         "dataset_id": identity_by_field["dataset_id"],
         "rows": sum(expected_resource_counts.values()),
-        "lineage_run_ids": lineage_run_ids,
+        "lineage_run_ids": run_evidence_by_field["lineage_run_ids"],
         "old_binding_sha256": hashlib.sha256(_encoded(old_document_by_field).encode()).hexdigest(),
         "new_binding_sha256": hashlib.sha256(_encoded(successor_by_field).encode()).hexdigest(),
     }
     if candidate_by_field["storage"] == new_storage:
         return {**receipt_by_field, "already_applied": True}
+    await _store_transition_successor(connection, policy, identity_by_field, successor_by_field, candidate_by_field)
+    return {**receipt_by_field, "already_applied": False}
+
+
+async def _store_transition_successor(connection, policy, identity_by_field, successor_by_field, candidate_by_field):
+    """Commit only the unchanged unpublished header preimage."""
     updated = await connection.execute(
         "UPDATE "
         + storage_relation(policy.schema, HEADER)
@@ -1031,7 +1251,6 @@ async def transition_isolated_loading_candidate_storage(
         _encoded(candidate_by_field),
     )
     _require(updated == "UPDATE 1", "transition_header_compare_failed")
-    return {**receipt_by_field, "already_applied": False}
 
 
 def _records(rows, columns, ordinal):
