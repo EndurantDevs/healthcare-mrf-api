@@ -4,11 +4,14 @@
 import asyncio
 import contextlib
 import contextvars
+import json
 import os
 import posixpath
 import ssl
 import urllib.parse
 import urllib.request
+from pathlib import Path
+from typing import Any
 
 from process import provider_directory_generic_source_policy as source_policy
 
@@ -727,3 +730,26 @@ async def fetch_source_candidate(directory, source_record, candidate_url, *, tim
             )
         )
     return directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms), False, retry_count
+
+
+def configured_seed_rows():
+    """Load baked public source metadata through the existing seed pipeline."""
+    path = Path(__file__).resolve().parents[1] / "specs/provider_directory_supplemental_sources.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise ValueError("provider_directory_configured_sources_invalid")
+    return rows
+
+
+def read_retest_results(
+    path: Path,
+) -> tuple[Any, list[Any]]:
+    """Read and validate the outer shape of a retest report."""
+    try:
+        retest_document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Provider Directory retest results could not be read from {path}: {exc}") from exc
+    retest_results = retest_document.get("results") if isinstance(retest_document, dict) else retest_document
+    if not isinstance(retest_results, list):
+        raise RuntimeError(f"Provider Directory retest results at {path} must be a JSON object/list with results.")
+    return retest_document, retest_results

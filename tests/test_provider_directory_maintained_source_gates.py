@@ -84,17 +84,18 @@ def _write_observations(tmp_path, observation_payload_by_kind):
 def test_all_maintained_sources_can_produce_ready_rows_and_table():
     report = _report(_observation_payload_by_kind())
 
-    assert report["maintained_source_count"] == 34
+    assert report["maintained_source_count"] == 35
     assert report["ready"] is True
-    assert len(report["sources"]) == 34
+    assert len(report["sources"]) == 35
     assert next(row for row in report["sources"] if row["entry_id"] == "cms-npd")["source_id"] == "cms-npd"
     assert next(row for row in report["sources"] if row["entry_id"] == "pacificsource")["source_id"] == (
         "pdfhir_19526dc970938f7a212516fa"
     )
     assert {row["status"] for row in report["sources"]} == {"ready"}
     table = gates.format_table(report)
-    assert table.count("\n") == 35
+    assert table.count("\n") == 36
     assert "aetna-commercial-medicare" in table
+    assert "florida-blue" in table
     assert "anthem-provider-directory" in table
     assert "capital-blue-cross-medicare" in table
     assert "capital-blue-cross-chip" in table

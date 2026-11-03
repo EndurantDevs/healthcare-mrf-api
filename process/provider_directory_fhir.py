@@ -1322,6 +1322,7 @@ REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES = {
 }
 SIMPRA_PROVIDER_DIRECTORY_BASE = "https://data.healthlx.com:8004/SIMPRA"
 CAPITAL_BLUE_CROSS_PROVIDER_DIRECTORY_BASE = "https://providerdirectory-api.capbluecross.com/r4"
+FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE = "https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir"
 REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE = "healthporta-reviewed-provider-directory-candidate"
 IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE = "https://api-idmedicaid.safhir.io/v1/api/provider-directory"
 IDAHO_MEDICAID_PAGINATION_HOST = "api-ida-prd.safhir.io"
@@ -1505,6 +1506,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         christus.API_BASE,
         "https://api.capitalbluecrossfhir.com/r4/public-ma",
         "https://api.capitalbluecrossfhir.com/r4/public-chip",
+        FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE,
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
@@ -40529,6 +40531,7 @@ def _seed_rows_from_supplemental_catalogs(
         ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
         ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
         ("mvp_health_care", mvp.API_BASE, mvp.seed_rows),
+        ("configured_sources", "provider-directory-supplemental-sources", source_selection.configured_seed_rows),
         (
             "provider_directory_blockers",
             PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
@@ -40542,18 +40545,8 @@ def _seed_rows_from_supplemental_catalogs(
     return supplemental_rows, metrics_by_name
 
 
-def _read_provider_directory_retest_results(
-    path: Path,
-) -> tuple[Any, list[Any]]:
-    """Read and validate the outer shape of a retest report."""
-    try:
-        retest_document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Provider Directory retest results could not be read from {path}: {exc}") from exc
-    retest_results = retest_document.get("results") if isinstance(retest_document, dict) else retest_document
-    if not isinstance(retest_results, list):
-        raise RuntimeError(f"Provider Directory retest results at {path} must be a JSON object/list with results.")
-    return retest_document, retest_results
+def _read_provider_directory_retest_results(path: Path) -> tuple[Any, list[Any]]:
+    return source_selection.read_retest_results(path)
 
 
 def _seed_rows_from_retest_results(path: Path, *, source_query: str | None = None) -> list[dict[str, Any]]:
