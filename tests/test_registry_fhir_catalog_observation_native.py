@@ -8,7 +8,12 @@ from copy import deepcopy
 import pytest
 
 from process import registry_fhir_catalog_observation as observation
-from process.registry_fhir_catalog_extraction import DEFAULT_BYTES, RESOURCE_TYPES, _decode_fhir_catalog_page
+from process.registry_fhir_catalog_extraction import (
+    DEFAULT_BYTES,
+    RESOURCE_TYPES,
+    _decode_fhir_catalog_page,
+    extract_fhir_catalog_batch,
+)
 from process.registry_fhir_catalog_observed_source import _validate_metadata_page
 from process.registry_fhir_catalog_reference_rollup import MAX_PAGE_REFERENCES
 
@@ -91,6 +96,48 @@ def test_native_complete_payload_and_four_family_receipts_match_reference(native
         payload["unconsumed"] = "changed"
         changed[index]["payload_json"] = json.dumps(payload)
         assert _actual(changed) == _reference(changed) != _reference(records)
+
+
+@pytest.mark.parametrize("family", ["Organization", "InsurancePlan"])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_optional_alias_filter_preserves_native_and_reference_payload_hashes(native, family, fallback):
+    payload = {
+        "name": "Example",
+        "aliases": [" Good ", "é" * 256, "é" * 257, "bad\nalias", "Good", "Second"],
+        "network_refs": ["Organization/network"],
+        **({"numeric": 1.25} if fallback else {}),
+    }
+    records = [_record(family, payload=payload)]
+    original = deepcopy(records)
+    frames = _native(native, records)
+    assert (frames is None) is fallback
+    if frames is not None:
+        assert json.loads(frames[0])["payload_json"] == payload
+    observed = _actual(records)
+    assert observed == _reference(records)
+    assert records == original
+
+    # The ignored display value remains part of the original observation digest.
+    changed_records = [_record(family, payload={**payload, "aliases": [*payload["aliases"], "x" * 513]})]
+    assert _actual(changed_records) == _reference(changed_records) != observed
+
+    def extract(rows):
+        return extract_fhir_catalog_batch(
+            _decode_fhir_catalog_page(rows, DEFAULT_BYTES), profile="published_normalized"
+        )
+
+    assert extract(changed_records) == extract(records)
+
+
+@pytest.mark.parametrize("family", ["Organization", "InsurancePlan"])
+def test_ignored_alias_bytes_still_bound_native_observation_without_advancing_hashes(native, family):
+    records = [_record(family, payload={"aliases": ["x" * 2048]})]
+    assert _native(native, records, 1024) is None
+    digests = observation.FHIRCatalogObservationDigests()
+    before = digests.document()
+    with pytest.raises(ValueError, match="page_bounds"):
+        digests.add_page(records, _validate, page_bytes=1024)
+    assert digests.document() == before
 
 
 @pytest.mark.parametrize(
@@ -242,3 +289,78 @@ def test_unavailable_native_uses_reference_and_runtime_errors_propagate(monkeypa
     monkeypatch.setattr(observation, "_native_page", broken)
     with pytest.raises(RuntimeError, match="native runtime failed"):
         _actual([_record()])
+
+
+@pytest.mark.parametrize("raw", ['{"value":1.25}', '{"value":-0.0}', '{"value":5e-324}', r'{"value":"\u00e9"}'])
+def test_mixed_page_encodes_only_unsupported_rows_in_python(native, monkeypatch, raw):
+    records = [_record(resource_id="a"), _record(resource_id="b", payload_json=raw), _record(resource_id="c")]
+    expected = _reference(records)
+    reference_frame = observation._observation_frame
+    python_rows = []
+
+    def capture(row):
+        python_rows.append(row["resource_id"])
+        return reference_frame(row)
+
+    def unexpected_page_decode(*_args):
+        raise AssertionError("valid mixed page decoded through the complete reference path")
+
+    monkeypatch.setattr(observation, "_observation_frame", capture)
+    monkeypatch.setattr(observation, "_decode_fhir_catalog_page", unexpected_page_decode)
+    assert _actual(records) == expected
+    assert python_rows == ["b"]
+
+
+def test_mixed_page_enforces_combined_canonical_bytes_atomically(native):
+    records = [
+        _record(resource_id="b", payload={"label": "é" * 128}),
+        _record(resource_id="c", payload={"value": 1.25}),
+    ]
+    decoded = _decode_fhir_catalog_page(records, DEFAULT_BYTES)
+    boundary = len(observation.fhir_catalog_json_bytes(decoded))
+    assert _actual(records, boundary) == _reference(records, boundary)
+    digests = observation.FHIRCatalogObservationDigests()
+    digests.add_page([_record(resource_id="a")], _validate)
+    before, previous_key = digests.document(), digests._last_key
+    with pytest.raises(ValueError, match="page_bounds"):
+        digests.add_page(records, _validate, page_bytes=boundary - 1)
+    assert digests.document() == before
+    assert digests._last_key == previous_key
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [_record(resource_id="b", payload={"network_refs": [True]}), _record(resource_id="c", payload_json="invalid")],
+        [
+            _record(resource_id="bad/id", payload={"value": 1.25}),
+            _record(resource_id="c", payload={"network_refs": [True]}),
+        ],
+        [_record(resource_id="c", payload={"value": 1.25}), _record(resource_id="b", payload_json='{"value":NaN}')],
+        [
+            _record("Organization", "b", {"name": "x" * 513}),
+            _record(resource_id="c", payload_json='{"value":"\\ud800"}'),
+        ],
+        [_record("Organization", "b", {"name": "x" * 513}), _record(resource_id="c", payload={"value": 1.25})],
+        [_record(resource_id="b", payload={"value": 1.25}), _record(resource_id="c", payload_json='{"value":1e309}')],
+    ],
+)
+def test_mixed_page_preserves_complete_reference_error_order_and_state(native, records):
+    with pytest.raises(Exception) as expected:
+        _reference(records)
+    digests = observation.FHIRCatalogObservationDigests()
+    digests.add_page([_record("InsurancePlan", "a", {})], _validate)
+    before, previous_key = digests.document(), digests._last_key
+    with pytest.raises(type(expected.value)) as actual:
+        digests.add_page(records, _validate)
+    assert str(actual.value) == str(expected.value)
+    assert digests.document() == before
+    assert digests._last_key == previous_key
+
+
+def test_mixed_page_preserves_observation_reference_bounds_before_rollup(native):
+    records = [
+        _record(resource_id="a", payload={"network_refs": [None] * (MAX_PAGE_REFERENCES // 2 + 1)}),
+        _record(resource_id="b", payload={"network_refs": [None] * (MAX_PAGE_REFERENCES // 2 + 1), "value": 1.25}),
+    ]
+    assert _actual(records) == _reference(records)

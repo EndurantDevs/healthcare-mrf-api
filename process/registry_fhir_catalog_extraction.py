@@ -127,9 +127,18 @@ def _documents(value):
 
 
 def _aliases(value):
-    aliases = tuple(_text(alias, 512) for alias in _items(value))
-    if len(aliases) > 100 or any(alias is None for alias in aliases):
+    values = _items(value)
+    if len(values) > 100:
         _fail()
+    aliases = []
+    for value in values:
+        try:
+            alias = _text(value, 512)
+        except FHIRCatalogExtractionError:
+            # Optional display text must not invalidate the source observation.
+            continue
+        if alias is not None:
+            aliases.append(alias)
     return tuple(dict.fromkeys(aliases))
 
 

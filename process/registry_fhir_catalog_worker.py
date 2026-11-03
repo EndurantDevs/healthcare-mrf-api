@@ -37,7 +37,7 @@ class RegistryFHIRCatalogSyncConfig:
     grant: object
     loader_role: str
     reader_roles: tuple[str, ...]
-    operation_seconds: int = 4200
+    operation_seconds: int | None = None
     source_endpoint_ids: tuple[str, ...] | None = None
 
 
@@ -99,7 +99,7 @@ def _validated_fhir_catalog_sync_config(encoded):
         ):
             _invalid()
         seconds = document["operation_seconds"]
-        if type(seconds) is not int or not 60 <= seconds <= 86400:
+        if seconds is not None and (type(seconds) is not int or not 60 <= seconds <= 86400):
             _invalid()
         endpoints = document.get("source_endpoint_ids")
         if endpoints is not None and (

@@ -159,7 +159,11 @@ def _create_single_job_worker(settings):
     scan_limit = _worker_once_scan_limit(settings)
     if target_job_id:
         scan_limit = max(scan_limit, _worker_once_target_scan_limit())
-    worker = create_worker(
+    from process import RegistryFHIRCatalogSync
+    from process.registry_fhir_catalog_queue import create_fhir_catalog_worker
+
+    factory = create_fhir_catalog_worker if settings is RegistryFHIRCatalogSync else create_worker
+    worker = factory(
         settings,
         burst=True,
         max_jobs=1,
@@ -440,8 +444,51 @@ def stop_pharmacy_license(burst: bool, import_id: str | None):
 
 
 cli.add_command(stop, name="stop")
+
+
+def _worker_cli(**options):
+    if options["worker_settings"] != "process.RegistryFHIRCatalogSync" or options["check"]:
+        return arq.cli.cli.callback(**options)
+    from process.registry_fhir_catalog_queue import create_fhir_catalog_worker
+
+    sys.path.append(os.getcwd())
+    settings = import_string(options["worker_settings"])
+    log_config = (
+        import_string(options["custom_log_dict"])
+        if options["custom_log_dict"]
+        else default_log_config(options["verbose"])
+    )
+    logging.config.dictConfig(log_config)
+    if options["watch"]:
+        return asyncio.run(_watch_catalog_worker(options["watch"], settings))
+    kwargs = {} if options["burst"] is None else {"burst": options["burst"]}
+    create_fhir_catalog_worker(settings, **kwargs).run()
+
+
+async def _watch_catalog_worker(path, settings):
+    from signal import SIGUSR1
+
+    from process.registry_fhir_catalog_queue import create_fhir_catalog_worker
+
+    try:
+        from watchfiles import awatch
+    except ImportError as error:
+        raise ImportError("watchfiles not installed, use `pip install watchfiles`") from error
+    loop, stopped = asyncio.get_running_loop(), asyncio.Event()
+    worker = create_fhir_catalog_worker(settings)
+    worker.on_stop = lambda signal: stopped.set() if signal != SIGUSR1 else None
+    try:
+        loop.create_task(worker.async_run())
+        async for _ in awatch(path, stop_event=stopped):
+            worker.handle_sig(SIGUSR1)
+            await worker.close()
+            loop.create_task(worker.async_run())
+    finally:
+        await worker.close()
+
+
 cli.add_command(worker_once, name="worker-once")
-cli.add_command(arq.cli.cli, name="worker")
+cli.add_command(click.Command("worker", callback=_worker_cli, params=arq.cli.cli.params, help=arq.cli.cli.help))
 cli.add_command(manage, name="manage")
 
 

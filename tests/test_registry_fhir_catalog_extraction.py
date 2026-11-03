@@ -2,6 +2,7 @@
 """Catalog extraction retains source scope without allocating registry identities."""
 
 import json
+from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -142,6 +143,76 @@ def test_published_normalized_payloads_keep_normalized_scope_without_claiming_ra
     assert all(edge.owner_ref == "Organization/insurer" for edge in batch.edges)
     with pytest.raises(FHIRCatalogExtractionError):
         extract_fhir_catalog_batch(rows, profile="raw_fhir")
+
+
+def alias_row(resource_type, profile, aliases, *, name="Example"):
+    is_raw = profile == "raw_fhir"
+    payload = {"name": name, "alias" if is_raw else "aliases": aliases}
+    if resource_type == "InsurancePlan":
+        payload.update(
+            {"network": [{"reference": "Organization/network"}]}
+            if is_raw
+            else {"network_refs": ["Organization/network"]}
+        )
+    return row(resource_type, "example", payload, raw=is_raw)
+
+
+@pytest.mark.parametrize("profile", ["raw_fhir", "published_normalized", "retained_normalized"])
+@pytest.mark.parametrize("resource_type", ["Organization", "InsurancePlan"])
+def test_optional_aliases_keep_valid_text_without_changing_source_facts(resource_type, profile):
+    aliases = [
+        " Good ",
+        "é" * 256,
+        "é" * 257,
+        "x" * 513,
+        "bad\nalias",
+        "bad\x7falias",
+        "",
+        "  ",
+        None,
+        7,
+        "Good",
+        "Second",
+    ]
+    source_row = alias_row(resource_type, profile, aliases)
+    original = deepcopy(source_row)
+    batch = extract_fhir_catalog_batch([source_row], profile=profile)
+    valid_aliases = ["Good", "é" * 256, "Second"]
+    assert batch == extract_fhir_catalog_batch([alias_row(resource_type, profile, valid_aliases)], profile=profile)
+    assert source_row == original
+    if resource_type == "Organization":
+        fact = batch.organizations[0]
+        assert (fact.resource_id, fact.name, fact.aliases) == ("example", "Example", tuple(valid_aliases))
+        assert not fact.declared_network
+    else:
+        fact = batch.edges[0]
+        assert (fact.plan_resource_id, fact.plan_name, fact.plan_aliases) == (
+            "example",
+            "Example",
+            tuple(valid_aliases),
+        )
+        assert fact.network_resource_id == "network"
+    assert fact.source_hash == source_row["payload_hash"]
+
+
+@pytest.mark.parametrize("profile", ["raw_fhir", "published_normalized", "retained_normalized"])
+@pytest.mark.parametrize("resource_type", ["Organization", "InsurancePlan"])
+def test_optional_alias_filter_retains_collection_input_and_primary_name_guards(resource_type, profile):
+    def extract(aliases, **options):
+        name = options.pop("name", "Example")
+        return extract_fhir_catalog_batch(
+            [alias_row(resource_type, profile, aliases, name=name)], profile=profile, **options
+        )
+
+    assert extract(["x" * 513] * 100) == extract([])
+    for aliases in (["Good"] * 101, ["x" * 513] * 101, "Good", {"alias": "Good"}):
+        with pytest.raises(FHIRCatalogExtractionError):
+            extract(aliases)
+    for name in ("é" * 257, "bad\nname", "bad\x7fname"):
+        with pytest.raises(FHIRCatalogExtractionError):
+            extract(["Good"], name=name)
+    with pytest.raises(FHIRCatalogExtractionError, match="input_bounds"):
+        extract(["x" * 2048], max_input_bytes=1024)
 
 
 def test_foreign_missing_and_malformed_references_remain_unresolved():
@@ -457,7 +528,7 @@ async def test_retained_source_pages_preserve_heap_and_native_verification(monke
     "payload",
     [
         {"name": "\ud800"},
-        {"aliases": [""]},
+        {"aliases": ["\ud800"]},
         {"aliases": ["alias"] * 101},
         {"aliases": "alias"},
         {"identifiers": ["not-an-object"]},

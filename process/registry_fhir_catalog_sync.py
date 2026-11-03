@@ -247,9 +247,7 @@ async def _catalog_source_reads(source_pool, sealer_pool, grant, source_export):
         yield source_connection, workspace, exports_by_profile
 
 
-async def _prepare_fhir_catalog_snapshot(
-    config, loader, source_pool, sealer_pool, staged_by_kind, *, source_export=None
-):
+async def _prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool, staged, *, source_export=None):
     """Pin source and registry reads, prepare privately, then seal the candidate."""
     started = perf_counter()
     producer_options = {"source_export": source_export} if source_export is not None else {}
@@ -294,13 +292,15 @@ async def _prepare_fhir_catalog_snapshot(
             copy_target = FHIRCatalogTarget(
                 str(uuid4()), str(uuid4()), str(uuid4()), str(candidate), "fhir_catalog_" + candidate.hex
             )
-            staged_by_kind["target"] = copy_target
+            staged["target"] = copy_target
             snapshot["schema_name"] = copy_target.schema_name
             accounting_by_phase.update(
                 await _build_source_catalog_candidate(
                     config, loader, source_reads, copy_target, snapshot, previous, current_by_generation
                 )
             )
+    if report := current_fhir_catalog_report():
+        report.progress("sealing")
     await _seal_catalog_snapshot(
         config, copy_target, snapshot, sealer_pool, source_pool=source_pool, **producer_options
     )
