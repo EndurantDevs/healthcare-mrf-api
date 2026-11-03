@@ -2315,7 +2315,7 @@ class RegistryFHIRCatalogSync:
     max_jobs = 1
     queue_read_limit = 1
     queue_name = "arq:RegistryFHIRCatalogSync"
-    job_timeout = 4200
+    job_timeout = None
     max_tries = 1
     burst = True
     redis_settings = build_redis_settings()
