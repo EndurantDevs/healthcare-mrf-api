@@ -14,7 +14,7 @@ import pytest
 
 from process import registry_fhir_catalog_source_fence as fence
 from process import registry_fhir_catalog_sources as sources
-from tests.test_registry_fhir_catalog_sources import descriptor, published_row
+from tests.test_registry_fhir_catalog_sources import descriptor, published_row, uhc_published_row
 
 
 @pytest.fixture
@@ -201,11 +201,15 @@ async def test_unscoped_access_preserves_registration_identity_after_catalog_ren
 
 
 @pytest.mark.asyncio
-async def test_native_inventory_groups_aliases_and_reports_legacy_and_missing_heads(source_database, monkeypatch):
+@pytest.mark.parametrize("row_factory", [published_row, uhc_published_row], ids=["generic", "uhc_canonical"])
+async def test_native_inventory_groups_aliases_and_reports_legacy_and_missing_heads(
+    source_database, monkeypatch, row_factory
+):
     fixture = source_database
+    published_header = row_factory()
     await _inventory_tables(fixture)
     for endpoint, aliases in (
-        ("endpoint-one", ("alias-a", "alias-b")),
+        ("endpoint-one", published_header["source_aliases"]),
         ("endpoint-two", ("legacy-alias",)),
         ("endpoint-three", ("unavailable-alias",)),
     ):
@@ -218,7 +222,7 @@ async def test_native_inventory_groups_aliases_and_reports_legacy_and_missing_he
             f'INSERT INTO "{fixture.catalog}".provider_directory_source VALUES($1,$2)',
             [(alias, endpoint) for alias in aliases],
         )
-    await _insert_header(fixture, fixture.payload, published_row())
+    await _insert_header(fixture, fixture.payload, published_header)
     await _insert_header(
         fixture,
         fixture.catalog,
@@ -232,7 +236,7 @@ async def test_native_inventory_groups_aliases_and_reports_legacy_and_missing_he
         ]
     dispositions_by_endpoint = {page[0].endpoint_id: page[0] for page in pages}
     assert len(pages) == 3 and dispositions_by_endpoint["endpoint-one"].status == "accepted"
-    assert dispositions_by_endpoint["endpoint-one"].descriptor["source_aliases"] == ["alias-a", "alias-b"]
+    assert dispositions_by_endpoint["endpoint-one"].descriptor["source_aliases"] == published_header["source_aliases"]
     assert dispositions_by_endpoint["endpoint-two"].reason == "legacy_source_not_enrolled"
     assert dispositions_by_endpoint["endpoint-three"].reason == "current_dataset_missing"
 

@@ -462,13 +462,19 @@ async def test_retirement_does_not_hold_registry_write_lock_during_reference_pro
             assert await session.get(CustomImportSnapshotFamily, created_families[0]) is not None
 
 
-async def test_retirement_total_deadline_rolls_back_its_caller_transaction(monkeypatch):
+@pytest.mark.parametrize("budget", ["MAX_RETIREMENT_SECONDS", "MAX_REFERENCE_CLOSURE_SECONDS"])
+async def test_retirement_total_deadline_rolls_back_its_caller_transaction(monkeypatch, budget):
+    assert retirement.MAX_REFERENCE_CLOSURE_SECONDS == 1
     async with isolated_publication_case() as case:
         _, family_id = await _replaced_fence(case)
-        monkeypatch.setattr(retirement, "MAX_RETIREMENT_SECONDS", 0)
+        caller_write = Table("caller_write", MetaData(), Column("value", BigInteger), schema=case.schema_name)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(caller_write.create)
+        monkeypatch.setattr(retirement, budget, 0)
         with pytest.raises(TimeoutError):
             async with case.sessions() as session, session.begin():
                 await _bounded(session)
+                await session.execute(caller_write.insert().values(value=1))
                 await retirement.retire_snapshot_family(
                     session,
                     family_id,
@@ -476,6 +482,7 @@ async def test_retirement_total_deadline_rolls_back_its_caller_transaction(monke
                     assert_external_unreferenced=_external_fixture_check,
                 )
         async with case.sessions() as session, session.begin():
+            assert await session.scalar(select(caller_write.c.value)) is None
             assert await session.get(CustomImportSnapshotFamily, family_id) is not None
             assert await session.get(CustomImportSnapshotRetirement, family_id) is None
 
@@ -642,6 +649,7 @@ async def test_retirement_preserves_closed_continuation_history_but_refuses_acti
     from tests.test_custom_import_build_source_postgres import _source_case
     from tests.test_custom_import_staged_verification_postgres import _frozen
 
+    assert retirement.MAX_REFERENCE_CLOSURE_SECONDS == 1
     async with _source_case() as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(install_current_verification, case.schema_name)
@@ -661,11 +669,14 @@ async def test_retirement_preserves_closed_continuation_history_but_refuses_acti
         from tests.test_custom_import_build_output_postgres import _records
 
         await _supersede_build(case, request, family.generation_id, _records(2, 3))
-        async with case.sessions() as session, session.begin():
-            await _bounded(session)
-            await retirement.retire_snapshot_family(
-                session, family_id, engine_id="synthetic", assert_external_unreferenced=_published_fixture_check
-            )
+        # Keep bounded DDL headroom while the separate deadline proof checks refusal.
+        with monkeypatch.context() as patch:
+            patch.setattr(retirement, "MAX_REFERENCE_CLOSURE_SECONDS", 3)
+            async with case.sessions() as session, session.begin():
+                await _bounded(session)
+                await retirement.retire_snapshot_family(
+                    session, family_id, engine_id="synthetic", assert_external_unreferenced=_published_fixture_check
+                )
         async with case.sessions() as session, session.begin():
             history = await session.scalar(select(CustomImportBuildContinuation))
             assert tuple(getattr(history, column.name) for column in history.__table__.columns) == original_values

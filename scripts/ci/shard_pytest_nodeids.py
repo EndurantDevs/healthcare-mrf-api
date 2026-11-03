@@ -11,6 +11,9 @@ from typing import Sequence
 
 TEST_PROCESS_TIMEOUT_SECONDS = "295s"
 MAIN_TEST_SHARDS = {
+    "tests/test_registry_source_inventory_consumers.py::test_inventory_carries_keep_every_selected_source_and_digest_state[1000-aca]": 1,
+    "tests/test_migration_adoption_offline.py::test_online_candidate_migrations_reject_offline_sql_without_stamping[20260713233000_provider_directory_resource_identifiers:head-rooted_graph_migration_requires_online_connection]": 1,
+    "tests/test_custom_import_snowflake_preflight_cli.py::test_preflight_cli_completes_cleanup_after_sigint_inside_synchronous_work[core]": 1,
     "tests/test_ptg2_v3_capacity_gate_request_boundaries.py::test_resource_measurements_are_bound_to_fresh_observation_windows": 5,
     "tests/test_custom_import_snowflake_operator_cli.py::test_registration_entry_point_redacts_rejected_stdin": 5,
     "tests/test_custom_import_geo_receiver_fixture.py::test_geo_receiver_hydrates_every_npi_in_a_separate_process": 5,

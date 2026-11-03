@@ -3,6 +3,7 @@
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from process.network_fhir_membership_source import (
     read_fhir_membership_fact_batch,
     with_fhir_successor,
 )
+from process.registry_imported_selection_preview import _recipe_impact
 from process.registry_membership_refresh_enrollment import require_complete_capture_enrollment
 from process.registry_membership_refresh_generic import (
     observe_accepted_generic_recipes,
@@ -138,6 +140,14 @@ async def test_native_two_captures_preserve_original_scope_and_physical_evidence
         )
         assert batch.membership_rows > 0 and batch.unresolved_rows == 0
         assert original.capture_sha256 != physical.capture_sha256
+        counts = await _recipe_impact(
+            reader,
+            wrapped,
+            SimpleNamespace(expected_approved_revision=approved.approved_revision),
+            "(SELECT NULL::text AS record_kind,NULL::text AS record_key,NULL::bigint AS revision WHERE false)",
+            schema,
+        )
+        assert counts["mapped_rows"] > 0 and counts["omitted_rows"] == counts["unresolved_rows"] == 0
         for fact in json.loads(batch.source_fact_bytes):
             if fact["omission_reason"] is None:
                 assert fact["source_scope_json"]["capture_sha256"] == original.capture_sha256
