@@ -164,6 +164,13 @@ def test_native_extension_supports_python_314_and_newer():
     assert 'features = ["abi3-py314"]' in (ROOT / "support/ptg2_scanner/Cargo.toml").read_text()
 
 
+def test_native_builder_copies_network_census_before_compilation():
+    builder = (ROOT / "Dockerfile").read_text().split("\nFROM ")[1]
+    copy = "COPY specs/uhc_provider_file_census_v1.json /build/specs/uhc_provider_file_census_v1.json"
+    assert builder.index(copy) < builder.index("cargo build")
+    assert builder.index(copy) < builder.index("maturin build")
+
+
 def test_local_example_has_neutral_database_and_no_shared_operator_token():
     value_by_name = dict(
         line.split("=", 1)

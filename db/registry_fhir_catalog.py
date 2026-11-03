@@ -2,7 +2,7 @@
 """Native immutable metadata storage, independent of provider membership heaps."""
 
 VIEW = "fhir-plans-v1"
-PROJECTOR_VERSION = "fhir-catalog/v1"
+PROJECTOR_VERSION = "fhir-catalog/plan-tier-v2"
 MAX_CORE_BYTES = 786432
 NESTED_LIMIT = 5
 TABLES = (

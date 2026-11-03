@@ -205,7 +205,17 @@ async def _one_batch_history(connection, namespace, document, actor, reference, 
                 for key, coordinate_value in document["source_coordinates"].items()
             )
         )
-        _require(binding_document["source_scope_json"].get("organization_id") == binding_document["source_key"])
+        scope = binding_document["source_scope_json"]
+        if scope.get("kind") == "uhc_plan_tier_v1":
+            from process.registry_fhir_plan_tier import source_key, validate_binding_scope
+            from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
+            _require(binding_document["source_id"] == UHC_PROVIDER_FILE_SOURCE_ID)
+            _require(binding_document["producer_id"] == "registry-source-fhir-witness-v1")
+            tier = validate_binding_scope(scope, binding_document["producer_id"])
+            _require(binding_document["source_key"] == source_key(tier))
+        else:
+            _require(scope.get("organization_id") == binding_document["source_key"])
         documents.append(binding_document)
     return documents
 

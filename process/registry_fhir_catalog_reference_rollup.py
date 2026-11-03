@@ -5,7 +5,7 @@ import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from uuid import uuid4
 
 import asyncpg
@@ -13,6 +13,7 @@ import asyncpg
 from process.registry_fhir_catalog_extraction import (
     DEFAULT_BYTES,
     MAX_BYTES,
+    FHIRCatalogPlanTierEdge,
     FHIRCatalogReferenceEdge,
     fhir_catalog_resource_relation,
     fhir_catalog_text,
@@ -29,7 +30,7 @@ MAX_OUTPUT_ROWS = 1000
 _STAGE_COLUMNS = """resource_type varchar(64) COLLATE "C" NOT NULL,
 reference_key text COLLATE "C" NOT NULL,network_ref text,
 resource_id varchar(64) COLLATE "C" NOT NULL,payload_hash varchar(64) NOT NULL,reference_ordinal integer NOT NULL,
-reference_rows bigint NOT NULL,PRIMARY KEY(resource_type,reference_key),
+ reference_rows bigint NOT NULL,PRIMARY KEY(resource_type,reference_key),
 UNIQUE(resource_type,resource_id,reference_ordinal)"""
 
 
@@ -113,7 +114,14 @@ _PAGE_SQL = """WITH page AS (
  SELECT *,sum(source_bytes) OVER(ORDER BY resource_type COLLATE "C",resource_id COLLATE "C") AS page_bytes,
  row_number() OVER(ORDER BY resource_type COLLATE "C",resource_id COLLATE "C") AS ordinal FROM page
 ), selected AS MATERIALIZED (
- SELECT resource_type,resource_id,payload_hash,parsed.payload->'network_refs' AS refs,
+ SELECT resource_type,resource_id,payload_hash,parsed.payload->'network_refs' AS raw_refs,
+ CASE WHEN $8::boolean AND (parsed.payload->>'network_key_id' IS NOT NULL OR parsed.payload->>'network_tier' IS NOT NULL)
+ THEN (CASE WHEN jsonb_typeof(parsed.payload->'network_refs')='array' THEN parsed.payload->'network_refs' ELSE '[]'::jsonb END)
+ ||jsonb_build_array(jsonb_build_object(
+   'kind','uhc_plan_tier_v1','plan_scope',parsed.payload->'plan_scope',
+   'network_tier',parsed.payload->'network_tier','network_key_id',parsed.payload->'network_key_id',
+   'insurance_plan_refs',parsed.payload->'insurance_plan_refs'))
+ ELSE parsed.payload->'network_refs' END AS refs,
  jsonb_typeof(parsed.payload) AS payload_kind,source_bytes,page_bytes,ordinal
  FROM sized
  CROSS JOIN LATERAL (SELECT payload_json::jsonb AS payload OFFSET 0) parsed
@@ -125,7 +133,9 @@ _PAGE_SQL = """WITH page AS (
    OR resource_id ~ '[^A-Za-z0-9.-]'
    OR payload_kind IS DISTINCT FROM 'object'
    OR length(payload_hash)<>64 OR payload_hash ~ '[^0-9a-f]' OR payload_hash IS NULL
-   OR (refs IS NOT NULL AND refs<>'null'::jsonb AND jsonb_typeof(refs)<>'array'))::bigint AS invalid_rows,
+   OR (raw_refs IS NOT NULL AND raw_refs<>'null'::jsonb AND jsonb_typeof(raw_refs)<>'array')
+   OR EXISTS(SELECT FROM jsonb_array_elements(CASE WHEN jsonb_typeof(raw_refs)='array' THEN raw_refs ELSE '[]'::jsonb END) item
+     WHERE jsonb_typeof(item) NOT IN ('string','null')))::bigint AS invalid_rows,
  coalesce(sum(CASE WHEN jsonb_typeof(refs)='array' THEN jsonb_array_length(refs) ELSE 0 END),0)::bigint AS reference_rows
  FROM selected
 ), expanded AS MATERIALIZED (
@@ -135,7 +145,8 @@ _PAGE_SQL = """WITH page AS (
    CASE WHEN jsonb_typeof(refs)='array' AND accounting.invalid_rows=0 AND accounting.reference_rows<=$7
      THEN refs ELSE '[]'::jsonb END) WITH ORDINALITY reference(value,ordinality)
 ), invalid_references AS MATERIALIZED (
- SELECT count(*)::bigint AS invalid FROM expanded WHERE jsonb_typeof(reference_json) NOT IN ('string','null')
+ SELECT count(*)::bigint AS invalid FROM expanded WHERE jsonb_typeof(reference_json) NOT IN ('string','null','object')
+ OR (jsonb_typeof(reference_json)='object' AND octet_length(reference_json::text)>2048)
  OR (jsonb_typeof(reference_json)='string' AND
    (octet_length(reference_json#>>'{{}}')>2048 OR (reference_json#>>'{{}}') ~ '[[:cntrl:]]'))
 ), counts AS MATERIALIZED (
@@ -168,7 +179,29 @@ SELECT accounting.*,invalid_references.invalid AS invalid_references,(SELECT cou
 FROM accounting,invalid_references"""
 
 
+def _plan_tier_edge(record, source_uri):
+    from process.registry_fhir_plan_tier import role_plan_tier
+
+    tier = role_plan_tier(json.loads(record["reference_key"]))
+    if tier is None:
+        _fail()
+    base = _edge({**dict(record), "reference_key": "null", "network_ref": None}, source_uri)
+    edge = FHIRCatalogPlanTierEdge(
+        **{
+            **asdict(base.edge),
+            "scope_path": "/plan_tier",
+            "resolution_reason": None,
+            "plan_resource_id": tier["plan_resource_id"],
+        },
+        plan_scope=tier["plan_scope"],
+        plan_tier=tier,
+    )
+    return FHIRCatalogReferenceRollup(edge, record["reference_rows"], record["reference_ordinal"])
+
+
 def _edge(record, source_uri):
+    if record.get("reference_key", "").startswith("{"):
+        return _plan_tier_edge(record, source_uri)
     network_ref = fhir_catalog_text(record["network_ref"], 2048, strip=False)
     target, reason = fhir_network_reference_target(network_ref, source_uri)
     ordinal = record["reference_ordinal"]
@@ -232,14 +265,18 @@ class FHIRCatalogReferenceStage:
             yield tuple(_edge(record, self.source_uri) for record in records)
 
 
-async def _fill_stage(connection, resources, table_name, dataset_id, page_rows, page_bytes, source_read=None):
+async def _fill_stage(
+    connection, resources, table_name, dataset_id, page_rows, page_bytes, source_read=None, plan_tiers=False
+):
     query = _PAGE_SQL.format(resources=resources, staging="pg_temp." + _identifier(table_name))
     totals_by_kind = {"source_rows": 0, "reference_rows": 0, "without_refs": 0, "source_bytes": 0}
     counts_by_type, cursor = {kind: 0 for kind in RESOURCE_TYPES}, ("", "")
     while True:
         await verify_fhir_catalog_source_read(connection, source_read, dataset_id=dataset_id)
         report = await drain_operation(
-            connection.fetchrow(query, dataset_id, RESOURCE_TYPES, *cursor, page_rows, page_bytes, MAX_PAGE_REFERENCES),
+            connection.fetchrow(
+                query, dataset_id, RESOURCE_TYPES, *cursor, page_rows, page_bytes, MAX_PAGE_REFERENCES, plan_tiers
+            ),
             preserve_cancellation=True,
         )
         if report["reference_rows"] > MAX_PAGE_REFERENCES and page_rows > 1:
@@ -306,8 +343,7 @@ async def _verify_reference_workspace(connection, workspace):
         await workspace.verify(connection)
 
 
-@asynccontextmanager
-async def staged_fhir_catalog_references(
+def staged_fhir_catalog_references(
     connection,
     *,
     schema_name,
@@ -318,7 +354,34 @@ async def staged_fhir_catalog_references(
     source_read=None,
     workspace=None,
 ):
+    """Stage bounded references using the original Organization policy."""
+    return _staged_references(
+        connection, schema_name, dataset_id, (page_rows, page_bytes), (source_uri, source_read, workspace), False
+    )
+
+
+def staged_plan_tier_references(
+    connection,
+    *,
+    schema_name,
+    dataset_id,
+    page_rows=MAX_SOURCE_ROWS,
+    page_bytes=DEFAULT_BYTES,
+    source_uri=None,
+    source_read=None,
+    workspace=None,
+):
+    """Stage bounded references using the typed published policy."""
+    return _staged_references(
+        connection, schema_name, dataset_id, (page_rows, page_bytes), (source_uri, source_read, workspace), True
+    )
+
+
+@asynccontextmanager
+async def _staged_references(connection, schema_name, dataset_id, bounds, readers, plan_tiers):
     """Roll up admitted normalized rows in the caller's pinned snapshot, without provider payload transfer."""
+    page_rows, page_bytes = bounds
+    source_uri, source_read, workspace = readers
     _validate_reference_page(schema_name, dataset_id, page_rows, page_bytes)
     await _verify_reference_workspace(connection, workspace)
     resources = await fhir_catalog_resource_relation(
@@ -335,7 +398,7 @@ async def staged_fhir_catalog_references(
         )
         await drain_operation(connection.execute(statement), preserve_cancellation=True)
         accounting = await _fill_stage(
-            connection, resources, table_name, dataset_id, page_rows, page_bytes, source_read
+            connection, resources, table_name, dataset_id, page_rows, page_bytes, source_read, plan_tiers
         )
         stage = FHIRCatalogReferenceStage(
             connection,

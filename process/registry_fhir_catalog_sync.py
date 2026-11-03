@@ -30,6 +30,7 @@ from process.registry_fhir_catalog_enrichment import (
 from process.registry_fhir_catalog_extraction import (
     FHIRCatalogOrganization,
     FHIRCatalogReferenceEdge,
+    catalog_reference_edge,
     iter_fhir_catalog_batches,
     iter_fhir_catalog_pages,
 )
@@ -49,6 +50,7 @@ from process.registry_fhir_catalog_published_read import fhir_catalog_published_
 from process.registry_fhir_catalog_reference_rollup import (
     fhir_catalog_reference_workspace,
     staged_fhir_catalog_references,
+    staged_plan_tier_references,
 )
 from process.registry_fhir_catalog_reporting import current_fhir_catalog_report
 from process.registry_fhir_catalog_retained import (
@@ -80,6 +82,7 @@ from process.registry_fhir_catalog_store import (
     write_fhir_catalog_rows,
 )
 from process.registry_fhir_catalog_validation import canonical_json, metadata_generation
+from process.registry_fhir_plan_tier import needs_plan_tier_refresh, supports_plan_tiers
 from process.registry_publication_consumer import consume_registry_publication_once
 
 PAGE_ROWS = 1000
@@ -491,6 +494,8 @@ async def _catalog_snapshot_inputs(loader, grant, head, manifest, previous, acce
             "source_id": disposition.descriptor["coordinates"]["source_id"],
             "status": "last_good" if disposition.descriptor["profile"] == "retained_normalized" else "current",
         }
+        if supports_plan_tiers(disposition.descriptor):
+            vector_by_generation[generation]["extraction_transform"] = PROJECTOR_VERSION
     mapping_revision, mapping = await select_fhir_catalog_mapping(
         loader, head["approved_revision"], manifest, control_schema=grant.control_schema
     )
@@ -647,7 +652,16 @@ async def _project_catalog_sources(
         if report:
             report.source_started(generation)
         extraction_by_kind = {"reused_observations": True}
-        if generation not in cached_generations:
+        needs_refresh = needs_plan_tier_refresh(previous, snapshot, disposition.descriptor)
+        if needs_refresh:
+            namespace = storage_identifier(copy_target.schema_name)
+            await loader.execute(
+                f"DELETE FROM {namespace}.registry_fhir_catalog_observation WHERE source_generation=$1", generation
+            )
+            await loader.execute(
+                f"DELETE FROM {namespace}.registry_fhir_catalog_source WHERE source_generation=$1", generation
+            )
+        if generation not in cached_generations or needs_refresh:
             extraction_by_kind = await stage_fhir_catalog_source(
                 source_connection,
                 loader,
@@ -894,9 +908,7 @@ def _organization(document):
 
 
 def _edge(document):
-    for field in ("plan_aliases", "plan_identifiers", "scope_identifiers", "scope_type_codes", "benefits", "geography"):
-        document[field] = tuple(document[field])
-    return FHIRCatalogReferenceEdge(**document)
+    return catalog_reference_edge(document)
 
 
 async def stage_fhir_catalog_source(
@@ -1023,7 +1035,10 @@ async def _stage_plan_observations(
         source_read=source_read,
     ):
         for batch in iter_fhir_catalog_batches(
-            resource_batch, profile=descriptor["profile"], source_uri=descriptor["source_uri"]
+            resource_batch,
+            profile=descriptor["profile"],
+            source_uri=descriptor["source_uri"],
+            plan_tiers=supports_plan_tiers(descriptor),
         ):
             source_count += batch.source_rows
             observation_rows = [
@@ -1050,7 +1065,10 @@ async def _stage_reference_observations(
     observations,
     generation,
 ):
-    async with staged_fhir_catalog_references(
+    stage_references = (
+        staged_plan_tier_references if supports_plan_tiers(descriptor) else staged_fhir_catalog_references
+    )
+    async with stage_references(
         source_connection,
         schema_name=read_schema,
         dataset_id=dataset_id,
@@ -1101,15 +1119,7 @@ async def project_fhir_catalog_source(
     started = perf_counter()
     counts_by_kind = {"created_networks": 0, "networks": 0, "relationships": 0, "batches": 0}
     published_read = await _published_read(source_connection, descriptor) if source_export is None else None
-    await connection.execute(
-        "CREATE TEMP TABLE fhir_catalog_network_targets(resource_id text PRIMARY KEY) ON COMMIT DROP"
-    )
-    await connection.execute(
-        f"INSERT INTO pg_temp.fhir_catalog_network_targets SELECT DISTINCT document_json->>'network_resource_id' "
-        f"FROM {namespace}.registry_fhir_catalog_observation WHERE source_generation=$1 AND observation_kind='edge' "
-        "AND document_json->>'network_resource_id' IS NOT NULL",
-        generation,
-    )
+    await _create_network_targets(connection, namespace, generation)
     after = ""
     while True:
         organization_records = await _network_organization_page(connection, namespace, generation, after)
@@ -1148,7 +1158,72 @@ async def project_fhir_catalog_source(
         loader_role=loader_role,
         status="last_good" if descriptor["profile"] == "retained_normalized" else "current",
     )
+    if supports_plan_tiers(descriptor):
+        typed_counts = await _project_plan_tier_source(
+            connection, copy_target, disposition, snapshot, grant, loader_role
+        )
+        for kind, count in typed_counts.items():
+            counts_by_kind[kind] += count
     counts_by_kind["seconds"] = perf_counter() - started
+    return counts_by_kind
+
+
+async def _create_network_targets(connection, namespace, generation):
+    """Collect exact observed Organization targets in the existing bounded projection workspace."""
+    await connection.execute(
+        "CREATE TEMP TABLE fhir_catalog_network_targets(resource_id text PRIMARY KEY) ON COMMIT DROP"
+    )
+    await connection.execute(
+        f"INSERT INTO pg_temp.fhir_catalog_network_targets SELECT DISTINCT document_json->>'network_resource_id' "
+        f"FROM {namespace}.registry_fhir_catalog_observation WHERE source_generation=$1 AND observation_kind='edge' "
+        "AND document_json->>'network_resource_id' IS NOT NULL",
+        generation,
+    )
+
+
+async def _project_plan_tier_source(connection, copy_target, disposition, snapshot, grant, loader_role):
+    """Allocate and write only exact typed evidence after ordinary Organization projection."""
+    descriptor = disposition.descriptor
+    generation = fhir_catalog_source_generation(descriptor)
+    namespace = storage_identifier(copy_target.schema_name)
+    counts_by_kind = {"created_networks": 0, "networks": 0, "relationships": 0}
+    from process.registry_fhir_plan_tier_catalog import (
+        plan_tier_pages,
+        plan_tier_projection,
+        replace_plan_tier_bindings,
+    )
+
+    context = _source_projection_context(disposition, snapshot, generation, "current")
+    async for pairs in plan_tier_pages(connection, copy_target.schema_name, generation):
+        projection, created = await plan_tier_projection(
+            connection,
+            descriptor,
+            context,
+            pairs,
+            revision=snapshot["metadata_approved_revision"],
+            control_schema=grant.control_schema,
+            allocate=True,
+            as_of=snapshot["as_of"],
+        )
+        relations_by_kind = {kind: namespace + ".registry_fhir_catalog_" + kind for kind in ("binding", "relationship")}
+        await replace_plan_tier_bindings(
+            connection,
+            relations_by_kind,
+            descriptor,
+            [json.loads(binding_row[4])["source_key"] for binding_row in projection.binding_rows],
+        )
+        await _write_network_projection(connection, copy_target, projection, loader_role, grant.control_schema)
+        await write_fhir_catalog_rows(
+            connection,
+            copy_target,
+            "registry_fhir_catalog_relationship",
+            projection.relationship_rows,
+            loader_role=loader_role,
+            control_schema=grant.control_schema,
+        )
+        counts_by_kind["created_networks"] += created
+        counts_by_kind["networks"] += len(projection.network_rows)
+        counts_by_kind["relationships"] += len(projection.relationship_rows)
     return counts_by_kind
 
 
@@ -1339,6 +1414,46 @@ async def project_fhir_catalog_relationships(
         )
         count += len(projection.relationship_rows)
         cursor_values = tuple(edge_records[-1][key] for key in ("resource_type", "resource_id", "ordinal"))
+    if status == "last_good" and supports_plan_tiers(descriptor):
+        count += await _carried_plan_tier_relationships(
+            connection, copy_target, descriptor, context, snapshot, grant, options_by_name
+        )
+    return count
+
+
+async def _carried_plan_tier_relationships(
+    connection, copy_target, descriptor, context, snapshot, grant, options_by_name
+):
+    """Regenerate surviving typed relationships without restoring bindings or changing names."""
+    generation = context.source_generation
+    namespace = storage_identifier(copy_target.schema_name)
+    count = 0
+    from process.registry_fhir_plan_tier_catalog import plan_tier_pages, plan_tier_projection
+
+    async for pairs in plan_tier_pages(
+        connection,
+        copy_target.schema_name,
+        generation,
+        surviving_bindings=namespace + ".registry_fhir_catalog_binding",
+    ):
+        projection, _ = await plan_tier_projection(
+            connection,
+            descriptor,
+            context,
+            pairs,
+            revision=snapshot["metadata_approved_revision"],
+            control_schema=grant.control_schema,
+            allocate=False,
+            as_of=snapshot["as_of"],
+        )
+        await write_fhir_catalog_rows(
+            connection,
+            copy_target,
+            "registry_fhir_catalog_relationship",
+            projection.relationship_rows,
+            **options_by_name,
+        )
+        count += len(projection.relationship_rows)
     return count
 
 

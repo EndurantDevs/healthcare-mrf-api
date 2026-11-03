@@ -5,7 +5,7 @@ import hashlib
 import json
 
 from process.network_address_projection import PinnedAddressSource
-from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
+from process.network_fhir_membership_source import FHIR_PLAN_TIER_WITNESS_TRANSFORM, FHIR_SOURCE_WITNESS_TRANSFORM_V2
 from process.registry_source_contribution_store import FACT_ANCHOR_FIELDS, _validate_fact_anchor
 from process.registry_source_office_summary_v3 import MAX_V3_RECEIPT_BYTES, _counter, _sha, canonical
 
@@ -105,7 +105,7 @@ def validate_verified_office_derivation_v2(document):
         artifact = document["fact_artifact"]
         _closed(artifact, FACT_ANCHOR_FIELDS | {"capture_sha256", "transform_version", "fact_sha256", "fact_rows"})
         _validate_fact_anchor(artifact)
-        if artifact["transform_version"] != FHIR_SOURCE_WITNESS_TRANSFORM_V2:
+        if artifact["transform_version"] not in (FHIR_SOURCE_WITNESS_TRANSFORM_V2, FHIR_PLAN_TIER_WITNESS_TRANSFORM):
             raise ValueError
         for name in ("capture_sha256", "fact_sha256"):
             _sha(artifact[name])

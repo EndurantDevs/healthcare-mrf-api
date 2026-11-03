@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import json
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -347,8 +348,9 @@ def _require_plan_summary(metadata, origin):
     )
 
 
-async def _validate_admitted_proof(reader, origin):
-    """Run the existing complete raw-COPY validator; never backfill or rewrite Source seals."""
+@asynccontextmanager
+async def _publication_metadata_copy(reader, origin):
+    """Yield the bounded original metadata only after its exact COPY bytes authenticate."""
     with TemporaryDirectory(prefix="retained-fhir-metadata-") as directory:
         path = Path(directory) / "metadata.copy"
         with path.open("wb") as output:
@@ -376,6 +378,12 @@ async def _validate_admitted_proof(reader, origin):
                 metadata_digest.update(block)
                 remaining -= len(block)
         require(metadata_digest.hexdigest() == origin.metadata_text_sha256)
+        yield path
+
+
+async def _validate_admitted_proof(reader, origin):
+    """Run the existing complete raw-COPY validator; never backfill or rewrite Source seals."""
+    async with _publication_metadata_copy(reader, origin) as path:
         try:
             seal = validate_generic_admission_copy(
                 path,
@@ -835,11 +843,11 @@ async def _derived(writer, schema, origin, release_id, resource_rows, observed_a
 
 def _resource_hash_contract(origin):
     """Choose only declared supported profiles; unknown profiles cannot fall back to legacy hashing."""
-    from process.network_fhir_source_witness_contract import OBSERVED_LEGACY_PROFILE
+    from process.network_fhir_source_witness_contract import HASH_CONTRACTS
 
-    if origin.admission_profile == SEMANTIC_PROFILE:
-        return SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-    require(origin.admission_profile in {LEGACY_PROFILE, OBSERVED_LEGACY_PROFILE})
+    if origin.admission_profile in HASH_CONTRACTS:
+        return HASH_CONTRACTS[origin.admission_profile]
+    require(origin.admission_profile == LEGACY_PROFILE)
     return LEGACY_RESOURCE_HASH_CONTRACT
 
 

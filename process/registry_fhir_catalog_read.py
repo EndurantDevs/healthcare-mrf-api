@@ -238,7 +238,10 @@ def fhir_catalog_binding_document(binding, *, network_id=None):
         and type(scope) is dict
         and set(scope) == {"organization_id", "capture_sha256"}
     ):
-        if legacy_by_field.get("producer_id") != "registry-retained-normalized-fhir-v1":
+        if legacy_by_field.get("producer_id") not in {
+            "registry-retained-normalized-fhir-v1",
+            "registry-source-fhir-witness-v1",
+        }:
             _invalid()
         if type(scope["organization_id"]) is not str or _FHIR_ID.fullmatch(scope["organization_id"]) is None:
             _invalid()
@@ -258,6 +261,17 @@ def _catalog_binding_document(binding):
     if binding["source_system"] != "fhir" or binding["producer_id"] != "registry-fhir-catalog-v1":
         _invalid()
     scope = binding["source_scope"]
+    if type(scope) is dict and scope.get("kind") == "uhc_plan_tier_v1":
+        from process.registry_fhir_plan_tier import UHC_PROVIDER_FILE_SOURCE_ID, source_key, validate_binding_scope
+
+        tier = validate_binding_scope(scope, binding["producer_id"])
+        if (
+            binding["source_id"] != UHC_PROVIDER_FILE_SOURCE_ID
+            or binding["source_key"] != source_key(tier)
+            or binding["evidence_id"] != scope["source_generation"] + ":" + source_key(tier)
+        ):
+            _invalid()
+        return
     _object(scope, {"organization_id", "source_generation"})
     organization_id = scope["organization_id"]
     if type(organization_id) is not str or _FHIR_ID.fullmatch(organization_id) is None:
@@ -428,14 +442,16 @@ def _continuation_scope(query, manifest, snapshot, exclusions, policy, access_sc
     return actual
 
 
-_DIRECTORY_AVAILABLE_SQL = """EXISTS(SELECT 1 FROM {candidate}.network_membership membership
-     JOIN {candidate}.provider_location_binding location
-       ON (location.provider_system,location.provider_id,location.location_id)=
-          (membership.provider_system,membership.provider_id,membership.location_id)
-     JOIN {addresses} address
-       ON (address.location_key,address.entity_type,address.entity_id)=
-          (location.location_key,location.entity_type,location.entity_id)
-     WHERE membership.network_id=page.network_id)"""
+_DIRECTORY_AVAILABLE_SQL = """EXISTS(SELECT 1 FROM (
+     SELECT provider_system,provider_id,location_id FROM {candidate}.network_membership
+     WHERE network_id=page.network_id OFFSET 0) membership
+     JOIN LATERAL (SELECT 1 FROM {candidate}.provider_location_binding location
+       JOIN {addresses} address
+         ON (address.location_key,address.entity_type,address.entity_id)=
+            (location.location_key,location.entity_type,location.entity_id)
+       WHERE (location.provider_system,location.provider_id,location.location_id)=
+             (membership.provider_system,membership.provider_id,membership.location_id)
+       LIMIT 1) available ON true)"""
 
 
 _PAGE_SQL = r"""

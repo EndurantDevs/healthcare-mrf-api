@@ -28,6 +28,16 @@ from process.network_membership_serving_indexes import _index_digest, _serving_p
 from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
+from process.registry_fhir_plan_tier import (
+    KIND as PLAN_TIER_KIND,
+)
+from process.registry_fhir_plan_tier import (
+    source_key as plan_tier_source_key,
+)
+from process.registry_fhir_plan_tier import (
+    validate_binding_scope,
+)
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 MAX_PAGE = 100
 MAX_OFFSET = 1_000_000
@@ -88,7 +98,7 @@ _uuid = catalog_uuid
 def _retained_fhir_scope(scope, producer_id):
     """Admit only registry-owned captures, without synthesizing legacy aliases."""
     if (
-        producer_id != RETAINED_FHIR_PRODUCER
+        producer_id not in {RETAINED_FHIR_PRODUCER, "registry-source-fhir-witness-v1"}
         or type(scope["organization_id"]) is not str
         or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", scope["organization_id"]) is None
         or not is_sha256(scope["capture_sha256"])
@@ -108,9 +118,20 @@ def _retained_product_scope(scope, producer_id):
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
 
 
+def _typed_plan_tier_scope(scope, producer_id):
+    try:
+        validate_binding_scope(scope, producer_id)
+    except ValueError:
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid") from None
+    return scope
+
+
 def _source_scope(system, scope, *, producer_id=None):
+    """Validate the closed scope for its exact source system and producer."""
     if type(scope) is not dict:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    if system == "fhir" and scope.get("kind") == PLAN_TIER_KIND:
+        return _typed_plan_tier_scope(scope, producer_id)
     if system == "fhir" and set(scope) == {"organization_id", "capture_sha256"}:
         _retained_fhir_scope(scope, producer_id)
         return scope
@@ -579,6 +600,11 @@ def catalog_binding_document(binding, *, network_id=None):
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     _source_scope(binding["source_system"], binding["source_scope"], producer_id=binding["producer_id"])
     scope = binding["source_scope"]
+    if scope.get("kind") == PLAN_TIER_KIND and (
+        binding["source_id"] != UHC_PROVIDER_FILE_SOURCE_ID
+        or binding["source_key"] != plan_tier_source_key(validate_binding_scope(scope, binding["producer_id"]))
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     if "insurance_plan_id" in scope and (
         binding["source_id"] == "cms-npd"
         or binding["source_key"] != "InsurancePlan/" + scope["insurance_plan_id"]

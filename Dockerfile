@@ -12,6 +12,7 @@ COPY requirements.txt requirements-runtime.in requirements-runtime.lock requirem
 COPY scripts/python_locks.py /build/scripts/python_locks.py
 COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
 COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
+COPY specs/uhc_provider_file_census_v1.json /build/specs/uhc_provider_file_census_v1.json
 RUN uv venv --python 3.14.7 /build/venv \
     && /build/venv/bin/python /build/scripts/python_locks.py check --root /build \
     && uv pip install \

@@ -153,6 +153,38 @@ struct RetainedFhirProductScope {
     product_network_id: i32,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PlanTierPlanScope {
+    logical_scope_id: String,
+    family: String,
+    market: String,
+    product: String,
+    #[serde(deserialize_with = "required_jurisdiction")]
+    jurisdiction: Option<String>,
+    plan_id_type: String,
+    plan_id: String,
+    plan_year: i32,
+    plan_key_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PlanTierScope {
+    kind: String,
+    plan_scope: PlanTierPlanScope,
+    network_tier: String,
+    network_key_id: String,
+    plan_resource_id: String,
+    capture_sha256: String,
+}
+
+fn required_jurisdiction<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(decoder)
+}
+
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub struct ValidatedSourceBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -282,6 +314,19 @@ fn published_plan_scope(scope: PublishedPlanScope) -> Option<serde_json::Value> 
 }
 
 fn fhir_scope(raw: &str, input: &BindingInput) -> Option<serde_json::Value> {
+    if input.producer_id == "registry-source-fhir-witness-v1"
+        && input.source_id == "pdfhir_2754e999dd691175821ec26e"
+        && let Ok(scope) = serde_json::from_str::<PlanTierScope>(raw)
+    {
+        if !valid_plan_tier(&scope)
+            || !canonical_uuid(&input.edition_id)
+            || input.source_key != format!("UHCPlanTier/{}", scope.network_key_id)
+            || input.operation == "rebind" && input.expected_network_id != Some(input.network_id)
+        {
+            return None;
+        }
+        return serde_json::to_value(scope).ok();
+    }
     if input.producer_id == "registry-retained-normalized-fhir-v1"
         && input.source_id != "cms-npd"
         && let Ok(scope) = serde_json::from_str::<RetainedFhirProductScope>(raw)
@@ -329,6 +374,107 @@ fn fhir_scope(raw: &str, input: &BindingInput) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::to_value(scope).ok()
+}
+
+fn json_digest(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).expect("validated identity serializes");
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn valid_plan_tier(scope: &PlanTierScope) -> bool {
+    use serde_json::json;
+    static CENSUS: std::sync::OnceLock<Option<serde_json::Value>> = std::sync::OnceLock::new();
+    let Some(census) = CENSUS.get_or_init(|| {
+        let value = serde_json::from_str(include_str!(
+            "../../../specs/uhc_provider_file_census_v1.json"
+        ))
+        .ok()?;
+        (json_digest(&value) == "b19c778496debc8453bffde8672d2df34f4c52f26376ae6bfd5b7fb41e5c14a1")
+            .then_some(value)
+    }) else {
+        return false;
+    };
+    let plan = &scope.plan_scope;
+    let jurisdiction = json!(plan.jurisdiction);
+    let known = match (plan.family.as_str(), plan.market.as_str()) {
+        ("cs", "community-and-state") => {
+            census["cs_provider_products"].get(&plan.product) == Some(&jurisdiction)
+        }
+        ("ifp", "individual-exchange") => {
+            (plan.product == "IEX"
+                && census["ifp_paired_states"]
+                    .as_array()
+                    .is_some_and(|states| states.contains(&jurisdiction)))
+                || census["ifp_unpaired_provider_products"]
+                    .as_array()
+                    .is_some_and(|products| {
+                        products.iter().any(|item| {
+                            item["product"] == plan.product && item["jurisdiction"] == jurisdiction
+                        })
+                    })
+        }
+        _ => false,
+    };
+    if !known
+        || scope.kind != "uhc_plan_tier_v1"
+        || !(2000..=9999).contains(&plan.plan_year)
+        || !valid_digest(&scope.capture_sha256)
+        || !valid_digest(&plan.plan_key_id)
+        || !valid_digest(&plan.logical_scope_id)
+        || !valid_digest(&scope.network_key_id)
+        || !valid_text(&plan.plan_id, usize::MAX)
+        || plan.plan_id.chars().count() > 256
+        || !valid_text(&scope.network_tier, usize::MAX)
+        || scope.network_tier.chars().count() > 256
+        || plan.plan_id_type.is_empty()
+        || plan.plan_id_type.len() > 64
+        || !plan.plan_id_type.as_bytes()[0].is_ascii_alphanumeric()
+        || !plan
+            .plan_id_type
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        || scope.plan_resource_id != format!("uhcplan-{}", &plan.plan_key_id[..48])
+    {
+        return false;
+    }
+    let logical = json!({"contract":"healthporta-uhc-logical-scope-v1","entry_id":"uhc-provider-files",
+        "family":plan.family,"market":plan.market,"product":plan.product,"jurisdiction":plan.jurisdiction});
+    let key = json!({"contract":"healthporta-uhc-plan-key-v1","logical_scope_id":plan.logical_scope_id,
+        "family":plan.family,"market":plan.market,"plan_id_type":plan.plan_id_type,
+        "plan_id":plan.plan_id,"plan_year":plan.plan_year});
+    let network = json!({"contract":"healthporta-uhc-network-key-v1","logical_scope_id":plan.logical_scope_id,
+        "family":plan.family,"market":plan.market,"plan_id_type":plan.plan_id_type,
+        "plan_id":plan.plan_id,"plan_year":plan.plan_year,"network_tier":scope.network_tier});
+    json_digest(&logical) == plan.logical_scope_id
+        && json_digest(&key) == plan.plan_key_id
+        && json_digest(&network) == scope.network_key_id
+}
+
+/// The Python boundary applies its exact Unicode printable contract to these typed fields.
+#[cfg(feature = "python")]
+pub(crate) fn plan_tier_text(rows: &[ValidatedSourceBinding]) -> String {
+    rows.iter()
+        .filter(|row| row.source_scope_json["kind"] == "uhc_plan_tier_v1")
+        .flat_map(|row| {
+            [
+                row.source_scope_json["plan_scope"]["plan_id"]
+                    .as_str()
+                    .unwrap(),
+                row.source_scope_json["network_tier"].as_str().unwrap(),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn valid_fhir_id(value: &str) -> bool {
@@ -523,7 +669,9 @@ fn validate_product_targets(rows: &[ValidatedSourceBinding]) -> Result<(), Sourc
             &row.edition_id,
             row.network_id,
         );
-        let conflict = if row.source_scope_json.get("insurance_plan_id").is_some() {
+        let conflict = if row.source_scope_json.get("insurance_plan_id").is_some()
+            || row.source_scope_json["kind"] == "uhc_plan_tier_v1"
+        {
             !products.insert(key) || organizations.contains(&key)
         } else {
             organizations.insert(key);

@@ -69,7 +69,8 @@ def _artifact(document):
         or str(identity) != document["fact_candidate_id"]
         or type(document["fact_table_oid"]) is not int
         or not 0 < document["fact_table_oid"] < 2**32
-        or document["transform_version"] not in {"fhir-source-facts-v1", "generic-fhir-source-facts-v1"}
+        or document["transform_version"]
+        not in {"fhir-source-facts-v1", "generic-fhir-source-facts-v1", "fhir-uhc-plan-tier-facts-v1"}
     ):
         raise ValueError("registry_source_office_v3_invalid")
     for name in ("fact_seal_sha256", "capture_sha256", "fact_sha256"):

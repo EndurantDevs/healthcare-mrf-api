@@ -26,6 +26,7 @@ SUMMARY_KEY = "registry_source_contributions"
 CONTRIBUTION_TABLE = "network_source_contribution"
 TRANSFORM_VERSION = "fhir-source-facts-v1"
 GENERIC_TRANSFORM_VERSION = "generic-fhir-source-facts-v1"
+SOURCE_PLAN_TIER_TRANSFORM_VERSION = "fhir-uhc-plan-tier-facts-v1"
 from process.network_fhir_retained_capture_contract import GENERIC_UNVERIFIED_NETWORK
 
 MAX_RECEIPT_BYTES = 524288
@@ -88,11 +89,16 @@ def recipe_contribution_identity(recipe):
 
 def fhir_fact_transform(source_pin):
     """Keep old CMS identities fixed; generic permanent omissions have their own transform."""
-    return (
-        GENERIC_TRANSFORM_VERSION
-        if fhir_normalized_capture(fhir_physical_source(source_pin)) is not None
-        else TRANSFORM_VERSION
-    )
+    from process.network_fhir_source_witness_contract import SourceWitnessCapture
+    from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
+    physical = fhir_physical_source(source_pin)
+    if (
+        type(physical.source_witness_capture) is SourceWitnessCapture
+        and physical.source_id == UHC_PROVIDER_FILE_SOURCE_ID
+    ):
+        return SOURCE_PLAN_TIER_TRANSFORM_VERSION
+    return GENERIC_TRANSFORM_VERSION if fhir_normalized_capture(physical) is not None else TRANSFORM_VERSION
 
 
 async def source_mapping_sha256(connection, recipe, approved, control_schema):
@@ -181,7 +187,8 @@ def validate_registry_source_contribution_receipt(receipt, *, inventory_root=Non
             if (
                 type(descriptor) is not dict
                 or set(descriptor) != _DESCRIPTOR_FIELDS | (FACT_ANCHOR_FIELDS if receipt["revision"] == 2 else set())
-                or descriptor["transform_version"] not in {TRANSFORM_VERSION, GENERIC_TRANSFORM_VERSION}
+                or descriptor["transform_version"]
+                not in {TRANSFORM_VERSION, GENERIC_TRANSFORM_VERSION, SOURCE_PLAN_TIER_TRANSFORM_VERSION}
                 or any(type(descriptor[field]) is not int or not 0 <= descriptor[field] < 2**63 for field in _COUNTERS)
                 or any(
                     type(descriptor[field]) is not str or re.fullmatch(r"[0-9a-f]{64}", descriptor[field]) is None
@@ -450,6 +457,9 @@ def _validate_fhir_fact(fact, source_pin):
 
 def _validate_fhir_scope(fact, source_pin):
     """Retain exact native-capture scope without manufacturing legacy identity."""
+    if type(fact["source_scope_json"]) is dict and fact["source_scope_json"].get("kind") == "uhc_plan_tier_v1":
+        _validate_plan_tier_fact_scope(fact, source_pin)
+        return
     capture = fhir_normalized_capture(source_pin)
     if capture is not None:
         scope = fact["source_scope_json"]
@@ -473,6 +483,27 @@ def _validate_fhir_scope(fact, source_pin):
         or str(UUID(scope["legacy_uuid"])) != scope["legacy_uuid"]
         or not UUID(scope["legacy_uuid"]).int
     ):
+        raise ValueError
+
+
+def _validate_plan_tier_fact_scope(fact, source_pin):
+    """Typed plan tiers belong only to the genuine Source witness capture path."""
+    from process.network_fhir_source_witness_contract import SourceWitnessCapture
+    from process.registry_fhir_plan_tier import source_key, validate_binding_scope
+    from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
+    capture = source_pin.source_witness_capture
+    physical = fhir_physical_source(source_pin)
+    if (
+        type(capture) is not SourceWitnessCapture
+        or type(physical.source_witness_capture) is not SourceWitnessCapture
+        or source_pin.source_id != UHC_PROVIDER_FILE_SOURCE_ID
+        or physical.source_id != UHC_PROVIDER_FILE_SOURCE_ID
+    ):
+        raise ValueError
+    scope = fact["source_scope_json"]
+    tier = validate_binding_scope(scope, "registry-source-fhir-witness-v1")
+    if scope["capture_sha256"] != capture.capture_sha256 or fact["source_key"] != source_key(tier):
         raise ValueError
 
 
@@ -768,18 +799,21 @@ _WITNESS_EDGE_V2 = _WITNESS_COMMON_V2 | {
 
 
 def verified_office_fact_identity(recipe):
-    """Select v2 explicitly; default recipe/fact identities remain permanently v1."""
-    from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
+    """Bind the selected witness transform without changing other source identities."""
+    from process.network_fhir_membership_source import fhir_source_witness_transform
 
     if type(recipe.source_pin) is not PinnedFHIRMembershipSource:
         raise RegistrySourceContributionError("registry_source_witness_descriptor_invalid")
     identity = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
-    return identity, _digest([identity, FHIR_SOURCE_WITNESS_TRANSFORM_V2])
+    return identity, _digest([identity, fhir_source_witness_transform(recipe.source_pin)])
 
 
 def validate_source_witness_descriptor_v2(descriptor):
     """Decode only the new closed accounting shape; this metadata grants no custody."""
-    from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
+    from process.network_fhir_membership_source import (
+        FHIR_PLAN_TIER_WITNESS_TRANSFORM,
+        FHIR_SOURCE_WITNESS_TRANSFORM_V2,
+    )
 
     try:
         if type(descriptor) is str:
@@ -798,7 +832,8 @@ def validate_source_witness_descriptor_v2(descriptor):
             or set(descriptor) != fields
             or type(descriptor["descriptor_version"]) is not int
             or descriptor["descriptor_version"] != SOURCE_WITNESS_DESCRIPTOR_VERSION_V2
-            or descriptor["transform_version"] != FHIR_SOURCE_WITNESS_TRANSFORM_V2
+            or descriptor["transform_version"]
+            not in (FHIR_SOURCE_WITNESS_TRANSFORM_V2, FHIR_PLAN_TIER_WITNESS_TRANSFORM)
             or any(
                 type(descriptor[field]) is not int or not 0 <= descriptor[field] < 2**63
                 for field in _WITNESS_COUNTERS_V2
@@ -869,15 +904,23 @@ def source_mapping_generation_v3(capture_sha256, mapping_sha256, covered_network
 
 
 def _mapping_input_rows_v3(descriptor):
-    from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
+    from process.network_fhir_membership_source import (
+        FHIR_PLAN_TIER_WITNESS_TRANSFORM,
+        FHIR_SOURCE_WITNESS_TRANSFORM_V2,
+    )
 
     return descriptor["fact_rows"] - (
-        descriptor["raw_source_rows"] if descriptor["transform_version"] == FHIR_SOURCE_WITNESS_TRANSFORM_V2 else 0
+        descriptor["raw_source_rows"]
+        if descriptor["transform_version"] in (FHIR_SOURCE_WITNESS_TRANSFORM_V2, FHIR_PLAN_TIER_WITNESS_TRANSFORM)
+        else 0
     )
 
 
 def _mapping_counts_v3(descriptor):
-    from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
+    from process.network_fhir_membership_source import (
+        FHIR_PLAN_TIER_WITNESS_TRANSFORM,
+        FHIR_SOURCE_WITNESS_TRANSFORM_V2,
+    )
 
     count = descriptor
     accepted, outputs = count["accepted_input_rows"], count["membership_rows"] + count["provider_only_evidence_rows"]
@@ -900,7 +943,7 @@ def _mapping_counts_v3(descriptor):
         or (count["provider_only_rows"] == 0) != (count["provider_only_evidence_rows"] == 0)
     ):
         raise ValueError
-    if count["transform_version"] != FHIR_SOURCE_WITNESS_TRANSFORM_V2 and (
+    if count["transform_version"] not in (FHIR_SOURCE_WITNESS_TRANSFORM_V2, FHIR_PLAN_TIER_WITNESS_TRANSFORM) and (
         count["unresolved_rows"] != 0
         or count["unresolved_raw_source_rows"] != 0
         or count["provider_only_rows"] > count["accepted_raw_source_rows"]
@@ -910,7 +953,10 @@ def _mapping_counts_v3(descriptor):
 
 def validate_source_mapping_descriptor_v3(descriptor):
     """Decode mapped output separately from unchanged raw facts; no Source authority is inferred."""
-    from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
+    from process.network_fhir_membership_source import (
+        FHIR_PLAN_TIER_WITNESS_TRANSFORM,
+        FHIR_SOURCE_WITNESS_TRANSFORM_V2,
+    )
 
     try:
         if type(descriptor) is str:
@@ -932,7 +978,13 @@ def validate_source_mapping_descriptor_v3(descriptor):
             or type(descriptor["descriptor_version"]) is not int
             or descriptor["descriptor_version"] != SOURCE_MAPPING_DESCRIPTOR_VERSION_V3
             or descriptor["transform_version"]
-            not in (TRANSFORM_VERSION, GENERIC_TRANSFORM_VERSION, FHIR_SOURCE_WITNESS_TRANSFORM_V2)
+            not in (
+                TRANSFORM_VERSION,
+                GENERIC_TRANSFORM_VERSION,
+                SOURCE_PLAN_TIER_TRANSFORM_VERSION,
+                FHIR_SOURCE_WITNESS_TRANSFORM_V2,
+                FHIR_PLAN_TIER_WITNESS_TRANSFORM,
+            )
             or any(
                 type(descriptor[name]) is not int or not 0 <= descriptor[name] < 2**63 for name in _MAPPING_COUNTERS_V3
             )
@@ -1016,6 +1068,9 @@ def _validate_witness_scope_v2(fact, source_pin):
     ):
         raise ValueError
     key, scope = fact["source_key"], fact["source_scope_json"]
+    if type(scope) is dict and scope.get("kind") == "uhc_plan_tier_v1":
+        _validate_plan_tier_fact_scope(fact, source_pin)
+        return
     if key is not None and (type(key) is not str or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", key) is None):
         raise ValueError
     if type(scope) is not dict or scope.get("organization_id") != key:
@@ -1313,7 +1368,7 @@ async def map_fhir_source_witnesses_v2(
     their exact immutable original anchor. Office policy/address/correspondence is
     separately bound and is never inferred from this descriptor.
     """
-    from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
+    from process.network_fhir_membership_source import fhir_source_witness_transform
 
     if not connection.is_in_transaction():
         raise RegistrySourceContributionError("registry_source_witness_transaction_required")
@@ -1339,5 +1394,5 @@ async def map_fhir_source_witnesses_v2(
         ):
             raise RegistrySourceContributionError("registry_source_contribution_accounting_invalid")
         return _mapped_witness_descriptor_v2(
-            accounting, identity, capture, mapping, fact_sha256, FHIR_SOURCE_WITNESS_TRANSFORM_V2
+            accounting, identity, capture, mapping, fact_sha256, fhir_source_witness_transform(recipe.source_pin)
         )
