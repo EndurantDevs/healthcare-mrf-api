@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -42,21 +43,21 @@ def _compare_metric(
 ) -> list[str]:
     current = _metric(current.get("covered"), current.get("total"), label)
     minimum = _metric(minimum.get("covered"), minimum.get("total"), label)
-    if current["covered"] * minimum["total"] < minimum["covered"] * current["total"]:
+    minimum_covered, minimum_total = minimum["covered"], minimum["total"]
+    use_whole_percent = os.environ.get("GITHUB_ACTIONS") == "true"
+    if use_whole_percent:
+        minimum_covered, minimum_total = 100 * minimum_covered // minimum_total, 100
+    if current["covered"] * minimum_total < minimum_covered * current["total"]:
         current_missing = current["total"] - current["covered"]
         minimum_missing = minimum["total"] - minimum["covered"]
-        if (
-            current_missing <= minimum_missing + allowed_missing_increase
-            and (
-                current["total"] < minimum["total"]
-                or allowed_missing_increase > 0
-            )
+        if current_missing <= minimum_missing + allowed_missing_increase and (
+            current["total"] < minimum["total"] or allowed_missing_increase > 0
         ):
             return []
-        return [
-            f"{label}: coverage fell to {_percent(current):.4f}% "
-            f"below {_percent(minimum):.4f}%"
-        ]
+        minimum_label = f"{_percent(minimum):.4f}%"
+        if use_whole_percent:
+            minimum_label = f"{minimum_covered}% floor (reference {minimum_label})"
+        return [f"{label}: coverage fell to {_percent(current):.4f}% below {minimum_label}"]
     return []
 
 
@@ -81,9 +82,7 @@ def _compare_policy(
     for field in ("features", "source_dirs", "source_pkgs", "tests"):
         if not set(reference.get(field, [])).issubset(set(candidate.get(field, []))):
             errors.append(f"{report_name}: measurement policy narrowed {field}")
-    if not set(candidate.get("test_deselections", [])).issubset(
-        set(reference.get("test_deselections", []))
-    ):
+    if not set(candidate.get("test_deselections", [])).issubset(set(reference.get("test_deselections", []))):
         errors.append(f"{report_name}: measurement policy added test deselections")
     for field in ("manifest", "source"):
         if reference.get(field) != candidate.get(field):
@@ -98,15 +97,9 @@ def _compare_policy(
             field == "rust"
             and reference.get(field) == "1.97.1"
             and candidate.get(field) == "1.98.1"
-            and reference.get("cargo_llvm_cov")
-            == candidate.get("cargo_llvm_cov")
-            == "0.8.7"
+            and reference.get("cargo_llvm_cov") == candidate.get("cargo_llvm_cov") == "0.8.7"
         )
-        if (
-            not is_transition_upgrade
-            and field in reference
-            and reference.get(field) != candidate.get(field)
-        ):
+        if not is_transition_upgrade and field in reference and reference.get(field) != candidate.get(field):
             errors.append(f"{report_name}: measurement policy changed {field}")
     return errors
 
@@ -122,13 +115,9 @@ def _compare_scope(
     if not isinstance(candidate_scope, dict) or not isinstance(reference_scope, dict):
         return [f"{report_name}: baseline scope is malformed"]
     errors: list[str] = []
-    if not set(reference_scope.get("include", [])).issubset(
-        set(candidate_scope.get("include", []))
-    ):
+    if not set(reference_scope.get("include", [])).issubset(set(candidate_scope.get("include", []))):
         errors.append(f"{report_name}: baseline source scope was narrowed")
-    if not set(candidate_scope.get("exclude", [])).issubset(
-        set(reference_scope.get("exclude", []))
-    ):
+    if not set(candidate_scope.get("exclude", [])).issubset(set(reference_scope.get("exclude", []))):
         errors.append(f"{report_name}: baseline exclusions were expanded")
     errors.extend(
         _compare_policy(
@@ -149,18 +138,13 @@ def _compare_baselines(
     """Compare policy and ratio floors while allowing deletion-only debt parity."""
 
     errors: list[str] = []
-    if reference.get("machine_artifact_required") is True and candidate.get(
-        "machine_artifact_required"
-    ) is not True:
+    if reference.get("machine_artifact_required") is True and candidate.get("machine_artifact_required") is not True:
         errors.append("coverage baseline machine-artifact requirement was removed")
     candidate_reports = candidate["reports"]
     allow_tool_version_transition = (
-        reference.get("machine_artifact_required") is not True
-        and candidate.get("machine_artifact_required") is True
+        reference.get("machine_artifact_required") is not True and candidate.get("machine_artifact_required") is True
     )
-    exact_base_jitter = (
-        EXACT_BASE_JITTER if reference.get("machine_artifact_required") is True else {}
-    )
+    exact_base_jitter = EXACT_BASE_JITTER if reference.get("machine_artifact_required") is True else {}
     for report_name, old_config in reference["reports"].items():
         new_config = candidate_reports.get(report_name)
         if not isinstance(new_config, dict) or not isinstance(old_config, dict):
@@ -236,19 +220,14 @@ def _check_current_report(
     snapshot = _collect_report(root, report_name, config)
     minimum_metrics = config.get("metrics")
     if not isinstance(minimum_metrics, dict) or not minimum_metrics:
-        raise CoverageRatchetError(
-            f"{report_name}: baseline metrics are missing; use --write-baseline"
-        )
+        raise CoverageRatchetError(f"{report_name}: baseline metrics are missing; use --write-baseline")
     errors: list[str] = []
     for metric_name, minimum in minimum_metrics.items():
         current = snapshot.metric_by_name.get(metric_name)
         if current is None:
             errors.append(f"{report_name}.{metric_name}: current metric is missing")
             continue
-        print(
-            f"{report_name}.{metric_name}: {_percent(current):.4f}% "
-            f"({current['covered']}/{current['total']})"
-        )
+        print(f"{report_name}.{metric_name}: {_percent(current):.4f}% ({current['covered']}/{current['total']})")
         errors.extend(_compare_metric(f"{report_name}.{metric_name}", current, minimum))
     return errors
 

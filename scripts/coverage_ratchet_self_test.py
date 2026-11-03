@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
+from unittest.mock import patch
 
 from coverage_growth import (
     build_diff_policy_test_baseline,
@@ -85,6 +87,27 @@ def _assert_parser_behavior(collect_report: CollectReport) -> None:
         )
 
 
+def _assert_whole_percent_behavior(compare_metric: CompareMetric) -> None:
+    for covered, minimum, local_fails, ci_fails in (
+        (952399, 952469, True, False),
+        (980043, 980128, True, False),
+        (950000, 952469, True, False),
+        (949999, 952469, True, True),
+        (950000, 959999, True, False),
+        (999999, 1000000, True, True),
+        (1000000, 1000000, False, False),
+        (0, 9999, True, False),
+    ):
+        for github_actions, should_fail in (("false", local_fails), ("true", ci_fails)):
+            with patch.dict(os.environ, {"GITHUB_ACTIONS": github_actions}):
+                errors = compare_metric(
+                    "boundary",
+                    {"covered": covered, "total": 1000000},
+                    {"covered": minimum, "total": 1000000},
+                )
+            _require(bool(errors) == should_fail, "local exact and CI whole-percent boundary")
+
+
 def _assert_exact_base_jitter_behavior(compare_baselines: CompareBaselines) -> None:
     """Keep machine-artifact allowances narrow and metric-specific."""
 
@@ -93,8 +116,7 @@ def _assert_exact_base_jitter_behavior(compare_baselines: CompareBaselines) -> N
     rust_reference["machine_artifact_required"] = True
     rust_reference["reports"]["rust"] = rust_reference["reports"].pop("python")
     rust_reference["reports"]["rust"]["metrics"] = {
-        metric_name: {"covered": 80, "total": 100}
-        for metric_name in ("functions", "lines", "regions")
+        metric_name: {"covered": 80, "total": 100} for metric_name in ("functions", "lines", "regions")
     }
     for metric_name, allowance in (("functions", 1), ("lines", 3), ("regions", 4)):
         rust_candidate = json.loads(json.dumps(rust_reference))
@@ -112,8 +134,7 @@ def _assert_exact_base_jitter_behavior(compare_baselines: CompareBaselines) -> N
     machine_python = json.loads(json.dumps(baseline))
     machine_python["machine_artifact_required"] = True
     machine_python["reports"]["python"]["metrics"] = {
-        metric_name: {"covered": 80, "total": 100}
-        for metric_name in ("branches", "lines")
+        metric_name: {"covered": 80, "total": 100} for metric_name in ("branches", "lines")
     }
     for metric_name in ("branches", "lines"):
         regressed_python = json.loads(json.dumps(machine_python))
@@ -134,9 +155,7 @@ def _assert_reference_behavior(compare_baselines: CompareBaselines) -> None:
     baseline = build_diff_policy_test_baseline()
     _require(not compare_baselines(baseline, baseline), "unchanged baseline")
     expanded_exclusions = json.loads(json.dumps(baseline))
-    expanded_exclusions["reports"]["python"]["growth"]["diff_exclude"] = [
-        "generated.py"
-    ]
+    expanded_exclusions["reports"]["python"]["growth"]["diff_exclude"] = ["generated.py"]
     _require(
         bool(compare_baselines(expanded_exclusions, baseline)),
         "new diff exclusion",
@@ -192,6 +211,7 @@ def run_self_test(
     """Exercise ratio floors, report parsing, and changed-line policy."""
 
     _assert_metric_behavior(compare_metric)
+    _assert_whole_percent_behavior(compare_metric)
     _assert_parser_behavior(collect_report)
     _assert_reference_behavior(compare_baselines)
     run_diff_helper_self_test()

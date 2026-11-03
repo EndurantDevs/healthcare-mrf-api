@@ -1,11 +1,14 @@
 # Test Coverage Ratchet
 
-CI keeps the measured Python and Rust coverage ratios for each metric at or
-above the exact base revision's ratios, with bounded runtime-measurement
-allowances against the provenance-bound exact-base artifact: one Python line
-or branch, and one Rust function, three lines, or four regions. Versioned floors
-remain exact. The policy does not cap absolute uncovered debt, reserve
-artificial headroom, or require unrelated debt paydown.
+Development checks require each measured Python and Rust coverage ratio to meet
+the full, precise baseline. Only GitHub Actions (`GITHUB_ACTIONS=true`) enforces
+the whole-percent floor: a 95.2469% reference requires 95% in CI, so 95.2399%
+passes CI but fails the development check; 94.9999% fails both. Versioned
+baselines retain their precise counts and remain the development targets.
+Existing bounded runtime-measurement allowances against the provenance-bound
+exact-base artifact remain: one Python line or branch, and one Rust function,
+three lines, or four regions. The policy does not cap absolute uncovered debt,
+reserve artificial headroom, or require unrelated debt paydown.
 Deleting covered code may lower a ratio when the missing-coverage count does
 not increase.
 
