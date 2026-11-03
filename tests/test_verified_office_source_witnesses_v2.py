@@ -594,3 +594,23 @@ def test_workspace_names_are_bounded_and_do_not_reuse_a_truncated_suffix():
     assert facts.witness_mapping_workspace_name(first) == facts.witness_mapping_workspace_name(first)
     with pytest.raises(ValueError):
         facts.witness_mapping_workspace_name('invalid"name')
+
+
+@pytest.mark.parametrize("source", [_legacy_pin(), pin(retained())])
+def test_v2_decoder_binds_each_page_once_and_checks_every_fact(source, monkeypatch):
+    documents = [_header(source), _edge(source)]
+    page = _page(source, documents)
+    original = fhir.fhir_source_witness_binding_v2
+    bindings = []
+
+    def binding(selected):
+        bindings.append(selected)
+        return original(selected)
+
+    monkeypatch.setattr(fhir, "fhir_source_witness_binding_v2", binding)
+    assert facts.decode_fhir_source_witness_page_v2(page) == documents
+    assert bindings == [source]
+    documents[-1]["source_binding"]["physical_generation_id"] = "f" * 64
+    with pytest.raises(facts.RegistrySourceContributionError, match="witness_facts_invalid"):
+        facts.decode_fhir_source_witness_page_v2(replace(page, source_fact_bytes=json.dumps(documents).encode()))
+    assert bindings == [source, source]

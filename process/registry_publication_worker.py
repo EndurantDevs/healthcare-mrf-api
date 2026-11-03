@@ -172,6 +172,7 @@ def _initial_sources(configured):
             "em_provider_inputs",
             "initial_source_recipes",
             "replacement_source_recipes",
+            "source_recipe_additions",
             "compact",
         }
     ):
@@ -197,7 +198,18 @@ def _initial_sources(configured):
         None if npi is None else _address_pin(npi),
         em_provider_inputs=provider_inputs,
         compact=configured.get("compact", False),
+        source_recipe_additions=_source_recipe_additions(configured),
         **recipes_by_phase,
+    )
+
+
+def _source_recipe_additions(configured):
+    from process.registry_source_recipe_additions import decode_source_recipe_additions
+
+    return (
+        decode_source_recipe_additions(configured["source_recipe_additions"])
+        if "source_recipe_additions" in configured
+        else None
     )
 
 

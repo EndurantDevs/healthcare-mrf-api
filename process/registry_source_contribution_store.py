@@ -1037,14 +1037,12 @@ def validate_source_contribution_descriptor(descriptor):
         raise RegistrySourceContributionError("registry_source_contribution_invalid") from None
 
 
-def _validate_witness_common_v2(fact, source_pin):
-    from process.network_fhir_membership_source import fhir_source_witness_binding_v2
-
+def _validate_witness_common_v2(fact, source_binding):
     if (
         type(fact) is not dict
         or type(fact.get("fact_version")) is not int
         or fact["fact_version"] != 2
-        or fact.get("source_binding") != fhir_source_witness_binding_v2(source_pin)
+        or fact.get("source_binding") != source_binding
         or fact.get("resource_type") not in {"PractitionerRole", "OrganizationAffiliation"}
         or type(fact.get("resource_id")) is not str
         or not 1 <= len(fact["resource_id"]) <= 256
@@ -1151,7 +1149,7 @@ def _validate_witness_edge_v2(fact, source_pin):
 
 def decode_source_witness_page_v2(page):
     """Validate a complete bounded raw census before COPY; never authenticate a source."""
-    from process.network_fhir_membership_source import FHIRSourceWitnessPageV2
+    from process.network_fhir_membership_source import FHIRSourceWitnessPageV2, fhir_source_witness_binding_v2
 
     try:
         if (
@@ -1166,9 +1164,10 @@ def decode_source_witness_page_v2(page):
         facts = json.loads(page.source_fact_bytes, object_pairs_hook=_unique_object)
         if type(facts) is not list or len(facts) > 10000:
             raise ValueError
+        source_binding = fhir_source_witness_binding_v2(page.source)
         resources, edges = {}, []
         for fact in facts:
-            _validate_witness_common_v2(fact, page.source)
+            _validate_witness_common_v2(fact, source_binding)
             identity = fact["resource_type"], fact["resource_id"]
             if fact.get("kind") == "resource":
                 if (

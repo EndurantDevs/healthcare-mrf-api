@@ -79,6 +79,7 @@ from process.registry_composition_addresses import (
 )
 from process.registry_composition_addresses import (
     _prepare_registry_composition_address_artifact,
+    _resolve_source_recipe_additions,
 )
 from process.registry_composition_addresses import (
     _prepared_address_artifact as _prepared_address_artifact,
@@ -846,6 +847,9 @@ async def _prepare_composition_snapshot(
         writer_roles,
         approved_revision,
         control_schema,
+    )
+    address_sources = await _resolve_source_recipe_additions(
+        inputs.connection, address_sources, source_manifest, expected_head, control_schema
     )
     inputs = replace(
         inputs,
