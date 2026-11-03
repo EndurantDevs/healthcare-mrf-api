@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import json
 import urllib.parse
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -167,6 +168,63 @@ async def test_cancelled_first_pass_resumes_without_discarding_proof(monkeypatch
     )
     assert result.complete and len(staged) == 6
     assert all(fingerprints_by_window_and_pass[k] == value for k, value in retained.items())
+
+
+def _resource_page_urls(collection):
+    return [url for url in collection.requests if "_summary=count" not in url and not url.endswith("/metadata")]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_callback_preserves_staged_rows_and_resume_proof(monkeypatch, unit_source_factory):
+    collection = Collection()
+    directory_source = capped_source()
+    config, _ = importer._last_updated_partition_config(directory_source, "Practitioner")
+    fingerprints_by_window_and_pass = {}
+    harness = _LastUpdatedPartitionFetchHarness(directory_source, fingerprints_by_window_and_pass)
+    checkpoint_saves, cancellation_callback = AsyncMock(), AsyncMock()
+    cancel_ctx, cancel_task = {"context": {}}, {"operation": "acquire"}
+    original_fetch = importer._fetch_last_updated_partition_resource_rows
+    original_post_census = capped.post_census
+
+    async def post_with_cancellation(*args, **kwargs):
+        assert len(harness.staged_resources_by_id) == len(collection.resources)
+        cancellation_callback.side_effect = asyncio.CancelledError
+        return await original_post_census(*args, **kwargs)
+
+    async def fetch_with_cancel(record, resource_type, model, config, options):
+        options = dataclasses.replace(options, cancel_ctx=cancel_ctx, cancel_task=cancel_task)
+        return await original_fetch(record, resource_type, model, config, options)
+
+    monkeypatch.setattr(importer, "_raise_if_resource_import_cancelled", cancellation_callback)
+    monkeypatch.setattr(importer, "_fetch_last_updated_partition_resource_rows", fetch_with_cancel)
+    monkeypatch.setattr(capped, "post_census", post_with_cancellation)
+    initial = importer.LastUpdatedPartitionResume(importer._new_last_updated_partition_plan(config))
+    harness._install_importer_mocks(monkeypatch, collection.fetch, initial, checkpoint_saves)
+    with pytest.raises(asyncio.CancelledError):
+        await harness._fetch_resource_rows(config)
+    assert cancellation_callback.await_args.args[0] is cancel_ctx
+    assert cancellation_callback.await_args.args[1] is cancel_task
+    assert len(harness.staged_resources_by_id) == 6 and harness.written_resource_ids == []
+    saved = checkpoint_saves.await_args
+    resume = importer._last_updated_partition_resume_from_checkpoint(
+        importer._last_updated_partition_checkpoint_payload(config, saved.args[3], saved.kwargs["census"]), config
+    )
+    resume = dataclasses.replace(
+        resume, pages_processed=saved.kwargs["pages_processed"], rows_processed=saved.kwargs["rows_processed"]
+    )
+    assert resume.census.capped["count_pre"] == 6
+    assert not importer._is_last_updated_partition_census_complete(resume.census)
+    retained_rows = copy.deepcopy(harness.staged_resources_by_id)
+    retained_fingerprints = copy.deepcopy(fingerprints_by_window_and_pass)
+    acquired_pages = _resource_page_urls(collection)
+    monkeypatch.setattr(importer, "_fetch_last_updated_partition_resource_rows", original_fetch)
+    monkeypatch.setattr(capped, "post_census", original_post_census)
+    harness._install_importer_mocks(monkeypatch, collection.fetch, resume, None)
+    fetch_outcome = await harness._fetch_resource_rows(config)
+    assert fetch_outcome.complete and fetch_outcome.rows_fetched == fetch_outcome.rows_written == 6
+    assert harness.staged_resources_by_id == retained_rows
+    assert fingerprints_by_window_and_pass == retained_fingerprints
+    assert _resource_page_urls(collection) == acquired_pages
 
 
 @pytest.mark.parametrize(
@@ -423,6 +481,40 @@ async def test_resumed_leaf_sum_cannot_replace_the_frozen_census(monkeypatch, un
     )
     assert not fetch_result.complete and "capped_leaf_census_changed" in fetch_result.error
     assert written == []
+
+
+@pytest.mark.asyncio
+async def test_post_census_sum_mismatch_retains_candidates_without_completion(monkeypatch, unit_source_factory):
+    collection = Collection()
+    fingerprints_by_window_and_pass = {}
+    retained_by_field = {}
+    saved_censuses = []
+    original_post_census = capped.post_census
+
+    async def save(_context, _resource_type, _config, _plan, **fields):
+        saved_censuses.append(copy.deepcopy(fields["census"]))
+
+    async def post_with_inconsistent_sum(directory, record, resource_type, model, config, state, options):
+        retained_by_field["fingerprints"] = copy.deepcopy(fingerprints_by_window_and_pass)
+        # Corrupt only the frozen aggregate after acquisition; every leaf still recounts exactly.
+        state.census.capped["count_pre"] += 1
+        return await original_post_census(directory, record, resource_type, model, config, state, options)
+
+    monkeypatch.setattr(capped, "post_census", post_with_inconsistent_sum)
+    fetch_outcome, staged, written = await run_fetch(
+        monkeypatch,
+        capped_source(),
+        collection.fetch,
+        save_plan_callback=save,
+        fingerprints_by_window_and_pass=fingerprints_by_window_and_pass,
+    )
+    assert not fetch_outcome.complete and "capped_leaf_post_sum_mismatch" in fetch_outcome.error
+    assert staged == {resource_payload["id"]: resource_payload for resource_payload in collection.resources}
+    assert fingerprints_by_window_and_pass == retained_by_field["fingerprints"] and written == []
+    saved = saved_censuses[-1]
+    assert saved.failure == "capped_leaf_post_sum_mismatch"
+    assert saved.capped["count_pre"] == 7 and saved.capped["count_post"] is None
+    assert not importer._is_last_updated_partition_census_complete(saved)
 
 
 @pytest.mark.asyncio
