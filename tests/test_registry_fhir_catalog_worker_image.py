@@ -78,10 +78,10 @@ def test_catalog_job_keeps_generic_launch(monkeypatch):
         return {}
 
     monkeypatch.setattr(control_workers, "_kubernetes_request", request)
-    result = control_workers._ensure_kubernetes_job(
+    launch_receipt = control_workers._ensure_kubernetes_job(
         catalog_spec(), {"importer": "registry-fhir-catalog-sync", "run_id": "run_catalog"}, {}
     )
-    assert result["status"] == "started" and len(jobs) == 1
+    assert launch_receipt["status"] == "started" and len(jobs) == 1
     assert "activeDeadlineSeconds" not in jobs[0]["spec"]
     container = jobs[0]["spec"]["template"]["spec"]["containers"][0]
     assert container["image"] == CATALOG_IMAGE and container["workingDir"] == "/opt"

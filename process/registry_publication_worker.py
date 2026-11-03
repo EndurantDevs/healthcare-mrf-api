@@ -77,7 +77,7 @@ class RegistryPublicationWorkerConfig:
     consumer: RegistryPublicationConsumerConfig
     initial_address_sources: RegistryCompositionAddressSources | None = None
     ptg: _PTGWorkerConfig | None = field(default=None, repr=False)
-    operation_seconds: int = 3600
+    operation_seconds: int | None = 3600
     sql_limits: RegistryPublicationSQLLimits = field(default_factory=RegistryPublicationSQLLimits)
     custody_url: object | None = field(default=None, repr=False)
     source_witness: RegistrySourceWitnessConfig | None = field(default=None, repr=False)
@@ -86,7 +86,9 @@ class RegistryPublicationWorkerConfig:
         """Validate immutable SQL limits and deadline for direct and parsed callers."""
         if type(self.sql_limits) is not RegistryPublicationSQLLimits:
             _invalid()
-        if type(self.operation_seconds) is not int or not 1 <= self.operation_seconds <= 86400:
+        if self.operation_seconds is not None and (
+            type(self.operation_seconds) is not int or not 1 <= self.operation_seconds <= 86400
+        ):
             _invalid()
         if self.source_witness is not None:
             if (

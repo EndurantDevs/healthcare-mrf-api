@@ -102,9 +102,8 @@ def _identifier(value):
     return '"' + value + '"'
 
 
-_PAGE_SQL = """WITH page AS MATERIALIZED (
- SELECT resource_type,resource_id,payload_hash,payload_json::jsonb->'network_refs' AS refs,
- jsonb_typeof(payload_json::jsonb) AS payload_kind,
+_PAGE_SQL = """WITH page AS (
+ SELECT resource_type,resource_id,payload_hash,payload_json,
  octet_length(payload_json::text)+128 AS source_bytes
  FROM {resources}
  WHERE dataset_id=$1 AND resource_type=ANY($2::text[])
@@ -114,13 +113,18 @@ _PAGE_SQL = """WITH page AS MATERIALIZED (
  SELECT *,sum(source_bytes) OVER(ORDER BY resource_type COLLATE "C",resource_id COLLATE "C") AS page_bytes,
  row_number() OVER(ORDER BY resource_type COLLATE "C",resource_id COLLATE "C") AS ordinal FROM page
 ), selected AS MATERIALIZED (
- SELECT * FROM sized WHERE ordinal=1 OR page_bytes<=$6
+ SELECT resource_type,resource_id,payload_hash,parsed.payload->'network_refs' AS refs,
+ jsonb_typeof(parsed.payload) AS payload_kind,source_bytes,page_bytes,ordinal
+ FROM sized
+ CROSS JOIN LATERAL (SELECT payload_json::jsonb AS payload OFFSET 0) parsed
+ WHERE ordinal=1 OR page_bytes<=$6
 ), accounting AS MATERIALIZED (
  SELECT count(*)::bigint AS source_rows,coalesce(sum(source_bytes),0)::bigint AS source_bytes,
  count(*) FILTER(WHERE refs IS NULL OR refs='null'::jsonb OR refs='[]'::jsonb)::bigint AS without_refs,
- count(*) FILTER(WHERE source_bytes>$6 OR resource_id IS NULL OR resource_id !~ '^[A-Za-z0-9.-]{{1,64}}$'
+ count(*) FILTER(WHERE source_bytes>$6 OR resource_id IS NULL OR length(resource_id) NOT BETWEEN 1 AND 64
+   OR resource_id ~ '[^A-Za-z0-9.-]'
    OR payload_kind IS DISTINCT FROM 'object'
-   OR payload_hash !~ '^[0-9a-f]{{64}}$' OR payload_hash IS NULL
+   OR length(payload_hash)<>64 OR payload_hash ~ '[^0-9a-f]' OR payload_hash IS NULL
    OR (refs IS NOT NULL AND refs<>'null'::jsonb AND jsonb_typeof(refs)<>'array'))::bigint AS invalid_rows,
  coalesce(sum(CASE WHEN jsonb_typeof(refs)='array' THEN jsonb_array_length(refs) ELSE 0 END),0)::bigint AS reference_rows
  FROM selected
