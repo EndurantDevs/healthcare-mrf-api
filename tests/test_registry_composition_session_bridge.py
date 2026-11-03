@@ -203,6 +203,14 @@ async def test_genuine_factory_prepares_on_fenced_session_then_copies_on_same_dr
     assert events.index("unlock") < events.index("copy") < events.index("close")
     assert "invalidate" not in events
     assert driver.execute.await_args_list == [
+        (
+            (
+                "CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
+                f'ON "{target.schema_name}".provider_location_binding USING hash(location_key)',
+            ),
+            {},
+        )
+    ] + [
         ((f'DROP TABLE IF EXISTS pg_temp."{name}"',), {})
         for name in ("synthetic_stage", "synthetic_adds", "synthetic_removals")
     ]

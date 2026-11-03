@@ -204,3 +204,18 @@ async def test_collection_probe_keeps_resource_floor_and_enclosing_deadlines(pro
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PROBE_HARD_TIMEOUT", "1")
     assert importer._source_probe_hard_timeout_seconds(source, timeout=15) == 1
     assert importer.source_selection._qualification_probe_timeout_seconds(importer, source, timeout=15) == 92
+
+
+@pytest.mark.asyncio
+async def test_absent_collection_probe_does_not_resolve_credentials(source, monkeypatch):
+    """Preserve an unavailable probe without inventing access evidence or resolving secrets."""
+    probe = AsyncMock(return_value=None)
+    credentials = AsyncMock(side_effect=AssertionError("unavailable probe has no credential target"))
+    monkeypatch.setattr(importer, "_probe_resource_access", probe)
+    monkeypatch.setattr(importer.source_selection, "resolve_probe_credentials", credentials)
+    assert (
+        await importer.source_selection.probe_declared_collection(importer, source, timeout=3, run_id="run-example")
+        is None
+    )
+    probe.assert_awaited_once()
+    credentials.assert_not_awaited()

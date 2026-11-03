@@ -1,8 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Keep existing worker CLI options and isolate the catalog worker factory."""
 
+import asyncio
+import sys
+from signal import SIGTERM, SIGUSR1
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from click.testing import CliRunner
@@ -53,3 +56,49 @@ def test_catalog_watch_uses_owned_worker_lifecycle(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     watched.assert_called_once_with(str(tmp_path), process.RegistryFHIRCatalogSync)
     run.assert_called_once_with(watched.return_value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("watch_fails", [False, True])
+async def test_catalog_watch_restarts_then_closes_on_stop_or_watch_failure(monkeypatch, tmp_path, watch_fails):
+    import watchfiles
+
+    worker = SimpleNamespace(async_run=AsyncMock(), close=AsyncMock(), handle_sig=Mock())
+    created = Mock(return_value=worker)
+    monkeypatch.setattr(queue, "create_fhir_catalog_worker", created)
+    before = asyncio.all_tasks()
+
+    async def changes(path, *, stop_event):
+        assert path == str(tmp_path)
+        await asyncio.sleep(0)
+        assert worker.async_run.await_count == 1
+        worker.on_stop(SIGUSR1)
+        assert not stop_event.is_set()
+        yield {("modified", "synthetic-file")}
+        await asyncio.sleep(0)
+        assert worker.async_run.await_count == 2
+        worker.on_stop(SIGTERM)
+        assert stop_event.is_set()
+        if watch_fails:
+            raise RuntimeError("synthetic watch failure")
+
+    monkeypatch.setattr(watchfiles, "awatch", changes)
+    if watch_fails:
+        with pytest.raises(RuntimeError, match="synthetic watch failure"):
+            await main._watch_catalog_worker(str(tmp_path), process.RegistryFHIRCatalogSync)
+    else:
+        await main._watch_catalog_worker(str(tmp_path), process.RegistryFHIRCatalogSync)
+    await asyncio.sleep(0)
+    created.assert_called_once_with(process.RegistryFHIRCatalogSync)
+    worker.handle_sig.assert_called_once_with(SIGUSR1)
+    assert worker.close.await_count == 2 and asyncio.all_tasks() <= before
+
+
+@pytest.mark.asyncio
+async def test_catalog_watch_missing_optional_dependency_refuses_before_worker_creation(monkeypatch, tmp_path):
+    created = Mock()
+    monkeypatch.setattr(queue, "create_fhir_catalog_worker", created)
+    monkeypatch.setitem(sys.modules, "watchfiles", None)
+    with pytest.raises(ImportError, match="watchfiles not installed"):
+        await main._watch_catalog_worker(str(tmp_path), process.RegistryFHIRCatalogSync)
+    created.assert_not_called()

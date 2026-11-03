@@ -633,7 +633,7 @@ async def test_prepared_address_supports_sealed_replay(monkeypatch):
         candidate["validation_json"]["address_source"] = json.loads(parameters[1])
         return [{"recorded": True}]
 
-    connection = SimpleNamespace(fetch=record)
+    connection = SimpleNamespace(fetch=record, execute=AsyncMock())
     inputs = SimpleNamespace(
         connection=connection,
         approved=fixture.approved,
@@ -648,6 +648,10 @@ async def test_prepared_address_supports_sealed_replay(monkeypatch):
         inputs, fixture.target, (fixture.recipes, fixture.stage, artifact, fixture.summary, None, ()), "fixture"
     )
     receipts.assert_awaited_once()
+    connection.execute.assert_awaited_once_with(
+        "CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
+        f'ON "{fixture.target.schema_name}".provider_location_binding USING hash(location_key)'
+    )
     candidate["state"] = "sealed"
     pinning = AsyncMock(return_value=fixture.approved)
     monkeypatch.setattr(policy, "pin_retained_approved_membership_source", pinning)
@@ -669,7 +673,7 @@ async def test_prepared_address_conflicts_precede_receipts(monkeypatch, recorded
     from process import registry_candidate_composition as composition
 
     fixture = _fixture()
-    connection = SimpleNamespace(fetch=AsyncMock(return_value=recorded))
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=recorded), execute=AsyncMock())
     inputs = SimpleNamespace(connection=connection)
     artifact = SimpleNamespace(address_source=fixture.address)
     receipts = AsyncMock()
@@ -680,3 +684,4 @@ async def test_prepared_address_conflicts_precede_receipts(monkeypatch, recorded
         )
     receipts.assert_not_awaited()
     connection.fetch.assert_awaited_once()
+    connection.execute.assert_not_awaited()

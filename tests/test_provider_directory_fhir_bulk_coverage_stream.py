@@ -7,6 +7,7 @@ import dataclasses
 import datetime
 import hashlib
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -28,6 +29,114 @@ from tests.provider_directory_fhir_bulk_test_support import (
     importer,
 )
 from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+
+
+def _stream_response(payload_bytes, chunk_bytes, activity_by_name):
+    response = _Response()
+
+    async def chunks(size):
+        assert size == importer.READ_CHUNK_BYTES
+        for offset in range(0, len(payload_bytes), chunk_bytes):
+            assert not activity_by_name["transaction"]
+            activity_by_name["chunks"] += 1
+            yield payload_bytes[offset : offset + chunk_bytes]
+
+    response.content.iter_chunked = chunks
+    return response
+
+
+def _stream_observation(monkeypatch):
+    observed = SimpleNamespace(
+        activity_by_name={"transaction": False, "chunks": 0},
+        ownership_boundaries=[],
+        resource_ids=[],
+        progress_boundaries=[],
+        buffer_sizes=[],
+    )
+
+    @contextlib.asynccontextmanager
+    async def transaction(*_args, **_kwargs):
+        assert not observed.activity_by_name["transaction"]
+        observed.activity_by_name["transaction"] = True
+        try:
+            yield
+        finally:
+            observed.activity_by_name["transaction"] = False
+
+    async def owner():
+        observed.ownership_boundaries.append(observed.activity_by_name["transaction"])
+
+    async def lock():
+        assert not observed.activity_by_name["transaction"]
+
+    async def write(_model, rows):
+        assert observed.activity_by_name["transaction"] and 1 <= len(rows) <= 7
+        observed.resource_ids.extend(row["resource_id"] for row in rows)
+        return len(rows)
+
+    async def record(identity, _output_id, rows, offset):
+        assert observed.activity_by_name["transaction"] and identity == _identity()
+        observed.progress_boundaries.append((rows, offset))
+
+    consume = importer._consume_bulk_stream_chunk
+
+    async def observe_buffers(state, chunk):
+        result = await consume(state, chunk)
+        observed.buffer_sizes.append((len(state.buffer), len(state.pending_rows), len(state.retained_rows)))
+        return result
+
+    monkeypatch.setattr(importer, "source_checkpoint_transaction", transaction)
+    monkeypatch.setattr(importer, "_begin_bulk_export_output", AsyncMock())
+    monkeypatch.setattr(importer, "_complete_bulk_export_output", AsyncMock())
+    monkeypatch.setattr(importer, "_record_bulk_export_output_progress", record)
+    monkeypatch.setattr(importer, "_consume_bulk_stream_chunk", observe_buffers)
+    observed.lock_probe = AsyncMock(side_effect=lock)
+    observed.options = dataclasses.replace(
+        _stream_options(range_resume_enabled=False),
+        row_batch_size=7,
+        row_batch_handler=write,
+        ownership_probe=importer._BulkCheckpointProbes(owner, observed.lock_probe),
+    )
+    return observed
+
+
+@pytest.mark.parametrize("chunk_bytes", [13, importer.READ_CHUNK_BYTES])
+@pytest.mark.asyncio
+async def test_checkpoint_stream_keeps_payload_and_bounded_batches_without_per_chunk_ownership(
+    monkeypatch, chunk_bytes
+):
+    """Chunking changes neither payload/checkpoints nor the maximum pending batch."""
+    resources = [{"resourceType": "Practitioner", "id": f"resource-{index}"} for index in range(103)]
+    payload_bytes = b"\n" + b"\n".join(json.dumps(resource).encode() for resource in resources)
+    observed = _stream_observation(monkeypatch)
+    response = _stream_response(payload_bytes, chunk_bytes, observed.activity_by_name)
+    manifest = importer._bulk_export_manifest_from_payload(
+        _manifest_payload(),
+        "Practitioner",
+        expected_request_url=_identity().start_url,
+    )
+    stream_state = importer.BulkExportStreamState()
+    error = await importer._stream_one_checkpointed_bulk_output(
+        _Session(response),
+        _source(),
+        _identity(),
+        manifest,
+        manifest.outputs[0],
+        {"output_id": "output-stream", "committed_bytes": 0, "rows_written": 0},
+        observed.options,
+        stream_state,
+    )
+
+    assert error is None and observed.resource_ids == [resource["id"] for resource in resources]
+    assert stream_state.rows_written_this_run == len(resources)
+    assert stream_state.retained_resource_rows == []
+    assert observed.progress_boundaries[-1] == (len(resources), len(payload_bytes))
+    assert all(payload_bytes[offset - 1 : offset] == b"\n" for _, offset in observed.progress_boundaries[:-1])
+    assert observed.ownership_boundaries == [False] + [True] * (2 * len(observed.progress_boundaries)) + [False]
+    assert observed.lock_probe.await_count == observed.activity_by_name["chunks"] + 1
+    assert max(size for size, _, _ in observed.buffer_sizes) <= max(len(line) for line in payload_bytes.splitlines())
+    assert max(pending for _, pending, _ in observed.buffer_sizes) < observed.options.row_batch_size
+    assert all(retained == 0 for _, _, retained in observed.buffer_sizes)
 
 
 @pytest.mark.parametrize(
