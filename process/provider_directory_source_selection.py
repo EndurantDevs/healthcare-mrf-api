@@ -5,12 +5,90 @@ import asyncio
 import contextvars
 import os
 import posixpath
+import ssl
 import urllib.parse
 import urllib.request
 
 from process import provider_directory_generic_source_policy as source_policy
 
 QUALIFICATION_API_BASE = contextvars.ContextVar("provider_directory_qualification_api_base", default=None)
+CREDENTIAL_REQUEST_LOCKS = contextvars.ContextVar("provider_directory_credential_request_locks", default=None)
+
+
+def is_credentialed_rest_source(directory, source_record):
+    """Keep authenticated connection reuse limited to the reviewed directory."""
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    return bool(api_base and api_base == getattr(getattr(directory, "anthem", None), "API_BASE", None))
+
+
+def retry_after_limit(directory, source_record):
+    """Retain the reviewed provider's full delay without changing other sources."""
+    return None if is_credentialed_rest_source(directory, source_record) else 600.0
+
+
+def credentialed_rest_request_allowed(directory, source_record, url):
+    """Reject origin, path and encoded traversal changes before resolving credentials."""
+    if not is_credentialed_rest_source(directory, source_record):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        normalized = parsed._replace(path=posixpath.normpath(urllib.parse.unquote(parsed.path))).geturl()
+        return bool(
+            directory._is_url_within_api_base(normalized, directory.anthem.API_BASE)
+            and "%" not in parsed.path
+            and not any(segment in {".", ".."} for segment in parsed.path.split("/"))
+            and not parsed.fragment
+            and "\\" not in url
+            and not any(ord(character) < 33 for character in url)
+        )
+    except ValueError:
+        return False
+
+
+def credentialed_rest_session(directory, source_record, url):
+    """Reuse a cancellable connection without enabling credentialed page prefetch."""
+    session = directory._SOURCE_HTTP_SESSION.get()
+    context = getattr(getattr(session, "connector", None), "_ssl", None)
+    return (
+        session
+        if session is not None
+        and not session.closed
+        and isinstance(context, ssl.SSLContext)
+        and context.check_hostname
+        and context.verify_mode == ssl.CERT_REQUIRED
+        and credentialed_rest_request_allowed(directory, source_record, url)
+        and directory._credential_spec_for_source(source_record)
+        else None
+    )
+
+
+def require_credentialed_rest_spec(directory, source_record, spec):
+    """Apply the reviewed token contract before every credential lookup path."""
+    if not is_credentialed_rest_source(directory, source_record):
+        return
+    if spec.get("query_params"):
+        raise ValueError("provider_directory_credential_query_parameters_forbidden")
+    oauth = directory._oauth2_spec(spec)
+    if oauth and directory._resolve_secret_text(oauth.get("token_url") or oauth.get("tokenUrl")) != (
+        directory.anthem.TOKEN_URL
+    ):
+        raise ValueError("provider_directory_credential_token_url_unapproved")
+
+
+async def credentialed_rest_options(directory, source_record, url):
+    """Share token refreshes across scans while keeping token I/O off the event loop."""
+    if not credentialed_rest_request_allowed(directory, source_record, url):
+        raise QualificationURLRejected("provider_directory_credential_url_outside_scope")
+    spec = directory._credential_spec_for_source(source_record)
+    require_credentialed_rest_spec(directory, source_record, spec)
+    oauth = directory._oauth2_spec(spec)
+    locks = CREDENTIAL_REQUEST_LOCKS.get()
+    if locks is None:
+        return await asyncio.to_thread(directory._credential_request_options_for_source, source_record, url, spec=spec)
+    key = directory._oauth2_cache_key(oauth)
+    lock = locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        return await asyncio.to_thread(directory._credential_request_options_for_source, source_record, url, spec=spec)
 
 
 def is_anonymous_source_url(url: str) -> bool:
@@ -57,16 +135,24 @@ def require_qualification_url(directory, url):
 
 def open_source_request(directory, request, *, timeout):
     """Refuse qualification and continuation redirects before contacting another destination."""
-    context = directory._ssl_context()
-    if QUALIFICATION_API_BASE.get() is None and not directory._has_fhir_continuation_query(request.full_url):
+    reviewed_base = getattr(getattr(directory, "anthem", None), "API_BASE", None)
+    is_credentialed = bool(
+        reviewed_base and credentialed_rest_request_allowed(directory, {"api_base": reviewed_base}, request.full_url)
+    )
+    context = directory._ssl_context(require_verified=True) if is_credentialed else directory._ssl_context()
+    if (
+        QUALIFICATION_API_BASE.get() is None
+        and not directory._has_fhir_continuation_query(request.full_url)
+        and not is_credentialed
+    ):
         return directory.christus.open_source_request(request, timeout=timeout, context=context)
     opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context), _NoQualificationRedirects())
     return opener.open(request, timeout=timeout)
 
 
-async def resolve_probe_credentials(credential_lookup, *args, **kwargs):
+async def resolve_probe_credentials(credential_lookup, *args, run_in_thread=False, **kwargs):
     """Keep qualification credential I/O off-loop and ordinary probes unchanged."""
-    if QUALIFICATION_API_BASE.get() is None:
+    if QUALIFICATION_API_BASE.get() is None and not run_in_thread:
         return credential_lookup(*args, **kwargs)
     return await asyncio.to_thread(credential_lookup, *args, **kwargs)
 
@@ -109,7 +195,10 @@ async def probe_declared_collection(directory, source_record, *, timeout, run_id
         if status != "valid":
             error = "resource search did not return a valid search Bundle"
     credential = await resolve_probe_credentials(
-        directory._credential_request_options_for_source, source_record, resource_probe["url"]
+        directory._credential_request_options_for_source,
+        source_record,
+        resource_probe["url"],
+        run_in_thread=is_credentialed_rest_source(directory, source_record),
     )
     return {
         **resource_probe,
@@ -124,6 +213,12 @@ async def probe_declared_collection(directory, source_record, *, timeout, run_id
 
 def open_token_request(directory, request, *, timeout):
     """Allow the configured token origin while refusing qualification redirects."""
+    if request.full_url == getattr(getattr(directory, "anthem", None), "TOKEN_URL", None):
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=directory._ssl_context(require_verified=True)),
+            _NoQualificationRedirects(),
+        )
+        return opener.open(request, timeout=timeout)
     if QUALIFICATION_API_BASE.get() is None:
         return urllib.request.urlopen(request, timeout=timeout, context=directory._ssl_context())
     return open_source_request(directory, request, timeout=timeout)
@@ -302,3 +397,130 @@ async def qualify_stale_isolated_source(directory, source_rows, task, *, timeout
     ):
         return [{**source_record, "last_validated_status": "valid"}]
     return source_rows
+
+
+async def fetch_unpaced_source_json(directory, source_record, url, *, timeout):
+    """Fetch through the admitted source transport without anonymous downgrade."""
+    directory.source_selection.require_qualification_url(directory, url)
+    proxy_run = directory.source_proxy.selected_run(directory, source_record)
+    if proxy_run is not None:
+        return await proxy_run.fetch(source_record, url, timeout=timeout)
+    census_contract = directory.current_version_census_contract(source_record)
+    if census_contract is not None:
+        if directory._has_source_declared_credentialed_access(source_record) or directory._credential_spec_for_source(
+            source_record
+        ):
+            raise RuntimeError("provider_directory_current_version_census_credentials_forbidden")
+        census_session = directory._SOURCE_HTTP_SESSION.get()
+        if census_session is None or census_session.closed:
+            raise RuntimeError("provider_directory_current_version_census_session_required")
+        return await directory._fetch_json_with_source_session(
+            census_session,
+            url,
+            timeout=timeout,
+            allow_redirects=False,
+            preserve_url_bytes=True,
+        )
+    if directory.capped_partition.enabled(directory, source_record):
+        capped_session = directory._SOURCE_HTTP_SESSION.get()
+        if capped_session is None or capped_session.closed:
+            raise RuntimeError("provider_directory_capped_search_session_required")
+        if directory._has_source_declared_credentialed_access(source_record) or directory._credential_spec_for_source(
+            source_record
+        ):
+            raise RuntimeError("provider_directory_capped_search_anonymous_required")
+        return await directory._fetch_json_with_source_session(
+            capped_session,
+            url,
+            timeout=timeout,
+            allow_redirects=False,
+            preserve_url_bytes=True,
+        )
+    if directory.source_selection.is_credentialed_rest_source(directory, source_record):
+        return await fetch_credentialed_rest_json(directory, source_record, url, timeout=timeout)
+    pinned_session = directory._SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.get()
+    if pinned_session is not None:
+        return await directory._fetch_json_with_source_session(
+            pinned_session,
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+    options = await directory.source_selection.resolve_probe_credentials(
+        directory._credential_request_options_for_source, source_record, url
+    )
+    if not options["headers"] and not options["query_params"]:
+        return await directory._fetch_json(url, timeout=timeout)
+    return await directory._fetch_json_with_options(
+        url,
+        timeout=timeout,
+        extra_headers=options["headers"],
+        query_params_by_name=options["query_params"],
+    )
+
+
+async def fetch_credentialed_rest_json(directory, source_record, url, *, timeout):
+    """Keep missing credentials and unverified sessions out of anonymous transport."""
+    options = await directory.source_selection.credentialed_rest_options(directory, source_record, url)
+    if not any(name.lower() == "authorization" and header_value for name, header_value in options["headers"].items()):
+        return None, None, "provider_directory_credentials_unavailable", 0
+    session = directory.source_selection.credentialed_rest_session(directory, source_record, url)
+    if session is not None:
+        return await directory._fetch_json_with_source_session(
+            session,
+            url,
+            timeout=timeout,
+            allow_redirects=False,
+            preserve_url_bytes=True,
+            extra_headers=options["headers"],
+            allow_gzip=True,
+        )
+    return await directory._fetch_json_with_options(
+        url, timeout=timeout, extra_headers=options["headers"], allow_gzip=True
+    )
+
+
+async def fetch_source_candidate(directory, source_record, candidate_url, *, timeout, is_last_candidate):
+    """Fetch one page-size candidate and report whether to try a smaller page."""
+    if directory.current_version_census_contract(source_record) is not None:
+        fetch_result, retry_count = await directory._fetch_current_version_census_json(
+            source_record,
+            candidate_url,
+            timeout=timeout,
+        )
+        return fetch_result, False, retry_count
+    empty_collection_retry_delays = directory._cigna_empty_collection_retry_delays(source_record, candidate_url)
+    attempt_count = max(directory._source_fetch_retry_attempts(), len(empty_collection_retry_delays) + 1)
+    total_elapsed_ms = 0
+    retry_count = 0
+    fetch_result = (None, None, "request_not_attempted", 0)
+    for attempt_index in range(attempt_count):
+        (
+            fetch_result,
+            should_try_smaller_page,
+            should_retry_fetch,
+            should_retry_empty_collection,
+        ) = await directory._fetch_source_json_attempt(
+            source_record,
+            candidate_url,
+            timeout=timeout,
+            empty_collection_retry_delays=empty_collection_retry_delays,
+        )
+        status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
+        total_elapsed_ms += elapsed_ms
+        if should_try_smaller_page and not is_last_candidate:
+            return directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms), True, retry_count
+        if not should_retry_fetch or attempt_index + 1 >= attempt_count:
+            break
+        retry_count += 1
+        await directory.asyncio.sleep(
+            directory._source_fetch_attempt_delay(
+                status_code,
+                fhir_payload,
+                attempt_index,
+                empty_collection_retry_delays,
+                should_retry_empty_collection,
+                max_delay_seconds=retry_after_limit(directory, source_record),
+            )
+        )
+    return directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms), False, retry_count
