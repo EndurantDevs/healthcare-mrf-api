@@ -19,6 +19,7 @@ from process.registry_approval_store import RegistryApprovalConflict, _stage_sel
 from process.registry_candidate_composition import compose_registry_membership_candidate
 from process.registry_imported_selection_preview import RegistryImportedSelectionUnavailable
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 from tests import cms_registry_recipe_postgres_support as cms_recipes
 from tests import test_network_approved_source_bindings_postgres as binding_tests
 from tests import test_network_initial_source_office_bindings_postgres as office_tests
@@ -113,9 +114,12 @@ async def test_prospective_binding_validation_excludes_inherited_controls(servin
                 approved_source.approved_revision,
                 *replace(binding_tests.COORDINATES, source_id=source_id).sql_parameters,
                 imported_preview._TRIM_CHARACTERS,
+                UHC_PROVIDER_FILE_SOURCE_ID,
             )
             assert dict(await connection.fetchrow(sql, *parameters)) == {
                 "binding_count": expected_count,
+                "plan_tier_count": 0,
+                "plan_tier_json": None,
                 "published_count": 0,
                 "published_json": None,
                 "invalid": False,

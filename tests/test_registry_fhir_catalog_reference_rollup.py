@@ -120,7 +120,8 @@ async def test_published_rollup_uses_global_sql_pages_and_precreated_workspace(p
         assert "provider_directory_dataset_resource" not in sql
         assert sql.count("LIMIT $5") == 1 and sql.count("sum(source_bytes) OVER") == 1
         assert "jsonb_array_elements" in sql and "GROUP BY resource_type,reference_json::text" in sql
-        assert query.args[-3:-1] == (2, 1024)
+        assert query.args[-4:-2] == (2, 1024)
+        assert query.args[-2:] == (rollup.MAX_PAGE_REFERENCES, False)
     assert queries[1].args[3:5] == ("PractitionerRole", "role-002")
     assert queries[2].args[3:5] == ("PractitionerRole", "role-003")
     assert all("payload_json" not in call.args[0] for call in connection.fetch.await_args_list)
@@ -136,7 +137,8 @@ async def test_reference_expansion_reduces_batch_size_without_counting_the_rejec
     ) as stage:
         assert stage.accounting.source_rows == stage.accounting.reference_rows == 1
     requests = connection.fetchrow.await_args_list[1:]
-    assert [request.args[-3:-1] for request in requests] == [(2, 1024), (1, 1024), (1, 1024)]
+    assert [request.args[-4:-2] for request in requests] == [(2, 1024), (1, 1024), (1, 1024)]
+    assert all(request.args[-2:] == (3, False) for request in requests)
     assert requests[0].args[3:5] == requests[1].args[3:5] == ("", "")
     assert requests[2].args[3:5] == ("PractitionerRole", "role-001")
     assert not stage.active
