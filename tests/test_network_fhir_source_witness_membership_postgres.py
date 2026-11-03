@@ -2,11 +2,14 @@
 """Genuine Source captures and exact reviewed mappings through existing v2 fact SQL."""
 
 from dataclasses import replace
+from functools import partial
+from types import SimpleNamespace
 
 import pytest
 
 from process import network_fhir_membership_source as fhir
 from process import network_fhir_source_witness_capture as source_capture
+from process import registry_imported_selection_preview as preview
 from process import registry_source_contribution_store as facts
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
@@ -15,6 +18,7 @@ from process.network_fhir_source_witness_contract import PRODUCER, source_witnes
 from process.network_source_binding_store import apply_network_source_binding_batch
 from process.registry_source_recipe_composition import (
     RegistrySourceCompositionError,
+    SourceWitnessRuntime,
     require_registry_source_recipe_custody,
 )
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
@@ -239,3 +243,47 @@ async def test_source_witness_capture_maps_only_approved_exact_offices_and_provi
                 "limits",
                 "LOCAL mapping proof only; final custody remains fail-closed, no office projection/publication/refresh/runtime/performance claim",
             )
+
+
+async def _preview_counts(case, recipe, approved, control_schema, monkeypatch):
+    """Count through genuine Source custody using the existing test runtime and approved pin."""
+    capture = recipe.source_pin.source_witness_capture
+    with monkeypatch.context() as preview_runtime:
+        preview_runtime.setattr(
+            preview,
+            "_require_recipe_custody",
+            partial(
+                require_registry_source_recipe_custody,
+                approved=approved,
+                control_schema=control_schema,
+                source_witness_runtime=SourceWitnessRuntime(
+                    case.source_export, (case.source_profile,), capture.owner_role, capture.runtime_roles
+                ),
+            ),
+        )
+        return await preview._recipe_impact(
+            case.reader,
+            recipe,
+            SimpleNamespace(expected_approved_revision=approved.approved_revision),
+            "(SELECT NULL::text AS record_kind,NULL::text AS record_key,NULL::bigint AS revision WHERE false)",
+            control_schema,
+        )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_source_witness_preview_binds_complete_capture_and_counts_approved_rows(monkeypatch, legacy):
+    """Both normalized profiles keep exact capture parameters and prospective aggregate counts."""
+    async with (
+        source_witness_case(monkeypatch, legacy=legacy) as case,
+        _registry_on_source(case.fixture, monkeypatch) as serving,
+    ):
+        await _registry_read_bootstrap(case, serving)
+        capture = await _capture(case, source_capture, capture_arguments(case))
+        recipe = _source_recipe(capture, case.anchors_by_id[capture.capture_id])
+        approved, _network_id = await _approve_mapping(serving, recipe, capture, organization="network-one")
+        async with case.reader.transaction(isolation="repeatable_read", readonly=True):
+            assert await _preview_counts(case, recipe, approved, serving[1], monkeypatch) == {
+                "mapped_rows": 2,
+                "omitted_rows": 0,
+                "unresolved_rows": 0,
+            }

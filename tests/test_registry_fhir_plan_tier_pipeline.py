@@ -30,6 +30,7 @@ from tests.test_network_fhir_source_witness_capture_postgres import _capture
 from tests.test_network_fhir_source_witness_membership_postgres import (
     _extract_facts,
     _mapped_facts,
+    _preview_counts,
     _read_guards_refuse,
     _registry_read_bootstrap,
     _source_recipe,
@@ -193,13 +194,12 @@ async def test_observed_published_plan_tier_replays_exact_office(monkeypatch):
         _registry_on_source(case.fixture, monkeypatch) as serving,
     ):
         await _registry_read_bootstrap(case, serving)
-        catalog_tier = await _original_catalog_tier(case)
+        tier = await _original_catalog_tier(case)
         capture = await _capture(case, capture_module, capture_arguments(case))
         anchor = case.anchors_by_id[capture.capture_id]
         recipe = _source_recipe(capture, anchor)
-        approved = await _approve_tier(serving, recipe, catalog_tier)
+        approved = await _approve_tier(serving, recipe, tier)
         control = serving[1]
-        tier = catalog_tier
         await _temporary_facts(case.reader)
         async with case.reader.transaction(isolation="repeatable_read", readonly=True):
             read, documents, _ = await _extract_facts(case, recipe, approved, control, anchor, limit=1)
@@ -217,8 +217,9 @@ async def test_observed_published_plan_tier_replays_exact_office(monkeypatch):
                 binding_coordinates=recipe.binding_coordinates,
                 retained_read=read,
             )
-            assert batch.unresolved_rows == 0 and batch.membership_rows == 1
-            assert json.loads(batch.input_bytes) == members
+            assert (batch.unresolved_rows, batch.membership_rows, json.loads(batch.input_bytes)) == (0, 1, members)
+            counts = await _preview_counts(case, recipe, approved, control, monkeypatch)
+            assert counts == {"mapped_rows": 1, "omitted_rows": 0, "unresolved_rows": 0}
             assert all(
                 resource_row.get("source_key") == "UHCPlanTier/" + tier["network_key_id"]
                 for resource_row in documents

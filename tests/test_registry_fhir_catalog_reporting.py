@@ -317,7 +317,7 @@ async def test_source_projection_reports_identity_and_measured_counts_without_ne
             object(),
             object(),
             object(),
-            {},
+            {"projector_version": sync.PROJECTOR_VERSION},
             previous,
             {"a" * 64: source},
         )
