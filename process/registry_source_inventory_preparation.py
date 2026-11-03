@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import replace
 
 from process.network_fhir_membership_source import (
+    FHIR_PLAN_TIER_WITNESS_TRANSFORM,
     FHIR_SOURCE_WITNESS_TRANSFORM_V2,
     PinnedFHIRMembershipSource,
     fhir_physical_source,
@@ -74,7 +75,7 @@ def _descriptor(document):
 
 
 def _check_fhir_descriptor(recipe, descriptor):
-    if descriptor["transform_version"] == FHIR_SOURCE_WITNESS_TRANSFORM_V2:
+    if descriptor["transform_version"] in {FHIR_SOURCE_WITNESS_TRANSFORM_V2, FHIR_PLAN_TIER_WITNESS_TRANSFORM}:
         identity, capture = verified_office_fact_identity(recipe)
         if descriptor["recipe_sha256"] != identity or descriptor["capture_sha256"] != capture:
             raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
@@ -90,7 +91,10 @@ def _check_fhir_descriptor(recipe, descriptor):
 
 def _check_derivation(recipe, descriptor, derivation):
     is_fhir = type(recipe.source_pin) is PinnedFHIRMembershipSource
-    is_witness = descriptor is not None and descriptor["transform_version"] == FHIR_SOURCE_WITNESS_TRANSFORM_V2
+    is_witness = descriptor is not None and descriptor["transform_version"] in {
+        FHIR_SOURCE_WITNESS_TRANSFORM_V2,
+        FHIR_PLAN_TIER_WITNESS_TRANSFORM,
+    }
     if "derivation_version" in derivation:
         if (
             not is_fhir

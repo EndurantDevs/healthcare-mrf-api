@@ -20,6 +20,7 @@ from process.registry_fhir_catalog_projection import (
     format_fhir_catalog_projection,
 )
 from process.registry_fhir_catalog_validation import canonical_json, snapshot_inputs
+from process.registry_fhir_plan_tier import TRANSFORM_VERSION, supports_plan_tiers
 
 _TABLES = {
     "network": (NETWORK_COLUMNS, "network_id"),
@@ -310,6 +311,45 @@ class _ProjectionReplay:
             await self.write("binding", projection.binding_rows)
             after = organizations[-1].resource_id
 
+    async def plan_tiers(self, generation, *, carried=False):
+        """Independently replay complete typed bindings and both source payload commitments."""
+        from process.registry_fhir_plan_tier_catalog import (
+            plan_tier_pages,
+            plan_tier_projection,
+            replace_plan_tier_bindings,
+        )
+
+        descriptor = self.sources[generation]["descriptor"]
+        if self.snapshot["projector_version"] != TRANSFORM_VERSION or not supports_plan_tiers(descriptor):
+            return
+        context = self.context(generation, "last_good" if carried else "current")
+        async for pairs in plan_tier_pages(
+            self.connection,
+            self.snapshot["schema_name"],
+            generation,
+            surviving_bindings=self.targets["binding"] if carried else None,
+        ):
+            projection, _ = await plan_tier_projection(
+                self.connection,
+                descriptor,
+                context,
+                pairs,
+                revision=self.snapshot["metadata_approved_revision"],
+                control_schema=self.grant.control_schema,
+                allocate=False,
+                as_of=self.snapshot["as_of"],
+            )
+            if not carried:
+                await replace_plan_tier_bindings(
+                    self.connection,
+                    self.targets,
+                    descriptor,
+                    [json.loads(binding_row[4])["source_key"] for binding_row in projection.binding_rows],
+                )
+                await self.write("network", projection.network_rows)
+                await self.write("binding", projection.binding_rows)
+            await self.write("relationship", projection.relationship_rows)
+
     async def replace_bindings(self, descriptor, identities):
         """Replace the same observed Organizations while preserving absent historical ones."""
         selection = (
@@ -468,8 +508,10 @@ class _ProjectionReplay:
                 "last_good" if self.sources[generation]["descriptor"]["profile"] == "retained_normalized" else "current"
             )
             await self.relationships(generation, status)
+            await self.plan_tiers(generation)
         for generation in sorted(self.sources.keys() - set(active)):
             await self.relationships(generation, "last_good")
+            await self.plan_tiers(generation, carried=True)
         await self.products(active)
         await self.compare(active)
         for target in reversed(tuple(self.targets.values())):

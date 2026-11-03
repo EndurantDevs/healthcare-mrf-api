@@ -23,11 +23,13 @@ from process.network_fhir_source_epoch import (
 from process.network_fhir_source_epoch_pin import _virtual_xid
 from process.network_fhir_source_witness_contract import (
     COMMENT_PREFIX,
+    COMPLETION_CONTRACT,
     CONTRACT,
     SCHEMA_PREFIX,
     TABLES,
     SourceWitnessCapture,
     SourceWitnessCaptureAnchor,
+    SourceWitnessCompletionOrigin,
     canonical,
     canonical_timestamp,
     capture_digest,
@@ -92,11 +94,12 @@ def _original_source_factory(factory, origin):
     """Invoke the installed Source adapter; a caller-supplied witness document has no authority."""
     from directory_membership_runtime import (
         CatalogSnapshotRuntime,
+        FHIRSourceMembershipCompletionInput,
         FHIRSourceMembershipInput,
         open_membership_source_export,
     )
 
-    require(type(origin) is FHIRSourceMembershipInput)
+    require(type(origin) in {FHIRSourceMembershipInput, FHIRSourceMembershipCompletionInput})
     require(
         type(factory) is partial
         and factory.func is open_membership_source_export
@@ -429,7 +432,8 @@ def _selection(origin):
 
 def _export_identity(export, reviewed, expected_identity=None):
     require(type(export) is dict and set(export) == {"contract", "origin", "database_identity", "resources"})
-    require(export["contract"] == CONTRACT and source_origin(export["origin"]) == reviewed)
+    contract = COMPLETION_CONTRACT if type(reviewed) is SourceWitnessCompletionOrigin else CONTRACT
+    require(export["contract"] == contract and source_origin(export["origin"]) == reviewed)
     identity = database_identity(export["database_identity"])
     require(
         identity.database_oid == reviewed.database_oid

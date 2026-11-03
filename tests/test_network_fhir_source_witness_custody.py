@@ -344,13 +344,33 @@ async def test_missing_installed_source_adapter_has_no_reader_fallback(
     runtime.source_export.assert_not_called()
 
 
+def _retained_origin(capture, with_completion):
+    """Build explicit synthetic input types without issuing native source custody."""
+    origin_type = make_dataclass("MembershipInput", [], bases=(witness.SourceWitnessOrigin,), frozen=True)
+    completion_type = make_dataclass("CompletionInput", [], bases=(witness.SourceWitnessCompletionOrigin,), frozen=True)
+    origin = origin_type(**asdict(capture.origin))
+    if with_completion:
+        origin = completion_type(
+            **(
+                asdict(capture.origin)
+                | {
+                    "admission_profile": witness.ADMITTED_TRANSPORT_PROFILE,
+                    "semantic_projection_as_of": None,
+                    "completion_required_version": 3,
+                    "completion_sha256": "a" * 64,
+                }
+            )
+        )
+    return origin, origin_type, completion_type
+
+
 @pytest.fixture
-def retained_replay(monkeypatch):
+def retained_replay(monkeypatch, request):
     """Model the installed adapter and native row IO; no native custody is issued."""
     capture = captured()
-    origin_type = make_dataclass("MembershipInput", [], bases=(witness.SourceWitnessOrigin,), frozen=True)
+    origin, origin_type, completion_type = _retained_origin(capture, getattr(request, "param", False))
     case = SimpleNamespace(
-        origin=origin_type(**asdict(capture.origin)),
+        origin=origin,
         anchor=witness.SourceWitnessCaptureAnchor(capture.capture_id, capture.release_id, capture.observed_at),
         identity=capture.source_database,
         profile=_profile(),
@@ -360,6 +380,7 @@ def retained_replay(monkeypatch):
         is_current=False,
     )
     case.exported_origin, case.exported_identity = case.origin, case.identity
+    case.contract = witness.COMPLETION_CONTRACT if type(origin) is completion_type else witness.CONTRACT
 
     async def pages():
         try:
@@ -377,7 +398,7 @@ def retained_replay(monkeypatch):
         assert origin is case.origin and not case.is_current
         case.events.append("source.retained")
         yield dict(
-            contract=witness.CONTRACT,
+            contract=case.contract,
             origin=case.exported_origin,
             database_identity=case.exported_identity,
             resources=pages,
@@ -388,6 +409,7 @@ def retained_replay(monkeypatch):
     adapter = SimpleNamespace(
         CatalogSnapshotRuntime=type(case.runtime),
         FHIRSourceMembershipInput=origin_type,
+        FHIRSourceMembershipCompletionInput=completion_type,
         open_membership_source_export=source_export,
     )
     monkeypatch.setitem(sys.modules, "directory_membership_runtime", adapter)
@@ -422,6 +444,25 @@ async def test_retained_replay_passes_bound_origin_and_finishes_after_eof(retain
     assert await _replay(case) == case.identity
     case.finish.assert_awaited_once()
     assert case.events == ["source.retained", "source.eof", "source.closed", "candidate.checked", "source.exit"]
+
+
+@pytest.mark.parametrize("retained_replay", [True], indirect=True)
+@pytest.mark.parametrize("change", [None, "contract", "completion"])
+async def test_completion_replay_requires_original_version_and_proof_identity(retained_replay, change):
+    case = retained_replay
+    if change == "contract":
+        case.contract = witness.CONTRACT
+    elif change == "completion":
+        case.exported_origin = replace(case.origin, completion_sha256="b" * 64)
+    if change is None:
+        assert await _replay(case) == case.identity
+        case.finish.assert_awaited_once()
+        assert case.events[-1] == "source.exit"
+    else:
+        with pytest.raises(ValueError):
+            await _replay(case)
+        case.compare.assert_not_awaited()
+        case.finish.assert_not_awaited()
 
 
 @pytest.mark.parametrize("fault", ["origin", "database", "identity"])

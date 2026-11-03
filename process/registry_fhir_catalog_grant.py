@@ -14,7 +14,7 @@ from datetime import datetime
 from uuid import UUID
 
 from db.plan_release_storage import storage_identifier
-from db.registry_fhir_catalog import PROJECTOR_VERSION, SNAPSHOT_COLUMNS
+from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_fhir_catalog_custody import verify_fhir_catalog_snapshot
 from process.registry_fhir_catalog_fingerprints import require_fhir_catalog_mapping_revision
@@ -48,6 +48,7 @@ from process.registry_fhir_catalog_validation import (
     metadata_generation,
     snapshot_inputs,
 )
+from process.registry_fhir_plan_tier import SUPPORTED_TRANSFORMS
 from process.registry_source_recipe_store import (
     RegistrySourceMembershipRecipe,
     canonical_registry_source_recipes,
@@ -529,7 +530,7 @@ class _GrantCallbacks:
         ):
             _fail("policy_changed")
         if (
-            stored["projector_version"] != PROJECTOR_VERSION
+            stored["projector_version"] not in SUPPORTED_TRANSFORMS
             or command["metadata_generation"] != stored["metadata_generation"]
             or command["expected_serving_generation"] != stored["network_generation"]
         ):
@@ -816,7 +817,7 @@ def build_fhir_catalog_observation_verifier(
     if source_export is not None and not callable(source_export):
         _fail("source_export_invalid")
 
-    async def verify(*, connection, copy_target, snapshot, standing_grant):
+    async def verify_inputs(*, connection, copy_target, snapshot, standing_grant):
         """Verify fresh facts or exact prior custody only after candidate writes close."""
         if standing_grant.sha256 != grant.sha256 or copy_target.schema_name != snapshot["schema_name"]:
             _fail("policy_changed")
@@ -831,9 +832,11 @@ def build_fhir_catalog_observation_verifier(
             descriptor = descriptors[generation]
             if not _is_observed_source(descriptor):
                 continue
-            if generation in previous:
-                if descriptor != previous[generation]:
-                    _fail("observation_history_changed")
+            from process.registry_fhir_plan_tier import needs_plan_tier_refresh
+
+            if generation in previous and descriptor != previous[generation]:
+                _fail("observation_history_changed")
+            if generation in previous and not needs_plan_tier_refresh(prior, snapshot, descriptor):
                 await _verify_carried_observation(connection, snapshot, prior, generation)
             else:
                 if entry["status"] != "current":
@@ -851,6 +854,13 @@ def build_fhir_catalog_observation_verifier(
         await validate_fhir_catalog_observed_projection(
             connection, snapshot, standing_grant=grant, prior_snapshot=prior, registry_reader=registry_reader
         )
+
+    async def verify(**arguments):
+        """Replay the extractor named by the closed snapshot, restoring caller context."""
+        from process.registry_fhir_plan_tier import extraction_transform
+
+        with extraction_transform(arguments["snapshot"]["projector_version"]):
+            return await verify_inputs(**arguments)
 
     return verify
 

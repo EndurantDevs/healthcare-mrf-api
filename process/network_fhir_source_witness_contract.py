@@ -15,10 +15,26 @@ from process.network_fhir_retained_capture_contract import (
     text,
 )
 from process.network_fhir_retained_capture_contract import TABLES as RETAINED_TABLES
+from process.provider_directory_admission_seal import ADMISSION_RAW_METADATA_MAX_BYTES
 from process.registry_fhir_catalog_extraction import fhir_source_uri
 
 CONTRACT = "fhir-source-membership-witness-v1"
+COMPLETION_CONTRACT = "fhir-source-membership-witness-v2"
 OBSERVED_LEGACY_PROFILE = "observed-legacy-normalized-v1"
+OBSERVED_PROOF_PROFILE = "observed-generic-legacy-proof-v1"
+OBSERVED_SEMANTIC_PROFILE = "observed-semantic-v3-v1"
+ADMITTED_LEGACY_PROFILE = "admitted-generic-legacy-v1"
+ADMITTED_TRANSPORT_PROFILE = "admitted-generic-transport-v2-v1"
+ADMITTED_UHC_PROFILE = "admitted-uhc-transport-v2-v1"
+HASH_CONTRACTS = {
+    OBSERVED_LEGACY_PROFILE: "transport_bound_v1",
+    OBSERVED_PROOF_PROFILE: "transport_bound_v1",
+    OBSERVED_SEMANTIC_PROFILE: "semantic_content_v3",
+    ADMITTED_LEGACY_PROFILE: "transport_bound_v1",
+    ADMITTED_TRANSPORT_PROFILE: "transport_neutral_v2",
+    ADMITTED_UHC_PROFILE: "transport_neutral_v2",
+    SEMANTIC_PROFILE: "semantic_content_v4",
+}
 CAPTURE_CONTRACT = "registry-source-fhir-witness-capture-v1"
 PRODUCER = "registry-source-fhir-witness-v1"
 SCHEMA_PREFIX = "registry_fhir_witness_"
@@ -55,6 +71,14 @@ def _pairs(value):
     require(type(value) in {list, tuple})
     require(all(type(pair) in {list, tuple} and len(pair) == 2 for pair in value))
     return tuple(tuple(pair) for pair in value)
+
+
+def source_metadata_max_bytes(profile):
+    """Keep existing declaration bounds; new proof profiles use the original streaming admission cap."""
+    require(profile in HASH_CONTRACTS)
+    if profile in {OBSERVED_LEGACY_PROFILE, SEMANTIC_PROFILE}:
+        return 64 * 1024**2 - 32768 - 1
+    return ADMISSION_RAW_METADATA_MAX_BYTES
 
 
 def canonical_timestamp(value):
@@ -115,7 +139,10 @@ class SourceWitnessOrigin:
             "native_catalog_sha256",
         ):
             require(is_sha256(getattr(self, name)))
-        require(type(self.metadata_bytes) is int and 0 < self.metadata_bytes < 64 * 1024**2 - 32768)
+        require(
+            type(self.metadata_bytes) is int
+            and 0 < self.metadata_bytes <= source_metadata_max_bytes(self.admission_profile)
+        )
         _system_identifier(self.database_system_identifier)
         require(
             type(self.source_aliases) is tuple
@@ -130,20 +157,42 @@ class SourceWitnessOrigin:
         _origin_families(self)
         require(self.source_id != "cms-npd")
         require(type(self.unresolved_plan_network_count) is int and self.unresolved_plan_network_count >= 0)
-        if self.admission_profile == OBSERVED_LEGACY_PROFILE:
+        require(self.admission_profile in HASH_CONTRACTS)
+        if self.admission_profile in {OBSERVED_LEGACY_PROFILE, OBSERVED_SEMANTIC_PROFILE}:
             require(
-                self.proof_sha256 is None
-                and self.admission_metadata_sha256 is None
-                and self.semantic_projection_as_of is None
-                and self.descriptor_counts is None
+                self.proof_sha256 is None and self.admission_metadata_sha256 is None and self.descriptor_counts is None
             )
-            return
-        require(self.admission_profile == SEMANTIC_PROFILE and is_sha256(self.proof_sha256))
-        require(is_sha256(self.admission_metadata_sha256) and self.descriptor_counts == self.resource_counts)
-        require(
-            type(self.semantic_projection_as_of) is str
-            and date.fromisoformat(self.semantic_projection_as_of).isoformat() == self.semantic_projection_as_of
-        )
+        else:
+            require(is_sha256(self.proof_sha256) and self.descriptor_counts is not None)
+            require(all(count >= dict(self.resource_counts)[kind] for kind, count in self.descriptor_counts))
+            if self.admission_profile == OBSERVED_PROOF_PROFILE:
+                require(self.admission_metadata_sha256 is None)
+                require(self.descriptor_counts != self.resource_counts)
+            else:
+                require(is_sha256(self.admission_metadata_sha256))
+                if self.admission_profile != SEMANTIC_PROFILE:
+                    require(self.descriptor_counts == self.resource_counts)
+        if self.admission_profile in {SEMANTIC_PROFILE, OBSERVED_SEMANTIC_PROFILE}:
+            require(
+                type(self.semantic_projection_as_of) is str
+                and date.fromisoformat(self.semantic_projection_as_of).isoformat() == self.semantic_projection_as_of
+            )
+        else:
+            require(self.semantic_projection_as_of is None)
+
+
+@dataclass(frozen=True)
+class SourceWitnessCompletionOrigin(SourceWitnessOrigin):
+    """Version two additionally pins the independently persisted completion proof."""
+
+    completion_required_version: int
+    completion_sha256: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        require(self.admission_profile == ADMITTED_TRANSPORT_PROFILE)
+        require(type(self.completion_required_version) is int and self.completion_required_version == 3)
+        require(is_sha256(self.completion_sha256))
 
 
 def _origin_families(origin):
@@ -169,19 +218,21 @@ def _origin_families(origin):
 
 def source_origin(value):
     """Decode a declaration only; the original Source factory authenticates it."""
-    if type(value) is SourceWitnessOrigin:
+    if type(value) in {SourceWitnessOrigin, SourceWitnessCompletionOrigin}:
         value.__post_init__()
         return value
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
-    require(type(value) is dict and set(value) == set(SourceWitnessOrigin.__dataclass_fields__))
+    require(type(value) is dict)
+    origin_type = SourceWitnessCompletionOrigin if "completion_sha256" in value else SourceWitnessOrigin
+    require(set(value) == set(origin_type.__dataclass_fields__))
     origin_by_field = dict(value)
     for name in ("resource_counts", "resource_hashes", "descriptor_counts"):
         if name != "descriptor_counts" or origin_by_field[name] is not None:
             origin_by_field[name] = _pairs(origin_by_field[name])
     require(type(origin_by_field["source_aliases"]) in {list, tuple})
     origin_by_field["source_aliases"] = tuple(origin_by_field["source_aliases"])
-    return SourceWitnessOrigin(**origin_by_field)
+    return origin_type(**origin_by_field)
 
 
 @dataclass(frozen=True)
@@ -274,7 +325,7 @@ def require_capture_anchor(capture, expected_anchor):
 def source_witness_membership_date(capture, expected_anchor):
     """Bind legacy evaluation to the independent Core observation, preserving absent Source dates."""
     capture = require_capture_anchor(capture, expected_anchor)
-    if capture.origin.admission_profile == OBSERVED_LEGACY_PROFILE:
+    if capture.origin.semantic_projection_as_of is None:
         return datetime.fromisoformat(capture.observed_at).date().isoformat()
     return capture.origin.semantic_projection_as_of
 
@@ -316,7 +367,8 @@ def validate_capture(capture):
         type(capture) is SourceWitnessCapture and type(capture.contract) is str and capture.contract == CAPTURE_CONTRACT
     )
     require(
-        type(capture.origin) is SourceWitnessOrigin and type(capture.source_database) is SourceWitnessDatabaseIdentity
+        type(capture.origin) in {SourceWitnessOrigin, SourceWitnessCompletionOrigin}
+        and type(capture.source_database) is SourceWitnessDatabaseIdentity
     )
     source_origin(capture.origin)
     database_identity(capture.source_database)

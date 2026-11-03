@@ -161,6 +161,55 @@ async def _read(fixture, query=None, policy=None, network_id=None, *, control_sc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["empty", "no_location", "no_address", "matching", "late_match"])
+async def test_directory_availability_preserves_page_and_filtered_census(catalog_database, case):
+    fixture = catalog_database
+    namespace = '"' + fixture.memberships + '"'
+    query = catalog.FHIRCatalogQuery(limit=1)
+    if case == "empty":
+        query = replace(query, search="absent network")
+    elif case == "no_location":
+        await fixture.connection.execute(
+            f"DELETE FROM {namespace}.provider_location_binding WHERE location_id='one'; "
+            f"INSERT INTO {namespace}.provider_location_binding "
+            "VALUES('npi','1234567890','two','other-office','npi','1234567890'); "
+            f"INSERT INTO {namespace}.entity_address_unified VALUES('other-office','npi','1234567890')"
+        )
+    elif case == "no_address":
+        await fixture.connection.execute(
+            f"DELETE FROM {namespace}.entity_address_unified WHERE location_key='office'; "
+            f"INSERT INTO {namespace}.entity_address_unified VALUES('other-office','npi','1234567890')"
+        )
+    elif case == "late_match":
+        await fixture.connection.execute(
+            f"DELETE FROM {namespace}.network_membership; "
+            f"INSERT INTO {namespace}.network_membership "
+            "SELECT 7,'npi',lpad(value::text,10,'0'),'unmatched' FROM generate_series(1,100) value; "
+            f"INSERT INTO {namespace}.network_membership VALUES(7,'npi','1234567890','one')"
+        )
+    page = await _read(fixture, query)
+    assert page["total"] == (0 if case == "empty" else 3)
+    assert len(page["items"]) == (0 if case == "empty" else 1)
+    if page["items"]:
+        assert page["items"][0]["network_id"] == 7
+        assert page["items"][0]["directory_available"] is (case in {"matching", "late_match"})
+    if case != "empty":
+        availability_by_network_id = {
+            network_document["network_id"]: network_document["directory_available"]
+            for network_document in (await _read(fixture, replace(query, limit=3)))["items"]
+        }
+        assert availability_by_network_id[8] is False and availability_by_network_id[9] is False
+    filtered = await _read(fixture, catalog.FHIRCatalogQuery(limit=1, company_id=COMPANY))
+    assert filtered["total"] == len(filtered["items"]) == 1
+    hidden = await _read(
+        fixture,
+        catalog.FHIRCatalogQuery(limit=1, company_id=COMPANY),
+        RegistryOrganizationVisibility((COMPANY,), ()),
+    )
+    assert hidden["total"] == 0 and not hidden["items"]
+
+
+@pytest.mark.asyncio
 async def test_combined_filters_share_relationship(catalog_database):
     fixture = catalog_database
     second = relationship_document()

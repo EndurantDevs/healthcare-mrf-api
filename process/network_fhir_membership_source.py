@@ -1005,10 +1005,9 @@ def _extraction_sql(source_pin, registry_namespace, reviewed, approved_only=Fals
     is_retained = fhir_normalized_capture(fhir_physical_source(source_pin)) is not None
     if is_retained:
         complete_key = "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL"
-    witness_fields = _source_witness_fields(source_pin, reviewed)
     provider_fields = _provider_identity_fields(source_pin, reviewed)
-    return sql.format(
-        **witness_fields,
+    query = sql.format(
+        **_source_witness_fields(source_pin, reviewed),
         **provider_fields,
         provider_only=(
             "expanded.location_reference IS NULL AND "
@@ -1054,6 +1053,128 @@ def _extraction_sql(source_pin, registry_namespace, reviewed, approved_only=Fals
         reviewed_join=_reviewed_network_join(is_retained, reviewed, approved_only),
         legacy_joins=_fhir_legacy_joins(source_pin, registry_namespace, reviewed, is_retained),
     )
+    return _plan_tier_membership_sql(query, source_pin, batch=True, approved_only=approved_only)
+
+
+def _is_plan_tier_source(source_pin):
+    from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
+    return source_pin.source_witness_capture is not None and source_pin.source_id == UHC_PROVIDER_FILE_SOURCE_ID
+
+
+def _plan_tier_evidence_sql(source_pin, *, batch):
+    """Join each typed role to the exact captured Plan without changing Source authority."""
+    dataset, capture = ("$8", "$17") if batch else ("$1", "$10")
+    resources = _identifier(source_pin.read_schema_name) + ".provider_directory_dataset_resource"
+    return f"""), tier_evidence AS MATERIALIZED (
+        SELECT page.resource_type,page.resource_id,coalesce(plan.payload_json::jsonb->'network_refs','[]'::jsonb)='[]'::jsonb AS empty_plan_network,'UHCPlanTier/'||(page.payload->>'network_key_id') AS source_key,
+          jsonb_build_object('kind','uhc_plan_tier_v1','plan_scope',page.payload->'plan_scope',
+            'network_tier',page.payload->'network_tier','network_key_id',page.payload->'network_key_id',
+            'plan_resource_id',split_part(page.payload->'insurance_plan_refs'->>0,'/',2),
+            'capture_sha256',{capture}::text) AS scope,
+          coalesce(jsonb_typeof(page.payload->'insurance_plan_refs')='array'
+            AND jsonb_array_length(page.payload->'insurance_plan_refs')=1
+            AND page.payload->'insurance_plan_refs'->>0='InsurancePlan/'||plan.resource_id
+            AND plan.payload_hash ~ '^[0-9a-f]{{64}}$'
+            AND plan.payload_json::jsonb->>'resource_id'=plan.resource_id
+            AND plan.payload_json::jsonb->'plan_json'->>'canonical_contract_id'='healthporta.uhc.provider-directory-canonical.v2'
+            AND plan.payload_json::jsonb->'plan_json'->'plan_key'=page.payload->'plan_scope'
+            AND plan.resource_id='uhcplan-'||left(page.payload->'plan_scope'->>'plan_key_id',48),false) AS valid
+        FROM page LEFT JOIN {resources} plan ON plan.dataset_id={dataset} AND plan.resource_type='InsurancePlan'
+          AND plan.resource_id=split_part(page.payload->'insurance_plan_refs'->>0,'/',2)
+        WHERE page.payload->>'network_key_id' IS NOT NULL OR page.payload->>'network_tier' IS NOT NULL
+      ), plan_networks AS MATERIALIZED ("""
+
+
+def _plan_tier_membership_sql(query, source_pin, *, batch, approved_only=False):
+    """Extend the two existing readers while retaining their provider, office and page guards."""
+    if not _is_plan_tier_source(source_pin):
+        return query
+    complete = "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL"
+    organization = "network.resource_id" if batch else "expanded.network_resource_id"
+    capture = "$17" if batch else "$10"
+    scope = f"jsonb_build_object('organization_id',{organization},'capture_sha256',{capture}::text)"
+    expected_counts_by_anchor = {
+        "), plan_networks AS MATERIALIZED (": 1,
+        "        LEFT JOIN LATERAL (\n          SELECT CASE WHEN reference ~ '^Organization/": 1,
+        "        ) networks ON true": 1,
+        " AS malformed\n        FROM page": 1,
+        "        FROM expanded\n        LEFT JOIN": 1,
+        complete: 2 if batch and approved_only else 0 if batch else 1,
+        "network.resource_id IS NULL OR network_evidence.resource_id IS NULL": int(batch and approved_only),
+        scope: 1,
+    }
+    if any(query.count(anchor) != count for anchor, count in expected_counts_by_anchor.items()):
+        raise FHIRMembershipSourceError("FHIR plan-tier membership SQL anchors are invalid")
+    tier_cte = _plan_tier_evidence_sql(source_pin, batch=batch)
+    query = query.replace("), plan_networks AS MATERIALIZED (", tier_cte, 1)
+    predicate = "tier.resource_type=providers.resource_type AND tier.resource_id=providers.resource_id"
+    start = query.index("        LEFT JOIN LATERAL (\n          SELECT CASE WHEN reference ~ '^Organization/")
+    end = query.index("        ) networks ON true", start)
+    body = query[start + len("        LEFT JOIN LATERAL (") : end]
+    body += (
+        " WHERE plan_networks.network_resource_id IS NOT NULL OR NOT EXISTS("
+        f"SELECT FROM tier_evidence tier WHERE {predicate} AND tier.empty_plan_network)"
+    )
+    query = (
+        query[:start]
+        + (
+            "        LEFT JOIN LATERAL (" + body + " UNION "
+            f"SELECT tier.source_key FROM tier_evidence tier WHERE {predicate}\n"
+        )
+        + query[end:]
+    )
+    query = query.replace(
+        " AS malformed\n        FROM page",
+        " OR EXISTS(SELECT FROM tier_evidence tier "
+        "WHERE tier.resource_type=page.resource_type AND tier.resource_id=page.resource_id AND NOT tier.valid) AS malformed\n        FROM page",
+        1,
+    )
+    query = query.replace(
+        "        FROM expanded\n        LEFT JOIN",
+        "        FROM expanded\n"
+        "        LEFT JOIN tier_evidence tier ON tier.resource_type=expanded.resource_type AND tier.resource_id=expanded.resource_id AND tier.source_key=expanded.network_resource_id\n        LEFT JOIN",
+        1,
+    )
+    query = query.replace(complete, "(" + complete + " OR coalesce(tier.valid,false))")
+    query = query.replace(
+        "network.resource_id IS NULL OR network_evidence.resource_id IS NULL",
+        "(network.resource_id IS NULL OR network_evidence.resource_id IS NULL) AND NOT coalesce(tier.valid,false)",
+    )
+    query = query.replace(scope, f"coalesce(tier.scope,{scope})")
+    if batch:
+        query = _plan_tier_approved_sql(query, approved_only=approved_only)
+    return query
+
+
+def _plan_tier_approved_sql(query, *, approved_only):
+    """Bind the typed key to exactly its approved capture scope in the existing batch query."""
+    expected_counts_by_anchor = {
+        "ON approved.network_resource_id=network.resource_id": 0 if approved_only else 1,
+        "network.resource_id AS fact_source_key": 1,
+        "FROM fhir_product_references WHERE network_resource_id IS NOT NULL\n)": 1,
+        "AND $14::text IS NOT NULL": 1,
+    }
+    if any(query.count(anchor) != count for anchor, count in expected_counts_by_anchor.items()):
+        raise FHIRMembershipSourceError("FHIR plan-tier approved SQL anchors are invalid")
+    query = query.replace(
+        "ON approved.network_resource_id=network.resource_id",
+        "ON approved.network_resource_id=coalesce(tier.source_key,network.resource_id)",
+    )
+    query = query.replace(
+        "network.resource_id AS fact_source_key", "coalesce(tier.source_key,network.resource_id) AS fact_source_key"
+    )
+    query = query.replace(
+        "FROM fhir_product_references WHERE network_resource_id IS NOT NULL\n)",
+        "FROM fhir_product_references WHERE network_resource_id IS NOT NULL UNION ALL "
+        "SELECT record_key,network_id,record_json,record_json->>'source_key',NULL::text,NULL::text,NULL::jsonb "
+        "FROM approved_network_bindings WHERE record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1'\n)",
+    )
+    query = query.replace(
+        "AND $14::text IS NOT NULL",
+        "AND $14::text IS NOT NULL AND (tier.scope IS NULL OR approved.record_json->'source_scope_json'=tier.scope)",
+    )
+    return query
 
 
 def _unresolved_network_sql(is_retained, approved_only, reviewed, complete_key):
@@ -1218,6 +1339,7 @@ async def _read_fhir_membership_page(
     descriptor = _reviewed_descriptor(source_pin, approved_source, binding_coordinates, approved_only)
     if type(capture_facts) is not bool or (capture_facts and not approved_only):
         raise FHIRMembershipSourceError("FHIR fact capture requires approved-only selection")
+    capture_facts = capture_facts or _is_plan_tier_source(source_pin)
     _validate_source_page(limit, after_resource)
     registry_namespace = _identifier(registry_schema)
     approved_parameters = await _require_source_recipe(
@@ -1250,6 +1372,13 @@ def _fhir_batch(source_pin, batch, approved_source, binding_coordinates, approve
     """Bound and validate one complete SQL page before exposing its dispositions."""
     if batch.get("product_selection_invalid", False):
         raise FHIRMembershipSourceError("Selected FHIR product plan is unavailable")
+    if _is_plan_tier_source(source_pin):
+        from process.registry_source_contribution_store import _validate_fhir_fact
+
+        if batch["source_facts"] is None:
+            raise FHIRMembershipBatchBoundsError("FHIR membership batch exceeds bounds")
+        for fact in json.loads(batch["source_facts"]):
+            _validate_fhir_fact(fact, source_pin)
     if batch["input_json"] is None:
         raise FHIRMembershipBatchBoundsError("FHIR membership batch exceeds bounds")
     input_bytes = batch["input_json"].encode()
@@ -1353,6 +1482,12 @@ async def copy_fhir_membership_batch(
 
 # Explicit v2 witnesses never change the legacy fact transform or its SQL bytes.
 FHIR_SOURCE_WITNESS_TRANSFORM_V2 = "fhir-source-witnesses-v2"
+FHIR_PLAN_TIER_WITNESS_TRANSFORM = "fhir-uhc-plan-tier-witnesses-v1"
+
+
+def fhir_source_witness_transform(source_pin):
+    """Version only the supported typed source while retaining existing witness identities."""
+    return FHIR_PLAN_TIER_WITNESS_TRANSFORM if _is_plan_tier_source(source_pin) else FHIR_SOURCE_WITNESS_TRANSFORM_V2
 
 
 _WITNESS_SQL_V2 = """WITH page AS MATERIALIZED (
@@ -1540,7 +1675,7 @@ def _source_witness_sql_v2(source_pin):
     complete_key = "network.resource_id IS NOT NULL AND network_evidence.resource_id IS NOT NULL"
     if not is_retained:
         complete_key += " AND legacy.network_id IS NOT NULL AND legacy.resource_type='Organization'"
-    return _WITNESS_SQL_V2.format(
+    query = _WITNESS_SQL_V2.format(
         **_source_witness_fields(source_pin, False),
         **provider_fields,
         source_namespace=_identifier(source_pin.read_schema_name),
@@ -1569,6 +1704,7 @@ def _source_witness_sql_v2(source_pin):
             provider_fields["provider_evidence"].replace("network_id", "NULL::integer"),
         ).replace("site_id", "binding.site_id"),
     )
+    return _plan_tier_membership_sql(query, source_pin, batch=False)
 
 
 def _validate_witness_cursor(after_resource):

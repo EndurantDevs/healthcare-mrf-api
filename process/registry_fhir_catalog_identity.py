@@ -48,9 +48,21 @@ def _validate_identity_source_aliases(source_aliases):
         raise ValueError("registry_fhir_catalog_identity_aliases_invalid")
 
 
-def _prepared(identity_inputs):
+def _allocation_key(network_identity, identity_kind):
+    """Preserve Organization identities and give plan tiers a separate allocation domain."""
+    allocation_parts = [network_identity.endpoint_id, network_identity.organization_id]
+    if identity_kind == "plan_tier":
+        allocation_parts.insert(1, "uhc_plan_tier_v1")
+    return uuid5(_ALLOCATION_DOMAIN, json.dumps(allocation_parts, separators=(",", ":")))
+
+
+def _prepared(identity_inputs, *, identity_kind="organization"):
     """Validate identity inputs and prepare their bounded COPY records without database writes."""
-    if type(identity_inputs) is not tuple or not 0 < len(identity_inputs) <= MAX_ROWS:
+    if (
+        identity_kind not in {"organization", "plan_tier"}
+        or type(identity_inputs) is not tuple
+        or not 0 < len(identity_inputs) <= MAX_ROWS
+    ):
         raise ValueError("registry_fhir_catalog_identity_bounds")
     identity_rows = []
     for ordinal, network_identity in enumerate(identity_inputs):
@@ -70,6 +82,10 @@ def _prepared(identity_inputs):
                 raise ValueError("registry_fhir_catalog_identity_invalid")
         _validate_identity_source_aliases(network_identity.source_aliases)
         legacy = None if network_identity.legacy_uuid is None else UUID(network_identity.legacy_uuid)
+        if identity_kind == "plan_tier" and (
+            legacy is not None or re.fullmatch(r"[0-9a-f]{64}", network_identity.organization_id) is None
+        ):
+            raise ValueError("registry_fhir_catalog_identity_invalid")
         if legacy is not None and (not legacy.int or str(legacy) != network_identity.legacy_uuid):
             raise ValueError("registry_fhir_catalog_identity_legacy_invalid")
         if (
@@ -82,10 +98,7 @@ def _prepared(identity_inputs):
             )
         ):
             raise ValueError("registry_fhir_catalog_identity_legacy_invalid")
-        allocation = uuid5(
-            _ALLOCATION_DOMAIN,
-            json.dumps([network_identity.endpoint_id, network_identity.organization_id], separators=(",", ":")),
-        )
+        allocation = _allocation_key(network_identity, identity_kind)
         identity_rows.append(
             (
                 ordinal,
@@ -106,13 +119,14 @@ def _prepared(identity_inputs):
 _RESOLVE_SQL = """WITH candidates AS (
   SELECT s.ordinal,a.network_id FROM {stage} s JOIN {control}.network_registry_alias a
     ON a.source_system='fhir' AND a.source_id=ANY(s.source_aliases)
-      AND ((a.alias_type='fhir_organization' AND a.alias_value=s.organization_id AND a.scope_key=$2)
+      AND ((a.alias_type=$3 AND a.alias_value=s.organization_id AND a.scope_key=$2)
         OR (a.alias_type='legacy_fhir_uuid' AND a.alias_value=s.legacy_uuid::text AND a.scope_key=s.legacy_scope))
   UNION
   SELECT s.ordinal,(b.record_json->>'network_id')::integer FROM {stage} s
     JOIN {control}.registry_approved_record b ON b.approved_revision=$1 AND b.record_kind='network_binding'
     AND b.record_json->>'source_system'='fhir' AND b.record_json->>'source_id'=ANY(s.source_aliases)
-    AND b.record_json->>'source_key'=s.organization_id AND b.record_json->'archived'='false'::jsonb
+    AND b.record_json->>'source_key'=CASE WHEN $3='fhir_plan_tier' THEN 'UHCPlanTier/' ELSE '' END||s.organization_id
+    AND b.record_json->'archived'='false'::jsonb
   UNION
   SELECT s.ordinal,i.network_id FROM {stage} s JOIN {control}.network_registry_identity i USING(allocation_key)
 ), resolved AS (
@@ -121,16 +135,21 @@ _RESOLVE_SQL = """WITH candidates AS (
 ) UPDATE {stage} s SET network_id=r.network_id,conflict=r.conflict FROM resolved r WHERE r.ordinal=s.ordinal"""
 
 
-async def allocate_fhir_catalog_network_ids(connection, rows, *, approved_revision, control_schema):
+async def allocate_fhir_catalog_network_ids(
+    connection, rows, *, approved_revision, control_schema, identity_kind="organization"
+):
     """COPY once, resolve aliases together, allocate only missing keys, append exact aliases."""
     if not connection.is_in_transaction() or type(approved_revision) is not int or approved_revision < 0:
         raise ValueError("registry_fhir_catalog_identity_transaction_required")
-    identity_rows = _prepared(rows)
+    identity_rows = _prepared(rows, identity_kind=identity_kind)
     control = storage_identifier(control_schema)
     stage = await _stage_identity_rows(connection, identity_rows)
-    await connection.execute(_RESOLVE_SQL.format(stage=stage, control=control), approved_revision, ALIAS_SCOPE)
+    alias_type = "fhir_plan_tier" if identity_kind == "plan_tier" else "fhir_organization"
+    await connection.execute(
+        _RESOLVE_SQL.format(stage=stage, control=control), approved_revision, ALIAS_SCOPE, alias_type
+    )
     created = await _allocate_missing(connection, stage, control)
-    await _append_aliases(connection, stage, control)
+    await _append_aliases(connection, stage, control, alias_type)
     resolved_identities = await connection.fetch(
         f"SELECT organization_id,network_id,conflict FROM {stage} ORDER BY ordinal"
     )
@@ -157,15 +176,22 @@ async def _stage_identity_rows(connection, identity_rows):
     return stage
 
 
-async def resolve_fhir_catalog_network_ids(connection, rows, *, approved_revision, control_schema):
+async def resolve_fhir_catalog_network_ids(
+    connection, rows, *, approved_revision, control_schema, identity_kind="organization"
+):
     """Resolve existing identities with TEMP-only writes; expose missing and conflicting rows."""
     if not connection.is_in_transaction() or type(approved_revision) is not int or approved_revision < 0:
         raise ValueError("registry_fhir_catalog_identity_transaction_required")
-    identity_rows = _prepared(rows)
+    identity_rows = _prepared(rows, identity_kind=identity_kind)
     control = storage_identifier(control_schema)
     async with connection.transaction():
         stage = await _stage_identity_rows(connection, identity_rows)
-        await connection.execute(_RESOLVE_SQL.format(stage=stage, control=control), approved_revision, ALIAS_SCOPE)
+        await connection.execute(
+            _RESOLVE_SQL.format(stage=stage, control=control),
+            approved_revision,
+            ALIAS_SCOPE,
+            "fhir_plan_tier" if identity_kind == "plan_tier" else "fhir_organization",
+        )
         resolved_identities = await connection.fetch(
             f"SELECT organization_id,network_id,conflict FROM {stage} ORDER BY ordinal"
         )
@@ -185,23 +211,25 @@ async def _allocate_missing(connection, stage, control):
     return created
 
 
-async def _append_aliases(connection, stage, control):
+async def _append_aliases(connection, stage, control, alias_type):
     await connection.execute(
         f"""INSERT INTO {control}.network_registry_alias
       (source_system,source_id,alias_type,alias_value,scope_key,network_id,evidence_id)
-      SELECT DISTINCT 'fhir',alias,'fhir_organization',s.organization_id,$1,s.network_id,s.evidence_id
+      SELECT DISTINCT 'fhir',alias,$2,s.organization_id,$1,s.network_id,s.evidence_id
       FROM {stage} s CROSS JOIN LATERAL unnest(s.source_aliases) alias
       WHERE s.network_id IS NOT NULL AND NOT s.conflict
       ON CONFLICT(source_system,source_id,alias_type,alias_value,scope_key) DO NOTHING""",
         ALIAS_SCOPE,
+        alias_type,
     )
     invalid = await connection.fetchval(
         f"""SELECT EXISTS(SELECT FROM {stage} s
       CROSS JOIN LATERAL unnest(s.source_aliases) alias_name
       LEFT JOIN {control}.network_registry_alias a ON a.source_system='fhir' AND a.source_id=alias_name
-        AND a.alias_type='fhir_organization' AND a.alias_value=s.organization_id AND a.scope_key=$1
+        AND a.alias_type=$2 AND a.alias_value=s.organization_id AND a.scope_key=$1
       WHERE NOT s.conflict AND a.network_id IS DISTINCT FROM s.network_id)""",
         ALIAS_SCOPE,
+        alias_type,
     )
     if invalid:
         raise ValueError("registry_fhir_catalog_identity_conflict")

@@ -169,7 +169,9 @@ async def _approved_source_witness_capture(connection, recipe, approved, control
             namespace=_identifier(registry_schema() if control_schema is None else control_schema)
         )
         + " SELECT count(*)>0 AND coalesce(bool_and(record_json->'source_scope_json'="
-        "jsonb_build_object('organization_id',record_json->>'source_key','capture_sha256',$8::text)),false)"
+        "jsonb_build_object('organization_id',record_json->>'source_key','capture_sha256',$8::text) OR "
+        "(record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1' "
+        "AND record_json->'source_scope_json'->>'capture_sha256'=$8::text)),false)"
         " FROM approved_network_bindings",
         approved.approved_revision,
         *recipe.binding_coordinates.sql_parameters,

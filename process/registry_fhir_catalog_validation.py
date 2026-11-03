@@ -8,7 +8,6 @@ from dataclasses import fields
 from datetime import date, datetime, timezone
 
 from db.plan_release_storage import storage_identifier
-from db.registry_fhir_catalog import PROJECTOR_VERSION
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.registry_fhir_catalog_enrichment import (
     FHIRCatalogEnrichmentContext,
@@ -16,6 +15,7 @@ from process.registry_fhir_catalog_enrichment import (
 )
 from process.registry_fhir_catalog_extraction import (
     FHIRCatalogOrganization,
+    FHIRCatalogPlanTierEdge,
     FHIRCatalogReferenceEdge,
     fhir_network_reference_target,
     fhir_source_uri,
@@ -26,10 +26,17 @@ from process.registry_fhir_catalog_read import (
     fhir_catalog_binding_document,
     fhir_catalog_relationship_document,
 )
+from process.registry_fhir_plan_tier import (
+    SUPPORTED_TRANSFORMS,
+    TRANSFORM_VERSION,
+    validate_plan_scope,
+    validate_plan_tier,
+)
 from process.registry_network_catalog_read import (
     catalog_network_document,
     catalog_text,
 )
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 INPUT_FIELDS = (
     "network_generation",
@@ -80,7 +87,12 @@ def validate_fhir_catalog_source_vector(vector):
         _invalid("inputs_invalid")
     previous, seen = None, set()
     for entry in vector:
-        if type(entry) is not dict or set(entry) != {"source_generation", "source_id", "status"}:
+        fields = {"source_generation", "source_id", "status"}
+        if type(entry) is not dict or set(entry) not in (fields, fields | {"extraction_transform"}):
+            _invalid("inputs_invalid")
+        if "extraction_transform" in entry and (
+            entry["extraction_transform"] != TRANSFORM_VERSION or entry["source_id"] != UHC_PROVIDER_FILE_SOURCE_ID
+        ):
             _invalid("inputs_invalid")
         _digest(entry["source_generation"])
         catalog_text(entry["source_id"], 128)
@@ -103,7 +115,7 @@ def snapshot_inputs(snapshot):
         inputs_by_field["source_vector_json"] = json.loads(inputs_by_field["source_vector_json"])
     if type(inputs_by_field["as_of"]) is date:
         inputs_by_field["as_of"] = inputs_by_field["as_of"].isoformat()
-    if inputs_by_field["projector_version"] != PROJECTOR_VERSION:
+    if inputs_by_field["projector_version"] not in SUPPORTED_TRANSFORMS:
         _invalid("projector_invalid")
     for field in ("membership_mapping_sha256", "mapping_sha256", "standing_grant_sha256"):
         _digest(inputs_by_field[field])
@@ -117,6 +129,10 @@ def snapshot_inputs(snapshot):
         ):
             _invalid("inputs_invalid")
     validate_fhir_catalog_source_vector(inputs_by_field["source_vector_json"])
+    if inputs_by_field["projector_version"] != TRANSFORM_VERSION and any(
+        "extraction_transform" in entry for entry in inputs_by_field["source_vector_json"]
+    ):
+        _invalid("inputs_invalid")
     for field, minimum in (("metadata_approved_revision", 0),):
         if type(inputs_by_field[field]) is not int or not minimum <= inputs_by_field[field] < 2**63:
             _invalid("inputs_invalid")
@@ -201,6 +217,8 @@ def _observation_document(observation_by_field):
     kind = (
         FHIRCatalogOrganization
         if observation_by_field["observation_kind"] == "organization"
+        else FHIRCatalogPlanTierEdge
+        if type(document) is dict and "plan_scope" in document
         else FHIRCatalogReferenceEdge
     )
     expected_fields = {field.name for field in fields(kind)}
@@ -253,6 +271,12 @@ def _observation_name(name, aliases):
 
 
 def _observation_edge(document):
+    if "plan_scope" in document:
+        validate_plan_scope(document["plan_scope"])
+        if document["plan_tier"] is not None:
+            tier = validate_plan_tier(document["plan_tier"])
+            if tier["plan_scope"] != document["plan_scope"] or tier["plan_resource_id"] != document["plan_resource_id"]:
+                _invalid("observation_invalid")
     if document["owner_resource_type"] not in {"InsurancePlan", "OrganizationAffiliation", "PractitionerRole"}:
         _invalid("observation_invalid")
     catalog_text(document["scope_path"], 512)
@@ -420,10 +444,13 @@ _SET_SQL = """WITH observation_counts AS (
 ), source_bindings AS (
  SELECT b.*,s.source_generation AS matched_generation,s.descriptor_json,s.accepted_at,v.status AS source_status,
    b.document_json->'source_scope' ? 'insurance_plan_id' AS is_product,
+   coalesce(b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1',false) AS is_tier,
    count(s.source_generation) OVER(PARTITION BY b.binding_id) AS source_matches
  FROM {namespace}.registry_fhir_catalog_binding b
  LEFT JOIN {namespace}.registry_fhir_catalog_source s
    ON b.document_json->>'evidence_id'=s.source_generation||':Organization/'||(b.document_json->>'source_key')
+   OR (b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1' AND s.profile='published_normalized'
+     AND b.document_json->'source_scope'->>'source_generation'=s.source_generation)
    OR (b.document_json->'source_scope' ? 'insurance_plan_id'
      AND s.profile='retained_normalized'
      AND s.descriptor_json->>'capture_sha256'=b.document_json->'source_scope'->>'capture_sha256'
@@ -446,7 +473,7 @@ OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_relationship r
    OR (r.source_id='registry-manual' AND NOT EXISTS(SELECT FROM {control}.registry_approved_record a
      WHERE a.approved_revision=$2 AND a.record_kind='company_links' AND a.record_key=r.company_id::text
        AND a.record_json->'archived'='false'::jsonb AND a.record_json->'network_ids' @> jsonb_build_array(r.network_id)))
-   OR (r.source_id<>'registry-manual' AND NOT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_observation o
+   OR (r.source_id<>'registry-manual' AND NOT b.is_tier AND NOT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_observation o
      WHERE o.source_generation=r.source_generation AND o.observation_kind='edge'
        AND ((NOT b.is_product AND o.document_json->>'network_resource_id'=b.document_json->>'source_key')
          OR (b.is_product AND o.resource_type='InsurancePlan'
@@ -477,11 +504,11 @@ OR EXISTS(SELECT FROM source_bindings b
  WHERE n.network_id IS NULL OR b.metadata_generation<>$1 OR b.matched_generation IS NULL
    OR b.source_matches<>1
    OR b.source_id IS DISTINCT FROM b.descriptor_json->'coordinates'->>'source_id'
-   OR (NOT b.is_product AND (b.document_json->'source_scope'->>'organization_id') IS DISTINCT FROM (b.document_json->>'source_key'))
+   OR (NOT b.is_product AND NOT b.is_tier AND (b.document_json->'source_scope'->>'organization_id') IS DISTINCT FROM (b.document_json->>'source_key'))
    OR (b.document_json->>'producer_id'='registry-fhir-catalog-v1' AND (
      b.document_json->'source_scope'->>'source_generation' IS DISTINCT FROM b.matched_generation
      OR coalesce(b.descriptor_json->>'profile','') NOT IN ('published_normalized','legacy_published_normalized')))
-   OR (NOT b.is_product AND (b.document_json->>'evidence_sha256') IS DISTINCT FROM (o.document_json->>'source_hash'))
+   OR (NOT b.is_product AND NOT b.is_tier AND (b.document_json->>'evidence_sha256') IS DISTINCT FROM (o.document_json->>'source_hash'))
    OR (b.is_product AND (product.record_key IS NULL
      OR product.record_json->'archived' IS DISTINCT FROM 'false'::jsonb
      OR product.record_json->>'network_id' IS DISTINCT FROM b.network_id::text
