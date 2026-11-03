@@ -138,7 +138,7 @@ async def _mutable(connection, target, loader_role, control_schema):
 
 
 async def create_fhir_catalog_candidate(connection, target, *, loader_role, control_schema):
-    """Create only fresh heaps and their essential primary-key indexes."""
+    """Create fresh heaps and indexes needed while assembling their projection."""
     namespace = _target(target)
     role = storage_identifier(loader_role)
     await _unregistered(connection, target, control_schema)
@@ -149,6 +149,10 @@ async def create_fhir_catalog_candidate(connection, target, *, loader_role, cont
             await connection.execute(table_sql(namespace, table)[0])
             if own_role != loader_role:
                 await connection.execute(f"ALTER TABLE {namespace}.{table} OWNER TO {role}")
+        await connection.execute(
+            f"CREATE INDEX registry_fhir_catalog_binding_evidence_idx ON {namespace}.registry_fhir_catalog_binding "
+            "((document_json->>'evidence_id') COLLATE \"C\")"
+        )
         await _mutable(connection, target, loader_role, control_schema)
     return len(PHYSICAL_TABLES)
 

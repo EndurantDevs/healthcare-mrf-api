@@ -95,7 +95,9 @@ class _ProjectionReplay:
             await self.connection.execute(
                 definition.replace(prefix, "CREATE TEMP TABLE " + self.targets[kind], 1) + " ON COMMIT DROP"
             )
-        await self.connection.execute(f"CREATE INDEX ON {self.targets['binding']} ((document_json->>'evidence_id'))")
+        await self.connection.execute(
+            f"CREATE INDEX ON {self.targets['binding']} ((document_json->>'evidence_id') COLLATE \"C\")"
+        )
         await self.connection.execute(f"CREATE INDEX ON {self.targets['relationship']} (source_generation)")
         await self.connection.execute(f"CREATE INDEX ON {self.targets['relationship']} (binding_id)")
         if self.prior is not None:
@@ -376,9 +378,9 @@ class _ProjectionReplay:
                 self.connection,
                 "SELECT jsonb_build_object('resource_type',resource_type,'resource_id',resource_id,'ordinal',ordinal,"
                 f"'edge',document_json)::text AS document FROM {self.namespace}.registry_fhir_catalog_observation o "
-                "WHERE source_generation=$1 AND observation_kind='edge' AND EXISTS("
-                f"SELECT FROM {self.targets['binding']} b WHERE b.document_json->>'evidence_id'="
-                "o.source_generation||':Organization/'||(o.document_json->>'network_resource_id')) "
+                "WHERE source_generation=$1 AND observation_kind='edge' AND COALESCE(("
+                f"SELECT true FROM {self.targets['binding']} b WHERE b.document_json->>'evidence_id'="
+                "o.source_generation||':Organization/'||(o.document_json->>'network_resource_id') LIMIT 1),false) "
                 'AND (resource_type COLLATE "C",resource_id COLLATE "C",ordinal)>($2 COLLATE "C",$3 COLLATE "C",$4) '
                 'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C",ordinal LIMIT 100',
                 generation,

@@ -497,6 +497,16 @@ async def seed_source_projection(fixture):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("table", ["registry_fhir_catalog_relationship", "registry_fhir_catalog_binding"])
+async def test_generation_filtered_evidence_still_refuses_cross_generation_rows(metadata_custody, table):
+    fixture = metadata_custody
+    snapshot_by_field = await seed_source_projection(fixture)
+    await fixture.loader.execute(f'UPDATE "{fixture.target.schema_name}".{table} SET metadata_generation=$1', "f" * 64)
+    with pytest.raises(ValueError, match="set_validation_failed"):
+        await freeze_metadata(fixture, snapshot=snapshot_by_field)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("injected_plan", [False, True])
 async def test_source_plan_provenance_is_required(metadata_custody, injected_plan):
     fixture = metadata_custody

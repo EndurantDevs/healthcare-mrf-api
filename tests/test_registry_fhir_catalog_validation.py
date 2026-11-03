@@ -269,7 +269,11 @@ async def test_organization_proof_page_refuses_oversized_rows_before_replay(miss
     )
     with pytest.raises(ValueError, match="registry_fhir_catalog_validation_bounds"):
         await validation._validate_source_organizations(
-            connection, '"catalog_snapshot"', '"catalog_control"', {"metadata_approved_revision": 6}, None
+            connection,
+            '"catalog_snapshot"',
+            '"catalog_control"',
+            validation.snapshot_inputs(snapshot(standing_grant())),
+            None,
         )
     assert connection.fetch.await_count == 2
 

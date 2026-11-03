@@ -250,8 +250,19 @@ async def test_copy_batches_are_bounded(storage_database):
     assert counted.statements < 40
     assert (
         await fixture.connection.fetchval("SELECT count(*) FROM pg_indexes WHERE schemaname=$1", candidate.schema_name)
-        == 5
+        == 6
     )
+    evidence_index = await fixture.connection.fetchrow(
+        "SELECT i.indisvalid,i.indisready,i.indnkeyatts,pg_get_expr(i.indexprs,i.indrelid) AS expression,"
+        "i.indcollation[0]=(SELECT oid FROM pg_collation WHERE collname='C' AND collnamespace='pg_catalog'::regnamespace) "
+        "AS c_collation,index.relowner=heap.relowner AS same_owner "
+        "FROM pg_index i JOIN pg_class index ON index.oid=i.indexrelid JOIN pg_class heap ON heap.oid=i.indrelid "
+        "WHERE i.indexrelid=$1::regclass",
+        candidate.schema_name + ".registry_fhir_catalog_binding_evidence_idx",
+    )
+    assert evidence_index["indisvalid"] and evidence_index["indisready"]
+    assert evidence_index["indnkeyatts"] == 1 and evidence_index["same_owner"] and evidence_index["c_collation"]
+    assert "document_json ->> 'evidence_id'::text" in evidence_index["expression"]
     async with fixture.connection.transaction():
         assert (
             await store.create_fhir_catalog_indexes(
@@ -261,7 +272,7 @@ async def test_copy_batches_are_bounded(storage_database):
         )
     assert (
         await fixture.connection.fetchval("SELECT count(*) FROM pg_indexes WHERE schemaname=$1", candidate.schema_name)
-        == 14
+        == 15
     )
     assert (
         await fixture.connection.fetchval(
