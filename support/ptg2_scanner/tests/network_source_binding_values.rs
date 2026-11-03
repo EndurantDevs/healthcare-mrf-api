@@ -34,6 +34,66 @@ fn fhir() -> Value {
     input
 }
 
+fn published_fhir() -> Value {
+    let mut input = fhir();
+    input["producer_id"] = json!("registry-fhir-catalog-v1");
+    input["edition_id"] = input["dataset_id"].clone();
+    input["source_key"] = json!("Organization-1.v2");
+    input["source_scope_json"] = json!({
+        "organization_id": "Organization-1.v2", "source_generation": "b".repeat(64)
+    });
+    input["evidence_id"] = json!(format!("{}:Organization/Organization-1.v2", "b".repeat(64)));
+    input
+}
+
+#[test]
+fn published_fhir_copy_preserves_catalog_evidence_without_capture() {
+    let input = published_fhir();
+    let output = encode(std::slice::from_ref(&input));
+    let fields = copy_rows(&output.copy_bytes);
+    assert_eq!(output.rows[0].source_scope_json, input["source_scope_json"]);
+    assert_eq!(fields[0][9].unwrap(), output.rows[0].binding_key.as_bytes());
+    assert_eq!(
+        fields[0][11].unwrap(),
+        input["evidence_id"].as_str().unwrap().as_bytes()
+    );
+    assert_eq!(
+        fields[0][12].unwrap(),
+        input["evidence_sha256"].as_str().unwrap().as_bytes()
+    );
+    assert!(output.rows[0]
+        .source_scope_json
+        .get("capture_sha256")
+        .is_none());
+    assert!(output.rows[0]
+        .source_scope_json
+        .get("legacy_uuid")
+        .is_none());
+}
+
+#[test]
+fn published_fhir_rejects_wrong_producer_edition_key_and_evidence() {
+    let input = published_fhir();
+    for field in ["producer_id", "edition_id", "source_key", "evidence_id"] {
+        let mut wrong = input.clone();
+        wrong[field] = json!("other");
+        reject(&[wrong], "invalid_scope");
+    }
+    for scope in [
+        fhir()["source_scope_json"].clone(),
+        json!({"organization_id": "Organization-1.v2", "source_generation": "A".repeat(64)}),
+        json!({"organization_id": "Organization-1.v2", "source_generation": "b".repeat(64), "capture_sha256": "a".repeat(64)}),
+    ] {
+        let mut wrong = input.clone();
+        wrong["source_scope_json"] = scope;
+        reject(&[wrong], "invalid_scope");
+    }
+    let mut late_invalid = input.clone();
+    late_invalid["binding_id"] = json!("01234567-89ab-cdef-8123-456789abcde1");
+    late_invalid["evidence_sha256"] = json!("not-a-hash");
+    reject(&[input, late_invalid], "invalid_digest");
+}
+
 #[test]
 fn retained_fhir_scope_has_no_invented_legacy_alias() {
     let mut input = fhir();

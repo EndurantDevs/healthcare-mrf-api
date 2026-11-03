@@ -126,12 +126,35 @@ def _typed_plan_tier_scope(scope, producer_id):
     return scope
 
 
+def _published_fhir_scope(scope):
+    if (
+        set(scope) != {"organization_id", "source_generation"}
+        or type(scope["organization_id"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", scope["organization_id"]) is None
+        or not is_sha256(scope["source_generation"])
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    return scope
+
+
+def _legacy_fhir_scope(scope):
+    if (
+        type(scope["organization_id"]) is not str
+        or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", scope["organization_id"]) is None
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    _uuid(scope["legacy_uuid"])
+    _text(scope["alias_scope"], 512)
+
+
 def _source_scope(system, scope, *, producer_id=None):
     """Validate the closed scope for its exact source system and producer."""
     if type(scope) is not dict:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     if system == "fhir" and scope.get("kind") == PLAN_TIER_KIND:
         return _typed_plan_tier_scope(scope, producer_id)
+    if system == "fhir" and producer_id == "registry-fhir-catalog-v1":
+        return _published_fhir_scope(scope)
     if system == "fhir" and set(scope) == {"organization_id", "capture_sha256"}:
         _retained_fhir_scope(scope, producer_id)
         return scope
@@ -152,13 +175,7 @@ def _source_scope(system, scope, *, producer_id=None):
         for key, entry in scope.items():
             _text(entry, 512 if key == "company_key" else 128)
     elif system == "fhir" and set(scope) == {"organization_id", "legacy_uuid", "alias_scope"}:
-        if (
-            type(scope["organization_id"]) is not str
-            or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", scope["organization_id"]) is None
-        ):
-            raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
-        _uuid(scope["legacy_uuid"])
-        _text(scope["alias_scope"], 512)
+        _legacy_fhir_scope(scope)
     elif system == "aca" and set(scope) == {
         "issuer_id",
         "plan_id",
@@ -600,6 +617,17 @@ def catalog_binding_document(binding, *, network_id=None):
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     _source_scope(binding["source_system"], binding["source_scope"], producer_id=binding["producer_id"])
     scope = binding["source_scope"]
+    if (
+        binding["source_system"] == "fhir"
+        and binding["producer_id"] == "registry-fhir-catalog-v1"
+        and scope.get("kind") != PLAN_TIER_KIND
+        and (
+            binding["edition_id"] != binding["dataset_id"]
+            or binding["source_key"] != scope["organization_id"]
+            or binding["evidence_id"] != scope["source_generation"] + ":Organization/" + scope["organization_id"]
+        )
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
     if scope.get("kind") == PLAN_TIER_KIND and (
         binding["source_id"] != UHC_PROVIDER_FILE_SOURCE_ID
         or binding["source_key"] != plan_tier_source_key(validate_binding_scope(scope, binding["producer_id"]))

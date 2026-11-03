@@ -8352,6 +8352,9 @@ paths:
         selection and authority page limits remain 100. Queueing does not establish publication;
         poll the existing publication request status route. Selection can also page the retained
         vector using request_id, including after completion, for the original actor or a platform admin.
+        The approve_source_binding_batch command uses the same complete selection and authority checks,
+        then atomically retains approval and completes the request without preparing a candidate or
+        changing the serving generation. Several bounded approvals may precede one publication command.
       security:
       - RegistryControlBearer: []
       - RegistryControlHeader: []
@@ -8583,12 +8586,15 @@ paths:
         integer counts verified against the retained imported-source selection.
         Omitted rows were excluded by approved source bindings; this is not a measure
         of unmatched providers or overall network coverage.
-        Source batch requests return operation publish_source_binding_batch, command_sha256,
+        Source batch requests return operation publish_source_binding_batch or approve_source_binding_batch, command_sha256,
         selection_count and selection_sha256 without the expanded selection. Page the retained
         vector through the source-batch selection operation with request_id. Completed results
         include approved_revision, previous_approved_revision, selected_count, serving_generation
         and policy_revision, with optional source_selection counters. The count and commitment
         remain bound to the original saved selection.
+        Approval-only results additionally include operation and selection_sha256; serving_generation
+        equals the command's expected serving generation. These results establish approval without
+        publishing a serving candidate.
         Reactivation requests return operation reactivate_generation and command_sha256
         in place of selection. Completed reactivation results contain operation,
         previous_generation_id, generation_id, approved_custom_revision,
@@ -18771,6 +18777,17 @@ components:
                 type: string
                 minLength: 1
                 maxLength: 512
+          - type: object
+            additionalProperties: false
+            required: [organization_id, source_generation]
+            properties:
+              organization_id: {type: string, pattern: '^[A-Za-z0-9.-]{1,64}$'}
+              source_generation: {type: string, pattern: '^[0-9a-f]{64}$'}
+            description: Published catalog evidence requires producer registry-fhir-catalog-v1, edition_id
+              equal to dataset_id, source_key equal to organization_id, and evidence_id equal to
+              source_generation followed by ':Organization/' and organization_id. Source-batch approval
+              requires exact evidence from the complete sealed catalog. This scope does not admit legacy
+              membership staging or claim a retained payload capture.
         network_id: &id002
           type: integer
           format: int32
@@ -19636,7 +19653,7 @@ components:
         both non-null. Offset is allowed only for selection. Approved revision cannot exceed draft
         revision. Reasons, idempotency keys and source coordinates must be nonblank and trimmed.
       properties:
-        operation: {type: string, enum: [publish_source_binding_batch]}
+        operation: {type: string, enum: [publish_source_binding_batch, approve_source_binding_batch]}
         batch_references:
           type: array
           minItems: 1
@@ -19698,7 +19715,7 @@ components:
       required: [operation, expected_draft_revision, expected_approved_revision, expected_serving_generation,
         selection_count, selection_sha256, selection, offset, next_offset]
       properties:
-        operation: {type: string, enum: [publish_source_binding_batch]}
+        operation: {type: string, enum: [publish_source_binding_batch, approve_source_binding_batch]}
         expected_draft_revision: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
         expected_approved_revision: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
         expected_serving_generation: {type: integer, format: int64, minimum: 0, maximum: 9223372036854775806}
@@ -19725,7 +19742,7 @@ components:
       description: Existing approval summary and diagnostics with an empty records array. Selection
         commitment covers the complete vector; imported source counts describe only this selection.
       properties:
-        operation: {type: string, enum: [publish_source_binding_batch]}
+        operation: {type: string, enum: [publish_source_binding_batch, approve_source_binding_batch]}
         selection_count: {type: integer, minimum: 1, maximum: 5000}
         selection_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         records: {type: array, maxItems: 0, items: {type: object}}

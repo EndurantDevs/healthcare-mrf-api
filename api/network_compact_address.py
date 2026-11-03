@@ -43,9 +43,11 @@ def _membership_arms(layout, *, selected):
     for index, artifact in enumerate(layout.artifacts):
         edge = compact_identifier(artifact.schema_name) + ".network_office_edge"
         selector = "AND ref.network_id=ANY(CAST(:_canonical_network_ids AS integer[]))" if selected else ""
-        arms.append(f"""SELECT ref.network_id FROM ONLY {_relation(layout.ref_map)} ref JOIN ONLY {edge} edge
+        projected = "edge.location_key" if selected else "ref.network_id"
+        office = "" if selected else "AND edge.location_key=office.location_key"
+        arms.append(f"""SELECT {projected} FROM ONLY {_relation(layout.ref_map)} ref JOIN ONLY {edge} edge
             ON edge.slice_id=ref.slice_id WHERE ref.artifact_candidate_id=CAST(:_compact_artifact_{index} AS uuid)
-            AND edge.location_key=office.location_key {selector}""")
+            {office} {selector}""")
     return " UNION ALL ".join(arms)
 
 
@@ -86,9 +88,7 @@ def _address_query(layout, network_ids, visible_membership_sql):
     query = f"SELECT {output_columns} FROM ({base}) office"
     if network_ids is not None:
         selected = _membership_arms(layout, selected=True)
-        return query + (
-            f" WHERE EXISTS(SELECT 1 FROM ({selected}) selected_membership)" if selected else " WHERE FALSE"
-        )
+        return query + (f" WHERE office.location_key IN ({selected})" if selected else " WHERE FALSE")
     visibility = "row_origin IN ('base','ptg_overlay')"
     if visible_membership_sql is not None:
         visibility += " OR (" + visible_membership_sql + ")"

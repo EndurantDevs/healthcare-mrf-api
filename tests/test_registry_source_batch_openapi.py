@@ -37,7 +37,10 @@ def test_source_batch_schema_matches_compact_command_and_existing_page_limits():
     assert set(command["required"]) == required
     assert set(command["properties"]) == required | {"offset"}
     fields = command["properties"]
-    assert fields["operation"]["enum"] == [_contract_literal(CONTRACT, "OPERATION")]
+    assert fields["operation"]["enum"] == [
+        _contract_literal(CONTRACT, "OPERATION"),
+        _contract_literal(CONTRACT, "APPROVAL_OPERATION"),
+    ]
     assert fields["batch_references"]["maxItems"] == 100
     reference = fields["batch_references"]["items"]
     assert reference["additionalProperties"] is False

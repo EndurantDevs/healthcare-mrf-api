@@ -95,7 +95,10 @@ def _command_actor(request_record):
     if _validated_actor(actor) != actor_by_name:
         raise ValueError("registry_publication_actor_invalid")
     command_by_name = _document(request_record["command_json"])
-    if type(command_by_name) is dict and command_by_name.get("operation") == "publish_source_binding_batch":
+    if type(command_by_name) is dict and command_by_name.get("operation") in (
+        "publish_source_binding_batch",
+        "approve_source_binding_batch",
+    ):
         from process.registry_source_binding_publication import stored_source_batch
 
         _compact, command = stored_source_batch(request_record)
@@ -123,7 +126,10 @@ async def _fresh_authority(authorize, request_record):
     if not callable(authorize):
         raise ValueError("registry_publication_authority_required")
     source_command = _document(request_record["command_json"])
-    if type(source_command) is dict and source_command.get("operation") == "publish_source_binding_batch":
+    if type(source_command) is dict and source_command.get("operation") in (
+        "publish_source_binding_batch",
+        "approve_source_binding_batch",
+    ):
         from process.registry_source_binding_publication import authorize_source_batch
 
         return await authorize_source_batch(authorize, request_record)
@@ -1113,7 +1119,7 @@ async def approve_queued_registry_publication(
     namespace = _namespace(control_schema)
     request_record = await _request(connection, request_id, lease_id, namespace)
     await _fresh_authority(authorize, request_record)
-    command, actor, _actor_by_name, _command_by_name = _command_actor(request_record)
+    command, actor, _actor_by_name, command_by_name = _command_actor(request_record)
     async with connection.transaction():
         locked_request = await _request(connection, request_id, lease_id, namespace, lock=True)
         if locked_request["request_sha256"] != request_record["request_sha256"]:
@@ -1127,7 +1133,7 @@ async def approve_queued_registry_publication(
                 raise RegistryApprovalConflict("registry_queue_request_changed")
             await _fresh_authority(authorize, current)
 
-        return await approve_registry_records(
+        receipt = await approve_registry_records(
             connection,
             command,
             actor,
@@ -1135,6 +1141,40 @@ async def approve_queued_registry_publication(
             plan_metadata_client=plan_metadata_client,
             final_authorize=final_authorize,
         )
+        if command_by_name.get("operation") == "approve_source_binding_batch":
+            return await _complete_source_batch_approval(connection, locked_request, receipt, authorize, control_schema)
+        return receipt
+
+
+async def _complete_source_batch_approval(connection, request_record, receipt, authorize, control_schema):
+    """Commit approval and its terminal lease receipt without preparing or switching serving data."""
+    from process.registry_source_binding_publication import (
+        stored_source_batch,
+        validate_source_batch_approval_result,
+    )
+
+    compact, command = stored_source_batch(request_record)
+    _approved, head = await _lock_publication_controls(connection, _namespace(control_schema))
+    if head != compact["expected_serving_generation"]:
+        raise RegistryApprovalConflict("registry_queue_revision_conflict")
+    policy_revision = await _fresh_authority(authorize, request_record)
+    result_by_name = {
+        "operation": compact["operation"],
+        **{field: receipt[field] for field in ("approved_revision", "previous_approved_revision", "selected_count")},
+        "selection_sha256": compact["selection_sha256"],
+        "serving_generation": head,
+        "policy_revision": policy_revision,
+    }
+    validate_source_batch_approval_result(result_by_name, compact, command, "completed")
+    await finish_registry_publication_request(
+        connection,
+        request_record["request_id"],
+        request_record["lease_id"],
+        state="completed",
+        result=result_by_name,
+        control_schema=control_schema,
+    )
+    return result_by_name
 
 
 async def _approval(connection, namespace, request_record):

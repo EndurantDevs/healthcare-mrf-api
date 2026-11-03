@@ -21,6 +21,7 @@ from api.network_address_scope import (
     scoped_address_statement,
 )
 from api.network_compact_address import (
+    _membership_arms,
     compact_address_parameters,
     compact_address_relation_sql,
     compact_address_selectable,
@@ -229,6 +230,10 @@ async def test_columns_parameters_and_physical_fanout(compact_db):
     assert tuple(selectable.c.keys()) == tuple(EntityAddressUnified.__table__.columns.keys())
     assert "ARRAY[42]" not in raw and "=42" not in raw and "IN (42" not in raw
     assert ":_canonical_network_ids" in raw
+    selected = _membership_arms(layout, selected=True)
+    assert "office." not in selected and "SELECT edge.location_key" in selected
+    assert "WHERE office.location_key IN (" + selected + ")" in raw
+    assert "edge.location_key=office.location_key" in _membership_arms(layout, selected=False)
     for index, artifact in enumerate(layout.artifacts):
         assert artifact.candidate_id not in raw
         assert f":_compact_artifact_{index}" in raw
@@ -241,6 +246,46 @@ async def test_columns_parameters_and_physical_fanout(compact_db):
             {**compact_address_parameters(layout), "_canonical_network_ids": [42]},
         )
         assert "Index" in str(plan) and "network_office_edge" in str(plan)
+
+
+@pytest.mark.asyncio
+async def test_selected_semijoin_preserves_correlated_reference_rows(compact_db):
+    db = compact_db
+    for layout in (db.first_layout, db.second_layout):
+        for network_ids in ((7, 42), (42, 99), (88,), (99,), (2147483647,)):
+            current = compact_address_relation_sql(layout, network_ids=network_ids)
+            selected = _membership_arms(layout, selected=True)
+            original = selected.replace("SELECT edge.location_key", "SELECT ref.network_id").replace(
+                "AND ref.network_id=ANY", "AND edge.location_key=office.location_key AND ref.network_id=ANY"
+            )
+            reference = current.replace(
+                "WHERE office.location_key IN (" + selected + ")",
+                "WHERE EXISTS(SELECT 1 FROM (" + original + ") selected_membership)",
+            )
+            assert reference != current
+            parameters_by_name = {
+                **compact_address_parameters(layout),
+                "_canonical_network_ids": list(network_ids),
+            }
+            async with db.engine.connect() as connection:
+                same = await connection.scalar(
+                    text(
+                        "SELECT NOT EXISTS((SELECT * FROM "
+                        + current
+                        + " actual EXCEPT ALL SELECT * FROM "
+                        + reference
+                        + " expected) UNION ALL (SELECT * FROM "
+                        + reference
+                        + " expected EXCEPT ALL SELECT * FROM "
+                        + current
+                        + " actual))"
+                    ),
+                    parameters_by_name,
+                )
+                assert same is True
+            assert await _read(db, layout, network_ids=network_ids) == await _read(
+                db, layout, network_ids=network_ids, typed=True
+            )
 
 
 @pytest.mark.asyncio

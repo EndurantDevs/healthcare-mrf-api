@@ -220,10 +220,20 @@ def _source_arguments(recipe, approved, *, descriptor_version=None):
 
 async def _append(connection, destination, fact_relation, recipe, approved, control_schema, *, descriptor_version=None):
     selected = _source_query(recipe, fact_relation, control_schema, descriptor_version=descriptor_version)
-    await connection.execute(
-        f"INSERT INTO {destination}({COLUMNS}) SELECT {COLUMNS} FROM ({selected}) selected ON CONFLICT DO NOTHING",
-        *_source_arguments(recipe, approved, descriptor_version=descriptor_version),
+    statement = (
+        f"INSERT INTO {destination}({COLUMNS}) SELECT {COLUMNS} FROM ({selected}) selected ON CONFLICT DO NOTHING"
     )
+    arguments = _source_arguments(recipe, approved, descriptor_version=descriptor_version)
+    if descriptor_version != 2:
+        await connection.execute(statement, *arguments)
+        return
+    # The header self-join must not repeatedly scan the retained fact heap.
+    # A savepoint also restores the caller's planner setting after failure.
+    async with connection.transaction():
+        original = await connection.fetchval("SHOW enable_nestloop")
+        await connection.execute("SET LOCAL enable_nestloop=off")
+        await connection.execute(statement, *arguments)
+        await connection.execute("SELECT set_config('enable_nestloop',$1,true)", original)
 
 
 async def append_provider_only_source(connection, copy_target, recipe, descriptor, approved, *, control_schema=None):

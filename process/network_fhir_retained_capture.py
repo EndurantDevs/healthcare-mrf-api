@@ -1096,16 +1096,35 @@ async def _require_modern_plan_evidence(writer, schema, origin, release_id):
     resources, plans = _relation(schema, TABLES[1]), _relation(schema, TABLES[4])
     require(
         await writer.fetchval(
-            "WITH expected AS (SELECT DISTINCT $2::varchar AS source_id,$3::varchar AS release_id,"
-            "'Organization'::varchar AS network_resource_type,split_part(ref.value,'/',2)::varchar AS network_resource_id,"
-            "r.resource_id AS insurance_plan_resource_id,r.payload_json::jsonb->'network_refs' AS network_refs,"
-            "r.payload_json::jsonb->>'owned_by_ref' AS owned_by_ref,r.payload_json::jsonb->>'administered_by_ref' AS administered_by_ref,"
-            "r.payload_hash AS plan_payload_sha256,r.payload_json::jsonb AS plan_payload_json "
-            f"FROM {resources} r CROSS JOIN LATERAL jsonb_array_elements_text(r.payload_json::jsonb->'network_refs') ref(value) "
-            "WHERE r.dataset_id=$1 AND r.resource_type='InsurancePlan'),observed AS ("
-            "SELECT source_id,release_id,network_resource_type,network_resource_id,insurance_plan_resource_id,network_refs,"
-            f"owned_by_ref,administered_by_ref,plan_payload_sha256,plan_payload_json FROM {plans}) "
-            "SELECT NOT EXISTS((TABLE expected EXCEPT TABLE observed) UNION ALL (TABLE observed EXCEPT TABLE expected))",
+            f"""
+WITH expected_keys AS MATERIALIZED (
+  SELECT DISTINCT r.resource_id AS plan_id, split_part(ref.value,'/',2) AS network_id
+  FROM {resources} r
+  CROSS JOIN LATERAL jsonb_array_elements_text(r.payload_json::jsonb->'network_refs') ref(value)
+  WHERE r.dataset_id=$1 AND r.resource_type='InsurancePlan'
+)
+SELECT NOT EXISTS (
+  SELECT FROM expected_keys e
+  LEFT JOIN {plans} p ON p.source_id=$2 AND p.release_id=$3
+    AND p.network_resource_id=e.network_id AND p.insurance_plan_resource_id=e.plan_id
+  WHERE p.source_id IS NULL
+) AND NOT EXISTS (
+  SELECT FROM {plans} p
+  LEFT JOIN {resources} r ON r.dataset_id=$1 AND r.resource_type='InsurancePlan'
+    AND r.resource_id=p.insurance_plan_resource_id
+  WHERE r.resource_id IS NULL OR p.source_id<>$2 OR p.release_id<>$3
+    OR p.network_resource_type<>'Organization'
+    OR NOT EXISTS (
+      SELECT FROM jsonb_array_elements_text(r.payload_json::jsonb->'network_refs') ref(value)
+      WHERE split_part(ref.value,'/',2)=p.network_resource_id
+    )
+    OR p.network_refs IS DISTINCT FROM r.payload_json::jsonb->'network_refs'
+    OR p.owned_by_ref IS DISTINCT FROM r.payload_json::jsonb->>'owned_by_ref'
+    OR p.administered_by_ref IS DISTINCT FROM r.payload_json::jsonb->>'administered_by_ref'
+    OR p.plan_payload_sha256 IS DISTINCT FROM r.payload_hash
+    OR p.plan_payload_json IS DISTINCT FROM r.payload_json::jsonb
+)
+""",
             origin.dataset_id,
             origin.source_id,
             release_id,

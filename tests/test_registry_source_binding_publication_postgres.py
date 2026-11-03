@@ -62,7 +62,7 @@ async def _rebind_source_binding_component(context):
     return prior, batch, receipt
 
 
-async def _queue_source_binding_component(context, head):
+async def _queue_source_binding_component(context, head, *, operation="publish_source_binding_batch"):
     """Start at the authenticated expansion seam; catalog resolution has a separate native proof."""
     worker, schema = context.worker, context.worker.fixture.control_schema
     admin, actor = worker.fixture.connection, worker.seed.actor
@@ -74,7 +74,7 @@ async def _queue_source_binding_component(context, head):
     )
     selected, digest = selection_identity(command.selection)
     compact_by_name = {
-        "operation": "publish_source_binding_batch",
+        "operation": operation,
         "batch_references": [
             {
                 "idempotency_key": batch.idempotency_key,
@@ -112,6 +112,54 @@ async def _queue_source_binding_component(context, head):
         {"record_kind": "network_binding", "record_id": str(prior["binding_id"]), "revision": prior["revision"] + 1}
     ]
     return queued
+
+
+async def _approval_and_serving_counts(worker):
+    schema = worker.fixture.control_schema
+    return tuple(
+        await worker.fixture.connection.fetchrow(f'''SELECT
+      (SELECT count(*) FROM "{schema}".registry_approval_history),
+      (SELECT count(*) FROM "{schema}".network_membership_candidate),
+      (SELECT count(*) FROM "{schema}".network_serving_manifest)''')
+    )
+
+
+async def test_source_approval_leaves_serving_pinned_then_one_final_batch_publishes(monkeypatch):
+    """The real direct-login consumer completes approval without entering candidate preparation."""
+    async with _publication_case(monkeypatch) as context:
+        first = await _publish_once(context)
+        worker, schema = context.worker, context.worker.fixture.control_schema
+        before = await _approval_and_serving_counts(worker)
+        queued = await _queue_source_binding_component(
+            context, first.generation_id, operation="approve_source_binding_batch"
+        )
+        async with _consumer(worker) as (arguments, calls):
+            arguments["initial_address_sources"] = None
+            completed = await _consume_expected_success(context, _exact_request_arguments(arguments, queued), queued)
+            assert completed["result"]["serving_generation"] == first.generation_id and len(calls) == 4
+        assert await _approval_and_serving_counts(worker) == (before[0] + 1, *before[1:])
+        assert await _head(worker) == first.generation_id
+        status = await _status(worker, queued)
+        assert status["state"] == "completed" and status["operation"] == "approve_source_binding_batch"
+        async with (
+            _login(worker, "execution") as reader,
+            reader.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            pinned = await resolve_network_serving_manifest(
+                reader, generation_id=first.generation_id, control_schema=schema
+            )
+            original_rows = await _assert_serving_parity(context, pinned, reader)
+            final_queue = await _queue_source_binding_component(context, first.generation_id)
+            async with _consumer(worker) as (arguments, _calls):
+                arguments["initial_address_sources"] = None
+                final = await _consume_expected_success(
+                    context, _exact_request_arguments(arguments, final_queue), final_queue
+                )
+            assert await _assert_serving_parity(context, pinned, reader) == original_rows
+        assert final["result"]["serving_generation"] > first.generation_id
+        assert await _approval_and_serving_counts(worker) == tuple(
+            count + increment for count, increment in zip(before, (2, 1, 1))
+        )
 
 
 async def test_source_batch_consumer_publishes_once_and_preserves_pinned_source(monkeypatch):
