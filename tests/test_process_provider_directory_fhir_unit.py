@@ -15571,7 +15571,7 @@ def _write_supplemental_catalog_fixtures(tmp_path):
 
 def _assert_supplemental_catalog_metrics(metrics) -> None:
     assert metrics["sources_seeded"] == 19
-    assert metrics["supplemental_catalog_sources_considered"] == 18
+    assert metrics["supplemental_catalog_sources_considered"] == 19
     catalog_metrics = metrics["supplemental_catalogs"]["catalogs"]
     assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 8
     assert catalog_metrics["amerihealth_caritas"]["rows"] == 1
@@ -15579,6 +15579,7 @@ def _assert_supplemental_catalog_metrics(metrics) -> None:
     assert catalog_metrics["cms_sma_endpoint_directory"]["rows"] == 0
     assert catalog_metrics["health_partners_plans"]["rows"] == 1
     assert catalog_metrics["pacificsource"]["rows"] == 1
+    assert catalog_metrics["anthem"]["rows"] == 1
     assert catalog_metrics["aetna_provider_directorydata"]["rows"] == 1
     assert catalog_metrics["mvp_health_care"]["rows"] == 1
     assert catalog_metrics["provider_directory_blockers"]["rows"] == 3
@@ -25244,7 +25245,7 @@ async def test_prefetched_page_uses_existing_cooldown_path(monkeypatch, unit_sou
     monkeypatch.setattr(
         importer,
         "_rest_pagination_cooldown_delay_seconds",
-        lambda _status, _payload: 0.0,
+        lambda _status, _payload, **_kwargs: 0.0,
     )
     fetch_result = await page_scan.run()
 
