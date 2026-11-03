@@ -192,9 +192,9 @@ async def _require_recipe_source(connection, recipe):
     }
     await require_fhir_source(connection, source, descriptor_by_field, retained_read=retained_read)
     physical = fhir_physical_source(source)
-    capture = fhir_normalized_capture(physical)
+    capture = fhir_normalized_capture(source)
     parameters = (physical.dataset_id, physical.source_id, physical.release_id, physical.alias_scope, physical.as_of)
-    return parameters + ((capture.capture_sha256,) if capture is not None else ())
+    return parameters + ((capture.capture_sha256,) if fhir_normalized_capture(physical) is not None else ())
 
 
 async def _recipe_impact(connection, recipe, command, staging, control_schema):
