@@ -149,6 +149,8 @@ def _install_callback_owner(fhir):
 async def coupled_fixture(mode="success"):
     """Connect original maintenance SQL to the actual retained owner candidate."""
     fhir, _, events, admission = fixture()
+    # Custody checks need scheduling headroom; deadline cases set their own budget.
+    fhir._profile_capacity_remaining_ms.return_value = 30_000
     admission.geometry = dataclasses.replace(
         admission.geometry, physical_projection_contract_id=BOUNDED_ADMISSION_CONTRACT_ID
     )
@@ -249,7 +251,8 @@ async def test_body_cancellation_rolls_back_and_drains_once_preserving_primary_i
 async def test_release_interruption_drains_commit_and_retains_confirmed_unmeasured_truth(cause):
     fhir, connection, _, admission, captures = await coupled_fixture()
     connection.commit_gate = asyncio.Event()
-    fhir._profile_capacity_remaining_ms = AsyncMock(return_value=10 if cause == "timeout" else 1000)
+    if cause == "timeout":
+        fhir._profile_capacity_remaining_ms.return_value = 10
 
     async def run():
         async with maintenance.control_maintenance_fence(fhir, connection):
