@@ -8,11 +8,13 @@ heaps change ownership; legacy guards and generation authority remain intact.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import struct
 import tempfile
 from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -30,6 +32,7 @@ from process.network_custom_address_source import (
 )
 from process.network_membership_writer_closure import NetworkWriterClosureError, _check_roles, _transfer_and_grant
 from process.npi_result_generation import validate_npi_result_generation_authority
+from process.provider_directory_proof_store import _drain_proof_steps_async, _merged_spool_lines, _RecordSpool
 
 _COPY_BATCH_ROWS = 4096
 _COPY_BATCH_BYTES = 64 * 1024 * 1024
@@ -151,24 +154,34 @@ async def _shape(connection, table_oid):
 
 
 async def _content(connection, schema_name, table_name):
-    """Stream compact native chunk hashes, with at most 4096 hashes per aggregate."""
-    query = f"""WITH hashes AS MATERIALIZED (
-      SELECT encode(sha256(convert_to(to_jsonb(source_row)::text,'UTF8')),'hex') AS fingerprint
+    """Sort only native row fingerprints in bounded runs, preserving the chunk commitment."""
+    query = f"""SELECT sha256(convert_to(to_jsonb(source_row)::text,'UTF8')) AS fingerprint
       FROM {_identifier(schema_name)}.{_identifier(table_name)} source_row
-    ), ordered AS (
-      SELECT fingerprint,row_number() OVER(ORDER BY fingerprint COLLATE "C")-1 AS ordinal FROM hashes
-    ) SELECT ordinal/4096 AS chunk_ordinal,count(*)::bigint AS row_count,
-      encode(sha256(convert_to(string_agg(fingerprint,'' ORDER BY ordinal),'UTF8')),'hex') AS fingerprint
-      FROM ordered GROUP BY ordinal/4096 ORDER BY chunk_ordinal"""
+    """
     digest = hashlib.sha256(b"entity-address-row-chunks/v1\0")
-    total_rows, next_chunk = 0, 0
-    async for chunk in connection.cursor(query, prefetch=32):
-        if chunk["chunk_ordinal"] != next_chunk or not 1 <= chunk["row_count"] <= 4096:
-            raise NetworkBootstrapSourceError("Native content accounting is invalid")
-        digest.update(struct.pack(">I", chunk["row_count"]))
-        digest.update(bytes.fromhex(chunk["fingerprint"]))
-        total_rows += chunk["row_count"]
-        next_chunk += 1
+    total_rows, chunk_rows, chunk = 0, 0, hashlib.sha256()
+    with tempfile.TemporaryDirectory(prefix="network-content-") as directory:
+        spool = _RecordSpool(Path(directory))
+        async for fingerprint_row in connection.cursor(query, prefetch=_COPY_BATCH_ROWS):
+            fingerprint = fingerprint_row["fingerprint"]
+            if type(fingerprint) is not bytes or len(fingerprint) != 32:
+                raise NetworkBootstrapSourceError("Native content accounting is invalid")
+            spool.add(fingerprint.hex().encode("ascii"))
+        paths = await _drain_proof_steps_async(spool.bounded_path_steps())
+        with _merged_spool_lines(spool, paths) as fingerprints:
+            for fingerprint in fingerprints:
+                chunk.update(fingerprint)
+                chunk_rows += 1
+                if chunk_rows == 4096:
+                    digest.update(struct.pack(">I", chunk_rows))
+                    digest.update(chunk.digest())
+                    total_rows += chunk_rows
+                    chunk_rows, chunk = 0, hashlib.sha256()
+                    await asyncio.sleep(0)
+        if chunk_rows:
+            digest.update(struct.pack(">I", chunk_rows))
+            digest.update(chunk.digest())
+            total_rows += chunk_rows
     return total_rows, digest.hexdigest()
 
 

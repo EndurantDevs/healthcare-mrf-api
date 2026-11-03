@@ -1720,6 +1720,22 @@ def _validate_witness_cursor(after_resource):
         raise FHIRMembershipSourceError("FHIR source cursor is invalid")
 
 
+def _source_witness_stream_sql_v2(source_pin):
+    """Keep the original documents and ordering; bound transfer per fact instead of per resource."""
+    query = _source_witness_sql_v2(source_pin)
+    expanded_limit = "        LIMIT 5001\n"
+    transfer = "      ), transfer AS (\n"
+    if query.count(expanded_limit) != 1 or query.count(transfer) != 1:
+        raise FHIRMembershipSourceError("FHIR source witness stream SQL anchors are invalid")
+    documents = query.replace(expanded_limit, "", 1).split(transfer, 1)[0]
+    return (
+        documents
+        + """      ) SELECT resource_type,resource_id,
+      CASE WHEN octet_length(fact::text)<=8388608 THEN fact::text END AS fact
+      FROM documents ORDER BY resource_type COLLATE "C",resource_id COLLATE "C",fact->>'kind' DESC,fact::text"""
+    )
+
+
 def _witness_query_arguments(source_pin, after_resource, limit):
     physical = fhir_physical_source(source_pin)
     arguments = (

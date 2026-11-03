@@ -222,13 +222,17 @@ async def _publication_address_sources(connection, expected_head, config, initia
             )
         compact_upgrade = (
             initial_address_sources is not None
-            and bool(initial_address_sources.replacement_source_recipes)
+            and bool(
+                initial_address_sources.replacement_source_recipes or initial_address_sources.source_recipe_additions
+            )
             and initial_address_sources.compact
         )
         address_sources = await _source_rollback_address_sources(
             connection, source_pin, config.control_schema, **({"compact_upgrade": True} if compact_upgrade else {})
         )
-        if initial_address_sources is not None and initial_address_sources.replacement_source_recipes:
+        if initial_address_sources is not None and (
+            initial_address_sources.replacement_source_recipes or initial_address_sources.source_recipe_additions
+        ):
             if (
                 initial_address_sources.base_source != address_sources.base_source
                 or initial_address_sources.npi_source != address_sources.npi_source
@@ -240,6 +244,7 @@ async def _publication_address_sources(connection, expected_head, config, initia
             address_sources = replace(
                 address_sources,
                 replacement_source_recipes=initial_address_sources.replacement_source_recipes,
+                source_recipe_additions=initial_address_sources.source_recipe_additions,
                 source_witness_runtime=initial_address_sources.source_witness_runtime,
             )
     else:
@@ -259,7 +264,7 @@ async def _ordinary_publication(
         expected_head
         and initial_address_sources.initial_source_recipes
         or not expected_head
-        and initial_address_sources.replacement_source_recipes
+        and (initial_address_sources.replacement_source_recipes or initial_address_sources.source_recipe_additions)
     ):
         raise ValueError("registry_publication_source_recipe_phase_invalid")
     approval = await approve_queued_registry_publication(

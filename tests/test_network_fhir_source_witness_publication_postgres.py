@@ -1127,7 +1127,9 @@ async def _additional_source_capture(context, monkeypatch):
     )
 
 
-async def _assert_source_addition_readers(context, second, other, source_composition, retained_network):
+async def _assert_source_addition_readers(
+    context, second, other, source_composition, retained_network, expected_recipes
+):
     """Keep prior API readers pinned through adding a distinct Source and rolling back."""
     from process.registry_source_recipe_store import (
         canonical_registry_source_recipes,
@@ -1161,7 +1163,7 @@ async def _assert_source_addition_readers(context, second, other, source_composi
                 reader, third, control_schema=schema, api_read=True
             )
             assert canonical_registry_source_recipes(actual_recipes) == canonical_registry_source_recipes(
-                source_composition.replacement_source_recipes
+                expected_recipes
             )
             restored = await _publish_source_rollback(context, second, third, require_witness_replay=False)
             assert await _membership_snapshot(reader, third) == current
@@ -1172,7 +1174,8 @@ async def _assert_source_addition_readers(context, second, other, source_composi
             assert await _membership_snapshot(reader, restored) == original
 
 
-async def test_distinct_source_addition_retains_prior_capture_and_readers(monkeypatch, record_property):
+@pytest.mark.parametrize("source_mode", ["replacement", "append"])
+async def test_distinct_source_addition_retains_prior_capture_and_readers(monkeypatch, record_property, source_mode):
     from process.network_approved_membership_source import pin_retained_approved_membership_source
     from process.network_approved_source_bindings import ApprovedNetworkSourceBindingError
 
@@ -1204,6 +1207,10 @@ async def test_distinct_source_addition_retains_prior_capture_and_readers(monkey
         source_composition = replace(
             a_sources, replacement_source_recipes=(*a_sources.replacement_source_recipes, other.recipe)
         )
+        expected_recipes = source_composition.replacement_source_recipes
+        if source_mode == "append":
+            source_composition = await _append_source_input(context, second, a_sources, other.recipe)
+            await _assert_append_input_refusals(context, second, source_composition)
         schema = context.worker.fixture.control_schema
         async with _login(context.worker, "execution") as execution:
             async with execution.transaction(isolation="repeatable_read", readonly=True):
@@ -1214,8 +1221,59 @@ async def test_distinct_source_addition_retains_prior_capture_and_readers(monkey
                     await recipes.require_source_witness_read(
                         execution, context.recipe, historical, schema, context.runtime
                     )
-        await _assert_source_addition_readers(context, second, other, source_composition, retained_network)
+        await _assert_source_addition_readers(
+            context, second, other, source_composition, retained_network, expected_recipes
+        )
         record_property("membership_and_provider_only_counts", "1 -> 2 -> 3 -> 2")
         record_property("distinct_sources_and_captures", "2")
         record_property("current_approval_remains_strict", "true")
         record_property("pinned_readers_after_publication_and_rollback", "unchanged")
+        record_property("source_input_mode", source_mode)
+
+
+async def _append_source_input(context, predecessor, sources, recipe):
+    from process.registry_source_recipe_additions import decode_source_recipe_additions
+    from process.registry_source_recipe_store import canonical_registry_source_recipes
+
+    async with _login(context.worker, "execution") as execution:
+        async with execution.transaction(isolation="repeatable_read", readonly=True):
+            reference = await execution.fetchval(
+                f'SELECT source_recipes_json::text FROM "{context.worker.fixture.control_schema}".network_membership_candidate '
+                "WHERE candidate_id=$1 AND state='published'",
+                UUID(predecessor.candidate_id),
+            )
+    additions = decode_source_recipe_additions(
+        {
+            "expected_serving_generation": predecessor.generation_id,
+            "manifest_sha256": predecessor.manifest_sha256,
+            "inventory": json.loads(reference),
+            "recipes": json.loads(canonical_registry_source_recipes((recipe,))),
+        }
+    )
+    return replace(sources, replacement_source_recipes=(), source_recipe_additions=additions)
+
+
+async def _assert_append_input_refusals(context, predecessor, sources):
+    additions = sources.source_recipe_additions
+    altered_reference = replace(
+        additions.inventory,
+        root=replace(
+            additions.inventory.root,
+            encoded_bytes=additions.inventory.root.encoded_bytes + 1,
+        ),
+    )
+    for changed in (
+        replace(additions, expected_serving_generation=predecessor.generation_id + 1),
+        replace(additions, manifest_sha256="f" * 64),
+        replace(additions, inventory=altered_reference),
+        replace(additions, recipes=(context.recipe,)),
+    ):
+        sealed_before = len(context.sealed_targets)
+        async with _consumer(context.worker) as (arguments, _):
+            arguments["initial_address_sources"] = replace(sources, source_recipe_additions=changed)
+            queued = await _enqueue_ordinary(context.worker, predecessor.generation_id)
+            with pytest.raises(ValueError, match="registry_publication_request_refused"):
+                await consume_registry_publication_once(**arguments)
+            assert (await _status(context.worker, queued))["state"] == "rejected"
+        assert await _head(context.worker) == predecessor.generation_id
+        assert len(context.sealed_targets) == sealed_before

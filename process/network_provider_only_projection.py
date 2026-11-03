@@ -24,6 +24,7 @@ from process.network_fhir_membership_source import (
     fhir_physical_source,
     read_fhir_source_witness_page_v2,
 )
+from process.network_fhir_witness_stream import copy_fhir_witness_resource_v2
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_membership_copy import MembershipCopyTarget
 from process.registry_source_contribution_artifacts import (
@@ -333,7 +334,19 @@ async def _rebuild_source_witnesses_v2(connection, recipe, fact_table, approved,
             )
         except FHIRMembershipBatchBoundsError:
             if limit == 1:
-                raise
+                cursor, ordinal = await copy_fhir_witness_resource_v2(
+                    connection,
+                    recipe.source_pin,
+                    registry_schema=control_schema,
+                    after_resource=cursor,
+                    approved_source=approved,
+                    binding_coordinates=recipe.binding_coordinates,
+                    retained_read=source_read,
+                    copy_position=(fact_table, verified_office_fact_identity(recipe)[0], ordinal),
+                )
+                resource_count += 1
+                _require(resource_count <= expected_resources)
+                continue
             limit //= 2
             continue
         _require(page.source == recipe.source_pin)
@@ -354,6 +367,7 @@ async def _rebuild_source_witnesses_v2(connection, recipe, fact_table, approved,
         )
         _require(page.next_resource is not None and (cursor is None or page.next_resource > cursor))
         cursor = page.next_resource
+        limit = min(1000, limit * 2)
 
 
 async def _receipt(connection, relation):

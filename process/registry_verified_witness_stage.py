@@ -16,6 +16,7 @@ from process.network_fhir_membership_source import (
     fhir_physical_source,
     read_fhir_source_witness_page_v2,
 )
+from process.network_fhir_witness_stream import copy_fhir_witness_resource_v2
 from process.registry_source_contribution_artifacts import anchored_source_fact_descriptor
 from process.registry_source_contribution_store import (
     _digest,
@@ -140,7 +141,22 @@ async def _capture_witness_facts(connection, recipe, approved, control_schema, f
     cursor, limit, ordinal, headers = None, 1000, 0, 0
     identity = verified_office_fact_identity(recipe)[0]
     while True:
-        page, limit = await _read_witness_page(connection, recipe, approved, control_schema, (cursor, limit), read)
+        try:
+            page, limit = await _read_witness_page(connection, recipe, approved, control_schema, (cursor, limit), read)
+        except FHIRMembershipBatchBoundsError:
+            cursor, ordinal = await copy_fhir_witness_resource_v2(
+                connection,
+                recipe.source_pin,
+                registry_schema=control_schema,
+                after_resource=cursor,
+                approved_source=approved,
+                binding_coordinates=recipe.binding_coordinates,
+                retained_read=read,
+                copy_position=(fact_table, identity, ordinal),
+            )
+            limit = 1
+            headers += 1
+            continue
         if page.source != recipe.source_pin:
             raise RegistrySourceCompositionError("registry_source_composition_generation_changed")
         ordinal = await copy_fhir_source_witness_page_v2(connection, page, fact_table, identity, ordinal)
@@ -152,6 +168,7 @@ async def _capture_witness_facts(connection, recipe, approved, control_schema, f
         if page.next_resource is None or cursor is not None and page.next_resource <= cursor:
             raise RegistrySourceCompositionError("registry_source_composition_cursor_invalid")
         cursor = page.next_resource
+        limit = min(1000, limit * 2)
 
 
 async def _stage_witness_source(
