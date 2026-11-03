@@ -484,6 +484,7 @@ async def _source_batch_preview(request, document, actor):
             raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable") from None
     else:
         async with request.ctx.sa_session.begin():
+            await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             preview_by_field = await _checked_preview(
                 await _driver(request.ctx.sa_session),
                 command,
