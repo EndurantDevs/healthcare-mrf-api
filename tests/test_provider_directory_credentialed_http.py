@@ -409,3 +409,33 @@ def test_reviewed_fallback_never_reports_invalid_secret_header_contents(monkeypa
     )
     assert fetch_result[:3] == (None, None, "ValueError")
     assert marker not in str(fetch_result)
+
+
+def test_unreviewed_or_malformed_collection_never_resolves_credentials(monkeypatch):
+    """Reject both unrelated sources and malformed destinations before secret lookup."""
+    base = "https://payer.example/fhir"
+    source, _spec = _reviewed_source(monkeypatch, base, "https://payer.example/token")
+    resolve = Mock(side_effect=AssertionError("credentials must not be resolved"))
+    monkeypatch.setattr(directory, "_credential_spec_for_source", resolve)
+    assert not selection.credentialed_rest_request_allowed(directory, {"api_base": base + "-other"}, base)
+    assert not selection.credentialed_rest_request_allowed(directory, source, "https://[invalid")
+    assert not selection.is_anonymous_source_url("https://[invalid")
+    resolve.assert_not_called()
+
+
+def test_reviewed_session_requires_verified_tls_context(monkeypatch):
+    """Reuse only the reviewed credentialed session while TLS verification remains enabled."""
+    base = "https://payer.example/fhir"
+    source, _spec = _reviewed_source(monkeypatch, base, "https://payer.example/token")
+    context = ssl.create_default_context()
+    session = SimpleNamespace(connector=SimpleNamespace(_ssl=context), closed=False)
+    token = directory._SOURCE_HTTP_SESSION.set(session)
+    try:
+        assert selection.credentialed_rest_session(directory, source, base + "/Location") is session
+        context.check_hostname = False
+        assert selection.credentialed_rest_session(directory, source, base + "/Location") is None
+        context.check_hostname = True
+        session.closed = True
+        assert selection.credentialed_rest_session(directory, source, base + "/Location") is None
+    finally:
+        directory._SOURCE_HTTP_SESSION.reset(token)

@@ -129,7 +129,9 @@ async def test_verified_current_offices_precede_carry_alias_binding_union(monkey
     stage = composition.RegistrySourceRecipeStage(
         "current_members", 1, 0, "a" * 64, office_matches=object(), preservation=object()
     )
-    inputs = composition._CompositionInputs(object(), None, object(), None, None)
+    connection = SimpleNamespace(execute=AsyncMock())
+    inputs = composition._CompositionInputs(connection, None, object(), None, None)
+    target = composition._target(UUID(int=8), 7, 0, {})
     events = []
 
     async def current(*_args):
@@ -143,8 +145,12 @@ async def test_verified_current_offices_precede_carry_alias_binding_union(monkey
 
     monkeypatch.setattr(composition, "_record_source_receipts", current)
     monkeypatch.setattr(composition, "_bindings", carry)
-    await composition._record_prepared_composition(inputs, object(), ((), stage, object(), None, None, ()), "registry")
+    await composition._record_prepared_composition(inputs, target, ((), stage, object(), None, None, ()), "registry")
     assert events == ["current", "carry"]
+    connection.execute.assert_awaited_once_with(
+        "CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
+        f'ON "{target.schema_name}".provider_location_binding USING hash(location_key)'
+    )
 
 
 @pytest.mark.asyncio

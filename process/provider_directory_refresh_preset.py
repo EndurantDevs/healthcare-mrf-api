@@ -4,15 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-
 PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL = "monthly-full"
-PROVIDER_DIRECTORY_REFRESH_PRESETS = (
-    PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL,
-)
+PROVIDER_DIRECTORY_REFRESH_PRESETS = (PROVIDER_DIRECTORY_REFRESH_PRESET_MONTHLY_FULL,)
 PROVIDER_DIRECTORY_MONTHLY_FULL_DEFAULTS: Mapping[str, object] = {
     "import_resources": True,
     "full_refresh": True,
-    "stale_cleanup": True,
+    "stale_cleanup": False,
     "publish_artifacts": True,
     "publish_corroboration": True,
     "open_only": False,
@@ -27,10 +24,7 @@ def apply_provider_directory_refresh_preset(
 ) -> dict[str, Any]:
     """Expand one recognized preset into its effective task parameters."""
 
-    preset_value = (
-        task_by_field.get("refresh_preset")
-        or task_by_field.get("preset")
-    )
+    preset_value = task_by_field.get("refresh_preset") or task_by_field.get("preset")
     if preset_value is None:
         return task_by_field
     preset = str(preset_value).strip()
@@ -45,9 +39,7 @@ def apply_provider_directory_refresh_preset(
         )
     normalized_task_by_field = dict(task_by_field)
     normalized_task_by_field["refresh_preset"] = normalized_preset
-    for field_name, default_value in (
-        PROVIDER_DIRECTORY_MONTHLY_FULL_DEFAULTS.items()
-    ):
+    for field_name, default_value in PROVIDER_DIRECTORY_MONTHLY_FULL_DEFAULTS.items():
         if normalized_task_by_field.get(field_name) in (None, ""):
             normalized_task_by_field[field_name] = default_value
     return normalized_task_by_field

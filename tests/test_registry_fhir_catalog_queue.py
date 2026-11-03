@@ -5,6 +5,7 @@ import asyncio
 import shutil
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -302,3 +303,173 @@ async def test_replacement_between_finalization_read_and_commit_is_preserved(wor
     assert await worker.pool.get(in_progress_key_prefix + job.job_id) == b"replacement-owner"
     assert await worker.pool.get(result_key_prefix + job.job_id) == b"replacement-result"
     assert await worker.pool.zscore(worker.queue_name, job.job_id) is not None
+
+
+@pytest.mark.parametrize("settings", [{"max_jobs": 2}, {"max_tries": 2}, {"job_timeout": 1}])
+async def test_catalog_worker_refuses_configuration_that_escapes_its_single_claim(catalog_redis, settings):
+    async def body(_ctx):
+        pytest.fail("invalid worker settings started work")
+
+    option_by_name = dict(
+        functions=[func(body, name="control_single_job_start", max_tries=1)],
+        redis_pool=catalog_redis,
+        job_timeout=None,
+        max_jobs=1,
+        max_tries=1,
+        handle_signals=False,
+    )
+    with pytest.raises(ValueError, match="registry_fhir_catalog_queue_settings_invalid"):
+        queue.FHIRCatalogWorker(**(option_by_name | settings))
+
+
+async def test_deferred_or_removed_job_cannot_acquire_a_live_claim(workers):
+    async def body(_ctx):
+        pytest.fail("ineligible queue entry started work")
+
+    worker = workers(body)
+    deferred = await worker.pool.enqueue_job("control_single_job_start", _queue_name=worker.queue_name, _defer_by=60)
+    await worker.start_jobs([deferred.job_id.encode(), b"removed-job"])
+    assert not worker.tasks and not worker._claims and worker.job_counter == 0
+    assert (
+        await worker.pool.exists(in_progress_key_prefix + deferred.job_id, in_progress_key_prefix + "removed-job") == 0
+    )
+    assert await worker.pool.zscore(worker.queue_name, deferred.job_id) is not None
+
+
+async def test_expired_local_deadline_cannot_renew_the_stored_claim(workers, monkeypatch):
+    async def body(_ctx):
+        pytest.fail("expired claim started work")
+
+    worker = workers(body)
+    job_id = "expired-job"
+    key = in_progress_key_prefix + job_id
+    claim = queue._Claim(b"original-owner", worker.loop.time() - 1)
+    await worker.pool.set(key, claim.token, px=5000)
+    evaluate = AsyncMock(wraps=worker.pool.eval)
+    monkeypatch.setattr(worker.pool, "eval", evaluate)
+    with pytest.raises(RuntimeError, match="registry_fhir_catalog_queue_claim_lost"):
+        await worker._renew_claim(job_id, claim)
+    evaluate.assert_not_awaited()
+    assert await worker.pool.get(key) == claim.token
+
+
+async def test_lost_initial_claim_never_enters_job_or_erases_the_replacement(workers):
+    body = AsyncMock(side_effect=AssertionError("unowned job started"))
+    worker = workers(body)
+    job = await worker.pool.enqueue_job("control_single_job_start", _queue_name=worker.queue_name)
+    key = in_progress_key_prefix + job.job_id
+    worker._claims[job.job_id] = queue._Claim(b"original", worker.loop.time() + 5)
+    await worker.pool.set(key, b"replacement", px=5000)
+    original_job = await worker.pool.get(job_key_prefix + job.job_id)
+    score = await worker.pool.zscore(worker.queue_name, job.job_id)
+    await worker.run_job(job.job_id, int(score))
+    body.assert_not_awaited()
+    assert worker.jobs_failed == 1 and not worker._claims
+    assert await worker.pool.get(key) == b"replacement"
+    assert await worker.pool.get(job_key_prefix + job.job_id) == original_job
+    assert await worker.pool.zscore(worker.queue_name, job.job_id) == score
+    assert await worker.pool.get(result_key_prefix + job.job_id) is None
+
+
+async def test_owned_deferred_finalization_preserves_payload_and_finite_claim(workers):
+    worker = workers(AsyncMock())
+    job = await worker.pool.enqueue_job("control_single_job_start", _queue_name=worker.queue_name)
+    key = in_progress_key_prefix + job.job_id
+    claim = queue._Claim(b"owner", worker.loop.time() + 5)
+    worker._claims[job.job_id] = claim
+    await worker.pool.set(key, claim.token, px=5000)
+    original_job = await worker.pool.get(job_key_prefix + job.job_id)
+    score = await worker.pool.zscore(worker.queue_name, job.job_id)
+    await worker.finish_job(job.job_id, False, None, 0, False, 1000, 2)
+    assert claim.finalizing
+    assert await worker.pool.get(key) == claim.token
+    assert 0 < await worker.pool.pttl(key) <= 2000
+    assert await worker.pool.zscore(worker.queue_name, job.job_id) == score + 1000
+    assert await worker.pool.get(job_key_prefix + job.job_id) == original_job
+    assert await worker.pool.get(result_key_prefix + job.job_id) is None
+
+
+async def test_finalizing_claim_stops_renewal_without_cancelling_its_owner(workers, monkeypatch):
+    from unittest.mock import Mock
+
+    worker = workers(AsyncMock())
+    claim = queue._Claim(b"owner", worker.loop.time() + 5)
+    owner = Mock()
+    evaluate = AsyncMock(wraps=worker.pool.eval)
+    monkeypatch.setattr(worker.pool, "eval", evaluate)
+    task = asyncio.create_task(worker._keep_claim("job", claim, owner))
+    try:
+        await asyncio.sleep(0)
+        claim.finalizing = True
+        await asyncio.wait_for(task, 1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    evaluate.assert_not_awaited()
+    owner.cancel.assert_not_called()
+
+
+async def test_catalog_factory_keeps_the_closed_execution_settings(catalog_redis):
+    from types import SimpleNamespace
+
+    settings = SimpleNamespace(
+        functions=[func(AsyncMock(), name="control_single_job_start", max_tries=1)],
+        job_timeout=None,
+        max_jobs=1,
+        max_tries=1,
+        handle_signals=False,
+    )
+    worker = queue.create_fhir_catalog_worker(settings, redis_pool=catalog_redis)
+    assert type(worker) is queue.FHIRCatalogWorker
+    assert worker.pool is catalog_redis and worker.max_jobs == worker.max_tries == 1
+    assert worker.job_timeout_s is None and not worker._claims and not worker.tasks
+    with pytest.raises(ValueError, match="registry_fhir_catalog_queue_settings_invalid"):
+        queue.create_fhir_catalog_worker(settings, redis_pool=catalog_redis, max_jobs=2)
+
+
+async def test_claim_acquisition_race_releases_capacity_without_overwriting_new_owner(workers, monkeypatch):
+    body = AsyncMock(side_effect=AssertionError("contested job started"))
+    worker = workers(body)
+    job = await worker.pool.enqueue_job("control_single_job_start", _queue_name=worker.queue_name)
+    key = in_progress_key_prefix + job.job_id
+    original_pipeline = worker.pool.pipeline
+
+    def pipeline(*args, **kwargs):
+        pipe = original_pipeline(*args, **kwargs)
+        execute = pipe.execute
+
+        async def replace_before_commit(*execute_args, **execute_kwargs):
+            await worker.pool.set(key, b"replacement", px=5000)
+            return await execute(*execute_args, **execute_kwargs)
+
+        pipe.execute = replace_before_commit
+        return pipe
+
+    monkeypatch.setattr(worker.pool, "pipeline", pipeline)
+    await worker.start_jobs([job.job_id.encode()])
+    body.assert_not_awaited()
+    assert not worker.tasks and not worker._claims and worker.job_counter == 0
+    assert await worker.pool.get(key) == b"replacement"
+    assert await worker.pool.get(job_key_prefix + job.job_id) is not None
+    assert await worker.pool.zscore(worker.queue_name, job.job_id) is not None
+
+
+async def test_running_catalog_job_keeps_the_second_job_queued_without_a_claim(workers):
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def body(_ctx):
+        entered.set()
+        await finish.wait()
+
+    worker = workers(body)
+    first = await _start(worker)
+    await asyncio.wait_for(entered.wait(), 1)
+    second = await worker.pool.enqueue_job("control_single_job_start", _queue_name=worker.queue_name)
+    await asyncio.wait_for(worker.start_jobs([second.job_id.encode()]), 1)
+    assert set(worker.tasks) == set(worker._claims) == {first.job_id}
+    assert worker.job_counter == 1
+    assert await worker.pool.get(in_progress_key_prefix + second.job_id) is None
+    assert await worker.pool.zscore(worker.queue_name, second.job_id) is not None
+    finish.set()
+    await asyncio.wait_for(worker.tasks[first.job_id], 1)
+    assert not worker._claims and worker.job_counter == 0

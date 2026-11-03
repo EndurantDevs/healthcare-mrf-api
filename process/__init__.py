@@ -1585,8 +1585,8 @@ def provider_enrichment(test: bool):
 )
 @click.option(
     "--stale-cleanup/--no-stale-cleanup",
-    default=None,
-    help="Delete rows absent from a completed source/resource scan. Defaults on for non-test resource imports.",
+    default=False,
+    help="Delete rows absent from a completed source/resource scan. Disabled unless explicitly requested.",
 )
 @click.option(
     "--publish-artifacts/--no-publish-artifacts",

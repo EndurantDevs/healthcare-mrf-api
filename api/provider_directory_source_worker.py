@@ -48,9 +48,17 @@ class FHIRSourceWorkerLaunch:
     proxy_cooldowns_json: str = ""
 
 
-def _configured_routes():
+@dataclass(frozen=True)
+class FHIRSourcePublicationLaunch(FHIRSourceWorkerLaunch):
+    """Bind a publication executor to the retained native attempt and handoff."""
+
+    attempt_id: str = ""
+    handoff_sha256: str = ""
+
+
+def _configured_routes(*, setting=ROUTES_ENV):
     """Validate the complete server-owned route inventory before selection."""
-    raw = os.getenv(ROUTES_ENV, "").strip()
+    raw = os.getenv(setting, "").strip()
     if not raw:
         return []
     try:
@@ -89,11 +97,11 @@ def _configured_routes():
     return routes
 
 
-def _source_route(admitted_run):
+def _source_route(admitted_run, *, routes=None):
     """Preserve an exact original route before selecting fresh or retry execution."""
     params = admitted_run.get("params")
     params = params if type(params) is dict else {}
-    routes = _configured_routes()
+    routes = _configured_routes() if routes is None else routes
     root = admitted_run.get("run_id")
     root_routes = [route for route in routes if route["root_run_id"] == root]
     if not root_routes:
@@ -158,7 +166,11 @@ def _fresh_source_route(admitted_run, params, routes):
 def _is_launch_secret_selected(selection, launch, *, allow_shared=False):
     """Keep routed credentials isolated while allowing explicitly shared env."""
     secret_name = str(selection.get("secretName") or selection.get("secret_name") or "").strip()
-    route_secret_names = {route["secret_name"] for route in _configured_routes()}
+    from api.provider_directory_source_publication import ROUTES_ENV as PUBLICATION_ROUTES_ENV
+
+    route_secret_names = {
+        route["secret_name"] for route in [*_configured_routes(), *_configured_routes(setting=PUBLICATION_ROUTES_ENV)]
+    }
     shared_for_routes = selection.get("sharedForRoutes", False)
     if type(shared_for_routes) is not bool or (shared_for_routes and not allow_shared):
         raise ValueError("worker purpose shared secret selector is invalid")
@@ -428,7 +440,12 @@ def _is_admissible_route_root(lineage_record, launch):
         return lineage_record["status"] == "failed"
     params = lineage_record["params"]
     return (
-        lineage_record["status"] in {"queued", "starting", "running", "finalizing"}
+        lineage_record["status"]
+        in (
+            {"succeeded"}
+            if type(launch) is FHIRSourcePublicationLaunch
+            else {"queued", "starting", "running", "finalizing"}
+        )
         and not launch.retry_of_run_id
         and params.get("retry_of_run_id") is None
         and params.get("provider_directory_pagination_root_run_id") in (None, launch.root_run_id)
@@ -492,7 +509,7 @@ async def _source_route_lineage(connection, root_run_id):
 
 async def require_fhir_source_route_ancestry(connection, launch):
     """Return the immutable launch only after native ancestry and cooldown capture."""
-    if type(launch) is not FHIRSourceWorkerLaunch or not launch.root_run_id:
+    if type(launch) not in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch) or not launch.root_run_id:
         return launch
     lineage_rows = await _source_route_lineage(connection, launch.root_run_id)
     runs_by_id = _lineage_by_id(lineage_rows)
@@ -522,14 +539,23 @@ async def require_fhir_source_route_ancestry(connection, launch):
             break
         if current_id == launch.root_run_id:
             if _is_admissible_route_root(lineage_record, launch):
-                return _proxy_lineage_launch(launch, ancestors or [lineage_record])
+                return (
+                    launch
+                    if type(launch) is FHIRSourcePublicationLaunch
+                    else _proxy_lineage_launch(launch, ancestors or [lineage_record])
+                )
             break
         parent_id = lineage_record["retry_of_run_id"]
         if not (
             type(parent_id) is str
             and params.get("retry_of_run_id") == parent_id
             and (
-                lineage_record["status"] in {"queued", "starting", "running", "finalizing"}
+                lineage_record["status"]
+                in (
+                    {"succeeded"}
+                    if type(launch) is FHIRSourcePublicationLaunch
+                    else {"queued", "starting", "running", "finalizing"}
+                )
                 if current_id == launch.run_id
                 else lineage_record["status"] == "failed"
                 or _is_unstarted_canceled_route_parent(lineage_record, current_params)
@@ -552,10 +578,18 @@ def authorized_fhir_source_worker_launch(spec, launch_request):
     launch = getattr(launch_request, "fhir_source_launch", None)
     if launch is None:
         return None
-    if type(launch) is not FHIRSourceWorkerLaunch:
+    if type(launch) not in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch):
         raise ValueError("fhir_source_worker_admission_unavailable")
-    _require_fhir_job_identity(spec, launch_request, launch.run_id, launch.job_id)
-    _require_proxy_launch(launch)
+    is_publication = type(launch) is FHIRSourcePublicationLaunch
+    _require_fhir_job_identity(spec, launch_request, launch.run_id, launch.job_id, publication=is_publication)
+    if is_publication and (
+        not re.fullmatch(re.escape(launch.run_id) + r":[0-9a-f]{32}", launch.attempt_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", launch.handoff_sha256)
+        or any((launch.policy_revision, launch.pool_revision, launch.pool_secret_name, launch.proxy_cooldowns_json))
+    ):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    if not is_publication:
+        _require_proxy_launch(launch)
     return launch
 
 
@@ -719,10 +753,12 @@ def _proxy_literal_environment(launch):
 
 
 def source_proxy_environment(spec, launch_request, environment):
-    """Emit only captured nonsecret policy, with exactly its selected pool keyref."""
+    """Emit captured source policy or publication proof with exact keyrefs."""
+    from api.provider_directory_source_publication import environment as publication_environment
+
     launch = authorized_fhir_source_worker_launch(spec, launch_request)
     if launch is None or not launch.pool_secret_name:
-        return []
+        return publication_environment(launch)
     expected_by_field = {
         "name": PROXY_POOL_ENV,
         "valueFrom": {"secretKeyRef": {"name": launch.pool_secret_name, "key": PROXY_POOL_ENV}},
@@ -813,13 +849,16 @@ def admitted_ordinary_fhir_job(spec, launch_request):
     return identity[4]
 
 
-def _require_fhir_job_identity(spec, launch_request, run_id, job_id):
+def _require_fhir_job_identity(spec, launch_request, run_id, job_id, *, publication=False):
     """Keep both runtimes on the same exact native adapter and queue identity."""
     from api.control_imports import _SINGLE_JOB_ADAPTERS
+    from api.provider_directory_source_publication import ROLE
 
     adapter = _SINGLE_JOB_ADAPTERS.get(_IMPORTER, {})
+    role = ROLE if publication else "start"
     if (
-        (spec.worker_class, spec.queue, spec.importers, spec.role) != (_WORKER_CLASS, _QUEUE, (_IMPORTER,), "start")
+        (spec.worker_class, spec.queue, spec.importers, spec.role) != (_WORKER_CLASS, _QUEUE, (_IMPORTER,), role)
+        or (publication and launch_request.get("role") != ROLE)
         or launch_request.admitted_job != (run_id, _IMPORTER, _QUEUE, _FUNCTION, job_id)
         or launch_request.get("run_id") != run_id
         or launch_request.get("importer", _IMPORTER) != _IMPORTER
@@ -869,8 +908,10 @@ def is_fhir_source_secret_selected(selection, worker_class, launch_request):
     if not _is_fhir_secret_scope(selection, worker_class):
         return False
     from api.control_workers import _BY_WORKER_CLASS
+    from api.provider_directory_source_publication import selected_spec
 
     spec = _BY_WORKER_CLASS.get(_WORKER_CLASS)
+    spec = selected_spec(spec, launch_request) if spec is not None and launch_request is not None else spec
     launch = authorized_fhir_source_worker_launch(spec, launch_request) if spec is not None else None
     return launch is not None and _is_launch_secret_selected(selection, launch, allow_shared=True)
 
@@ -879,7 +920,7 @@ def is_fhir_source_volume_selected(selection, worker_class, launch):
     """Use the existing Source capability for explicitly purpose-scoped mounts."""
     return (
         _is_fhir_secret_scope(selection, worker_class)
-        and type(launch) is FHIRSourceWorkerLaunch
+        and type(launch) in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch)
         and _is_launch_secret_selected(selection, launch)
     )
 
@@ -895,25 +936,28 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
         _worker_job_pvc_volumes,
         _worker_job_secret_volumes,
     )
+    from api.provider_directory_source_publication import ROLE
 
-    if type(launch) is not FHIRSourceWorkerLaunch or _has_broad_proxy_pool_reference(job):
+    if type(launch) not in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch) or _has_broad_proxy_pool_reference(
+        job
+    ):
         return False
+    spec = _BY_WORKER_CLASS[_WORKER_CLASS]
+    spec = replace(spec, role=ROLE) if type(launch) is FHIRSourcePublicationLaunch else spec
     try:
         template = job["spec"]["template"]
         pod = template["spec"]
         containers = pod["containers"]
         security = pod["securityContext"]
-        volumes = [*_worker_job_pvc_volumes(), *_worker_job_secret_volumes(_BY_WORKER_CLASS[_WORKER_CLASS], launch)]
+        volumes = [*_worker_job_pvc_volumes(), *_worker_job_secret_volumes(spec, launch)]
         expected_security = _worker_job_pod_security_context(has_group_read_volume="fsGroup" in security)
         expected_security.update(runAsUser=10001, runAsGroup=10001)
         expected_env = None
         if launch_request is not None:
-            expected_job = _worker_job_manifest(_BY_WORKER_CLASS[_WORKER_CLASS], launch_request, launch.image)
+            expected_job = _worker_job_manifest(spec, launch_request, launch.image)
             expected_env = expected_job["spec"]["template"]["spec"]["containers"][0]["env"]
         return (
-            job["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
-            and template["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
-            and security == expected_security
+            security == expected_security
             and pod["automountServiceAccountToken"] is False
             and all(not pod.get(key, False) for key in ("hostPID", "hostIPC", "hostNetwork"))
             and not any(pod.get(name) for name in ("initContainers", "ephemeralContainers"))
@@ -922,28 +966,54 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
             and containers[0]["image"] == launch.image
             and (expected_env is None or containers[0]["env"] == expected_env)
             and _is_proxy_job_matching(job, launch)
-            and job["metadata"]["annotations"].get("healthporta.com/source-root-run-id", "")
-            == (launch.root_run_id if launch.retry_of_run_id else "")
-            and job["metadata"]["annotations"].get("healthporta.com/source-id", "")
-            == (launch.source_id if launch.secret_name and not launch.root_run_id else "")
-            and job["metadata"]["annotations"].get("healthporta.com/source-endpoint-scope", "")
-            == (launch.endpoint_scope if launch.secret_name and not launch.root_run_id else "")
-            and containers[0]["command"] == COMMAND
-            and containers[0]["workingDir"] == "/app"
-            and not any(containers[0].get(name) for name in ("args", "lifecycle", "volumeDevices"))
+            and _fhir_source_identity_matches(job, launch)
             and containers[0].get("volumeMounts", []) == [volume["volumeMount"] for volume in volumes]
             and _secret_volume_defaults(pod.get("volumes", []))
             == _secret_volume_defaults([volume["volume"] for volume in volumes])
-            and all(
-                [entry.get("value") for entry in containers[0]["env"] if entry.get("name") == name] == [expected]
-                for name, expected in (
-                    ("HLTHPRT_CONTROL_RUN_ID", launch.run_id),
-                    ("HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", launch.job_id),
-                )
-            )
         )
     except KeyError, TypeError, IndexError:
         return False
+
+
+def _fhir_source_identity_matches(job, launch):
+    """Match only the fixed acquisition or publication bootstrap and native target."""
+    from api.provider_directory_source_publication import ROLE, environment
+
+    template = job["spec"]["template"]
+    container = template["spec"]["containers"][0]
+    is_publication = type(launch) is FHIRSourcePublicationLaunch
+    return (
+        job["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
+        and template["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
+        and job["metadata"]["annotations"].get("healthporta.com/source-root-run-id", "")
+        == (launch.root_run_id if launch.retry_of_run_id else "")
+        and job["metadata"]["annotations"].get("healthporta.com/source-id", "")
+        == (launch.source_id if launch.secret_name and not launch.root_run_id else "")
+        and job["metadata"]["annotations"].get("healthporta.com/source-endpoint-scope", "")
+        == (launch.endpoint_scope if launch.secret_name and not launch.root_run_id else "")
+        and container["command"] == COMMAND
+        and container["workingDir"] == "/app"
+        and (container.get("args") == ["publish"] if is_publication else not container.get("args"))
+        and not any(container.get(name) for name in ("lifecycle", "volumeDevices"))
+        and (
+            not is_publication
+            or (
+                job["metadata"]["labels"]["healthporta.com/role"] == ROLE
+                and template["metadata"]["labels"]["healthporta.com/role"] == ROLE
+                and all(
+                    [entry for entry in container["env"] if entry.get("name") == expected["name"]] == [expected]
+                    for expected in environment(launch)
+                )
+            )
+        )
+        and all(
+            [entry.get("value") for entry in container["env"] if entry.get("name") == name] == [expected]
+            for name, expected in (
+                ("HLTHPRT_CONTROL_RUN_ID", launch.run_id),
+                ("HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", launch.job_id),
+            )
+        )
+    )
 
 
 def _secret_volume_defaults(volumes):

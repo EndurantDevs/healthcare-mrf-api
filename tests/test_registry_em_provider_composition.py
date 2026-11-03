@@ -131,7 +131,7 @@ async def test_stale_retained_dependencies_cannot_be_silently_dropped(monkeypatc
 
 @pytest.mark.asyncio
 async def test_provider_digest_enters_identity_before_candidate_creation_and_record(monkeypatch):
-    connection = object()
+    connection = SimpleNamespace(execute=AsyncMock())
     request_id = UUID("22222222-2222-4222-8222-222222222222")
     address_sources = _sources(_inputs())
     receipt_by_field = {"receipt_sha256": "a" * 64}
@@ -177,6 +177,10 @@ async def test_provider_digest_enters_identity_before_candidate_creation_and_rec
         connection, request_id, 2, 0, address_sources, None, roles_by_kind, "registry"
     )
     assert calls == [("create", prepared_snapshot[0]), ("record", prepared_snapshot[0])]
+    connection.execute.assert_awaited_once_with(
+        "CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
+        f'ON "{prepared_snapshot[0].schema_name}".provider_location_binding USING hash(location_key)'
+    )
 
 
 @pytest.mark.asyncio

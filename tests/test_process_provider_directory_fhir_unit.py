@@ -6610,7 +6610,7 @@ def test_provider_directory_monthly_full_refresh_preset_sets_schedulable_default
     assert task["refresh_preset"] == "monthly-full"
     assert task["import_resources"] is True
     assert task["full_refresh"] is True
-    assert task["stale_cleanup"] is True
+    assert task["stale_cleanup"] is False
     assert task["publish_artifacts"] is True
     assert task["open_only"] is False
     assert task["include_auth_required"] is True

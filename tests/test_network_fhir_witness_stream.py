@@ -385,3 +385,68 @@ async def _extract_complete(module, connection, recipe, monkeypatch, independent
         await module._rebuild_source_witnesses_v2(connection, recipe, "facts", None, "controls", None)
         return None
     return await module._capture_witness_facts(connection, recipe, None, "controls", "facts", "read")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["untyped-pin", "no-transaction"])
+async def test_stream_scope_refuses_before_savepoint_or_authority_read(source_pin, fault):
+    connection = Connection([_header(source_pin)])
+    if fault == "no-transaction":
+        connection.is_in_transaction = lambda: False
+    with pytest.raises(fhir.FHIRMembershipSourceError, match="caller transaction"):
+        await stream.copy_fhir_witness_resource_v2(
+            connection, object() if fault == "untyped-pin" else source_pin, **arguments(source_pin)
+        )
+    assert not connection.transitions and not connection.chunks
+    fhir._require_source_recipe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("digest,ordinal", [("invalid", 17), ("a" * 64, True), ("a" * 64, 2**63)])
+async def test_stream_refuses_uncommitted_copy_position_before_authority(source_pin, digest, ordinal):
+    connection = Connection([_header(source_pin)])
+    options = arguments(source_pin) | {"copy_position": ("synthetic_facts", digest, ordinal)}
+    with pytest.raises(facts.RegistrySourceContributionError, match="registry_source_witness_facts_invalid"):
+        await stream.copy_fhir_witness_resource_v2(connection, source_pin, **options)
+    assert not connection.transitions and not connection.chunks
+    fhir._require_source_recipe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["invalid-json", "duplicate-key", "non-object", "resource-changed"])
+async def test_malformed_late_document_rolls_back_prior_native_chunks(source_pin, monkeypatch, fault):
+    monkeypatch.setattr(fhir, "MAX_INPUT_BYTES", 4096)
+    malformed = {
+        "invalid-json": "{",
+        "duplicate-key": '{"resource_id":"role-one","resource_id":"other"}',
+        "non-object": "[]",
+        "resource-changed": {**_edge(source_pin), "resource_id": "other"},
+    }[fault]
+    connection = Connection([_header(source_pin), *[_edge(source_pin) for _ in range(8)], malformed])
+    with pytest.raises(facts.RegistrySourceContributionError, match="registry_source_witness_facts_invalid"):
+        await stream.copy_fhir_witness_resource_v2(connection, source_pin, **arguments(source_pin))
+    assert connection.chunks and not connection.records
+    assert connection.transitions[-1] == "rollback"
+    assert fhir._require_source_recipe.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_individually_bounded_edge_cannot_overflow_repeated_frame_header(source_pin, monkeypatch):
+    monkeypatch.setattr(fhir, "MAX_INPUT_BYTES", 1536)
+    documents = [_header(source_pin), _edge(source_pin)]
+    assert all(len(json.dumps(document).encode()) <= 1536 for document in documents)
+    connection = Connection(documents)
+    with pytest.raises(fhir.FHIRMembershipBatchBoundsError, match="exceeds bounds"):
+        await stream.copy_fhir_witness_resource_v2(connection, source_pin, **arguments(source_pin))
+    assert len(connection.chunks) == 1 and len(connection.chunks[0]) == 1
+    assert not connection.records and connection.transitions[-1] == "rollback"
+
+
+@pytest.mark.asyncio
+async def test_stream_ordinal_exhaustion_refuses_before_copy(source_pin):
+    connection = Connection([_header(source_pin)])
+    options = arguments(source_pin) | {"copy_position": ("synthetic_facts", "a" * 64, 2**63 - 1)}
+    with pytest.raises(facts.RegistrySourceContributionError, match="registry_source_witness_facts_invalid"):
+        await stream.copy_fhir_witness_resource_v2(connection, source_pin, **options)
+    assert not connection.chunks and not connection.records
+    assert connection.transitions[-1] == "rollback"

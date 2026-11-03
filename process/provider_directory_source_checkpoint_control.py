@@ -2,8 +2,10 @@
 """Original-session authority and bounded parent fences for batch checkpoints."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 from db.connection import ConnectionProxy, Database
 from db.plan_release_storage import storage_relation
@@ -39,6 +41,73 @@ DELETE FROM {output} AS output USING released
 """
 
 
+@dataclass(frozen=True)
+class BulkCheckpointProbes:
+    ownership_probe: Callable[[], Awaitable[None]]
+    stream_probe: Callable[[], Awaitable[None]]
+
+    async def __call__(self) -> None:
+        """Keep write callers on the full, uncached ownership check."""
+        await self.ownership_probe()
+
+
+async def assert_bulk_checkpoint_guard_live(directory, connection, identity):
+    """Check the original lock backend without opening a Source transaction."""
+    try:
+        owns_lock = await connection.scalar(
+            directory.db.text(
+                "SELECT EXISTS(SELECT FROM pg_locks WHERE locktype='advisory' AND granted "
+                "AND mode='ExclusiveLock' AND pid=pg_backend_pid() AND objsubid=1 "
+                "AND classid=((hashtextextended(:checkpoint_id,0)>>32)&4294967295)::oid "
+                "AND objid=(hashtextextended(:checkpoint_id,0)&4294967295)::oid)"
+            ),
+            {"checkpoint_id": identity.checkpoint_id},
+        )
+    except Exception as exc:
+        raise RuntimeError("bulk_export_checkpoint_worker_guard_lost") from exc
+    if owns_lock is not True:
+        raise RuntimeError("bulk_export_checkpoint_worker_guard_lost")
+
+
+@asynccontextmanager
+async def bulk_checkpoint_worker_guard(directory, identity):
+    """Fence writes with fresh Source custody and reads with the held session lock."""
+    from process import provider_directory_profile_scope_copy as scope
+
+    if directory.db.engine is None:
+        await directory.db.connect()
+    assert directory.db.engine is not None
+    async with directory.db.engine.connect() as guard_connection:
+        connection = await directory._bulk_guard_autocommit_connection(guard_connection)
+        acquired = await connection.scalar(
+            directory.db.text("SELECT pg_try_advisory_lock(hashtextextended(:checkpoint_id, 0));"),
+            {"checkpoint_id": identity.checkpoint_id},
+        )
+        if acquired is not True:
+            raise RuntimeError("bulk_export_checkpoint_worker_active")
+        connection_lock = asyncio.Lock()
+
+        async def ownership_probe():
+            """Serialize the original connection and freshly verify Source ownership."""
+            async with scope.source_read_transaction(directory), connection_lock:
+                await directory._assert_bulk_checkpoint_guard_owner(connection, identity)
+
+        async def stream_probe():
+            """Permit byte consumption only while the original advisory lock remains held."""
+            async with connection_lock:
+                await assert_bulk_checkpoint_guard_live(directory, connection, identity)
+
+        try:
+            yield BulkCheckpointProbes(ownership_probe, stream_probe)
+        finally:
+            with suppress(Exception):
+                async with connection_lock:
+                    await connection.scalar(
+                        directory.db.text("SELECT pg_advisory_unlock(hashtextextended(:checkpoint_id, 0));"),
+                        {"checkpoint_id": identity.checkpoint_id},
+                    )
+
+
 async def assert_bulk_checkpoint_guard_owner(directory, guard_connection, identity):
     """Probe the lock backend and read closed storage through its issued actor."""
     from process import provider_directory_profile_scope_copy as scope
@@ -46,16 +115,7 @@ async def assert_bulk_checkpoint_guard_owner(directory, guard_connection, identi
     try:
         uses_source = source.is_source_storage_required()
         if uses_source:
-            owns_lock = await guard_connection.scalar(
-                directory.db.text(
-                    "SELECT EXISTS(SELECT FROM pg_locks WHERE locktype='advisory' AND granted "
-                    "AND mode='ExclusiveLock' AND pid=pg_backend_pid() AND objsubid=1 "
-                    "AND classid=((hashtextextended(:checkpoint_id,0)>>32)&4294967295)::oid "
-                    "AND objid=(hashtextextended(:checkpoint_id,0)&4294967295)::oid)"
-                ),
-                {"checkpoint_id": identity.checkpoint_id},
-            )
-            _require(owns_lock is True, "checkpoint_guard_lost")
+            await assert_bulk_checkpoint_guard_live(directory, guard_connection, identity)
         async with scope.source_read_transaction(directory):
             executor = source_copy_session() if uses_source else guard_connection
             is_owner = await executor.scalar(

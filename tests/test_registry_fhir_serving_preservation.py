@@ -289,6 +289,32 @@ async def test_mapping_marker_requires_paired_receipt_and_native_final_input(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["receipt", "approval", "generation", "unready"])
+async def test_typed_office_receipt_cannot_replace_current_approval_or_publication_readiness(damage):
+    from process.network_membership_publication import NetworkPublicationError
+    from process.registry_fhir_serving_preservation import _current_office_inputs
+    from process.registry_initial_source_composition import SUMMARY_KEY, verify_initial_source_office_receipt
+    from tests.test_registry_typed_source_recipe import _recipe, _registered_typed_resume
+
+    _, _, candidate, _ = _registered_typed_resume()
+    summary = verify_initial_source_office_receipt(candidate)
+    approved = SimpleNamespace(approved_revision=1, generation_id=summary["context"]["approved_generation_sha256"])
+    if damage == "receipt":
+        candidate["source_generations"].pop(SUMMARY_KEY)
+        candidate["validation_json"].pop(SUMMARY_KEY)
+    elif damage == "approval":
+        approved.approved_revision += 1
+    elif damage == "generation":
+        approved.generation_id = "0" * 64
+    elif damage == "unready":
+        candidate["validation_json"].pop("address_source", None)
+    error = NetworkPublicationError if damage == "unready" else FHIRServingPreservationError
+    message = "Candidate lacks a pinned validation report" if damage == "unready" else "source_changed"
+    with pytest.raises(error, match=message):
+        await _current_office_inputs(object(), candidate, (_recipe(),), approved, "control")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["none", "receipt", "marker", "raw_generation"])
 async def test_replayed_mapping_binds_full_office_receipt_and_raw_generation(monkeypatch, damage):
     from process import registry_fhir_serving_preservation as preservation
@@ -863,3 +889,228 @@ async def test_legacy_replay_failure_preserves_primary_error_and_cleans_exact_ca
     connection.execute.assert_awaited_once_with(f"DROP TABLE IF EXISTS {relation}")
     replay.assert_awaited_once_with(connection, candidate, carried, (recipe(),), approved, "registry")
     assert overlay.await_count == int(phase == "overlay")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transaction,isolation", [(False, "repeatable read"), (True, "read committed"), (True, "read uncommitted")]
+)
+async def test_preservation_refuses_unstable_snapshots_before_reading_or_writing_sources(transaction, isolation):
+    from process.registry_fhir_serving_preservation import prepare_fhir_serving_preservation
+
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: transaction,
+        fetchval=AsyncMock(return_value=isolation),
+        fetchrow=AsyncMock(),
+        execute=AsyncMock(),
+    )
+    with pytest.raises(FHIRServingPreservationError, match="requires_repeatable_read"):
+        await prepare_fhir_serving_preservation(
+            connection,
+            None,
+            (recipe(),),
+            request_id=UUID(int=1),
+            expected_head=1,
+            approved_revision=1,
+            control_schema="registry",
+        )
+    assert connection.fetchval.await_count == int(transaction)
+    connection.fetchrow.assert_not_awaited()
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["prepare", "identity", "verify"])
+async def test_preservation_rejects_unknown_runtime_inputs_before_any_source_access(entrypoint):
+    from process import registry_fhir_serving_preservation as preservation
+
+    with pytest.raises(FHIRServingPreservationError, match="source_runtime_invalid"):
+        if entrypoint == "prepare":
+            await preservation.prepare_fhir_serving_preservation(
+                object(),
+                None,
+                (),
+                request_id=UUID(int=1),
+                expected_head=1,
+                approved_revision=1,
+                control_schema="registry",
+                untrusted_runtime=object(),
+            )
+        elif entrypoint == "identity":
+            await preservation._identity_stages(
+                object(),
+                (),
+                (),
+                None,
+                None,
+                1,
+                "registry",
+                untrusted_runtime=object(),
+            )
+        else:
+            await preservation.verify_fhir_preservation_rows(
+                object(),
+                None,
+                {},
+                control_schema="registry",
+                untrusted_runtime=object(),
+            )
+
+
+@pytest.mark.parametrize("inventory", [None, 0, 1, "true"])
+def test_preservation_inventory_mode_requires_an_explicit_boolean(inventory):
+    from process.registry_fhir_serving_preservation import _recipe_commitment
+
+    assert _recipe_commitment((recipe(),), False)[1] is None
+    assert _recipe_commitment((recipe(),), True)[1]["entry_count"] == 1
+    with pytest.raises(FHIRServingPreservationError, match="receipt_invalid"):
+        _recipe_commitment((recipe(),), inventory)
+
+
+@pytest.mark.parametrize("seal", [None, "A" * 64, "short", 1])
+def test_predecessor_custody_seal_cannot_be_missing_or_retyped(seal):
+    from process.registry_fhir_serving_preservation import _require_predecessor_seal
+
+    valid = SimpleNamespace(_custody_seal_sha256="a" * 64)
+    _require_predecessor_seal(valid, valid)
+    with pytest.raises(FHIRServingPreservationError, match="predecessor_changed"):
+        _require_predecessor_seal(SimpleNamespace(_custody_seal_sha256=seal))
+
+
+@pytest.mark.asyncio
+async def test_predecessor_address_oid_is_rechecked_under_its_read_lock():
+    from process.registry_fhir_serving_preservation import _predecessor_addresses
+
+    predecessor = SimpleNamespace(compact_layout=None, schema_name="prior_snapshot", address_table_oid=101)
+    events = []
+
+    async def lock(statement):
+        events.append(statement)
+
+    async def oid(query, relation):
+        assert events[-1] == 'LOCK TABLE ONLY "prior_snapshot".entity_address_unified IN ACCESS SHARE MODE NOWAIT'
+        return 102
+
+    connection = SimpleNamespace(execute=AsyncMock(side_effect=lock), fetchval=AsyncMock(side_effect=oid))
+    with pytest.raises(FHIRServingPreservationError, match="predecessor_changed"):
+        await _predecessor_addresses(connection, predecessor)
+    connection.execute.assert_awaited_once()
+    connection.fetchval.assert_awaited_once_with(
+        "SELECT to_regclass($1)::oid::bigint", '"prior_snapshot".entity_address_unified'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [0, 5001])
+async def test_preservation_coverage_digest_refuses_empty_or_overfull_native_ranges(count):
+    from process.registry_fhir_serving_preservation import _coverage_digest
+
+    async def rows(query, *arguments, prefetch):
+        assert prefetch == 1000 and arguments == ("previous", "slot", "organization")
+        for _ in range(count):
+            yield (1, b"a" * 32)
+
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(return_value=("previous", "slot", "organization")),
+        cursor=rows,
+    )
+    with pytest.raises(FHIRServingPreservationError, match="coverage_range"):
+        await _coverage_digest(connection, "pg_temp.coverage")
+    connection.fetchrow.assert_awaited_once()
+
+
+@pytest.mark.parametrize("missing", ["binding_rows", "address_rows"])
+def test_preservation_receipt_cannot_carry_memberships_without_resolved_addresses(missing):
+    from process import registry_fhir_serving_preservation as preservation
+
+    original = receipt()
+    predecessor = SimpleNamespace(generation_id=2, candidate_id=str(UUID(int=2)), manifest_sha256="a" * 64)
+    counters_by_name = {
+        key: original[key]
+        for key in preservation._COUNTS | preservation._DIGESTS
+        if key
+        in {
+            "missing_networks",
+            "missing_networks_sha256",
+            "carried_rows",
+            "membership_sha256",
+            "binding_rows",
+            "bindings_sha256",
+            "address_rows",
+            "addresses_sha256",
+        }
+    }
+    arguments = (predecessor, (recipe(),), (recipe("two"),), (UUID(int=4), 2, 4, None))
+    assert preservation._carry_receipt(*arguments, counters_by_name, "d" * 64)["carried_rows"] == 3
+    counters_by_name[missing] = 0
+    if missing == "binding_rows":
+        counters_by_name["address_rows"] = 0
+    with pytest.raises(FHIRServingPreservationError, match="address_unresolved"):
+        preservation._carry_receipt(*arguments, counters_by_name, "d" * 64)
+
+
+@pytest.mark.asyncio
+async def test_address_carry_cannot_write_through_an_external_read_relation():
+    from process.registry_fhir_serving_preservation import FHIRServingPreservation, carry_fhir_preservation_addresses
+
+    carried = FHIRServingPreservation(
+        None, "ids", "SELECT * FROM raw", "SELECT * FROM bindings", "SELECT * FROM addresses", {}
+    )
+    connection = SimpleNamespace(fetchval=AsyncMock(), execute=AsyncMock())
+    with pytest.raises(FHIRServingPreservationError, match="address_parity"):
+        await carry_fhir_preservation_addresses(
+            connection,
+            carried,
+            "candidate",
+            writing=True,
+            address_relation="external.addresses",
+        )
+    connection.fetchval.assert_not_awaited()
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["generation", "membership"])
+async def test_carried_target_rows_recheck_current_approved_generation_and_exact_multiset(damage):
+    from process.registry_fhir_serving_preservation import verify_fhir_preservation_target_rows
+
+    scope_by_field = {
+        "approved_revision": 4,
+        "generation_id": "a" * 64,
+        "total_rows": 3,
+        "isolation": "repeatable read",
+        "is_bounded": True,
+        "invalid_documents": 0,
+        "unresolved_rows": 0,
+        "command_documents": 0,
+    }
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchrow=AsyncMock(return_value=scope_by_field),
+        fetchval=AsyncMock(return_value=True),
+        execute=AsyncMock(),
+    )
+    candidate_by_field = {
+        "approved_custom_revision": 4,
+        "source_generations": json.dumps(
+            {
+                "custom_membership": "b" * 64 if damage == "generation" else scope_by_field["generation_id"],
+            }
+        ),
+    }
+    carried = SimpleNamespace(membership_query="SELECT * FROM prior_memberships", network_table="pg_temp.selected")
+    reason = "source_changed" if damage == "generation" else "membership_parity"
+    with pytest.raises(FHIRServingPreservationError, match=reason):
+        await verify_fhir_preservation_target_rows(
+            connection,
+            SimpleNamespace(schema_name="candidate"),
+            candidate_by_field,
+            carried,
+            control_schema="registry",
+        )
+    connection.fetchrow.assert_awaited_once()
+    assert connection.fetchrow.await_args.args[1] == 4
+    assert connection.fetchval.await_count == int(damage == "membership")
+    if damage == "membership":
+        assert connection.fetchval.await_args.args[0].count("EXCEPT ALL") == 2
+    connection.execute.assert_not_awaited()

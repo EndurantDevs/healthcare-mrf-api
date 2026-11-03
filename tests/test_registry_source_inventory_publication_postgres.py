@@ -49,6 +49,9 @@ from tests.test_network_provider_only_read_postgres import provider_only_source 
 from tests.test_registry_compact_source_offices_postgres import _rebind
 from tests.test_registry_compact_source_offices_postgres import compact_cms_source as compact_cms_source
 from tests.test_registry_source_inventory_schema_postgres import _migration
+from tests.test_registry_typed_office_parity_postgres import (
+    test_typed_binding_parity_dense_aliases_custom_preservation_and_corruption as test_typed_binding_parity_dense_aliases_custom_preservation_and_corruption,
+)
 
 pytestmark = pytest.mark.asyncio
 _HEAPS = {
