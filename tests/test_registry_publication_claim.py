@@ -741,3 +741,294 @@ async def test_source_batch_history_applies_remaining_budget_to_each_reference(m
     else:
         assert await source_batch._binding_history(*arguments) == first_records + second_records
     assert [call.kwargs["remaining_records"] for call in load.await_args_list] == [5000, 4998]
+
+
+class _BatchHttpSession:
+    def __init__(self, driver):
+        self.events = []
+        self.active = False
+        self.execute = AsyncMock()
+        self.connection = AsyncMock(
+            return_value=SimpleNamespace(
+                get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver))
+            )
+        )
+
+    @asynccontextmanager
+    async def begin(self):
+        assert not self.active
+        self.active = True
+        self.events.append("begin")
+        try:
+            yield
+        except BaseException:
+            self.events.append("rollback")
+            raise
+        else:
+            self.events.append("commit")
+        finally:
+            self.active = False
+
+
+@pytest.fixture
+def source_batch_http(monkeypatch):
+    from api.endpoint import registry_publication as publication
+
+    monkeypatch.setenv("HLTHPRT_REGISTRY_CONTROL_API_TOKEN", "synthetic-registry-token")
+    monkeypatch.delenv("HLTHPRT_CONTROL_API_TOKEN", raising=False)
+    compact, command = source_batch.stored_source_batch(_source_batch_request(101))
+    driver = _Connection()
+    driver.fetchval.return_value = compact["expected_serving_generation"]
+    session = _BatchHttpSession(driver)
+    actor = RegistryActor("platform_admin", UUID(int=22), "system")
+    body_by_field = {
+        **compact,
+        "actor": {**asdict(actor), "user_id": str(actor.user_id)},
+        "session_token_sha256": "c" * 64,
+    }
+    request = SimpleNamespace(
+        body=json.dumps(body_by_field).encode(),
+        args={},
+        query_string="",
+        headers={"Authorization": "Bearer synthetic-registry-token"},
+        ctx=SimpleNamespace(sa_session=session),
+        app=SimpleNamespace(ctx=SimpleNamespace()),
+    )
+    resolve = AsyncMock(return_value=(compact, command))
+    enqueue = AsyncMock(return_value={"request_id": str(UUID(int=23)), "state": "queued", "replayed": False})
+    monkeypatch.setattr(source_batch, "resolve_source_batch", resolve)
+    monkeypatch.setattr(source_batch, "enqueue_source_batch", enqueue)
+    return SimpleNamespace(
+        endpoint=publication,
+        request=request,
+        body_by_field=body_by_field,
+        compact=compact,
+        command=command,
+        driver=driver,
+        session=session,
+        actor=actor,
+        resolve=resolve,
+        enqueue=enqueue,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored", [False, True])
+async def test_source_batch_endpoint_selection_reads_only_the_bound_page(source_batch_http, stored):
+    fixture = source_batch_http
+    body_by_field = {**fixture.body_by_field, "offset": 100}
+    if stored:
+        body_by_field = {key: body_by_field[key] for key in ("actor", "session_token_sha256", "offset")}
+        body_by_field["request_id"] = str(UUID(int=23))
+        fixture.driver.fetchrow.return_value = _source_batch_request(101)
+    fixture.request.body = json.dumps(body_by_field).encode()
+    response_message = await fixture.endpoint.request_source_batch_publication(fixture.request, "selection")
+    assert response_message.status == 200 and response_message.headers["Cache-Control"] == "private, no-store"
+    assert json.loads(response_message.body) == source_batch.source_batch_page(fixture.compact, fixture.command, 100)
+    assert fixture.session.events == ["begin", "commit"] and not fixture.session.active
+    assert [str(call.args[0]) for call in fixture.session.execute.await_args_list] == [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+        "SET LOCAL lock_timeout='1s'",
+    ]
+    fixture.enqueue.assert_not_awaited()
+    if stored:
+        fixture.resolve.assert_not_awaited()
+        assert fixture.driver.fetchrow.await_args.args[1:] == (UUID(int=23),)
+    else:
+        fixture.resolve.assert_awaited_once_with(fixture.driver, fixture.compact, fixture.actor, allow_unbound=True)
+        fixture.driver.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_source_batch_endpoint_queue_owns_one_transaction_and_exact_session(source_batch_http):
+    fixture = source_batch_http
+
+    async def enqueue(driver, document, actor, session_hash):
+        assert fixture.session.active and driver is fixture.driver
+        assert document == fixture.compact and actor == fixture.actor and session_hash == "c" * 64
+        return {"request_id": str(UUID(int=23)), "state": "queued", "replayed": False}
+
+    fixture.enqueue.side_effect = enqueue
+    response_message = await fixture.endpoint.request_source_batch_publication(fixture.request, "queue")
+    assert response_message.status == 200 and response_message.headers["Cache-Control"] == "private, no-store"
+    assert json.loads(response_message.body) == {"request_id": str(UUID(int=23)), "state": "queued", "replayed": False}
+    assert fixture.session.events == ["begin", "commit"] and not fixture.session.active
+    assert [str(call.args[0]) for call in fixture.session.execute.await_args_list] == [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "SET LOCAL lock_timeout='1s'",
+    ]
+    fixture.enqueue.assert_awaited_once()
+    fixture.resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["selection", "preview", "queue"])
+@pytest.mark.parametrize("damage", ["auth", "operation", "body", "actor", "duplicate", "query", "unbound-queue"])
+async def test_source_batch_endpoint_rejects_before_database_or_queue(source_batch_http, operation, damage):
+    from sanic.exceptions import Forbidden
+
+    fixture = source_batch_http
+    body_by_case = {
+        "body": b"[]",
+        "actor": json.dumps({**fixture.body_by_field, "actor": {"kind": "platform_admin"}}).encode(),
+        "duplicate": fixture.request.body[:-1] + b',"actor":{}}',
+        "unbound-queue": json.dumps(
+            {**fixture.body_by_field, "selection_count": None, "selection_sha256": None}
+        ).encode(),
+    }
+    fixture.request.body = body_by_case.get(damage, fixture.request.body)
+    fixture.request.query_string = "extra=1" if damage == "query" else ""
+    fixture.request.headers = {} if damage == "auth" else fixture.request.headers
+    operation = {"operation": "unknown", "unbound-queue": "queue"}.get(damage, operation)
+    if damage == "auth":
+        with pytest.raises(Forbidden):
+            await fixture.endpoint.request_source_batch_publication(fixture.request, operation)
+    else:
+        response_message = await fixture.endpoint.request_source_batch_publication(fixture.request, operation)
+        assert response_message.status == 400 and json.loads(response_message.body) == {
+            "error": {"code": "registry_request_invalid"}
+        }
+        assert response_message.headers["Cache-Control"] == "private, no-store"
+    assert fixture.session.events == []
+    fixture.session.execute.assert_not_awaited()
+    fixture.resolve.assert_not_awaited()
+    fixture.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (RegistryApprovalConflict("synthetic private conflict"), 409),
+        (ValueError("synthetic private value"), 400),
+        (TypeError("synthetic private type"), 400),
+        (KeyError("synthetic private key"), 400),
+        (asyncpg.PostgresError("synthetic private database"), 503),
+    ],
+)
+async def test_source_batch_endpoint_queue_failure_rolls_back_and_sanitizes(source_batch_http, error, status):
+    fixture = source_batch_http
+    fixture.enqueue.side_effect = error
+    response_message = await fixture.endpoint.request_source_batch_publication(fixture.request, "queue")
+    assert response_message.status == status and response_message.headers["Cache-Control"] == "private, no-store"
+    assert b"synthetic private" not in response_message.body
+    assert fixture.session.events == ["begin", "rollback"] and not fixture.session.active
+    fixture.enqueue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_source_batch_endpoint_cancelled_queue_rolls_back_without_receipt(source_batch_http):
+    fixture = source_batch_http
+    fixture.enqueue.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await fixture.endpoint.request_source_batch_publication(fixture.request, "queue")
+    assert fixture.session.events == ["begin", "rollback"] and not fixture.session.active
+    fixture.enqueue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_head", [1, 2, None])
+async def test_source_batch_endpoint_fallback_preview_is_summary_only_and_head_bound(
+    monkeypatch, source_batch_http, current_head
+):
+    fixture = source_batch_http
+    fixture.driver.fetchval.return_value = current_head
+    preview = AsyncMock(return_value={"selected_count": 101, "records": []})
+    monkeypatch.setattr(fixture.endpoint, "preview_registry_approval", preview)
+    response_message = await fixture.endpoint.request_source_batch_publication(fixture.request, "preview")
+    if current_head == 1:
+        assert response_message.status == 200 and json.loads(response_message.body) == {
+            "selected_count": 101,
+            "records": [],
+            "operation": source_batch.OPERATION,
+            "selection_count": 101,
+            "selection_sha256": fixture.compact["selection_sha256"],
+        }
+        preview.assert_awaited_once_with(
+            fixture.driver, fixture.command, fixture.actor, office_authority=None, summary_only=True
+        )
+        assert fixture.session.events == ["begin", "commit", "begin", "commit"]
+    else:
+        assert response_message.status == 409
+        preview.assert_not_awaited()
+        assert fixture.session.events == ["begin", "commit", "begin", "rollback"]
+    assert response_message.headers["Cache-Control"] == "private, no-store"
+    fixture.enqueue.assert_not_awaited()
+    fixture.resolve.assert_awaited_once_with(fixture.driver, fixture.compact, fixture.actor, allow_unbound=True)
+    assert not fixture.session.active
+
+
+@pytest.mark.asyncio
+async def test_source_batch_endpoint_configured_summary_uses_fenced_source_session(monkeypatch, source_batch_http):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+    from process.registry_ptg_scope_engine import RegistryPTGScopeEngineService
+    from tests.test_registry_composition_session_bridge import _bridge_owner
+
+    fixture = source_batch_http
+    sessions, driver, events = _bridge_owner(monkeypatch)
+    identity_by_field = {
+        "database_name": "synthetic",
+        "database_oid": 1,
+        "control_oid": 2,
+        "current_role": "api",
+        "session_role": "api",
+    }
+    driver.fetchrow = AsyncMock(
+        side_effect=[identity_by_field, {**identity_by_field, "current_role": "synthetic", "session_role": "synthetic"}]
+    )
+    driver.fetchval = AsyncMock(return_value=1)
+    service = object.__new__(RegistryPTGScopeEngineService)
+    object.__setattr__(service, "reader_sessions", sessions)
+    object.__setattr__(service, "store", RegistryPTGProducerScopeStore("owner", "approver", "synthetic_control"))
+    fixture.request.app.ctx.registry_ptg_scope_engine = service
+    monkeypatch.setattr(fixture.endpoint, "_namespace", lambda _: '"synthetic_control"')
+    monkeypatch.setattr(fixture.endpoint, "_driver", AsyncMock(return_value=driver))
+
+    async def preview(connection, command, actor, *, office_authority, summary_only):
+        assert connection is driver and command is fixture.command and actor == fixture.actor
+        assert summary_only is True and type(office_authority[0]) is AsyncSession
+        assert office_authority[0].in_transaction() and office_authority[1] is service.store
+        assert events.index("lock") < events.index("native_fence")
+        return {"selected_count": 101, "records": []}
+
+    observed = AsyncMock(side_effect=preview)
+    monkeypatch.setattr(fixture.endpoint, "preview_registry_approval", observed)
+    response_message = await fixture.endpoint.request_source_batch_publication(fixture.request, "preview")
+    assert response_message.status == 200 and json.loads(response_message.body)["selection_count"] == 101
+    assert json.loads(response_message.body)["records"] == []
+    observed.assert_awaited_once()
+    fixture.enqueue.assert_not_awaited()
+    assert fixture.session.events == ["begin", "commit", "begin", "commit"]
+    assert events[-1] == "close" and events.count("checkout") == events.count("unlock") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unavailable", "sqlalchemy", "timeout", "value", "type", "conflict", "cancel"])
+async def test_source_batch_endpoint_preview_failure_is_sanitized_or_cancelled(monkeypatch, source_batch_http, failure):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    fixture = source_batch_http
+    errors_by_case = {
+        "unavailable": fixture.endpoint.RegistryImportedSelectionUnavailable("synthetic private failure"),
+        "sqlalchemy": SQLAlchemyError("synthetic private failure"),
+        "timeout": TimeoutError("synthetic private failure"),
+        "value": ValueError("synthetic private failure"),
+        "type": TypeError("synthetic private failure"),
+        "conflict": RegistryApprovalConflict("synthetic private failure"),
+        "cancel": asyncio.CancelledError(),
+    }
+    fixture.request.app.ctx.registry_ptg_scope_engine = object()
+    preview = AsyncMock(side_effect=errors_by_case[failure])
+    monkeypatch.setattr(fixture.endpoint, "_configured_preview", preview)
+    if failure == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await fixture.endpoint.request_source_batch_publication(fixture.request, "preview")
+    else:
+        response_message = await fixture.endpoint.request_source_batch_publication(fixture.request, "preview")
+        assert response_message.status == (409 if failure == "conflict" else 503)
+        assert b"synthetic private" not in response_message.body
+        assert response_message.headers["Cache-Control"] == "private, no-store"
+    fixture.enqueue.assert_not_awaited()
+    assert fixture.session.events == ["begin", "commit"] and not fixture.session.active

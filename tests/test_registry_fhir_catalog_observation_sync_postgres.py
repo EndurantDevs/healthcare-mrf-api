@@ -262,6 +262,50 @@ async def test_historical_observations_discover_seal_publish_query_and_replay(ob
     assert replay_accounting["accepted_sources"] == 1
 
 
+async def test_relationship_pages_keep_all_surviving_bindings_and_skip_unresolved_networks(observation_case):
+    case = observation_case
+    plans = [f"page-plan-{number:03}" for number in range(165)]
+    await case.source.admin.copy_records_to_table(
+        "provider_directory_dataset_resource",
+        schema_name=case.source.schema,
+        records=[
+            (
+                "dataset-one",
+                "InsurancePlan",
+                plan,
+                "d" * 64,
+                json.dumps(
+                    {
+                        "name": plan,
+                        "owned_by_ref": "Organization/insurer",
+                        "network_refs": ["Organization/network-new", "Organization/not-observed"],
+                    }
+                ),
+            )
+            for plan in plans
+        ],
+    )
+    snapshot, previous, accounting = await _prepare(case)
+    assert previous is None and accounting["accepted_sources"] == 1
+    namespace = '"' + snapshot["schema_name"] + '"'
+    assert await case.fixture.loader.fetchval(
+        f"SELECT count(*) FROM {namespace}.registry_fhir_catalog_observation "
+        "WHERE observation_kind='edge' AND document_json->>'network_resource_id'='not-observed'"
+    ) == len(plans)
+    surviving = await case.fixture.loader.fetch(
+        f"SELECT DISTINCT r.document_json->'plan'->>'resource_id' AS plan,b.document_json->>'source_key' AS network "
+        f"FROM {namespace}.registry_fhir_catalog_relationship r "
+        f"JOIN {namespace}.registry_fhir_catalog_binding b USING(binding_id) "
+        "WHERE r.document_json->'plan'->>'resource_id' LIKE 'page-plan-%' ORDER BY plan,network"
+    )
+    assert [(relationship["plan"], relationship["network"]) for relationship in surviving] == [
+        (plan, "network-new") for plan in plans
+    ]
+    await _publish(case, snapshot)
+    repeated, retained, _accounting = await _prepare(case)
+    assert repeated is None and retained["metadata_generation"] == snapshot["metadata_generation"]
+
+
 @pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
 async def test_leaf_only_source_pipeline_seals_publishes_and_replays_without_directory_change(observation_case):
     """Use the real scoped login through Loader, Sealer and exact metadata publication."""

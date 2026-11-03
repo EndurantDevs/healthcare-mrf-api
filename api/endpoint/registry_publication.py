@@ -474,9 +474,14 @@ async def _source_batch_preview(request, document, actor):
         )
     service = getattr(request.app.ctx, "registry_ptg_scope_engine", None)
     if service is not None:
-        preview_by_field = await _configured_preview(
-            request, service, command, actor, compact["expected_serving_generation"], summary_only=True
-        )
+        try:
+            preview_by_field = await _configured_preview(
+                request, service, command, actor, compact["expected_serving_generation"], summary_only=True
+            )
+        except RegistryRecordConflict:
+            raise
+        except ValueError, TypeError, TimeoutError:
+            raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable") from None
     else:
         async with request.ctx.sa_session.begin():
             preview_by_field = await _checked_preview(
