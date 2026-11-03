@@ -1314,9 +1314,9 @@ async def project_fhir_catalog_relationships(
             f"SELECT resource_type,resource_id,ordinal,document_json::text AS document "
             f"FROM {namespace}.registry_fhir_catalog_observation o "
             "WHERE source_generation=$1 AND observation_kind='edge' "
-            f"AND EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_binding b "
+            f"AND COALESCE((SELECT true FROM {namespace}.registry_fhir_catalog_binding b "
             "WHERE b.document_json->>'evidence_id'=o.source_generation||':Organization/'||"
-            "(o.document_json->>'network_resource_id')) "
+            "(o.document_json->>'network_resource_id') LIMIT 1),false) "
             'AND (resource_type COLLATE "C",resource_id COLLATE "C",ordinal)>($2 COLLATE "C",$3 COLLATE "C",$4) '
             'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C",ordinal LIMIT $5',
             generation,

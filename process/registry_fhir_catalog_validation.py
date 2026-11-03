@@ -561,7 +561,8 @@ _ORGANIZATION_PROOF_SQL = """WITH page AS MATERIALIZED (
    AND a.record_kind='company' AND a.record_key=r.company_id::text
  LEFT JOIN {control}.registry_approved_record g ON g.approved_revision=$1
    AND g.record_kind='group' AND g.record_key=r.group_id::text
- WHERE r.source_id<>'registry-manual' AND (r.company_id IS NOT NULL OR r.group_id IS NOT NULL)
+ WHERE r.metadata_generation=$6 AND r.source_id<>'registry-manual'
+   AND (r.company_id IS NOT NULL OR r.group_id IS NOT NULL)
    AND (r.network_id,r.relationship_id)>($2,$3)
  ORDER BY r.network_id,r.relationship_id LIMIT $4
 ), sized AS (
@@ -698,6 +699,7 @@ def _replay_organization_page(proofs, maps, inputs, standing_grant):
 
 
 async def _validate_source_organizations(connection, namespace, control, inputs, standing_grant):
+    generation = metadata_generation(inputs)
     revision = inputs["metadata_approved_revision"]
     maps = await _organization_maps(connection, control, revision)
     after = (0, "")
@@ -708,6 +710,7 @@ async def _validate_source_organizations(connection, namespace, control, inputs,
             *after,
             PAGE_ROWS,
             PAGE_BYTES,
+            generation,
         )
         if not rows:
             return
