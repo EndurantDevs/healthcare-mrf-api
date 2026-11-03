@@ -2,6 +2,7 @@
 """Complete CMS aggregate keeps source lineage and avoids wide resolved spooling."""
 
 import re
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -11,6 +12,7 @@ import pytest
 from process import registry_imported_selection_preview as preview
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, _extraction_sql
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 
 def _recipe():
@@ -29,6 +31,44 @@ def _recipe():
         "fhir", source.source_id, source.schema_name, source.dataset_id, "producer-example", "edition-example"
     )
     return SimpleNamespace(source_pin=source, binding_coordinates=coordinates)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "retained", "source", "plan_tier"])
+async def test_preview_binding_validation_passes_every_native_sql_parameter(monkeypatch, mode):
+    from tests.test_network_fhir_source_witness_recipe import _reader_recipe, _source_recipe
+    from tests.test_registry_fhir_plan_tier_bindings import witness_pin
+
+    recipe = _recipe() if mode == "legacy" else _reader_recipe() if mode == "retained" else _source_recipe()
+    if mode == "plan_tier":
+        recipe = replace(
+            recipe,
+            source_pin=witness_pin(),
+            binding_coordinates=replace(recipe.binding_coordinates, source_id=UHC_PROVIDER_FILE_SOURCE_ID),
+        )
+    monkeypatch.setattr(preview, "_require_recipe_custody", AsyncMock())
+    monkeypatch.setattr(preview, "require_fhir_source", AsyncMock())
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={"invalid": True}))
+    with pytest.raises(preview.RegistryImportedSelectionUnavailable, match="selection_unavailable"):
+        await preview._recipe_impact(
+            connection, recipe, SimpleNamespace(expected_approved_revision=7), '"selected"', "synthetic_registry"
+        )
+    connection.fetchrow.assert_awaited_once()
+    sql, *parameters = connection.fetchrow.await_args.args
+    assert max(map(int, re.findall(r"\$(\d+)", sql))) == len(parameters) == 9
+    assert tuple(parameters) == (
+        7,
+        *recipe.binding_coordinates.sql_parameters,
+        preview._TRIM_CHARACTERS,
+        UHC_PROVIDER_FILE_SOURCE_ID,
+    )
+    source_parameters = await preview._require_recipe_source(connection, recipe)
+    aggregate = preview._impact_sql(recipe, '"synthetic_registry"', '"selected"', "synthetic_registry")
+    assert max(map(int, re.findall(r"\$(\d+)", aggregate))) == 7 + len(source_parameters)
+    assert "LIMIT" not in aggregate
+    capture = preview.fhir_normalized_capture(preview.fhir_physical_source(recipe.source_pin))
+    if capture is not None:
+        assert source_parameters[-1] == capture.capture_sha256 and len(source_parameters) == 6
+        assert "(SELECT invalid FROM fhir_product_selection_guard) AS product_selection_invalid" in aggregate
 
 
 def test_cms_aggregate_preserves_extractor_lineage_and_full_accounting():

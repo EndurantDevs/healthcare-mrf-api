@@ -18,6 +18,7 @@ from process.network_approved_source_bindings import _VALIDATION_SQL, APPROVED_N
 from process.network_fhir_membership_source import (
     FHIRMembershipSourceError,
     PinnedFHIRMembershipSource,
+    fhir_normalized_capture,
     fhir_physical_source,
 )
 from process.network_fhir_membership_source import _extraction_sql as fhir_extraction_sql
@@ -47,6 +48,7 @@ from process.registry_source_selection_receipt import (
     RegistrySourceSelectionError,
     verify_registry_source_selection_receipt,
 )
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 MAX_PREVIEW_COUNT = 9007199254740991
 PREVIEW_DEADLINE_SECONDS = 2.5
@@ -146,7 +148,7 @@ def _impact_sql(recipe, namespace, staging, control_schema):
 def _fhir_impact_sql(sql, source_pin):
     """Retain complete product checks while counting deduplicated membership facts."""
     sql = sql.replace(", resolved AS MATERIALIZED (", ", resolved AS NOT MATERIALIZED (", 1)
-    if source_pin.retained_capture is not None:
+    if fhir_normalized_capture(fhir_physical_source(source_pin)) is not None:
         if (
             sql.count("LIMIT 5001 /* reviewed mappings */") != 1
             or sql.count("fhir_product_selection_guard AS MATERIALIZED (") != 1
@@ -190,8 +192,9 @@ async def _require_recipe_source(connection, recipe):
     }
     await require_fhir_source(connection, source, descriptor_by_field, retained_read=retained_read)
     physical = fhir_physical_source(source)
+    capture = fhir_normalized_capture(physical)
     parameters = (physical.dataset_id, physical.source_id, physical.release_id, physical.alias_scope, physical.as_of)
-    return parameters + ((source.retained_capture.capture_sha256,) if source.retained_capture is not None else ())
+    return parameters + ((capture.capture_sha256,) if capture is not None else ())
 
 
 async def _recipe_impact(connection, recipe, command, staging, control_schema):
@@ -202,6 +205,7 @@ async def _recipe_impact(connection, recipe, command, staging, control_schema):
         command.expected_approved_revision,
         *recipe.binding_coordinates.sql_parameters,
         _TRIM_CHARACTERS,
+        UHC_PROVIDER_FILE_SOURCE_ID,
     )
     if checks is None or checks["invalid"]:
         raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")

@@ -552,7 +552,8 @@ async def test_retained_plan_read_survives_newer_approved_control_revision(provi
         calls.append((sql, parameters))
         if len(parameters) == 3:
             return scope_row(7 if "registry_revision_control" in sql else 4)
-        if len(parameters) == 8:
+        if len(parameters) == 9:
+            assert parameters[8] == bindings.UHC_PROVIDER_FILE_SOURCE_ID
             return dict(invalid=False, binding_count=1, published_count=0)
         return dict(bounded=True, source_valid=True, rows_json="[]")
 

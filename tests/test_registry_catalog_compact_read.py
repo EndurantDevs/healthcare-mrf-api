@@ -145,7 +145,13 @@ def _directory_shape(sql, manifest):
         "(address.location_key,address.entity_type,address.entity_id)= (location.location_key,location.entity_type,location.entity_id)"
         in sql
     )
-    assert "WHERE membership.network_id=page.network_id" in sql
+    assert any(
+        predicate in sql
+        for predicate in (
+            "WHERE membership.network_id=page.network_id",
+            "WHERE network_id=page.network_id OFFSET 0) membership",
+        )
+    )
     assert "membership.network_id=ANY" not in sql
     assert '"' + manifest.schema_name + '".entity_address_unified' not in sql
 
