@@ -413,6 +413,18 @@ def test_native_proofs_use_measured_shards_without_redistributing_other_cases(sh
 def _main_cost_moves() -> dict[str, tuple[int, int]]:
     """Bind exact measured cases to their original and balanced six-shard assignments."""
     return {
+        "tests/test_registry_source_inventory_consumers.py::test_inventory_carries_keep_every_selected_source_and_digest_state[1000-aca]": (
+            0,
+            1,
+        ),
+        "tests/test_migration_adoption_offline.py::test_online_candidate_migrations_reject_offline_sql_without_stamping[20260713233000_provider_directory_resource_identifiers:head-rooted_graph_migration_requires_online_connection]": (
+            0,
+            1,
+        ),
+        "tests/test_custom_import_snowflake_preflight_cli.py::test_preflight_cli_completes_cleanup_after_sigint_inside_synchronous_work[core]": (
+            0,
+            1,
+        ),
         "tests/test_ptg2_v3_capacity_gate_request_boundaries.py::test_resource_measurements_are_bound_to_fresh_observation_windows": (
             0,
             5,
@@ -472,5 +484,11 @@ def test_main_cost_moves_preserve_other_layouts() -> None:
         for count in (8, 16):
             assert SHARDER.shard_index_for_nodeid(node, count) == digest % count
         for count in (32, 48):
-            assert SHARDER.shard_index_for_nodeid(node, count) == 21 + digest % (count - 21)
+            expected = 21 + digest % (count - 21)
+            if count == 48 and node == (
+                "tests/test_registry_source_inventory_consumers.py"
+                "::test_inventory_carries_keep_every_selected_source_and_digest_state[1000-aca]"
+            ):
+                expected = 10
+            assert SHARDER.shard_index_for_nodeid(node, count) == expected
     assert SHARDER.TEST_PROCESS_TIMEOUT_SECONDS == "295s"

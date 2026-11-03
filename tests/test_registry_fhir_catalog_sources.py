@@ -12,7 +12,10 @@ import pytest
 
 from process import registry_fhir_catalog_source_fence as source_fence
 from process import registry_fhir_catalog_sources as sources
-from process.provider_directory_admission_seal import ADMISSION_GENERIC_PROOF_SUMMARY_KEY, _receipt
+from process.provider_directory_admission_seal import ADMISSION_GENERIC_PROOF_SUMMARY_KEY, AdmissionSealError, _receipt
+from process.provider_directory_source_summary import ProviderDirectorySourceSummaryError, source_summary_sha256
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+from tests.test_provider_directory_uhc_source_summary import _uhc_summary
 
 
 def read_profile():
@@ -226,6 +229,150 @@ def published_row(
         "completion_bytes": 0,
         "row_bytes": 8192,
     }
+
+
+def uhc_published_row():
+    summary = _uhc_summary()
+    summary["dataset_id"] = "dataset-one"
+    summary["endpoint_id"] = "endpoint-one"
+    summary["source_ids"] = [UHC_PROVIDER_FILE_SOURCE_ID]
+    summary["summary_sha256"] = source_summary_sha256(summary)
+    metadata = {
+        "source_ids": summary["source_ids"],
+        "selected_resources": summary["selected_resources"],
+        "acquisition_root_run_id": summary["acquisition_root_run_id"],
+        "source_summary_v1": summary,
+    }
+    seal = _receipt(
+        metadata,
+        admission_kind="uhc_canonical",
+        proof_sha256="c" * 64,
+        resource_counts=summary["resource_counts"],
+    )
+    return {
+        **published_row(),
+        "dataset_id": summary["dataset_id"],
+        "endpoint_id": summary["endpoint_id"],
+        "source_aliases": summary["source_ids"],
+        "alias_count": 1,
+        "dataset_hash": summary["dataset_hash"],
+        "resource_count": summary["total_resources"],
+        "content_proof_admission_kind": seal.admission_kind,
+        "content_proof_resource_types": list(seal.resource_types),
+        "publication_metadata_sha256": seal.metadata_sha256,
+        "metadata_json": json.dumps(seal.metadata_summary),
+    }
+
+
+def test_uhc_sealed_publication_uses_shared_catalog_without_generic_proof():
+    published_header = uhc_published_row()
+    metadata = json.loads(published_header["metadata_json"])
+    assert ADMISSION_GENERIC_PROOF_SUMMARY_KEY not in metadata
+    disposition = sources._disposition(
+        published_header, read_profile(), native_inventory(), None, sources.DEFAULT_BYTES
+    )
+    assert disposition.status == "accepted"
+    descriptor = disposition.descriptor
+    assert descriptor["admission"]["kind"] == "uhc_canonical"
+    assert descriptor["admission"]["resource_counts"] == metadata["source_summary_v1"]["resource_counts"]
+    assert descriptor["accepted_receipt_sha256"] == published_header["publication_metadata_sha256"]
+    assert descriptor["source_aliases"] == [UHC_PROVIDER_FILE_SOURCE_ID]
+    assert descriptor["complete"] is True
+    assert sources.validate_fhir_catalog_source_descriptor(descriptor) == descriptor
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "summary_missing",
+        "summary_hash",
+        "wrong_source",
+        "root",
+        "family",
+        "counts",
+        "digest",
+        "metadata_changed",
+        "kind",
+        "generic_proof",
+    ],
+)
+def test_uhc_catalog_requires_exact_existing_seal_and_summary(mutation):
+    published_header = uhc_published_row()
+    metadata = json.loads(published_header["metadata_json"])
+    if mutation == "summary_missing":
+        metadata.pop("source_summary_v1")
+        with pytest.raises(ProviderDirectorySourceSummaryError, match="^provider_directory_source_summary_invalid$"):
+            sources._admission_proof(published_header, metadata)
+    if mutation == "summary_hash":
+        metadata["source_summary_v1"]["summary_sha256"] = "f" * 64
+        with pytest.raises(
+            ProviderDirectorySourceSummaryError, match="^provider_directory_source_summary_hash_mismatch$"
+        ):
+            sources._admission_proof(published_header, metadata)
+    if mutation == "wrong_source":
+        metadata["source_ids"] = ["unrelated-source"]
+        with pytest.raises(sources.FHIRCatalogSourceError, match="^registry_fhir_catalog_source_admission_invalid$"):
+            sources._admission_proof(published_header, metadata)
+    if mutation == "root":
+        metadata["acquisition_root_run_id"] = "different-root"
+        published_header["publication_metadata_sha256"] = _receipt(
+            metadata,
+            admission_kind=published_header["content_proof_admission_kind"],
+            proof_sha256=published_header["content_proof_admission_sha256"],
+            resource_counts=metadata["source_summary_v1"]["resource_counts"],
+        ).metadata_sha256
+    if mutation == "family":
+        metadata["selected_resources"].remove("InsurancePlan")
+        with pytest.raises(sources.FHIRCatalogSourceError, match="^registry_fhir_catalog_source_admission_invalid$"):
+            sources._admission_proof(published_header, metadata)
+    if mutation == "counts":
+        published_header["resource_count"] += 1
+    if mutation == "digest":
+        published_header["publication_metadata_sha256"] = "f" * 64
+    if mutation == "metadata_changed":
+        metadata["source_summary_v1"]["unknown_field_counts"] = {"new_field": 1}
+        metadata["source_summary_v1"]["summary_sha256"] = source_summary_sha256(metadata["source_summary_v1"])
+        with pytest.raises(
+            ProviderDirectorySourceSummaryError, match="^provider_directory_source_summary_uhc_unaccounted_fields$"
+        ):
+            sources._admission_proof(published_header, metadata)
+    if mutation == "kind":
+        published_header["content_proof_admission_kind"] = "unreviewed"
+        with pytest.raises(sources.FHIRCatalogSourceError, match="^registry_fhir_catalog_source_admission_missing$"):
+            sources._admission_proof(published_header, metadata)
+    if mutation == "generic_proof":
+        metadata[ADMISSION_GENERIC_PROOF_SUMMARY_KEY] = {}
+        with pytest.raises(AdmissionSealError, match="^provider_directory_admission_reserved_metadata_key$"):
+            sources._admission_proof(published_header, metadata)
+    published_header["metadata_json"] = json.dumps(metadata)
+    disposition = sources._disposition(
+        published_header, read_profile(), native_inventory(), None, sources.DEFAULT_BYTES
+    )
+    assert disposition.status == "unsupported"
+    assert disposition.descriptor is None
+
+
+@pytest.mark.parametrize("mutation", ["source", "family", "scope", "kind", "kind_list", "kind_dict"])
+def test_uhc_catalog_descriptor_does_not_broaden_source_or_resource_scope(mutation):
+    published_header = uhc_published_row()
+    descriptor = sources._disposition(
+        published_header, read_profile(), native_inventory(), None, sources.DEFAULT_BYTES
+    ).descriptor
+    if mutation == "source":
+        descriptor["source_aliases"] = ["different-source"]
+        descriptor["coordinates"]["source_id"] = "different-source"
+    if mutation == "family":
+        descriptor["admission"]["selected_resources"].remove("Location")
+    if mutation == "scope":
+        descriptor["admission"]["proof_resource_scope"] = list(sources.RESOURCE_TYPES)
+    if mutation == "kind":
+        descriptor["admission"]["kind"] = "unreviewed"
+    if mutation == "kind_list":
+        descriptor["admission"]["kind"] = []
+    if mutation == "kind_dict":
+        descriptor["admission"]["kind"] = {}
+    with pytest.raises(sources.FHIRCatalogSourceError):
+        sources.validate_fhir_catalog_source_descriptor(descriptor)
 
 
 def descriptor():

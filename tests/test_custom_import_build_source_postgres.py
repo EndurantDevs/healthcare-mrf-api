@@ -473,12 +473,13 @@ async def test_retirement_does_not_hold_registry_write_lock_during_reference_pro
     await verify(monkeypatch)
 
 
-async def test_retirement_total_deadline_rolls_back_its_caller_transaction(monkeypatch):
+@pytest.mark.parametrize("budget", ["MAX_RETIREMENT_SECONDS", "MAX_REFERENCE_CLOSURE_SECONDS"])
+async def test_retirement_total_deadline_rolls_back_its_caller_transaction(monkeypatch, budget):
     from tests.custom_import_retirement_postgres import (
         test_retirement_total_deadline_rolls_back_its_caller_transaction as verify,
     )
 
-    await verify(monkeypatch)
+    await verify(monkeypatch, budget)
 
 
 async def test_retirement_allows_an_unrelated_idle_mutable_family():
