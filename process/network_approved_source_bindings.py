@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -16,7 +17,17 @@ from process.network_approved_membership_source import (
     pin_retained_approved_membership_source,
 )
 from process.network_read_identity import NetworkReadIdentityError
+from process.registry_fhir_plan_tier import (
+    KIND as PLAN_TIER_KIND,
+)
+from process.registry_fhir_plan_tier import (
+    source_key as plan_tier_source_key,
+)
+from process.registry_fhir_plan_tier import (
+    validate_binding_scope,
+)
 from process.registry_source_observation_store import _TRIM_CHARACTERS, _namespace
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 
 class ApprovedNetworkSourceBindingError(ValueError):
@@ -181,7 +192,15 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
       AND scope->>'capture_sha256' ~ '^[0-9a-f]{{64}}$'
       AND jsonb_typeof(scope->'product_network_id')='number'
       AND scope->>'product_network_id'=record_json->>'network_id'
-      AND record_json->>'source_key'='InsurancePlan/'||(scope->>'insurance_plan_id'))
+      AND record_json->>'source_key'='InsurancePlan/'||(scope->>'insurance_plan_id')) OR (
+      $6='registry-source-fhir-witness-v1' AND $3=$9
+      AND scope->>'kind'='uhc_plan_tier_v1'
+      AND (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
+        =ARRAY['capture_sha256','kind','network_key_id','network_tier','plan_resource_id','plan_scope']::text[]
+      AND jsonb_typeof(scope->'plan_scope')='object'
+      AND scope->>'capture_sha256' ~ '^[0-9a-f]{{64}}$'
+      AND scope->>'network_key_id' ~ '^[0-9a-f]{{64}}$'
+      AND record_json->>'source_key'='UHCPlanTier/'||(scope->>'network_key_id'))
     WHEN 'aca' THEN
       (SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys(scope) key)
         =ARRAY['checksum_network','issuer_id','plan_id','plan_year','state']::text[]
@@ -213,8 +232,13 @@ _VALIDATION_SQL = """WITH {bindings},scoped AS MATERIALIZED (
   HAVING count(*) FILTER (WHERE record_json->'source_scope_json' ? 'insurance_plan_id')>1
     OR bool_or(record_json->'source_scope_json' ? 'insurance_plan_id')
       AND bool_or(record_json->'source_scope_json' ? 'organization_id')
+    OR bool_or(record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1') AND count(*)>1
 )
 SELECT count(*)::bigint AS binding_count,
+  (SELECT count(*) FROM scoped WHERE record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1') AS plan_tier_count,
+  (SELECT CASE WHEN coalesce(sum(octet_length(record_json::text)+2),0)<=8388608
+    THEN jsonb_agg(record_json)::text END FROM scoped
+    WHERE record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1') AS plan_tier_json,
   count(*) FILTER (WHERE record_json->'source_scope_json' ? 'review_type')::bigint AS published_count,
   CASE WHEN coalesce(sum(octet_length(record_json::text)+2) FILTER
     (WHERE record_json->'source_scope_json' ? 'review_type'),0)<=8388608 THEN
@@ -301,6 +325,7 @@ async def _require_network_source_bindings(
             approved_source.approved_revision,
             *coordinates.sql_parameters,
             _TRIM_CHARACTERS,
+            UHC_PROVIDER_FILE_SOURCE_ID,
         )
         if read_identity is not None:
             from process.network_approved_membership_source import _verify_approved_consumption
@@ -310,6 +335,8 @@ async def _require_network_source_bindings(
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_unavailable") from error
     if checks is None or checks["invalid"]:
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_invalid")
+    if checks.get("plan_tier_count"):
+        _require_plan_tier_bindings(checks["plan_tier_json"], checks["plan_tier_count"])
     if checks["published_count"]:
         from process.registry_published_plan_binding_refs import (
             require_published_plan_binding_references,
@@ -327,3 +354,24 @@ async def _require_network_source_bindings(
         except asyncpg.PostgresError, ValueError:
             raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_unavailable") from None
     return checks["binding_count"]
+
+
+def _require_plan_tier_bindings(encoded, count):
+    """Validate every typed scope, including archived rows, after bounded native selection."""
+    try:
+        if type(count) is not int or count < 1 or type(encoded) is not str or len(encoded.encode()) > 8388608:
+            raise ValueError
+        bindings = json.loads(encoded)
+        if type(bindings) is not list or len(bindings) != count:
+            raise ValueError
+        for binding in bindings:
+            if (
+                binding["source_id"] != UHC_PROVIDER_FILE_SOURCE_ID
+                or binding["producer_id"] != "registry-source-fhir-witness-v1"
+            ):
+                raise ValueError
+            document = validate_binding_scope(binding["source_scope_json"], binding["producer_id"])
+            if document["kind"] != PLAN_TIER_KIND or binding["source_key"] != plan_tier_source_key(document):
+                raise ValueError
+    except KeyError, TypeError, ValueError:
+        raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_invalid") from None

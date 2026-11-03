@@ -438,6 +438,16 @@ mod python_api {
                     )
                 })
         })?;
+        let text = crate::network_source_binding_values::plan_tier_text(&encoded.rows);
+        if !text.is_empty()
+            && !pyo3::types::PyString::new(py, &text)
+                .call_method0("isprintable")?
+                .extract::<bool>()?
+        {
+            return Err(PyValueError::new_err(
+                "Source binding plan identity is not printable",
+            ));
+        }
         Ok((
             PyBytes::new(py, &encoded.copy_bytes).unbind(),
             encoded.row_count,

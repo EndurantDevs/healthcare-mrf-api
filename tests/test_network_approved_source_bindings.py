@@ -37,7 +37,8 @@ def boundary(*, current_revision=7, fingerprint="a" * 64, invalid=False, publish
         if len(parameters) == 3:
             revision = current_revision if "registry_revision_control" in sql else parameters[0]
             return scope_row(revision, fingerprint)
-        assert len(parameters) == 8 and parameters[1:7] == COORDINATES.sql_parameters
+        assert len(parameters) == 9 and parameters[1:7] == COORDINATES.sql_parameters
+        assert parameters[8] == bindings.UHC_PROVIDER_FILE_SOURCE_ID
         return dict(
             invalid=invalid,
             binding_count=2,

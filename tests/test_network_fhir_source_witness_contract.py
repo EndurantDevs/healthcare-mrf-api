@@ -168,7 +168,7 @@ def test_extra_origin_field_cannot_borrow_reader_or_completion_authority(field):
         {"resource_counts": (("Location", 0),)},
         {"resource_counts": (("Location", True),)},
         {"resource_hashes": (("Location", "e" * 64),)},
-        {"descriptor_counts": (("Location", 2), ("Organization", 1), ("Practitioner", 0))},
+        {"descriptor_counts": (("Location", 0), ("Organization", 1), ("Practitioner", 0))},
         {"admission_profile": reader.LEGACY_PROFILE},
         {"admission_metadata_sha256": None},
         {"semantic_projection_as_of": "2026-1-1"},
@@ -461,6 +461,67 @@ def test_observed_legacy_origin_preserves_absent_metadata_and_wire_shape():
     assert witness.validate_capture(captured(legacy=True).as_dict()) == captured(legacy=True)
     with pytest.raises(ValueError):
         replace(reader_capture().origin, admission_profile=witness.OBSERVED_LEGACY_PROFILE)
+
+
+def test_semantic_origin_preserves_actual_descriptor_occurrences():
+    fields = origin_fields()
+    fields["descriptor_counts"] = (("Location", 2), ("Organization", 1), ("Practitioner", 0))
+    assert asdict(witness.source_origin(fields)) == fields
+
+
+def test_new_proof_profile_uses_existing_streaming_admission_bound():
+    fields = origin_fields() | {
+        "admission_profile": witness.ADMITTED_LEGACY_PROFILE,
+        "semantic_projection_as_of": None,
+        "metadata_bytes": 160 * 1024**2,
+    }
+    assert witness.source_origin(fields).metadata_bytes == 160 * 1024**2
+    limit = witness.source_metadata_max_bytes(witness.ADMITTED_LEGACY_PROFILE)
+    assert limit == 256 * 1024**2
+    assert witness.source_origin(fields | {"metadata_bytes": limit}).metadata_bytes == limit
+    with pytest.raises(ValueError):
+        witness.source_origin(fields | {"metadata_bytes": limit + 1})
+    for original in (origin_fields(), legacy_origin_fields()):
+        with pytest.raises(ValueError):
+            witness.source_origin(original | {"metadata_bytes": 64 * 1024**2 - 32768})
+
+
+@pytest.mark.parametrize(
+    "profile", [witness.ADMITTED_LEGACY_PROFILE, witness.ADMITTED_TRANSPORT_PROFILE, witness.ADMITTED_UHC_PROFILE]
+)
+def test_profiles_without_semantic_date_use_original_capture_anchor(profile):
+    capture = captured()
+    origin = witness.source_origin(origin_fields() | {"admission_profile": profile, "semantic_projection_as_of": None})
+    capture = replace(capture, origin=origin)
+    capture = replace(capture, capture_sha256=witness.capture_digest(capture))
+    anchor = witness.SourceWitnessCaptureAnchor(capture.capture_id, capture.release_id, capture.observed_at)
+    assert witness.source_witness_membership_date(capture, anchor) == "2026-01-02"
+
+
+def test_completion_origin_preserves_closed_wire_shapes():
+    fields = origin_fields() | {
+        "admission_profile": witness.ADMITTED_TRANSPORT_PROFILE,
+        "semantic_projection_as_of": None,
+        "completion_required_version": 3,
+        "completion_sha256": "8" * 64,
+    }
+    origin = witness.source_origin(fields)
+    assert type(origin) is witness.SourceWitnessCompletionOrigin and len(asdict(origin)) == 27
+    original = captured()
+    capture = replace(original, origin=origin)
+    capture = replace(capture, capture_sha256=witness.capture_digest(capture))
+    assert witness.validate_capture(capture.as_dict()) == capture
+    assert len(asdict(witness.source_origin(origin_fields()))) == 25
+    for change in (
+        {"completion_required_version": True},
+        {"completion_sha256": "bad"},
+        {"admission_profile": witness.ADMITTED_LEGACY_PROFILE},
+    ):
+        with pytest.raises(ValueError):
+            witness.source_origin(fields | change)
+    for missing in ("completion_sha256", "completion_required_version"):
+        with pytest.raises(ValueError):
+            witness.source_origin({key: value for key, value in fields.items() if key != missing})
 
 
 @pytest.mark.parametrize(

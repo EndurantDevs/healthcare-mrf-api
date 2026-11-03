@@ -63,6 +63,19 @@ class FHIRCatalogReferenceEdge:
 
 
 @dataclass(frozen=True)
+class FHIRCatalogPlanTierEdge(FHIRCatalogReferenceEdge):
+    plan_scope: dict
+    plan_tier: dict | None
+
+
+def catalog_reference_edge(document):
+    """Decode typed edges without changing the original Organization wire format."""
+    arrays = ("plan_aliases", "plan_identifiers", "scope_identifiers", "scope_type_codes", "benefits", "geography")
+    kind = FHIRCatalogPlanTierEdge if "plan_scope" in document else FHIRCatalogReferenceEdge
+    return kind(**{**document, **{field: tuple(document[field]) for field in arrays}})
+
+
+@dataclass(frozen=True)
 class FHIRCatalogBatch:
     organizations: tuple[FHIRCatalogOrganization, ...]
     edges: tuple[FHIRCatalogReferenceEdge, ...]
@@ -299,12 +312,93 @@ def _scope_metadata(payload, scope, is_normalized):
     }
 
 
-def _resource_edges(source_row, resource_payload, is_normalized, source_uri):
+def _plan_tier_edges(source_row, resource_payload, context):
+    """Add exact Plan declarations and role evidence without replacing ordinary references."""
+    from process.registry_fhir_plan_tier import validate_plan_scope
+
+    if source_row["resource_type"] == "InsurancePlan":
+        details = resource_payload.get("plan_json")
+        if (
+            type(details) is dict
+            and details.get("canonical_contract_id") == "healthporta.uhc.provider-directory-canonical.v2"
+        ):
+            scope = details.get("plan_key")
+            plan = validate_plan_scope(scope)
+            if source_row["resource_id"] != "uhcplan-" + plan.plan_key_id[:48]:
+                _fail()
+            yield FHIRCatalogPlanTierEdge(
+                **context,
+                **_scope_metadata(resource_payload, resource_payload, True),
+                scope_path="/plan_tier",
+                network_ref=None,
+                network_resource_id=None,
+                resolution_reason="reference_missing",
+                plan_scope=scope,
+                plan_tier=None,
+            )
+            from process.registry_fhir_plan_tier import KIND, validate_plan_tier
+            from process.uhc_provider_file_semantic_identity import network_key_for_plan
+
+            tiers = details.get("network_tiers", [])
+            if type(tiers) is not list or any(type(tier) is not str for tier in tiers):
+                _fail()
+            for tier in sorted(set(tiers)):
+                key = network_key_for_plan(plan, network_tier=tier)
+                typed = validate_plan_tier(
+                    dict(
+                        kind=KIND,
+                        plan_scope=scope,
+                        network_tier=tier,
+                        network_key_id=key.network_key_id,
+                        plan_resource_id=source_row["resource_id"],
+                    )
+                )
+                yield FHIRCatalogPlanTierEdge(
+                    **context,
+                    **_scope_metadata(resource_payload, resource_payload, True),
+                    scope_path="/plan_tier/" + key.network_key_id,
+                    network_ref=None,
+                    network_resource_id=None,
+                    resolution_reason=None,
+                    plan_scope=scope,
+                    plan_tier=typed,
+                )
+    elif source_row["resource_type"] in {"PractitionerRole", "OrganizationAffiliation"}:
+        yield from _role_plan_tier_edges(resource_payload, context)
+
+
+def _role_plan_tier_edges(resource_payload, context):
+    from process.registry_fhir_plan_tier import role_plan_tier
+
+    tier = role_plan_tier(resource_payload)
+    if tier is not None:
+        yield FHIRCatalogPlanTierEdge(
+            **{**context, "plan_resource_id": tier["plan_resource_id"]},
+            **_scope_metadata(resource_payload, resource_payload, True),
+            scope_path="/plan_tier",
+            network_ref=None,
+            network_resource_id=None,
+            resolution_reason=None,
+            plan_scope=tier["plan_scope"],
+            plan_tier=tier,
+        )
+
+
+def _resource_edges(source_row, resource_payload, is_normalized, source_uri, plan_tiers=False):
     context = _edge_context(source_row, resource_payload, is_normalized)
+    has_typed_plan = False
+    if plan_tiers and is_normalized:
+        has_typed_plan = (
+            source_row["resource_type"] == "InsurancePlan"
+            and isinstance(resource_payload.get("plan_json"), dict)
+            and resource_payload["plan_json"].get("canonical_contract_id")
+            == "healthporta.uhc.provider-directory-canonical.v2"
+        )
+        yield from _plan_tier_edges(source_row, resource_payload, context)
     for path, scope, references in _edge_scopes(resource_payload, source_row["resource_type"], is_normalized):
         metadata = _scope_metadata(resource_payload, scope, is_normalized)
         network_references = _reference_values(references, is_normalized)
-        if not network_references and source_row["resource_type"] == "InsurancePlan":
+        if not network_references and source_row["resource_type"] == "InsurancePlan" and not has_typed_plan:
             network_references = (None,)
         for index, reference in enumerate(network_references):
             network_resource_id, reason = _network_target(reference, source_uri)
@@ -349,7 +443,7 @@ def _output_bounds(resource_index, input_rows, edges, used_bytes, resource_edges
 
 
 def _extract_catalog_rows(
-    resource_rows, profile, source_uri, max_output_bytes, identities, input_rows, resource_offset=0
+    resource_rows, profile, source_uri, max_output_bytes, identities, input_rows, resource_offset=0, plan_tiers=False
 ):
     organizations, edges = [], []
     used_bytes = _EMPTY_OUTPUT_BYTES
@@ -367,7 +461,7 @@ def _extract_catalog_rows(
             used_bytes += observation_bytes + (len(organizations) > 1)
             resource_bytes += observation_bytes
         else:
-            for edge in _resource_edges(source_row, resource_payload, is_normalized, source_uri):
+            for edge in _resource_edges(source_row, resource_payload, is_normalized, source_uri, plan_tiers):
                 edge_bytes = len(_json_bytes(asdict(edge)))
                 used_bytes += edge_bytes + bool(edges)
                 resource_bytes += edge_bytes + bool(resource_edges)
@@ -404,10 +498,13 @@ def extract_fhir_catalog_batch(
     max_rows=MAX_ROWS,
     max_input_bytes=DEFAULT_BYTES,
     max_output_bytes=DEFAULT_BYTES,
+    plan_tiers=False,
 ):
     """Extract source facts only; hashes, local references and names grant no authority."""
     source_uri = _extraction_input(resource_rows, profile, source_uri, max_rows, max_input_bytes, max_output_bytes)
-    return _extract_catalog_rows(resource_rows, profile, source_uri, max_output_bytes, set(), len(resource_rows))
+    return _extract_catalog_rows(
+        resource_rows, profile, source_uri, max_output_bytes, set(), len(resource_rows), plan_tiers=plan_tiers
+    )
 
 
 def iter_fhir_catalog_batches(
@@ -418,6 +515,7 @@ def iter_fhir_catalog_batches(
     max_rows=MAX_ROWS,
     max_input_bytes=DEFAULT_BYTES,
     max_output_bytes=DEFAULT_BYTES,
+    plan_tiers=False,
 ):
     """Split a validated input page at resource boundaries, preserving every bounded resource."""
     source_uri = _extraction_input(resource_rows, profile, source_uri, max_rows, max_input_bytes, max_output_bytes)
@@ -425,7 +523,14 @@ def iter_fhir_catalog_batches(
     source_rows, used_bytes = 0, _EMPTY_OUTPUT_BYTES
     for resource_index, source_row in enumerate(resource_rows):
         resource = _extract_catalog_rows(
-            (source_row,), profile, source_uri, max_output_bytes, identities, len(resource_rows), resource_index
+            (source_row,),
+            profile,
+            source_uri,
+            max_output_bytes,
+            identities,
+            len(resource_rows),
+            resource_index,
+            plan_tiers,
         )
         combined_bytes = (
             used_bytes

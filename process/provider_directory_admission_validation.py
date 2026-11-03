@@ -4,21 +4,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from process import provider_directory_proof_store as proof_store
 from process.provider_directory_admission_seal import (
+    _LEGACY_PROOF_FIELDS,
+    _SEMANTIC_PROOF_CONTRACT_IDS,
+    _SEMANTIC_PROOF_FIELDS,
     ADMISSION_KIND_GENERIC,
     ADMISSION_KIND_UHC_CANONICAL,
     AdmissionSealError,
     ProviderDirectoryAdmissionSeal,
     _generic_proof_summary,
-    _LEGACY_PROOF_FIELDS,
     _receipt,
-    _SEMANTIC_PROOF_FIELDS,
 )
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
@@ -79,17 +80,13 @@ def _validate_uhc_contract(
                 dataset_id=expected.dataset_id,
                 endpoint_id=expected.endpoint_id,
                 acquisition_root_run_id=expected.evidence_run_id,
-                selected_resources=tuple(
-                    sorted(canonical_proof["resource_counts"])
-                ),
+                selected_resources=tuple(sorted(canonical_proof["resource_counts"])),
                 semantic_contract_id=canonical_proof["semantic_contract_id"],
                 catalog_set_sha256=canonical_proof["catalog_set_sha256"],
             ),
         )
     except (UhcCanonicalProofError, UhcFinalPublicationError) as error:
-        raise AdmissionSealError(
-            "provider_directory_admission_uhc_proof_invalid"
-        ) from error
+        raise AdmissionSealError("provider_directory_admission_uhc_proof_invalid") from error
     return canonical_proof
 
 
@@ -104,15 +101,11 @@ def _uhc_receipt(
         canonical_proof.get("dataset_hash") != expected.dataset_hash
         or canonical_proof.get("resource_count") != expected.resource_count
         or expected.expected_resource_hashes is not None
-        and canonical_proof.get("resource_hashes")
-        != expected.expected_resource_hashes
+        and canonical_proof.get("resource_hashes") != expected.expected_resource_hashes
         or expected.expected_resource_counts is not None
-        and canonical_proof.get("resource_counts")
-        != expected.expected_resource_counts
+        and canonical_proof.get("resource_counts") != expected.expected_resource_counts
     ):
-        raise AdmissionSealError(
-            "provider_directory_admission_completion_summary_invalid"
-        )
+        raise AdmissionSealError("provider_directory_admission_completion_summary_invalid")
     return _receipt(
         proof_stream.metadata,
         admission_kind=ADMISSION_KIND_UHC_CANONICAL,
@@ -127,8 +120,7 @@ def _require_generic_header_summaries(
 ) -> None:
     expected_fields = (
         _LEGACY_PROOF_FIELDS
-        if proof_stream.proof_header.get("contract_id")
-        == PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
+        if proof_stream.proof_header.get("contract_id") == PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
         else _SEMANTIC_PROOF_FIELDS
     )
     if set(proof_stream.proof_header).union({"shards"}) != expected_fields:
@@ -138,28 +130,19 @@ def _require_generic_header_summaries(
         or type(proof_stream.proof_header.get("shard_count")) is not int
         or proof_stream.proof_header.get("shard_count") <= 0
         or proof_stream.proof_header.get("shard_count") != proof_stream.shard_count
-        or proof_stream.proof_header.get("shard_set_sha256")
-        != proof_stream.shard_set_digest.hexdigest()
+        or proof_stream.proof_header.get("shard_set_sha256") != proof_stream.shard_set_digest.hexdigest()
         or proof_stream.proof_header.get("resource_count") != expected.resource_count
         or proof_stream.proof_header.get("dataset_hash") != expected.dataset_hash
-        or proof_stream.proof_header.get("proof_sha256")
-        != proof_stream._proof_digest()
+        or proof_stream.proof_header.get("proof_sha256") != proof_stream._proof_digest()
     ):
         raise AdmissionSealError("provider_directory_admission_shard_summary_invalid")
-    if (
-        expected.expected_resource_hashes is not None
-        or expected.expected_resource_counts is not None
-    ) and (
+    if (expected.expected_resource_hashes is not None or expected.expected_resource_counts is not None) and (
         not isinstance(expected.expected_resource_hashes, Mapping)
         or not isinstance(expected.expected_resource_counts, Mapping)
-        or proof_stream.proof_header.get("resource_hashes")
-        != expected.expected_resource_hashes
-        or proof_stream.proof_header.get("resource_counts")
-        != expected.expected_resource_counts
+        or proof_stream.proof_header.get("resource_hashes") != expected.expected_resource_hashes
+        or proof_stream.proof_header.get("resource_counts") != expected.expected_resource_counts
     ):
-        raise AdmissionSealError(
-            "provider_directory_admission_completion_summary_invalid"
-        )
+        raise AdmissionSealError("provider_directory_admission_completion_summary_invalid")
 
 
 def _require_parent_identity(
@@ -167,35 +150,28 @@ def _require_parent_identity(
     expected: _AdmissionCopyExpectation,
 ) -> None:
     if (
-        "dataset_hash" in proof_stream.metadata
-        and proof_stream.metadata["dataset_hash"] != expected.dataset_hash
-    ) or (
-        "resource_count" in proof_stream.metadata
-        and (
-            type(proof_stream.metadata["resource_count"]) is not int
-            or proof_stream.metadata["resource_count"] != expected.resource_count
+        ("dataset_hash" in proof_stream.metadata and proof_stream.metadata["dataset_hash"] != expected.dataset_hash)
+        or (
+            "resource_count" in proof_stream.metadata
+            and (
+                type(proof_stream.metadata["resource_count"]) is not int
+                or proof_stream.metadata["resource_count"] != expected.resource_count
+            )
         )
-    ) or (
-        "acquisition_root_run_id" in proof_stream.metadata
-        and proof_stream.metadata["acquisition_root_run_id"]
-        != expected.evidence_run_id
+        or (
+            "acquisition_root_run_id" in proof_stream.metadata
+            and proof_stream.metadata["acquisition_root_run_id"] != expected.evidence_run_id
+        )
     ):
-        raise AdmissionSealError(
-            "provider_directory_admission_parent_identity_invalid"
-        )
+        raise AdmissionSealError("provider_directory_admission_parent_identity_invalid")
 
 
 def _validated_lineage_context(
     proof_stream: Any,
     expected: _AdmissionCopyExpectation,
 ) -> tuple[Any, bool, Any]:
-    is_legacy_contract = (
-        proof_stream.proof_header.get("contract_id")
-        == PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
-    )
-    proof_scope = proof_stream.metadata.get(
-        PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
-    )
+    is_legacy_contract = proof_stream.proof_header.get("contract_id") == PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
+    proof_scope = proof_stream.metadata.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
     source_ids = proof_stream.metadata.get("source_ids")
     selected_resources = proof_stream.metadata.get("selected_resources")
     scope_groups = (
@@ -209,22 +185,11 @@ def _validated_lineage_context(
         or not is_legacy_contract
         and proof_scope is not None
         and not isinstance(proof_scope, list)
-        or any(
-            type(scope_item) is not str
-            for scope_group in scope_groups
-            for scope_item in scope_group
-        )
+        or any(type(scope_item) is not str for scope_group in scope_groups for scope_item in scope_group)
     ):
-        raise ProviderDirectoryProofStoreError(
-            "provider directory proof finalization lineage is invalid"
-        )
-    if (
-        "resource_hash_contract" in proof_stream.metadata
-        and proof_stream.metadata["resource_hash_contract"] is None
-    ):
-        raise ProviderDirectoryProofStoreError(
-            "provider directory expected proof contract is invalid"
-        )
+        raise ProviderDirectoryProofStoreError("provider directory proof finalization lineage is invalid")
+    if "resource_hash_contract" in proof_stream.metadata and proof_stream.metadata["resource_hash_contract"] is None:
+        raise ProviderDirectoryProofStoreError("provider directory expected proof contract is invalid")
     lineage = proof_store._validated_proof_lineage(
         dataset_id=expected.dataset_id,
         endpoint_id=expected.endpoint_id,
@@ -244,26 +209,18 @@ def _require_unchanged_lineage(
 ) -> None:
     if (
         proof_stream.metadata["source_ids"] != lineage.source_ids
-        or proof_stream.metadata["selected_resources"]
-        != lineage.selected_resources
+        or proof_stream.metadata["selected_resources"] != lineage.selected_resources
         or not is_legacy_contract
         and proof_scope is not None
         and proof_scope != lineage.proof_resource_scope
     ):
-        raise ProviderDirectoryProofStoreError(
-            "provider directory proof finalization lineage is invalid"
-        )
+        raise ProviderDirectoryProofStoreError("provider directory proof finalization lineage is invalid")
     if (
         not is_legacy_contract
         and proof_scope is not None
-        and proof_scope
-        != proof_stream.proof_header.get(
-            PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY
-        )
+        and proof_scope != proof_stream.proof_header.get(PROVIDER_DIRECTORY_PROOF_RESOURCE_SCOPE_METADATA_KEY)
     ):
-        raise ProviderDirectoryProofStoreError(
-            "provider directory proof resource scope changed"
-        )
+        raise ProviderDirectoryProofStoreError("provider directory proof resource scope changed")
 
 
 def _require_exact_resource_scope(
@@ -274,43 +231,37 @@ def _require_exact_resource_scope(
 ) -> set[str]:
     proof_store._validate_metadata_lineage(proof_stream.proof_header, lineage)
     proof_store._validate_metadata_summary(proof_stream.proof_header, lineage)
-    exact_resource_types = set(
-        lineage.proof_resource_scope or lineage.selected_resources
-    )
+    exact_resource_types = set(lineage.proof_resource_scope or lineage.selected_resources)
     if (
-        set(proof_stream.proof_header["resource_counts"])
-        != exact_resource_types
-        or set(proof_stream.proof_header["resource_hashes"])
-        != exact_resource_types
+        set(proof_stream.proof_header["resource_counts"]) != exact_resource_types
+        or set(proof_stream.proof_header["resource_hashes"]) != exact_resource_types
     ):
-        raise ProviderDirectoryProofStoreError(
-            "provider directory proof resource scope changed"
-        )
+        raise ProviderDirectoryProofStoreError("provider directory proof resource scope changed")
+    is_semantic_contract = proof_stream.proof_header.get("contract_id") in _SEMANTIC_PROOF_CONTRACT_IDS
     if (
-        proof_stream.resource_count != expected.resource_count
+        (
+            proof_stream.resource_count < expected.resource_count
+            if is_semantic_contract
+            else proof_stream.resource_count != expected.resource_count
+        )
         or not set(proof_stream.resource_counts).issubset(exact_resource_types)
         or any(
-            proof_stream.resource_counts.get(resource_type, 0)
-            != finalized_count
-            for resource_type, finalized_count in proof_stream.proof_header[
-                "resource_counts"
-            ].items()
+            (
+                proof_stream.resource_counts.get(resource_type, 0) < finalized_count
+                if is_semantic_contract
+                else proof_stream.resource_counts.get(resource_type, 0) != finalized_count
+            )
+            for resource_type, finalized_count in proof_stream.proof_header["resource_counts"].items()
         )
     ):
-        raise ProviderDirectoryProofStoreError(
-            "provider directory proof shard resource total changed"
-        )
+        raise ProviderDirectoryProofStoreError("provider directory proof shard resource total changed")
     proof_store._assert_expected_proof_contract(
         proof_stream.proof_header,
         proof_stream.metadata.get(
             "resource_hash_contract",
             LEGACY_RESOURCE_HASH_CONTRACT,
         ),
-        (
-            None
-            if is_legacy_contract
-            else proof_stream.metadata.get("semantic_projection_as_of")
-        ),
+        (None if is_legacy_contract else proof_stream.metadata.get("semantic_projection_as_of")),
         lineage.proof_resource_scope,
     )
     return exact_resource_types
@@ -331,12 +282,8 @@ def _require_shard_scopes(
                 acquisition_root_run_id=expected.evidence_run_id,
                 source_ids=lineage.source_ids,
             )
-            if not set(descriptor_by_field["resource_counts"]).issubset(
-                exact_resource_types
-            ):
-                raise ProviderDirectoryProofStoreError(
-                    "provider directory proof shard resource scope changed"
-                )
+            if not set(descriptor_by_field["resource_counts"]).issubset(exact_resource_types):
+                raise ProviderDirectoryProofStoreError("provider directory proof shard resource scope changed")
 
 
 def _require_generic_proof_store_contract(
@@ -367,9 +314,7 @@ def _require_generic_proof_store_contract(
             exact_resource_types,
         )
     except (ProviderDirectoryProofStoreError, TypeError, ValueError) as error:
-        raise AdmissionSealError(
-            f"provider_directory_admission_shard_validation_invalid:{error}"
-        ) from error
+        raise AdmissionSealError(f"provider_directory_admission_shard_validation_invalid:{error}") from error
 
 
 def _generic_receipt(
@@ -394,9 +339,7 @@ def _validate_finished_stream(
 ) -> ProviderDirectoryAdmissionSeal:
     proof_stream.descriptor_file.close()
     if not proof_stream.complete or proof_stream.mode != "root":
-        raise AdmissionSealError(
-            "provider_directory_admission_metadata_incomplete"
-        )
+        raise AdmissionSealError("provider_directory_admission_metadata_incomplete")
     if UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY in proof_stream.seen_root_keys:
         return _uhc_receipt(proof_stream, expected)
     return _generic_receipt(proof_stream, expected)
