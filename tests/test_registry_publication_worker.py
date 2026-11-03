@@ -856,7 +856,7 @@ async def test_ptg_assembly_uses_execution_url_and_disposes_genuine_single_engin
     ]
 
 
-@pytest.mark.parametrize("seconds", [1, 3600, 86400])
+@pytest.mark.parametrize("seconds", [None, 1, 3600, 86400])
 def test_operation_deadline_preserves_config_and_positional_contract(seconds):
     configured = configuration()
     legacy = worker.parse_registry_publication_worker_config(json.dumps(configured))
@@ -876,7 +876,7 @@ def test_operation_deadline_preserves_config_and_positional_contract(seconds):
     assert parsed.operation_seconds == seconds
 
 
-@pytest.mark.parametrize("seconds", [True, False, None, "1", 1.0, 0, -1, 86401])
+@pytest.mark.parametrize("seconds", [True, False, "1", 1.0, 0, -1, 86401])
 def test_operation_deadline_rejects_invalid_direct_and_json_config(monkeypatch, seconds):
     config = worker.parse_registry_publication_worker_config(json.dumps(configuration()))
     from dataclasses import replace
@@ -893,16 +893,19 @@ def test_operation_deadline_rejects_invalid_direct_and_json_config(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_operation_timeout_drains_before_owned_pool_and_ptg_cleanup(monkeypatch):
+@pytest.mark.parametrize("seconds", [1, None])
+async def test_operation_timeout_drains_before_owned_pool_and_ptg_cleanup(monkeypatch, seconds):
     events, options = resources(monkeypatch)
     configured = ptg_configuration()
-    configured["operation_seconds"] = 1
+    configured["operation_seconds"] = seconds
     config = worker.parse_registry_publication_worker_config(json.dumps(configured))
     _observe_ptg_engine(monkeypatch, config, events, "{synthetic-password}")
     completed = asyncio.Event()
+    started = asyncio.Event()
 
     async def consume(**arguments):
         try:
+            started.set()
             await asyncio.Event().wait()
         finally:
             events.append("work drain")
@@ -911,8 +914,17 @@ async def test_operation_timeout_drains_before_owned_pool_and_ptg_cleanup(monkey
             events.append("work drained")
 
     monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
-    with pytest.raises(TimeoutError):
-        await worker.run_registry_publication_worker(config)
+    pending = asyncio.create_task(worker.run_registry_publication_worker(config))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        if seconds is None:
+            pending.cancel()
+        with pytest.raises(asyncio.CancelledError if seconds is None else TimeoutError):
+            await pending
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
     assert completed.is_set()
     assert events == [
         "authority open",

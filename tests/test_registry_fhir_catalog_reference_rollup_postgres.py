@@ -17,17 +17,19 @@ from tests.test_registry_fhir_catalog_observed_source_postgres import observed_s
 
 
 @pytest.fixture
-async def reference_database():
+async def reference_database(request):
     dsn = os.getenv("NETWORK_REGISTRY_TEST_DSN")
     if not dsn:
         pytest.skip("NETWORK_REGISTRY_TEST_DSN must select an isolated database")
     connection = await asyncpg.connect(dsn.replace("postgresql+asyncpg://", "postgresql://"))
+    payload_storage = getattr(request, "param", "jsonb")
+    assert payload_storage in {"jsonb", "json"}
     schema = "fc_reference_" + uuid4().hex
     try:
         await connection.execute(f'CREATE SCHEMA "{schema}"')
         await connection.execute(f"""CREATE TABLE "{schema}".provider_directory_dataset_resource(
           dataset_id text NOT NULL,resource_type text NOT NULL,resource_id text NOT NULL,
-          payload_hash text NOT NULL,payload_json jsonb NOT NULL,PRIMARY KEY(dataset_id,resource_type,resource_id))""")
+          payload_hash text NOT NULL,payload_json {payload_storage} NOT NULL,PRIMARY KEY(dataset_id,resource_type,resource_id))""")
         await connection.execute(
             f'CREATE INDEX reference_cursor_idx ON "{schema}".provider_directory_dataset_resource(dataset_id,resource_type COLLATE "C",resource_id COLLATE "C")'
         )
@@ -56,6 +58,7 @@ async def copy_resources(fixture, resources):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reference_database", ("jsonb", "json"), indirect=True)
 async def test_many_roles_retain_only_exact_reference_representatives_with_complete_counts(reference_database):
     """Collapse repeated roles while retaining genuine witnesses and complete accounting."""
     fixture = reference_database
@@ -204,6 +207,53 @@ async def test_malformed_normalized_references_refuse_without_mutating_source(re
             )
             == 0
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (2, ""),
+        (2, "x" * 65),
+        (2, "role/one"),
+        (2, "rôle"),
+        (2, "role\n"),
+        (3, "a" * 63),
+        (3, "a" * 65),
+        (3, "A" * 64),
+        (3, "g" * 64),
+        (3, "a" * 63 + "\n"),
+    ],
+)
+async def test_reference_resource_identity_validation_survives_page_aggregation(reference_database, field, value):
+    fixture = reference_database
+    record_values = list(resource_row("PractitionerRole", "role-one", {"network_refs": ["Organization/network"]}))
+    record_values[field] = value
+    await copy_resources(fixture, [tuple(record_values)])
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        with pytest.raises(rollup.FHIRCatalogReferenceRollupError, match="source_page_invalid"):
+            async with rollup.staged_fhir_catalog_references(
+                fixture.connection, schema_name=fixture.schema, dataset_id="dataset"
+            ):
+                pytest.fail("invalid source identity was aggregated")
+
+
+@pytest.mark.asyncio
+async def test_reference_resource_identity_accepts_ascii_boundaries(reference_database):
+    fixture = reference_database
+    resource_id = "Az09.-" + "x" * 58
+    payload_hash = "0123456789abcdef" * 4
+    await copy_resources(
+        fixture,
+        [("dataset", "PractitionerRole", resource_id, payload_hash, '{"network_refs":["Organization/network"]}')],
+    )
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        async with rollup.staged_fhir_catalog_references(
+            fixture.connection, schema_name=fixture.schema, dataset_id="dataset"
+        ) as stage:
+            edges = [edge async for batch in stage.iter_batches() for edge in batch]
+            assert len(edges) == 1 and stage.accounting.source_rows == stage.accounting.reference_rows == 1
+            assert (edges[0].edge.owner_resource_id, edges[0].edge.source_hash) == (resource_id, payload_hash)
 
 
 @pytest.mark.asyncio
@@ -433,3 +483,49 @@ async def test_published_consumers_refuse_unbranded_source_read(observed_source_
                     workspace=workspace,
                 ):
                     pytest.fail("unbranded reference scope was accepted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["invalid_reference", "invalid_identity", "numeric_range"])
+async def test_discarded_tail_is_eventually_validated_before_stage_exposure(reference_database, failure):
+    fixture = reference_database
+    connection = fixture.connection
+    relation = f'"{fixture.schema}".provider_directory_dataset_resource'
+    await connection.execute(f"ALTER TABLE {relation} ALTER COLUMN payload_json TYPE json USING payload_json::json")
+    resource_rows = [
+        resource_row(
+            "PractitionerRole",
+            f"role-{number:05}",
+            {"network_refs": ["Organization/network"], "metadata": "x" * 1000},
+        )
+        for number in range(30)
+    ]
+    last_values = list(resource_rows[-1])
+    expected_error = rollup.FHIRCatalogReferenceRollupError
+    if failure == "invalid_reference":
+        last_values[-1] = json.dumps({"network_refs": [{"invalid": True}], "metadata": "x" * 1000})
+    elif failure == "invalid_identity":
+        last_values[3] = "g" * 64
+    else:
+        last_values[-1] = '{"network_refs":["Organization/network"],"number":1e1000000}'
+        expected_error = asyncpg.NumericValueOutOfRangeError
+    if failure != "invalid_identity":
+        last_values[3] = hashlib.sha256(last_values[-1].encode()).hexdigest()
+    resource_rows[-1] = tuple(last_values)
+    await copy_resources(fixture, resource_rows)
+    is_exposed = False
+    with pytest.raises(expected_error):
+        async with connection.transaction(isolation="repeatable_read"):
+            async with rollup.staged_fhir_catalog_references(
+                connection, schema_name=fixture.schema, dataset_id="dataset", page_rows=5000, page_bytes=4000
+            ):
+                is_exposed = True
+    assert not is_exposed
+    assert await connection.fetchval(f"SELECT count(*) FROM {relation}") == 30
+    assert (
+        await connection.fetchval(
+            "SELECT count(*) FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
+            "AND relname LIKE 'fhir_catalog_refs_%'"
+        )
+        == 0
+    )
