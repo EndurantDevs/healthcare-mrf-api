@@ -306,6 +306,7 @@ async def test_exact_sites_digest_indexes_and_no_address_clone(slice_db):
     )
     indexes = await db.connection.fetch("SELECT indexdef FROM pg_indexes WHERE schemaname=$1", copy_target.schema_name)
     assert any("(location_key, slice_id)" in entry["indexdef"] for entry in indexes)
+    assert any("(slice_id, artifact_candidate_id) INCLUDE (network_id)" in entry["indexdef"] for entry in indexes)
 
 
 @pytest.mark.asyncio

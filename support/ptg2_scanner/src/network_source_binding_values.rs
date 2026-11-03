@@ -140,6 +140,13 @@ struct FhirScope {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct PublishedFhirScope {
+    organization_id: String,
+    source_generation: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RetainedFhirScope {
     organization_id: String,
     capture_sha256: String,
@@ -314,6 +321,22 @@ fn published_plan_scope(scope: PublishedPlanScope) -> Option<serde_json::Value> 
 }
 
 fn fhir_scope(raw: &str, input: &BindingInput) -> Option<serde_json::Value> {
+    if input.producer_id == "registry-fhir-catalog-v1" {
+        let scope: PublishedFhirScope = serde_json::from_str(raw).ok()?;
+        if !valid_fhir_id(&scope.organization_id)
+            || !valid_digest(&scope.source_generation)
+            || input.edition_id != input.dataset_id
+            || input.source_key != scope.organization_id
+            || input.evidence_id
+                != format!(
+                    "{}:Organization/{}",
+                    scope.source_generation, scope.organization_id
+                )
+        {
+            return None;
+        }
+        return serde_json::to_value(scope).ok();
+    }
     if input.producer_id == "registry-source-fhir-witness-v1"
         && input.source_id == "pdfhir_2754e999dd691175821ec26e"
         && let Ok(scope) = serde_json::from_str::<PlanTierScope>(raw)

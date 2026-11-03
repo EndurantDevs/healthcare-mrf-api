@@ -15,6 +15,8 @@ from process.registry_record_store import _bounded_text, _validated_actor
 from process.registry_source_observation_store import _namespace
 
 OPERATION = "publish_source_binding_batch"
+APPROVAL_OPERATION = "approve_source_binding_batch"
+OPERATIONS = (OPERATION, APPROVAL_OPERATION)
 MAX_SELECTIONS = 5000
 MAX_SELECTION_BYTES = 1048576
 PAGE_SIZE = 100
@@ -50,7 +52,7 @@ def _counter(value, *, positive=False):
 def validated_source_batch_command(document, *, allow_unbound=False):
     """A new closed reference command leaves the existing selection wire unchanged."""
     _require(type(allow_unbound) is bool and type(document) is dict and set(document) == _FIELDS)
-    _require(document["operation"] == OPERATION)
+    _require(document["operation"] in OPERATIONS)
     for field in ("expected_draft_revision", "expected_approved_revision", "expected_serving_generation"):
         _counter(document[field])
     _require(document["expected_approved_revision"] <= document["expected_draft_revision"])
@@ -233,7 +235,7 @@ async def _catalog_map(connection, namespace, document):
     coordinates = document["source_coordinates"]
     relation = _namespace(snapshot["schema_name"]) + ".registry_fhir_catalog_binding"
     rows = await connection.fetch(
-        f"SELECT b.network_id,b.document_json->>'source_key' AS source_key FROM {relation} b "
+        f"SELECT b.network_id,b.document_json->>'source_key' AS source_key,b.document_json::text AS document FROM {relation} b "
         f"JOIN {_namespace(snapshot['schema_name'])}.registry_fhir_catalog_network n USING(metadata_generation,network_id) "
         "WHERE b.metadata_generation=$1 AND b.source_id=$2 AND b.document_json->>'dataset_schema'=$3 "
         "AND b.document_json->>'dataset_id'=$4 AND NOT n.archived ORDER BY b.network_id,b.binding_id LIMIT 5001",
@@ -243,9 +245,9 @@ async def _catalog_map(connection, namespace, document):
         coordinates["dataset_id"],
     )
     _require(1 <= len(rows) <= MAX_SELECTIONS)
-    catalog_pairs = {(row["source_key"], row["network_id"]) for row in rows}
-    _require(len(catalog_pairs) == len(rows) and len({key for key, _ in catalog_pairs}) == len(catalog_pairs))
-    return catalog_pairs
+    catalog_by_pair = {(row["source_key"], row["network_id"]): json.loads(row["document"]) for row in rows}
+    _require(len(catalog_by_pair) == len(rows) and len({key for key, _ in catalog_by_pair}) == len(catalog_by_pair))
+    return catalog_by_pair
 
 
 async def _prospective_bindings(connection, namespace, document, changes):
@@ -267,11 +269,32 @@ async def _prospective_bindings(connection, namespace, document, changes):
     ]
     prospective = existing_by_id | {item["binding_id"]: item for item in changes}
     active_bindings = [item for item in prospective.values() if item["archived"] is False]
-    captures = {item["source_scope_json"].get("capture_sha256") for item in active_bindings}
-    _require(len(captures) == 1 and all(type(value) is str and _SHA.fullmatch(value) for value in captures))
-    binding_pairs = {(item["source_key"], item["network_id"]) for item in active_bindings}
-    _require(len(binding_pairs) == len(active_bindings))
-    return selections, binding_pairs
+    if coordinates["producer_id"] != "registry-fhir-catalog-v1":
+        captures = {item["source_scope_json"].get("capture_sha256") for item in active_bindings}
+        _require(len(captures) == 1 and all(type(value) is str and _SHA.fullmatch(value) for value in captures))
+    bindings_by_pair = {(item["source_key"], item["network_id"]): item for item in active_bindings}
+    _require(len(bindings_by_pair) == len(active_bindings))
+    return selections, bindings_by_pair
+
+
+def _require_published_catalog_bindings(coordinates, prospective, catalog):
+    """Bind capture-free approval to the complete sealed metadata evidence."""
+    from process.registry_network_catalog_read import catalog_binding_document
+
+    fields = (*coordinates, "source_key", "evidence_id", "evidence_sha256")
+    for pair, binding in prospective.items():
+        expected = catalog[pair]
+        document_by_field = {field: expected[field] for field in fields}
+        document_by_field.update(
+            namespace="source_binding",
+            binding_id=expected["binding_id"],
+            revision=expected["revision"],
+            source_scope=expected["source_scope"],
+        )
+        catalog_binding_document(document_by_field, network_id=pair[1])
+        _require(all(expected[field] == coordinates[field] for field in coordinates))
+        _require(all(binding[field] == expected[field] for field in fields))
+        _require(binding["source_scope_json"] == expected["source_scope"])
 
 
 async def _missing_network_selections(connection, namespace, document, network_ids):
@@ -308,7 +331,9 @@ async def resolve_source_batch(connection, document, actor, *, control_schema=No
     changes = await _binding_history(connection, namespace, compact, actor)
     catalog = await _catalog_map(connection, namespace, compact)
     selections, prospective = await _prospective_bindings(connection, namespace, compact, changes)
-    _require(prospective == catalog)
+    _require(prospective.keys() == catalog.keys())
+    if compact["source_coordinates"]["producer_id"] == "registry-fhir-catalog-v1":
+        _require_published_catalog_bindings(compact["source_coordinates"], prospective, catalog)
     selections += await _missing_network_selections(connection, namespace, compact, {key for _, key in prospective})
     selected, digest = selection_identity(selections)
     if compact["selection_sha256"] is not None:
@@ -330,7 +355,7 @@ def source_batch_page(compact, command, offset):
     _require(type(offset) is int and 0 <= offset < len(command.selection) and offset % PAGE_SIZE == 0)
     selected_versions = list(command.selection[offset : offset + PAGE_SIZE])
     return {
-        "operation": OPERATION,
+        "operation": compact["operation"],
         **{
             key: compact[key]
             for key in (
@@ -411,3 +436,43 @@ async def authorize_source_batch(authorize, request_record):
                 revision = receipt["policy_revision"]
             _require(receipt["policy_revision"] == revision)
     return revision
+
+
+def validate_source_batch_approval_result(result_by_name, compact, command, state):
+    """Keep approval completion bound to the exact selection and unchanged serving head."""
+    if state != "completed":
+        _require(
+            result_by_name is None
+            or state == "rejected"
+            and result_by_name == {"error": {"code": "registry_publication_rejected"}}
+        )
+        return
+    _require(
+        type(result_by_name) is dict
+        and set(result_by_name)
+        == {
+            "operation",
+            "approved_revision",
+            "previous_approved_revision",
+            "selected_count",
+            "selection_sha256",
+            "serving_generation",
+            "policy_revision",
+        }
+    )
+    _require(result_by_name["operation"] == APPROVAL_OPERATION and compact["operation"] == APPROVAL_OPERATION)
+    for field in (
+        "approved_revision",
+        "previous_approved_revision",
+        "selected_count",
+        "serving_generation",
+        "policy_revision",
+    ):
+        _counter(result_by_name[field])
+    _require(
+        result_by_name["approved_revision"] == command.expected_draft_revision + 1
+        and result_by_name["previous_approved_revision"] == command.expected_approved_revision
+        and result_by_name["selected_count"] == len(command.selection) == compact["selection_count"]
+        and result_by_name["selection_sha256"] == compact["selection_sha256"]
+        and result_by_name["serving_generation"] == compact["expected_serving_generation"]
+    )

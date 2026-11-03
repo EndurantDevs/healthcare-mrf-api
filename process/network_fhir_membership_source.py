@@ -393,34 +393,36 @@ def _generation_id(source, approved_source, coordinates, approved_only):
     return hashlib.sha256(json.dumps(recipe_dict, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _reviewed_descriptor(source, approved_source, coordinates, approved_only=False):
+def _reviewed_descriptor(source_pin, approved_source, coordinates, approved_only=False):
     """Require paired pins and their exact admitted FHIR coordinates."""
-    if type(source) is not PinnedFHIRMembershipSource or type(approved_only) is not bool:
+    if type(source_pin) is not PinnedFHIRMembershipSource or type(approved_only) is not bool:
         raise FHIRMembershipSourceError("Pinned FHIR source is invalid")
     if approved_source is None and coordinates is None:
-        if approved_only or fhir_normalized_capture(source) is not None:
+        if approved_only or fhir_normalized_capture(source_pin) is not None:
             raise FHIRMembershipSourceError("Reviewed FHIR source coordinates are invalid")
         return None
     if (
         type(approved_source) is not ApprovedMembershipSource
         or type(coordinates) is not RegistryNetworkSourceCoordinates
         or coordinates.source_system != "fhir"
-        or coordinates.source_id != source.source_id
-        or coordinates.dataset_schema != source.schema_name
-        or coordinates.dataset_id != source.dataset_id
+        or coordinates.source_id != source_pin.source_id
+        or coordinates.dataset_schema != source_pin.schema_name
+        or coordinates.dataset_id != source_pin.dataset_id
     ):
         raise FHIRMembershipSourceError("Reviewed FHIR source coordinates are invalid")
-    if source.retained_capture is not None and (
+    if coordinates.producer_id == "registry-fhir-catalog-v1" and fhir_normalized_capture(source_pin) is None:
+        raise FHIRMembershipSourceError("Published catalog bindings require a typed Source reader")
+    if source_pin.retained_capture is not None and (
         coordinates.producer_id != RETAINED_FHIR_PRODUCER
-        or coordinates.edition_id != source.retained_capture.capture_id
+        or coordinates.edition_id != source_pin.retained_capture.capture_id
     ):
         raise FHIRMembershipSourceError("Reviewed FHIR source coordinates are invalid")
-    if source.source_witness_capture is not None and (
+    if source_pin.source_witness_capture is not None and (
         coordinates.producer_id != SOURCE_WITNESS_PRODUCER
-        or coordinates.edition_id != source.source_witness_capture.capture_id
+        or coordinates.edition_id != source_pin.source_witness_capture.capture_id
     ):
         raise FHIRMembershipSourceError("Reviewed FHIR source coordinates are invalid")
-    return {**asdict(coordinates), "alias_scope": source.alias_scope, "source_key_kind": "organization_resource_id"}
+    return {**asdict(coordinates), "alias_scope": source_pin.alias_scope, "source_key_kind": "organization_resource_id"}
 
 
 async def _require_pinned_source(connection, source_pin, descriptor=None, retained_read=None, *, api_read=False):
