@@ -27,6 +27,7 @@ from process.registry_initial_source_composition import (
 )
 from process.registry_source_inventory_preparation import SourceInventoryPreparation
 from process.registry_source_observation_store import _namespace
+from process.registry_source_recipe_additions import RegistrySourceRecipeAdditions, resolve_source_recipe_additions
 from process.registry_source_recipe_composition import SourceRecipeReadContext
 
 
@@ -66,6 +67,7 @@ class RegistryCompositionAddressSources:
     compact: bool = False
     prepared_address_artifact: CustomAddressSourceReceipt | None = None
     source_witness_runtime: object = field(default=None, repr=False, compare=False)
+    source_recipe_additions: RegistrySourceRecipeAdditions | None = None
 
     def __post_init__(self):
         if self.source_witness_runtime is not None:
@@ -92,6 +94,13 @@ class RegistryCompositionAddressSources:
             raise RegistryCompositionError("registry_composition_address_artifact_invalid")
         if self.initial_source_recipes and self.replacement_source_recipes:
             raise RegistryCompositionError("registry_composition_initial_sources_invalid")
+        if self.source_recipe_additions is not None and (
+            type(self.source_recipe_additions) is not RegistrySourceRecipeAdditions
+            or not self.compact
+            or self.initial_source_recipes
+            or self.replacement_source_recipes
+        ):
+            raise RegistryCompositionError("registry_source_recipe_additions_invalid")
         for name in ("initial_source_recipes", "replacement_source_recipes"):
             if getattr(self, name):
                 recipes = getattr(self, name)
@@ -305,6 +314,8 @@ def _inventory_office_summary(root, entries, approved, artifact, stage):
 def _require_source_recipe_phase(address_sources, source_manifest, expected_head):
     if source_manifest is not None and type(source_manifest) is not PinnedNetworkServingManifest:
         raise RegistryCompositionError("registry_composition_source_invalid")
+    if address_sources.source_recipe_additions is not None:
+        address_sources.source_recipe_additions.require_predecessor(source_manifest, expected_head)
     if address_sources.initial_source_recipes and (
         source_manifest is not None or type(expected_head) is not int or expected_head != 0
     ):
@@ -332,6 +343,19 @@ def _require_source_recipe_phase(address_sources, source_manifest, expected_head
         )
         if address_sources.base_source != retained_address:
             raise RegistryCompositionError("registry_composition_source_address_mismatch")
+
+
+async def _resolve_source_recipe_additions(connection, address_sources, source_manifest, expected_head, control_schema):
+    if address_sources.source_recipe_additions is None:
+        return address_sources
+    recipes = await resolve_source_recipe_additions(
+        connection,
+        address_sources.source_recipe_additions,
+        source_manifest,
+        expected_head,
+        control_schema=control_schema,
+    )
+    return replace(address_sources, source_recipe_additions=None, replacement_source_recipes=recipes)
 
 
 def _address_arguments(request_id, approved, owner_role, runtime_roles, address_sources, control_schema):
@@ -427,6 +451,9 @@ async def _prepare_registry_composition_address_artifact(
     await _require_transaction(connection)
     await _require_artifact_custodian(connection)
     _require_source_recipe_phase(address_sources, source_manifest, expected_head)
+    address_sources = await _resolve_source_recipe_additions(
+        connection, address_sources, source_manifest, expected_head, custody.control_schema
+    )
     approved = await pin_approved_membership_source(
         connection,
         approved_revision=approved_revision,

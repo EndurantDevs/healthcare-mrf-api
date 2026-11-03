@@ -292,7 +292,7 @@ async def test_v2_fresh_rebuild_copies_complete_pages_and_refuses_gaps(monkeypat
     )
     if damage is None:
         await operation
-        assert [call.kwargs["limit"] for call in reader.await_args_list] == [1000, 500, 500]
+        assert [call.kwargs["limit"] for call in reader.await_args_list] == [1000, 500, 1000]
         assert reader.await_args.kwargs["after_resource"] == first.next_resource
         copy_records = connection.copy_records_to_table.await_args.kwargs["records"]
         assert [copy_record[:2] for copy_record in copy_records] == [
@@ -400,10 +400,12 @@ async def test_v2_independent_verification_dispatches_rebuild_and_mapper(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_v2_rebuild_propagates_single_resource_bounds_failure(monkeypatch):
+async def test_v2_rebuild_propagates_single_fact_stream_bounds_failure(monkeypatch):
     reader = AsyncMock(side_effect=fhir.FHIRMembershipBatchBoundsError("bounded"))
     monkeypatch.setattr(projection, "read_fhir_source_witness_page_v2", reader)
     monkeypatch.setattr(projection, "_require_recipe_custody", AsyncMock(return_value="authenticated-read"))
+    fallback = AsyncMock(side_effect=fhir.FHIRMembershipBatchBoundsError("single fact bounded"))
+    monkeypatch.setattr(projection, "copy_fhir_witness_resource_v2", fallback)
     connection = SimpleNamespace(
         is_in_transaction=lambda: True, copy_records_to_table=AsyncMock(), fetchval=AsyncMock(return_value=1)
     )
@@ -418,6 +420,8 @@ async def test_v2_rebuild_propagates_single_resource_bounds_failure(monkeypatch)
             descriptor_version=2,
         )
     assert reader.await_args.kwargs["limit"] == 1
+    fallback.assert_awaited_once()
+    assert fallback.await_args.kwargs["retained_read"] == "authenticated-read"
     connection.copy_records_to_table.assert_not_awaited()
 
 
