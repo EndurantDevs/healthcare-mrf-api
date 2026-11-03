@@ -2097,6 +2097,19 @@ keep any legacy full-rebuild schedule held and dispatch only the signed,
 capacity-admitted source-delta geometry; the intermediate dataset checkpoint
 must never be reported as a completed UHC Profile import.
 
+The shared network catalog reads the official dataset's existing
+`uhc_canonical` admission seal and complete `source_summary_v1`; it does not
+require or fabricate a generic FHIR proof. Its plan-tier projection retains the
+source's exact plan scope, year and tier instead of synthesizing network
+Organization references. Ordinary catalog reconciliation upgrades an older
+`fhir-catalog/v1` snapshot to `fhir-catalog/plan-tier-v2` from the same retained
+publication, without another provider import. Metadata availability is a
+separate checkpoint: approved source bindings, exact provider-location
+membership, pinned addresses and serving publication are still required before
+network-filtered provider search can use those identities. Missing plan details
+and unknown jurisdictions remain explicit; plan/tier labels do not establish
+an employer product or nationwide network equivalence.
+
 The official-file, Flex-cohort, formulary, and release boundaries are recorded
 in [Provider-directory and formulary source acceptance](provider-directory-formulary-source-acceptance.md).
 

@@ -15,6 +15,8 @@ from process.network_approved_source_bindings import RegistryNetworkSourceCoordi
 from process.plan_release_storage_catalog import CATALOG_SQL
 from process.provider_directory_admission_seal import (
     ADMISSION_GENERIC_PROOF_SUMMARY_KEY,
+    ADMISSION_KIND_GENERIC,
+    ADMISSION_KIND_UHC_CANONICAL,
     ADMISSION_METADATA_SUMMARY_MAX_BYTES,
     ADMISSION_SEAL_CONTRACT,
     AdmissionSealError,
@@ -27,6 +29,12 @@ from process.provider_directory_generic_source_provision import (
     verify_generic_source_read_family,
 )
 from process.provider_directory_generic_source_storage import validate_handoff_completion
+from process.provider_directory_source_summary import (
+    SOURCE_SUMMARY_METADATA_KEY,
+    SOURCE_SUMMARY_UHC_SELECTED_RESOURCES,
+    SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
+    validate_semantic_source_summary,
+)
 from process.registry_fhir_catalog_extraction import (
     DEFAULT_BYTES,
     MAX_BYTES,
@@ -45,6 +53,7 @@ from process.registry_fhir_catalog_published_read import (
     parse_fhir_catalog_published_read_scope,
     validate_fhir_catalog_published_descriptor,
 )
+from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 PRODUCER = "registry-fhir-catalog-v1"
 MAX_PAGE = 1000
@@ -325,7 +334,11 @@ def _validate_admission_descriptor(admission, descriptor):
         return
     if type(admission) is not dict or set(admission) != _ADMISSION_FIELDS:
         _fail()
-    if type(admission["version"]) is not int or admission["version"] != 1 or admission["kind"] != "generic":
+    if (
+        type(admission["version"]) is not int
+        or admission["version"] != 1
+        or admission["kind"] not in (ADMISSION_KIND_GENERIC, ADMISSION_KIND_UHC_CANONICAL)
+    ):
         _fail()
     for field in ("proof_sha256", "metadata_sha256"):
         _digest(admission[field])
@@ -343,6 +356,13 @@ def _validate_admission_descriptor(admission, descriptor):
     ):
         _fail()
     selected = _strings(admission["selected_resources"], 64, count=64)
+    if admission["kind"] == ADMISSION_KIND_UHC_CANONICAL and (
+        descriptor["source_aliases"] != [UHC_PROVIDER_FILE_SOURCE_ID]
+        or resources != list(SOURCE_SUMMARY_UHC_SELECTED_RESOURCES)
+        or selected != list(SOURCE_SUMMARY_UHC_SELECTED_RESOURCES)
+        or admission["proof_resource_scope"] is not None
+    ):
+        _fail("admission_invalid")
     scope = admission["proof_resource_scope"]
     if scope is not None:
         _strings(scope, 64, count=64)
@@ -667,12 +687,45 @@ def _validate_proof_counts(proof_summary, source_row):
         _digest(digest)
 
 
-def _admission(source_row):
-    """Revalidate the existing fixed receipt and completion evidence without raw proof copies."""
-    metadata = _decoded(source_row["metadata_json"])
-    if type(metadata) is not dict or ADMISSION_GENERIC_PROOF_SUMMARY_KEY not in metadata:
+def _uhc_proof_summary(source_row, metadata):
+    summary = validate_semantic_source_summary(
+        metadata.get(SOURCE_SUMMARY_METADATA_KEY),
+        expected_by_field={
+            "dataset_id": source_row["dataset_id"],
+            "endpoint_id": source_row["endpoint_id"],
+            "dataset_hash": source_row["dataset_hash"],
+            "total_resources": source_row["resource_count"],
+            "source_ids": [UHC_PROVIDER_FILE_SOURCE_ID],
+            "selected_resources": list(SOURCE_SUMMARY_UHC_SELECTED_RESOURCES),
+            "acquisition_root_run_id": metadata.get("acquisition_root_run_id"),
+        },
+        expected_semantic_contract_id=SOURCE_SUMMARY_UHC_SEMANTIC_CONTRACT_ID,
+    )
+    if (
+        metadata.get("source_ids") != summary["source_ids"]
+        or sorted(metadata.get("selected_resources", [])) != summary["selected_resources"]
+        or metadata.get("proof_resource_scope") is not None
+    ):
+        _fail("admission_invalid")
+    return {
+        "dataset_hash": summary["dataset_hash"],
+        "resource_count": summary["total_resources"],
+        "resource_counts": summary["resource_counts"],
+        "resource_hashes": summary["resource_hashes"],
+    }
+
+
+def _admission_proof(source_row, metadata):
+    admission_kind = source_row["content_proof_admission_kind"]
+    if type(metadata) is not dict or (
+        admission_kind != ADMISSION_KIND_UHC_CANONICAL and ADMISSION_GENERIC_PROOF_SUMMARY_KEY not in metadata
+    ):
         _fail("admission_missing")
-    proof_summary = metadata[ADMISSION_GENERIC_PROOF_SUMMARY_KEY]
+    proof_summary = (
+        _uhc_proof_summary(source_row, metadata)
+        if admission_kind == ADMISSION_KIND_UHC_CANONICAL
+        else metadata[ADMISSION_GENERIC_PROOF_SUMMARY_KEY]
+    )
     if type(proof_summary) is not dict or set(proof_summary) != _SUMMARY_FIELDS:
         _fail("admission_invalid")
     if (
@@ -681,14 +734,26 @@ def _admission(source_row):
     ):
         _fail("admission_changed")
     _validate_proof_counts(proof_summary, source_row)
-    _digest(source_row["content_proof_admission_sha256"])
     seal = parse_source_admission_receipt(
-        {key: metadata_value for key, metadata_value in metadata.items() if key != ADMISSION_GENERIC_PROOF_SUMMARY_KEY},
-        admission_kind="generic",
+        metadata
+        if admission_kind == ADMISSION_KIND_UHC_CANONICAL
+        else {
+            key: metadata_value
+            for key, metadata_value in metadata.items()
+            if key != ADMISSION_GENERIC_PROOF_SUMMARY_KEY
+        },
+        admission_kind=admission_kind,
         proof_sha256=source_row["content_proof_admission_sha256"],
         resource_counts=proof_summary["resource_counts"],
-        proof_summary=proof_summary,
+        proof_summary=proof_summary if admission_kind == ADMISSION_KIND_GENERIC else None,
     )
+    return proof_summary, seal
+
+
+def _admission(source_row):
+    """Revalidate the existing fixed receipt and completion evidence without raw proof copies."""
+    metadata = _decoded(source_row["metadata_json"])
+    proof_summary, seal = _admission_proof(source_row, metadata)
     if (
         source_row["content_proof_admission_version"],
         source_row["content_proof_admission_kind"],
