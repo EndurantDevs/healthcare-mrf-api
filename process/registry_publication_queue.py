@@ -25,6 +25,7 @@ _CLAIM_OPERATIONS = {
         "publish_initial_inventory",
         "publish_fhir_catalog",
         "publish_source_binding_batch",
+        "approve_source_binding_batch",
     ),
     "office": ("prepare_ptg_office_capture", "approve_ptg_office_capture"),
 }
@@ -889,6 +890,10 @@ async def _enqueue_validated_publication(
 
 
 def _source_batch_result(result_by_field, compact, command, state):
+    if compact["operation"] == "approve_source_binding_batch":
+        from process.registry_source_binding_publication import validate_source_batch_approval_result
+
+        return validate_source_batch_approval_result(result_by_field, compact, command, state)
     if state != "completed":
         _reactivation_result(result_by_field, compact, state)
         return
@@ -927,7 +932,7 @@ def _source_batch_result(result_by_field, compact, command, state):
 def _publication_operation_command(request_record, command_by_name, status_by_name):
     """Validate operation-specific identity and results before exposing their digest."""
     operation = command_by_name["operation"]
-    if operation == "publish_source_binding_batch":
+    if operation in ("publish_source_binding_batch", "approve_source_binding_batch"):
         from process.registry_source_binding_publication import stored_source_batch
 
         compact, command = stored_source_batch(request_record)

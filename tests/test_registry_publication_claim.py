@@ -62,6 +62,7 @@ async def test_omitted_family_cannot_fall_back_to_unfiltered_claim():
                 "publish_source_rollback",
                 "publish_initial_inventory",
                 "publish_source_binding_batch",
+                "approve_source_binding_batch",
             ),
         ),
         ("office", False, ("prepare_ptg_office_capture", "approve_ptg_office_capture")),
@@ -275,11 +276,11 @@ def _source_batch_command(**changes):
     }
 
 
-def _source_batch_request(count=2602):
+def _source_batch_request(count=2602, *, operation=source_batch.OPERATION):
     selected, digest = source_batch.selection_identity(
         [{"record_kind": "network", "record_id": number + 1, "revision": 1} for number in range(count)]
     )
-    compact = _source_batch_command(selection_count=count, selection_sha256=digest)
+    compact = _source_batch_command(operation=operation, selection_count=count, selection_sha256=digest)
     stored = {key: value for key, value in compact.items() if key != "idempotency_key"} | {"selection": selected}
     actor_by_name = {
         "kind": "platform_admin",
@@ -289,6 +290,66 @@ def _source_batch_request(count=2602):
     }
     metadata = queue.publication_request_metadata(stored, actor_by_name, "c" * 64, compact["idempotency_key"])
     return {**metadata, "idempotency_key": compact["idempotency_key"], "session_token_sha256": "c" * 64}
+
+
+def _source_approval_result(compact, command):
+    return {
+        "operation": source_batch.APPROVAL_OPERATION,
+        "approved_revision": command.expected_draft_revision + 1,
+        "previous_approved_revision": command.expected_approved_revision,
+        "selected_count": len(command.selection),
+        "selection_sha256": compact["selection_sha256"],
+        "serving_generation": compact["expected_serving_generation"],
+        "policy_revision": 7,
+    }
+
+
+@pytest.mark.parametrize("damage", [None, "count", "digest", "head", "revision", "policy", "operation", "extra"])
+def test_source_approval_result_is_closed_and_preserves_the_serving_head(damage):
+    compact, command = source_batch.stored_source_batch(
+        _source_batch_request(101, operation=source_batch.APPROVAL_OPERATION)
+    )
+    result_by_field = _source_approval_result(compact, command)
+    changes_by_case = {
+        "count": {"selected_count": 100},
+        "digest": {"selection_sha256": "0" * 64},
+        "head": {"serving_generation": 2},
+        "revision": {"approved_revision": 5},
+        "policy": {"policy_revision": True},
+        "operation": {"operation": source_batch.OPERATION},
+        "extra": {"source_selection": {"mapped_rows": 1, "omitted_rows": 0}},
+    }
+    result_by_field.update(changes_by_case.get(damage, {}))
+    if damage is None:
+        queue._source_batch_result(result_by_field, compact, command, "completed")
+        queue._source_batch_result(None, compact, command, "queued")
+    else:
+        with pytest.raises(ValueError):
+            queue._source_batch_result(result_by_field, compact, command, "completed")
+
+
+@pytest.mark.asyncio
+async def test_source_approval_uses_existing_complete_authority_pages():
+    from process.registry_publication_execution import _fresh_authority
+
+    request = _source_batch_request(201, operation=source_batch.APPROVAL_OPERATION)
+    calls = []
+
+    async def authorize(**arguments):
+        calls.extend(arguments["selection"])
+        return {
+            "authorized": True,
+            "actor": arguments["actor"],
+            "policy_revision": 7,
+            "selection_sha256": hashlib.sha256(
+                json.dumps(arguments["selection"], sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+
+    assert await _fresh_authority(authorize, request) == 7
+    compact, command = source_batch.stored_source_batch(request)
+    assert calls == list(command.selection)
+    assert source_batch.source_batch_page(compact, command, 0)["operation"] == source_batch.APPROVAL_OPERATION
 
 
 @pytest.mark.parametrize(
@@ -348,7 +409,8 @@ async def test_source_batch_authorizes_complete_vector_in_existing_hundred_recor
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["denied", "digest", "policy", "timeout"])
-async def test_source_batch_late_authority_failure_never_returns_partial_acceptance(damage):
+@pytest.mark.parametrize("operation", source_batch.OPERATIONS)
+async def test_source_batch_late_authority_failure_never_returns_partial_acceptance(damage, operation):
     calls = []
 
     async def authority(**arguments):
@@ -366,7 +428,7 @@ async def test_source_batch_late_authority_failure_never_returns_partial_accepta
         }
 
     with pytest.raises((ValueError, TimeoutError)):
-        await source_batch.authorize_source_batch(authority, _source_batch_request(201))
+        await source_batch.authorize_source_batch(authority, _source_batch_request(201, operation=operation))
     assert len(calls) == 2
 
 
@@ -840,8 +902,11 @@ async def test_source_batch_endpoint_selection_reads_only_the_bound_page(source_
 
 
 @pytest.mark.asyncio
-async def test_source_batch_endpoint_queue_owns_one_transaction_and_exact_session(source_batch_http):
+@pytest.mark.parametrize("operation", source_batch.OPERATIONS)
+async def test_source_batch_endpoint_queue_owns_one_transaction_and_exact_session(source_batch_http, operation):
     fixture = source_batch_http
+    fixture.compact["operation"] = fixture.body_by_field["operation"] = operation
+    fixture.request.body = json.dumps(fixture.body_by_field).encode()
 
     async def enqueue(driver, document, actor, session_hash):
         assert fixture.session.active and driver is fixture.driver

@@ -295,6 +295,19 @@ async def _office_relation(connection, copy_target, address_source, office_sourc
     return compact_base_relation_sql(office_sources), relation
 
 
+async def _finish_slice_relations(connection, copy_target, work_table):
+    """Index and analyze only the completed candidate before recording its relations."""
+    schema = _identifier(copy_target.schema_name)
+    await connection.execute(
+        f"CREATE INDEX network_slice_ref_slice_lookup_idx ON {schema}.network_slice_ref "
+        "(slice_id,artifact_candidate_id) INCLUDE(network_id)"
+    )
+    await connection.execute(f"ANALYZE {schema}.network_slice_ref")
+    await connection.execute(f"ANALYZE {schema}.network_office_edge")
+    await connection.execute(f"DROP TABLE {work_table}")
+    return await _slice_relation_oids(connection, copy_target.schema_name)
+
+
 async def _prepare_slices(connection, copy_target, address_source, previous, affected, control_schema, office_sources):
     """Prepare one complete immutable slice payload and its physical receipt."""
     schema = _identifier(copy_target.schema_name)
@@ -333,10 +346,7 @@ async def _prepare_slices(connection, copy_target, address_source, previous, aff
             WHERE NOT EXISTS(SELECT 1 FROM {schema}.network_slice_ref r
                 WHERE r.network_id=p.network_id AND r.office_bucket=p.office_bucket)""")
         )
-        await connection.execute(f"ANALYZE {schema}.network_slice_ref")
-        await connection.execute(f"ANALYZE {schema}.network_office_edge")
-        await connection.execute(f"DROP TABLE {work_table}")
-        ref_oid, edge_oid = await _slice_relation_oids(connection, copy_target.schema_name)
+        ref_oid, edge_oid = await _finish_slice_relations(connection, copy_target, work_table)
     return NetworkMembershipSliceReceipt(
         copy_target.candidate_id,
         address_source.generation_id,

@@ -387,11 +387,11 @@ async def _execute_publication_request(
             )
         if operation == "publish_fhir_catalog":
             return await _execute_catalog_request(connection, config, request_record)
-        options_by_name = dict(authorize=authorize, control_schema=config.control_schema)
-        if operation in (None, "publish_source_binding_batch"):
-            return await _ordinary_publication(
+        if operation in (None, "publish_source_binding_batch", "approve_source_binding_batch"):
+            return await _execute_approval_request(
                 connection, request_record, authorize, config, initial_address_sources, plan_metadata_client
             )
+        options_by_name = dict(authorize=authorize, control_schema=config.control_schema)
         if operation == "publish_initial_inventory":
             return await complete_queued_registry_initial_inventory(
                 connection,
@@ -416,6 +416,20 @@ async def _execute_publication_request(
         else:
             raise ValueError("registry_publication_operation_invalid")
         return await complete(connection, request_record["request_id"], request_record["lease_id"], **options_by_name)
+
+
+async def _execute_approval_request(connection, request_record, authorize, config, initial_sources, metadata_client):
+    """Keep terminal Source approval separate from ordinary candidate publication."""
+    if _document(request_record["command_json"]).get("operation") == "approve_source_binding_batch":
+        return await approve_queued_registry_publication(
+            connection,
+            request_record["request_id"],
+            request_record["lease_id"],
+            authorize=authorize,
+            control_schema=config.control_schema,
+            plan_metadata_client=metadata_client,
+        )
+    return await _ordinary_publication(connection, request_record, authorize, config, initial_sources, metadata_client)
 
 
 async def _lease_authority(authorize, stopped, request_by_name):
