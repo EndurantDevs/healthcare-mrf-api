@@ -16,6 +16,7 @@
     "verification_snapshot": "specs/provider_directory_endpoint_verification.json",
     "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
+      "anthem-provider-directory": {"support_level": "acquisition-configured", "access_requirement": "oauth2-client-credentials", "requires_registration": true, "reviewed_at": "2026-11-03", "method": "rest", "limitation": "The registered production endpoint supports seven directory collections through OAuth2 client credentials and server-issued next links. Explicit source-ID selection is required; broad scheduled imports exclude the endpoint. Bounded searches and issued continuations returned distinct sampled IDs for each collection; 100-row InsurancePlan and PractitionerRole pages succeeded, but no reliable totals were observed. Endpoint is not advertised. Specimen is advertised, but both Specimen and Endpoint reads returned HTTP 400 and are excluded. No Bulk Data export is advertised. Product, geographic and affiliate coverage must be established from native InsurancePlan, role and affiliation evidence; the endpoint path does not prove Medicaid-only or enterprise-wide coverage. Bounded access does not establish complete acquisition, publication or API readiness."},
       "iowa-medicaid": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition is configured for all eight Plan-Net collections at the CMS-listed R4 base, using stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. Resource population and publication readiness require separate verification. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections, and bounded ID-only searches succeeded. Repeated sampled windows agreed and adjacent sampled windows did not overlap; the samples did not establish exhaustive traversal. Searches omitted totals."},
       "pennsylvania-medicaid": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition is configured for all eight Plan-Net collections at the CMS-listed R4 base, using stable _id sorting, synthetic _skip pagination, one-request-per-second pacing, and durable checkpoints. Resource population and publication readiness require separate verification. Bounded source observations (2026-10-10): The official CMS catalog listed the public base. Anonymous R4 metadata declared all eight configured collections, and bounded ID-only searches succeeded. Repeated sampled windows agreed and adjacent sampled windows did not overlap; the samples did not establish exhaustive traversal. Searches omitted totals."},
       "san-bernardino-county-dbh": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-10-11", "method": "rest", "limitation": "Acquisition is configured for all eight resource families at the Netsmart R4 base. It ignores advertised next links and advances a stable _id-sorted _offset page index by one after each full page; short pages terminate traversal and repeated pages fail closed. Bounded source observations (2026-10-10): Anonymous R4 metadata declared all eight configured collections. Bounded ID-only Location searches found that _offset values 0, 1 and 2 returned distinct sampled pages, consistent with the maintained page-index rule. These samples did not establish exhaustive traversal, population adequacy or publication readiness."},
@@ -281,6 +282,27 @@
         "pdfhir_b674847fc79d2b2ea1f4e986"
       ],
       "canonical_base": "https://doctors.christushealthplan.org/fhir/provider-directory",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "A7",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ]
+    },
+    {
+      "entry_id": "anthem-provider-directory",
+      "display_name": "Anthem / Elevance Health Provider Directory",
+      "owner_id": "anthem-provider-directory",
+      "source_ids": [
+        "pdfhir_d09f9fa3d4c8e3ecee8c907b"
+      ],
+      "canonical_base": "https://totalview.healthos.elevancehealth.com/resources/unregistered/api/v1/fhir/cms_mandate/mcd",
       "classification": "acquisition",
       "launch_mode": "create",
       "resource_profile": "A7",

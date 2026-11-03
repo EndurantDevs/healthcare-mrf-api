@@ -1672,6 +1672,56 @@ disabled because those deletes can lock the serving table and block API reads.
 
 ## Credentialed API Access
 
+Anthem's registered production Provider Directory uses the exact base
+`https://totalview.healthos.elevancehealth.com/resources/unregistered/api/v1/fhir/cms_mandate/mcd`.
+The additive `anthem-provider-directory` catalog entry supports InsurancePlan,
+PractitionerRole, Practitioner, Organization, Location, HealthcareService and
+OrganizationAffiliation. It does not rewrite historical Availity or affiliated
+insurer entries. Acquisition requires explicit source-ID selection; broad
+scheduled imports exclude this endpoint, including catalog aliases, before
+probing or downloading resources. The endpoint path alone establishes neither
+Medicaid-only
+coverage nor coverage of every affiliated insurer, product or state; preserve
+native plan, network and office participation evidence.
+
+Configure an exact `api_bases` or `sources` credential rule using the existing
+secret-mounted JSON format below. Anthem uses OAuth2 `client_credentials` with
+Basic client authentication at
+`https://totalview.healthos.elevancehealth.com/client.oauth2/unregistered/api/v1/token`,
+then Bearer authorization for directory reads. Developer-portal credentials are
+not API credentials. The client ID and secret must belong to an approved
+production application; keep their values outside source definitions and import
+parameters.
+
+The source follows server-issued REST next links using the shared durable
+checkpoints. Full refreshes prefer 1,000 rows per page for six collections and
+500 for PractitionerRole, whose larger payloads benefit from smaller pages;
+bounded probes preserve their requested page size. These exact-source caps
+remain subject to the shared page and response-body limits. Requests negotiate
+gzip for this source while decoded responses retain the same body limit.
+Unsorted production pages were
+observed to overlap. Starts therefore require `_sort=_id`; continuations must
+retain the sort and page count and advance a server-issued `_offset` on the
+exact collection by the returned entry count. Saved cursors undergo separate
+scope validation on resume. The importer preserves the issued URL unchanged and refuses
+malformed, unsorted or overlapping resource IDs before staging the page. The
+last sorted ID is committed with each page's existing checkpoint and checked
+again on resume. Sorted page pairs for all seven collections had strictly
+increasing IDs and retained the issued sort. No reliable collection totals were
+observed. The sampled plans included
+Medicare, Medicaid and other product codes and multiple insurer brands; those
+samples do not establish complete product or geographic coverage.
+Bulk Data export and Endpoint are not advertised. Metadata also advertises
+Specimen, but bounded reads of Specimen and Endpoint returned HTTP 400 and
+neither is acquired. The operator plan requests up to eight independent
+resource scans and retains partial checkpoints when continuation recovery
+would require a reset. Effective parallelism remains subject to the shared
+transport, candidate-storage and connection-capacity gates, and cannot exceed
+the seven supported collections; a bounded concurrent probe reached seven
+successful collection requests. Bounded metadata
+and collection probes establish access only; full acquisition, atomic
+publication and Profile/API verification remain separate acceptance steps.
+
 CMS requires these Provider Directory APIs to be public at the user-data level,
 but payer API servers can still require app registration or API keys. The
 importer supports secret-backed credentials without storing secret values in the

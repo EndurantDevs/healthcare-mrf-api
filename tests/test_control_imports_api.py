@@ -4740,9 +4740,9 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (43, 29, 31)
+    ) == (44, 30, 32)
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 29
+    assert len(runnable_items) == 30
     assert all(entry["profile_enabled"] for entry in runnable_items)
     assert all(entry["supported_resources"] == entry["resources"] for entry in runnable_items)
     assert len(nonrunnable_items) == 14
@@ -4750,6 +4750,7 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     assert len(probe_items) == 13
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
+    assert runnable_by_id["anthem-provider-directory"]["resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE[:-1]
     assert probe_by_id["capital-blue-cross"]["resources"] == []
     assert probe_by_id["capital-blue-cross"]["supported_resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
     assert len(runnable_by_id["devoted-health"]["resources"]) == 7
@@ -4775,6 +4776,7 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     assert probe_by_id["scan"]["supported_resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
     assert {entry["entry_id"] for entry in runnable_items} >= {
         "aetna-commercial-medicare",
+        "anthem-provider-directory",
         "alohr",
         "caresource",
         "molina",

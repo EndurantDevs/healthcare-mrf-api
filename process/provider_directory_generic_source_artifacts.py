@@ -207,6 +207,9 @@ async def import_resources_with_source_session(directory, source_records, rest_p
     force_session = force_session or any(
         directory.capped_partition.enabled(directory, record) for record in source_records
     )
+    force_session = force_session or any(
+        directory.source_selection.is_credentialed_rest_source(directory, record) for record in source_records
+    )
     require_verified_tls = force_session
     force_session = force_session or bool(proxy_run is not None and proxy_run.bindings)
     token = directory._REST_PAGE_PREFETCH_OVERRIDE.set(rest_page_prefetch)

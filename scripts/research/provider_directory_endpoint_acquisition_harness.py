@@ -277,6 +277,13 @@ def entry_params(manifest: dict[str, Any], entry: dict[str, Any]) -> dict[str, A
     params_by_name["source_ids"] = list(entry["source_ids"])
     if classification in ACQUISITION_CLASSIFICATIONS:
         params_by_name["resources"] = ",".join(entry["resources"])
+    if entry["entry_id"] == "anthem-provider-directory" and classification == "acquisition":
+        params_by_name.update(
+            open_only=False,
+            include_auth_required=True,
+            resource_scan_concurrency=8,
+            allow_retained_pagination_reset=False,
+        )
     return params_by_name
 
 

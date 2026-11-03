@@ -84,6 +84,7 @@ from db.models import (
     db,
 )
 from db.plan_release_storage import storage_relation
+from process import provider_directory_anthem as anthem
 from process import provider_directory_bulk_parallel as bulk_parallel
 from process import provider_directory_capped_partition as capped_partition
 from process import provider_directory_christus as christus
@@ -1420,6 +1421,7 @@ SOURCE_RESOURCE_TIMEOUT_MIN_SECONDS = {
     ): REVIEWED_PRACTITIONER_ROLE_TIMEOUT_MIN_SECONDS,
 }
 PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
+    **{(anthem.API_BASE, resource): cap for resource, cap in anthem.PAGE_COUNT_CAPS.items()},
     **{
         (AETNA_PROVIDER_DIRECTORY_DATA_BASE, resource_type): 30
         for resource_type in AETNA_COMMERCIAL_SUPPORTED_RESOURCES
@@ -1431,6 +1433,7 @@ PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS = {
     (UHC_PROVIDER_DIRECTORY_BASE, "InsurancePlan"): 1,
 }
 PREFERRED_FULL_REFRESH_PAGE_COUNT_BY_BASE = {
+    anthem.API_BASE: 1000,
     CARESOURCE_PROVIDER_DIRECTORY_BASE: 1000,
     HAP_PROVIDER_DIRECTORY_BASE: 1000,
 }
@@ -1490,6 +1493,7 @@ PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
 PAGINATION_CHECKPOINT_API_BASES = frozenset(
     {
+        anthem.API_BASE,
         AETNA_PROVIDER_DIRECTORY_DATA_BASE,
         ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
         ALOHR_PUBLIC_PROVIDER_DIRECTORY_BASE,
@@ -3756,13 +3760,17 @@ def _resource_start_url(source_record: dict[str, Any], resource_type: str, *, pa
         resource_type,
         page_count,
     )
+    endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
+    endpoint = _clean_text(source_record.get(endpoint_field)) if endpoint_field else None
+    if api_base == anthem.API_BASE:
+        return anthem.start_url(
+            resource_type, resource_page_count, endpoint if endpoint and not _is_placeholder_url(endpoint) else None
+        )
     census_contract = current_version_census_contract(source_record)
     if census_contract is not None:
         if resource_type not in census_contract.resources:
             return None
         return census_contract.start_url(resource_type, resource_page_count)
-    endpoint_field = RESOURCE_ENDPOINT_FIELDS.get(resource_type)
-    endpoint = _clean_text(source_record.get(endpoint_field)) if endpoint_field else None
     if endpoint and not _is_placeholder_url(endpoint):
         parsed = urllib.parse.urlsplit(endpoint)
         if parsed.scheme and parsed.netloc:
@@ -4844,6 +4852,8 @@ def _is_url_within_api_base(url: str, api_base: str) -> bool:
 
 
 def _is_credential_allowed_for_url(source: dict[str, Any], url: str) -> bool:
+    if source_selection.is_credentialed_rest_source(sys.modules[__name__], source):
+        return source_selection.credentialed_rest_request_allowed(sys.modules[__name__], source, url)
     parsed = urllib.parse.urlsplit(url)
     if not parsed.netloc:
         return True
@@ -4968,6 +4978,7 @@ def _credential_request_options_for_source(
     spec = _credential_spec_for_source(source_record) if spec is None else spec
     if not spec or not _is_credential_allowed_for_url(source_record, url):
         return {"headers": {}, "query_params": {}, "descriptor": None}
+    source_selection.require_credentialed_rest_spec(sys.modules[__name__], source_record, spec)
     headers_by_name: dict[str, str] = {}
     bearer = _resolve_secret_text(spec.get("bearer_token"))
     if bearer:
@@ -40523,6 +40534,7 @@ def _seed_rows_from_supplemental_catalogs(
     supplemental_rows.extend(remote_rows)
     metrics_by_name["catalogs"].update(remote_metrics_by_catalog)
     for name, base, seed_loader in (
+        ("anthem", anthem.API_BASE, anthem.seed_rows),
         ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
         ("pacificsource", pacificsource.API_BASE, pacificsource.seed_rows),
         ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
@@ -40745,7 +40757,7 @@ def _source_http_client_session(
     request_concurrency: int = 100,
     source_concurrency: int = 1,
 ) -> aiohttp.ClientSession:
-    """Create an anonymous REST client without adding cookies or compression."""
+    """Create a REST client without adding cookies or compression."""
     if type(request_concurrency) is not int or not 1 <= request_concurrency <= 100:
         raise ValueError("provider_directory_request_concurrency_invalid")
     if type(source_concurrency) is not int or source_concurrency < 1:
@@ -40773,7 +40785,7 @@ async def _source_http_session_scope(
     request_concurrency: int = 100,
     source_concurrency: int = 1,
 ) -> AsyncIterator[None]:
-    """Reuse anonymous REST connections for one resource-import run."""
+    """Reuse bounded REST connections for one resource-import run."""
     if not force and not _is_source_http_keepalive_enabled():
         yield
         return
@@ -40784,9 +40796,11 @@ async def _source_http_session_scope(
     ) as session:
         session_token = _SOURCE_HTTP_SESSION.set(session)
         slots_token = SOURCE_HTTP_REQUEST_SLOTS.set({})
+        credential_locks_token = source_selection.CREDENTIAL_REQUEST_LOCKS.set({})
         try:
             yield
         finally:
+            source_selection.CREDENTIAL_REQUEST_LOCKS.reset(credential_locks_token)
             SOURCE_HTTP_REQUEST_SLOTS.reset(slots_token)
             _SOURCE_HTTP_SESSION.reset(session_token)
 
@@ -40926,24 +40940,12 @@ async def _read_source_http_payload(
     response: aiohttp.ClientResponse,
     *,
     timeout: int,
+    allow_gzip: bool = False,
 ) -> dict[str, Any] | None:
     """Read JSON while retaining status metadata when an error body stalls."""
-    is_error_response = not 200 <= response.status < 300
-    max_bytes = 1024 * 1024 if is_error_response else MAX_FHIR_JSON_BODY_BYTES
-    try:
-        body = await _read_source_http_response_body(
-            response,
-            timeout=timeout,
-            max_bytes=max_bytes,
-        )
-    except Exception:
-        if not is_error_response:
-            raise
-        return _source_http_payload_with_retry_after(None, response.headers)
-    payload_by_field = _decode_json_body(body)
-    if not is_error_response:
-        return payload_by_field
-    return _source_http_payload_with_retry_after(payload_by_field, response.headers)
+    return await fhir_response.read_source_http_payload(
+        sys.modules[__name__], response, timeout=timeout, allow_gzip=allow_gzip
+    )
 
 
 def _source_http_redirect_result(
@@ -40972,51 +40974,22 @@ async def _fetch_json_with_source_session(
     preserve_url_bytes: bool = False,
     proxy_options: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
+    allow_gzip: bool = False,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
-    """Fetch anonymous FHIR JSON through a persistent source session."""
-    headers_by_name = {
-        "Accept": "application/fhir+json, application/json;q=0.9, */*;q=0.1",
-        "Accept-Encoding": "identity",
-        "User-Agent": USER_AGENT,
-    }
-    request_timeout = aiohttp.ClientTimeout(total=None, connect=timeout, sock_connect=timeout, sock_read=timeout)
-    started = time.monotonic()
-    try:
-        request_options = proxy_options or {}
-        if extra_headers:
-            if any(key.lower() == "proxy-authorization" for key in extra_headers):
-                raise ValueError("source_proxy_origin_header_forbidden")
-            headers_by_name.update(extra_headers)
-        is_continuation = _has_fhir_continuation_query(url)
-        is_encoded = preserve_url_bytes or request_options or christus.is_request_url(url) or is_continuation
-        request_url = URL(url, encoded=True) if is_encoded else url
-        async with session.get(
-            request_url,
-            headers=headers_by_name,
-            timeout=request_timeout,
-            allow_redirects=allow_redirects
-            and not christus.is_request_url(url)
-            and not is_continuation
-            and source_selection.QUALIFICATION_API_BASE.get() is None
-            and not request_options,
-            **request_options,
-        ) as response:
-            payload_by_field = await _read_source_http_payload(response, timeout=timeout)
-            return (
-                response.status,
-                payload_by_field,
-                None,
-                int((time.monotonic() - started) * 1000),
-            )
-    except aiohttp.TooManyRedirects as exc:
-        return _source_http_redirect_result(exc, started=started)
-    except Exception as exc:
-        return (
-            None,
-            None,
-            type(exc).__name__,
-            int((time.monotonic() - started) * 1000),
-        )
+    """Fetch FHIR JSON through a persistent source session."""
+    return await fhir_response.fetch_session_json(
+        sys.modules[__name__],
+        session,
+        url,
+        timeout=timeout,
+        options_by_name={
+            "allow_redirects": allow_redirects,
+            "preserve_url_bytes": preserve_url_bytes,
+            "proxy_options": proxy_options,
+            "extra_headers": extra_headers,
+            "allow_gzip": allow_gzip,
+        },
+    )
 
 
 def _fetch_json_sync(
@@ -41025,33 +40998,17 @@ def _fetch_json_sync(
     timeout: int,
     extra_headers: dict[str, str] | None = None,
     query_params_by_name: dict[str, str] | None = None,
+    allow_gzip: bool = False,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
-    headers_by_name = {
-        "Accept": "application/fhir+json, application/json;q=0.9, */*;q=0.1",
-        "User-Agent": USER_AGENT,
-    }
-    if extra_headers:
-        headers_by_name.update(extra_headers)
-    fetch_url = _url_with_query_params(url, query_params_by_name)
-    started = time.monotonic()
-    request = urllib.request.Request(fetch_url, headers=headers_by_name)
-    try:
-        with source_selection.open_source_request(sys.modules[__name__], request, timeout=timeout) as response:
-            body = _read_response_body_with_deadline(response, timeout=timeout)
-            return response.status, _decode_json_body(body), None, int((time.monotonic() - started) * 1000)
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read(1024 * 1024)
-        except Exception:
-            body = b""
-        error_payload_dict = _decode_json_body(body)
-        retry_after = _clean_text(exc.headers.get("Retry-After"))
-        if retry_after:
-            error_payload_dict = dict(error_payload_dict or {})
-            error_payload_dict[SOURCE_RETRY_AFTER_FIELD] = retry_after
-        return exc.code, error_payload_dict, None, int((time.monotonic() - started) * 1000)
-    except Exception as exc:
-        return None, None, f"{type(exc).__name__}: {exc}", int((time.monotonic() - started) * 1000)
+    """Delegate to the existing bounded source transport."""
+    return fhir_response.fetch_json_sync(
+        sys.modules[__name__],
+        url,
+        timeout=timeout,
+        extra_headers=extra_headers,
+        query_params_by_name=query_params_by_name,
+        allow_gzip=allow_gzip,
+    )
 
 
 def _post_json_sync(
@@ -41106,9 +41063,10 @@ async def _fetch_json_with_options(
     timeout: int,
     extra_headers: dict[str, str] | None = None,
     query_params_by_name: dict[str, str] | None = None,
+    allow_gzip: bool = False,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
     return await asyncio.to_thread(
-        _fetch_json_sync,
+        partial(_fetch_json_sync, allow_gzip=True) if allow_gzip else _fetch_json_sync,
         url,
         timeout=timeout,
         extra_headers=extra_headers,
@@ -41130,6 +41088,7 @@ def _is_transient_source_fetch_failure(
             RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR,
             CIGNA_AMBIGUOUS_EMPTY_CONTINUATION_ERROR,
             SOURCE_QUOTA_EXHAUSTED_ERROR,
+            "provider_directory_credentials_unavailable",
         }
     return status_code in SOURCE_TRANSIENT_HTTP_STATUSES
 
@@ -41400,6 +41359,7 @@ def _checkpoint_non_bundle_retry_not_before(
     response_payload: dict[str, Any] | None,
     *,
     now_utc: datetime.datetime | None = None,
+    max_delay_seconds: float | None = 600.0,
 ) -> str | None:
     """Return a bounded defer time for an invalid checkpoint continuation."""
     if checkpoint_context is None or not is_continuation or status_code != 200 or _is_bundle_payload(response_payload):
@@ -41407,6 +41367,7 @@ def _checkpoint_non_bundle_retry_not_before(
     retry_delay_seconds = _source_retry_after_seconds(
         response_payload,
         now_utc=now_utc,
+        max_delay_seconds=max_delay_seconds,
     )
     if retry_delay_seconds is None:
         retry_delay_seconds = float(SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS)
@@ -41461,56 +41422,8 @@ async def _fetch_source_json_unpaced(
     *,
     timeout: int,
 ) -> tuple[int | None, dict[str, Any] | None, str | None, int]:
-    source_selection.require_qualification_url(sys.modules[__name__], url)
-    proxy_run = source_proxy.selected_run(sys.modules[__name__], source_record)
-    if proxy_run is not None:
-        return await proxy_run.fetch(source_record, url, timeout=timeout)
-    census_contract = current_version_census_contract(source_record)
-    if census_contract is not None:
-        if _has_source_declared_credentialed_access(source_record) or _credential_spec_for_source(source_record):
-            raise RuntimeError("provider_directory_current_version_census_credentials_forbidden")
-        census_session = _SOURCE_HTTP_SESSION.get()
-        if census_session is None or census_session.closed:
-            raise RuntimeError("provider_directory_current_version_census_session_required")
-        return await _fetch_json_with_source_session(
-            census_session,
-            url,
-            timeout=timeout,
-            allow_redirects=False,
-            preserve_url_bytes=True,
-        )
-    if capped_partition.enabled(sys.modules[__name__], source_record):
-        capped_session = _SOURCE_HTTP_SESSION.get()
-        if capped_session is None or capped_session.closed:
-            raise RuntimeError("provider_directory_capped_search_session_required")
-        if _has_source_declared_credentialed_access(source_record) or _credential_spec_for_source(source_record):
-            raise RuntimeError("provider_directory_capped_search_anonymous_required")
-        return await _fetch_json_with_source_session(
-            capped_session,
-            url,
-            timeout=timeout,
-            allow_redirects=False,
-            preserve_url_bytes=True,
-        )
-    pinned_session = _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.get()
-    if pinned_session is not None:
-        return await _fetch_json_with_source_session(
-            pinned_session,
-            url,
-            timeout=timeout,
-            allow_redirects=True,
-        )
-    options = await source_selection.resolve_probe_credentials(
-        _credential_request_options_for_source, source_record, url
-    )
-    if not options["headers"] and not options["query_params"]:
-        return await _fetch_json(url, timeout=timeout)
-    return await _fetch_json_with_options(
-        url,
-        timeout=timeout,
-        extra_headers=options["headers"],
-        query_params_by_name=options["query_params"],
-    )
+    """Delegate to the existing bounded source transport."""
+    return await source_selection.fetch_unpaced_source_json(sys.modules[__name__], source_record, url, timeout=timeout)
 
 
 def _source_fetch_result_with_payload_error(
@@ -41548,11 +41461,12 @@ def _source_fetch_attempt_delay(
     empty_collection_retry_delays: tuple[float, ...],
     should_retry_empty_collection: bool,
     now_utc: datetime.datetime | None = None,
+    max_delay_seconds: float | None = 600.0,
 ) -> float:
     if should_retry_empty_collection:
         return empty_collection_retry_delays[min(attempt_index, len(empty_collection_retry_delays) - 1)]
     retry_after_seconds = (
-        _source_retry_after_seconds(fhir_payload, now_utc=now_utc)
+        _source_retry_after_seconds(fhir_payload, now_utc=now_utc, max_delay_seconds=max_delay_seconds)
         if status_code in SOURCE_TRANSIENT_HTTP_STATUSES
         else None
     )
@@ -41614,57 +41528,8 @@ async def _fetch_source_json_candidate(
     is_last_candidate: bool,
 ) -> tuple[tuple[int | None, dict[str, Any] | None, str | None, int], bool, int]:
     """Fetch one page-size candidate and report whether to try a smaller page."""
-    if current_version_census_contract(source_record) is not None:
-        fetch_result, retry_count = await _fetch_current_version_census_json(
-            source_record,
-            candidate_url,
-            timeout=timeout,
-        )
-        return fetch_result, False, retry_count
-    empty_collection_retry_delays = _cigna_empty_collection_retry_delays(
-        source_record,
-        candidate_url,
-    )
-    attempt_count = max(_source_fetch_retry_attempts(), len(empty_collection_retry_delays) + 1)
-    total_elapsed_ms = 0
-    retry_count = 0
-    fetch_result = (None, None, "request_not_attempted", 0)
-    for attempt_index in range(attempt_count):
-        (
-            fetch_result,
-            should_try_smaller_page,
-            should_retry_fetch,
-            should_retry_empty_collection,
-        ) = await _fetch_source_json_attempt(
-            source_record,
-            candidate_url,
-            timeout=timeout,
-            empty_collection_retry_delays=empty_collection_retry_delays,
-        )
-        status_code, fhir_payload, fetch_error, elapsed_ms = fetch_result
-        total_elapsed_ms += elapsed_ms
-        if should_try_smaller_page and not is_last_candidate:
-            return (
-                _source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms),
-                True,
-                retry_count,
-            )
-        if not should_retry_fetch or attempt_index + 1 >= attempt_count:
-            break
-        retry_count += 1
-        await asyncio.sleep(
-            _source_fetch_attempt_delay(
-                status_code,
-                fhir_payload,
-                attempt_index,
-                empty_collection_retry_delays,
-                should_retry_empty_collection,
-            )
-        )
-    return (
-        _source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms),
-        False,
-        retry_count,
+    return await source_selection.fetch_source_candidate(
+        sys.modules[__name__], source_record, candidate_url, timeout=timeout, is_last_candidate=is_last_candidate
     )
 
 
@@ -41900,8 +41765,10 @@ def _is_rest_pagination_cooldown_failure(
 def _rest_pagination_cooldown_delay_seconds(
     status_code: int | None,
     fhir_payload: dict[str, Any] | None,
+    *,
+    max_delay_seconds: float | None = 600.0,
 ) -> float:
-    retry_after_seconds = _source_retry_after_seconds(fhir_payload)
+    retry_after_seconds = _source_retry_after_seconds(fhir_payload, max_delay_seconds=max_delay_seconds)
     if retry_after_seconds is not None:
         return retry_after_seconds
     return SOURCE_TRANSIENT_RETRY_FALLBACK_SECONDS if status_code == 429 else REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
@@ -41922,7 +41789,11 @@ async def _retry_rest_pagination_after_cooldown(
         status_code, fhir_payload, fetch_error, _elapsed_ms = fetch_result
         if not _is_rest_pagination_cooldown_failure(status_code, fetch_error):
             break
-        delay_seconds = _rest_pagination_cooldown_delay_seconds(status_code, fhir_payload)
+        delay_seconds = _rest_pagination_cooldown_delay_seconds(
+            status_code,
+            fhir_payload,
+            max_delay_seconds=source_selection.retry_after_limit(sys.modules[__name__], source_record),
+        )
         if deadline_at is not None and time.monotonic() + delay_seconds >= deadline_at:
             return RestPaginationCooldownResult(
                 fetch_result=fetch_result,
@@ -42150,11 +42021,22 @@ async def _probe_resource_access(
     resource_type = resource_type or _resource_access_probe_type(source_record, capability_payload)
     if not resource_type:
         return None
-    resource_probe_source_map, resource_url = _resource_access_probe_url(
-        source_record,
-        candidate_base,
-        resource_type,
-    )
+    try:
+        resource_probe_source_map, resource_url = _resource_access_probe_url(
+            source_record, candidate_base, resource_type
+        )
+    except ValueError as exc:
+        if str(exc) != "untrusted_anthem_start_url":
+            raise
+        return {
+            "status": "resource_error",
+            "http_status": None,
+            "response_time_ms": 0,
+            "url": None,
+            "resource_type": resource_type,
+            "error": str(exc),
+            "search_bundle_valid": False,
+        }
     if not resource_url:
         return None
     targeted_search_error = _aetna_medicaid_targeted_search_error(
@@ -42193,7 +42075,10 @@ async def _probe_metadata_candidate(
     )
     status = _classify_http(status_code, error, capability_payload, source_record)
     credential = await source_selection.resolve_probe_credentials(
-        _credential_request_options_for_source, source_record, metadata_url
+        _credential_request_options_for_source,
+        source_record,
+        metadata_url,
+        run_in_thread=source_selection.is_credentialed_rest_source(sys.modules[__name__], source_record),
     )
     is_credential_missing = not credential["descriptor"] and not _uses_alohr_graphql_connector(source_record)
     if status == "valid" and _has_source_declared_credentialed_access(source_record) and is_credential_missing:
@@ -42373,7 +42258,11 @@ async def _probe_source(
         }
         return source_probe_map, None
     missing_credential_result = await source_selection.resolve_probe_credentials(
-        _credential_probe_short_circuit, source_record, metadata_urls, run_id=run_id
+        _credential_probe_short_circuit,
+        source_record,
+        metadata_urls,
+        run_id=run_id,
+        run_in_thread=source_selection.is_credentialed_rest_source(sys.modules[__name__], source_record),
     )
     if missing_credential_result:
         return missing_credential_result
@@ -43083,6 +42972,10 @@ def _resolved_fhir_next_url(
     """Resolve a source-specific continuation without widening trust."""
 
     api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if api_base == anthem.API_BASE:
+        collection = resource_type or urllib.parse.urlsplit(current_url).path.rsplit("/", 1)[-1]
+        page_count_cap = _source_resource_page_count(source_record, collection, _max_page_count())
+        return anthem.next_url(current_url, next_link, collection, page_count_cap, page_entry_count)
     if api_base == MOLINA_PROVIDER_DIRECTORY_BASE and resource_type == "HealthcareService":
         return molina.healthcare_service_next_url(current_url, next_link, page_entry_count)
     if not next_link:
@@ -43116,15 +43009,7 @@ def _resolved_fhir_next_url(
         and parsed_next.port in {None, 443}
     ):
         public_base = urllib.parse.urlsplit(HAP_PROVIDER_DIRECTORY_BASE)
-        next_url = urllib.parse.urlunsplit(
-            (
-                public_base.scheme,
-                public_base.netloc,
-                parsed_next.path,
-                parsed_next.query,
-                parsed_next.fragment,
-            )
-        )
+        next_url = parsed_next._replace(scheme=public_base.scheme, netloc=public_base.netloc).geturl()
     if not _is_trusted_fhir_pagination_url(source_record, current_url, next_url):
         raise ValueError("untrusted_pagination_link")
     return next_url
@@ -48855,6 +48740,7 @@ def _should_restart_expired_pagination_checkpoint(
     )
     return bool(
         allow_retained_pagination_reset
+        and not _is_url_within_api_base(request_url, anthem.API_BASE)
         and (not is_current_version_census or allow_current_version_census_restart)
         and resume_state
         and resume_state.resumed
@@ -53363,6 +53249,26 @@ async def _fetch_resource_rows(
     supported_resource_types = _source_supported_resource_types(source_record)
     if supported_resource_types is not None and resource_type not in supported_resource_types:
         return None
+    if _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")) == anthem.API_BASE:
+        try:
+            _resource_start_url(source_record, resource_type, page_count=page_count)
+        except ValueError as exc:
+            if str(exc) != "untrusted_anthem_start_url":
+                raise
+            return ResourceFetchResult(
+                model=model,
+                rows=[],
+                rows_fetched=0,
+                rows_written=0,
+                pages_fetched=0,
+                complete=False,
+                row_limit_reached=False,
+                page_limit_reached=False,
+                hard_page_limit_reached=False,
+                next_url_remaining=True,
+                error=str(exc),
+                fetch_mode="source_start_refused",
+            )
     resource_timeout = _source_resource_timeout(source_record, resource_type, timeout)
     raw_partition_config = _source_metadata(source_record).get(LAST_UPDATED_PARTITION_METADATA_KEY)
     partition_acquisition_declared = (
@@ -53612,11 +53518,30 @@ async def _fetch_resource_rows(
                     retryable=False,
                     contract=current_version_contract,
                 )
+    is_anthem_source = (
+        _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")) == anthem.API_BASE
+    )
+    previous_anthem_id = None
     synthetic_resume_guard_error = molina.healthcare_service_resume_error(
         _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")),
         resource_type,
         resume_state.next_url if resume_state else None,
     ) or _synthetic_position_resume_guard_error(source_record, resume_state)
+    if is_anthem_source:
+        try:
+            previous_anthem_id = anthem.resume_boundary(
+                resume_state.rows_processed if resume_state else 0,
+                resume_state.completeness if resume_state else {},
+            )
+            if resume_state and resume_state.rows_processed and not resume_state.complete:
+                anthem.resume_url(
+                    checkpoint_start_url,
+                    resume_state.next_url,
+                    resource_type,
+                    _source_resource_page_count(source_record, resource_type, _max_page_count()),
+                )
+        except ValueError as exc:
+            synthetic_resume_guard_error = str(exc)
     if synthetic_resume_guard_error and resume_state is not None:
         return ResourceFetchResult(
             model=model,
@@ -53944,11 +53869,26 @@ async def _fetch_resource_rows(
             if used_prefetched_page:
                 page_prefetch_state.consumed += 1
             if not used_prefetched_page:
-                page_fetch_result = await _fetch_source_json(
-                    source_record,
-                    url,
-                    timeout=resource_timeout,
-                )
+                remaining_seconds = deadline_at - time.monotonic() if deadline_at is not None else None
+                try:
+                    async with asyncio.timeout(remaining_seconds) as page_deadline:
+                        page_fetch_result = await _fetch_source_json(
+                            source_record,
+                            url,
+                            timeout=resource_timeout,
+                        )
+                except TimeoutError:
+                    if not page_deadline.expired():
+                        raise
+                    is_deadline_reached = True
+                    has_next_url = True
+                    pacing_state = source_record.get("_provider_directory_request_pacing_state", source_record)
+                    retry_after_seconds = float(pacing_state.get("retry_after_monotonic") or 0) - time.monotonic()
+                    if retry_after_seconds > 0:
+                        retry_not_before = _retry_not_before_timestamp(
+                            datetime.datetime.now(datetime.UTC), retry_after_seconds
+                        )
+                    break
             assert page_fetch_result is not None
             if is_current_version_census_enabled:
                 await _raise_if_resource_import_cancelled(
@@ -54002,6 +53942,7 @@ async def _fetch_resource_rows(
                 is_checkpoint_continuation,
                 status_code,
                 response_payload,
+                max_delay_seconds=source_selection.retry_after_limit(sys.modules[__name__], source_record),
             )
             if status_code != 200 or error:
                 if (
@@ -54085,7 +54026,11 @@ async def _fetch_resource_rows(
                         response_payload,
                         error,
                         retry_count=int((fetch_diagnostic or {}).get("retry_count") or 0),
-                        max_delay_seconds=(None if is_current_version_census_enabled else 600.0),
+                        max_delay_seconds=(
+                            None
+                            if is_current_version_census_enabled
+                            else source_selection.retry_after_limit(sys.modules[__name__], source_record)
+                        ),
                         fallback_seconds=(
                             REST_PAGINATION_COOLDOWN_FALLBACK_SECONDS
                             if status_code != 429
@@ -54146,6 +54091,25 @@ async def _fetch_resource_rows(
                 break
             if _is_uhc_partition_cap_exhausted(source_record, url, response_payload):
                 error_message = f"uhc_{resource_type.lower()}_partition_cap_exhausted"
+            if is_anthem_source:
+                try:
+                    previous_anthem_id = anthem.page_boundary(
+                        response_payload,
+                        resource_type,
+                        previous_anthem_id,
+                        _source_resource_page_count(source_record, resource_type, page_count),
+                    )
+                    anthem.next_url(
+                        url,
+                        anthem.next_link(response_payload),
+                        resource_type,
+                        _source_resource_page_count(source_record, resource_type, page_count),
+                        len(response_payload.get("entry", [])),
+                    )
+                except ValueError as exc:
+                    error_message = str(exc)
+                    has_next_url = True
+                    break
             entries = _bundle_entries(response_payload)
             current_version_next_link: str | None = None
             current_version_resolved_next_url: str | None = None
@@ -54260,7 +54224,7 @@ async def _fetch_resource_rows(
             next_url = current_version_next_link
             if not is_current_version_census_enabled:
                 try:
-                    next_url = _next_link(response_payload)
+                    next_url = anthem.next_link(response_payload) if is_anthem_source else _next_link(response_payload)
                 except ValueError as exc:
                     error_message = str(exc)
                     has_next_url = True
@@ -54384,6 +54348,8 @@ async def _fetch_resource_rows(
                                 completeness=(
                                     current_version_proof_by_field
                                     if is_current_version_census_enabled
+                                    else {anthem.SORTED_LAST_ID_KEY: previous_anthem_id}
+                                    if is_anthem_source
                                     else (
                                         _synthetic_position_page_guard_completeness(
                                             synthetic_page_identity,
@@ -57463,7 +57429,9 @@ def _is_source_catalog_stale_cleanup_enabled(
     )
 
 
-def _configured_catalog_protected_source_ids(task: dict[str, Any]) -> list[str]:
+def _configured_catalog_protected_source_ids(
+    task: dict[str, Any], catalog_source_rows: Iterable[Mapping[str, Any]] = ()
+) -> list[str]:
     """Return explicit and manifest-pinned acquisition source IDs to retain."""
     configured_source_ids = _clean_source_id_list(
         task.get("protected_source_ids") or task.get("provider_directory_protected_source_ids")
@@ -57480,6 +57448,12 @@ def _configured_catalog_protected_source_ids(task: dict[str, Any]) -> list[str]:
             raise RuntimeError("provider_directory_acquisition_manifest_invalid")
         if entry.get("classification") in PROVIDER_DIRECTORY_CATALOG_RETENTION_CLASSIFICATIONS:
             configured_source_ids.extend(_clean_source_id_list(entry.get("source_ids")))
+    configured_source_ids.extend(
+        source_id
+        for row in catalog_source_rows
+        if _canonical_base(row.get("canonical_api_base") or row.get("api_base")) == anthem.API_BASE
+        and (source_id := _clean_text(row.get("source_id")))
+    )
     return sorted(set(configured_source_ids))
 
 
@@ -57643,24 +57617,24 @@ def _has_parallel_resource_transport(
     *,
     minimum_resources: int = 2,
 ) -> bool:
-    """Require one anonymous, nonpartitioned start URL for every wave member."""
+    """Require one reviewed, nonpartitioned start URL for every wave member."""
     fetchable_count = 0
     for resource_type in resource_types:
-        request_url = _resource_start_url(
-            source_record,
-            resource_type,
-            page_count=page_count,
-        )
-        if request_url is None:
+        try:
+            request_url = _resource_start_url(source_record, resource_type, page_count=page_count)
+            if request_url is None:
+                return False
+            partition_start_urls = _partitioned_resource_start_urls(source_record, resource_type, page_count=page_count)
+        except ValueError as exc:
+            if str(exc) != "untrusted_anthem_start_url":
+                raise
             return False
-        partition_start_urls = _partitioned_resource_start_urls(
-            source_record,
-            resource_type,
-            page_count=page_count,
-        )
         if partition_start_urls != [request_url]:
             return False
-        if _rest_page_prefetch_session(source_record, request_url) is None:
+        if (
+            _rest_page_prefetch_session(source_record, request_url) is None
+            and source_selection.credentialed_rest_session(sys.modules[__name__], source_record, request_url) is None
+        ):
             return False
         fetchable_count += 1
     return fetchable_count >= minimum_resources
@@ -68572,7 +68546,7 @@ async def _import_resources_with_source_http_session(
     publish_source_dataset_only: bool = False,
     **import_options: Any,
 ) -> dict[str, int]:
-    """Run one resource import inside its optional anonymous HTTP session."""
+    """Run one resource import inside its optional bounded HTTP session."""
     from process.provider_directory_generic_source_artifacts import import_resources_with_source_session
 
     return await import_resources_with_source_session(
@@ -70155,6 +70129,7 @@ async def process_provider_directory_fhir_data(
                 test_mode=test_mode,
                 limit=limit,
             )
+        catalog_source_rows = source_rows
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
@@ -70188,7 +70163,7 @@ async def process_provider_directory_fhir_data(
             requested_source_ids=requested_source_ids,
             retest_results_configured=retest_path is not None,
         ):
-            protected_source_ids = _configured_catalog_protected_source_ids(task)
+            protected_source_ids = _configured_catalog_protected_source_ids(task, catalog_source_rows)
             catalog_cleanup_result = await _delete_stale_provider_directory_source_catalog(
                 [source_record["source_id"] for source_record in source_rows],
                 protected_source_ids=protected_source_ids,
@@ -70750,7 +70725,12 @@ def _scope_source_rows(
     requested_source_ids: list[str],
 ) -> list[dict[str, Any]]:
     if not requested_source_ids:
-        return source_rows
+        # This registered endpoint is human-start only until a scheduled import is explicitly enabled.
+        return [
+            row
+            for row in source_rows
+            if _canonical_base(row.get("canonical_api_base") or row.get("api_base")) != anthem.API_BASE
+        ]
     rows_by_source_id = {source_id: row for row in source_rows if (source_id := _clean_text(row.get("source_id")))}
     missing_source_ids = [source_id for source_id in requested_source_ids if source_id not in rows_by_source_id]
     if missing_source_ids:
