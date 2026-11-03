@@ -159,6 +159,9 @@ async def project_prepared_cms_relationships(workspace, handoff):
             "graph_not_empty",
         )
         await _require_twins(workspace, relations_by_root)
+        await storage.refresh_statistics(
+            workspace.connection, workspace.policy.schema, [workspace.receipts[references._BINDING]["name"]]
+        )
         previous = await references._raised_work_mem(workspace.session)
         counts_by_family = {}
         with workspace.session.no_autoflush:
