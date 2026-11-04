@@ -285,3 +285,77 @@ def test_typed_successor_requires_one_exact_physical_source_and_preserves_old_sl
         current = (typed,)
     with pytest.raises(FHIRServingPreservationError, match="vector_incomplete"):
         fhir_vector_succession((old,), current)
+
+
+def _ordinary_replacement_configuration():
+    configured = _configuration()
+    sources = configured["initial_address_sources"]
+    sources["replacement_source_recipes"] = sources.pop("source_recipe_additions")["recipes"]
+    return configured
+
+
+def test_ordinary_replacement_wire_accepts_complete_vector_without_inventory():
+    configured = _ordinary_replacement_configuration()
+    encoded = json.dumps(configured, separators=(",", ":"))
+    parsed = parse_registry_publication_worker_config(encoded)
+    sources = parsed.initial_address_sources
+    assert sources.source_recipe_additions is None
+    assert len(sources.replacement_source_recipes) == 14
+    assert all(type(recipe) is TypedFHIRRecipeReference for recipe in sources.replacement_source_recipes)
+    assert len(encoded.encode()) < MAX_CONFIG_BYTES
+    assert "inventory" not in configured["initial_address_sources"]
+
+
+@pytest.mark.parametrize("change", ["unknown", "duplicate", "hash", "anchor", "full_origin", "kind", "too_many"])
+def test_ordinary_replacement_reference_codec_preserves_closed_bounds(change):
+    configured = _ordinary_replacement_configuration()
+    _mutate_reference_documents(configured["initial_address_sources"]["replacement_source_recipes"], change)
+    with pytest.raises(ValueError):
+        parse_registry_publication_worker_config(json.dumps(configured))
+
+
+@pytest.mark.parametrize("phase", ["initial", "noncompact", "conflicting"])
+def test_transport_references_require_compact_replacement_phase(phase):
+    configured = _ordinary_replacement_configuration()
+    sources = configured["initial_address_sources"]
+    if phase == "initial":
+        sources["initial_source_recipes"] = sources.pop("replacement_source_recipes")
+    elif phase == "noncompact":
+        sources["compact"] = False
+    else:
+        sources["source_recipe_additions"] = _configuration()["initial_address_sources"]["source_recipe_additions"]
+    with pytest.raises(ValueError):
+        parse_registry_publication_worker_config(json.dumps(configured))
+
+
+@pytest.mark.asyncio
+async def test_ordinary_replacement_hydrates_all_references_before_full_validation(monkeypatch):
+    from process.registry_composition_addresses import _resolve_source_recipe_additions
+
+    sources = parse_registry_publication_worker_config(
+        json.dumps(_ordinary_replacement_configuration())
+    ).initial_address_sources
+    current_recipes = tuple(_source_recipe(index) for index in range(1, 15))
+    hydrate = AsyncMock(side_effect=current_recipes)
+    monkeypatch.setattr(TypedFHIRRecipeReference, "resolve", hydrate)
+    connection = object()
+    resolved = await _resolve_source_recipe_additions(connection, sources, None, 1, "registry")
+    assert resolved.source_recipe_additions is None
+    assert len(resolved.replacement_source_recipes) == 14
+    assert all(recipe in resolved.replacement_source_recipes for recipe in current_recipes)
+    assert hydrate.await_count == 14
+    assert all(call.args == (connection, sources.source_witness_runtime) for call in hydrate.await_args_list)
+    hydrate.side_effect = [current_recipes[0]] * 14
+    with pytest.raises(ValueError):
+        await _resolve_source_recipe_additions(connection, sources, None, 1, "registry")
+
+
+@pytest.mark.asyncio
+async def test_ordinary_replacement_cannot_hydrate_without_installed_runtime():
+    from process.registry_composition_addresses import _resolve_source_recipe_additions
+
+    sources = parse_registry_publication_worker_config(
+        json.dumps(_ordinary_replacement_configuration())
+    ).initial_address_sources
+    with pytest.raises(ValueError, match="runtime_unavailable"):
+        await _resolve_source_recipe_additions(object(), sources, None, 1, "registry")
