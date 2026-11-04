@@ -833,10 +833,50 @@ async def _typed_addition_inputs(context, first, monkeypatch, replacement):
     )
     if replacement:
         source_inputs = _typed_replacement_inputs(source_inputs, first_typed, reference)
+        if replacement == "ordinary":
+            source_inputs = replace(
+                source_inputs,
+                replacement_source_recipes=source_inputs.source_recipe_additions.recipes,
+                source_recipe_additions=None,
+            )
     return source_inputs, typed_recipe
 
 
-@pytest.mark.parametrize("replacement", [False, True], ids=["append", "replace_typed_vector"])
+async def _assert_ordinary_reference_refusals(context, first, source_inputs):
+    from dataclasses import replace
+
+    from process.registry_composition_addresses import _resolve_source_recipe_additions
+    from process.registry_fhir_serving_preservation import fhir_vector_succession
+    from process.registry_source_recipe_store import resolve_retained_registry_source_recipes
+    from tests import test_network_fhir_source_witness_publication_postgres as publication
+
+    schema = context.worker.fixture.control_schema
+    async with (
+        publication._login(context.worker, "execution") as connection,
+        connection.transaction(isolation="repeatable_read", readonly=True),
+    ):
+        references = source_inputs.replacement_source_recipes
+        forged = replace(
+            source_inputs,
+            replacement_source_recipes=(replace(references[0], capture_sha256="0" * 64), *references[1:]),
+        )
+        with pytest.raises(ValueError):
+            await _resolve_source_recipe_additions(connection, forged, first, first.generation_id, schema)
+        hydrated = await _resolve_source_recipe_additions(connection, source_inputs, first, first.generation_id, schema)
+        previous = await resolve_retained_registry_source_recipes(connection, first, control_schema=schema)
+        omitted_recipes = tuple(
+            recipe
+            for recipe in hydrated.replacement_source_recipes
+            if recipe.binding_coordinates.source_id != context.recipe.binding_coordinates.source_id
+        )
+        assert omitted_recipes and len(omitted_recipes) < len(hydrated.replacement_source_recipes)
+        with pytest.raises(ValueError, match="vector_incomplete"):
+            fhir_vector_succession(previous, omitted_recipes)
+
+
+@pytest.mark.parametrize(
+    "replacement", [False, True, "ordinary"], ids=["append", "replace_typed_vector", "ordinary_replacement"]
+)
 async def test_typed_source_addition_to_legacy_generation_keeps_readers_and_rollback(monkeypatch, replacement):
     """Keep pinned reads and exact rollback valid across typed append or replacement."""
 
@@ -847,6 +887,8 @@ async def test_typed_source_addition_to_legacy_generation_keeps_readers_and_roll
         context.replay_actors = []
         first = await publication._publish_once(context)
         source_inputs, typed_recipe = await _typed_addition_inputs(context, first, monkeypatch, replacement)
+        if replacement == "ordinary":
+            await _assert_ordinary_reference_refusals(context, first, source_inputs)
         schema = context.worker.fixture.control_schema
         async with (
             publication._login(context.worker, "api") as reader,
@@ -969,3 +1011,12 @@ async def test_typed_bounded_multiset_parity_hot_duplicate_bucket(monkeypatch):
                 assert not await has_multiset_difference(case.writer, actual, effective)
             finally:
                 await transaction.rollback()
+
+
+async def test_unsealed_inline_fhir_upgrade_keeps_pinned_readers(monkeypatch):
+    """Upgrade a genuine legacy FHIR generation through the ordinary typed path."""
+    from tests.network_typed_inline_legacy_support import (
+        test_unsealed_inline_retained_source_to_typed_reference_preserves_readers as verify_upgrade,
+    )
+
+    await verify_upgrade(monkeypatch)

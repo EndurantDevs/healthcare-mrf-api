@@ -18,6 +18,7 @@ from process.network_custom_address_source import (
     verify_custom_address_source,
 )
 from process.network_em_provider_inputs import EMProviderInputs
+from process.network_fhir_typed_recipe import TypedFHIRRecipeReference
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_initial_source_composition import (
     OfficeSummaryRequest,
@@ -57,6 +58,27 @@ def _retained_address_artifact(source, runtime_roles):
             json.dumps(asdict(source), sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     return RegistryRetainedAddressArtifact(replace(source, generation_id=generation), runtime_roles, generation, source)
+
+
+def _validated_replacement_recipes(recipes, compact):
+    """Allow bounded transport references only until native capture hydration."""
+    references = tuple(recipe for recipe in recipes if type(recipe) is TypedFHIRRecipeReference)
+    ordinary_recipes = tuple(recipe for recipe in recipes if type(recipe) is not TypedFHIRRecipeReference)
+    if references:
+        if (
+            not compact
+            or len(recipes) > 100
+            or len({reference.capture_id for reference in references}) != len(references)
+        ):
+            raise RegistryCompositionError("registry_composition_replacement_sources_invalid")
+        for reference in references:
+            reference.__post_init__()
+    validated = (
+        validate_initial_source_recipes(ordinary_recipes, inventory=True)
+        if compact
+        else validate_initial_source_recipes(ordinary_recipes)
+    )
+    return validated + tuple(sorted(references, key=lambda reference: reference.capture_id))
 
 
 @dataclass(frozen=True)
@@ -110,7 +132,9 @@ class RegistryCompositionAddressSources:
             if getattr(self, name):
                 recipes = getattr(self, name)
                 recipes = (
-                    validate_initial_source_recipes(recipes, inventory=True)
+                    _validated_replacement_recipes(recipes, self.compact)
+                    if name == "replacement_source_recipes"
+                    else validate_initial_source_recipes(recipes, inventory=True)
                     if self.compact
                     else validate_initial_source_recipes(recipes)
                 )
@@ -357,6 +381,16 @@ def _require_source_recipe_phase(address_sources, source_manifest, expected_head
 
 
 async def _resolve_source_recipe_additions(connection, address_sources, source_manifest, expected_head, control_schema):
+    if any(type(recipe) is TypedFHIRRecipeReference for recipe in address_sources.replacement_source_recipes):
+        recipes = tuple(
+            [
+                await recipe.resolve(connection, address_sources.source_witness_runtime)
+                if type(recipe) is TypedFHIRRecipeReference
+                else recipe
+                for recipe in address_sources.replacement_source_recipes
+            ]
+        )
+        return replace(address_sources, replacement_source_recipes=recipes)
     if address_sources.source_recipe_additions is None:
         return address_sources
     recipes = await resolve_source_recipe_additions(

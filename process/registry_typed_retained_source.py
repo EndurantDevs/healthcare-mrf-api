@@ -16,7 +16,10 @@ from process.registry_source_contribution_artifacts import (
     _verify_artifact_owner,
 )
 from process.registry_source_inventory_store import _load_locked_source_inventory
-from process.registry_source_recipe_store import canonical_registry_source_recipes
+from process.registry_source_recipe_store import (
+    canonical_registry_source_recipes,
+    resolve_retained_registry_source_recipes,
+)
 from process.registry_typed_source_metadata import validate_typed_contribution, validate_typed_derivation
 
 _BRAND = object()
@@ -72,6 +75,11 @@ async def retained_typed_source_proofs(connection, manifest, recipes, control_sc
         connection, generation_id=manifest.generation_id, control_schema=control_schema
     )
     require(current == manifest, "retained_source_manifest")
+    previous_recipes = await resolve_retained_registry_source_recipes(
+        connection, current, control_schema=control_schema
+    )
+    if not any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in previous_recipes):
+        return {}
     candidates = await _published_artifact_candidates(connection, control_schema, {manifest.candidate_id})
     candidate = candidates[manifest.candidate_id]
     custody = await _verify_artifact_owner(connection, candidate, control_schema)
