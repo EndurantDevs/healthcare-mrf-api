@@ -81,11 +81,16 @@ def _derivation(value, recipe_sha256):
     if value is None:
         return None
     document = _document(value, MAX_V3_RECEIPT_BYTES)
-    derivation = (
-        validate_verified_office_derivation_v2(document)
-        if "derivation_version" in document
-        else validate_derivation(document)
-    )
+    if document.get("derivation_version") == 3:
+        from process.registry_typed_source_metadata import validate_typed_derivation
+
+        derivation = validate_typed_derivation(document)
+    else:
+        derivation = (
+            validate_verified_office_derivation_v2(document)
+            if "derivation_version" in document
+            else validate_derivation(document)
+        )
     if derivation["recipe_sha256"] != recipe_sha256:
         raise ValueError
     return _canonical(derivation)

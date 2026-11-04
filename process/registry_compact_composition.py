@@ -68,8 +68,14 @@ async def prepare_compact_composition_source(
 async def _verify_witness_stage(connection, address_source, roles, approved, request, stage):
     """The direct EAU matcher never claims a retained logical-office origin."""
     from process.network_initial_cms_office_bindings import verified_retained_offices
+    from process.registry_typed_source_stage import is_typed_source_stage, verify_typed_stage_offices
     from process.registry_verified_witness_offices import _policy_context
 
+    if is_typed_source_stage(stage):
+        if request.revision != 6 or not stage.inventory:
+            raise ValueError("registry_verified_office_context_changed")
+        await verify_typed_stage_offices(connection, stage, address_source, roles, approved, request.control_schema)
+        return
     if request.revision != 5 or not stage.inventory or stage.office_policy_context is None:
         raise ValueError("registry_verified_office_context_changed")
     context, _ = await _policy_context(connection, address_source, roles, approved, request.control_schema)

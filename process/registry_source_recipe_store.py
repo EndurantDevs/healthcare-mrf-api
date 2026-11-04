@@ -22,6 +22,7 @@ from process.network_fhir_membership_source import SOURCE_WITNESS_PRODUCER, Pinn
 from process.network_fhir_source_epoch import validate_retained_cms_fhir_source_epoch
 from process.network_fhir_source_witness_contract import SourceWitnessCaptureAnchor
 from process.network_fhir_source_witness_contract import validate_capture as validate_source_witness_capture
+from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.network_legacy_membership_source import PinnedACAMembershipSource, aca_source_descriptor
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
@@ -48,7 +49,12 @@ class RegistrySourceRecipeError(ValueError):
 
 @dataclass(frozen=True)
 class RegistrySourceMembershipRecipe:
-    source_pin: PinnedFHIRMembershipSource | PinnedACAMembershipSource | PinnedPTGOfficeMembershipSource
+    source_pin: (
+        PinnedFHIRMembershipSource
+        | PinnedACAMembershipSource
+        | PinnedPTGOfficeMembershipSource
+        | PinnedTypedFHIRMembershipSource
+    )
     binding_coordinates: RegistryNetworkSourceCoordinates
     selection_policy: str = SELECTION_POLICY
 
@@ -64,6 +70,11 @@ def _validate_recipe_scope(recipe):
         or recipe.selection_policy != SELECTION_POLICY
     ):
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    if type(source_pin) is PinnedTypedFHIRMembershipSource:
+        source_pin.__post_init__()
+        if asdict(coordinates) != source_pin.catalog_descriptor["coordinates"]:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        return
     if type(source_pin) is PinnedFHIRMembershipSource:
         expected_scope = ("fhir", source_pin.source_id, source_pin.schema_name, source_pin.dataset_id)
         if source_pin.source_witness_capture is not None and (
@@ -201,7 +212,13 @@ def _decode_recipe(document):
         "selection_policy",
     }:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-    if document["source_kind"] == "fhir":
+    if document["source_kind"] == "fhir_typed":
+        from process.network_fhir_typed_capture import TypedGraphAnchor
+
+        values = dict(_closed_document(document["source_pin"], PinnedTypedFHIRMembershipSource))
+        values["anchor"] = TypedGraphAnchor(**_closed_document(values["anchor"], TypedGraphAnchor))
+        source_pin = PinnedTypedFHIRMembershipSource(**values)
+    elif document["source_kind"] == "fhir":
         source_pin = _decode_fhir_pin(document["source_pin"])
     elif document["source_kind"] == "aca":
         source_pin = _decode_aca_pin(document["source_pin"])
@@ -285,7 +302,9 @@ def _recipe_document(recipe):
     if type(recipe) is not RegistrySourceMembershipRecipe:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
     _validate_recipe_scope(recipe)
-    if type(recipe.source_pin) is PinnedFHIRMembershipSource:
+    if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource:
+        source_kind, source_by_field = "fhir_typed", asdict(recipe.source_pin)
+    elif type(recipe.source_pin) is PinnedFHIRMembershipSource:
         source_kind, source_by_field = "fhir", recipe.source_pin.coordinates
     elif type(recipe.source_pin) is PinnedPTGOfficeMembershipSource:
         source_kind, source_by_field = "ptg", asdict(recipe.source_pin)

@@ -13,6 +13,7 @@ from process.network_fhir_membership_source import (
     fhir_physical_source,
     fhir_source_witness_binding_v2,
 )
+from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.registry_source_contribution_store import (
     FACT_ANCHOR_FIELDS,
     _canonical,
@@ -31,6 +32,7 @@ from process.registry_source_inventory_contract import (
 from process.registry_source_inventory_reference import SourceInventoryReference
 from process.registry_source_office_summary_v3 import validate_derivation
 from process.registry_source_recipe_store import decode_registry_source_recipes
+from process.registry_typed_source_metadata import validate_typed_derivation
 from process.registry_verified_office_derivation import validate_verified_office_derivation_v2
 
 _FACT_FIELDS = ("capture_sha256", "transform_version", "fact_sha256", "fact_rows")
@@ -69,12 +71,32 @@ def _recipe_base(recipes):
 
 def _descriptor(document):
     descriptor = validate_source_contribution_descriptor(document)
-    if not FACT_ANCHOR_FIELDS <= descriptor.keys():
+    if descriptor.get("descriptor_version") != 4 and not FACT_ANCHOR_FIELDS <= descriptor.keys():
         raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
     return descriptor
 
 
 def _check_fhir_descriptor(recipe, descriptor):
+    if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource:
+        if (
+            descriptor.get("descriptor_version") != 4
+            or descriptor["capture_sha256"] != recipe.source_pin.generation_id
+            or descriptor["catalog_generation"] != recipe.source_pin.catalog_generation
+            or any(
+                descriptor["counters"][field] != recipe.source_pin.capture["graph"]["counts"][original]
+                for field, original in (
+                    ("source_rows", "source_rows"),
+                    ("projected_rows", "projected_rows"),
+                    ("strict_pair_rows", "pair_rows"),
+                    ("reference_rows", "reference_rows"),
+                    ("provider_only_roles", "provider_only_roles"),
+                )
+            )
+        ):
+            raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
+        return
+    if descriptor.get("descriptor_version") == 4:
+        raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
     if descriptor["transform_version"] in {FHIR_SOURCE_WITNESS_TRANSFORM_V2, FHIR_PLAN_TIER_WITNESS_TRANSFORM}:
         identity, capture = verified_office_fact_identity(recipe)
         if descriptor["recipe_sha256"] != identity or descriptor["capture_sha256"] != capture:
@@ -90,6 +112,20 @@ def _check_fhir_descriptor(recipe, descriptor):
 
 
 def _check_derivation(recipe, descriptor, derivation):
+    if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource:
+        if (
+            derivation.get("derivation_version") != 3
+            or descriptor is None
+            or descriptor.get("descriptor_version") != 4
+            or derivation["capture_sha256"] != recipe.source_pin.generation_id
+            or derivation["contribution_sha256"] != hashlib.sha256(_canonical(descriptor).encode()).hexdigest()
+            or derivation["mapping_sha256"] != descriptor["mapping_sha256"]
+            or any(derivation[name] != descriptor["counters"][name] for name in ("matched_offices", "missing_offices"))
+        ):
+            raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
+        return
+    if derivation.get("derivation_version") == 3:
+        raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
     is_fhir = type(recipe.source_pin) is PinnedFHIRMembershipSource
     is_witness = descriptor is not None and descriptor["transform_version"] in {
         FHIR_SOURCE_WITNESS_TRANSFORM_V2,
@@ -147,7 +183,7 @@ class SourceInventoryPreparation:
         self._fhir_identities = {
             identity
             for identity, recipe in self._recipes_by_sha.items()
-            if type(recipe.source_pin) is PinnedFHIRMembershipSource
+            if type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource)
         }
         self._contributions, self._derivations = set(), set()
         self._encoded_bytes = self._recipe_root.encoded_bytes
@@ -212,7 +248,9 @@ class SourceInventoryPreparation:
             recipe, current = self._recipes_by_sha[identity], self._entries_by_sha[identity]
             descriptor = json.loads(current.contribution_json) if current.contribution_json is not None else None
             derivation = (
-                validate_verified_office_derivation_v2(document)
+                validate_typed_derivation(document)
+                if document.get("derivation_version") == 3
+                else validate_verified_office_derivation_v2(document)
                 if "derivation_version" in document
                 else validate_derivation(document)
             )

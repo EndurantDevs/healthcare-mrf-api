@@ -43,7 +43,7 @@ async def verify_compact_final_proof(
         office_authority,
         **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),
     )
-    await verify_compact_slice_contents(connection, copy_target, layout)
+    await verify_compact_slice_contents(connection, copy_target, layout, candidate=candidate)
     namespace = _identifier(copy_target.schema_name)
     from process.network_compact_custom_preparation import compact_carrier_receipt
 

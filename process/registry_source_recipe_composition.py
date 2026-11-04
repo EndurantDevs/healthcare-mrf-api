@@ -31,6 +31,7 @@ from process.network_fhir_source_custody import (
     require_retained_cms_fhir_source_custody,
 )
 from process.network_fhir_source_epoch import FHIRSourceEpochError, require_retained_cms_fhir_source_epoch
+from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.network_legacy_membership_source import (
     LegacyMembershipBatchBoundsError,
     PinnedACAMembershipSource,
@@ -221,6 +222,86 @@ async def require_source_witness_read(
     return await pin_source_fhir_witness_read(connection, capture)
 
 
+async def _typed_source_read_scope(connection, recipe, approved, control_schema, runtime, retained_approval):
+    """Authenticate configured actors and current or retained approved scope before any typed read."""
+    from process.network_approved_source_bindings import (
+        require_approved_network_source_bindings,
+        require_retained_approved_network_source_bindings,
+    )
+    from process.network_fhir_source_witness_contract import source_origin
+
+    if type(runtime) is not SourceWitnessRuntime or type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource:
+        raise RegistrySourceCompositionError("registry_source_typed_runtime_unavailable")
+    runtime.__post_init__()
+    pin = recipe.source_pin
+    pin.__post_init__()
+    capture = pin.capture
+    if (capture["owner_role"], tuple(capture["runtime_roles"])) != (runtime.capture_owner_role, runtime.runtime_roles):
+        raise RegistrySourceCompositionError("registry_source_typed_runtime_census_differs")
+    origin = source_origin(capture["graph"]["origin"])
+    from directory_membership_runtime import FHIRSourceMembershipCompletionInput, FHIRSourceMembershipInput
+
+    from process.network_fhir_source_witness_capture import _original_source_factory
+    from process.network_fhir_source_witness_contract import SourceWitnessCompletionOrigin
+
+    origin_type = (
+        FHIRSourceMembershipCompletionInput
+        if type(origin) is SourceWitnessCompletionOrigin
+        else FHIRSourceMembershipInput
+    )
+    _original_source_factory(runtime.source_export, origin_type(**asdict(origin)))
+    profiles = [profile for profile in runtime.source_profiles if profile.schema_name == origin.schema_name]
+    if len(profiles) != 1 or type(retained_approval) is not bool:
+        raise RegistrySourceCompositionError("registry_source_typed_profile_unavailable")
+    require_bindings = (
+        require_retained_approved_network_source_bindings
+        if retained_approval
+        else require_approved_network_source_bindings
+    )
+    await require_bindings(connection, approved, recipe.binding_coordinates, control_schema=control_schema)
+    return pin, profiles[0], origin
+
+
+async def load_typed_source_read(connection, recipe, approved, control_schema, runtime, *, retained_approval=False):
+    """E consumes only a natively closed typed capture; this never marks raw Source as checked."""
+    from process.network_fhir_typed_capture import load_typed_graph_capture
+
+    pin, _profile, _origin = await _typed_source_read_scope(
+        connection, recipe, approved, control_schema, runtime, retained_approval
+    )
+    return await load_typed_graph_capture(connection, pin.capture, expected_anchor=pin.anchor)
+
+
+async def require_typed_source_read(
+    connection, recipe, approved, control_schema, runtime, *, retained_approval=False, replay_stage=None
+):
+    """K independently reopens original Source; a sealed producer capture alone cannot satisfy this gate."""
+    from process.network_fhir_source_witness_contract import SourceWitnessCompletionOrigin
+    from process.network_fhir_typed_capture import verify_typed_graph_capture
+
+    pin, profile, origin = await _typed_source_read_scope(
+        connection, recipe, approved, control_schema, runtime, retained_approval
+    )
+    try:
+        from directory_membership_runtime import FHIRSourceMembershipCompletionInput, FHIRSourceMembershipInput
+    except ImportError:
+        raise RegistrySourceCompositionError("registry_source_typed_factory_unavailable") from None
+    origin_type = (
+        FHIRSourceMembershipCompletionInput
+        if type(origin) is SourceWitnessCompletionOrigin
+        else FHIRSourceMembershipInput
+    )
+    return await verify_typed_graph_capture(
+        runtime.source_export,
+        connection,
+        pin.capture,
+        source_profile=profile,
+        reviewed_origin=origin_type(**asdict(origin)),
+        expected_anchor=pin.anchor,
+        replay_stage=replay_stage,
+    )
+
+
 async def _read_recipe_page(
     connection, recipe, approved, cursor, control_schema, limit, office_source=None, *, capture_facts=False
 ):
@@ -367,6 +448,8 @@ async def require_registry_source_recipe_custody(
 ):
     """Recheck CMS retained custody once before paging its complete recipe."""
     source_pin = recipe.source_pin
+    if type(source_pin) is PinnedTypedFHIRMembershipSource:
+        return await require_typed_source_read(connection, recipe, approved, control_schema, source_witness_runtime)
     if type(source_pin) is PinnedPTGOfficeMembershipSource:
         return await require_ptg_office_recipe(connection, recipe, approved, control_schema, office_authority)
     if type(source_pin) is PinnedACAMembershipSource:
@@ -573,10 +656,47 @@ def _source_stage_table_names(stage_id, recipes):
 
 
 async def stage_registry_source_recipes(
+    connection, recipes, approved, *, request_id, control_schema, read_context=None, **contribution_options
+):
+    """Stage producer inputs; typed captures retain their sealed-read capability, never raw-verifier authority."""
+    from process.registry_typed_source_stage import stage_typed_source_recipes
+
+    return await _stage_registry_source_recipes(
+        connection,
+        recipes,
+        approved,
+        request_id=request_id,
+        control_schema=control_schema,
+        read_context=read_context,
+        typed_stage_reader=stage_typed_source_recipes,
+        **contribution_options,
+    )
+
+
+async def stage_verified_registry_source_recipes(
+    connection, recipes, approved, *, request_id, control_schema, read_context=None, **contribution_options
+):
+    """Independent custody always selects a fresh original-Source verifier for typed recipes."""
+    from process.registry_typed_source_stage import stage_verified_typed_source_recipes
+
+    return await _stage_registry_source_recipes(
+        connection,
+        recipes,
+        approved,
+        request_id=request_id,
+        control_schema=control_schema,
+        read_context=read_context,
+        typed_stage_reader=stage_verified_typed_source_recipes,
+        **contribution_options,
+    )
+
+
+async def _stage_registry_source_recipes(
     connection,
     recipes,
     approved,
     *,
+    typed_stage_reader,
     request_id,
     control_schema,
     read_context=None,
@@ -590,6 +710,49 @@ async def stage_registry_source_recipes(
     """
     contribution_revision, inventory = _source_stage_options(contribution_options)
     read_context = SourceRecipeReadContext() if read_context is None else read_context
+    if any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes):
+        from process.registry_typed_source_stage import combine_typed_source_stages
+
+        if not inventory or read_context.verified_office_inputs is None:
+            raise RegistrySourceCompositionError("registry_source_typed_inventory_scope_invalid")
+        typed_recipes = tuple(
+            recipe for recipe in recipes if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource
+        )
+        legacy_recipes = tuple(
+            recipe for recipe in recipes if type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource
+        )
+        async with connection.transaction():
+            typed_stage = await typed_stage_reader(
+                connection,
+                typed_recipes,
+                approved,
+                request_id=request_id,
+                control_schema=control_schema,
+                read_context=read_context,
+            )
+            if not legacy_recipes:
+                return typed_stage
+            legacy_options = {**contribution_options, "contribution_revision": 2}
+            legacy_stage = await stage_registry_source_recipes(
+                connection,
+                legacy_recipes,
+                approved,
+                request_id=request_id,
+                control_schema=control_schema,
+                read_context=read_context,
+                **legacy_options,
+            )
+            return await combine_typed_source_stages(
+                connection,
+                typed_stage,
+                legacy_stage,
+                request_id=request_id,
+                recipes=recipes,
+                approved=approved,
+                control_schema=control_schema,
+            )
+    if contribution_revision == 4:
+        raise RegistrySourceCompositionError("registry_source_typed_inventory_scope_invalid")
     if any(getattr(recipe.source_pin, "source_witness_capture", None) is not None for recipe in recipes) and not (
         inventory and read_context.verified_office_inputs is not None
     ):
@@ -638,7 +801,7 @@ def _source_stage_options(options):
     if set(options) - {"contribution_revision", "inventory"}:
         raise RegistrySourceCompositionError("registry_source_composition_scope_invalid")
     revision, inventory = options.get("contribution_revision", 2), options.get("inventory", False)
-    if type(inventory) is not bool or inventory and (type(revision) is not int or revision != 2):
+    if type(inventory) is not bool or inventory and (type(revision) is not int or revision not in (2, 4)):
         raise RegistrySourceCompositionError("registry_source_composition_scope_invalid")
     return revision, inventory
 

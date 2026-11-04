@@ -112,8 +112,13 @@ def _stage_relation(stage, receipt):
     return f'pg_temp."{stage.table_name}"'
 
 
-def registry_source_stage_projection(stage_relation):
+def registry_source_stage_projection(stage_relation, *, stage=None):
     """Return the closed five-column projection of a caller-validated native page stage."""
+    if stage is not None:
+        from process.registry_typed_source_stage import is_typed_source_stage, typed_stage_projection
+
+        if is_typed_source_stage(stage):
+            return typed_stage_projection(stage)
     return f"""SELECT member.* FROM {stage_relation} page CROSS JOIN LATERAL
       jsonb_to_record(page.input_json::jsonb) AS member(network_id integer,provider_system text,
         provider_id text,location_id uuid,evidence_id text)"""
@@ -149,7 +154,16 @@ async def retain_registry_source_memberships(connection, copy_target, stage, *, 
             if counts["stage_rows"] != receipt["source_rows"]:
                 raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
             if counts["source_rows"] == 0:
-                await connection.execute(f"INSERT INTO {source_relation} {_stage_projection(stage_relation)}")
+                from process.registry_typed_membership_parity import create_order_index, typed_candidate
+
+                if typed_candidate(candidate):
+                    await create_order_index(connection, source_relation, "typed_source_membership_order_idx")
+                    from process.registry_typed_office_parity import create_source_pair_index
+
+                    await create_source_pair_index(connection, source_relation)
+                await connection.execute(
+                    f"INSERT INTO {source_relation} {_stage_projection(stage_relation, stage=stage)}"
+                )
             await verify_registry_source_retention_rows(connection, copy_target, candidate, source_stage=stage)
         except asyncpg.PostgresError as error:
             raise RegistrySourceRetentionError("registry_source_retention_source_invalid") from error
@@ -178,11 +192,20 @@ async def verify_registry_source_retention_rows(connection, copy_target, candida
         if await connection.fetchval(f"SELECT count(*) FROM {source_relation}") != receipt["source_rows"]:
             raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
         if source_stage is not None:
-            projection = _stage_projection(_stage_relation(source_stage, receipt))
-            differs = await connection.fetchval(f"""WITH staged AS MATERIALIZED ({projection}), differences AS (
-              (SELECT * FROM {source_relation} EXCEPT ALL SELECT * FROM staged)
-              UNION ALL (SELECT * FROM staged EXCEPT ALL SELECT * FROM {source_relation}))
-              SELECT EXISTS(SELECT 1 FROM differences)""")
+            projection = _stage_projection(_stage_relation(source_stage, receipt), stage=source_stage)
+            from process.registry_typed_membership_parity import multiset_differs, typed_candidate
+
+            if typed_candidate(candidate):
+                from process.registry_typed_membership_parity import require_order_index
+
+                await require_order_index(connection, source_relation)
+                await require_order_index(connection, _stage_relation(source_stage, receipt))
+                differs = await multiset_differs(connection, "SELECT * FROM " + source_relation, projection)
+            else:
+                differs = await connection.fetchval(f"""WITH staged AS MATERIALIZED ({projection}), differences AS (
+                  (SELECT * FROM {source_relation} EXCEPT ALL SELECT * FROM staged)
+                  UNION ALL (SELECT * FROM staged EXCEPT ALL SELECT * FROM {source_relation}))
+                  SELECT EXISTS(SELECT 1 FROM differences)""")
             if differs:
                 raise RegistrySourceRetentionError("registry_source_retention_parity_invalid")
     except asyncpg.PostgresError as error:
