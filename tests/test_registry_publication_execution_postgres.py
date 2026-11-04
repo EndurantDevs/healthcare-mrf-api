@@ -1535,14 +1535,15 @@ async def test_revocation_during_company_fence_preserves_approval(pipeline_db, s
     await _assert_revoked_execution_unchanged(fixture, lease, before, history_count)
 
 
-async def _preview_diff_tables(fixture):
+async def _preview_diff_tables(fixture, *, include_indexes=True):
     schemas = ["preview_diff_" + uuid4().hex for _ in range(2)]
     for schema in schemas:
         await fixture.connection.execute(f'CREATE SCHEMA "{schema}"')
         fixture.additional_schemas.append(schema)
         await fixture.connection.execute(
             f'CREATE TABLE "{schema}".network_membership '
-            f'(LIKE "{fixture.copy_target.schema_name}".network_membership INCLUDING ALL)'
+            f'(LIKE "{fixture.copy_target.schema_name}".network_membership '
+            + ("INCLUDING ALL)" if include_indexes else "INCLUDING CONSTRAINTS)")
         )
     return schemas
 
@@ -1635,6 +1636,203 @@ async def test_preview_samples_are_bounded(publication_db, long_identity):
         )
         == receipt
     )
+
+
+@pytest.mark.parametrize("sides", ["both", "current", "proposed", "neither"])
+async def test_preview_diff_pages_preserve_complete_units(publication_db, sides):
+    """Page tails, duplicate counts and a split evidence set cannot change unit-level results."""
+    from process.registry_typed_membership_parity import create_order_index
+
+    fixture = publication_db
+    current, proposed = await _preview_diff_tables(fixture)
+    for schema in (current, proposed):
+        await create_order_index(fixture.connection, f'"{schema}".network_membership', "rollback_order_idx")
+    office = UUID(int=1)
+    unit = lambda number: (1, "manual", f"provider-{number:05d}", office)
+    common_rows = [(*unit(number), "shared") for number in range(10010)]
+    current_rows = [*common_rows, *((*unit(0), f"evidence-{number:05d}") for number in range(6000))]
+    changed_units = {0, 4999, 5000, 10009}
+    proposed_rows = [(*unit(number), "changed" if number in changed_units else "shared") for number in range(10010)]
+    proposed_rows.extend((*unit(0), f"evidence-{number:05d}") for number in range(6000))
+    proposed_rows.extend([(*unit(5001), "shared")] * 6000)
+    if sides in {"both", "current"}:
+        await _copy_preview_rows(fixture.connection, current, current_rows)
+    if sides in {"both", "proposed"}:
+        await _copy_preview_rows(fixture.connection, proposed, proposed_rows)
+        await _copy_preview_rows(fixture.connection, proposed, [(2, "manual", "尾", office, "a" * 64)])
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        receipt = await execution._source_rollback_difference(
+            fixture.connection, {"schema_name": proposed}, SimpleNamespace(schema_name=current)
+        )
+    expected = {
+        "both": (1, 0, 4),
+        "current": (0, 10010, 0),
+        "proposed": (10011, 0, 0),
+        "neither": (0, 0, 0),
+    }[sides]
+    assert tuple(receipt[category] for category in ("additions", "removals", "changes")) == expected
+    assert receipt["has_imported"] is (sides in {"both", "proposed"})
+    samples_by_category = {category: [] for category in ("additions", "removals", "changes")}
+    if sides == "both":
+        samples_by_category["additions"] = [[2, "manual", "尾", str(office)]]
+        samples_by_category["changes"] = [[*unit(number)[:3], str(office)] for number in sorted(changed_units)]
+    elif sides in {"current", "proposed"}:
+        category = "removals" if sides == "current" else "additions"
+        samples_by_category[category] = [[*unit(number)[:3], str(office)] for number in range(20)]
+    assert receipt["samples"] == samples_by_category
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "index_collation", "column_collation", "nondeterministic", "pattern_ops"]
+)
+async def test_preview_projection_order_rejects_incompatible_indexes_before_paging(publication_db, damage):
+    fixture = publication_db
+    current, proposed = await _preview_diff_tables(fixture, include_indexes=False)
+    if damage == "nondeterministic":
+        await fixture.connection.execute(
+            f"CREATE COLLATION \"{current}\".preview_locale (provider=icu,locale='und-u-ks-level2',deterministic=false)"
+        )
+    for schema in (current, proposed):
+        relation = f'"{schema}".network_membership'
+        if damage == "nondeterministic":
+            await fixture.connection.execute(
+                f'ALTER TABLE {relation} ALTER COLUMN provider_id TYPE text COLLATE "{current}".preview_locale'
+            )
+        elif damage == "column_collation" and schema == proposed:
+            await fixture.connection.execute(f'ALTER TABLE {relation} ALTER COLUMN provider_id TYPE text COLLATE "C"')
+        if damage == "missing" and schema == proposed:
+            continue
+        order = "provider_system,provider_id,location_id,network_id"
+        if schema == proposed and damage == "index_collation":
+            order = 'provider_system,provider_id COLLATE "C",location_id,network_id'
+        elif schema == proposed and damage == "pattern_ops":
+            order = "provider_system text_pattern_ops,provider_id,location_id,network_id"
+        await fixture.connection.execute(f"CREATE INDEX preview_projection_idx ON {relation}({order})")
+    logged_queries = []
+    fixture.connection.add_query_logger(logged_queries.append)
+    try:
+        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+            with pytest.raises(ValueError, match="^registry_source_rollback_order_index_required$"):
+                await execution._source_rollback_difference(
+                    fixture.connection, {"schema_name": proposed}, SimpleNamespace(schema_name=current)
+                )
+        await asyncio.sleep(0)
+    finally:
+        fixture.connection.remove_query_logger(logged_queries.append)
+    assert not any("LIMIT 5000" in entry.query for entry in logged_queries)
+
+
+def _projection_preview_rows(sides):
+    count = 5005 if sides == "both" else 9
+    prefixes = ("A", "a", "é", "e\u0301", "尾")
+    units = [
+        (count - number, "manual", prefixes[number % len(prefixes)] + f"-{number:05d}", UUID(int=number % 3 + 1))
+        for number in range(count)
+    ]
+    current_rows = [
+        (*unit, "old" if number % 4 == 2 else "shared") for number, unit in enumerate(units) if number % 4 != 1
+    ]
+    proposed_rows = [
+        (*unit, "a" * 64 if number == 1 else "new" if number % 4 == 2 else "shared")
+        for number, unit in enumerate(units)
+        if number % 4 != 0
+    ]
+    if sides == "both":
+        current_rows.extend([(*units[2], "old"), (*units[3], "shared")] * 6000)
+        proposed_rows.extend([(*units[2], "old"), (*units[3], "shared")] * 6000)
+        proposed_rows.append((*units[3], "shared"))
+    return current_rows if sides in {"both", "current"} else [], proposed_rows if sides in {"both", "proposed"} else []
+
+
+def _expected_preview_difference(current_rows, proposed_rows):
+    evidence_maps = []
+    for rows in (current_rows, proposed_rows):
+        evidence_by_unit = {}
+        for *unit, evidence in rows:
+            evidence_by_unit.setdefault(tuple(unit), set()).add(evidence)
+        evidence_maps.append(evidence_by_unit)
+    current_by_unit, proposed_by_unit = evidence_maps
+    units_by_category = {category: [] for category in ("additions", "removals", "changes")}
+    for unit in current_by_unit.keys() | proposed_by_unit.keys():
+        if unit not in current_by_unit:
+            units_by_category["additions"].append(unit)
+        elif unit not in proposed_by_unit:
+            units_by_category["removals"].append(unit)
+        elif current_by_unit[unit] != proposed_by_unit[unit]:
+            units_by_category["changes"].append(unit)
+    return {
+        **{category: len(units) for category, units in units_by_category.items()},
+        "samples": {
+            category: [
+                [*unit[:3], str(unit[3])]
+                for unit in sorted(units, key=lambda unit: (unit[0], unit[1].encode(), unit[2].encode(), unit[3].int))[
+                    :20
+                ]
+            ]
+            for category, units in units_by_category.items()
+        },
+        "has_imported": any(row[-1] == "a" * 64 for row in proposed_rows),
+    }
+
+
+@pytest.mark.parametrize(
+    ("index_mode", "sides"),
+    [
+        ("projection", "both"),
+        ("mixed", "both"),
+        ("projection", "current"),
+        ("mixed", "proposed"),
+        ("projection", "neither"),
+    ],
+)
+async def test_preview_projection_pages_preserve_canonical_counts_and_samples(publication_db, index_mode, sides):
+    from process.registry_typed_membership_parity import create_order_index
+
+    fixture = publication_db
+    current, proposed = await _preview_diff_tables(fixture, include_indexes=False)
+    await fixture.connection.execute(f"CREATE COLLATION \"{current}\".preview_locale (provider=icu,locale='en-US')")
+    for schema in (current, proposed):
+        relation = f'"{schema}".network_membership'
+        await fixture.connection.execute(
+            f'ALTER TABLE {relation} ALTER COLUMN provider_id TYPE text COLLATE "{current}".preview_locale'
+        )
+        await fixture.connection.execute(
+            f"CREATE INDEX preview_projection_idx ON {relation}(provider_system,provider_id,location_id,network_id)"
+        )
+        await create_order_index(fixture.connection, relation, "preview_order_idx")
+    current_rows, proposed_rows = _projection_preview_rows(sides)
+    await _copy_preview_rows(fixture.connection, current, current_rows)
+    await _copy_preview_rows(fixture.connection, proposed, proposed_rows)
+    expected_by_field = _expected_preview_difference(current_rows, proposed_rows)
+    results_by_order, logged_queries = {}, []
+    fixture.connection.add_query_logger(logged_queries.append)
+    try:
+        for projection_order in (False, True):
+            if projection_order:
+                for schema in (current, proposed) if index_mode == "projection" else (current,):
+                    await fixture.connection.execute(f'DROP INDEX "{schema}".preview_order_idx')
+            assert (
+                await execution._uses_source_rollback_projection_order(
+                    fixture.connection, f'"{proposed}".network_membership', f'"{current}".network_membership'
+                )
+                is projection_order
+            )
+            logged_queries.clear()
+            async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+                receipt = await execution._source_rollback_difference(
+                    fixture.connection, {"schema_name": proposed}, SimpleNamespace(schema_name=current)
+                )
+            await asyncio.sleep(0)
+            assert receipt == expected_by_field
+            results_by_order[projection_order] = execution._json(receipt)
+            page_queries = [entry for entry in logged_queries if "WITH keys AS MATERIALIZED" in entry.query]
+            order = execution._ROLLBACK_PROJECTION_ORDER if projection_order else execution._ROLLBACK_ORDER
+            assert all(f"ORDER BY {order} LIMIT 5000" in entry.query for entry in page_queries)
+            if sides == "both":
+                assert any(len(entry.args) == 8 and isinstance(entry.args[3], UUID) for entry in page_queries)
+    finally:
+        fixture.connection.remove_query_logger(logged_queries.append)
+    assert results_by_order[False] == results_by_order[True]
 
 
 def _invalid_preview_samples(result_by_name):

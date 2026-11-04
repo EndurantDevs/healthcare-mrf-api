@@ -180,6 +180,14 @@ async def verify_registry_composition_rows(connection, copy_target, candidate, c
                 f"SELECT (SELECT count(*) FROM {_relation(command_stage.add_table)}) AS add_rows,(SELECT count(*) FROM {_relation(command_stage.remove_table)}) AS remove_rows,(SELECT count(*) FROM {namespace}.{SOURCE_TABLE}) AS source_rows,(SELECT count(*) FROM ({expected}) rows) AS effective_rows"
             )
         )
+        if any(counts_by_kind[name] != receipt[name] for name in counts_by_kind):
+            raise RegistrySourceRetentionError("registry_composition_effective_parity_invalid")
+        if counts_by_kind["remove_rows"] == 0:
+            expected = "SELECT * FROM " + namespace + "." + SOURCE_TABLE
+            if counts_by_kind["add_rows"] != 0:
+                expected += " UNION ALL SELECT * FROM " + _relation(command_stage.add_table)
+        elif counts_by_kind["add_rows"] == 0:
+            expected = _allowed_source(namespace + "." + SOURCE_TABLE, command_stage)
         counts_by_kind["differs"] = await has_multiset_difference(
             connection, "SELECT * FROM " + namespace + ".network_membership", expected
         )
@@ -214,9 +222,14 @@ async def materialize_registry_composition(connection, copy_target, command_stag
 
     if is_typed_candidate(candidate):
         await create_order_index(connection, table, "typed_effective_membership_order_idx")
-    source = '"' + copy_target.schema_name + '".' + SOURCE_TABLE
+        await connection.execute(f"CREATE INDEX IF NOT EXISTS network_membership_network_idx ON {table}(network_id)")
+        await connection.execute(
+            f"CREATE INDEX IF NOT EXISTS network_membership_projection_idx ON {table}"
+            "(provider_system,provider_id,location_id,network_id)"
+        )
+    source_relation = '"' + copy_target.schema_name + '".' + SOURCE_TABLE
     status = await connection.execute(
-        f"INSERT INTO {table} {_allowed_source(source, command_stage)}"
+        f"INSERT INTO {table} {_allowed_source(source_relation, command_stage)}"
         " UNION ALL SELECT * FROM " + _relation(command_stage.add_table)
     )
     if status != f"INSERT 0 {receipt['effective_rows']}":

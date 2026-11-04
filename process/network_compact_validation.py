@@ -3,7 +3,12 @@
 
 from uuid import UUID
 
-from process.network_address_projection import PinnedAddressSource, _identifier, _membership_accounting
+from process.network_address_projection import (
+    PinnedAddressSource,
+    _has_binding_location_index,
+    _identifier,
+    _membership_accounting,
+)
 from process.network_compact_dependencies import capture_compact_dependencies, compact_slice_ref_digest
 from process.network_compact_offices import CompactOfficeSources, pin_compact_office_sources
 from process.network_compact_readiness import _require, compact_index_digest, compact_readiness
@@ -23,6 +28,48 @@ def _actual_memberships(layout):
         " UNION ALL ".join(arms)
         if arms
         else "SELECT NULL::integer AS network_id,NULL::text AS location_key WHERE FALSE"
+    )
+
+
+async def _membership_sets_differ(connection, namespace, layout):
+    """Probe both complete sets without sorting duplicate source evidence."""
+    if not await _has_binding_location_index(connection, namespace + ".provider_location_binding"):
+        return await connection.fetchval(
+            f"""WITH expected AS (
+            SELECT DISTINCT m.network_id,b.location_key FROM {namespace}.network_membership m
+            JOIN {namespace}.provider_location_binding b USING(provider_system,provider_id,location_id)
+        ), actual AS ({_actual_memberships(layout)})
+        SELECT EXISTS((SELECT * FROM expected EXCEPT SELECT * FROM actual)
+            UNION ALL (SELECT * FROM actual EXCEPT SELECT * FROM expected))""",
+            *(UUID(artifact.candidate_id) for artifact in layout.artifacts),
+        )
+    refs = _identifier(layout.ref_map.schema_name) + ".network_slice_ref"
+    matched_queries, extra_queries = [], []
+    for position, artifact in enumerate(layout.artifacts, 1):
+        edges = _identifier(artifact.schema_name) + ".network_office_edge"
+        matched_queries.append(f"""SELECT 1 FROM {refs} r CROSS JOIN LATERAL (
+          SELECT 1 FROM {edges} e WHERE e.slice_id=r.slice_id AND e.location_key=b.location_key OFFSET 0
+        ) edge WHERE r.network_id=m.network_id
+          AND r.office_bucket=(get_byte(sha256(convert_to(b.location_key,'UTF8')),0)&63)
+          AND r.artifact_candidate_id=${position}::uuid OFFSET 0""")
+        extra_queries.append(f"""SELECT 1 FROM {refs} r CROSS JOIN LATERAL (
+          SELECT e.location_key FROM {edges} e WHERE e.slice_id=r.slice_id OFFSET 0
+        ) edge WHERE r.artifact_candidate_id=${position}::uuid
+          AND NOT EXISTS(SELECT 1 FROM {namespace}.provider_location_binding b
+            WHERE b.location_key=edge.location_key AND EXISTS(
+              SELECT 1 FROM {namespace}.network_membership m
+              WHERE (m.provider_system,m.provider_id,m.location_id)=
+                    (b.provider_system,b.provider_id,b.location_id)
+                AND m.network_id=r.network_id OFFSET 0) OFFSET 0)""")
+    matches_query = " UNION ALL ".join("(" + query + ")" for query in matched_queries) or "SELECT 1 WHERE FALSE"
+    extras_query = " UNION ALL ".join("(" + query + ")" for query in extra_queries) or "SELECT 1 WHERE FALSE"
+    return await connection.fetchval(
+        f"""SELECT EXISTS(SELECT 1 FROM {namespace}.network_membership m CROSS JOIN LATERAL (
+          SELECT b.location_key FROM {namespace}.provider_location_binding b
+          WHERE (b.provider_system,b.provider_id,b.location_id)=(m.provider_system,m.provider_id,m.location_id)
+          OFFSET 0
+        ) b WHERE NOT EXISTS({matches_query})) OR EXISTS({extras_query})""",
+        *(UUID(artifact.candidate_id) for artifact in layout.artifacts),
     )
 
 
@@ -73,16 +120,7 @@ async def verify_compact_final_proof(
             artifact_ids,
         )
     )
-    mismatch = await connection.fetchval(
-        f"""WITH expected AS (
-        SELECT DISTINCT m.network_id,b.location_key FROM {namespace}.network_membership m
-        JOIN {namespace}.provider_location_binding b USING(provider_system,provider_id,location_id)
-    ), actual AS ({_actual_memberships(layout)})
-    SELECT EXISTS((SELECT * FROM expected EXCEPT SELECT * FROM actual)
-        UNION ALL (SELECT * FROM actual EXCEPT SELECT * FROM expected))""",
-        *(UUID(artifact.candidate_id) for artifact in layout.artifacts),
-    )
-    _require(mismatch is False)
+    _require(await _membership_sets_differ(connection, namespace, layout) is False)
 
 
 async def _verify_custom_contribution(

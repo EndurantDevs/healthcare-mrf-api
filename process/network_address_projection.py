@@ -68,26 +68,94 @@ async def _lock_candidate(connection, copy_target, address_source, control_schem
     return candidate
 
 
-async def _membership_accounting(connection, membership_table, binding_table, address_table):
-    accounting = await connection.fetchrow(f"""
-        WITH binding_matches AS MATERIALIZED (
-            SELECT b.*, a.location_key AS matched_location_key
-            FROM {binding_table} b LEFT JOIN {address_table} a
-              ON a.location_key=b.location_key AND a.entity_type=b.entity_type AND a.entity_id=b.entity_id
-        ), membership_matches AS (
-            SELECT m.network_id, b.matched_location_key
-            FROM {membership_table} m LEFT JOIN binding_matches b
-              ON b.provider_system=m.provider_system AND b.provider_id=m.provider_id AND b.location_id=m.location_id
-        )
-        SELECT count(*) AS membership_rows,
-            count(*) FILTER (WHERE matched_location_key IS NULL OR network_id IS NULL OR network_id <= 0)
-                AS invalid_memberships,
-            count(DISTINCT (matched_location_key,network_id)) FILTER (WHERE matched_location_key IS NOT NULL)
-                AS distinct_memberships,
-            count(DISTINCT matched_location_key) AS projected_locations,
-            (SELECT count(*) FROM binding_matches WHERE matched_location_key IS NULL) AS orphan_bindings
-        FROM membership_matches
+async def _has_binding_location_index(connection, binding_table):
+    return await connection.fetchval(
+        """SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid
+        JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam
+        WHERE i.indrelid=to_regclass($1) AND i.indisvalid AND i.indisready AND i.indislive
+          AND i.indpred IS NULL AND i.indexprs IS NULL AND am.amname IN ('btree','hash')
+          AND a.attname='location_key' AND a.attnum=i.indkey[0])""",
+        binding_table,
+    )
+
+
+async def _indexed_membership_accounting(connection, membership_table, binding_table, address_table):
+    # A physical office/network belongs to its first matching alias, across all evidence rows.
+    return await connection.fetchrow(f"""
+        SELECT raw.*,
+          (SELECT count(*) FROM {binding_table} b CROSS JOIN LATERAL (
+            SELECT DISTINCT ON (m.network_id) m.network_id FROM {membership_table} m
+            WHERE (m.provider_system,m.provider_id,m.location_id)=(b.provider_system,b.provider_id,b.location_id)
+            ORDER BY m.network_id
+          ) networks
+          WHERE EXISTS(SELECT 1 FROM {address_table} a
+            WHERE (a.location_key,a.entity_type,a.entity_id)=(b.location_key,b.entity_type,b.entity_id) OFFSET 0)
+          AND NOT EXISTS(SELECT 1 FROM {binding_table} earlier WHERE earlier.location_key=b.location_key
+            AND (earlier.provider_system,earlier.provider_id,earlier.location_id)
+                <(b.provider_system,b.provider_id,b.location_id)
+            AND EXISTS(SELECT 1 FROM {address_table} a
+              WHERE (a.location_key,a.entity_type,a.entity_id)=
+                    (earlier.location_key,earlier.entity_type,earlier.entity_id) OFFSET 0)
+            AND EXISTS(SELECT 1 FROM {membership_table} m
+              WHERE (m.provider_system,m.provider_id,m.location_id)=
+                    (earlier.provider_system,earlier.provider_id,earlier.location_id)
+                AND m.network_id IS NOT DISTINCT FROM networks.network_id OFFSET 0)
+            OFFSET 0)) AS distinct_memberships,
+          (SELECT count(*) FROM {binding_table} b
+          WHERE EXISTS(SELECT 1 FROM {address_table} a
+            WHERE (a.location_key,a.entity_type,a.entity_id)=(b.location_key,b.entity_type,b.entity_id) OFFSET 0)
+          AND EXISTS(SELECT 1 FROM {membership_table} m
+            WHERE (m.provider_system,m.provider_id,m.location_id)=(b.provider_system,b.provider_id,b.location_id)
+            OFFSET 0)
+          AND NOT EXISTS(SELECT 1 FROM {binding_table} earlier WHERE earlier.location_key=b.location_key
+            AND (earlier.provider_system,earlier.provider_id,earlier.location_id)
+                <(b.provider_system,b.provider_id,b.location_id)
+            AND EXISTS(SELECT 1 FROM {address_table} a
+              WHERE (a.location_key,a.entity_type,a.entity_id)=
+                    (earlier.location_key,earlier.entity_type,earlier.entity_id) OFFSET 0)
+            AND EXISTS(SELECT 1 FROM {membership_table} m
+              WHERE (m.provider_system,m.provider_id,m.location_id)=
+                    (earlier.provider_system,earlier.provider_id,earlier.location_id) OFFSET 0)
+            OFFSET 0)) AS projected_locations,
+          (SELECT count(*) FROM {binding_table} b WHERE NOT EXISTS(SELECT 1 FROM {address_table} a
+            WHERE (a.location_key,a.entity_type,a.entity_id)=(b.location_key,b.entity_type,b.entity_id) OFFSET 0))
+            AS orphan_bindings
+        FROM (SELECT count(*) AS membership_rows,
+          count(*) FILTER (WHERE matched_location_key IS NULL OR m.network_id IS NULL OR m.network_id<=0)
+            AS invalid_memberships
+          FROM {membership_table} m LEFT JOIN LATERAL (
+            SELECT a.location_key AS matched_location_key FROM {binding_table} b LEFT JOIN {address_table} a
+              ON (a.location_key,a.entity_type,a.entity_id)=(b.location_key,b.entity_type,b.entity_id)
+            WHERE (b.provider_system,b.provider_id,b.location_id)=(m.provider_system,m.provider_id,m.location_id)
+            OFFSET 0
+          ) matched ON true) raw
     """)
+
+
+async def _membership_accounting(connection, membership_table, binding_table, address_table):
+    indexed = await _has_binding_location_index(connection, binding_table)
+    if indexed:
+        accounting = await _indexed_membership_accounting(connection, membership_table, binding_table, address_table)
+    else:
+        accounting = await connection.fetchrow(f"""
+            WITH binding_matches AS MATERIALIZED (
+                SELECT b.*, a.location_key AS matched_location_key
+                FROM {binding_table} b LEFT JOIN {address_table} a
+                  ON a.location_key=b.location_key AND a.entity_type=b.entity_type AND a.entity_id=b.entity_id
+            ), membership_matches AS (
+                SELECT m.network_id, b.matched_location_key
+                FROM {membership_table} m LEFT JOIN binding_matches b
+                  ON b.provider_system=m.provider_system AND b.provider_id=m.provider_id AND b.location_id=m.location_id
+            )
+            SELECT count(*) AS membership_rows,
+                count(*) FILTER (WHERE matched_location_key IS NULL OR network_id IS NULL OR network_id <= 0)
+                    AS invalid_memberships,
+                count(DISTINCT (matched_location_key,network_id)) FILTER (WHERE matched_location_key IS NOT NULL)
+                    AS distinct_memberships,
+                count(DISTINCT matched_location_key) AS projected_locations,
+                (SELECT count(*) FROM binding_matches WHERE matched_location_key IS NULL) AS orphan_bindings
+            FROM membership_matches
+        """)
     if accounting["invalid_memberships"]:
         raise NetworkAddressProjectionError("Selected memberships lack an exact provider/site/address binding")
     return accounting
