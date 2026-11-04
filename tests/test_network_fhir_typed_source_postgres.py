@@ -874,6 +874,161 @@ async def test_typed_source_ordinary_compact_publication(monkeypatch, source_pro
                 assert await publication.consume_registry_publication_once(**arguments) is None
 
 
+async def _assert_sealed_resume_failure(context, address_sources, head):
+    from uuid import UUID, uuid5
+
+    from process import registry_publication_consumer as consumer
+    from tests import test_network_fhir_source_witness_publication_postgres as publication
+
+    connection = context.worker.fixture.connection
+    namespace = '"' + context.worker.fixture.control_schema + '"'
+    request_sql = (
+        f"SELECT request_sha256,command_json,actor_key,session_token_sha256,idempotency_key "
+        f"FROM {namespace}.registry_publication_request WHERE request_id=$1"
+    )
+    async with publication._consumer(context.worker) as (arguments, _calls):
+        arguments["initial_address_sources"] = address_sources
+        queued = await publication._enqueue_ordinary(context.worker, head)
+        request = UUID(queued["request_id"])
+        arguments["config"] = replace(arguments["config"], only_request_id=request)
+        request_by_field = dict(await connection.fetchrow(request_sql, request))
+        approval_count = await connection.fetchval(f"SELECT count(*) FROM {namespace}.registry_approval_history")
+        with pytest.raises(RuntimeError, match="^registry_publication_consumer_unavailable$"):
+            await consumer.consume_registry_publication_once(**arguments)
+        candidate_by_field = dict(
+            await connection.fetchrow(
+                f"SELECT * FROM {namespace}.network_membership_candidate WHERE dataset_id=$1", uuid5(request, "dataset")
+            )
+        )
+        report = json.loads(candidate_by_field["validation_json"])
+        assert candidate_by_field["state"] == "sealed" and candidate_by_field["expected_rows"] > 0
+        assert "writer_closure" in report and "address_source" not in report and "serving_readiness" not in report
+        assert (await publication._status(context.worker, queued))["state"] == "running"
+        assert await publication._head(context.worker) == head
+        revision_by_field = dict(
+            await connection.fetchrow(
+                f"SELECT draft_revision,approved_revision FROM {namespace}.registry_revision_control WHERE id=1"
+            )
+        )
+        assert (
+            await connection.fetchval(f"SELECT count(*) FROM {namespace}.registry_approval_history")
+            == approval_count + 1
+        )
+    return {
+        "queued": queued,
+        "candidate": candidate_by_field,
+        "request": request_by_field,
+        "revision": revision_by_field,
+        "approval_count": approval_count + 1,
+    }
+
+
+async def _assert_sealed_resume_publication(context, address_sources, failed_by_field):
+    """Wait for the real lease, then verify unchanged approval and candidate custody."""
+    from uuid import UUID
+
+    from process import registry_publication_consumer as consumer
+    from tests import test_network_fhir_source_witness_publication_postgres as publication
+
+    connection = context.worker.fixture.connection
+    namespace = '"' + context.worker.fixture.control_schema + '"'
+    queued = failed_by_field["queued"]
+    request = UUID(queued["request_id"])
+    expiry_sql = (
+        f"SELECT lease_expires_at>clock_timestamp() FROM {namespace}.registry_publication_request WHERE request_id=$1"
+    )
+    deadline = asyncio.get_running_loop().time() + 45
+    while await connection.fetchval(expiry_sql, request):
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(1)
+    async with publication._consumer(context.worker) as (arguments, _calls):
+        arguments["initial_address_sources"] = address_sources
+        arguments["config"] = replace(arguments["config"], only_request_id=request)
+        completed = await publication._consume_expected_success(context, arguments, queued)
+        assert completed["request_id"] == queued["request_id"] and completed["state"] == "completed"
+        revision_record = await connection.fetchrow(
+            f"SELECT draft_revision,approved_revision FROM {namespace}.registry_revision_control WHERE id=1"
+        )
+        assert dict(revision_record) == failed_by_field["revision"]
+        assert (
+            await connection.fetchval(f"SELECT count(*) FROM {namespace}.registry_approval_history")
+            == failed_by_field["approval_count"]
+        )
+        request_record = await connection.fetchrow(
+            f"SELECT request_sha256,command_json,actor_key,session_token_sha256,idempotency_key "
+            f"FROM {namespace}.registry_publication_request WHERE request_id=$1",
+            request,
+        )
+        assert dict(request_record) == failed_by_field["request"]
+        candidate_by_field = failed_by_field["candidate"]
+        published_by_field = dict(
+            await connection.fetchrow(
+                f"SELECT * FROM {namespace}.network_membership_candidate WHERE dataset_id=$1",
+                candidate_by_field["dataset_id"],
+            )
+        )
+        identity_fields = ("candidate_id", "dataset_id", "schema_id", "producer_id", "schema_name")
+        for field in identity_fields + ("expected_rows", "source_generations", "source_recipes_json"):
+            assert published_by_field[field] == candidate_by_field[field]
+        assert published_by_field["state"] == "published"
+        assert await publication._head(context.worker) == completed["result"]["serving_generation"]
+        assert completed["result"]["serving_generation"] > candidate_by_field["expected_head"]
+        assert context.ready_targets[-1] == context.sealed_targets[-1]
+        assert context.sealed_targets[-1].candidate_id == str(candidate_by_field["candidate_id"])
+        assert await consumer.consume_registry_publication_once(**arguments) is None
+
+
+async def test_sealed_typed_candidate_resumes_after_transient_readiness_failure(monkeypatch):
+    """Fresh workers resume the same sealed candidate before its validation report exists."""
+    from process import registry_candidate_composition as composition
+    from process import registry_publication_consumer as consumer
+    from process import registry_typed_office_parity as parity
+    from tests import test_network_fhir_source_witness_publication_postgres as publication
+
+    monkeypatch.setattr(publication, "_source_capture_for_workers", _typed_worker_capture)
+    monkeypatch.setattr(consumer, "_LEASE_SECONDS", 30)
+    monkeypatch.setattr(consumer, "_HEARTBEAT_SECONDS", 10)
+    checked_actors = _observe_typed_verification(monkeypatch)
+    async with publication._publication_case(monkeypatch) as context:
+        initial_sources = publication._initial_sources(context)
+        previous = await publication._publish_once(context, sources=replace(initial_sources, initial_source_recipes=()))
+        address_sources = replace(
+            initial_sources, initial_source_recipes=(), replacement_source_recipes=(context.recipe,)
+        )
+        connection = context.worker.fixture.connection
+        original_domain = parity.has_binding_domain_difference
+        original_approve = consumer.approve_queued_registry_publication
+        approvals = []
+        backends = []
+
+        async def approve(*args, **kwargs):
+            result = await original_approve(*args, **kwargs)
+            approvals.append(result)
+            return result
+
+        async def fail_readiness(active, receipt, carrier):
+            backends.append(await active.fetchval("SELECT pg_backend_pid()"))
+            raise RuntimeError("synthetic_readiness_unavailable")
+
+        monkeypatch.setattr(consumer, "approve_queued_registry_publication", approve)
+        monkeypatch.setattr(parity, "has_binding_domain_difference", fail_readiness)
+        failed_by_field = await _assert_sealed_resume_failure(context, address_sources, previous.generation_id)
+        assert checked_actors == []
+        assert len(backends) == 1
+        assert await connection.fetchval("SELECT count(*) FROM pg_stat_activity WHERE pid=$1", backends[0]) == 0
+        monkeypatch.setattr(parity, "has_binding_domain_difference", original_domain)
+
+        async def refuse_recopy(*args, **kwargs):
+            raise AssertionError("A sealed candidate must not copy raw memberships again")
+
+        monkeypatch.setattr(composition, "_copy_composition", refuse_recopy)
+        await _assert_sealed_resume_publication(context, address_sources, failed_by_field)
+        assert approvals[0]["replayed"] is False and approvals[1]["replayed"] is True
+        assert approvals[0]["approved_revision"] == approvals[1]["approved_revision"]
+        assert checked_actors == [await context.operator.connection.fetchval("SELECT session_user")]
+        assert context.worker.roles_by_kind["execution"] not in checked_actors
+
+
 def _typed_replacement_inputs(source_inputs, first_typed, reference):
     from dataclasses import replace
 

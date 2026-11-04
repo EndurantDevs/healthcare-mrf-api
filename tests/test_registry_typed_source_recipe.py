@@ -339,7 +339,7 @@ def test_typed_office_summary_binds_the_registered_approval_and_address():
         verify_initial_source_office_receipt(candidate_by_field)
 
 
-def _registered_typed_resume():
+def _registered_typed_resume(state="open"):
     from process.network_address_projection import PinnedAddressSource
     from process.registry_candidate_composition import _target
     from process.registry_initial_source_composition import SUMMARY_KEY as OFFICE_KEY
@@ -373,7 +373,7 @@ def _registered_typed_resume():
             for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
         },
         "bounded": True,
-        "state": "open",
+        "state": state,
         "expected_head": 0,
         "source_recipes_json": reference.as_dict(),
         "source_generations": generations_by_kind,
@@ -383,27 +383,27 @@ def _registered_typed_resume():
             OFFICE_KEY: office,
         },
     }
+    if state != "open":
+        candidate_by_field["validation_json"]["writer_closure"] = {
+            "loader_roles": ["writer"],
+            "reader_roles": ["reader"],
+        }
+    if state not in {"open", "sealed"}:
+        candidate_by_field["validation_json"]["address_source"] = dict(derivation["address_source"])
     return request, copy_target, candidate_by_field, PinnedAddressSource(**derivation["address_source"])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["open", "sealed", "validated", "ready", "published"])
 async def test_registered_typed_resume_preserves_revision_and_office_pin(state):
-    """Open registration rederives offices; closed registration retains its custody inputs."""
-    from dataclasses import asdict
-
+    """Unvalidated registration rederives offices; validated registration retains custody inputs."""
     from process import registry_composition_resume as resume
     from tests.test_registry_composition_resume import _connection
 
-    request, copy_target, candidate, address_source = _registered_typed_resume()
-    candidate["state"] = state
+    request, copy_target, candidate, address_source = _registered_typed_resume(state)
     fresh_inputs = (address_source, ("current_reader", "current_writer"))
     expected = fresh_inputs
-    if state != "open":
-        candidate["validation_json"].update(
-            address_source=asdict(address_source),
-            writer_closure={"loader_roles": ["writer"], "reader_roles": ["reader"]},
-        )
+    if state not in {"open", "sealed"}:
         expected = (address_source, ("reader", "writer"))
     connection = _connection([candidate])
     assert await resume.resolve_registered_contribution_resume(
@@ -420,12 +420,13 @@ async def test_registered_typed_resume_preserves_revision_and_office_pin(state):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["open", "sealed"])
 @pytest.mark.parametrize("damage", ["absent", "shape", "roles", "schema_name", "table_name", "generation_id"])
-async def test_open_typed_resume_requires_current_inputs_matching_the_frozen_address(damage):
+async def test_unvalidated_typed_resume_requires_current_inputs_matching_the_frozen_address(state, damage):
     from process import registry_composition_resume as resume
     from tests.test_registry_composition_resume import _connection
 
-    request, _target, candidate, address_source = _registered_typed_resume()
+    request, _target, candidate, address_source = _registered_typed_resume(state)
     inputs = (address_source, ("reader", "writer"))
     if damage == "absent":
         inputs = None
@@ -442,14 +443,15 @@ async def test_open_typed_resume_requires_current_inputs_matching_the_frozen_add
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["open", "sealed"])
 @pytest.mark.parametrize(
     "field", ["dataset_id", "schema_id", "producer_id", "approved_custom_revision", "expected_head"]
 )
-async def test_open_typed_resume_refuses_changed_request_identity(field):
+async def test_unvalidated_typed_resume_refuses_changed_request_identity(state, field):
     from process import registry_composition_resume as resume
     from tests.test_registry_composition_resume import _connection
 
-    request, _target, candidate, address_source = _registered_typed_resume()
+    request, _target, candidate, address_source = _registered_typed_resume(state)
     candidate[field] = 2 if field in ("approved_custom_revision", "expected_head") else str(UUID(int=9))
     with pytest.raises(resume.RegistryCompositionResumeError, match="scope_changed"):
         await resume.resolve_registered_verified_office_inputs(
@@ -458,14 +460,15 @@ async def test_open_typed_resume_refuses_changed_request_identity(field):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["open", "sealed"])
 @pytest.mark.parametrize("damage", ["address_identity", "address_source", "inventory", "contribution", "generation"])
-async def test_open_typed_resume_refuses_changed_registered_commitments(damage):
+async def test_unvalidated_typed_resume_refuses_changed_registered_commitments(state, damage):
     from process import registry_composition_resume as resume
     from process.registry_initial_source_composition import SUMMARY_KEY as OFFICE_KEY
     from process.registry_source_contribution_store import SUMMARY_KEY as CONTRIBUTION_KEY
     from tests.test_registry_composition_resume import _connection
 
-    request, _target, candidate, address_source = _registered_typed_resume()
+    request, _target, candidate, address_source = _registered_typed_resume(state)
     match damage:
         case "address_identity":
             candidate["validation_json"][OFFICE_KEY]["context"]["address_identity"]["table_oid"] += 1
@@ -484,20 +487,14 @@ async def test_open_typed_resume_refuses_changed_registered_commitments(damage):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["sealed", "validated", "ready", "published"])
+@pytest.mark.parametrize("state", ["validated", "ready", "published"])
 @pytest.mark.parametrize("damage", ["address_source", "writer_closure", "address_changed"])
-async def test_closed_typed_resume_requires_retained_custody(state, damage):
-    from dataclasses import asdict
-
+async def test_validated_typed_resume_requires_retained_custody(state, damage):
     from process import registry_composition_resume as resume
     from tests.test_registry_composition_resume import _connection
 
-    request, _target, candidate, address_source = _registered_typed_resume()
-    candidate["state"] = state
+    request, _target, candidate, address_source = _registered_typed_resume(state)
     report = candidate["validation_json"]
-    report.update(
-        address_source=asdict(address_source), writer_closure={"loader_roles": ["writer"], "reader_roles": ["reader"]}
-    )
     if damage == "address_changed":
         report["address_source"]["generation_id"] = "a" * 64
     else:
