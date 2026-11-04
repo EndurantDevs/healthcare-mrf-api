@@ -9,7 +9,7 @@ from process.network_compact_readiness import _require
 from process.network_membership_slices import _DIGEST_DOMAIN, OFFICE_BUCKET_COUNT
 
 
-async def verify_compact_slice_contents(connection, copy_target, layout):
+async def verify_compact_slice_contents(connection, copy_target, layout, *, candidate=None):
     """Check new content hashes and exact reference-map reuse after dependency custody."""
     namespace = _identifier(copy_target.schema_name)
     current = UUID(copy_target.candidate_id)
@@ -34,6 +34,14 @@ async def verify_compact_slice_contents(connection, copy_target, layout):
             current,
         )
     )
+    if candidate is not None:
+        from process.registry_typed_membership_parity import typed_candidate
+
+        if typed_candidate(candidate):
+            from process.network_typed_slice_native import verify_digests
+
+            await verify_digests(connection, copy_target)
+            return
     previous, digest, count, expected = None, None, 0, None
     query = f"""SELECT ref.network_id,ref.office_bucket,ref.slice_id,ref.row_count,ref.content_sha256,edge.location_key
         FROM {namespace}.network_slice_ref ref LEFT JOIN {namespace}.network_office_edge edge USING(slice_id)

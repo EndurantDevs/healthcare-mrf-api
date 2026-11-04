@@ -34,7 +34,7 @@ class RegisteredContributionResume:
         if (
             type(self.target) is not MembershipCopyTarget
             or type(self.contribution_revision) is not int
-            or (self.contribution_revision not in (1, 2))
+            or (self.contribution_revision not in (1, 2, 4))
         ):
             raise RegistryCompositionResumeError("registry_composition_resume_invalid")
 
@@ -139,7 +139,8 @@ async def resolve_registered_contribution_resume(
             if await select_legacy_verified_office_inputs(connection, candidate, control_schema=control_schema) is None:
                 raise RegistryCompositionResumeError("registry_composition_resume_unversioned")
             return RegisteredContributionResume(copy_target, 1)
-        return RegisteredContributionResume(copy_target, 2 if receipt["revision"] in (3, 4) else receipt["revision"])
+        revision = 4 if receipt["revision"] == 6 else 2 if receipt["revision"] in (3, 4) else receipt["revision"]
+        return RegisteredContributionResume(copy_target, revision)
     except RegistryCompositionResumeError:
         raise
     except asyncpg.PostgresError, ValueError, TypeError, KeyError, UnicodeError, RecursionError:
@@ -223,8 +224,20 @@ async def resolve_registered_verified_office_inputs(
         candidate = registered[1]
         summary = verify_initial_source_office_receipt(candidate)
         contribution = verify_registry_source_contributions(candidate)
+        if summary is not None and summary["revision"] == 6:
+            from dataclasses import asdict
+
+            address_source, runtime_roles = _office_inputs(candidate)
+            if (
+                verify_source_recipe_metadata(candidate).inventory is None
+                or contribution is None
+                or contribution["revision"] != 6
+                or asdict(address_source) != summary["context"]["address_source"]
+            ):
+                raise RegistryCompositionResumeError("registry_composition_resume_verified_offices_differ")
+            return address_source, runtime_roles
         if summary is None or summary["revision"] != 5:
-            if contribution is not None and contribution["revision"] == 4:
+            if contribution is not None and contribution["revision"] in (4, 6):
                 raise RegistryCompositionResumeError("registry_composition_resume_verified_offices_differ")
             return None
         address_source, runtime_roles = _office_inputs(candidate)

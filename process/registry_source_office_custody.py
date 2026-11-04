@@ -342,6 +342,26 @@ async def verify_verified_witness_bindings(connection, copy_target, candidate, a
 
     preservation = stage.preservation
     stage = _selected_stage(stage)
+    from process.registry_typed_source_stage import is_typed_source_stage, verify_typed_stage_offices
+
+    if is_typed_source_stage(stage):
+        await _require_transaction(connection)
+        await _native_candidate(connection, copy_target, candidate, control_schema)
+        expected = verify_initial_source_office_receipt(candidate)
+        address_source, roles = _office_inputs(candidate)
+        if expected is None or expected["revision"] != 6:
+            raise RegistryInitialSourceError("registry_source_office_summary_differs")
+        await verify_typed_stage_offices(connection, stage, address_source, roles, approved, control_schema)
+        from process.registry_typed_source_stage import verify_independent_typed_source_stage
+
+        await verify_independent_typed_source_stage(connection, stage)
+        from process.registry_typed_office_parity import typed_binding_parity
+
+        relation = "pg_temp." + _identifier(stage.office_matches.table_name)
+        await typed_binding_parity(
+            connection, copy_target, relation, candidate, control_schema, preservation=preservation
+        )
+        return
     await _require_transaction(connection)
     await _native_candidate(connection, copy_target, candidate, control_schema)
     expected = verify_initial_source_office_receipt(candidate)

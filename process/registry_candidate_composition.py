@@ -568,7 +568,10 @@ def _bind_composition_stage(generations, stage, introduced, changed, inventory):
 
 
 async def _contribution_revision(connection, recipes, approved, request_id, expected_head, control_schema):
-    if not any(type(recipe.source_pin) is PinnedFHIRMembershipSource for recipe in recipes):
+    from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+
+    typed = any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes)
+    if not typed and not any(type(recipe.source_pin) is PinnedFHIRMembershipSource for recipe in recipes):
         return 2
     registered = await resolve_registered_contribution_resume(
         connection,
@@ -577,7 +580,7 @@ async def _contribution_revision(connection, recipes, approved, request_id, expe
         expected_head,
         control_schema=control_schema,
     )
-    return 2 if registered is None else registered.contribution_revision
+    return (4 if typed else 2) if registered is None else registered.contribution_revision
 
 
 async def _record_source_receipts(
@@ -607,7 +610,7 @@ async def _record_source_receipts(
             source_stage,
             control_schema=control_schema,
         )
-    if initial_summary is not None and initial_summary["revision"] == 5:
+    if initial_summary is not None and initial_summary["revision"] in (5, 6):
         await _record_witness_offices(
             connection, copy_target, recipes, approved, artifact, source_stage, control_schema
         )
@@ -1188,6 +1191,13 @@ async def _compose_fenced_candidate(
 async def _drop_composition_stages(connection, prepared, original_error):
     source_stage, command_stage = prepared[3:5]
     cleanup_error = None
+    from process.registry_typed_source_stage import drop_typed_source_stage, is_typed_source_stage
+
+    if is_typed_source_stage(source_stage):
+        try:
+            await drop_typed_source_stage(connection, source_stage)
+        except BaseException as error:
+            cleanup_error = error
     for name in (
         source_stage.table_name,
         source_stage.contribution_table_name,
@@ -1218,6 +1228,10 @@ async def _complete_composition(connection, prepared, source_manifest, control_s
         if _prepared_state not in {"open", "sealed", "validated", "ready", "published"}:
             raise RegistryCompositionError("registry_composition_candidate_unavailable")
         async with connection.transaction(isolation="repeatable_read"):
+            from process.registry_typed_source_stage import is_typed_source_stage, rebind_typed_producer_stage
+
+            if is_typed_source_stage(source_stage):
+                await rebind_typed_producer_stage(connection, source_stage)
             candidate = await _locked_candidate(connection, copy_target, _namespace(control_schema))
             if candidate["state"] not in {
                 "open",
@@ -1445,6 +1459,8 @@ async def _prepare_selected_source_stage(
     inputs, request_scope, control_schema, selection, initial_recipes, inventory, artifact_inputs, generations_by_source
 ):
     """Stage the chosen recipe set and bind preservation after validating introduced offices."""
+    from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+
     request_id, expected_head = request_scope
     retained, recipes, has_selection_changed = selection
     connection, approved, office_authority = inputs.connection, inputs.approved, inputs.office_context
@@ -1485,7 +1501,11 @@ async def _prepare_selected_source_stage(
             source_manifest=source_manifest,
             retained_fhir_reads=inputs.retained_fhir_reads,
             verified_office_inputs=verified_inputs
-            if _retained_fhir_only(recipes) and (inventory or approved.total_rows == 0)
+            if (
+                _retained_fhir_only(recipes)
+                or any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes)
+            )
+            and (inventory or approved.total_rows == 0)
             else None,
             source_witness_runtime=inputs.source_witness_runtime,
         ),

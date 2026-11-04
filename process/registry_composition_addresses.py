@@ -27,7 +27,11 @@ from process.registry_initial_source_composition import (
 )
 from process.registry_source_inventory_preparation import SourceInventoryPreparation
 from process.registry_source_observation_store import _namespace
-from process.registry_source_recipe_additions import RegistrySourceRecipeAdditions, resolve_source_recipe_additions
+from process.registry_source_recipe_additions import (
+    RegistrySourceRecipeAdditions,
+    RegistryTypedSourceRecipeReplacement,
+    resolve_source_recipe_additions,
+)
 from process.registry_source_recipe_composition import SourceRecipeReadContext
 
 
@@ -67,7 +71,7 @@ class RegistryCompositionAddressSources:
     compact: bool = False
     prepared_address_artifact: CustomAddressSourceReceipt | None = None
     source_witness_runtime: object = field(default=None, repr=False, compare=False)
-    source_recipe_additions: RegistrySourceRecipeAdditions | None = None
+    source_recipe_additions: RegistrySourceRecipeAdditions | RegistryTypedSourceRecipeReplacement | None = None
 
     def __post_init__(self):
         if self.source_witness_runtime is not None:
@@ -95,7 +99,8 @@ class RegistryCompositionAddressSources:
         if self.initial_source_recipes and self.replacement_source_recipes:
             raise RegistryCompositionError("registry_composition_initial_sources_invalid")
         if self.source_recipe_additions is not None and (
-            type(self.source_recipe_additions) is not RegistrySourceRecipeAdditions
+            type(self.source_recipe_additions)
+            not in (RegistrySourceRecipeAdditions, RegistryTypedSourceRecipeReplacement)
             or not self.compact
             or self.initial_source_recipes
             or self.replacement_source_recipes
@@ -306,6 +311,12 @@ def _inventory_office_summary(root, entries, approved, artifact, stage):
     derivations = sorted(
         (json.loads(entry.office_derivation_json) for entry in entries), key=lambda row: row["recipe_sha256"]
     )
+    from process.registry_typed_source_stage import is_typed_source_stage
+
+    if is_typed_source_stage(stage):
+        from process.registry_typed_source_metadata import typed_office_summary
+
+        return typed_office_summary(root, derivations)
     if getattr(stage, "office_policy_context", None) is not None:
         return office_summary_v5(root, stage.office_policy_context, derivations)
     return office_summary_v4(root, approved, artifact.address_source, derivations, artifact.origin_manifest_sha256)
@@ -354,6 +365,11 @@ async def _resolve_source_recipe_additions(connection, address_sources, source_m
         source_manifest,
         expected_head,
         control_schema=control_schema,
+        **(
+            {"source_witness_runtime": address_sources.source_witness_runtime}
+            if address_sources.source_witness_runtime is not None
+            else {}
+        ),
     )
     return replace(address_sources, source_recipe_additions=None, replacement_source_recipes=recipes)
 
@@ -661,7 +677,9 @@ def _prepare_source_inventory(recipes, source_stage, office_revision):
     preparation = None
     is_witness_stage = getattr(source_stage, "office_policy_context", None) is not None
     if source_stage.inventory:
-        selected_revision = 5 if is_witness_stage else 4
+        from process.registry_typed_source_stage import is_typed_source_stage
+
+        selected_revision = 6 if is_typed_source_stage(source_stage) else 5 if is_witness_stage else 4
         if office_revision not in (None, selected_revision if recipes else 1):
             raise RegistryCompositionError("registry_composition_initial_sources_changed")
         preparation = SourceInventoryPreparation(recipes)

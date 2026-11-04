@@ -175,6 +175,15 @@ async def create_provider_only_projection(connection, copy_target, *, control_sc
 
 async def prepare_provider_only_projection(connection, copy_target, recipes, stage, approved, *, control_schema=None):
     """Project producer facts without reopening SOURCE; independent custody still checks every row."""
+    from process.registry_typed_source_stage import is_typed_source_stage
+
+    if is_typed_source_stage(stage):
+        await _candidate(connection, copy_target, approved, control_schema, preparing=True)
+        await create_provider_only_projection(connection, copy_target, control_schema=control_schema)
+        await _append_typed_staged_sources(
+            connection, _relation(copy_target.schema_name), recipes, stage, approved, control_schema
+        )
+        return
     recipes_by_identity, descriptors_by_identity = _staged_sources(recipes, stage)
     await _candidate(connection, copy_target, approved, control_schema, preparing=True)
     await create_provider_only_projection(connection, copy_target, control_schema=control_schema)
@@ -557,6 +566,17 @@ async def _verify_staged_provider_only_projection(
     reads, mapping, or content hashes. The issuer must bind every FHIR identity to its
     independently verified complete inventory before issuing custody.
     """
+    from process.registry_typed_source_stage import is_typed_source_stage
+
+    if is_typed_source_stage(stage):
+        await _candidate(connection, copy_target, approved, control_schema, preparing=False)
+        async with _expected_evidence(connection) as (_name, expected):
+            identity = await _append_typed_staged_sources(
+                connection, expected, recipes, stage, approved, control_schema
+            )
+            return await _expected_receipt(
+                connection, copy_target, expected, len(stage.contribution_receipts), identity
+            )
     recipes_by_identity, descriptors_by_identity = _staged_sources(recipes, stage)
     await _candidate(connection, copy_target, approved, control_schema, preparing=False)
     async with _expected_evidence(connection) as (_name, expected):
@@ -564,6 +584,29 @@ async def _verify_staged_provider_only_projection(
             connection, expected, recipes_by_identity, descriptors_by_identity, stage, approved, control_schema
         )
         return await _expected_receipt(connection, copy_target, expected, len(recipes_by_identity), identity_sha256)
+
+
+async def _append_typed_staged_sources(connection, expected, recipes, stage, approved, control_schema):
+    """Use verified typed cells and retain unchanged legacy child fact projections."""
+    matches = stage.office_matches
+    await matches.verify(connection, matches.address_source, matches.runtime_roles, approved, control_schema)
+    for mapping in matches.mappings:
+        await connection.execute(
+            f"INSERT INTO {expected}({COLUMNS}) SELECT {COLUMNS} FROM "
+            + mapping.relation("provider_only")
+            + " ON CONFLICT DO NOTHING"
+        )
+    recipes_by_sha = {
+        hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest(): recipe for recipe in recipes
+    }
+    for child in matches.legacy_stages:
+        selected = tuple(recipes_by_sha[item["recipe_sha256"]] for item in child.contribution_receipts)
+        selected_recipes, descriptors = _staged_sources(selected, child)
+        await _append_staged_sources(
+            connection, expected, selected_recipes, descriptors, child, approved, control_schema
+        )
+    identities = sorted(item["recipe_sha256"] for item in stage.contribution_receipts)
+    return hashlib.sha256("".join(identities).encode("ascii")).hexdigest()
 
 
 def provider_only_page_sql(schema_name, *, control_schema=None):
@@ -593,7 +636,7 @@ def provider_only_page_sql(schema_name, *, control_schema=None):
         AND binding.record_json->>'producer_id'=source.producer_id
         AND binding.record_json->>'edition_id'=source.edition_id
         AND binding.record_json->'source_scope_json'->>source.fhir_scope_key=source.fhir_scope_value
-        AND (source.fhir_scope_key='alias_scope' OR source.fhir_scope_key='capture_sha256'
+        AND (source.fhir_scope_key='alias_scope' OR source.fhir_scope_key IN ('capture_sha256','source_generation')
           AND binding.record_json->'source_scope_json'->>'organization_id'=binding.record_json->>'source_key')
       JOIN ONLY {namespace}.registry_approved_record network ON network.approved_revision=$1
         AND network.record_kind='network' AND network.record_key=parsed.network_id::text

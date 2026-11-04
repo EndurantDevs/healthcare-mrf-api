@@ -598,6 +598,45 @@ async def test_mixed_vector_parity_scopes_comparison_to_both_approved_fhir_cohor
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mixed,corrupt", [(False, False), (False, True), (True, False), (True, True)])
+async def test_typed_raw_parity_uses_bounded_indexed_multiset_check(monkeypatch, mixed, corrupt):
+    from process import registry_fhir_serving_preservation as preservation
+    from process import registry_typed_membership_parity as parity
+    from process import registry_typed_source_stage as typed
+
+    stage = SimpleNamespace(generation_sha256="a" * 64)
+    monkeypatch.setattr(typed, "is_typed_source_stage", lambda value: value is stage)
+    monkeypatch.setattr(typed, "typed_stage_projection", lambda _: "SELECT * FROM exact_typed_stage")
+    bounded = AsyncMock(return_value=corrupt)
+    monkeypatch.setattr(parity, "multiset_differs", bounded)
+    connection = SimpleNamespace(fetch=AsyncMock(side_effect=[[{"network_id": 1}, {"network_id": 9}], []]))
+    candidate = {
+        "schema_name": "candidate",
+        "source_generations": {"registry_source_membership": "a" * 64},
+        "approved_custom_revision": 9,
+    }
+    carried = SimpleNamespace(
+        membership_query="SELECT * FROM exact_carry", predecessor=SimpleNamespace(approved_custom_revision=7)
+    )
+    arguments = (connection, candidate, carried, stage, (1, 2 if mixed else 1), "control")
+    if corrupt:
+        with pytest.raises(FHIRServingPreservationError, match="membership_parity"):
+            await preservation._current_raw_parity(*arguments)
+    else:
+        await preservation._current_raw_parity(*arguments)
+    _, actual, expected = bounded.await_args.args
+    assert "EXCEPT" not in actual + expected and "MATERIALIZED" not in actual + expected
+    assert "UNION ALL SELECT * FROM exact_carry" in expected
+    if mixed:
+        assert "network_id=ANY(ARRAY[1,9]::integer[])" in actual + expected
+        assert connection.fetch.await_args_list[0].args[1:] == ([7, 9], None)
+        if not corrupt:
+            assert connection.fetch.await_args_list[-1].args[2] == 9
+    else:
+        connection.fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bound_failure", [False, True])
 async def test_carry_copy_reduces_batch_then_resumes_exact_keyset(monkeypatch, bound_failure):
     from process import network_bootstrap_sources as bootstrap

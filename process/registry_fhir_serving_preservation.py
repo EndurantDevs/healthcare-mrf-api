@@ -17,6 +17,7 @@ from process.network_address_projection import copy_network_address_projection_r
 from process.network_approved_membership_source import pin_retained_approved_membership_source
 from process.network_approved_source_bindings import require_retained_approved_network_source_bindings
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_physical_source
+from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_source_observation_store import source_observation_namespace
 from process.registry_source_recipe_composition import (
@@ -168,9 +169,16 @@ def _family(recipe):
 
 def _slot(recipe):
     source = recipe.source_pin
+    if type(source) is PinnedTypedFHIRMembershipSource:
+        return (*_family(recipe), source.capture["graph"]["origin"]["endpoint_id"], None)
     capture = source.retained_capture
     # Reviewed products/captures keep their exact pinned-capture semantics.
     return (*_family(recipe), source.endpoint_id, None if capture is None else str(capture.capture_id))
+
+
+def _physical_slot(recipe):
+    slot = _slot(recipe)
+    return (*slot[:3], slot[4])
 
 
 def _recipe_commitment(recipes, inventory):
@@ -185,7 +193,11 @@ def _recipe_commitment(recipes, inventory):
 
 
 def _fhir_recipes(recipes, *, inventory=False):
-    selected_recipes = tuple(recipe for recipe in recipes if type(recipe.source_pin) is PinnedFHIRMembershipSource)
+    selected_recipes = tuple(
+        recipe
+        for recipe in recipes
+        if type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource)
+    )
     return (
         _recipe_commitment(selected_recipes, True)[0]
         if inventory
@@ -196,18 +208,38 @@ def _fhir_recipes(recipes, *, inventory=False):
 def fhir_vector_succession(previous, current):
     """Conserve every protected physical endpoint; other families retain their own authority."""
     previous_by_slot = {
-        _slot(recipe): recipe for recipe in previous if type(recipe.source_pin) is PinnedFHIRMembershipSource
+        _slot(recipe): recipe
+        for recipe in previous
+        if type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource)
     }
     current_by_slot = {
-        _slot(recipe): recipe for recipe in current if type(recipe.source_pin) is PinnedFHIRMembershipSource
+        _slot(recipe): recipe
+        for recipe in current
+        if type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource)
     }
-    if (
-        len(previous_by_slot) != sum(type(recipe.source_pin) is PinnedFHIRMembershipSource for recipe in previous)
-        or len(current_by_slot) != sum(type(recipe.source_pin) is PinnedFHIRMembershipSource for recipe in current)
-        or not previous_by_slot.keys() <= current_by_slot.keys()
+    if len(previous_by_slot) != sum(
+        type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource) for recipe in previous
+    ) or len(current_by_slot) != sum(
+        type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource) for recipe in current
     ):
         _fail("vector_incomplete")
-    return tuple((recipe, current_by_slot[slot]) for slot, recipe in previous_by_slot.items())
+    pairs = []
+    for slot, recipe in previous_by_slot.items():
+        successor = current_by_slot.get(slot)
+        if successor is None:
+            # A new native typed catalog can replace old capture/producer editions,
+            # but never another physical Source, schema or endpoint.
+            matches = [
+                candidate
+                for candidate in current_by_slot.values()
+                if type(candidate.source_pin) is PinnedTypedFHIRMembershipSource
+                and _physical_slot(candidate) == _physical_slot(recipe)
+            ]
+            if len(matches) != 1:
+                _fail("vector_incomplete")
+            successor = matches[0]
+        pairs.append((recipe, successor))
+    return tuple(pairs)
 
 
 def require_fhir_source_event_delta(previous, current, assertion, *, inventory=False):
@@ -290,9 +322,14 @@ async def append_fhir_preservation_memberships(connection, stage, preservation):
     if preservation is None:
         return stage
     table = "pg_temp." + storage_identifier(stage.table_name)
-    await connection.execute(f"""INSERT INTO {table}(ordinal,input_json)
-      SELECT {stage.membership_rows}+row_number() OVER(ORDER BY to_jsonb(row)::text COLLATE "C"),
-        to_jsonb(row)::text FROM ({preservation.membership_query}) row""")
+    from process.registry_typed_source_stage import MEMBER_COLUMNS, is_typed_source_stage
+
+    if is_typed_source_stage(stage):
+        await connection.execute(f"INSERT INTO {table}({','.join(MEMBER_COLUMNS)}) {preservation.membership_query}")
+    else:
+        await connection.execute(f"""INSERT INTO {table}(ordinal,input_json)
+          SELECT {stage.membership_rows}+row_number() OVER(ORDER BY to_jsonb(row)::text COLLATE "C"),
+            to_jsonb(row)::text FROM ({preservation.membership_query}) row""")
     count = await connection.fetchval(f"SELECT count(*) FROM {table}")
     if count != stage.membership_rows + preservation.receipt["carried_rows"]:
         _fail("membership_accounting")
@@ -309,6 +346,11 @@ async def _coverage(
 ):
     """Authenticate complete native families before any membership eligibility filter."""
     for recipe in recipes:
+        if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource:
+            await _typed_coverage(
+                connection, recipe, approved, control_schema, side, inventory, coverage, source_witness_runtime
+            )
+            continue
         if type(recipe.source_pin) is not PinnedFHIRMembershipSource:
             continue
         if side == "previous" and recipe.source_pin.source_witness_capture is not None:
@@ -332,7 +374,7 @@ async def _coverage(
         source_pin, coordinates = recipe.source_pin, recipe.binding_coordinates
         slot = _canonical(_slot(recipe))
         await connection.execute(
-            f"INSERT INTO {inventory} VALUES($1,$2,$3::jsonb,$4::jsonb,$5)",
+            f"INSERT INTO {inventory}(side,slot,family,coordinates,endpoint) VALUES($1,$2,$3::jsonb,$4::jsonb,$5)",
             side,
             slot,
             _canonical(_family(recipe)),
@@ -353,6 +395,30 @@ async def _coverage(
         "OR payload_hash !~ '^[0-9a-f]{64}$')"
     ):
         _fail("coverage_invalid")
+
+
+async def _typed_coverage(connection, recipe, approved, control_schema, side, inventory, coverage, runtime):
+    """Whole-network absence is derived from independently checked typed Source cells."""
+    from process.registry_source_recipe_composition import load_typed_source_read
+
+    stage = await load_typed_source_read(
+        connection, recipe, approved, control_schema, runtime, retained_approval=side == "previous"
+    )
+    slot = _canonical(_slot(recipe))
+    await connection.execute(
+        f"INSERT INTO {inventory}(side,slot,family,coordinates,endpoint) VALUES($1,$2,$3::jsonb,$4::jsonb,$5)",
+        side,
+        slot,
+        _canonical(_family(recipe)),
+        _canonical(recipe.binding_coordinates.sql_parameters),
+        recipe.source_pin.capture["graph"]["origin"]["endpoint_id"],
+    )
+    await connection.execute(
+        f"INSERT INTO {coverage} SELECT $1,$2,resource_id,payload_sha256 FROM {stage.relation('cells')} "
+        "WHERE resource_type='Organization'",
+        side,
+        slot,
+    )
 
 
 async def _subjects(connection, inventory, control, revision, destination, side, *, historical=False):
@@ -409,7 +475,9 @@ async def _preservation_baseline(
         control_schema=control_schema,
     )
     previous = await resolve_retained_registry_source_recipes(connection, predecessor, control_schema=control_schema)
-    if not any(type(recipe.source_pin) is PinnedFHIRMembershipSource for recipe in previous):
+    if not any(
+        type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource) for recipe in previous
+    ):
         return None
     fhir_vector_succession(previous, recipes)
     candidate = await connection.fetchrow(
@@ -485,7 +553,8 @@ async def _identity_stages(
     relations = tuple("pg_temp." + storage_identifier(name) for name in names)
     inventory, coverage, subjects, current_subjects, reviewed_subjects, missing = relations
     await connection.execute(
-        f"CREATE TEMP TABLE {inventory}(side text,slot text,family jsonb,coordinates jsonb,endpoint text) ON COMMIT DROP"
+        f"CREATE TEMP TABLE {inventory}(side text,slot text,family jsonb,coordinates jsonb,endpoint text,"
+        "successor_slot text) ON COMMIT DROP"
     )
     await connection.execute(
         f"CREATE TEMP TABLE {coverage}(side text,slot text,organization_id text,payload_hash text,PRIMARY KEY(side,slot,organization_id)) ON COMMIT DROP"
@@ -501,6 +570,13 @@ async def _identity_stages(
     await _coverage(
         connection, recipes, current_approved, control_schema, "current", inventory, coverage, **source_options
     )
+    for old, new in fhir_vector_succession(previous, recipes):
+        if _slot(old) != _slot(new):
+            await connection.execute(
+                f"UPDATE {inventory} SET successor_slot=$2 WHERE side='previous' AND slot=$1",
+                _canonical(_slot(old)),
+                _canonical(_slot(new)),
+            )
     await _subjects(
         connection,
         inventory,
@@ -577,15 +653,19 @@ async def _select_missing_networks(connection, relations, previous_selection, ap
           AND network.record_key=m.network_id::text AND network.record_json->'archived'='false'::jsonb)
       AND (EXISTS(SELECT FROM {effective} e WHERE e.network_id=m.network_id)
         OR m.network_id IN ({prior_missing}))
-      AND EXISTS(SELECT FROM {subjects} original JOIN {reviewed_subjects} reviewed
+      AND EXISTS(SELECT FROM {subjects} original JOIN {inventory} predecessor
+        ON predecessor.side='previous' AND predecessor.slot=original.slot
+        JOIN {reviewed_subjects} reviewed
         ON (original.network_id,original.organization_id)=(reviewed.network_id,reviewed.organization_id)
-          AND (original.slot=reviewed.slot OR reviewed.slot IS NULL)
+          AND (COALESCE(predecessor.successor_slot,original.slot)=reviewed.slot OR reviewed.slot IS NULL)
         WHERE original.network_id=m.network_id AND original.supported AND reviewed.supported)
       AND NOT EXISTS(SELECT FROM {current_subjects} s JOIN {coverage} c
         ON c.side='current' AND (c.slot,c.organization_id)=(s.slot,s.organization_id)
         WHERE s.network_id=m.network_id AND s.supported)
-      AND NOT EXISTS(SELECT FROM {subjects} s JOIN {coverage} c
-        ON c.side='current' AND (c.slot,c.organization_id)=(s.slot,s.organization_id)
+      AND NOT EXISTS(SELECT FROM {subjects} s JOIN {inventory} predecessor
+        ON predecessor.side='previous' AND predecessor.slot=s.slot
+        JOIN {coverage} c ON c.side='current'
+          AND (c.slot,c.organization_id)=(COALESCE(predecessor.successor_slot,s.slot),s.organization_id)
         WHERE s.network_id=m.network_id)""")
     if await connection.fetchval(f"""SELECT EXISTS(SELECT FROM {missing} WHERE network_id IN ({ambiguous})
       OR network_id IN (SELECT network_id FROM {reviewed_subjects} GROUP BY network_id
@@ -972,7 +1052,9 @@ async def fhir_preservation_obligation(
         if RECIPE_DIGEST_KEY in predecessor.source_generations
         else ()
     )
-    required = any(type(recipe.source_pin) is PinnedFHIRMembershipSource for recipe in previous)
+    required = any(
+        type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource) for recipe in previous
+    )
     if required and receipt is None:
         prior_candidate = await connection.fetchrow(
             f"SELECT * FROM {source_observation_namespace(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
@@ -1017,6 +1099,34 @@ def _exclusive_fhir_cohort(control_schema):
         AND NOT (record_json->'source_scope_json' ? 'insurance_plan_id'))"""
 
 
+async def _typed_current_raw_differs(connection, actual, expected, revisions, control_schema):
+    from process.registry_typed_membership_parity import multiset_differs
+
+    if revisions is None:
+        return await multiset_differs(connection, actual, expected)
+    # Catalog IDs, not membership rows, cross Python. Each bounded cohort probes
+    # the leading network_id indexes; the ordered helper preserves multiplicity.
+    after = None
+    while True:
+        rows = await connection.fetch(
+            f"SELECT network_id FROM ({_exclusive_fhir_cohort(control_schema)}) cohort "
+            "WHERE ($2::integer IS NULL OR network_id>$2) ORDER BY network_id LIMIT 1000",
+            revisions,
+            after,
+        )
+        if not rows:
+            return False
+        identifiers = ",".join(str(int(row["network_id"])) for row in rows)
+        scope = f"network_id=ANY(ARRAY[{identifiers}]::integer[])"
+        if await multiset_differs(
+            connection,
+            f"SELECT * FROM ({actual}) rows WHERE {scope}",
+            f"SELECT * FROM ({expected}) rows WHERE {scope}",
+        ):
+            return True
+        after = rows[-1]["network_id"]
+
+
 async def _current_raw_parity(connection, candidate, preservation, current_stage, recipe_counts, control_schema):
     """Compare both directions using only the approved-input cohort for mixed vectors."""
     from process.registry_source_retention import registry_source_stage_projection
@@ -1029,9 +1139,25 @@ async def _current_raw_parity(connection, candidate, preservation, current_stage
     ):
         _fail("source_changed")
     namespace = storage_identifier(candidate["schema_name"])
-    expected = registry_source_stage_projection("pg_temp." + storage_identifier(current_stage.table_name))
+    from process.registry_typed_source_stage import is_typed_source_stage, typed_stage_projection
+
+    expected = (
+        typed_stage_projection(current_stage)
+        if is_typed_source_stage(current_stage)
+        else registry_source_stage_projection("pg_temp." + storage_identifier(current_stage.table_name))
+    )
     expected += " UNION ALL " + preservation.membership_query
-    if fhir_count == all_count:
+    if is_typed_source_stage(current_stage):
+        differs = await _typed_current_raw_differs(
+            connection,
+            f"SELECT * FROM {namespace}.network_membership_source",
+            expected,
+            None
+            if fhir_count == all_count
+            else [preservation.predecessor.approved_custom_revision, candidate["approved_custom_revision"]],
+            control_schema,
+        )
+    elif fhir_count == all_count:
         comparison = f"""WITH expected AS MATERIALIZED ({expected})
           SELECT EXISTS((SELECT * FROM expected EXCEPT ALL SELECT * FROM {namespace}.network_membership_source)
             UNION ALL (SELECT * FROM {namespace}.network_membership_source EXCEPT ALL SELECT * FROM expected))"""
@@ -1054,13 +1180,22 @@ async def _verify_current_fhir_rows(
     connection, candidate, preservation, recipes, approved, control_schema, *, source_witness_runtime=None
 ):
     """Replay all current FHIR inputs without acquiring unrelated graph authority."""
-    from process.registry_source_recipe_composition import stage_registry_source_recipes
+    from process.registry_source_recipe_composition import (
+        stage_registry_source_recipes,
+        stage_verified_registry_source_recipes,
+    )
 
-    fhir_recipes = tuple(recipe for recipe in recipes if type(recipe.source_pin) is PinnedFHIRMembershipSource)
+    fhir_recipes = tuple(
+        recipe
+        for recipe in recipes
+        if type(recipe.source_pin) in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource)
+    )
     if not fhir_recipes:
         return
     office_inputs = await _current_office_inputs(connection, candidate, recipes, approved, control_schema)
-    current_stage = await stage_registry_source_recipes(
+    typed = any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in fhir_recipes)
+    stage_source = stage_verified_registry_source_recipes if typed else stage_registry_source_recipes
+    current_stage = await stage_source(
         connection,
         fhir_recipes,
         approved,
@@ -1069,6 +1204,7 @@ async def _verify_current_fhir_rows(
         read_context=SourceRecipeReadContext(
             verified_office_inputs=office_inputs, source_witness_runtime=source_witness_runtime
         ),
+        **({"inventory": True} if typed else {}),
     )
     primary = None
     try:
@@ -1097,6 +1233,24 @@ async def _current_office_inputs(connection, candidate, recipes, approved, contr
 
     generations_by_name = candidate["source_generations"]
     generations_by_name = json.loads(generations_by_name) if type(generations_by_name) is str else generations_by_name
+    typed = any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes)
+    summary = verify_initial_source_office_receipt(candidate) if typed else None
+    if typed:
+        if summary is None or summary["revision"] != 6:
+            _fail("source_changed")
+        context = summary["context"]
+        if (context["approved_revision"], context["approved_generation_sha256"]) != (
+            approved.approved_revision,
+            approved.generation_id,
+        ):
+            _fail("source_changed")
+        address_source = PinnedAddressSource(**context["address_source"])
+        writer_roles = publication_candidate_readiness(candidate)[3]
+        runtime_roles = tuple(sorted(set((*writer_roles["loader_roles"], *writer_roles["reader_roles"]))))
+        await verify_artifact_dependency_identity(
+            connection, address_source, runtime_roles, address=True, control_schema=control_schema
+        )
+        return address_source, runtime_roles
     if OFFICE_MAPPING_KEY not in generations_by_name:
         return None
     mapping_sha256 = generations_by_name[OFFICE_MAPPING_KEY]
@@ -1131,6 +1285,18 @@ async def _verify_current_offices(connection, candidate, recipes, approved, stag
     )
 
     address_source, runtime_roles = office_inputs
+    from process.registry_typed_source_stage import is_typed_source_stage, verify_typed_stage_offices
+
+    if is_typed_source_stage(stage):
+        from process.registry_source_inventory_reference import verify_source_recipe_metadata
+        from process.registry_typed_source_metadata import typed_office_summary
+
+        await verify_typed_stage_offices(connection, stage, address_source, runtime_roles, approved, control_schema)
+        root = verify_source_recipe_metadata(candidate).inventory.root
+        actual = typed_office_summary(root, sorted(stage.office_derivations, key=lambda row: row["recipe_sha256"]))
+        if actual != verify_initial_source_office_receipt(candidate):
+            _fail("source_changed")
+        return
     summary = await verified_retained_source_office_summary(
         connection,
         recipes,
