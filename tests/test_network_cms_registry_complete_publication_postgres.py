@@ -35,19 +35,24 @@ from tests.test_provider_directory_cms_resource_batch_postgres import cms_resour
 
 pytestmark = pytest.mark.usefixtures(cms_resource_template.__name__)
 
+PROFILE_BUILD_SECONDS = 600
+# A successor waits out the prior lease in real time, so those tests reserve what one publication needs.
+SUCCESSOR_BUILD_SECONDS = 120
+SUCCESSOR_LEASE_SECONDS = 300 + SUCCESSOR_BUILD_SECONDS + 30
+
 
 async def _native_profile_lease(monkeypatch, execution):
     """Sign actual native preflight output with the enrolled synthetic authority."""
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
-    # The paired Source build may use its 300s reservation before the 600s Profile build starts.
+    # The paired Source build may use its 300s reservation before the Profile build starts.
     timing = signing._GuardTiming(
         now - datetime.timedelta(seconds=2),
         now - datetime.timedelta(seconds=1),
-        now + datetime.timedelta(seconds=930),
-        now + datetime.timedelta(seconds=910),
+        now + datetime.timedelta(seconds=300 + PROFILE_BUILD_SECONDS + 30),
+        now + datetime.timedelta(seconds=300 + PROFILE_BUILD_SECONDS + 10),
         hashlib.sha256(f"profile-{execution.generation}-{uuid4()}".encode()).hexdigest(),
     )
-    limits = signing._limits_payload(max_build_seconds=600, temp_file_limit_bytes=64 * 1024 * 1024)
+    limits = signing._limits_payload(max_build_seconds=PROFILE_BUILD_SECONDS, temp_file_limit_bytes=64 * 1024 * 1024)
     for cap in limits["relation_byte_caps"]:
         for field in cap:
             if field.endswith("_bytes") and cap[field]:
