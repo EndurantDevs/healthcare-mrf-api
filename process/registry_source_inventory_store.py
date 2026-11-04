@@ -12,6 +12,7 @@ from uuid import UUID
 from process.network_address_projection import _identifier
 from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_normalized_capture
+from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.network_membership_candidate_lifecycle import (
     _control_namespace,
     _locked_candidate,
@@ -70,7 +71,9 @@ def source_inventory_record(entry):
     singleton = "[" + entry.recipe_json + "]"
     (recipe,) = decode_registry_source_recipes(singleton)
     scope_key = scope_value = None
-    if type(recipe.source_pin) is PinnedFHIRMembershipSource:
+    if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource:
+        scope_key, scope_value = "source_generation", recipe.source_pin.catalog_generation
+    elif type(recipe.source_pin) is PinnedFHIRMembershipSource:
         capture = fhir_normalized_capture(recipe.source_pin)
         scope_key, scope_value = (
             ("alias_scope", recipe.source_pin.alias_scope)
@@ -128,7 +131,7 @@ async def _create_inventory(connection, relation):
       fhir_scope_key text,
       fhir_scope_value text,
       CHECK((source_system='fhir' AND fhir_scope_key IS NOT NULL AND fhir_scope_value IS NOT NULL
-          AND fhir_scope_key IN ('capture_sha256','alias_scope') AND octet_length(fhir_scope_value) BETWEEN 1 AND 512)
+          AND fhir_scope_key IN ('capture_sha256','alias_scope','source_generation') AND octet_length(fhir_scope_value) BETWEEN 1 AND 512)
         OR (source_system<>'fhir' AND fhir_scope_key IS NULL AND fhir_scope_value IS NULL)))""")
     await connection.execute(
         f"CREATE INDEX source_inventory_scope_idx ON {relation} "

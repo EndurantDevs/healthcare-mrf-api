@@ -72,6 +72,8 @@ class ResolvedSourceFactArtifact:
 def _validated_descriptor(descriptor):
     if type(descriptor) is not dict:
         raise RegistrySourceContributionError("registry_source_artifact_reference_invalid")
+    if descriptor.get("descriptor_version") == 4:
+        raise RegistrySourceContributionError("registry_source_artifact_reference_invalid")
     if "descriptor_version" in descriptor:
         document = validate_source_contribution_descriptor(descriptor)
         return {key: value for key, value in document.items() if key not in _ANCHOR_FIELDS}
@@ -217,7 +219,10 @@ async def _owner_sources(connection, candidate, custody, control_schema, *, api_
         source_descriptors = tuple(
             json.loads(entry.contribution_json) for entry in entries if entry.contribution_json is not None
         )
+        from process.registry_typed_source_metadata import typed_contribution_summary
+
         summarize = {
+            6: typed_contribution_summary,
             3: contribution_summary_v3,
             4: contribution_summary_v4,
             5: contribution_summary_v5,
@@ -228,7 +233,7 @@ async def _owner_sources(connection, candidate, custody, control_schema, *, api_
             != receipt
         ):
             raise ValueError
-        return source_descriptors
+        return tuple(source for source in source_descriptors if source.get("descriptor_version") != 4)
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError:
         raise RegistrySourceContributionError("registry_source_artifact_inventory_changed") from None
 

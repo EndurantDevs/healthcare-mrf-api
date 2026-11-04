@@ -35,6 +35,11 @@ from process.uhc_flex_practitioner_async_safety import drain_operation
 async def _drop_stage(connection, stage, commands):
     if commands is not None:
         await drop_registry_command_stage(connection, commands)
+    from process.registry_typed_source_stage import drop_typed_source_stage, is_typed_source_stage
+
+    if is_typed_source_stage(stage):
+        await drop_typed_source_stage(connection, stage)
+        return
     matches = getattr(stage, "office_matches", None)
     for name in (stage.table_name, stage.contribution_table_name, None if matches is None else matches.table_name):
         if name is not None:
@@ -119,19 +124,27 @@ async def _independent_source_stage(
     if inventory is not None or "retained_network_source" in generations:
         retained = await resolve_registry_retained_generation(connection, candidate, control_schema=control_schema)
         previous = None if retained is None else retained[0]
-    if expected is not None and expected["revision"] == 4:
+    if expected is not None and expected["revision"] in (4, 6):
         from process.registry_initial_source_composition import verify_initial_source_office_receipt
         from process.registry_source_office_custody import _office_inputs
 
         office_receipt = verify_initial_source_office_receipt(candidate)
-        if inventory is None or office_receipt is None or office_receipt["revision"] != 5:
+        if inventory is None or office_receipt is None or office_receipt["revision"] not in (5, 6):
             raise RegistrySourceContributionError("registry_source_contribution_offices_differ")
         verified_inputs = _office_inputs(candidate)
     elif inventory is None and previous is None and candidate["expected_head"]:
         previous = await resolve_network_serving_manifest(
             connection, generation_id=candidate["expected_head"], control_schema=control_schema
         )
-    return await stage_registry_source_recipes(
+    from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+    from process.registry_source_recipe_composition import stage_verified_registry_source_recipes
+
+    staging = (
+        stage_verified_registry_source_recipes
+        if any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes)
+        else stage_registry_source_recipes
+    )
+    return await staging(
         connection,
         recipes,
         approved,
@@ -188,7 +201,12 @@ async def _verify_inventory_stage(
         if is_witness_stage:
             from process.registry_source_inventory_summaries import office_summary_v5
 
-            actual = office_summary_v5(root, stage.office_policy_context, derivations)
+            if stage.contribution_revision == 4:
+                from process.registry_typed_source_metadata import typed_office_summary
+
+                actual = typed_office_summary(root, derivations)
+            else:
+                actual = office_summary_v5(root, stage.office_policy_context, derivations)
         else:
             actual = office_summary_v4(
                 root, approved, _office_inputs(candidate)[0], derivations, expected["origin_manifest_sha256"]

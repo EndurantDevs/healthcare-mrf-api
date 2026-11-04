@@ -16,6 +16,7 @@ from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import ApprovedMembershipSource, pin_retained_approved_membership_source
 from process.network_custom_address_source import _require_transaction
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_normalized_capture
+from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.network_initial_cms_office_bindings import _capture_offices as capture_cms_offices
 from process.network_initial_cms_office_bindings import (
     copy_initial_cms_office_bindings,
@@ -108,7 +109,13 @@ def validate_initial_source_recipes(recipes, *, inventory=False) -> tuple:
             recipes = decode_registry_source_recipes(canonical_registry_source_recipes(recipes))
         for recipe in recipes:
             source_pin = recipe.source_pin
-            if type(source_pin) in {PinnedACAMembershipSource, PinnedPTGOfficeMembershipSource}:
+            if type(source_pin) is PinnedTypedFHIRMembershipSource and not inventory:
+                raise ValueError
+            if type(source_pin) in {
+                PinnedACAMembershipSource,
+                PinnedPTGOfficeMembershipSource,
+                PinnedTypedFHIRMembershipSource,
+            }:
                 continue
             if type(source_pin) is PinnedFHIRMembershipSource and (
                 source_pin.retained_epoch is not None or fhir_normalized_capture(source_pin) is not None
@@ -183,6 +190,10 @@ def _inventory_office_receipt(receipt, root):
     from process.registry_source_inventory_summaries import validate_office_summary_v4, validate_office_summary_v5
 
     parsed = _document(receipt, MAX_RECEIPT_BYTES)
+    if type(parsed.get("revision")) is int and parsed["revision"] == 6:
+        from process.registry_typed_source_metadata import validate_typed_summary
+
+        return validate_typed_summary(parsed, root, offices=True)
     if type(parsed.get("revision")) is int and parsed["revision"] == 5:
         return validate_office_summary_v5(parsed, root)
     return validate_office_summary_v4(receipt, root)
@@ -197,6 +208,21 @@ def initial_source_office_receipt_sha256(receipt, *, inventory_root=None) -> str
 
 def _is_receipt_match(candidate, receipt, recipes):
     generations = _generations(candidate)
+    if receipt["revision"] == 6:
+        from process.registry_source_inventory_reference import verify_source_recipe_metadata
+
+        metadata = verify_source_recipe_metadata(candidate)
+        if metadata.inventory is None:
+            return False
+        root = metadata.inventory.root
+        validate_initial_source_office_receipt(receipt, inventory_root=root)
+        context = receipt["context"]
+        return (
+            candidate["approved_custom_revision"] == context["approved_revision"]
+            and generations.get("custom_membership") == context["approved_generation_sha256"]
+            and generations.get("unified_address") == context["address_source"]["generation_id"]
+            and generations.get(SUMMARY_KEY) == initial_source_office_receipt_sha256(receipt, inventory_root=root)
+        )
     if receipt["revision"] in (4, 5):
         from process.registry_source_inventory_reference import verify_source_recipe_metadata
 
@@ -1096,6 +1122,19 @@ async def record_verified_witness_offices(
     connection, copy_target, recipes, approved, address_source, runtime_roles, stage, *, control_schema=None
 ):
     """Recheck current native matches and record only the registered inventory-v5 policy."""
+    from process.registry_typed_source_stage import is_typed_source_stage, record_typed_source_offices
+
+    if is_typed_source_stage(stage):
+        return await record_typed_source_offices(
+            connection,
+            copy_target,
+            recipes,
+            approved,
+            address_source,
+            runtime_roles,
+            stage,
+            control_schema=control_schema,
+        )
     from process.network_initial_cms_office_bindings import verified_retained_offices
     from process.registry_verified_witness_offices import _policy_context, copy_witness_offices
 

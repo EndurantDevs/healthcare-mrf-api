@@ -152,6 +152,10 @@ def _validate_inventory_contribution(receipt, inventory_root):
     )
 
     document = json.loads(receipt, object_pairs_hook=_unique_object) if type(receipt) is str else receipt
+    if type(document) is dict and type(document.get("revision")) is int and document["revision"] == 6:
+        from process.registry_typed_source_metadata import validate_typed_summary
+
+        return validate_typed_summary(document, inventory_root)
     if type(document) is dict and type(document.get("revision")) is int and document["revision"] == 5:
         return validate_contribution_summary_v5(document, inventory_root)
     if type(document) is dict and type(document.get("revision")) is int and document["revision"] == 4:
@@ -219,6 +223,14 @@ def registry_source_contribution_receipt(stage, *, inventory_root=None):
     """Describe the exact staged FHIR facts for candidate registration."""
     descriptors = list(stage.contribution_receipts)
     revision = getattr(stage, "contribution_revision", 2)
+    if any(descriptor.get("descriptor_version") == 4 for descriptor in descriptors):
+        from process.registry_typed_source_metadata import typed_contribution_summary
+
+        if inventory_root is None or type(revision) is not int or revision != 4:
+            raise RegistrySourceContributionError("registry_source_contribution_stage_invalid")
+        return typed_contribution_summary(
+            inventory_root, sorted(descriptors, key=lambda descriptor: descriptor["recipe_sha256"])
+        )
     if revision == 2:
         descriptors = [
             validate_source_witness_descriptor_v2(descriptor)
@@ -399,7 +411,8 @@ async def retained_source_contributions(
     selected_descriptors = tuple(
         validate_source_witness_descriptor_v2(descriptor) if witnesses else descriptor
         for descriptor in descriptors
-        if ("descriptor_version" in descriptor) == witnesses
+        if descriptor.get("descriptor_version") != 4
+        and ("descriptor_version" in descriptor) == witnesses
         and (wanted is None or descriptor["capture_sha256"] in wanted)
     )
     artifacts = await verify_anchored_source_fact_contents(
@@ -693,7 +706,7 @@ async def retain_registry_source_contributions(
         own_rows = sum(
             descriptor["fact_rows"]
             for descriptor in stage.contribution_receipts
-            if descriptor.get("fact_candidate_id") is None
+            if descriptor.get("descriptor_version") != 4 and descriptor.get("fact_candidate_id") is None
         )
         if own_rows and await connection.fetchval(f"SELECT count(*) FROM {relation}") == 0:
             stage_relation = f"pg_temp.{_identifier(stage.contribution_table_name)}"
@@ -724,6 +737,9 @@ async def verify_registry_source_contributions_rows(
         for field in ("candidate_id", "dataset_id", "schema_id", "producer_id", "schema_name")
     ):
         raise RegistrySourceContributionError("registry_source_contribution_scope_invalid")
+    if inventory is not None:
+        await _require_typed_contribution_captures(connection, inventory[1])
+    descriptors = tuple(descriptor for descriptor in descriptors if descriptor.get("descriptor_version") != 4)
     relation = f"{_identifier(copy_target.schema_name)}.{CONTRIBUTION_TABLE}"
     native_counts = await connection.fetch(f"SELECT recipe_sha256,count(*) AS fact_rows FROM {relation} GROUP BY 1")
     actual_by_recipe = {native_count["recipe_sha256"]: native_count["fact_rows"] for native_count in native_counts}
@@ -755,6 +771,17 @@ async def verify_registry_source_contributions_rows(
         if differs:
             raise RegistrySourceContributionError("registry_source_contribution_parity_invalid")
     return receipt
+
+
+async def _require_typed_contribution_captures(connection, recipes):
+    """Native retained custody is required here; independent Source replay is a later, separate gate."""
+    from process.network_fhir_typed_capture import require_typed_graph_capture
+    from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+
+    for recipe in recipes:
+        pin = recipe.source_pin
+        if type(pin) is PinnedTypedFHIRMembershipSource:
+            await require_typed_graph_capture(connection, pin.capture, expected_anchor=pin.anchor)
 
 
 async def _verify_fact_owners(connection, descriptors, control_schema, *, inventory):
@@ -1024,6 +1051,10 @@ def validate_source_contribution_descriptor(descriptor):
                 return validate_source_witness_descriptor_v2(descriptor)
             if version == 3:
                 return validate_source_mapping_descriptor_v3(descriptor)
+            if version == 4:
+                from process.registry_typed_source_metadata import validate_typed_contribution
+
+                return validate_typed_contribution(descriptor)
             raise ValueError
         return validate_registry_source_contribution_receipt(
             {
