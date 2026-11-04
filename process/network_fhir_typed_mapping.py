@@ -58,9 +58,12 @@ class TypedGraphMapping:
 
 async def create_typed_mapping_tables(connection):
     """Precreate scratch before a read-only custodian snapshot, or in the producer transaction."""
+    from process.network_fhir_typed_office_lookup import create_office_lookup_tables
+
     names_by_kind = {kind: "typed_map_" + kind + "_" + uuid4().hex for kind in _MAPPING_DDL}
     for kind, name in names_by_kind.items():
         await connection.execute("CREATE TEMP TABLE " + _identifier(name) + "(" + _MAPPING_DDL[kind] + ")")
+    await create_office_lookup_tables(connection, names_by_kind["offices"])
     return names_by_kind
 
 
@@ -199,7 +202,7 @@ def _accepted_office_rows(matched_rows, canonical):
     return accepted_rows
 
 
-async def _match_offices(connection, mapping, address_source):
+async def _match_offices(connection, mapping, address_source, matches):
     """Match bounded office pages by approved NPI, address key and full canonical identity."""
     import ptg2_address_canon as native
 
@@ -210,9 +213,11 @@ async def _match_offices(connection, mapping, address_source):
         + mapping.relation("offices")
         + " WHERE (provider_id,location_id)>($1::text,$2::uuid) ORDER BY provider_id,location_id LIMIT $3) SELECT o.*,a.location_key AS matched_key,"
         + fields
-        + " FROM requested o LEFT JOIN LATERAL (SELECT * FROM "
+        + " FROM requested o LEFT JOIN LATERAL (SELECT a.* FROM "
+        + matches
+        + " matched JOIN LATERAL (SELECT * FROM "
         + address
-        + " a WHERE a.entity_type='npi' AND a.entity_id=o.provider_id AND a.npi=o.provider_id::bigint AND a.address_key=o.address_key AND a.type='practice' AND a.address_precision='street' AND a.inferred_npi IS NULL LIMIT 2) a ON true ORDER BY o.provider_id,o.location_id"
+        + " a WHERE a.location_key=matched.location_key OFFSET 0) a ON true WHERE (matched.provider_id,matched.address_key)=(o.provider_id,o.address_key) AND a.entity_type='npi' AND a.entity_id=o.provider_id AND a.npi=o.provider_id::bigint AND a.address_key=o.address_key AND a.type='practice' AND a.address_precision='street' AND a.inferred_npi IS NULL LIMIT 2) a ON true ORDER BY o.provider_id,o.location_id"
     )
     after, limit = ("", UUID(int=0)), 1000
     while True:
@@ -258,10 +263,13 @@ async def _match_offices(connection, mapping, address_source):
 
 
 async def _mapping_workspace(connection, stage, table_names):
-    names = await create_typed_mapping_tables(connection) if table_names is None else table_names
-    require(type(names) is dict and set(names) == set(_MAPPING_DDL), "mapping_tables")
+    from process.network_fhir_typed_office_lookup import office_lookup_names
+
+    names_by_kind = await create_typed_mapping_tables(connection) if table_names is None else table_names
+    require(type(names_by_kind) is dict and set(names_by_kind) == set(_MAPPING_DDL), "mapping_tables")
+    names_by_kind = {**names_by_kind, **office_lookup_names(names_by_kind["offices"])}
     oids_by_kind = {}
-    for kind, name in names.items():
+    for kind, name in names_by_kind.items():
         _identifier(name)
         oids_by_kind[kind] = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + name)
         require(
@@ -269,7 +277,7 @@ async def _mapping_workspace(connection, stage, table_names):
             and await connection.fetchval("SELECT NOT EXISTS(SELECT FROM pg_temp." + _identifier(name) + ")"),
             "restart_from_zero",
         )
-    mapping = TypedGraphMapping(stage, names, oids_by_kind, {})
+    mapping = TypedGraphMapping(stage, names_by_kind, oids_by_kind, {})
     return mapping
 
 
@@ -410,7 +418,18 @@ async def prepare_typed_graph_mapping(
     control_schema=None,
     table_names=None,
 ):
-    """Return existing membership/binding row shapes only after raw graph, approval and office custody checks."""
+    """Prepare one graph through the same bounded lookup used by complete recipe batches."""
+    mappings = await map_typed_graph_batch(
+        connection,
+        [(stage, approval, table_names)],
+        address_source=address_source,
+        runtime_roles=runtime_roles,
+        control_schema=control_schema,
+    )
+    return mappings[0]
+
+
+async def _prepare_mapping_offices(connection, stage, approval, table_names, control_schema):
     approved_source = approval.approved_source
     binding_coordinates, catalog_descriptor = approval.binding_coordinates, approval.catalog_descriptor
     await stage.verify(connection)
@@ -418,15 +437,19 @@ async def prepare_typed_graph_mapping(
     await require_approved_network_source_bindings(
         connection, approved_source, binding_coordinates, control_schema=control_schema
     )
-    address_identity = await _artifact_dependency_identity(
-        connection, address_source, runtime_roles, address=True, control_schema=control_schema
-    )
     mapping = await _mapping_workspace(connection, stage, table_names)
     bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
     arguments = (approved_source.approved_revision, *binding_coordinates.sql_parameters, generation)
     approved_keys = await _approved_graph_keys(connection, bindings, arguments)
     await _office_inputs(connection, stage, mapping, approved_keys)
-    await _match_offices(connection, mapping, address_source)
+    return mapping, approval, generation, arguments
+
+
+async def _finish_mapping(connection, prepared, address_source, address_identity, matches, control_schema):
+    mapping, approval, generation, arguments = prepared
+    stage, approved_source = mapping.source_stage, approval.approved_source
+    bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
+    await _match_offices(connection, mapping, address_source, matches)
     totals = await _map_pair_rows(connection, stage, mapping, bindings, arguments)
     await _map_provider_rows(connection, stage, mapping, bindings, arguments)
     office_counts = await _require_mapping_counts(connection, stage, mapping, totals)
@@ -446,3 +469,32 @@ async def prepare_typed_graph_mapping(
     mapping.metadata["mapping_sha256"] = digest(mapping.metadata)
     await mapping.verify(connection)
     return mapping
+
+
+async def map_typed_graph_batch(connection, inputs, *, address_source, runtime_roles, control_schema=None):
+    """Resolve every approved office before scanning the pinned address snapshot once for this batch."""
+    from process.network_fhir_typed_office_lookup import typed_office_lookup
+
+    require(bool(inputs), "mapping_inputs")
+    async with connection.transaction():
+        address_identity = await _artifact_dependency_identity(
+            connection, address_source, runtime_roles, address=True, control_schema=control_schema
+        )
+        prepared_mappings = [
+            await _prepare_mapping_offices(connection, stage, approval, names, control_schema)
+            for stage, approval, names in inputs
+        ]
+        office_names = [mapping.table_names["offices"] for mapping, _, _, _ in prepared_mappings]
+        async with typed_office_lookup(connection, office_names, address_source) as matches:
+            mappings = [
+                await _finish_mapping(connection, selected, address_source, address_identity, matches, control_schema)
+                for selected in prepared_mappings
+            ]
+            require(
+                await _artifact_dependency_identity(
+                    connection, address_source, runtime_roles, address=True, control_schema=control_schema
+                )
+                == address_identity,
+                "office_native_identity",
+            )
+        return mappings
