@@ -12,6 +12,74 @@ fn context(rows: Vec<Value>, contract: &str, derive: bool) -> Value {
 fn input(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
 }
+
+#[test]
+fn completion_v3_uses_subset_utf8_hash_with_required_acquired_marker() {
+    let payload = json!({"resource_id":"site-one","name":"Café","integer":1});
+    let expected: String = Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let mut resource = row("Location", payload, &expected);
+    resource["acquired_resource_sha256"] = json!("a".repeat(64));
+    let mut document = context(vec![resource], "transport_neutral_v2", false);
+    document["completion_required_version"] = json!(3);
+    let batch = encode(&input(&document)).unwrap();
+    assert_eq!(batch.row_count, 1);
+    assert!(batch.fallback_rows.is_empty());
+
+    for marker in [
+        Value::Null,
+        json!("a".repeat(63)),
+        json!("A".repeat(64)),
+        json!(true),
+        json!([]),
+    ] {
+        let mut changed = document.clone();
+        changed["rows"][0]["acquired_resource_sha256"] = marker;
+        assert!(encode(&input(&changed)).is_err());
+    }
+    for version in [json!(0), json!(2), json!(4), json!(true)] {
+        let mut changed = document.clone();
+        changed["completion_required_version"] = version;
+        assert!(encode(&input(&changed)).is_err());
+    }
+    for contract in [
+        "transport_bound_v1",
+        "semantic_content_v3",
+        "semantic_content_v4",
+    ] {
+        let mut changed = document.clone();
+        changed["hash_contract"] = json!(contract);
+        assert_eq!(
+            encode(&input(&changed)).unwrap_err().code,
+            "invalid_context"
+        );
+    }
+    let mut changed = document.clone();
+    changed
+        .as_object_mut()
+        .unwrap()
+        .remove("completion_required_version");
+    assert!(encode(&input(&changed)).is_err());
+    changed = document.clone();
+    changed["rows"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("acquired_resource_sha256");
+    assert!(encode(&input(&changed)).is_err());
+    changed = document.clone();
+    changed["rows"][0]["payload_hash"] = json!("0".repeat(64));
+    assert_eq!(encode(&input(&changed)).unwrap_err().code, "payload_hash");
+    changed = document;
+    changed["rows"][0]["payload_json"] =
+        json!(r#"{"resource_id":"site-one","source_id":"foreign-source"}"#);
+    assert_eq!(
+        encode(&input(&changed)).unwrap_err().code,
+        "payload_identity"
+    );
+}
+
 fn row(kind: &str, payload: Value, hash: &str) -> Value {
     json!({"resource_type":kind,"resource_id":payload["resource_id"],"payload_hash":hash,
         "payload_json":serde_json::to_string(&payload).unwrap(),"acquired_resource_sha256":null,

@@ -27,6 +27,7 @@ pub(super) fn payload_hash(
     payload: &Map<String, Value>,
     contract: &str,
     resource_type: &str,
+    completion_v3: bool,
 ) -> std::result::Result<String, &'static str> {
     if contract == "transport_bound_v1" {
         return Ok(digest(&object_json_bytes(payload, true, true)));
@@ -39,6 +40,9 @@ pub(super) fn payload_hash(
         "fhir_fetch_mode",
     ] {
         content.remove(field);
+    }
+    if completion_v3 {
+        return Ok(digest(&object_json_bytes(&content, false, false)));
     }
     if contract == "transport_neutral_v2" {
         return Ok(sha256(&Value::Object(content)));

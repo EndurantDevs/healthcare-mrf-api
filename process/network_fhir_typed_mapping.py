@@ -3,6 +3,7 @@
 
 import asyncio
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date
 from uuid import UUID, uuid4
@@ -190,15 +191,26 @@ async def _office_inputs(connection, stage, mapping, approved_keys):
     )
 
 
+def _single_office_matches(office_rows):
+    counts_by_office = Counter((office_row["provider_id"], office_row["location_id"]) for office_row in office_rows)
+    return [
+        office_row
+        for office_row in office_rows
+        if office_row["matched_key"] is not None
+        and counts_by_office[office_row["provider_id"], office_row["location_id"]] == 1
+    ]
+
+
 def _accepted_office_rows(matched_rows, canonical):
     accepted_rows = []
     for office_row, canonical_address in zip(matched_rows, canonical, strict=True):
-        require(
-            UUID(canonical_address["address_key"]) == office_row["address_key"]
-            and canonical_address["identity_key"] == office_row["canonical_identity"],
-            "office_identity_differs",
-        )
-        accepted_rows.append((office_row["provider_id"], office_row["location_id"], office_row["matched_key"]))
+        if (
+            canonical_address["address_key"] is not None
+            and canonical_address["identity_key"] is not None
+            and UUID(canonical_address["address_key"]) == office_row["address_key"]
+            and canonical_address["identity_key"] == office_row["canonical_identity"]
+        ):
+            accepted_rows.append((office_row["provider_id"], office_row["location_id"], office_row["matched_key"]))
     return accepted_rows
 
 
@@ -232,9 +244,7 @@ async def _match_offices(connection, mapping, address_source, matches):
         if not office_rows:
             break
         after = office_rows[-1]["provider_id"], office_rows[-1]["location_id"]
-        identities = [(office_row["provider_id"], office_row["location_id"]) for office_row in office_rows]
-        require(len(identities) == len(set(identities)), "ambiguous_office")
-        matched_rows = [office_row for office_row in office_rows if office_row["matched_key"] is not None]
+        matched_rows = _single_office_matches(office_rows)
         address_values = [tuple(office_row[field] for field in ADDRESS_FIELDS) for office_row in matched_rows]
         canonical = (
             await drain_operation(

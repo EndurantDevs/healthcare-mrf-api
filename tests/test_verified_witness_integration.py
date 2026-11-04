@@ -136,7 +136,7 @@ async def test_independent_v2_reuse_follows_declared_source_not_publication_fenc
         expected={"revision": 4},
         control_schema="registry",
         office_authority=None,
-        inventory=(object(), (object(),), ()),
+        inventory=(object(), (SimpleNamespace(source_pin=object()),), ()),
     )
     read_context = stage.await_args.kwargs["read_context"]
     assert read_context.source_manifest is previous
