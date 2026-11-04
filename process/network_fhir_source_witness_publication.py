@@ -28,7 +28,7 @@ from process.provider_directory_admission_seal import (
     AdmissionSealError,
     ProviderDirectoryAdmissionSeal,
 )
-from process.provider_directory_admission_stream import _copy_field_reader, _GenericProofStream
+from process.provider_directory_admission_stream import _Capture, _copy_field_reader, _GenericProofStream
 from process.provider_directory_fhir_subset_canonical import canonical_payload_sha256
 from process.provider_directory_generic_source_storage import validate_handoff_completion
 from process.provider_directory_source_summary import (
@@ -37,6 +37,50 @@ from process.provider_directory_source_summary import (
     validate_semantic_source_summary,
 )
 from process.uhc_canonical_proof import UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY
+
+
+class _SkippedMetadataCapture(_Capture):
+    """Validate unused values without retaining their aggregate object graph."""
+
+    def __init__(self):
+        self.allow_payload_numbers = True
+        self.depth = 0
+        self.event_count = 0
+        self.estimated_bytes = 0
+
+    def _is_complete_after_event(self, event_name, event_value):
+        normalized = self._normalized_event_value(event_name, event_value)
+        # Keep the original scalar and event bounds; no aggregate is constructed.
+        self.estimated_bytes = 0
+        self._record_event_size(event_name, normalized)
+        if event_name in {"start_map", "start_array"}:
+            self.depth += 1
+        elif event_name in {"end_map", "end_array"}:
+            self.depth -= 1
+        return self.depth == 0
+
+
+class _AdmittedGenericWitnessStream(_GenericProofStream):
+    """Reconstruct proof inputs while the original raw hash and seal stay authoritative."""
+
+    def _start_capture(self, capture_scope, key, event_name, event_value, *, allow_payload_numbers=False):
+        if capture_scope == "root" and key in {
+            "completion_proof_v1",
+            "resource_diagnostics",
+            "server_issued_subset_replay_evidence",
+        }:
+            self.capture = _SkippedMetadataCapture()
+            self.capture_target = (capture_scope, key)
+            if self.capture._is_complete_after_event(event_name, event_value):
+                self._store_capture()
+            return
+        super()._start_capture(capture_scope, key, event_name, event_value, allow_payload_numbers=allow_payload_numbers)
+
+    def _store_capture(self):
+        if isinstance(self.capture, _SkippedMetadataCapture):
+            self.capture = self.capture_target = None
+        else:
+            super()._store_capture()
 
 
 def publication_profile(header):
@@ -108,9 +152,14 @@ def _summary(summary, origin):
 
 
 @contextmanager
-def _metadata_stream(path):
+def _metadata_stream(path, *, admission_profile=None):
     """Reuse the bounded original parser, including duplicate-key and COPY-trailer guards."""
-    stream = _GenericProofStream(path.parent)
+    stream_type = (
+        _AdmittedGenericWitnessStream
+        if admission_profile in {ADMITTED_LEGACY_PROFILE, ADMITTED_TRANSPORT_PROFILE}
+        else _GenericProofStream
+    )
+    stream = stream_type(path.parent)
     try:
         source, field = _copy_field_reader(path)
         with source:
@@ -274,5 +323,5 @@ async def verify_publication(reader, declaration, header):
     else:
         require(header["completion_proof_required_version"] is None and header["completion_absent"] is True)
     async with retained._publication_metadata_copy(reader, origin) as path:
-        with _metadata_stream(path) as stream:
+        with _metadata_stream(path, admission_profile=origin.admission_profile) as stream:
             _validate_metadata(stream, origin, header)
