@@ -195,42 +195,44 @@ def _summary(root, documents, *, offices):
 
     if type(root) is not SourceInventoryRoot:
         raise ValueError("registry_typed_metadata_invalid")
-    selected = [_child(document, offices) for document in documents]
-    documents = [document for document, _version in selected]
-    typed = [document for document, version in selected if version is None]
+    selected_documents = [_child(document, offices) for document in documents]
+    documents = [document for document, _version in selected_documents]
+    typed_documents = [document for document, version in selected_documents if version is None]
     expected = root.derivation_count if offices else root.contribution_count
     identities = [document["recipe_sha256"] for document in documents]
-    if not typed or len(documents) != expected or identities != sorted(set(identities)):
+    if not typed_documents or len(documents) != expected or identities != sorted(set(identities)):
         raise ValueError("registry_typed_metadata_invalid")
     counters = ("matched_offices", "missing_offices") if offices else COUNTERS
-    totals = {
-        name: sum((document if offices else document["counters"])[name] for document in typed) for name in counters
+    totals_by_name = {
+        name: sum((document if offices else document["counters"])[name] for document in typed_documents)
+        for name in counters
     }
-    legacy = []
-    for version in sorted({version for _document, version in selected if version is not None}):
-        children = [document for document, selected_version in selected if selected_version == version]
-        legacy.append(
+    legacy_summaries = []
+    for version in sorted({version for _document, version in selected_documents if version is not None}):
+        child_documents = [document for document, selected_version in selected_documents if selected_version == version]
+        legacy_summaries.append(
             {
                 "version": version,
-                "source_count": len(children),
+                "source_count": len(child_documents),
                 "counters": {
-                    name: sum(document[name] for document in children) for name in _legacy_fields(version, offices)
+                    name: sum(document[name] for document in child_documents)
+                    for name in _legacy_fields(version, offices)
                 },
             }
         )
-    summary = {
+    summary_by_field = {
         "component": "registry_initial_source_offices" if offices else "registry_source_contributions",
         "revision": 6,
         "inventory_entries_sha256": root.entries_sha256,
         "source_count": len(documents),
-        "typed_source_count": len(typed),
+        "typed_source_count": len(typed_documents),
         "sources_sha256": hashlib.sha256(canonical(documents).encode()).hexdigest(),
-        "counters": totals,
-        "legacy": legacy,
+        "counters": totals_by_name,
+        "legacy": legacy_summaries,
     }
     if offices:
-        context = {
-            name: typed[0][name]
+        context_by_name = {
+            name: typed_documents[0][name]
             for name in (
                 "office_policy",
                 "canonicalizer_version",
@@ -240,18 +242,45 @@ def _summary(root, documents, *, offices):
                 "address_identity",
             )
         }
-        if any(any(document[name] != value for name, value in context.items()) for document in typed):
+        if any(
+            any(document[name] != context_value for name, context_value in context_by_name.items())
+            for document in typed_documents
+        ):
             raise ValueError("registry_typed_metadata_invalid")
-        summary["context"] = context
-    return validate_typed_summary(summary, root, offices=offices)
+        summary_by_field["context"] = context_by_name
+    return validate_typed_summary(summary_by_field, root, offices=offices)
 
 
 def typed_contribution_summary(root, descriptors):
+    """Summarize exact mixed contribution formats under the inventory root."""
     return _summary(root, descriptors, offices=False)
 
 
 def typed_office_summary(root, derivations):
+    """Summarize office derivations with their shared approval and address context."""
     return _summary(root, derivations, offices=True)
+
+
+def _validate_legacy_summary(document, expected, offices):
+    legacy = document["legacy"]
+    if type(legacy) is not list or len(legacy) > (2 if offices else 3):
+        raise ValueError("registry_typed_metadata_invalid")
+    versions, count = [], document["typed_source_count"]
+    for child in legacy:
+        _closed(child, {"version", "source_count", "counters"})
+        if type(child["version"]) is not int:
+            raise ValueError("registry_typed_metadata_invalid")
+        fields = _legacy_fields(child["version"], offices)
+        _closed(child["counters"], set(fields))
+        _counter(child["source_count"])
+        if not child["source_count"]:
+            raise ValueError("registry_typed_metadata_invalid")
+        for counter_value in child["counters"].values():
+            _counter(counter_value)
+        versions.append(child["version"])
+        count += child["source_count"]
+    if versions != sorted(set(versions)) or count != expected:
+        raise ValueError("registry_typed_metadata_invalid")
 
 
 def validate_typed_summary(document, root, *, offices=False):
@@ -287,25 +316,7 @@ def validate_typed_summary(document, root, *, offices=False):
     _counter(document["typed_source_count"])
     if not 0 < document["typed_source_count"] <= expected:
         raise ValueError("registry_typed_metadata_invalid")
-    legacy = document["legacy"]
-    if type(legacy) is not list or len(legacy) > (2 if offices else 3):
-        raise ValueError("registry_typed_metadata_invalid")
-    versions, count = [], document["typed_source_count"]
-    for child in legacy:
-        _closed(child, {"version", "source_count", "counters"})
-        if type(child["version"]) is not int:
-            raise ValueError("registry_typed_metadata_invalid")
-        fields = _legacy_fields(child["version"], offices)
-        _closed(child["counters"], set(fields))
-        _counter(child["source_count"])
-        if not child["source_count"]:
-            raise ValueError("registry_typed_metadata_invalid")
-        for value in child["counters"].values():
-            _counter(value)
-        versions.append(child["version"])
-        count += child["source_count"]
-    if versions != sorted(set(versions)) or count != expected:
-        raise ValueError("registry_typed_metadata_invalid")
+    _validate_legacy_summary(document, expected, offices)
     if offices:
         _closed(document["counters"], {"matched_offices", "missing_offices"})
         context = document["context"]
@@ -321,8 +332,8 @@ def validate_typed_summary(document, root, *, offices=False):
             },
         )
         _office_context(context)
-        for value in document["counters"].values():
-            _counter(value)
+        for counter_value in document["counters"].values():
+            _counter(counter_value)
     else:
         _counts(document["counters"])
     return _defensive(document)

@@ -35,9 +35,9 @@ async def verify_compact_slice_contents(connection, copy_target, layout, *, cand
         )
     )
     if candidate is not None:
-        from process.registry_typed_membership_parity import typed_candidate
+        from process.registry_typed_membership_parity import is_typed_candidate
 
-        if typed_candidate(candidate):
+        if is_typed_candidate(candidate):
             from process.network_typed_slice_native import verify_digests
 
             await verify_digests(connection, copy_target)

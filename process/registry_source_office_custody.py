@@ -278,7 +278,7 @@ async def _legacy_verified_bindings(
     connection, copy_target, candidate, approved, table_name, schema, *, source_stage=None
 ):
     """Reconstruct raw SOURCE/EAU matches and compare retained membership multisets."""
-    from process.network_initial_cms_office_bindings import _matched_page, verified_retained_offices
+    from process.network_initial_cms_office_bindings import verified_retained_offices
     from process.registry_source_retention import verify_registry_source_retention_rows
     from process.registry_verified_office_policy import (
         cleanup_legacy_verified_stage,

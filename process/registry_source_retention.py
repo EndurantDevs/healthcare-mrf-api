@@ -154,9 +154,9 @@ async def retain_registry_source_memberships(connection, copy_target, stage, *, 
             if counts["stage_rows"] != receipt["source_rows"]:
                 raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
             if counts["source_rows"] == 0:
-                from process.registry_typed_membership_parity import create_order_index, typed_candidate
+                from process.registry_typed_membership_parity import create_order_index, is_typed_candidate
 
-                if typed_candidate(candidate):
+                if is_typed_candidate(candidate):
                     await create_order_index(connection, source_relation, "typed_source_membership_order_idx")
                     from process.registry_typed_office_parity import create_source_pair_index
 
@@ -193,14 +193,14 @@ async def verify_registry_source_retention_rows(connection, copy_target, candida
             raise RegistrySourceRetentionError("registry_source_retention_accounting_invalid")
         if source_stage is not None:
             projection = _stage_projection(_stage_relation(source_stage, receipt), stage=source_stage)
-            from process.registry_typed_membership_parity import multiset_differs, typed_candidate
+            from process.registry_typed_membership_parity import has_multiset_difference, is_typed_candidate
 
-            if typed_candidate(candidate):
+            if is_typed_candidate(candidate):
                 from process.registry_typed_membership_parity import require_order_index
 
                 await require_order_index(connection, source_relation)
                 await require_order_index(connection, _stage_relation(source_stage, receipt))
-                differs = await multiset_differs(connection, "SELECT * FROM " + source_relation, projection)
+                differs = await has_multiset_difference(connection, "SELECT * FROM " + source_relation, projection)
             else:
                 differs = await connection.fetchval(f"""WITH staged AS MATERIALIZED ({projection}), differences AS (
                   (SELECT * FROM {source_relation} EXCEPT ALL SELECT * FROM staged)

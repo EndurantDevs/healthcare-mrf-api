@@ -42,12 +42,15 @@ class RetainedTypedGraphRead:
 
     @property
     def document(self):
+        """Expose the graph descriptor retained by the independently verified predecessor."""
         return self.loaded.document
 
     def relation(self, kind):
+        """Resolve a relation through the retained producer capability."""
         return self.loaded.relation(kind)
 
     async def verify(self, connection):
+        """Require predecessor custody, task identity and the unchanged capture hash."""
         require(type(self.proof) is RetainedTypedSourceProof and self.proof.brand is _BRAND, "retained_source_custody")
         require(
             self.proof.connection is connection and self.proof.task is asyncio.current_task(), "retained_source_scope"
@@ -58,12 +61,12 @@ class RetainedTypedGraphRead:
 
 async def retained_typed_source_proofs(connection, manifest, recipes, control_schema):
     """Authenticate the exact predecessor and native inventory before reusing any immutable Source input."""
-    wanted = {
+    recipes_by_json = {
         canonical_registry_source_recipes((recipe,))[1:-1]: recipe
         for recipe in recipes
         if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource
     }
-    if manifest is None or not wanted:
+    if manifest is None or not recipes_by_json:
         return {}
     current = await resolve_network_serving_manifest(
         connection, generation_id=manifest.generation_id, control_schema=control_schema
@@ -82,9 +85,9 @@ async def retained_typed_source_proofs(connection, manifest, recipes, control_sc
         expected_table_oid=inventory_oid,
         control_schema=control_schema,
     )
-    proofs = {}
+    proofs_by_recipe = {}
     for entry in entries:
-        recipe = wanted.get(entry.recipe_json)
+        recipe = recipes_by_json.get(entry.recipe_json)
         if recipe is None:
             continue
         require(
@@ -100,7 +103,7 @@ async def retained_typed_source_proofs(connection, manifest, recipes, control_sc
             and descriptor["catalog_generation"] == recipe.source_pin.catalog_generation,
             "retained_source_inventory",
         )
-        proofs[identity] = RetainedTypedSourceProof(
+        proofs_by_recipe[identity] = RetainedTypedSourceProof(
             connection,
             asyncio.current_task(),
             identity,
@@ -109,4 +112,4 @@ async def retained_typed_source_proofs(connection, manifest, recipes, control_sc
             recipe.source_pin.generation_id,
             _BRAND,
         )
-    return proofs
+    return proofs_by_recipe

@@ -59,18 +59,18 @@ async def bind_typed_graph_stage(connection, *, schema_name, table_names, expect
     require(type(table_names) is dict and set(table_names) in ({"cells", "addresses", "pairs"}, set(_DDL)), "tables")
     for name in table_names.values():
         _identifier(name)
-    oids = {
+    oids_by_kind = {
         kind: await connection.fetchval("SELECT to_regclass($1)::oid::bigint", schema_name + "." + name)
         for kind, name in table_names.items()
     }
-    require(all(type(oid) is int and oid > 0 for oid in oids.values()), "tables_missing")
-    require(expected_oids is None or expected_oids == oids, "tables_changed")
+    require(all(type(oid) is int and oid > 0 for oid in oids_by_kind.values()), "tables_missing")
+    require(expected_oids is None or expected_oids == oids_by_kind, "tables_changed")
     return TypedFHIRGraphStage(
         connection,
         asyncio.current_task(),
         await _virtual_xid(connection),
         dict(table_names),
-        oids,
+        oids_by_kind,
         schema_name=schema_name,
         document=document,
         brand=_BRAND,
@@ -86,19 +86,19 @@ def _raw_key(prefix=""):
 async def _workspace(connection):
     """A savepoint owns every temporary object; any incomplete pass restarts from zero."""
     require(connection.is_in_transaction(), "transaction_required")
-    names = {kind: "fhir_typed_" + kind + "_" + uuid4().hex for kind in _DDL}
+    names_by_kind = {kind: "fhir_typed_" + kind + "_" + uuid4().hex for kind in _DDL}
     stage, transaction = None, connection.transaction()
     await drain_operation(transaction.start(), preserve_cancellation=True)
     try:
         for kind, definition in _DDL.items():
             await connection.execute(
-                "CREATE TEMP TABLE " + _identifier(names[kind]) + "(" + definition + ") ON COMMIT DROP"
+                "CREATE TEMP TABLE " + _identifier(names_by_kind[kind]) + "(" + definition + ") ON COMMIT DROP"
             )
-        await connection.execute("CREATE INDEX ON " + _identifier(names["addresses"]) + "(address_key)")
-        stage = await bind_typed_graph_stage(connection, schema_name="pg_temp", table_names=names)
+        await connection.execute("CREATE INDEX ON " + _identifier(names_by_kind["addresses"]) + "(address_key)")
+        stage = await bind_typed_graph_stage(connection, schema_name="pg_temp", table_names=names_by_kind)
         yield stage
         stage.active = False
-        for name in reversed(tuple(names.values())):
+        for name in reversed(tuple(names_by_kind.values())):
             await drain_operation(
                 connection.execute("DROP TABLE pg_temp." + _identifier(name)), preserve_cancellation=True
             )
@@ -128,11 +128,14 @@ def _page_rows(page, origin, counts, after):
         len(json.dumps(page, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()) <= 8 * 1024**2,
         "page_bounds",
     )
-    wire = []
-    for row in page:
-        require(type(row) is dict and set(row) == _RESOURCE_FIELDS, "resource_shape")
-        require(row["dataset_id"] == origin.dataset_id and row["acquired_resource_sha256"] is None, "resource_scope")
-        kind, identity = row["resource_type"], row["resource_id"]
+    wire_rows = []
+    for resource_row in page:
+        require(type(resource_row) is dict and set(resource_row) == _RESOURCE_FIELDS, "resource_shape")
+        require(
+            resource_row["dataset_id"] == origin.dataset_id and resource_row["acquired_resource_sha256"] is None,
+            "resource_scope",
+        )
+        kind, identity = resource_row["resource_type"], resource_row["resource_id"]
         require(
             type(kind) is str and kind in counts and type(identity) is str and _ID.fullmatch(identity),
             "resource_identity",
@@ -140,24 +143,25 @@ def _page_rows(page, origin, counts, after):
         key = kind, identity
         require(after is None or after < key, "resource_order")
         require(
-            type(row["payload_hash"]) is str and re.fullmatch(r"[0-9a-f]{64}", row["payload_hash"]), "resource_hash"
+            type(resource_row["payload_hash"]) is str and re.fullmatch(r"[0-9a-f]{64}", resource_row["payload_hash"]),
+            "resource_hash",
         )
         counts[kind] += 1
         require(counts[kind] <= dict(origin.resource_counts)[kind], "resource_counts")
         after = key
         if kind in KINDS:
-            wire.append(
+            wire_rows.append(
                 {
                     "resource_type": kind,
                     "resource_id": identity,
-                    "payload_hash": row["payload_hash"],
-                    "payload_json": row["payload_json"]
-                    if type(row["payload_json"]) is str
-                    else json.dumps(row["payload_json"]),
+                    "payload_hash": resource_row["payload_hash"],
+                    "payload_json": resource_row["payload_json"]
+                    if type(resource_row["payload_json"]) is str
+                    else json.dumps(resource_row["payload_json"]),
                     "site_id": str(registry_location_id(origin.source_id, identity)) if kind == "Location" else None,
                 }
             )
-    return wire, after
+    return wire_rows, after
 
 
 async def _project_page(connection, stage, rows):
@@ -192,21 +196,21 @@ def _target(value, kind, base):
     return match[1] if match else None
 
 
-def _period_allows(start, end, as_of):
-    converted = []
+def _is_period_allowed(start, end, as_of):
+    converted_dates = []
     for value in (start, end):
         if value is None:
-            converted.append(None)
+            converted_dates.append(None)
             continue
         if _DATE.fullmatch(value) is None:
             return False
         try:
             if len(value) > 10:
                 datetime.fromisoformat(value.replace("Z", "+00:00"))
-            converted.append(date.fromisoformat(value[:10]))
+            converted_dates.append(date.fromisoformat(value[:10]))
         except ValueError:
             return False
-    start_date, end_date = converted
+    start_date, end_date = converted_dates
     return (
         (start_date is None or start_date <= as_of)
         and (end_date is None or end_date >= as_of)
@@ -214,11 +218,11 @@ def _period_allows(start, end, as_of):
     )
 
 
-def _raw_projection(row, base, as_of):
+def _raw_projection(resource_row, base, as_of):
     """Independent raw parser: no producer cells, overlay NPI or Source record-id cache is consulted."""
-    payload = json.loads(row["payload_json"])
-    require(type(payload) is dict, "raw_payload")
-    kind = row["resource_type"]
+    raw_payload = json.loads(resource_row["payload_json"])
+    require(type(raw_payload) is dict, "raw_payload")
+    kind = resource_row["resource_type"]
     is_entity, is_role = (
         kind in {"Organization", "Practitioner"},
         kind in {"PractitionerRole", "OrganizationAffiliation"},
@@ -227,22 +231,24 @@ def _raw_projection(row, base, as_of):
     networks, locations, start, end, status = [], [], None, None, None
     address = [None] * len(ADDRESS_FIELDS)
     if is_entity or is_role:
-        raw_npi = payload.get("npi")
+        raw_npi = raw_payload.get("npi")
         require(raw_npi is None or type(raw_npi) in {str, int}, "raw_npi")
         npi = str(raw_npi) if raw_npi is not None else None
-        active = payload.get("active")
+        active = raw_payload.get("active")
         require(active is None or type(active) is bool, "raw_active")
     if is_role:
-        subject = _text(payload, "practitioner_ref" if kind == "PractitionerRole" else "participating_organization_ref")
-        networks, locations = _refs(payload, "network_refs"), _refs(payload, "location_refs")
-        start, end = _text(payload, "period_start"), _text(payload, "period_end")
+        subject = _text(
+            raw_payload, "practitioner_ref" if kind == "PractitionerRole" else "participating_organization_ref"
+        )
+        networks, locations = _refs(raw_payload, "network_refs"), _refs(raw_payload, "location_refs")
+        start, end = _text(raw_payload, "period_start"), _text(raw_payload, "period_end")
     if kind == "Location":
-        status = _text(payload, "status")
-        address = [_text(payload, field) for field in ADDRESS_FIELDS]
+        status = _text(raw_payload, "status")
+        address = [_text(raw_payload, field) for field in ADDRESS_FIELDS]
     cells = (
         kind,
-        row["resource_id"],
-        row["payload_hash"],
+        resource_row["resource_id"],
+        resource_row["payload_hash"],
         npi,
         active,
         subject,
@@ -252,26 +258,29 @@ def _raw_projection(row, base, as_of):
         end,
         status,
         *address,
-        UUID(row["site_id"]) if row["site_id"] else None,
+        UUID(resource_row["site_id"]) if resource_row["site_id"] else None,
     )
     subject_kind = "Practitioner" if kind == "PractitionerRole" else "Organization"
     checks = (
         kind,
-        row["resource_id"],
+        resource_row["resource_id"],
         subject_kind,
         _target(subject, subject_kind, base),
-        [target for ref in networks if (target := _target(ref, "Organization", base)) is not None],
-        [target for ref in locations if (target := _target(ref, "Location", base)) is not None],
-        active is not False and status != "inactive" and (not is_role or _period_allows(start, end, as_of)),
+        [reference_target for ref in networks if (reference_target := _target(ref, "Organization", base)) is not None],
+        [reference_target for ref in locations if (reference_target := _target(ref, "Location", base)) is not None],
+        active is not False and status != "inactive" and (not is_role or _is_period_allowed(start, end, as_of)),
         npi is not None and is_valid_npi(npi) and re.fullmatch(r"[12][0-9]{9}", npi) is not None,
     )
     return cells, checks
 
 
 async def _check_page(connection, stage, rows, base, as_of):
-    projected = [_raw_projection(row, base, as_of) for row in rows]
-    if projected:
-        for table, records in (("cells", [item[0] for item in projected]), ("checks", [item[1] for item in projected])):
+    projected_rows = [_raw_projection(row, base, as_of) for row in rows]
+    if projected_rows:
+        for table, records in (
+            ("cells", [item[0] for item in projected_rows]),
+            ("checks", [item[1] for item in projected_rows]),
+        ):
             copied = await drain_operation(
                 connection.copy_records_to_table(stage.names[table], schema_name=stage.schema_name, records=records),
                 preserve_cancellation=True,
@@ -305,8 +314,65 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
     return identity, sum(counts.values())
 
 
-async def _canonicalize(connection, stage):
+def _valid_canonical_address_records(pending_by_key, canonical):
+    return [
+        (raw_key, *address_values, UUID(result["address_key"]), result["identity_key"])
+        for (raw_key, address_values), result in zip(pending_by_key.items(), canonical, strict=True)
+        if result["address_key"] is not None and result["identity_key"] is not None
+    ]
+
+
+async def _canonical_address_records(connection, stage, address_rows, fields):
     import ptg2_address_canon as native
+
+    pending_by_key = {}
+    for address_row in address_rows:
+        address_values = tuple(address_row[field] for field in ADDRESS_FIELDS)
+        require(
+            address_row["raw_key"] not in pending_by_key or pending_by_key[address_row["raw_key"]] == address_values,
+            "raw_address_collision",
+        )
+        pending_by_key[address_row["raw_key"]] = address_values
+    known = await connection.fetch(
+        "SELECT raw_key," + fields + " FROM " + stage.relation("addresses") + " WHERE raw_key=ANY($1::text[])",
+        list(pending_by_key),
+    )
+    for address_row in known:
+        require(
+            pending_by_key.pop(address_row["raw_key"]) == tuple(address_row[field] for field in ADDRESS_FIELDS),
+            "raw_address_collision",
+        )
+    if not pending_by_key:
+        return None
+    address_values = list(pending_by_key.values())
+    canonical = await drain_operation(
+        asyncio.to_thread(native.canonicalize_batch, address_values), preserve_cancellation=True
+    )
+    require(len(canonical) == len(pending_by_key), "canonical_count")
+    address_records = _valid_canonical_address_records(pending_by_key, canonical)
+    identities_by_key = {}
+    for address_record in address_records:
+        key, identity = address_record[-2:]
+        require(key not in identities_by_key or identities_by_key[key] == identity, "canonical_collision")
+        identities_by_key[key] = identity
+    existing = await connection.fetch(
+        "SELECT address_key,canonical_identity FROM "
+        + stage.relation("addresses")
+        + " WHERE address_key=ANY($1::uuid[])",
+        list(identities_by_key),
+    )
+    require(
+        all(
+            identities_by_key[address_row["address_key"]] == address_row["canonical_identity"]
+            for address_row in existing
+        ),
+        "canonical_collision",
+    )
+    return address_records
+
+
+async def _canonicalize(connection, stage):
+    """Canonicalize bounded location pages while refusing raw-key and full-identity collisions."""
 
     fields = ",".join(ADDRESS_FIELDS)
     query = (
@@ -327,53 +393,20 @@ async def _canonicalize(connection, stage):
             require(limit > 1, "canonical_bounds")
             limit = max(1, limit // 2)
             continue
-        rows = await connection.fetch(query, after, limit)
-        if not rows:
+        address_rows = await connection.fetch(query, after, limit)
+        if not address_rows:
             break
-        after = rows[-1]["resource_id"]
-        pending = {}
-        for row in rows:
-            values = tuple(row[field] for field in ADDRESS_FIELDS)
-            require(row["raw_key"] not in pending or pending[row["raw_key"]] == values, "raw_address_collision")
-            pending[row["raw_key"]] = values
-        known = await connection.fetch(
-            "SELECT raw_key," + fields + " FROM " + stage.relation("addresses") + " WHERE raw_key=ANY($1::text[])",
-            list(pending),
-        )
-        for row in known:
-            require(
-                pending.pop(row["raw_key"]) == tuple(row[field] for field in ADDRESS_FIELDS), "raw_address_collision"
-            )
-        if not pending:
+        after = address_rows[-1]["resource_id"]
+        address_records = await _canonical_address_records(connection, stage, address_rows, fields)
+        if address_records is None:
             continue
-        values = list(pending.values())
-        canonical = await drain_operation(
-            asyncio.to_thread(native.canonicalize_batch, values), preserve_cancellation=True
-        )
-        require(len(canonical) == len(pending), "canonical_count")
-        identities = {}
-        for result in canonical:
-            key = UUID(result["address_key"])
-            require(key not in identities or identities[key] == result["identity_key"], "canonical_collision")
-            identities[key] = result["identity_key"]
-        existing = await connection.fetch(
-            "SELECT address_key,canonical_identity FROM "
-            + stage.relation("addresses")
-            + " WHERE address_key=ANY($1::uuid[])",
-            list(identities),
-        )
-        require(
-            all(identities[row["address_key"]] == row["canonical_identity"] for row in existing), "canonical_collision"
-        )
-        records = [
-            (key, *values[index], UUID(result["address_key"]), result["identity_key"])
-            for index, (key, result) in enumerate(zip(pending, canonical, strict=True))
-        ]
         copied = await drain_operation(
-            connection.copy_records_to_table(stage.names["addresses"], schema_name=stage.schema_name, records=records),
+            connection.copy_records_to_table(
+                stage.names["addresses"], schema_name=stage.schema_name, records=address_records
+            ),
             preserve_cancellation=True,
         )
-        require(copied == "COPY " + str(len(records)), "canonical_copy")
+        require(copied == "COPY " + str(len(address_records)), "canonical_copy")
 
 
 async def _pairs(connection, stage, origin, as_of, *, checker=False):
@@ -389,9 +422,9 @@ async def _pairs(connection, stage, origin, as_of, *, checker=False):
         + " WHERE resource_type IN ('PractitionerRole','OrganizationAffiliation') AND (resource_type,resource_id)>($1,$2) ORDER BY resource_type,resource_id LIMIT 128",
         *after,
     ):
-        last = tuple(rows[-1])
-        await connection.execute("INSERT INTO " + stage.relation("pairs") + " " + query, *arguments, *after, *last)
-        after = last
+        last_keys = tuple(rows[-1])
+        await connection.execute("INSERT INTO " + stage.relation("pairs") + " " + query, *arguments, *after, *last_keys)
+        after = last_keys
 
 
 async def _same_rows(connection, left, right, columns, keys):

@@ -12,7 +12,12 @@ from process.network_custom_address_source import _artifact_dependency_identity
 from process.network_fhir_source_epoch_pin import _virtual_xid
 from process.network_fhir_source_witness_contract import digest
 from process.network_fhir_typed_contract import require
-from process.network_fhir_typed_mapping import BINDING_COLUMNS, MEMBER_COLUMNS, prepare_typed_graph_mapping
+from process.network_fhir_typed_mapping import (
+    BINDING_COLUMNS,
+    MEMBER_COLUMNS,
+    TypedGraphApproval,
+    prepare_typed_graph_mapping,
+)
 from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.registry_source_recipe_composition import (
     RegistrySourceRecipeStage,
@@ -43,6 +48,7 @@ class TypedOfficeMatches:
     brand: object = None
 
     async def verify(self, connection, address_source, roles, approved, control_schema):
+        """Recheck task, transaction, approval, native address identity and child mappings."""
         require(
             self.brand is _BRAND and self.connection is connection and self.task is asyncio.current_task(),
             "office_capability",
@@ -75,6 +81,7 @@ class TypedOfficeMatches:
 
 
 def is_typed_source_stage(stage):
+    """Recognize only a typed stage carrying the original office capability brand."""
     return (
         type(stage) is RegistrySourceRecipeStage
         and stage.contribution_revision == 4
@@ -84,11 +91,13 @@ def is_typed_source_stage(stage):
 
 
 def typed_stage_projection(stage):
+    """Render membership rows only from an authenticated typed stage."""
     require(is_typed_source_stage(stage), "stage_kind")
     return "SELECT " + ",".join(MEMBER_COLUMNS) + " FROM pg_temp." + _identifier(stage.table_name)
 
 
 async def verify_typed_stage_offices(connection, stage, address_source, runtime_roles, approved, control_schema):
+    """Require the typed office capability against the supplied approval and address pins."""
     require(is_typed_source_stage(stage), "stage_kind")
     await stage.office_matches.verify(connection, address_source, runtime_roles, approved, control_schema)
 
@@ -173,9 +182,156 @@ async def stage_verified_typed_source_recipes(
     )
 
 
+def _typed_mapping_documents(recipe, mapped):
+    recipe_sha256 = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
+    metadata = mapped.metadata
+    contribution = validate_typed_contribution(
+        {
+            "component": "registry_fhir_typed_contribution",
+            "descriptor_version": 4,
+            "recipe_sha256": recipe_sha256,
+            "capture_sha256": recipe.source_pin.generation_id,
+            **{key: metadata[key] for key in ("catalog_generation", "mapping_sha256", "counters")},
+        }
+    )
+    derivation = validate_typed_derivation(
+        {
+            "derivation_version": 3,
+            "recipe_sha256": recipe_sha256,
+            "capture_sha256": recipe.source_pin.generation_id,
+            "contribution_sha256": digest(contribution),
+            **{
+                key: metadata[key]
+                for key in (
+                    "mapping_sha256",
+                    "office_policy",
+                    "canonicalizer_version",
+                    "approved_revision",
+                    "approved_generation_sha256",
+                    "address_source",
+                    "address_identity",
+                )
+            },
+            **{key: metadata["counters"][key] for key in ("matched_offices", "missing_offices")},
+        }
+    )
+    return contribution, derivation
+
+
+async def _map_typed_recipes(
+    connection, recipes, approved, table, read_context, source_reader, retained_proofs, control_schema
+):
+    address_source, roles = read_context.verified_office_inputs
+    mappings, contributions, derivations, generations = [], [], [], []
+    for recipe in recipes:
+        recipe_sha256 = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
+        if retained_proofs is not None and recipe_sha256 in retained_proofs:
+            from process.registry_source_recipe_composition import load_typed_source_read
+            from process.registry_typed_retained_source import RetainedTypedGraphRead
+
+            loaded = await load_typed_source_read(
+                connection, recipe, approved, control_schema, read_context.source_witness_runtime
+            )
+            read = RetainedTypedGraphRead(loaded, retained_proofs[recipe_sha256])
+            await read.verify(connection)
+        else:
+            read = await source_reader(
+                connection, recipe, approved, control_schema, read_context.source_witness_runtime
+            )
+        mapped = await prepare_typed_graph_mapping(
+            connection,
+            read,
+            approval=TypedGraphApproval(
+                approved_source=approved,
+                binding_coordinates=recipe.binding_coordinates,
+                catalog_descriptor=recipe.source_pin.catalog_descriptor,
+            ),
+            address_source=address_source,
+            runtime_roles=roles,
+            control_schema=control_schema,
+        )
+        await connection.execute(
+            "INSERT INTO pg_temp."
+            + _identifier(table)
+            + " SELECT "
+            + ",".join(MEMBER_COLUMNS)
+            + " FROM "
+            + mapped.relation("memberships")
+        )
+        contribution, derivation = _typed_mapping_documents(recipe, mapped)
+        mappings.append(mapped)
+        contributions.append(contribution)
+        derivations.append(derivation)
+        generations.append(digest([contribution, derivation]))
+    return mappings, contributions, derivations, generations
+
+
+async def _typed_office_matches(connection, mappings, recipe_hash, approved, address_source, roles, control_schema):
+    name, oid = await _bindings(connection, [mapping.relation("bindings") for mapping in mappings])
+    address_identity_values = tuple(
+        await _artifact_dependency_identity(
+            connection, address_source, roles, address=True, control_schema=control_schema
+        )
+    )
+    matches = TypedOfficeMatches(
+        connection,
+        asyncio.current_task(),
+        await _virtual_xid(connection),
+        name,
+        oid,
+        recipe_hash,
+        approved.generation_id,
+        address_source,
+        address_identity_values,
+        tuple(roles),
+        tuple(mappings),
+        brand=_BRAND,
+    )
+    return matches
+
+
+async def _typed_recipe_stage(connection, recipes, approved, table, recipe_hash, mapped_outputs, matches):
+    mappings, contributions, derivations, generations = mapped_outputs
+    mapped_rows = sum(contribution_document["counters"]["mapped_pair_rows"] for contribution_document in contributions)
+    omitted = sum(
+        contribution_document["counters"]["strict_pair_rows"] - contribution_document["counters"]["mapped_pair_rows"]
+        for contribution_document in contributions
+    )
+    provider_rows = sum(
+        [await connection.fetchval("SELECT count(*) FROM " + mapping.relation("provider_only")) for mapping in mappings]
+    )
+    context_by_name = {
+        key: mappings[0].metadata[key]
+        for key in (
+            "office_policy",
+            "canonicalizer_version",
+            "approved_revision",
+            "approved_generation_sha256",
+            "address_source",
+            "address_identity",
+        )
+    }
+    return RegistrySourceRecipeStage(
+        table,
+        mapped_rows,
+        omitted,
+        _source_stage_generation(recipe_hash, approved, generations, mapped_rows, omitted),
+        source_generations=tuple(generations),
+        provider_only_rows=provider_rows,
+        contribution_receipts=tuple(contributions),
+        contribution_revision=4,
+        inventory=True,
+        office_matches=matches,
+        raw_source_generations=tuple(recipe.source_pin.generation_id for recipe in recipes),
+        office_derivations=tuple(derivations),
+        office_policy_context=context_by_name,
+    )
+
+
 async def _stage_typed_source_recipes(
     connection, recipes, approved, *, request_id, control_schema, read_context, source_reader, retained_proofs=None
 ):
+    """Stage complete typed recipes and bind their membership, office and accounting proofs."""
     require(
         connection.is_in_transaction()
         and type(request_id) is UUID
@@ -190,7 +346,6 @@ async def _stage_typed_source_recipes(
     address_source, roles = read_context.verified_office_inputs
     recipes, recipe_hash = _source_stage_recipes(recipes, True)
     table = "registry_source_page_" + uuid5(request_id, recipe_hash + ":" + approved.generation_id).hex
-    mappings, contributions, derivations, generations = [], [], [], []
     async with connection.transaction():
         await connection.execute(
             "CREATE TEMP TABLE "
@@ -200,154 +355,20 @@ async def _stage_typed_source_recipes(
         from process.registry_typed_membership_parity import create_order_index
 
         await create_order_index(connection, "pg_temp." + _identifier(table), table + "_order_idx")
-        for recipe in recipes:
-            identity = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
-            if retained_proofs is not None and identity in retained_proofs:
-                from process.registry_source_recipe_composition import load_typed_source_read
-                from process.registry_typed_retained_source import RetainedTypedGraphRead
-
-                loaded = await load_typed_source_read(
-                    connection, recipe, approved, control_schema, read_context.source_witness_runtime
-                )
-                read = RetainedTypedGraphRead(loaded, retained_proofs[identity])
-                await read.verify(connection)
-            else:
-                read = await source_reader(
-                    connection, recipe, approved, control_schema, read_context.source_witness_runtime
-                )
-            mapped = await prepare_typed_graph_mapping(
-                connection,
-                read,
-                approved_source=approved,
-                binding_coordinates=recipe.binding_coordinates,
-                catalog_descriptor=recipe.source_pin.catalog_descriptor,
-                address_source=address_source,
-                runtime_roles=roles,
-                control_schema=control_schema,
-            )
-            await connection.execute(
-                "INSERT INTO pg_temp."
-                + _identifier(table)
-                + " SELECT "
-                + ",".join(MEMBER_COLUMNS)
-                + " FROM "
-                + mapped.relation("memberships")
-            )
-            identity = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
-            metadata = mapped.metadata
-            contribution = validate_typed_contribution(
-                {
-                    "component": "registry_fhir_typed_contribution",
-                    "descriptor_version": 4,
-                    "recipe_sha256": identity,
-                    "capture_sha256": recipe.source_pin.generation_id,
-                    **{key: metadata[key] for key in ("catalog_generation", "mapping_sha256", "counters")},
-                }
-            )
-            derivation = validate_typed_derivation(
-                {
-                    "derivation_version": 3,
-                    "recipe_sha256": identity,
-                    "capture_sha256": recipe.source_pin.generation_id,
-                    "contribution_sha256": digest(contribution),
-                    **{
-                        key: metadata[key]
-                        for key in (
-                            "mapping_sha256",
-                            "office_policy",
-                            "canonicalizer_version",
-                            "approved_revision",
-                            "approved_generation_sha256",
-                            "address_source",
-                            "address_identity",
-                        )
-                    },
-                    **{key: metadata["counters"][key] for key in ("matched_offices", "missing_offices")},
-                }
-            )
-            mappings.append(mapped)
-            contributions.append(contribution)
-            derivations.append(derivation)
-            generations.append(digest([contribution, derivation]))
-        name, oid = await _bindings(connection, [mapping.relation("bindings") for mapping in mappings])
-        identity = tuple(
-            await _artifact_dependency_identity(
-                connection, address_source, roles, address=True, control_schema=control_schema
-            )
+        mapped_outputs = await _map_typed_recipes(
+            connection, recipes, approved, table, read_context, source_reader, retained_proofs, control_schema
         )
-        matches = TypedOfficeMatches(
-            connection,
-            asyncio.current_task(),
-            await _virtual_xid(connection),
-            name,
-            oid,
-            recipe_hash,
-            approved.generation_id,
-            address_source,
-            identity,
-            tuple(roles),
-            tuple(mappings),
-            brand=_BRAND,
+        matches = await _typed_office_matches(
+            connection, mapped_outputs[0], recipe_hash, approved, address_source, roles, control_schema
         )
-        mapped_rows = sum(item["counters"]["mapped_pair_rows"] for item in contributions)
-        omitted = sum(
-            item["counters"]["strict_pair_rows"] - item["counters"]["mapped_pair_rows"] for item in contributions
-        )
-        provider_rows = sum(
-            [
-                await connection.fetchval("SELECT count(*) FROM " + mapping.relation("provider_only"))
-                for mapping in mappings
-            ]
-        )
-        context = {
-            key: mappings[0].metadata[key]
-            for key in (
-                "office_policy",
-                "canonicalizer_version",
-                "approved_revision",
-                "approved_generation_sha256",
-                "address_source",
-                "address_identity",
-            )
-        }
-        return RegistrySourceRecipeStage(
-            table,
-            mapped_rows,
-            omitted,
-            _source_stage_generation(recipe_hash, approved, generations, mapped_rows, omitted),
-            source_generations=tuple(generations),
-            provider_only_rows=provider_rows,
-            contribution_receipts=tuple(contributions),
-            contribution_revision=4,
-            inventory=True,
-            office_matches=matches,
-            raw_source_generations=tuple(recipe.source_pin.generation_id for recipe in recipes),
-            office_derivations=tuple(derivations),
-            office_policy_context=context,
-        )
+        return await _typed_recipe_stage(connection, recipes, approved, table, recipe_hash, mapped_outputs, matches)
 
 
-async def combine_typed_source_stages(
-    connection, typed_stage, legacy_stage, *, request_id, recipes, approved, control_schema
-):
-    """Union native typed rows with unchanged legacy semantics and retain both proof capabilities."""
+async def _copy_combined_stage(connection, typed_stage, legacy_stage, request_id, recipe_hash, approved):
     from process.registry_source_office_custody import _copy_verified_binding_pages
     from process.registry_source_retention import registry_source_stage_projection
 
-    require(
-        is_typed_source_stage(typed_stage)
-        and type(legacy_stage) is RegistrySourceRecipeStage
-        and legacy_stage.office_matches is not None,
-        "mixed_stage",
-    )
-    recipes, recipe_hash = _source_stage_recipes(recipes, True)
     matches = typed_stage.office_matches
-    await matches.verify(connection, matches.address_source, matches.runtime_roles, approved, control_schema)
-    from process.network_initial_cms_office_bindings import verified_retained_offices
-
-    await verified_retained_offices(
-        connection, legacy_stage.office_matches, matches.address_source, matches.runtime_roles, control_schema
-    )
     name = "registry_source_page_" + uuid5(request_id, "mixed:" + recipe_hash + approved.generation_id).hex
     from process.registry_typed_membership_parity import create_order_index
 
@@ -368,6 +389,28 @@ async def combine_typed_source_stages(
         + registry_source_stage_projection("pg_temp." + _identifier(legacy_stage.table_name))
     )
     await _copy_verified_binding_pages(connection, legacy_stage.office_matches, matches.table_name)
+    return name
+
+
+async def combine_typed_source_stages(
+    connection, typed_stage, legacy_stage, *, request_id, recipes, approved, control_schema
+):
+    """Union native typed rows with unchanged legacy semantics and retain both proof capabilities."""
+    require(
+        is_typed_source_stage(typed_stage)
+        and type(legacy_stage) is RegistrySourceRecipeStage
+        and legacy_stage.office_matches is not None,
+        "mixed_stage",
+    )
+    recipes, recipe_hash = _source_stage_recipes(recipes, True)
+    matches = typed_stage.office_matches
+    await matches.verify(connection, matches.address_source, matches.runtime_roles, approved, control_schema)
+    from process.network_initial_cms_office_bindings import verified_retained_offices
+
+    await verified_retained_offices(
+        connection, legacy_stage.office_matches, matches.address_source, matches.runtime_roles, control_schema
+    )
+    name = await _copy_combined_stage(connection, typed_stage, legacy_stage, request_id, recipe_hash, approved)
     combined = replace(
         matches, recipe_sha256=recipe_hash, legacy_stages=(legacy_stage,), child_stages=(typed_stage, legacy_stage)
     )
@@ -395,10 +438,48 @@ async def combine_typed_source_stages(
     )
 
 
+async def _copy_typed_offices(connection, copy_target, stage):
+    from process.network_initial_source_office_bindings import _copy_bindings
+
+    await _copy_bindings(connection, copy_target, ())
+    target_relation = _identifier(copy_target.schema_name) + ".provider_location_binding"
+    index = _identifier(copy_target.schema_name) + ".typed_office_location_idx"
+    if await connection.fetchval("SELECT to_regclass($1)", index) is None:
+        require(
+            not await connection.fetchval("SELECT EXISTS(SELECT FROM " + target_relation + ")"),
+            "office_index_requires_empty_heap",
+        )
+        await connection.execute(
+            "CREATE INDEX typed_office_location_idx ON "
+            + target_relation
+            + "(location_key,provider_system,provider_id,entity_type,entity_id)"
+        )
+    source_relation = "pg_temp." + _identifier(stage.office_matches.table_name)
+    require(
+        not await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM "
+            + source_relation
+            + " a JOIN "
+            + target_relation
+            + " b USING(provider_system,provider_id,location_id) WHERE ROW(a.location_key,a.entity_type,a.entity_id) IS DISTINCT FROM ROW(b.location_key,b.entity_type,b.entity_id))"
+        ),
+        "office_collision",
+    )
+    await connection.execute(
+        "INSERT INTO "
+        + target_relation
+        + " SELECT "
+        + ",".join(BINDING_COLUMNS)
+        + " FROM "
+        + source_relation
+        + " ON CONFLICT DO NOTHING"
+    )
+
+
 async def record_typed_source_offices(
     connection, copy_target, recipes, approved, address_source, runtime_roles, stage, *, control_schema=None
 ):
-    from process.network_initial_source_office_bindings import _copy_bindings
+    """Copy verified office bindings and record their exact candidate inventory summary."""
     from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
     from process.registry_initial_source_composition import SUMMARY_KEY, _is_receipt_match, _report
     from process.registry_source_inventory_preparation import prepare_source_inventory
@@ -414,33 +495,7 @@ async def record_typed_source_offices(
         reference.root, sorted(stage.office_derivations, key=lambda item: item["recipe_sha256"])
     )
     require(_is_receipt_match(candidate, receipt, None), "office_summary")
-    await _copy_bindings(connection, copy_target, ())
-    target = _identifier(copy_target.schema_name) + ".provider_location_binding"
-    index = _identifier(copy_target.schema_name) + ".typed_office_location_idx"
-    if await connection.fetchval("SELECT to_regclass($1)", index) is None:
-        require(
-            not await connection.fetchval("SELECT EXISTS(SELECT FROM " + target + ")"),
-            "office_index_requires_empty_heap",
-        )
-        await connection.execute(
-            "CREATE INDEX typed_office_location_idx ON "
-            + target
-            + "(location_key,provider_system,provider_id,entity_type,entity_id)"
-        )
-    source = "pg_temp." + _identifier(stage.office_matches.table_name)
-    require(
-        not await connection.fetchval(
-            "SELECT EXISTS(SELECT FROM "
-            + source
-            + " a JOIN "
-            + target
-            + " b USING(provider_system,provider_id,location_id) WHERE ROW(a.location_key,a.entity_type,a.entity_id) IS DISTINCT FROM ROW(b.location_key,b.entity_type,b.entity_id))"
-        ),
-        "office_collision",
-    )
-    await connection.execute(
-        "INSERT INTO " + target + " SELECT " + ",".join(BINDING_COLUMNS) + " FROM " + source + " ON CONFLICT DO NOTHING"
-    )
+    await _copy_typed_offices(connection, copy_target, stage)
     report = _report(candidate)
     require(SUMMARY_KEY not in report or report[SUMMARY_KEY] == receipt, "office_summary")
     if SUMMARY_KEY not in report:
@@ -485,6 +540,7 @@ async def rebind_typed_producer_stage(connection, stage):
 
 
 async def drop_typed_source_stage(connection, stage):
+    """Drop only temporary relations owned by this typed stage and its attached children."""
     require(is_typed_source_stage(stage), "stage_kind")
     matches, names = stage.office_matches, {stage.table_name, stage.office_matches.table_name}
     for mapped in matches.mappings:

@@ -2,7 +2,6 @@
 """Map independently verified typed graph rows through approved bindings and pinned offices."""
 
 import asyncio
-import json
 import re
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -43,9 +42,11 @@ class TypedGraphMapping:
     metadata: dict
 
     def relation(self, kind):
+        """Resolve a declared mapping relation in the current temporary workspace."""
         return "pg_temp." + _identifier(self.table_names[kind])
 
     async def verify(self, connection):
+        """Recheck source custody and every temporary mapping relation identity."""
         await self.source_stage.verify(connection)
         for kind, oid in self.oids.items():
             require(
@@ -57,10 +58,10 @@ class TypedGraphMapping:
 
 async def create_typed_mapping_tables(connection):
     """Precreate scratch before a read-only custodian snapshot, or in the producer transaction."""
-    names = {kind: "typed_map_" + kind + "_" + uuid4().hex for kind in _MAPPING_DDL}
-    for kind, name in names.items():
+    names_by_kind = {kind: "typed_map_" + kind + "_" + uuid4().hex for kind in _MAPPING_DDL}
+    for kind, name in names_by_kind.items():
         await connection.execute("CREATE TEMP TABLE " + _identifier(name) + "(" + _MAPPING_DDL[kind] + ")")
-    return names
+    return names_by_kind
 
 
 def require_catalog_graph_scope(stage, coordinates, descriptor):
@@ -147,9 +148,9 @@ async def _pair_ranges(connection, stage):
         )
         if row is None:
             return
-        last = tuple(row)
-        yield after, last
-        after = last
+        last_keys = tuple(row)
+        yield after, last_keys
+        after = last_keys
 
 
 def _range(prefix, start):
@@ -186,7 +187,20 @@ async def _office_inputs(connection, stage, mapping, approved_keys):
     )
 
 
+def _accepted_office_rows(matched_rows, canonical):
+    accepted_rows = []
+    for office_row, canonical_address in zip(matched_rows, canonical, strict=True):
+        require(
+            UUID(canonical_address["address_key"]) == office_row["address_key"]
+            and canonical_address["identity_key"] == office_row["canonical_identity"],
+            "office_identity_differs",
+        )
+        accepted_rows.append((office_row["provider_id"], office_row["location_id"], office_row["matched_key"]))
+    return accepted_rows
+
+
 async def _match_offices(connection, mapping, address_source):
+    """Match bounded office pages by approved NPI, address key and full canonical identity."""
     import ptg2_address_canon as native
 
     address = _identifier(address_source.schema_name) + "." + _identifier(address_source.table_name)
@@ -209,35 +223,30 @@ async def _match_offices(connection, mapping, address_source):
             require(limit > 1, "office_bounds")
             limit = max(1, limit // 2)
             continue
-        rows = await connection.fetch(query, *after, limit)
-        if not rows:
+        office_rows = await connection.fetch(query, *after, limit)
+        if not office_rows:
             break
-        after = rows[-1]["provider_id"], rows[-1]["location_id"]
-        identities = [(row["provider_id"], row["location_id"]) for row in rows]
+        after = office_rows[-1]["provider_id"], office_rows[-1]["location_id"]
+        identities = [(office_row["provider_id"], office_row["location_id"]) for office_row in office_rows]
         require(len(identities) == len(set(identities)), "ambiguous_office")
-        matched = [row for row in rows if row["matched_key"] is not None]
-        values = [tuple(row[field] for field in ADDRESS_FIELDS) for row in matched]
+        matched_rows = [office_row for office_row in office_rows if office_row["matched_key"] is not None]
+        address_values = [tuple(office_row[field] for field in ADDRESS_FIELDS) for office_row in matched_rows]
         canonical = (
-            await drain_operation(asyncio.to_thread(native.canonicalize_batch, values), preserve_cancellation=True)
-            if values
+            await drain_operation(
+                asyncio.to_thread(native.canonicalize_batch, address_values), preserve_cancellation=True
+            )
+            if address_values
             else []
         )
-        accepted = []
-        for row, result in zip(matched, canonical, strict=True):
-            require(
-                UUID(result["address_key"]) == row["address_key"]
-                and result["identity_key"] == row["canonical_identity"],
-                "office_identity_differs",
-            )
-            accepted.append((row["provider_id"], row["location_id"], row["matched_key"]))
-        if accepted:
+        accepted_rows = _accepted_office_rows(matched_rows, canonical)
+        if accepted_rows:
             await connection.execute(
                 "UPDATE "
                 + mapping.relation("offices")
                 + " o SET location_key=v.location_key FROM unnest($1::text[],$2::uuid[],$3::text[]) v(provider_id,location_id,location_key) WHERE (o.provider_id,o.location_id)=(v.provider_id,v.location_id)",
-                [row[0] for row in accepted],
-                [row[1] for row in accepted],
-                [row[2] for row in accepted],
+                [office_row[0] for office_row in accepted_rows],
+                [office_row[1] for office_row in accepted_rows],
+                [office_row[2] for office_row in accepted_rows],
             )
     await connection.execute(
         "INSERT INTO "
@@ -248,41 +257,23 @@ async def _match_offices(connection, mapping, address_source):
     )
 
 
-async def prepare_typed_graph_mapping(
-    connection,
-    stage,
-    *,
-    approved_source,
-    binding_coordinates,
-    catalog_descriptor,
-    address_source,
-    runtime_roles,
-    control_schema=None,
-    table_names=None,
-):
-    """Return existing membership/binding row shapes only after raw graph, approval and office custody checks."""
-    await stage.verify(connection)
-    generation = require_catalog_graph_scope(stage, binding_coordinates, catalog_descriptor)
-    await require_approved_network_source_bindings(
-        connection, approved_source, binding_coordinates, control_schema=control_schema
-    )
-    address_identity = await _artifact_dependency_identity(
-        connection, address_source, runtime_roles, address=True, control_schema=control_schema
-    )
+async def _mapping_workspace(connection, stage, table_names):
     names = await create_typed_mapping_tables(connection) if table_names is None else table_names
     require(type(names) is dict and set(names) == set(_MAPPING_DDL), "mapping_tables")
-    oids = {}
+    oids_by_kind = {}
     for kind, name in names.items():
         _identifier(name)
-        oids[kind] = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + name)
+        oids_by_kind[kind] = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + name)
         require(
-            type(oids[kind]) is int
+            type(oids_by_kind[kind]) is int
             and await connection.fetchval("SELECT NOT EXISTS(SELECT FROM pg_temp." + _identifier(name) + ")"),
             "restart_from_zero",
         )
-    mapping = TypedGraphMapping(stage, names, oids, {})
-    bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
-    arguments = (approved_source.approved_revision, *binding_coordinates.sql_parameters, generation)
+    mapping = TypedGraphMapping(stage, names, oids_by_kind, {})
+    return mapping
+
+
+async def _approved_graph_keys(connection, bindings, arguments):
     valid = await connection.fetchval(
         "WITH "
         + bindings
@@ -294,8 +285,10 @@ async def prepare_typed_graph_mapping(
         "WITH " + bindings + " SELECT array_agg(record_json->>'source_key') FROM approved_network_bindings",
         *arguments[:7],
     )
-    await _office_inputs(connection, stage, mapping, approved_keys)
-    await _match_offices(connection, mapping, address_source)
+    return approved_keys
+
+
+async def _map_pair_rows(connection, stage, mapping, bindings, arguments):
     joins = (
         " FROM "
         + stage.relation("pairs")
@@ -326,8 +319,8 @@ async def prepare_typed_graph_mapping(
             *low,
             *high,
         )
-        for key, value in counts.items():
-            totals[key] += value
+        for key, count_value in counts.items():
+            totals[key] += count_value
         evidence = "encode(sha256(convert_to(jsonb_build_array('fhir-direct-network-office-v3',$8::text,p.resource_type,p.resource_id,p.network_source_key,p.location_resource_id,p.evidence_basis)::text,'UTF8')),'hex')"
         await connection.execute(
             "WITH "
@@ -343,15 +336,19 @@ async def prepare_typed_graph_mapping(
             *low,
             *high,
         )
+    return totals
+
+
+async def _map_provider_rows(connection, stage, mapping, bindings, arguments):
     origin = source_origin(stage.document["origin"])
     after = ("", "")
-    while rows := await connection.fetch(
+    while resource_rows := await connection.fetch(
         "SELECT resource_type,resource_id FROM "
         + stage.relation("cells")
         + " WHERE resource_type IN ('PractitionerRole','OrganizationAffiliation') AND (resource_type,resource_id)>($1,$2) ORDER BY resource_type,resource_id LIMIT 128",
         *after,
     ):
-        last = tuple(rows[-1])
+        last_keys = tuple(resource_rows[-1])
         provider_sql = PROVIDER_ONLY_SQL.replace("{cells}", stage.relation("cells"))
         # Shift Source query parameters after the closed approved coordinates and generation.
         provider_sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + 8), provider_sql)
@@ -367,9 +364,12 @@ async def prepare_typed_graph_mapping(
             origin.source_uri.rstrip("/"),
             date.fromisoformat(stage.document["membership_as_of"]),
             *after,
-            *last,
+            *last_keys,
         )
-        after = last
+        after = last_keys
+
+
+async def _require_mapping_counts(connection, stage, mapping, totals):
     office_counts = await connection.fetchrow(
         "SELECT count(*) FILTER(WHERE location_key IS NOT NULL) matched_offices,count(*) FILTER(WHERE location_key IS NULL) missing_offices FROM "
         + mapping.relation("offices")
@@ -387,6 +387,48 @@ async def prepare_typed_graph_mapping(
         == stage.document["counts"]["reference_rows"],
         "mapping_reference_counts",
     )
+    return office_counts
+
+
+@dataclass(frozen=True)
+class TypedGraphApproval:
+    """Exact approved binding and catalog coordinates required by typed mapping."""
+
+    approved_source: object
+    binding_coordinates: object
+    catalog_descriptor: dict
+
+
+async def prepare_typed_graph_mapping(
+    connection,
+    stage,
+    *,
+    approval,
+    address_source,
+    runtime_roles,
+    control_schema=None,
+    table_names=None,
+):
+    """Return existing membership/binding row shapes only after raw graph, approval and office custody checks."""
+    approved_source = approval.approved_source
+    binding_coordinates, catalog_descriptor = approval.binding_coordinates, approval.catalog_descriptor
+    await stage.verify(connection)
+    generation = require_catalog_graph_scope(stage, binding_coordinates, catalog_descriptor)
+    await require_approved_network_source_bindings(
+        connection, approved_source, binding_coordinates, control_schema=control_schema
+    )
+    address_identity = await _artifact_dependency_identity(
+        connection, address_source, runtime_roles, address=True, control_schema=control_schema
+    )
+    mapping = await _mapping_workspace(connection, stage, table_names)
+    bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
+    arguments = (approved_source.approved_revision, *binding_coordinates.sql_parameters, generation)
+    approved_keys = await _approved_graph_keys(connection, bindings, arguments)
+    await _office_inputs(connection, stage, mapping, approved_keys)
+    await _match_offices(connection, mapping, address_source)
+    totals = await _map_pair_rows(connection, stage, mapping, bindings, arguments)
+    await _map_provider_rows(connection, stage, mapping, bindings, arguments)
+    office_counts = await _require_mapping_counts(connection, stage, mapping, totals)
     mapping.metadata = {
         "office_policy": POLICY,
         "canonicalizer_version": 2,

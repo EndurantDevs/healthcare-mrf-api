@@ -215,9 +215,11 @@ def _decode_recipe(document):
     if document["source_kind"] == "fhir_typed":
         from process.network_fhir_typed_capture import TypedGraphAnchor
 
-        values = dict(_closed_document(document["source_pin"], PinnedTypedFHIRMembershipSource))
-        values["anchor"] = TypedGraphAnchor(**_closed_document(values["anchor"], TypedGraphAnchor))
-        source_pin = PinnedTypedFHIRMembershipSource(**values)
+        pin_fields_by_name = dict(_closed_document(document["source_pin"], PinnedTypedFHIRMembershipSource))
+        pin_fields_by_name["anchor"] = TypedGraphAnchor(
+            **_closed_document(pin_fields_by_name["anchor"], TypedGraphAnchor)
+        )
+        source_pin = PinnedTypedFHIRMembershipSource(**pin_fields_by_name)
     elif document["source_kind"] == "fhir":
         source_pin = _decode_fhir_pin(document["source_pin"])
     elif document["source_kind"] == "aca":

@@ -74,7 +74,7 @@ def _recipe():
         },
     )
     anchor = TypedGraphAnchor(str(UUID(int=5)), "2026-10-01T00:00:00.000000+00:00")
-    capture = {
+    capture_by_field = {
         "component": "registry_fhir_typed_capture",
         "descriptor_version": 4,
         "capture_id": anchor.capture_id,
@@ -91,8 +91,8 @@ def _recipe():
         "graph": graph,
         "catalog_descriptor": catalog,
     }
-    capture["capture_sha256"] = digest(capture)
-    pin = PinnedTypedFHIRMembershipSource(capture, anchor, catalog)
+    capture_by_field["capture_sha256"] = digest(capture_by_field)
+    pin = PinnedTypedFHIRMembershipSource(capture_by_field, anchor, catalog)
     return RegistrySourceMembershipRecipe(pin, RegistryNetworkSourceCoordinates(**catalog["coordinates"]))
 
 
@@ -192,22 +192,31 @@ def test_typed_inventory_pairs_distinct_descriptors_and_indexed_scope():
         registry_source_contribution_receipt(replace(stage, contribution_revision=2), inventory_root=reference.root)
 
 
+def _mutate_inventory_metadata(contribution, derivation, mutation):
+    if mutation == "capture":
+        contribution["capture_sha256"] = "0" * 64
+        return
+    if mutation == "catalog":
+        contribution["catalog_generation"] = "0" * 64
+        return
+    if mutation == "mapping":
+        derivation["mapping_sha256"] = "0" * 64
+        return
+    if mutation == "count":
+        contribution["counters"]["mapped_pair_rows"] = 2
+        return
+    if mutation == "anchor":
+        contribution["fact_candidate_id"] = str(UUID(int=1))
+        return
+    else:
+        derivation["derivation_version"] = 2
+
+
 @pytest.mark.parametrize("mutation", ["capture", "catalog", "mapping", "count", "anchor", "legacy"])
 def test_typed_inventory_refuses_cross_recipe_or_old_protocol_metadata(mutation):
     recipe = _recipe()
     contribution, derivation = _metadata(recipe)
-    if mutation == "capture":
-        contribution["capture_sha256"] = "0" * 64
-    elif mutation == "catalog":
-        contribution["catalog_generation"] = "0" * 64
-    elif mutation == "mapping":
-        derivation["mapping_sha256"] = "0" * 64
-    elif mutation == "count":
-        contribution["counters"]["mapped_pair_rows"] = 2
-    elif mutation == "anchor":
-        contribution["fact_candidate_id"] = str(UUID(int=1))
-    else:
-        derivation["derivation_version"] = 2
+    _mutate_inventory_metadata(contribution, derivation, mutation)
     preparation = SourceInventoryPreparation((recipe,))
     with pytest.raises(ValueError):
         preparation.add_contribution(contribution)
@@ -312,7 +321,7 @@ def test_typed_office_summary_binds_the_registered_approval_and_address():
     preparation.add_derivation(derivation)
     reference, _entries = preparation.finish()
     summary = typed_office_summary(reference.root, [derivation])
-    candidate = {
+    candidate_by_field = {
         "source_recipes_json": reference.as_dict(),
         "approved_custom_revision": 1,
         "source_generations": {
@@ -324,15 +333,15 @@ def test_typed_office_summary_binds_the_registered_approval_and_address():
         },
         "validation_json": {SUMMARY_KEY: summary},
     }
-    assert verify_initial_source_office_receipt(candidate) == summary
-    candidate["approved_custom_revision"] = 2
+    assert verify_initial_source_office_receipt(candidate_by_field) == summary
+    candidate_by_field["approved_custom_revision"] = 2
     with pytest.raises(ValueError):
-        verify_initial_source_office_receipt(candidate)
+        verify_initial_source_office_receipt(candidate_by_field)
 
 
 @pytest.mark.asyncio
 async def test_registered_typed_resume_preserves_revision_and_office_pin(monkeypatch):
-    from types import SimpleNamespace
+    """Resume registered typed metadata with the same revision, source and office pins."""
     from unittest.mock import AsyncMock
     from uuid import uuid4
 
@@ -354,7 +363,7 @@ async def test_registered_typed_resume_preserves_revision_and_office_pin(monkeyp
     reference, _entries = preparation.finish()
     contribution = typed_contribution_summary(reference.root, [contribution])
     office = typed_office_summary(reference.root, [derivation])
-    generations = {
+    generations_by_kind = {
         RECIPE_DIGEST_KEY: reference.root.recipes_sha256,
         INVENTORY_DIGEST_KEY: reference.root.entries_sha256,
         "custom_membership": derivation["approved_generation_sha256"],
@@ -363,10 +372,10 @@ async def test_registered_typed_resume_preserves_revision_and_office_pin(monkeyp
         OFFICE_KEY: initial_source_office_receipt_sha256(office, inventory_root=reference.root),
     }
     request = uuid4()
-    target = _target(request, 1, 0, generations)
-    candidate = {
+    copy_target = _target(request, 1, 0, generations_by_kind)
+    candidate_by_field = {
         "source_recipes_json": reference.as_dict(),
-        "source_generations": generations,
+        "source_generations": generations_by_kind,
         "approved_custom_revision": 1,
         "validation_json": {
             CONTRIBUTION_KEY: contribution,
@@ -375,17 +384,20 @@ async def test_registered_typed_resume_preserves_revision_and_office_pin(monkeyp
             "writer_closure": {"loader_roles": ["writer"], "reader_roles": ["reader"]},
         },
     }
-    monkeypatch.setattr(resume, "_registered_candidate", AsyncMock(return_value=(target, candidate)))
+    monkeypatch.setattr(resume, "_registered_candidate", AsyncMock(return_value=(copy_target, candidate_by_field)))
     assert await resume.resolve_registered_contribution_resume(
         None, request, 1, 0
-    ) == resume.RegisteredContributionResume(target, 4)
+    ) == resume.RegisteredContributionResume(copy_target, 4)
     assert await resume.resolve_registered_office_summary_revision(None, request, 1, 0) == 6
     assert await resume.resolve_registered_verified_office_inputs(None, request, 1, 0) == (
         PinnedAddressSource(**derivation["address_source"]),
         ("reader", "writer"),
     )
     assert await resume.resolve_registered_source_inventory(None, request, 1, 0) is True
-    candidate["validation_json"]["address_source"] = {**derivation["address_source"], "generation_id": "0" * 64}
+    candidate_by_field["validation_json"]["address_source"] = {
+        **derivation["address_source"],
+        "generation_id": "0" * 64,
+    }
     with pytest.raises(ValueError):
         await resume.resolve_registered_verified_office_inputs(None, request, 1, 0)
 
@@ -426,7 +438,7 @@ async def test_mixed_stage_dispatches_each_protocol_once_and_rolls_back_combinat
     monkeypatch.setattr(typed_stage, "stage_verified_typed_source_recipes", verify)
     monkeypatch.setattr(typed_stage, "combine_typed_source_stages", merge)
     monkeypatch.setattr(witness_stage, "stage_verified_witness_inventory", replay)
-    options = {
+    options_by_name = {
         "request_id": uuid4(),
         "control_schema": "registry",
         "inventory": True,
@@ -434,7 +446,7 @@ async def test_mixed_stage_dispatches_each_protocol_once_and_rolls_back_combinat
         "read_context": composition.SourceRecipeReadContext(verified_office_inputs=(object(), ("reader",))),
     }
     dispatch = getattr(composition, entrypoint)
-    assert await dispatch(connection, (legacy, typed), object(), **options) is combined
+    assert await dispatch(connection, (legacy, typed), object(), **options_by_name) is combined
     selected, unused = (produce, verify) if entrypoint == "stage_registry_source_recipes" else (verify, produce)
     assert selected.await_args.args[1] == (typed,) and replay.await_args.args[1] == (legacy,)
     unused.assert_not_awaited()
@@ -442,5 +454,52 @@ async def test_mixed_stage_dispatches_each_protocol_once_and_rolls_back_combinat
     assert events == ["begin", "complete"]
     merge.side_effect = ValueError("changed_native_binding")
     with pytest.raises(ValueError, match="changed_native_binding"):
-        await dispatch(connection, (legacy, typed), object(), **options)
+        await dispatch(connection, (legacy, typed), object(), **options_by_name)
     assert events[-2:] == ["begin", "rollback"]
+
+
+def test_invalid_native_canonical_addresses_are_omitted_before_uuid_conversion():
+    from process.network_fhir_typed_source import _valid_canonical_address_records
+
+    address_values = (None,) * 6
+    pending_by_key = {name: address_values for name in ("missing", "no-key", "no-identity", "valid")}
+    key = str(UUID(int=1))
+    canonical_results = [
+        {"address_key": None, "identity_key": None},
+        {"address_key": None, "identity_key": "unused"},
+        {"address_key": key, "identity_key": None},
+        {"address_key": key, "identity_key": "valid-identity"},
+    ]
+    assert _valid_canonical_address_records(pending_by_key, canonical_results) == [
+        ("valid", *address_values, UUID(key), "valid-identity")
+    ]
+    canonical_results[-1]["address_key"] = "malformed"
+    with pytest.raises(ValueError):
+        _valid_canonical_address_records(pending_by_key, canonical_results)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("collision", ["batch", "retained"])
+async def test_valid_canonical_address_collisions_still_refuse(monkeypatch, collision):
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from process.network_fhir_typed_contract import ADDRESS_FIELDS, TypedFHIRGraphError
+    from process.network_fhir_typed_source import _canonical_address_records
+
+    key = str(UUID(int=1))
+    canonical_results = [{"address_key": key, "identity_key": "first"}]
+    address_rows = [{"raw_key": "first", **dict.fromkeys(ADDRESS_FIELDS)}]
+    retained_rows = [{"address_key": UUID(key), "canonical_identity": "different"}]
+    if collision == "batch":
+        canonical_results.append({"address_key": key, "identity_key": "different"})
+        address_rows.append({"raw_key": "second", **dict.fromkeys(ADDRESS_FIELDS)})
+        retained_rows = []
+    monkeypatch.setitem(
+        sys.modules, "ptg2_address_canon", SimpleNamespace(canonicalize_batch=lambda _rows: canonical_results)
+    )
+    connection = SimpleNamespace(fetch=AsyncMock(side_effect=[[], retained_rows]))
+    stage = SimpleNamespace(relation=lambda _kind: "pg_temp.addresses")
+    with pytest.raises(TypedFHIRGraphError, match="canonical_collision"):
+        await _canonical_address_records(connection, stage, address_rows, ",".join(ADDRESS_FIELDS))
