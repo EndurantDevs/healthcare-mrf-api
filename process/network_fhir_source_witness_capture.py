@@ -35,9 +35,11 @@ from process.network_fhir_source_witness_contract import (
     capture_digest,
     database_identity,
     digest,
+    is_completion_v3_origin,
     require,
     require_capture_anchor,
     source_origin,
+    source_resource_marker_valid,
     validate_capture,
 )
 from process.network_membership_writer_closure import _check_roles, _protected_owner, _transfer_and_grant
@@ -220,6 +222,7 @@ async def _store_resource_batch(copy_state, resource_rows, prepared):
 async def _copy_resources(writer, schema, origin, export, release_id, observed_at):
     """Consume one real Source iterator to EOF; validate complete batches before bounded COPY."""
     pair = _CaptureWriter(writer, asyncio.current_task(), await _virtual_xid(writer))
+    is_completion_v3 = is_completion_v3_origin(origin)
     hashes_by_family = {kind: hashlib.sha256() for kind, _ in origin.resource_counts}
     copy_state = _CaptureCopyState(
         pair,
@@ -241,7 +244,9 @@ async def _copy_resources(writer, schema, origin, export, release_id, observed_a
                 require(type(resource_record) is dict and set(resource_record) == set(_RESOURCE_FIELDS))
                 require(
                     resource_record["dataset_id"] == origin.dataset_id
-                    and resource_record["acquired_resource_sha256"] is None
+                    and source_resource_marker_valid(
+                        resource_record["acquired_resource_sha256"], completion_v3=is_completion_v3
+                    )
                 )
                 key = resource_record["resource_type"], resource_record["resource_id"]
                 require(all(type(key_part) is str and key_part.isascii() for key_part in key))
@@ -461,10 +466,12 @@ def _fold_source_page(replay, resource_rows):
     """Validate actual second-stream payload commitments independently of retained rows or receipts."""
     require(type(resource_rows) in {tuple, list} and 0 < len(resource_rows) <= 1000)
     require(len(canonical(resource_rows).encode()) <= _MAX_PAGE_BYTES)
+    is_completion_v3 = is_completion_v3_origin(replay.origin)
     for resource_row in resource_rows:
         require(type(resource_row) is dict and set(resource_row) == set(_RESOURCE_FIELDS))
         require(
-            resource_row["dataset_id"] == replay.origin.dataset_id and resource_row["acquired_resource_sha256"] is None
+            resource_row["dataset_id"] == replay.origin.dataset_id
+            and source_resource_marker_valid(resource_row["acquired_resource_sha256"], completion_v3=is_completion_v3)
         )
         cursor = resource_row["resource_type"], resource_row["resource_id"]
         require(all(type(part) is str and part.isascii() for part in cursor))

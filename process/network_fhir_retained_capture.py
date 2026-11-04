@@ -61,6 +61,7 @@ from process.provider_directory_fhir_subset_canonical import canonical_payload_s
 from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
     SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+    resource_content_hash_payload,
     resource_payload_sha256_for_contract,
 )
 from process.provider_directory_source_summary import validate_fhir_source_summary
@@ -853,7 +854,10 @@ def _resource_hash_contract(origin):
 
 def _fold_rows(resource_rows, origin, hash_by_family, counts, root, total):
     """Use the original normalized payload and ordered dataset-root algorithms."""
+    from process.network_fhir_source_witness_contract import is_completion_v3_origin, source_resource_marker_valid
+
     hash_contract = _resource_hash_contract(origin)
+    is_completion_v3 = is_completion_v3_origin(origin)
     for resource_row in resource_rows:
         kind, identity, stored_hash = (
             resource_row["resource_type"],
@@ -863,7 +867,7 @@ def _fold_rows(resource_rows, origin, hash_by_family, counts, root, total):
         require(
             kind in hash_by_family
             and re.fullmatch(r"[A-Za-z0-9.-]{1,64}", identity)
-            and resource_row["acquired_resource_sha256"] is None
+            and source_resource_marker_valid(resource_row["acquired_resource_sha256"], completion_v3=is_completion_v3)
         )
         normalized_payload = (
             json.loads(resource_row["payload_json"])
@@ -876,10 +880,10 @@ def _fold_rows(resource_rows, origin, hash_by_family, counts, root, total):
             and normalized_payload.get("source_id", origin.source_id) == origin.source_id
         )
         require(
-            resource_payload_sha256_for_contract(
-                normalized_payload,
-                hash_contract,
-                resource_type=kind,
+            (
+                canonical_payload_sha256(resource_content_hash_payload(normalized_payload))
+                if is_completion_v3
+                else resource_payload_sha256_for_contract(normalized_payload, hash_contract, resource_type=kind)
             )
             == stored_hash
         )
@@ -927,6 +931,8 @@ def _validate_reference_rows(resource_rows, origin):
 
 def _prepare_native_resources(resource_rows, origin, release_id, observed_at, derive):
     """Reuse the unchanged reference only for rows outside exact native semantics."""
+    from process.network_fhir_source_witness_contract import is_completion_v3_origin
+
     context_by_field = {
         "source_id": origin.source_id,
         "release_id": release_id,
@@ -935,6 +941,8 @@ def _prepare_native_resources(resource_rows, origin, release_id, observed_at, de
         "resource_types": [kind for kind, _ in origin.resource_counts],
         "derive": derive,
     }
+    if is_completion_v3_origin(origin):
+        context_by_field["completion_required_version"] = origin.completion_required_version
     try:
         return prepare_retained_fhir_batch(
             resource_rows,
