@@ -210,9 +210,9 @@ async def resolve_registered_legacy_office_inputs(
 
 
 async def resolve_registered_verified_office_inputs(
-    connection, request_id, approved_revision, expected_head, *, control_schema=None
+    connection, request_id, approved_revision, expected_head, *, verified_office_inputs=None, control_schema=None
 ):
-    """Select the exact registered v5 address inputs; metadata grants no native office authority."""
+    """Pin registered address inputs; open typed candidates must rebuild fresh native capabilities."""
     registered = await _registered_candidate(connection, request_id, approved_revision, expected_head, control_schema)
     if registered is None:
         return None
@@ -227,7 +227,19 @@ async def resolve_registered_verified_office_inputs(
         if summary is not None and summary["revision"] == 6:
             from dataclasses import asdict
 
-            address_source, runtime_roles = _office_inputs(candidate)
+            from process.network_address_projection import PinnedAddressSource
+
+            if candidate["state"] == "open":
+                if (
+                    type(verified_office_inputs) is not tuple
+                    or len(verified_office_inputs) != 2
+                    or type(verified_office_inputs[0]) is not PinnedAddressSource
+                    or type(verified_office_inputs[1]) is not tuple
+                ):
+                    raise RegistryCompositionResumeError("registry_composition_resume_verified_offices_differ")
+                address_source, runtime_roles = verified_office_inputs
+            else:
+                address_source, runtime_roles = _office_inputs(candidate)
             if (
                 verify_source_recipe_metadata(candidate).inventory is None
                 or contribution is None

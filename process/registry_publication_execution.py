@@ -268,44 +268,166 @@ async def _source_rollback_pins(connection, command, control_schema):
     return source_pin, current_pin
 
 
-async def _source_rollback_difference(connection, candidate_by_name, current_pin):
-    units = "network_id,provider_system,provider_id,location_id"
-    proposed = f"{_identifier(candidate_by_name['schema_name'])}.network_membership"
-    current = f"{_identifier(current_pin.schema_name)}.network_membership"
-    proposed_units = "p." + units.replace(",", ",p.")
-    current_units = "c." + units.replace(",", ",c.")
-    order = 'network_id,provider_system COLLATE "C",provider_id COLLATE "C",location_id'
+_ROLLBACK_UNITS = "network_id,provider_system,provider_id,location_id"
+_ROLLBACK_ORDER = 'network_id,provider_system COLLATE "C",provider_id COLLATE "C",location_id'
+_ROLLBACK_KEY = '($1::integer,$2::text COLLATE "C",$3::text COLLATE "C",$4::uuid)'
+_ROLLBACK_PROJECTION_ORDER = "provider_system,provider_id,location_id,network_id"
+
+
+async def _uses_source_rollback_projection_order(connection, proposed, current):
+    from process.registry_typed_membership_parity import require_order_index
+
+    try:
+        await require_order_index(connection, proposed)
+        await require_order_index(connection, current)
+        return False
+    except ValueError as error:
+        if str(error) != "registry_typed_parity_index_required":
+            raise
+    valid = await connection.fetchval(
+        """WITH relations AS (SELECT relation,to_regclass(relation) AS oid FROM unnest($1::text[]) relation),
+        collations AS (SELECT a.attname,a.attcollation,c.collisdeterministic FROM relations r
+          JOIN pg_attribute a ON a.attrelid=r.oid JOIN pg_collation c ON c.oid=a.attcollation
+          WHERE a.attname IN ('provider_system','provider_id'))
+        SELECT (SELECT count(*)=4 AND bool_and(collisdeterministic)
+          AND count(DISTINCT (attname,attcollation))=2 FROM collations)
+        AND bool_and(EXISTS(SELECT FROM pg_index i
+        JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am am ON am.oid=c.relam
+        WHERE i.indrelid=relations.oid AND i.indisvalid AND i.indisready AND i.indislive
+          AND i.indpred IS NULL AND i.indexprs IS NULL AND am.amname='btree' AND i.indnkeyatts>=4
+          AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(attnum,n)
+            JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+            WHERE k.n<=4 ORDER BY k.n)=$2::text[]
+          AND NOT EXISTS(SELECT FROM unnest(i.indkey::smallint[],i.indcollation::oid[],
+            i.indoption::smallint[],i.indclass::oid[]) WITH ORDINALITY k(attnum,collation_oid,option,opclass,n)
+            JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+            JOIN pg_opclass op ON op.oid=k.opclass
+            WHERE k.n<=4 AND (k.collation_oid<>a.attcollation OR k.option<>0 OR NOT op.opcdefault))))
+        FROM relations""",
+        [proposed, current],
+        _ROLLBACK_PROJECTION_ORDER.split(","),
+    )
+    if valid is not True:
+        raise ValueError("registry_source_rollback_order_index_required")
+    return True
+
+
+async def _source_rollback_upper(connection, proposed, current, after, *, projection_order=False):
+    """Advance complete units in the selected native index order."""
+    order = _ROLLBACK_PROJECTION_ORDER if projection_order else _ROLLBACK_ORDER
+    key = "($2::text,$3::text,$4::uuid,$1::integer)" if projection_order else _ROLLBACK_KEY
+    predicate = "TRUE" if after is None else "(" + order + ")>" + key
+    descending = ",".join(term + " DESC" for term in order.split(","))
+    endpoints = " UNION ALL ".join(
+        f"(SELECT {_ROLLBACK_UNITS} FROM (SELECT {_ROLLBACK_UNITS} FROM {relation} "
+        f"WHERE {predicate} ORDER BY {order} LIMIT 5000) page ORDER BY {descending} LIMIT 1)"
+        for relation in (proposed, current)
+    )
+    upper = await connection.fetchrow(
+        f"SELECT {_ROLLBACK_UNITS} FROM ({endpoints}) endpoints ORDER BY {order} LIMIT 1",
+        *(() if after is None else after),
+    )
+    return None if upper is None else tuple(upper)
+
+
+async def _source_rollback_page(connection, proposed, current, after, upper, *, projection_order=False):
+    """Classify bounded units with indexed evidence probes instead of unbounded evidence arrays."""
+    order = _ROLLBACK_PROJECTION_ORDER if projection_order else _ROLLBACK_ORDER
+    key = "($2::text,$3::text,$4::uuid,$1::integer)" if projection_order else _ROLLBACK_KEY
+    predicate = "TRUE" if after is None else "(" + order + ")>" + key
+    high = (
+        key
+        if after is None
+        else (
+            "($6::text,$7::text,$8::uuid,$5::integer)"
+            if projection_order
+            else '($5::integer,$6::text COLLATE "C",$7::text COLLATE "C",$8::uuid)'
+        )
+    )
+    pages = " UNION ALL ".join(
+        f"SELECT {_ROLLBACK_UNITS},{flag} AS proposed FROM (SELECT {_ROLLBACK_UNITS} FROM {relation} "
+        f"WHERE {predicate} ORDER BY {order} LIMIT 5000) page"
+        for relation, flag in ((proposed, "true"), (current, "false"))
+    )
+    unit = lambda alias, fields: "(" + alias + "." + fields.replace(",", "," + alias + ".") + ")"
+    matches = lambda left, right: " AND ".join(
+        f"{unit(left, fields)}={unit(right, fields)}" for fields in (_ROLLBACK_UNITS, _ROLLBACK_ORDER)
+    )
+    # Keep both legacy and C-collated index paths; OFFSET bounds each exact missing-evidence probe.
+    missing = lambda left, right: (
+        f"EXISTS(SELECT FROM {left} p WHERE {matches('p', 'u')} AND NOT EXISTS("
+        f"SELECT FROM {right} c WHERE {matches('c', 'p')} "
+        'AND c.evidence_id COLLATE "C"=p.evidence_id COLLATE "C" OFFSET 0))'
+    )
     sample_units = " UNION ALL ".join(
-        f"(SELECT category,{units} FROM differences WHERE category='{category}' ORDER BY {order} LIMIT 20)"
+        f"(SELECT category,{_ROLLBACK_UNITS} FROM differences WHERE category='{category}' "
+        f"ORDER BY {_ROLLBACK_ORDER} LIMIT 20)"
         for category in ("additions", "removals", "changes")
     )
-    sample = f"jsonb_agg(jsonb_build_array({units}) ORDER BY {order})"
-    aggregate_record = await connection.fetchrow(
-        f'WITH proposed AS MATERIALIZED (SELECT {units},array_agg(DISTINCT evidence_id COLLATE "C" '
-        f'ORDER BY evidence_id COLLATE "C") AS evidence FROM {proposed} GROUP BY {units}),'
-        f'current_pin AS MATERIALIZED (SELECT {units},array_agg(DISTINCT evidence_id COLLATE "C" '
-        f'ORDER BY evidence_id COLLATE "C") AS evidence FROM {current} GROUP BY {units}),'
-        "differences AS MATERIALIZED ("
-        f"SELECT 'additions' AS category,{proposed_units} FROM proposed p LEFT JOIN current_pin c "
-        f"USING ({units}) WHERE c.network_id IS NULL UNION ALL "
-        f"SELECT 'removals',{current_units} FROM current_pin c LEFT JOIN proposed p "
-        f"USING ({units}) WHERE p.network_id IS NULL UNION ALL "
-        f"SELECT 'changes',{proposed_units} FROM proposed p JOIN current_pin c USING ({units}) WHERE p.evidence<>c.evidence),"
-        f"sampled AS MATERIALIZED ({sample_units}) "
-        "SELECT count(*) FILTER (WHERE category='additions') AS additions,"
-        "count(*) FILTER (WHERE category='removals') AS removals,"
-        "count(*) FILTER (WHERE category='changes') AS changes,"
-        f"jsonb_build_object('additions',COALESCE((SELECT {sample} FROM sampled "
-        "WHERE category='additions'),'[]'::jsonb),"
-        f"'removals',COALESCE((SELECT {sample} FROM sampled "
-        "WHERE category='removals'),'[]'::jsonb),"
-        f"'changes',COALESCE((SELECT {sample} FROM sampled "
-        "WHERE category='changes'),'[]'::jsonb)) AS samples,"
-        f"EXISTS(SELECT 1 FROM {proposed} WHERE evidence_id ~ '^[0-9a-f]{{64}}$') AS has_imported "
-        "FROM differences"
+    sample = f"jsonb_agg(jsonb_build_array({_ROLLBACK_UNITS}) ORDER BY {_ROLLBACK_ORDER})"
+    return dict(
+        await connection.fetchrow(
+            f"WITH keys AS MATERIALIZED ({pages}),units AS MATERIALIZED (SELECT {_ROLLBACK_UNITS},"
+            "bool_or(proposed) AS has_proposed,bool_or(NOT proposed) AS has_current FROM keys "
+            f"WHERE ({order})<={high} GROUP BY {_ROLLBACK_UNITS}),differences AS MATERIALIZED ("
+            "SELECT CASE WHEN NOT has_current THEN 'additions' WHEN NOT has_proposed THEN 'removals' "
+            f"WHEN {missing(proposed, current)} OR {missing(current, proposed)} THEN 'changes' END AS category,"
+            f"{_ROLLBACK_UNITS} FROM units u),sampled AS MATERIALIZED ({sample_units}) "
+            "SELECT count(*) FILTER (WHERE category='additions') AS additions,"
+            "count(*) FILTER (WHERE category='removals') AS removals,"
+            "count(*) FILTER (WHERE category='changes') AS changes,"
+            f"jsonb_build_object('additions',COALESCE((SELECT {sample} FROM sampled "
+            "WHERE category='additions'),'[]'::jsonb),"
+            f"'removals',COALESCE((SELECT {sample} FROM sampled "
+            "WHERE category='removals'),'[]'::jsonb),"
+            f"'changes',COALESCE((SELECT {sample} FROM sampled "
+            "WHERE category='changes'),'[]'::jsonb)) AS samples FROM differences",
+            *((() if after is None else after) + upper),
+        )
     )
-    difference_by_name = dict(aggregate_record)
-    samples_by_category = _document(difference_by_name["samples"])
+
+
+async def _source_rollback_samples(connection, previous_by_category, page_by_category):
+    # Each category contributes at most twenty old and twenty new sample units.
+    samples_by_category = {
+        category: previous_by_category[category] + page_by_category[category] for category in previous_by_category
+    }
+    ranked = await connection.fetchval(
+        f"""WITH samples AS (SELECT category,unit,(unit->>0)::integer AS network_id,
+        unit->>1 AS provider_system,unit->>2 AS provider_id,(unit->>3)::uuid AS location_id
+        FROM jsonb_each($1::jsonb) categories(category,units)
+        CROSS JOIN LATERAL jsonb_array_elements(units) sample(unit)),ranked AS (
+        SELECT *,row_number() OVER(PARTITION BY category ORDER BY {_ROLLBACK_ORDER}) AS position FROM samples)
+        SELECT COALESCE(jsonb_object_agg(category,units),'{{}}'::jsonb) FROM (
+          SELECT category,jsonb_agg(unit ORDER BY {_ROLLBACK_ORDER}) AS units
+          FROM ranked WHERE position<=20 GROUP BY category) bounded""",
+        _json(samples_by_category),
+    )
+    merged_by_category = _document(ranked)
+    return {category: merged_by_category.get(category, []) for category in previous_by_category}
+
+
+async def _source_rollback_difference(connection, candidate_by_name, current_pin):
+    proposed = f"{_identifier(candidate_by_name['schema_name'])}.network_membership"
+    current = f"{_identifier(current_pin.schema_name)}.network_membership"
+    difference_by_name = dict.fromkeys(("additions", "removals", "changes"), 0)
+    samples_by_category = {category: [] for category in difference_by_name}
+    projection_order = await _uses_source_rollback_projection_order(connection, proposed, current)
+    after = None
+    while (
+        upper := await _source_rollback_upper(connection, proposed, current, after, projection_order=projection_order)
+    ) is not None:
+        page = await _source_rollback_page(
+            connection, proposed, current, after, upper, projection_order=projection_order
+        )
+        samples = _document(page["samples"])
+        for category in difference_by_name:
+            difference_by_name[category] += page[category]
+            if not projection_order:
+                samples_by_category[category].extend(samples[category][: 20 - len(samples_by_category[category])])
+        if projection_order:
+            samples_by_category = await _source_rollback_samples(connection, samples_by_category, samples)
+        after = upper
     # Leave room for preview metadata under the queue result limit, retaining stable sample prefixes.
     while len(_json(samples_by_category).encode("utf-8")) > 60 * 1024:
         next(
@@ -313,7 +435,10 @@ async def _source_rollback_difference(connection, candidate_by_name, current_pin
             for category in ("changes", "removals", "additions")
             if samples_by_category[category]
         ).pop()
-    return {**difference_by_name, "samples": samples_by_category}
+    has_imported = await connection.fetchval(
+        f"SELECT EXISTS(SELECT FROM {proposed} WHERE evidence_id ~ '^[0-9a-f]{{64}}$')"
+    )
+    return {**difference_by_name, "samples": samples_by_category, "has_imported": has_imported}
 
 
 async def _verified_source_rollback_candidate(connection, copy_target, command, writer_roles, control_schema):

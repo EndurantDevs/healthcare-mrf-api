@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import asyncpg
 import pytest
 
+from process.network_address_projection import NetworkAddressProjectionError, _membership_accounting
 from process.network_membership_candidate_lifecycle import _create_raw_membership
 from process.network_membership_validation import (
     NetworkMembershipValidationError,
@@ -105,7 +106,7 @@ async def test_valid_report_and_exact_replay(validation_db):
         logged_queries.clear()
         report = await _validate(fixture)
         await asyncio.sleep(0)
-        assert len(logged_queries) == 9
+        assert len(logged_queries) == 10
     original_state = await _candidate_state(fixture)
     assert original_state["state"] == "validated" and original_state["index_ready"] is False
     assert json.loads(original_state["validation_json"]) == report
@@ -377,7 +378,7 @@ async def test_set_queries_remain_bounded(validation_db):
         logged_queries.clear()
         report = await _validate(fixture)
         await asyncio.sleep(0)
-        assert len(logged_queries) == 9 and report["raw_rows"] == 10004
+        assert len(logged_queries) == 10 and report["raw_rows"] == 10004
         await fixture.connection.execute("SET LOCAL enable_seqscan=off")
         query_plan = await fixture.connection.fetch(
             f'EXPLAIN SELECT membership.network_id FROM "{fixture.copy_target.schema_name}".network_membership membership '
@@ -505,3 +506,102 @@ async def test_qualified_empty_validation_and_retained_report_replay(validation_
     async with fixture.connection.transaction():
         with pytest.raises(NetworkMembershipValidationError, match="immutable pinned scope"):
             await _validate(fixture)
+
+
+def _accounting_relations(fixture):
+    namespace = '"' + fixture.copy_target.schema_name + '"'
+    return (
+        namespace + ".network_membership",
+        namespace + ".provider_location_binding",
+        '"' + fixture.control_schema + '".retained_addresses',
+    )
+
+
+async def _accounting_indexes(connection, membership, bindings):
+    await connection.execute(
+        f"CREATE INDEX IF NOT EXISTS network_membership_projection_idx ON {membership}"
+        "(provider_system,provider_id,location_id,network_id)"
+    )
+    await connection.execute(f"CREATE INDEX binding_location_lookup ON {bindings} USING hash(location_key)")
+
+
+@pytest.mark.asyncio
+async def test_indexed_accounting_preserves_aliases_evidence_and_readonly(validation_db):
+    fixture = validation_db
+    connection = fixture.connection
+    membership, bindings, addresses = _accounting_relations(fixture)
+    await connection.execute(f"""INSERT INTO {bindings}
+        SELECT 'npi','alias-'||n::text,md5(n::text)::uuid,repeat('a',64),'npi','provider-a'
+        FROM generate_series(1,12) n""")
+    await connection.execute(f"""INSERT INTO {membership}
+        SELECT CASE WHEN n%2=0 THEN 42 ELSE 88 END,'npi','alias-'||n::text,md5(n::text)::uuid,'duplicate'
+        FROM generate_series(1,12) n CROSS JOIN generate_series(1,1001) duplicate""")
+    await connection.execute(f"""INSERT INTO {bindings} VALUES
+        ('unused','orphan',md5('orphan')::uuid,'missing','npi','provider-a'),
+        ('first','unused',md5('unused')::uuid,repeat('a',64),'npi','provider-a')""")
+    async with connection.transaction(readonly=True):
+        expected_counts_by_field = dict(await _membership_accounting(connection, membership, bindings, addresses))
+    assert expected_counts_by_field == {
+        "membership_rows": 12016,
+        "invalid_memberships": 0,
+        "distinct_memberships": 4,
+        "projected_locations": 2,
+        "orphan_bindings": 1,
+    }
+    await _accounting_indexes(connection, membership, bindings)
+    await connection.execute(f"ANALYZE {membership}; ANALYZE {bindings}")
+    async with connection.transaction(readonly=True):
+        assert (
+            dict(await _membership_accounting(connection, membership, bindings, addresses)) == expected_counts_by_field
+        )
+    outer = connection.transaction()
+    await outer.start()
+    try:
+        await connection.execute(f"DELETE FROM {membership} WHERE network_id=88")
+        changed = await _membership_accounting(connection, membership, bindings, addresses)
+        assert changed["distinct_memberships"] == 2 and changed["projected_locations"] == 1
+    finally:
+        await outer.rollback()
+    assert dict(await _membership_accounting(connection, membership, bindings, addresses)) == expected_counts_by_field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing_binding", "wrong_entity"])
+async def test_indexed_accounting_refuses_invalid_exact_binding(validation_db, damage):
+    fixture = validation_db
+    membership, bindings, addresses = _accounting_relations(fixture)
+    await _accounting_indexes(fixture.connection, membership, bindings)
+    mutation = (
+        f"DELETE FROM {bindings} WHERE provider_id='provider-b'"
+        if damage == "missing_binding"
+        else f"UPDATE {bindings} SET entity_id='different-provider' WHERE provider_id='provider-b'"
+    )
+    outer = fixture.connection.transaction()
+    await outer.start()
+    try:
+        await fixture.connection.execute(mutation)
+        with pytest.raises(NetworkAddressProjectionError, match="exact provider/site"):
+            await _membership_accounting(fixture.connection, membership, bindings, addresses)
+    finally:
+        await outer.rollback()
+    assert (await _membership_accounting(fixture.connection, membership, bindings, addresses))["membership_rows"] == 4
+
+
+@pytest.mark.asyncio
+async def test_indexed_accounting_preserves_duplicate_address_multiplicity(validation_db):
+    fixture = validation_db
+    membership, bindings, addresses = _accounting_relations(fixture)
+    repeated_addresses = f"(SELECT * FROM {addresses} UNION ALL SELECT * FROM {addresses})"
+    expected_counts_by_field = dict(
+        await _membership_accounting(fixture.connection, membership, bindings, repeated_addresses)
+    )
+    assert expected_counts_by_field["membership_rows"] == 8 and expected_counts_by_field["distinct_memberships"] == 3
+    await _accounting_indexes(fixture.connection, membership, bindings)
+    async with fixture.connection.transaction(readonly=True):
+        assert (
+            dict(await _membership_accounting(fixture.connection, membership, bindings, repeated_addresses))
+            == expected_counts_by_field
+        )
+    await fixture.connection.execute(f"DELETE FROM {membership}")
+    empty = await _membership_accounting(fixture.connection, membership, bindings, addresses)
+    assert empty["membership_rows"] == empty["distinct_memberships"] == empty["projected_locations"] == 0

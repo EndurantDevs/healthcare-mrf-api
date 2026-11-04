@@ -145,7 +145,7 @@ async def test_complete_profile_and_native_replay(serving_indexes_db):
         await asyncio.sleep(0)
         print({"serving_build_roundtrips": len(logged_queries)})
         build_count = len(logged_queries)
-        assert build_count == 52
+        assert build_count == 53
         assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
     indexes = await _indexes(fixture)
     plan, _ = _post_publish_index_plan(f'"{fixture.copy_target.schema_name}"', "serving", build_concurrently=False)
@@ -168,7 +168,7 @@ async def test_complete_profile_and_native_replay(serving_indexes_db):
         assert await _prepare(fixture) == readiness
         await asyncio.sleep(0)
         print({"serving_replay_roundtrips": len(logged_queries), "build_roundtrips": build_count})
-        assert len(logged_queries) == 24
+        assert len(logged_queries) == 25
         assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
         _assert_only_parity_temporary_ddl(logged_queries)
     assert await _state(fixture) == state and await _indexes(fixture) == indexes
@@ -366,7 +366,7 @@ async def test_large_candidate_uses_bounded_parity_statements(serving_indexes_db
         logged_queries.clear()
         await _prepare(fixture)
         await asyncio.sleep(0)
-        assert len(logged_queries) == 60
+        assert len(logged_queries) == 61
         assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
         assert len([entry for entry in logged_queries if "WITH source AS (" in entry.query]) == 5
     assert (
