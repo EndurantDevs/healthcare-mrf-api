@@ -62,7 +62,9 @@ def _source_recipe(index):
     )
     if "catalog_descriptor" in capture:
         capture["catalog_descriptor"] = catalog
-    capture["capture_sha256"] = digest({key: value for key, value in capture.items() if key != "capture_sha256"})
+    capture["capture_sha256"] = digest(
+        {key: source_pin for key, source_pin in capture.items() if key != "capture_sha256"}
+    )
     return RegistrySourceMembershipRecipe(
         PinnedTypedFHIRMembershipSource(capture, anchor, catalog), RegistryNetworkSourceCoordinates(**coordinates)
     )
@@ -107,22 +109,31 @@ def test_complete_fourteen_source_worker_configuration_fits_existing_wire_cap():
     )
 
 
+def _mutate_reference_documents(documents, change):
+    if change == "duplicate":
+        documents[1] = deepcopy(documents[0])
+        return
+    if change == "hash":
+        documents[0]["capture_sha256"] = "not-a-hash"
+        return
+    if change == "anchor":
+        documents[0]["observed_at"] = "today"
+        return
+    if change == "kind":
+        documents[0]["source_kind"] = "fhir"
+        return
+    if change == "too_many":
+        documents *= 8
+        return
+    else:
+        documents[0]["raw_origin" if change == "full_origin" else "extra"] = {}
+
+
 @pytest.mark.parametrize("change", ["unknown", "duplicate", "hash", "anchor", "full_origin", "kind", "too_many"])
 def test_reference_codec_refuses_malformed_or_ambiguous_batches(change):
     configured = _configuration()
     documents = configured["initial_address_sources"]["source_recipe_additions"]["recipes"]
-    if change == "duplicate":
-        documents[1] = deepcopy(documents[0])
-    elif change == "hash":
-        documents[0]["capture_sha256"] = "not-a-hash"
-    elif change == "anchor":
-        documents[0]["observed_at"] = "today"
-    elif change == "kind":
-        documents[0]["source_kind"] = "fhir"
-    elif change == "too_many":
-        documents *= 8
-    else:
-        documents[0]["raw_origin" if change == "full_origin" else "extra"] = {}
+    _mutate_reference_documents(documents, change)
     with pytest.raises(ValueError):
         parse_registry_publication_worker_config(json.dumps(configured))
 
@@ -221,20 +232,20 @@ async def test_replacement_hydrates_complete_vector_preserves_non_fhir_and_remov
     manifest = _inventory().manifest
     document["manifest_sha256"] = manifest.manifest_sha256
     replacement = decode_source_recipe_additions(document)
-    current = tuple(_source_recipe(index) for index in range(1, 15))
-    old = (_old_capture_recipe(current[0]), _old_capture_recipe(current[0], second=True))
+    current_recipes = tuple(_source_recipe(index) for index in range(1, 15))
+    old = (_old_capture_recipe(current_recipes[0]), _old_capture_recipe(current_recipes[0], second=True))
     unrelated = _configured_recipe("ptg")
     monkeypatch.setattr(
         additions_module, "resolve_retained_registry_source_recipes", AsyncMock(return_value=(*old, unrelated))
     )
-    hydrate = AsyncMock(side_effect=current)
+    hydrate = AsyncMock(side_effect=current_recipes)
     monkeypatch.setattr(TypedFHIRRecipeReference, "resolve", hydrate)
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=json.dumps(replacement.inventory.as_dict())))
     actual = await resolve_source_recipe_additions(
         connection, replacement, manifest, 7, control_schema="registry", source_witness_runtime=object()
     )
     assert len(actual) == 15 and unrelated in actual
-    assert all(recipe in actual for recipe in current) and all(recipe not in actual for recipe in old)
+    assert all(recipe in actual for recipe in current_recipes) and all(recipe not in actual for recipe in old)
     assert hydrate.await_count == 14
     connection.fetchval.return_value = json.dumps({**replacement.inventory.as_dict(), "table_name": "other"})
     hydrate.reset_mock()
@@ -255,20 +266,20 @@ def test_typed_successor_requires_one_exact_physical_source_and_preserves_old_sl
     elif damage == "duplicate":
         current = (typed, typed)
     else:
-        source = old.source_pin
-        capture = source.retained_capture
+        source_pin = old.source_pin
+        capture = source_pin.retained_capture
         from process.network_fhir_retained_capture_contract import capture_digest
         from tests.test_network_fhir_retained_capture import pin
 
         field = {"source": "source_id", "schema": "schema_name", "endpoint": "endpoint_id"}[damage]
         capture = replace(capture, origin=replace(capture.origin, **{field: "different"}))
         capture = replace(capture, capture_sha256=capture_digest(capture))
-        source = pin(capture)
+        source_pin = pin(capture)
         old = replace(
             old,
-            source_pin=source,
+            source_pin=source_pin,
             binding_coordinates=replace(
-                old.binding_coordinates, source_id=source.source_id, dataset_schema=source.schema_name
+                old.binding_coordinates, source_id=source_pin.source_id, dataset_schema=source_pin.schema_name
             ),
         )
         current = (typed,)

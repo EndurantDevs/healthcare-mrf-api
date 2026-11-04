@@ -91,6 +91,7 @@ def _period(column, operator):
 
 
 def reference_sql(expression):
+    """Render the existing scoped reference expression without changing its SQL semantics."""
     return "CASE WHEN starts_with({e},$1::text||'/') THEN substr({e},length($1::text)+2) ELSE {e} END".format(
         e=expression
     )

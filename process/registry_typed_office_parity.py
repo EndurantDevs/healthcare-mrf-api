@@ -32,9 +32,9 @@ async def _upper_bound(connection, queries, after):
     return None if row is None else tuple(row)
 
 
-async def _pair_rows_differ(connection, target, expected, revision, control, preservation):
-    source = f"{target}.network_membership_source"
-    queries = [f"SELECT {_KEYS} FROM {source}", f"SELECT {_COLUMNS} FROM {expected}"]
+async def _has_pair_row_difference(connection, target_namespace, expected, revision, control, preservation):
+    source_relation = f"{target_namespace}.network_membership_source"
+    queries = [f"SELECT {_KEYS} FROM {source_relation}", f"SELECT {_COLUMNS} FROM {expected}"]
     if preservation is not None:
         queries.append(preservation.binding_query)
     after = None
@@ -49,7 +49,7 @@ async def _pair_rows_differ(connection, target, expected, revision, control, pre
             _APPROVED_CTE.format(control=control)
             + f""", expected AS MATERIALIZED ({expected_rows}),
             source_pairs AS MATERIALIZED (
-              SELECT DISTINCT {_KEYS} FROM {source} WHERE {scope}
+              SELECT DISTINCT {_KEYS} FROM {source_relation} WHERE {scope}
             ), expected_final AS (
               SELECT expected.provider_system,expected.provider_id,expected.location_id,
                 coalesce(custom.location_key,expected.location_key) AS location_key,
@@ -64,7 +64,7 @@ async def _pair_rows_differ(connection, target, expected, revision, control, pre
               OR EXISTS(SELECT FROM source_pairs LEFT JOIN expected USING({_KEYS})
                 WHERE expected.location_id IS NULL)
               OR EXISTS(SELECT FROM expected_final expected LEFT JOIN LATERAL (
-                SELECT location_key,entity_type,entity_id FROM {target}.provider_location_binding binding
+                SELECT location_key,entity_type,entity_id FROM {target_namespace}.provider_location_binding binding
                 WHERE (binding.provider_system,binding.provider_id,binding.location_id)
                   =(expected.provider_system,expected.provider_id,expected.location_id) OFFSET 0
               ) actual ON true WHERE (actual.location_key,actual.entity_type,actual.entity_id)
@@ -78,7 +78,7 @@ async def _pair_rows_differ(connection, target, expected, revision, control, pre
     return False
 
 
-async def _office_keys_collide(connection, bindings):
+async def _has_office_key_collision(connection, bindings):
     after = None
     while True:
         lower = "TRUE" if after is None else "location_key>$1::text"
@@ -109,7 +109,7 @@ async def typed_binding_parity(connection, copy_target, expected, candidate, sch
     from process.registry_initial_source_composition import RegistryInitialSourceError
 
     namespace = _identifier(copy_target.schema_name)
-    if await _pair_rows_differ(
+    if await _has_pair_row_difference(
         connection, namespace, expected, candidate["approved_custom_revision"], _identifier(schema), preservation
-    ) or await _office_keys_collide(connection, namespace + ".provider_location_binding"):
+    ) or await _has_office_key_collision(connection, namespace + ".provider_location_binding"):
         raise RegistryInitialSourceError("registry_source_office_bindings_differ")

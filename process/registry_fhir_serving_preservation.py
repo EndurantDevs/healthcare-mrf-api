@@ -539,12 +539,7 @@ def _legacy_predecessor_pins(manifest):
     return relation_pins
 
 
-async def _identity_stages(
-    connection, previous, recipes, old_approved, current_approved, approved_revision, control_schema, **source_options
-):
-    """Stage complete authenticated Organization families and both reviewed subject maps."""
-    if set(source_options) - {"source_witness_runtime"}:
-        _fail("source_runtime_invalid")
+async def _create_identity_tables(connection):
     identity = uuid4().hex
     names = [
         "fhir_preserve_" + kind + "_" + identity
@@ -564,6 +559,18 @@ async def _identity_stages(
     )
     for relation in (current_subjects, reviewed_subjects):
         await connection.execute(f"CREATE TEMP TABLE {relation}(LIKE {subjects}) ON COMMIT DROP")
+    return relations
+
+
+async def _identity_stages(
+    connection, previous, recipes, old_approved, current_approved, approved_revision, control_schema, **source_options
+):
+    """Stage complete authenticated Organization families and both reviewed subject maps."""
+    if set(source_options) - {"source_witness_runtime"}:
+        _fail("source_runtime_invalid")
+    inventory, coverage, subjects, current_subjects, reviewed_subjects, missing = await _create_identity_tables(
+        connection
+    )
     await _coverage(
         connection, previous, old_approved, control_schema, "previous", inventory, coverage, **source_options
     )
@@ -1100,10 +1107,10 @@ def _exclusive_fhir_cohort(control_schema):
 
 
 async def _typed_current_raw_differs(connection, actual, expected, revisions, control_schema):
-    from process.registry_typed_membership_parity import multiset_differs
+    from process.registry_typed_membership_parity import has_multiset_difference
 
     if revisions is None:
-        return await multiset_differs(connection, actual, expected)
+        return await has_multiset_difference(connection, actual, expected)
     # Catalog IDs, not membership rows, cross Python. Each bounded cohort probes
     # the leading network_id indexes; the ordered helper preserves multiplicity.
     after = None
@@ -1118,7 +1125,7 @@ async def _typed_current_raw_differs(connection, actual, expected, revisions, co
             return False
         identifiers = ",".join(str(int(row["network_id"])) for row in rows)
         scope = f"network_id=ANY(ARRAY[{identifiers}]::integer[])"
-        if await multiset_differs(
+        if await has_multiset_difference(
             connection,
             f"SELECT * FROM ({actual}) rows WHERE {scope}",
             f"SELECT * FROM ({expected}) rows WHERE {scope}",

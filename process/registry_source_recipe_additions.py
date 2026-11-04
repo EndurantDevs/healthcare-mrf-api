@@ -41,15 +41,15 @@ class RegistrySourceRecipeAdditions:
             or not self.recipes
         ):
             raise ValueError("registry_source_recipe_additions_invalid")
-        ordinary = tuple(recipe for recipe in self.recipes if type(recipe) is not TypedFHIRRecipeReference)
+        ordinary_recipes = tuple(recipe for recipe in self.recipes if type(recipe) is not TypedFHIRRecipeReference)
         references = tuple(recipe for recipe in self.recipes if type(recipe) is TypedFHIRRecipeReference)
         for reference in references:
             reference.__post_init__()
         if len(self.recipes) > 100 or len({reference.capture_id for reference in references}) != len(references):
             raise ValueError("registry_source_recipe_additions_invalid")
-        ordinary = validate_initial_source_recipes(ordinary, inventory=True)
+        ordinary_recipes = validate_initial_source_recipes(ordinary_recipes, inventory=True)
         object.__setattr__(
-            self, "recipes", ordinary + tuple(sorted(references, key=lambda reference: reference.capture_id))
+            self, "recipes", ordinary_recipes + tuple(sorted(references, key=lambda reference: reference.capture_id))
         )
 
     def require_predecessor(self, manifest, expected_head):
@@ -76,15 +76,15 @@ class RegistryTypedSourceRecipeReplacement(RegistrySourceRecipeAdditions):
 
 def decode_source_recipe_additions(document):
     """Keep the worker input closed and reuse the existing recipe/reference codecs."""
-    replacement = type(document) is dict and document.get("operation") == "replace_typed_source_vector"
+    is_replacement = type(document) is dict and document.get("operation") == "replace_typed_source_vector"
     fields = {"expected_serving_generation", "manifest_sha256", "inventory", "recipes"}
     if (
         type(document) is not dict
-        or set(document) != fields | ({"operation"} if replacement else set())
+        or set(document) != fields | ({"operation"} if is_replacement else set())
         or type(document["recipes"]) is not list
     ):
         raise ValueError("registry_source_recipe_additions_invalid")
-    input_type = RegistryTypedSourceRecipeReplacement if replacement else RegistrySourceRecipeAdditions
+    input_type = RegistryTypedSourceRecipeReplacement if is_replacement else RegistrySourceRecipeAdditions
     return input_type(
         document["expected_serving_generation"],
         document["manifest_sha256"],
@@ -123,7 +123,7 @@ async def resolve_source_recipe_additions(
     )
     if decode_source_inventory_reference(encoded) != additions.inventory:
         raise ValueError("registry_source_recipe_additions_inventory_changed")
-    added = tuple(
+    added_recipes = tuple(
         [
             await recipe.resolve(connection, source_witness_runtime)
             if type(recipe) is TypedFHIRRecipeReference
@@ -131,15 +131,15 @@ async def resolve_source_recipe_additions(
             for recipe in additions.recipes
         ]
     )
-    preserved = retained
+    preserved_recipes = retained
     if type(additions) is RegistryTypedSourceRecipeReplacement:
-        if any(type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource for recipe in added):
+        if any(type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource for recipe in added_recipes):
             raise ValueError("registry_source_recipe_replacement_invalid")
-        preserved = tuple(
+        preserved_recipes = tuple(
             recipe
             for recipe in retained
             if type(recipe.source_pin) not in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource)
         )
-    recipes = SourceInventoryPreparation((*preserved, *added)).recipes
+    recipes = SourceInventoryPreparation((*preserved_recipes, *added_recipes)).recipes
     fhir_vector_succession(retained, recipes)
     return recipes

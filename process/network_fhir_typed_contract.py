@@ -51,11 +51,13 @@ class TypedFHIRGraphError(ValueError):
 
 
 def require(condition, reason="invalid"):
+    """Reject a failed typed-graph invariant with its stable reason code."""
     if not condition:
         raise TypedFHIRGraphError("registry_fhir_typed_" + reason)
 
 
 def policy_date(value):
+    """Parse only canonical ISO dates used by the versioned membership policy."""
     require(type(value) is str, "as_of")
     try:
         parsed = date.fromisoformat(value)
@@ -128,10 +130,12 @@ class TypedFHIRGraphStage:
     brand: object = None
 
     def relation(self, kind):
+        """Resolve only a declared relation in the bound workspace."""
         require(kind in self.names)
         return _identifier(self.schema_name) + "." + _identifier(self.names[kind])
 
     async def verify(self, connection, *, complete=True):
+        """Require the original task, transaction and relation identities before reading rows."""
         require(self.brand is _BRAND and self.active and self.connection is connection, "workspace_closed")
         require(self.task is asyncio.current_task() and connection.is_in_transaction(), "workspace_scope")
         require(await _virtual_xid(connection) == self.virtual_xid, "workspace_scope")

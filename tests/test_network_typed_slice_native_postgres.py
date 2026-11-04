@@ -9,7 +9,8 @@ from process import registry_typed_membership_parity as parity
 from process.network_compact_readiness import NetworkCompactReadinessError
 from process.network_compact_slice_validation import verify_compact_slice_contents
 from tests.test_network_compact_slice_validation_postgres import _layout
-from tests.test_network_membership_slices_postgres import _candidate, _prepare, _refs, slice_db
+from tests.test_network_membership_slices_postgres import _candidate, _prepare, _refs
+from tests.test_network_membership_slices_postgres import slice_db as slice_db
 
 
 async def _seed_memberships(db, copy_target, count):
@@ -55,7 +56,7 @@ async def test_native_typed_slice_parity_duplicates_and_corruption(slice_db, mon
         await _seed_memberships(db, copy_target, count)
     async with db.connection.transaction():
         legacy_receipt = await _prepare(db, legacy)
-    monkeypatch.setattr(parity, "typed_candidate", lambda _candidate: True)
+    monkeypatch.setattr(parity, "is_typed_candidate", lambda _candidate: True)
     async with db.connection.transaction():
         typed_receipt = await _prepare(db, typed)
         layout = await _layout(db, typed, typed_receipt)

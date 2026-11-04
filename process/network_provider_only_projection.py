@@ -600,8 +600,8 @@ async def _append_typed_staged_sources(connection, expected, recipes, stage, app
         hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest(): recipe for recipe in recipes
     }
     for child in matches.legacy_stages:
-        selected = tuple(recipes_by_sha[item["recipe_sha256"]] for item in child.contribution_receipts)
-        selected_recipes, descriptors = _staged_sources(selected, child)
+        selected_stages = tuple(recipes_by_sha[item["recipe_sha256"]] for item in child.contribution_receipts)
+        selected_recipes, descriptors = _staged_sources(selected_stages, child)
         await _append_staged_sources(
             connection, expected, selected_recipes, descriptors, child, approved, control_schema
         )

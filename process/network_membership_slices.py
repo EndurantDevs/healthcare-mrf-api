@@ -139,7 +139,7 @@ async def _matched_facts(
     )
     if not indexed_address:
         raise NetworkMembershipSliceError("Pinned addresses require the native location primary key")
-    if registry_typed_membership_parity.typed_candidate(candidate):
+    if registry_typed_membership_parity.is_typed_candidate(candidate):
         from process.network_typed_slice_native import matched_facts
 
         return await matched_facts(
@@ -347,7 +347,7 @@ async def _prepare_slices(connection, copy_target, address_source, previous, aff
         accounting = await _matched_facts(
             connection, schema, address_table, work_table, candidate, affected_table, office_relation
         )
-        is_typed = registry_typed_membership_parity.typed_candidate(candidate)
+        is_typed = registry_typed_membership_parity.is_typed_candidate(candidate)
         await _create_slice_relations(connection, schema, **({"typed": True} if is_typed else {}))
         carried_slices = 0
         if affected_table:

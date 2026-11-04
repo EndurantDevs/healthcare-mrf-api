@@ -229,11 +229,11 @@ async def _owner_sources(connection, candidate, custody, control_schema, *, api_
         }[receipt["revision"]]
         if (
             reference != expected
-            or summarize(reference.root, sorted(source_descriptors, key=lambda source: source["recipe_sha256"]))
+            or summarize(reference.root, sorted(source_descriptors, key=lambda source_pin: source_pin["recipe_sha256"]))
             != receipt
         ):
             raise ValueError
-        return tuple(source for source in source_descriptors if source.get("descriptor_version") != 4)
+        return tuple(source_pin for source_pin in source_descriptors if source_pin.get("descriptor_version") != 4)
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError:
         raise RegistrySourceContributionError("registry_source_artifact_inventory_changed") from None
 
