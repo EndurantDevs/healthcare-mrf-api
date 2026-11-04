@@ -767,15 +767,16 @@ def _substitute_typed_mapping(monkeypatch):
     from process import registry_typed_source_stage as staging
     from process.network_fhir_typed_capture import SealedTypedGraphRead
 
-    original_mapping = staging.prepare_typed_graph_mapping
+    original_mapping = staging.map_typed_graph_batch
 
-    async def substitute(connection, source_stage, **options):
-        result = await original_mapping(connection, source_stage, **options)
-        if type(source_stage) is SealedTypedGraphRead:
-            await connection.execute("UPDATE " + result.relation("memberships") + " SET evidence_id=repeat('0',64)")
-        return result
+    async def substitute(connection, inputs, **options):
+        results = await original_mapping(connection, inputs, **options)
+        for result in results:
+            if type(result.source_stage) is SealedTypedGraphRead:
+                await connection.execute("UPDATE " + result.relation("memberships") + " SET evidence_id=repeat('0',64)")
+        return results
 
-    monkeypatch.setattr(staging, "prepare_typed_graph_mapping", substitute)
+    monkeypatch.setattr(staging, "map_typed_graph_batch", substitute)
 
 
 async def _assert_rejected_typed_publication(context, checked_actors):
