@@ -274,9 +274,9 @@ def require_fhir_source_event_delta(previous, current, assertion, *, inventory=F
         _fail("event_delta")
 
 
-async def _ordered_digest(connection, query, arguments=()):
+async def _ordered_digest(connection, query, arguments=(), *, digest=None):
     """Stream fixed-size native row hashes; neither complete rows nor ID sets are collected."""
-    digest, count = hashlib.sha256(), 0
+    digest, count = hashlib.sha256() if digest is None else digest, 0
     native = (
         "SELECT octet_length(document)::bigint,sha256(convert_to(document,'UTF8')) "
         f"FROM ({query}) ordered_rows(document)"
@@ -552,7 +552,7 @@ async def _create_identity_tables(connection):
         "successor_slot text) ON COMMIT DROP"
     )
     await connection.execute(
-        f"CREATE TEMP TABLE {coverage}(side text,slot text,organization_id text,payload_hash text,PRIMARY KEY(side,slot,organization_id)) ON COMMIT DROP"
+        f'CREATE TEMP TABLE {coverage}(side text,slot text COLLATE "C",organization_id text COLLATE "C",payload_hash text,PRIMARY KEY(side,slot,organization_id)) ON COMMIT DROP'
     )
     await connection.execute(
         f"CREATE TEMP TABLE {subjects}(network_id integer,slot text,organization_id text,supported boolean) ON COMMIT DROP"
@@ -720,6 +720,37 @@ async def _predecessor_addresses(connection, predecessor):
     return query, arguments
 
 
+async def _coverage_digest(connection, coverage):
+    """Retain the historical row order while bounding each native hash range."""
+    digest = hashlib.sha256()
+    lower_keys = None
+    keys = 'side,slot COLLATE "C",organization_id COLLATE "C"'
+    while True:
+        predicate = "" if lower_keys is None else f"WHERE ({keys}) > ($1,$2,$3)"
+        upper_keys = await connection.fetchrow(
+            f"SELECT side,slot,organization_id FROM (SELECT side,slot,organization_id "
+            f"FROM {coverage} {predicate} ORDER BY {keys} LIMIT 5000) page "
+            'ORDER BY side DESC,slot COLLATE "C" DESC,organization_id COLLATE "C" DESC LIMIT 1',
+            *(lower_keys or ()),
+        )
+        if upper_keys is None:
+            return digest.hexdigest()
+        predicate = f"({keys}) <= ($1,$2,$3)"
+        arguments = tuple(upper_keys)
+        if lower_keys is not None:
+            predicate += f" AND ({keys}) > ($4,$5,$6)"
+            arguments += lower_keys
+        count, _ = await _ordered_digest(
+            connection,
+            f"SELECT to_jsonb(row)::text FROM {coverage} row WHERE {predicate} ORDER BY {keys}",
+            arguments,
+            digest=digest,
+        )
+        if not 0 < count <= 5000:
+            _fail("coverage_range")
+        lower_keys = tuple(upper_keys)
+
+
 async def _carry_counters(connection, missing, coverage, queries, address_arguments=()):
     """Hash fixed-size native row digests while retaining exact multiset counts."""
     membership_query, binding_query, address_query = queries
@@ -732,15 +763,15 @@ async def _carry_counters(connection, missing, coverage, queries, address_argume
         ("binding_rows", "bindings_sha256", binding_query),
         ("address_rows", "addresses_sha256", address_query),
     ):
-        counters_by_name[count_name], counters_by_name[digest_name] = await _ordered_digest(
-            connection,
-            f'SELECT to_jsonb(row)::text FROM ({query}) row ORDER BY to_jsonb(row)::text COLLATE "C"',
-            address_arguments if count_name == "address_rows" else (),
-        )
-    _, coverage_digest = await _ordered_digest(
-        connection,
-        f'SELECT to_jsonb(row)::text FROM {coverage} row ORDER BY side,slot COLLATE "C",organization_id COLLATE "C"',
-    )
+        if counters_by_name["missing_networks"] == 0:
+            counters_by_name[count_name], counters_by_name[digest_name] = 0, hashlib.sha256().hexdigest()
+        else:
+            counters_by_name[count_name], counters_by_name[digest_name] = await _ordered_digest(
+                connection,
+                f'SELECT to_jsonb(row)::text FROM ({query}) row ORDER BY to_jsonb(row)::text COLLATE "C"',
+                address_arguments if count_name == "address_rows" else (),
+            )
+    coverage_digest = await _coverage_digest(connection, coverage)
     return counters_by_name, coverage_digest
 
 
