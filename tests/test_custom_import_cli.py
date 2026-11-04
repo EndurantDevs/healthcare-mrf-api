@@ -449,7 +449,15 @@ def test_captures_entrypoint_reads_retained_evidence(monkeypatch, capsys, has_ca
     }
     assert database.events == ["connect", "begin", "commit", "disconnect"]
     assert database.disconnected_echo is True
-    assert len(session.statements) == 1
+    assert len(session.statements) == (2 if has_capture else 1)
+    if has_capture:
+        assert "resolve_custom_import_generation_snapshot(" in str(session.statements[1])
+        assert session.parameters[1] == {
+            "dataset_id": 3,
+            "generation_id": 19,
+            "definition_revision_id": 5,
+            "schema_revision_id": 7,
+        }
     statement = session.statements[0]
     assert statement.is_select and statement.get_execution_options()["autoflush"] is False
     assert statement.compile().params["dataset_id_1"] == 3

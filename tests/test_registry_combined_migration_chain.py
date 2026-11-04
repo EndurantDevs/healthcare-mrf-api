@@ -13,6 +13,9 @@ def test_catalog_membership_and_inventory_extend_the_existing_target_head():
         "20261028010000_registry_fhir_catalog",
         "20261028020000_registry_membership_refresh",
         "20261029010000_registry_source_inventory",
+        "20261102010000_custom_import_snapshot_retirement",
+        "20261102030000_custom_import_build_scratch",
+        "20261102040000_custom_import_post_seal_audit",
     )
     assert scripts.get_heads() == [chain[-1]]
     for predecessor, successor in zip(chain, chain[1:]):

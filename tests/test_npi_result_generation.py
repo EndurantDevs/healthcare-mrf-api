@@ -149,6 +149,9 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261028010000_registry_fhir_catalog",
     "20261028020000_registry_membership_refresh",
     "20261029010000_registry_source_inventory",
+    "20261102010000_custom_import_snapshot_retirement",
+    "20261102030000_custom_import_build_scratch",
+    "20261102040000_custom_import_post_seal_audit",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -207,7 +210,7 @@ def _assert_legacy_capture_lineage(script):
 
 def _assert_current_registry_head(script: ScriptDirectory) -> None:
     """Require one registry head after the unchanged published custom-import chain."""
-    assert script.get_heads() == ["20261029010000_registry_source_inventory"]
+    assert script.get_heads() == ["20261102040000_custom_import_post_seal_audit"]
     assert (
         script.get_revision("20261029010000_registry_source_inventory").down_revision
         == "20261028020000_registry_membership_refresh"

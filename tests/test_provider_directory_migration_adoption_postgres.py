@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import asyncpg
@@ -406,6 +407,48 @@ async def _assert_adopted_schema(database_url, schema_name: str) -> None:
     await assert_abandonment_object_shapes(database_url, schema_name)
 
 
+async def _drop_adoption_schema(url) -> None:
+    """Release cleanup locks between tables in the disposable adoption schema."""
+    connection = await _connect(url)
+    try:
+        tables = await connection.fetch(
+            "SELECT format('%I.%I', n.nspname, c.relname) AS qualified_name "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname=$1 AND c.relkind IN ('r','p') "
+            "ORDER BY c.relkind DESC,c.oid",
+            ADOPTION_SCHEMA,
+        )
+        for table in tables:
+            await connection.execute(f"DROP TABLE IF EXISTS {table['qualified_name']} CASCADE")
+        await connection.execute(f'DROP SCHEMA IF EXISTS "{ADOPTION_SCHEMA}" CASCADE')
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_drop_failure", [False, True])
+async def test_adoption_cleanup_releases_locks_per_table_and_always_closes(monkeypatch, has_drop_failure):
+    connection = SimpleNamespace(
+        fetch=AsyncMock(return_value=[{"qualified_name": '"owned"."leaf"'}, {"qualified_name": '"owned"."parent"'}]),
+        execute=AsyncMock(side_effect=RuntimeError("drop failed") if has_drop_failure else None),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_connect", AsyncMock(return_value=connection))
+    if has_drop_failure:
+        with pytest.raises(RuntimeError, match="drop failed"):
+            await _drop_adoption_schema(object())
+    else:
+        await _drop_adoption_schema(object())
+        assert [call.args[0] for call in connection.execute.await_args_list] == [
+            'DROP TABLE IF EXISTS "owned"."leaf" CASCADE',
+            'DROP TABLE IF EXISTS "owned"."parent" CASCADE',
+            f'DROP SCHEMA IF EXISTS "{ADOPTION_SCHEMA}" CASCADE',
+        ]
+    assert "WHERE n.nspname=$1" in connection.fetch.await_args.args[0]
+    assert connection.fetch.await_args.args[1] == ADOPTION_SCHEMA
+    connection.close.assert_awaited_once_with()
+
+
 def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
     """Adopt current ORM columns and preserve the exact repair cycle."""
 
@@ -414,17 +457,10 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
     environment = _database_environment(url, ADOPTION_SCHEMA)
 
     async def reset_adoption_schema() -> None:
+        await _drop_adoption_schema(url)
         connection = await _connect(url)
         try:
-            await connection.execute(f'DROP SCHEMA IF EXISTS "{ADOPTION_SCHEMA}" CASCADE')
             await connection.execute(f'CREATE SCHEMA "{ADOPTION_SCHEMA}"')
-        finally:
-            await connection.close()
-
-    async def drop_adoption_schema() -> None:
-        connection = await _connect(url)
-        try:
-            await connection.execute(f'DROP SCHEMA IF EXISTS "{ADOPTION_SCHEMA}" CASCADE')
         finally:
             await connection.close()
 
@@ -452,7 +488,7 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
         _run_alembic(environment, "upgrade", "head")
         asyncio.run(_assert_adopted_schema(url, ADOPTION_SCHEMA))
     finally:
-        asyncio.run(drop_adoption_schema())
+        asyncio.run(_drop_adoption_schema(url))
 
 
 def test_membership_idempotency_index_creation_adoption_and_drift_refusal(monkeypatch):

@@ -349,3 +349,173 @@ async def test_late_reader_close_failure_cannot_freeze_source(monkeypatch):
             assert [cursor.next_source_ordinal for cursor in cursors] == [2, 0]
             assert all(cursor.replay_verified_at is None for cursor in cursors)
             await _assert_unpublished(session, request)
+
+
+async def test_retired_read_is_refused_before_legacy_fallback_without_reader_grants():
+    from tests.custom_import_retirement_postgres import (
+        test_retired_read_is_refused_before_legacy_fallback_without_reader_grants as verify,
+    )
+
+    await verify()
+
+
+async def test_retired_producer_cannot_recreate_or_resume_the_same_fence():
+    from tests.custom_import_retirement_postgres import (
+        test_retired_producer_cannot_recreate_or_resume_the_same_fence as verify,
+    )
+
+    await verify()
+
+
+async def test_retirement_migration_preserves_existing_function_metadata_and_legacy_reads():
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_migration_preserves_existing_function_metadata_and_legacy_reads as verify,
+    )
+
+    await verify()
+
+
+async def test_actual_api_owner_and_worker_logins_cannot_retire_storage():
+    from tests.custom_import_retirement_postgres import (
+        test_actual_api_owner_and_worker_logins_cannot_retire_storage as verify,
+    )
+
+    await verify()
+
+
+async def test_application_owned_definer_reads_retirement_marker_without_new_grants():
+    from tests.custom_import_retirement_postgres import (
+        test_application_owned_definer_reads_retirement_marker_without_new_grants as verify,
+    )
+
+    await verify()
+
+
+async def test_retirement_removes_only_replaced_storage_and_replays_exactly():
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_removes_only_replaced_storage_and_replays_exactly as verify,
+    )
+
+    await verify()
+
+
+async def test_retirement_rolls_back_native_drops_and_tombstone_on_interruption(monkeypatch):
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_rolls_back_native_drops_and_tombstone_on_interruption as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_retirement_refuses_reader_pins_and_external_native_dependents():
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_refuses_reader_pins_and_external_native_dependents as verify,
+    )
+
+    await verify()
+
+
+async def test_reference_proof_checks_wrong_parent_membership_and_every_bounded_page(monkeypatch):
+    from tests.custom_import_retirement_postgres import (
+        test_reference_proof_checks_wrong_parent_membership_and_every_bounded_page as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_indexed_reference_proof_preserves_multirange_holes_and_unbounded_ranges(monkeypatch):
+    from tests.custom_import_retirement_postgres import (
+        test_indexed_reference_proof_preserves_multirange_holes_and_unbounded_ranges as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_retirement_preserves_current_and_previous_publication_targets():
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_preserves_current_and_previous_publication_targets as verify,
+    )
+
+    await verify()
+
+
+async def test_read_retirement_race_never_takes_missing_family_legacy_fallback():
+    from tests.custom_import_retirement_postgres import (
+        test_read_retirement_race_never_takes_missing_family_legacy_fallback as verify,
+    )
+
+    await verify()
+
+
+@pytest.mark.parametrize(
+    "kind,column,revision_kind",
+    (
+        ("root", "revision_id", 1),
+        ("child", "revision_id", 2),
+        ("root", "base_root_revision_id", 1),
+        ("child", "base_child_revision_id", 2),
+        ("child", "root_revision_id", 1),
+    ),
+)
+async def test_retirement_checks_retained_legacy_origin_references(kind, column, revision_kind):
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_checks_retained_legacy_origin_references as verify,
+    )
+
+    await verify(kind, column, revision_kind)
+
+
+async def test_retirement_does_not_hold_registry_write_lock_during_reference_proof(monkeypatch):
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_does_not_hold_registry_write_lock_during_reference_proof as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_retirement_total_deadline_rolls_back_its_caller_transaction(monkeypatch):
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_total_deadline_rolls_back_its_caller_transaction as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_retirement_allows_an_unrelated_idle_mutable_family():
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_allows_an_unrelated_idle_mutable_family as verify,
+    )
+
+    await verify()
+
+
+async def test_retirement_never_waits_behind_an_unrelated_mutable_writer():
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_never_waits_behind_an_unrelated_mutable_writer as verify,
+    )
+
+    await verify()
+
+
+async def test_retirement_refuses_origin_registered_during_the_frozen_proof(monkeypatch):
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_refuses_origin_registered_during_the_frozen_proof as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_retirement_preserves_completed_projection_history_and_removes_its_storage():
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_preserves_completed_projection_history_and_removes_its_storage as verify,
+    )
+
+    await verify()
+
+
+async def test_retirement_preserves_closed_continuation_history_but_refuses_active_authority(monkeypatch):
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_preserves_closed_continuation_history_but_refuses_active_authority as verify,
+    )
+
+    await verify(monkeypatch)

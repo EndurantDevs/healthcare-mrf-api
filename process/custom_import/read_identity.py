@@ -7,6 +7,7 @@ from __future__ import annotations
 import hmac
 
 from sqlalchemy import and_, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
@@ -17,6 +18,11 @@ from db.models.custom_import import (
     CustomImportSchemaRevision,
 )
 from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.failure_diagnostics import (
+    _failure_chain,
+    _static_attribute,
+    database_sqlstate,
+)
 from process.custom_import.publication import (
     FINALITY_EVENT_CONTRACT,
     PublicationConflict,
@@ -42,8 +48,8 @@ async def resolve_generation_snapshot(session: AsyncSession, pinned_target: Pinn
     if not schema:
         raise CustomImportReadUnavailableError("generation snapshot resolver requires an explicit model schema")
     quoted = connection.dialect.identifier_preparer.quote_schema(schema)
-    family_id = (
-        await session.execute(
+    try:
+        snapshot_binding_result = await session.execute(
             text(
                 f"SELECT {quoted}.resolve_custom_import_generation_snapshot("
                 "CAST(:generation_id AS bigint), CAST(:dataset_id AS bigint), "
@@ -56,10 +62,35 @@ async def resolve_generation_snapshot(session: AsyncSession, pinned_target: Pinn
                 "schema_revision_id": pinned_target.schema_revision_id,
             },
         )
-    ).scalar_one()
+    except DBAPIError as error:
+        if _is_snapshot_error(error, "55000", "custom_import_snapshot_retired"):
+            raise CustomImportReadUnavailableError("pinned generation storage is retired") from error
+        raise
+    family_id = snapshot_binding_result.scalar_one()
     if family_id is not None and (type(family_id) is not int or not 0 < family_id < 2**63):
         raise CustomImportReadUnavailableError("generation snapshot identity is invalid")
     return family_id
+
+
+def _is_snapshot_error(error: DBAPIError, code: str, message: str) -> bool:
+    return database_sqlstate(error) == code and any(
+        _static_attribute(cause, "message") == message for cause in _failure_chain(error)
+    )
+
+
+async def verify_generation_storage(session: AsyncSession, generation) -> None:
+    """Pin sealed storage before accepting a retained seal or generation status."""
+
+    await resolve_generation_snapshot(
+        session,
+        PinnedReadTarget(
+            dataset_id=generation.dataset_id,
+            generation_id=generation.generation_id,
+            definition_revision_id=generation.definition_revision_id,
+            schema_revision_id=generation.schema_revision_id,
+            profile_id="default",
+        ),
+    )
 
 
 def verified_definition(

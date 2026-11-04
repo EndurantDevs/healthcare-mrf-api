@@ -61,7 +61,7 @@ async def _metadata_wait_observer(fixture, reader):
 
     task = asyncio.create_task(sample())
     try:
-        yield
+        yield task
     except BaseException as error:
         failure = error
         raise
@@ -107,8 +107,9 @@ async def test_wait_observer_bounds_sanitizes_and_preserves_failure_when_close_f
     monkeypatch.setenv("NETWORK_REGISTRY_TEST_DSN", "postgresql+asyncpg://example.invalid/diagnostic")
     failure, cause = RuntimeError("original failure"), ValueError("original cause")
     with pytest.raises(RuntimeError) as observed:
-        async with _metadata_wait_observer(fixture, reader):
-            await asyncio.wait_for(reached_limit.wait(), timeout=0.5)
+        async with _metadata_wait_observer(fixture, reader) as sampling_task:
+            await sampling_task
+            assert reached_limit.is_set()
             raise failure from cause
     assert observed.value is failure and failure.__cause__ is cause
     diagnostic_by_field = json.loads(failure.__notes__[0].split("=", 1)[1])

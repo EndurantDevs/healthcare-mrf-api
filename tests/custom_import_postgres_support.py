@@ -165,13 +165,10 @@ def _install_custom_import_migrations(
         migration._schema = lambda: schema_name
         migration.op = Operations(MigrationContext.configure(sync_connection))
         migration.upgrade()
+
     if is_segmented_capture_enabled:
         install_segmented_capture_migration(sync_connection, schema_name)
-        for name in migration_names:
-            migration = _migration(_ROOT / "alembic" / "versions" / f"{name}.py", f"{name}_test_migration")
-            migration._schema = lambda: schema_name
-            migration.op = Operations(MigrationContext.configure(sync_connection))
-            migration.upgrade()
+        install_snapshot_storage_migrations(sync_connection, schema_name, migration_names)
 
     install_materialization_contract_migration(sync_connection, schema_name)
     install_query_projection_metadata(sync_connection, schema_name)
@@ -180,6 +177,26 @@ def _install_custom_import_migrations(
         schema_name,
         install_authority=is_segmented_capture_enabled and is_snapshot_storage_enabled and migration_through is None,
     )
+    if is_segmented_capture_enabled and is_snapshot_storage_enabled and migration_through is None:
+        install_snapshot_retirement_migration(sync_connection, schema_name)
+
+
+def install_snapshot_storage_migrations(sync_connection, schema_name, migration_names=_SNAPSHOT_MIGRATION_NAMES):
+    """Upgrade retained canonical rows through the real snapshot writer migration chain."""
+    for name in migration_names:
+        migration = _migration(_ROOT / "alembic" / "versions" / f"{name}.py", f"{name}_test_migration")
+        migration._schema = lambda: schema_name
+        migration.op = Operations(MigrationContext.configure(sync_connection))
+        migration.upgrade()
+
+
+def install_snapshot_retirement_migration(sync_connection, schema_name: str) -> None:
+    """Apply retirement guards after the current continuation authority definitions."""
+    path = _ROOT / "alembic" / "versions" / "20261102010000_custom_import_snapshot_retirement.py"
+    migration = _migration(path, "custom_import_retirement_test_migration")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    migration.upgrade()
 
 
 def install_build_continuation_migration(sync_connection, schema_name: str, *, install_authority=True) -> None:

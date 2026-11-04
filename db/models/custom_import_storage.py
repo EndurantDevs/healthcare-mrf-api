@@ -12,14 +12,25 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     LargeBinary,
     SmallInteger,
+    String,
     UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import INT8MULTIRANGE, ExcludeConstraint
 
-from db.models.custom_import import _CustomImportModel, _reference, _table_args, _timestamp_column
+from db.models.custom_import import (
+    _CustomImportModel,
+    _reference,
+    _table_args,
+    _timestamp_column,
+)
 
-__all__ = ("CustomImportSnapshotFamily", "CustomImportSnapshotRelation", "CustomImportRevisionHome")
+__all__ = (
+    "CustomImportSnapshotFamily",
+    "CustomImportSnapshotRelation",
+    "CustomImportRevisionHome",
+    "CustomImportSnapshotRetirement",
+)
 
 
 class CustomImportSnapshotFamily(_CustomImportModel):
@@ -151,3 +162,39 @@ class CustomImportRevisionHome(_CustomImportModel):
     revision_kind = Column(SmallInteger, primary_key=True)
     revision_ids = Column(INT8MULTIRANGE, nullable=False)
     first_revision_id = Column(BigInteger, Computed("lower(revision_ids)", persisted=True), primary_key=True)
+
+
+class CustomImportSnapshotRetirement(_CustomImportModel):
+    """Owner-only evidence preventing a deleted snapshot from becoming legacy storage."""
+
+    __tablename__ = "custom_import_snapshot_retirement"
+    __main_table__ = __tablename__
+    __table_args__ = _table_args(
+        UniqueConstraint("execution_id", "producing_fence", name="custom_import_retirement_attempt_key"),
+        UniqueConstraint("generation_id", name="custom_import_retirement_generation_key"),
+        CheckConstraint(
+            "family_id > 0 AND dataset_id > 0 AND definition_revision_id > 0 AND schema_revision_id > 0 "
+            "AND execution_id > 0 AND capture_bundle_id > 0 AND producing_fence > 0 "
+            "AND octet_length(producing_token_sha256) = 32 AND (generation_id IS NULL OR generation_id > 0) "
+            "AND retained_bytes >= 0 AND engine_id ~ '^[a-z][a-z0-9_]{0,62}$'",
+            name="custom_import_retirement_identity_check",
+        ),
+        CheckConstraint(
+            "reason IN ('replaced_fence', 'abandoned', 'no_change', 'superseded')",
+            name="custom_import_retirement_reason_check",
+        ),
+    )
+
+    family_id = Column(BigInteger, primary_key=True, autoincrement=False)
+    engine_id = Column(String(63), nullable=False)
+    dataset_id = Column(BigInteger, nullable=False)
+    definition_revision_id = Column(BigInteger, nullable=False)
+    schema_revision_id = Column(BigInteger, nullable=False)
+    execution_id = Column(BigInteger, nullable=False)
+    capture_bundle_id = Column(BigInteger, nullable=False)
+    producing_fence = Column(BigInteger, nullable=False)
+    producing_token_sha256 = Column(LargeBinary(32), nullable=False)
+    generation_id = Column(BigInteger)
+    retained_bytes = Column(BigInteger, nullable=False)
+    reason = Column(String(24), nullable=False)
+    retired_at = _timestamp_column()
