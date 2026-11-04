@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from sqlalchemy import and_, exists, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import (
@@ -674,7 +675,7 @@ async def inspect_generation(
     dataset_id: int,
     generation_id: int,
 ) -> GenerationStatus:
-    """Read one generation and its publication evidence in one statement."""
+    """Read one generation's evidence, verify availability, and pin sealed storage."""
 
     dataset_id = _positive_id(dataset_id)
     generation_id = _positive_id(generation_id)
@@ -699,7 +700,7 @@ async def inspect_generation(
         ever_published=is_ever_published,
         no_change_event_exists=has_no_change_event,
     )
-    return GenerationStatus(
+    status = GenerationStatus(
         generation_id=generation_snapshot["generation_id"],
         dataset_id=generation_snapshot["dataset_id"],
         definition_revision_id=generation_snapshot["definition_revision_id"],
@@ -716,6 +717,41 @@ async def inspect_generation(
         current=current,
         no_change=no_change,
     )
+    await _pin_generation_storage(session, status, status.generation_id, sealed=status.seal is not None)
+    return status
+
+
+async def _pin_generation_storage(session, identity, generation_id, *, sealed):
+    """Retained metadata alone never establishes that generation storage is available."""
+
+    from process.custom_import.read_contracts import (
+        CustomImportReadUnavailableError,
+        PinnedReadTarget,
+    )
+    from process.custom_import.read_identity import (
+        _is_snapshot_error,
+        resolve_generation_snapshot,
+    )
+
+    pinned_target = PinnedReadTarget(
+        dataset_id=identity.dataset_id,
+        generation_id=generation_id,
+        definition_revision_id=identity.definition_revision_id,
+        schema_revision_id=identity.schema_revision_id,
+        profile_id="default",
+    )
+    try:
+        if sealed:
+            await resolve_generation_snapshot(session, pinned_target)
+        else:
+            try:
+                async with session.begin_nested():
+                    await resolve_generation_snapshot(session, pinned_target)
+            except DBAPIError as error:
+                if not _is_snapshot_error(error, "P0001", "custom_import_snapshot_read_generation_mismatch"):
+                    raise
+    except CustomImportReadUnavailableError as error:
+        raise OperatorObjectNotFound("custom import generation storage is unavailable") from error
 
 
 def _execution_evidence_statement(dataset_id: int, execution_id: int, candidate_generation_id: int | None):
@@ -1015,7 +1051,7 @@ async def inspect_execution_evidence(
     execution_id: int,
     candidate_generation_id: int | None = None,
 ) -> ExecutionEvidenceStatus:
-    """Read one exact execution and its retained evidence in one statement.
+    """Read one exact execution's evidence and pin any retained sealed storage.
 
     Receipt callers can identify one candidate; without that ID, ambiguous
     recovery evidence is rejected rather than selected arbitrarily.
@@ -1049,7 +1085,7 @@ async def inspect_execution_evidence(
         definition_sha256,
         schema_sha256,
     )
-    return ExecutionEvidenceStatus(
+    evidence = ExecutionEvidenceStatus(
         execution=execution,
         definition_sha256=definition_sha256,
         schema_sha256=schema_sha256,
@@ -1059,6 +1095,11 @@ async def inspect_execution_evidence(
         current=current,
         generation=_evidence_generation(evidence_snapshot, execution, current),
     )
+    if evidence.generation is not None:
+        await _pin_generation_storage(
+            session, evidence.execution, evidence.generation.generation_id, sealed=evidence.generation.seal is not None
+        )
+    return evidence
 
 
 __all__ = (

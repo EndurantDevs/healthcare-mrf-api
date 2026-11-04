@@ -2,6 +2,9 @@
 
 """Native snapshot registry lifecycle, replay and access-boundary regressions."""
 
+import asyncio
+import datetime as dt
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,9 +13,20 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text, update
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from db.models.custom_import import CustomImportCurrentGeneration, CustomImportExecution, CustomImportGenerationSeal
-from db.models.custom_import_storage import CustomImportSnapshotFamily
+from db.models.custom_import import (
+    CustomImportCurrentGeneration,
+    CustomImportExecution,
+    CustomImportGenerationSeal,
+    CustomImportLease,
+)
+from db.models.custom_import_storage import (
+    CustomImportSnapshotFamily,
+    CustomImportSnapshotRetirement,
+)
+from process.custom_import import retirement
+from process.custom_import.execution import claim_execution
 from process.custom_import.publication import seal_generation
 from process.custom_import.storage_layout import snapshot_schema
 from tests.custom_import_postgres_support import (
@@ -527,3 +541,180 @@ async def test_native_auxiliary_landing_is_pinned_and_column_writes_close_at_fre
                 async with case.sessions() as session, session.begin():
                     await session.execute(text(f'SET LOCAL ROLE "{role}"'))
                     await session.execute(text(statement))
+
+
+async def _sealed_current_snapshot(case):
+    from tests.test_custom_import_snapshot_reads_postgres import _prepare_read_indexes
+
+    graph, attempt = await _attempt(case)
+    family_id = await _create_snapshot(case, attempt)
+    async with case.sessions() as session, session.begin():
+        await session.execute(text("SET LOCAL statement_timeout='2000ms'"))
+        await _call(
+            session, case, attempt, "bind_custom_import_snapshot_generation", generation_id=attempt.generation_id
+        )
+        await session.scalar(
+            text(f'SELECT "{case.schema_name}".install_custom_import_legacy_snapshot_writers(:family)'),
+            {"family": family_id},
+        )
+        await _call(session, case, attempt, "freeze_custom_import_snapshot_family")
+    await _prepare_read_indexes(case, family_id)
+    async with case.sessions() as session, session.begin():
+        await _seal_empty_fixture(session, graph, attempt)
+    return graph, attempt, family_id
+
+
+async def _remember_retirement(session, family_id, *, generation=True):
+    family = await session.get(CustomImportSnapshotFamily, family_id)
+    names = (
+        "family_id",
+        "dataset_id",
+        "definition_revision_id",
+        "schema_revision_id",
+        "execution_id",
+        "capture_bundle_id",
+        "producing_fence",
+        "producing_token_sha256",
+    )
+    session.add(
+        CustomImportSnapshotRetirement(
+            **{name: getattr(family, name) for name in names},
+            engine_id="synthetic",
+            generation_id=family.generation_id if generation else None,
+            retained_bytes=0,
+            reason="superseded" if generation else "replaced_fence",
+        )
+    )
+    await session.flush()
+
+
+async def _bounded(session):
+    await session.execute(text("SET LOCAL statement_timeout='2000ms'"))
+    await session.execute(text("SET LOCAL lock_timeout='150ms'"))
+
+
+@asynccontextmanager
+async def _ordinary_retirement_roles(case):
+    roles = ["retirement_" + uuid.uuid4().hex[:12] for _ in range(2)]
+    password = uuid.uuid4().hex
+    async with case.sessions() as session, session.begin():
+        original_owner = await session.scalar(text("SELECT current_user"))
+        for role in roles:
+            await session.execute(
+                text(
+                    f"CREATE ROLE \"{role}\" LOGIN NOINHERIT NOSUPERUSER NOCREATEROLE NOCREATEDB PASSWORD '{password}'"
+                )
+            )
+            await session.execute(text(f'GRANT USAGE ON SCHEMA "{case.schema_name}" TO "{role}"'))
+        await session.execute(
+            text(f'ALTER TABLE "{case.schema_name}".custom_import_snapshot_family OWNER TO "{roles[0]}"')
+        )
+    try:
+        yield roles, password
+    finally:
+        async with case.sessions() as session, session.begin():
+            quoted_owner = (await session.connection()).dialect.identifier_preparer.quote(original_owner)
+            for name in ("custom_import_snapshot_family", "custom_import_generation"):
+                await session.execute(text(f'ALTER TABLE "{case.schema_name}".{name} OWNER TO {quoted_owner}'))
+            for role in roles:
+                await session.execute(text(f'DROP OWNED BY "{role}"'))
+                await session.execute(text(f'DROP ROLE "{role}"'))
+
+
+async def _refuse_actual_retirement_login(case, role, password):
+    role_engine = create_async_engine(case.engine.url.set(username=role, password=password)).execution_options(
+        schema_translate_map={"mrf": case.schema_name}
+    )
+    try:
+        role_sessions = async_sessionmaker(role_engine, expire_on_commit=False, autoflush=False)
+        async with role_sessions() as session, session.begin():
+            await _bounded(session)
+            assert await session.scalar(text("SELECT current_user = session_user")) is True
+            with pytest.raises(retirement.SnapshotRetirementRefused, match="protected native owner authority"):
+                await retirement.retire_snapshot_family(
+                    session,
+                    1,
+                    engine_id="synthetic",
+                    assert_external_unreferenced=_external_fixture_check,
+                )
+    finally:
+        await role_engine.dispose()
+
+
+async def _install_retirement_with_application_resolver_owner(case, role):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from tests.custom_import_postgres_support import (
+        _ROOT,
+        _migration,
+        install_snapshot_retirement_migration,
+    )
+
+    def replace(sync):
+        module = _migration(
+            _ROOT / "alembic/versions/20261102010000_custom_import_snapshot_retirement.py",
+            "application_owned_retirement_test",
+        )
+        module._schema = lambda: case.schema_name
+        module.op = Operations(MigrationContext.configure(sync))
+        module.downgrade()
+        sync.execute(text(f'ALTER TABLE "{case.schema_name}".custom_import_generation OWNER TO "{role}"'))
+        for name, arguments in (
+            ("resolve_custom_import_generation_snapshot", "bigint,bigint,bigint,bigint"),
+            ("lock_custom_import_snapshot_attempt", "bigint,bigint,bytea"),
+        ):
+            sync.execute(text(f'ALTER FUNCTION "{case.schema_name}".{name}({arguments}) OWNER TO "{role}"'))
+        metadata = text(
+            "SELECT p.oid,to_jsonb(p)-'prosrc' FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+            "WHERE n.nspname=:schema AND p.proname IN "
+            "('resolve_custom_import_generation_snapshot','lock_custom_import_snapshot_attempt') ORDER BY p.oid"
+        )
+        before = sync.execute(metadata, {"schema": case.schema_name}).all()
+        install_snapshot_retirement_migration(sync, case.schema_name)
+        assert sync.execute(metadata, {"schema": case.schema_name}).all() == before
+        owner = sync.scalar(
+            text("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid=to_regclass(:marker)"),
+            {"marker": f"{case.schema_name}.custom_import_snapshot_retirement"},
+        )
+        assert owner == role
+
+    async with case.engine.begin() as connection:
+        await connection.run_sync(replace)
+
+
+async def _external_fixture_check(session, family, current, rollback):
+    assert session.in_transaction()
+    assert current is None and rollback is None
+    assert family.dataset_id > 0
+
+
+async def _replaced_fence(case):
+    _, attempt = await _attempt(case)
+    family_id = await _create_snapshot(case, attempt)
+    async with case.sessions() as session, session.begin():
+        await session.execute(
+            update(CustomImportLease)
+            .where(
+                CustomImportLease.execution_id == attempt.execution_id,
+            )
+            .values(expires_at=dt.datetime(2000, 1, 1, tzinfo=dt.UTC))
+        )
+        successor = await claim_execution(session, execution_id=attempt.execution_id, token=uuid.uuid4().hex)
+        assert successor.fence == attempt.fence + 1
+    return attempt, family_id
+
+
+async def _wait_for_registry_pin(owner, reader_pid, schema):
+    for _ in range(100):
+        is_waiting = await owner.scalar(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=:pid AND NOT granted "
+                "AND relation=to_regclass(:registry))"
+            ),
+            {"pid": reader_pid, "registry": f"{schema}.custom_import_snapshot_family"},
+        )
+        if is_waiting:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail("reader never reached the held registry relation")

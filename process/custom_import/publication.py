@@ -1053,8 +1053,12 @@ async def _materialization(session: AsyncSession, generation: CustomImportGenera
         root_scalar_count=root_scalar_count,
         child_scalar_count=child_scalar_count,
     )
-    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
-    from process.custom_import.query_projection_finality import bind_generation_materialization
+    from process.custom_import.query_projection_binding import (
+        QueryProjectionUnavailable,
+    )
+    from process.custom_import.query_projection_finality import (
+        bind_generation_materialization,
+    )
 
     try:
         return await bind_generation_materialization(session, generation, materialization)
@@ -2246,8 +2250,12 @@ def _validate_generation_seal(
     materialization: _Materialization,
 ) -> None:
     _validate_generation_seal_identity(seal, generation)
-    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
-    from process.custom_import.query_projection_evidence import read_seal_projection_evidence
+    from process.custom_import.query_projection_binding import (
+        QueryProjectionUnavailable,
+    )
+    from process.custom_import.query_projection_evidence import (
+        read_seal_projection_evidence,
+    )
 
     try:
         evidence = read_seal_projection_evidence(seal)
@@ -2315,14 +2323,21 @@ async def _validated_generation_seal(
 
 
 async def _validate_sealed_projection(session, generation, seal):
-    """Keep advertised projection failures inside the existing finality error contract."""
+    """Require retained storage and advertised projection evidence before seal replay."""
 
-    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
-    from process.custom_import.query_projection_finality import validate_sealed_projection
+    from process.custom_import.query_projection_binding import (
+        QueryProjectionUnavailable,
+    )
+    from process.custom_import.query_projection_finality import (
+        validate_sealed_projection,
+    )
+    from process.custom_import.read_contracts import CustomImportReadUnavailableError
+    from process.custom_import.read_identity import verify_generation_storage
 
     try:
+        await verify_generation_storage(session, generation)
         await validate_sealed_projection(session, generation, seal)
-    except QueryProjectionUnavailable as exc:
+    except (CustomImportReadUnavailableError, QueryProjectionUnavailable) as exc:
         raise PublicationConflict(str(exc)) from exc
 
 
@@ -3162,6 +3177,7 @@ async def _seal_no_change_candidate(
             bytes(existing_seal.sealing_token_sha256), request.token_sha256
         ):
             raise PublicationConflict("no-change candidate seal authority differs")
+        await _validate_sealed_projection(session, candidate_generation, existing_seal)
         return existing_seal
     seal_request = _GenerationSealRequest(
         dataset_id=request.dataset_id,

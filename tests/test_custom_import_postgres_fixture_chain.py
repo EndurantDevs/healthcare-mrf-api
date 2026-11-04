@@ -74,6 +74,26 @@ async def test_publication_fixture_preserves_explicit_schema_override():
     assert (schema.canonical_schema, schema.schema_sha256) == (canonical_schema, schema_sha256)
 
 
+def _expected_fixture_migrations(segmented, expected_tail, installs_continuation_authority):
+    expected_migrations = [
+        "20260914120000_custom_import_v1_schema",
+        "20260917130000_custom_import_generation_finality",
+        "20260922000000_custom_import_durable_parquet_capture",
+        "20260922010000_custom_import_execution_request_identity",
+        "20260923030000_custom_import_source_binding",
+    ]
+    if segmented:
+        expected_migrations.append("20261002000000_custom_import_segmented_capture")
+        expected_migrations.append("20261017010000_custom_import_raw_objects")
+    expected_migrations.extend(expected_tail)
+    expected_migrations.append("20261010010000_custom_import_materialization_contract")
+    expected_migrations.append("20261015020000_custom_import_query_projections")
+    expected_migrations.append("20261019010000_custom_import_build_continuation")
+    if installs_continuation_authority:
+        expected_migrations.append("20261102010000_custom_import_snapshot_retirement")
+    return expected_migrations
+
+
 @pytest.mark.parametrize(
     "segmented,snapshots,migration_through,expected_tail",
     [
@@ -125,23 +145,10 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
     monkeypatch.setattr(support, "MigrationContext", SimpleNamespace(configure=lambda value: value))
     monkeypatch.setattr(support, "Operations", lambda value: value)
     support._install_custom_import_migrations(connection, schema, segmented, snapshots, migration_through)
-    expected_migrations = [
-        "20260914120000_custom_import_v1_schema",
-        "20260917130000_custom_import_generation_finality",
-        "20260922000000_custom_import_durable_parquet_capture",
-        "20260922010000_custom_import_execution_request_identity",
-        "20260923030000_custom_import_source_binding",
-    ]
-    if segmented:
-        expected_migrations.append("20261002000000_custom_import_segmented_capture")
-        expected_migrations.append("20261017010000_custom_import_raw_objects")
-    expected_migrations.extend(expected_tail)
-    expected_migrations.append("20261010010000_custom_import_materialization_contract")
-    expected_migrations.append("20261015020000_custom_import_query_projections")
-    expected_migrations.append("20261019010000_custom_import_build_continuation")
+    installs_continuation_authority = segmented and snapshots and migration_through is None
+    expected_migrations = _expected_fixture_migrations(segmented, expected_tail, installs_continuation_authority)
     assert installed_migrations == expected_migrations
     assert len(installed_migrations) == len(set(installed_migrations))
-    installs_continuation_authority = segmented and snapshots and migration_through is None
     assert installed_metadata_revisions == (
         [] if has_snapshot_storage else [("20261015020000_custom_import_query_projections", None)]
     ) + (

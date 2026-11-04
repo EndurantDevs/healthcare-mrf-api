@@ -19,14 +19,17 @@ from db.models.custom_import import (
     CustomImportBuildCandidateContext,
     CustomImportBuildVerification,
     CustomImportChildRevision,
+    CustomImportExecution,
     CustomImportFamilyRevision,
     CustomImportGeneration,
     CustomImportGenerationFamily,
+    CustomImportLease,
     CustomImportRootRevision,
     CustomImportRootScalar,
 )
 from process.custom_import import build_graph as graph
 from process.custom_import import build_output as output
+from process.custom_import import build_scratch as cleanup
 from process.custom_import import materialization as material
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.runner_types import CandidateRegistry, CandidateRunnerError, LeaseAuthorityLost
@@ -574,6 +577,44 @@ def _proof_tuple():
         verified_at=stamp,
     )
     return build, generation, proof
+
+
+@pytest.mark.parametrize("lease_age", [None, -1, 1], ids=["unclaimed", "expired", "active"])
+async def test_scratch_eligibility_refuses_only_an_unexpired_lease(monkeypatch, lease_age):
+    build, generation, proof = _proof_tuple()
+    now = dt.datetime(2029, 1, 1, tzinfo=dt.UTC)
+    lease = CustomImportLease(
+        execution_id=generation.execution_id,
+        fence=0 if lease_age is None else generation.producing_fence,
+        token_sha256=None if lease_age is None else generation.producing_token_sha256,
+        expires_at=None if lease_age is None else now + dt.timedelta(seconds=lease_age),
+    )
+    build.candidate_error_count, build.plan_stage, build.plan_complete_at = 0, "complete", now
+    proof.verification_contract = "custom-import/build-structure/v1"
+    counts_by_name = {name: 0 for name in cleanup._COUNT_NAMES}
+    for name, count in counts_by_name.items():
+        setattr(proof, name, count)
+    seal = SimpleNamespace(**counts_by_name)
+    family = SimpleNamespace(frozen_at=now, **{name: getattr(generation, name) for name in cleanup._IDENTITY[1:]})
+    entities_by_model = {
+        CustomImportExecution: SimpleNamespace(state="completed"),
+        CustomImportLease: lease,
+        CustomImportGeneration: generation,
+    }
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=lambda model, *_args, **_options: entities_by_model[model]),
+        scalars=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: build)),
+        scalar=AsyncMock(side_effect=[now, proof]),
+    )
+    validate_seal = AsyncMock(return_value=seal)
+    monkeypatch.setattr(cleanup.publication, "_validated_generation_seal", validate_seal)
+    if lease_age == 1:
+        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="unexpired producer lease"):
+            await cleanup._eligible(session, family)
+        validate_seal.assert_not_awaited()
+    else:
+        assert await cleanup._eligible(session, family) == (build, generation, proof, seal)
+        validate_seal.assert_awaited_once_with(session, generation)
 
 
 @pytest.mark.parametrize(

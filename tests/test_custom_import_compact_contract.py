@@ -436,7 +436,14 @@ async def test_operator_status_distinguishes_legacy_and_compact_evidence(contrac
 
     assert status.seal.materialization_contract == (_COMPACT if contract == _COMPACT else _LEGACY)
     assert status.seal.verification_evidence == evidence
-    assert len(session.statements) == 1
+    assert len(session.statements) == 2
+    assert "resolve_custom_import_generation_snapshot(" in str(session.statements[1])
+    assert session.parameters[1] == {
+        "dataset_id": 3,
+        "generation_id": 19,
+        "definition_revision_id": 5,
+        "schema_revision_id": 7,
+    }
     selected_columns = session.statements[0].selected_columns.keys()
     assert "materialization_contract" in selected_columns and "verification_evidence" in selected_columns
 

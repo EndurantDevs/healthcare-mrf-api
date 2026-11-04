@@ -233,3 +233,127 @@ async def test_root_union_and_complete_groups_preserve_null_duplicate_and_ordina
         assert semantic_result.difference_rows == 0
         assert semantic_result.accepted == [12, 21, 22, 31, 32, 51, 52, 61, 62, 72]
         assert semantic_result.root_ids == [-9, 1, 2, 3, 4, 5, 6, 7, 11]
+
+
+async def test_inventory_pages_stay_server_side_and_reuse_only_in_live_transaction(monkeypatch):
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_pages_stay_server_side_and_reuse_only_in_live_transaction as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+@pytest.mark.parametrize("operation", ["insert", "update"])
+async def test_inventory_excludes_owner_writes_and_discards_cross_commit_evidence(operation):
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_excludes_owner_writes_and_discards_cross_commit_evidence as verify,
+    )
+
+    await verify(operation)
+
+
+@pytest.mark.parametrize("reference", [9000000, 9223372036854775807])
+async def test_inventory_detects_wrong_parent_and_maximum_bigint_references(monkeypatch, reference):
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_detects_wrong_parent_and_maximum_bigint_references as verify,
+    )
+
+    await verify(monkeypatch, reference)
+
+
+@pytest.mark.parametrize("kind,revision_kind", [("root", 1), ("child", 2)])
+async def test_inventory_preserves_origin_revision_kind_and_null_references(kind, revision_kind):
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_preserves_origin_revision_kind_and_null_references as verify,
+    )
+
+    await verify(kind, revision_kind)
+
+
+@pytest.mark.parametrize("change", ["truncate", "new_family", "missing_index", "temporary_rows"])
+async def test_inventory_refuses_changed_frozen_or_temporary_evidence(change):
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_refuses_changed_frozen_or_temporary_evidence as verify,
+    )
+
+    await verify(change)
+
+
+async def test_inventory_is_bound_to_its_actual_connection_and_backend():
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_is_bound_to_its_actual_connection_and_backend as verify,
+    )
+
+    await verify()
+
+
+async def test_inventory_does_not_certify_interrupted_preparation(monkeypatch):
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_does_not_certify_interrupted_preparation as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_inventory_excludes_only_the_target_and_completed_retired_sources():
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_excludes_only_the_target_and_completed_retired_sources as verify,
+    )
+
+    await verify()
+
+
+async def test_manual_audit_resumes_and_authorizes_only_complete_cleanup(monkeypatch):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_manual_audit_resumes_and_authorizes_only_complete_cleanup as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_audit_stales_on_same_oid_heap_and_authority_changes(monkeypatch):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_audit_stales_on_same_oid_heap_and_authority_changes as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_audit_records_real_invariant_failure_without_waiving_it(monkeypatch):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_audit_records_real_invariant_failure_without_waiving_it as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_audit_metadata_is_owner_only_and_append_chain_is_checked(monkeypatch):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_audit_metadata_is_owner_only_and_append_chain_is_checked as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_audit_reads_trimmed_retained_base_and_rejects_base_rewrite(monkeypatch):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_audit_reads_trimmed_retained_base_and_rejects_base_rewrite as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_audit_binds_completed_projection_heaps_and_manifest():
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_audit_binds_completed_projection_heaps_and_manifest as verify,
+    )
+
+    await verify()
+
+
+def test_audit_sql_matches_current_verifier():
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_audit_sql_matches_current_verifier as verify,
+    )
+
+    verify()
