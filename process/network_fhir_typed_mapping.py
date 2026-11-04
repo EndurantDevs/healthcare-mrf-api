@@ -307,6 +307,17 @@ async def _approved_graph_keys(connection, bindings, arguments):
 
 
 async def _map_pair_rows(connection, stage, mapping, bindings, arguments):
+    # Large approved maps must not be rescanned for every pair in each page.
+    # The savepoint restores the caller's planner setting after failure.
+    async with connection.transaction():
+        original = await connection.fetchval("SHOW enable_nestloop")
+        await connection.execute("SET LOCAL enable_nestloop=off")
+        totals = await _map_pair_pages(connection, stage, mapping, bindings, arguments)
+        await connection.execute("SELECT set_config('enable_nestloop',$1,true)", original)
+        return totals
+
+
+async def _map_pair_pages(connection, stage, mapping, bindings, arguments):
     joins = (
         " FROM "
         + stage.relation("pairs")
