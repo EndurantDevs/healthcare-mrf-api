@@ -42,6 +42,51 @@ async def test_inventory_custody_is_required_even_without_contributions(monkeypa
     assert source_inventory_heaps(candidate) == {"network_source_inventory", "network_provider_only_evidence"}
 
 
+async def test_ready_inventory_without_seal_revalidates_before_custody(monkeypatch):
+    from process import network_compact_validation as compact
+    from process import network_membership_pipeline as pipeline
+
+    candidate_by_name = {**_registered(1), "state": "ready"}
+    verify = AsyncMock(return_value=None)
+    closure = AsyncMock()
+    final_proof = AsyncMock()
+    monkeypatch.setattr(publication, "verify_network_candidate_custody", verify)
+    monkeypatch.setattr(pipeline, "_locked_candidate", AsyncMock(return_value=candidate_by_name))
+    monkeypatch.setattr(pipeline, "_scope_report", lambda *args: {})
+    monkeypatch.setattr(pipeline, "_validated_replay", lambda *args: None)
+    monkeypatch.setattr(pipeline, "_publication_readiness", lambda *args: ())
+    monkeypatch.setattr(pipeline, "verify_network_candidate_writer_closure", closure)
+    monkeypatch.setattr(indexes, "is_compact_candidate", lambda _: True)
+    monkeypatch.setattr(compact, "verify_compact_final_proof", final_proof)
+    connection, target, address = object(), object(), object()
+    await pipeline._prepare_phase_snapshot(connection, target, address, {}, "fixture")
+    assert verify.await_args.kwargs == {"control_schema": "fixture", "required": False}
+    closure.assert_awaited_once_with(connection, target, control_schema="fixture")
+    final_proof.assert_awaited_once_with(
+        connection, target, candidate_by_name, control_schema="fixture", office_authority=None
+    )
+
+    verify.side_effect = ValueError("damaged_seal")
+    with pytest.raises(ValueError, match="^damaged_seal$"):
+        await pipeline._prepare_phase_snapshot(connection, target, address, {}, "fixture")
+    assert closure.await_count == final_proof.await_count == 1
+
+
+@pytest.mark.parametrize(
+    "state,api_read,allow_unsealed",
+    [("published", False, True), ("sealed", False, True), ("ready", True, True), ("ready", False, 1)],
+)
+async def test_optional_inventory_seal_is_preparation_only(monkeypatch, state, api_read, allow_unsealed):
+    candidate_by_name = {**_registered(1), "state": state}
+    verify = AsyncMock()
+    monkeypatch.setattr(publication, "verify_network_candidate_custody", verify)
+    with pytest.raises(publication.NetworkPublicationError, match="verification mode"):
+        await publication._candidate_custody(
+            object(), candidate_by_name, "fixture", api_read=api_read, allow_unsealed=allow_unsealed
+        )
+    verify.assert_not_awaited()
+
+
 @pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("count", [0, 1])
 async def test_rollback_requires_inventory_custody_and_matching_physical_indexes(monkeypatch, compact, count):

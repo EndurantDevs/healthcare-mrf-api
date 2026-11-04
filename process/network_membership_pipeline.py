@@ -125,7 +125,7 @@ async def _prepare_phase_snapshot(
     if candidate["state"] == "ready":
         _validated_replay(candidate, _scope_report(candidate, address_source))
         readiness = _publication_readiness(candidate)
-        if await _candidate_custody(connection, candidate, control_schema) is not None:
+        if await _candidate_custody(connection, candidate, control_schema, allow_unsealed=True) is not None:
             _require_configured_writer_roles(roles_by_group, readiness[3])
             return
         await verify_network_candidate_writer_closure(

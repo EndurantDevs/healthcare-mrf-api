@@ -210,11 +210,6 @@ async def _assert_modern_typed_seal_required(context, manifest, recipe):
 
 async def test_unsealed_inline_retained_source_to_typed_reference_preserves_readers(monkeypatch):
     """Actual legacy native closure remains readable while its all-typed successor publishes."""
-    from tests import source_witness_capture_postgres_support as support
-
-    monkeypatch.setattr(
-        support, "SOURCE_PRODUCER_SHA256", "56570f28c5a17721980179b0fc8e3b66108ceddcddc392aaf76de258301eb1f9"
-    )
     async with (
         publication._publication_case(monkeypatch) as context,
         _legacy_bootstrap(context, monkeypatch) as bootstrap,

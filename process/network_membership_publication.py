@@ -252,13 +252,18 @@ async def _verify_provider_custody(connection, candidate, closure):
     return await verify_candidate_em_provider_inputs(connection, candidate, runtime_roles=runtime_roles)
 
 
-async def _candidate_custody(connection, candidate, control_schema, *, api_read=False):
+async def _candidate_custody(connection, candidate, control_schema, *, api_read=False, allow_unsealed=False):
     from process.registry_source_inventory_reference import source_inventory_heaps
 
-    target = MembershipCopyTarget(
+    copy_target = MembershipCopyTarget(
         *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
     )
-    if type(api_read) is not bool:
+    if (
+        type(api_read) is not bool
+        or type(allow_unsealed) is not bool
+        or allow_unsealed
+        and (api_read or candidate["state"] != "ready")
+    ):
         raise NetworkPublicationError("Candidate read verification mode is invalid")
     verifier = verify_network_candidate_custody
     if api_read:
@@ -266,7 +271,10 @@ async def _candidate_custody(connection, candidate, control_schema, *, api_read=
 
         verifier = verify_network_candidate_read_metadata
     custody = await verifier(
-        connection, target, control_schema=control_schema, required=bool(source_inventory_heaps(candidate))
+        connection,
+        copy_target,
+        control_schema=control_schema,
+        required=not allow_unsealed and bool(source_inventory_heaps(candidate)),
     )
     from process.network_compact_readiness import is_compact_candidate
 

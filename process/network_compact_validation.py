@@ -94,14 +94,9 @@ async def verify_compact_final_proof(
     namespace = _identifier(copy_target.schema_name)
     from process.network_compact_custom_preparation import compact_carrier_receipt
 
-    address = await pin_compact_office_sources(
-        connection,
-        copy_target,
-        CompactOfficeSources(address_source, layout.custom, layout.base, compact_carrier_receipt(candidate)),
-    )
-    counts = await _membership_accounting(
-        connection, namespace + ".network_membership", namespace + ".provider_location_binding", address
-    )
+    offices = CompactOfficeSources(address_source, layout.custom, layout.base, compact_carrier_receipt(candidate))
+    address = await pin_compact_office_sources(connection, copy_target, offices)
+    work, counts = await _compact_accounting(connection, candidate, namespace, address, offices)
     native = await _native_accounting(
         connection, namespace + ".network_membership", control_schema, copy_target.candidate_id
     )
@@ -120,7 +115,28 @@ async def verify_compact_final_proof(
             artifact_ids,
         )
     )
-    _require(await _membership_sets_differ(connection, namespace, layout) is False)
+    if work is not None:
+        from process.network_typed_slice_native import verify_work_refs
+
+        await verify_work_refs(connection, copy_target, work)
+        await connection.execute(f"DROP TABLE {work}")
+    else:
+        _require(await _membership_sets_differ(connection, namespace, layout) is False)
+
+
+async def _compact_accounting(connection, candidate, namespace, address, offices):
+    from process.registry_typed_membership_parity import is_typed_candidate
+
+    if is_typed_candidate(candidate):
+        from process.network_typed_membership_accounting import prepare_accounting_work
+        from process.network_typed_slice_native import require_complete_facts
+
+        work, counts = await prepare_accounting_work(connection, namespace, offices)
+        require_complete_facts(counts, candidate, None)
+        return work, counts
+    return None, await _membership_accounting(
+        connection, namespace + ".network_membership", namespace + ".provider_location_binding", address
+    )
 
 
 async def _verify_custom_contribution(

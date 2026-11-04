@@ -195,7 +195,7 @@ AND """
 
 # The raw checker independently normalizes typed reference arrays and eligibility in
 # Python. Its SQL joins those validated reference targets without producer predicates.
-CHECKER_DDL = """resource_type text NOT NULL,resource_id text NOT NULL,subject_kind text NOT NULL,subject_id text,
+CHECKER_DDL = """resource_type text COLLATE "C" NOT NULL,resource_id text COLLATE "C" NOT NULL,subject_kind text NOT NULL,subject_id text,
 network_ids text[] NOT NULL,location_ids text[] NOT NULL,eligible boolean NOT NULL,valid_npi boolean NOT NULL,
 PRIMARY KEY(resource_type,resource_id)"""
 CHECKER_PAIR_SQL = (

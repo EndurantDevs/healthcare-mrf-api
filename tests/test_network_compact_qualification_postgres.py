@@ -163,14 +163,14 @@ async def test_failed_compact_preparation_rolls_back_local_artifacts_and_resumes
     await _publish_ready(fixture, first)
     original_pin, original_rows = await publication._read(fixture)
     candidate_target = await publication._candidate(fixture, (42, 99), original_pin.generation_id)
-    prepare_slices = compact_preparation.prepare_network_membership_slices
+    prepare_slices = compact_preparation._prepare_slices
 
     async def fail_after_copy(*arguments, **options):
         await prepare_slices(*arguments, **options)
         raise RuntimeError("synthetic failure after compact copy")
 
     with monkeypatch.context() as patch:
-        patch.setattr(compact_preparation, "prepare_network_membership_slices", fail_after_copy)
+        patch.setattr(compact_preparation, "_prepare_slices", fail_after_copy)
         with pytest.raises(RuntimeError, match="synthetic failure after compact copy"):
             await publication._prepare(fixture, candidate_target)
     assert not fixture.execution_connection.is_in_transaction()
