@@ -2,6 +2,7 @@
 """Native bounded office-lookup parity; synthetic rows do not establish Source custody."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -9,7 +10,7 @@ import pytest
 
 from process import network_fhir_typed_mapping as mapping
 from process import network_fhir_typed_office_lookup as lookup
-from process.network_fhir_typed_contract import TypedFHIRGraphError
+from process.network_fhir_typed_sql import PAIR_DDL
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 
 pytestmark = pytest.mark.asyncio
@@ -108,24 +109,125 @@ async def test_shared_lookup_keeps_missing_offices_and_empty_page_tail(serving_s
         assert await connection.fetchval("SELECT count(*) FROM lookup_addresses") == 5
 
 
-@pytest.mark.parametrize(
-    "change,refusal", [("duplicate", "ambiguous_office"), ("canonical", "office_identity_differs")]
-)
-async def test_lookup_preserves_ambiguity_and_full_canonical_refusals(serving_schema, change, refusal):
+async def _mixed_offices(connection, selected):
+    import ptg2_address_canon as native
+
+    addresses = [(line, *_ADDRESS[1:]) for line in ("789 Example St", "901 Example St", "234 Example St")]
+    canonical = native.canonicalize_batch(addresses)
+    for site, normalized in enumerate(canonical, 5):
+        await connection.execute(
+            "INSERT INTO " + selected.relation("offices") + " VALUES($1,$2,$3,$4,NULL)",
+            _PROVIDER,
+            UUID(int=site),
+            UUID(normalized["address_key"]),
+            normalized["identity_key"],
+        )
+    for key, index, address in (
+        ("wrong-canonical", 0, _ADDRESS),
+        ("uncanonicalizable", 1, (None, None, None, None, None, "US")),
+        ("ambiguous-one", 2, addresses[2]),
+        ("ambiguous-two", 2, addresses[2]),
+    ):
+        await connection.execute(
+            "INSERT INTO lookup_addresses VALUES($1,'npi',$2,$3,$4,'practice','street',NULL,$5,$6,$7,$8,$9,$10)",
+            key,
+            _PROVIDER,
+            int(_PROVIDER),
+            UUID(canonical[index]["address_key"]),
+            *address,
+        )
+    assert native.canonicalize_batch([(None, None, None, None, None, "US")])[0]["address_key"] is None
+
+
+async def _pair_accounting(connection, selected):
+    await connection.execute("CREATE TEMP TABLE lookup_pairs(" + PAIR_DDL + ")")
+    await connection.execute(
+        "INSERT INTO lookup_pairs SELECT 'network-one','npi',provider_id,location_id,address_key,canonical_identity,"
+        "'PractitionerRole','role-'||location_id::text,location_id::text,'direct',3 FROM "
+        + selected.relation("offices")
+    )
+    count = await connection.fetchval("SELECT count(*) FROM lookup_pairs")
+    stage = SimpleNamespace(
+        relation=lambda _kind: "pg_temp.lookup_pairs",
+        document={"counts": {"pair_rows": count, "reference_rows": count * 3}},
+    )
+    bindings = (
+        "approved_network_bindings AS (SELECT $1::integer network_id,$2::jsonb record_json,"
+        "$3::text source,$4::text schema,$5::text dataset,$6::text producer,$7::text edition)"
+    )
+    binding_by_field = {"source_key": "network-one", "source_scope_json": {"source_generation": "generation-one"}}
+    totals = await mapping._map_pair_rows(
+        connection,
+        stage,
+        selected,
+        bindings,
+        (1, json.dumps(binding_by_field), None, None, None, None, None, "generation-one"),
+    )
+    offices = await mapping._require_mapping_counts(connection, stage, selected, totals)
+    await connection.execute("DROP TABLE lookup_pairs")
+    return totals, dict(offices)
+
+
+async def test_mixed_lookup_omits_invalid_and_ambiguous_offices_with_exact_accounting(serving_schema, monkeypatch):
+    import ptg2_address_canon as native
+
     connection, _, _ = serving_schema
     async with connection.transaction():
         address, mappings = await _fixture(connection)
-        if change == "duplicate":
-            await connection.execute(
-                "INSERT INTO lookup_addresses SELECT 'duplicate',entity_type,entity_id,npi,address_key,type,address_precision,inferred_npi,first_line,second_line,city_name,state_name,postal_code,country_code FROM lookup_addresses WHERE location_key='2'"
+        await _mixed_offices(connection, mappings[1])
+        original, batch_sizes = native.canonicalize_batch, []
+
+        def observed(rows):
+            batch_sizes.append(len(rows))
+            return original(rows)
+
+        monkeypatch.setattr(native, "canonicalize_batch", observed)
+        async with lookup.typed_office_lookup(
+            connection, [selected.table_names["offices"] for selected in mappings], address
+        ) as matches:
+            for selected in mappings:
+                await mapping._match_offices(connection, selected, address, matches)
+        assert batch_sizes == [1, 4]
+        actual_bindings = [
+            tuple(binding_row)
+            for selected in mappings
+            for binding_row in await connection.fetch(
+                "SELECT location_id,location_key FROM " + selected.relation("bindings") + " ORDER BY location_id"
             )
-        else:
-            await connection.execute("UPDATE lookup_addresses SET first_line='789 Different St' WHERE location_key='2'")
-        with pytest.raises(TypedFHIRGraphError, match=refusal):
-            async with lookup.typed_office_lookup(connection, [mappings[0].table_names["offices"]], address) as matches:
-                await mapping._match_offices(connection, mappings[0], address, matches)
+        ]
+        assert actual_bindings == [(UUID(int=1), "2"), (UUID(int=3), "2"), (UUID(int=4), "4")]
+        for selected, matched, missing in ((mappings[0], 1, 1), (mappings[1], 2, 3)):
+            totals, offices = await _pair_accounting(connection, selected)
+            assert offices == {"matched_offices": matched, "missing_offices": missing}
+            assert totals == {
+                "mapped_pair_rows": matched,
+                "mapped_reference_rows": matched * 3,
+                "unapproved_pair_rows": 0,
+                "unapproved_reference_rows": 0,
+                "unmatched_office_pair_rows": missing,
+                "unmatched_office_reference_rows": missing * 3,
+            }
+            assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("memberships")) == matched
         assert await _lookup_rows(connection) == 0
-        assert await connection.fetchval("SELECT count(*) FROM " + mappings[0].relation("bindings")) == 0
+        assert await connection.fetchval("SELECT count(*) FROM lookup_addresses") == 9
+
+
+async def test_office_acceptance_keeps_full_identity_and_native_result_shape_checks():
+    import ptg2_address_canon as native
+
+    canonical = native.canonicalize_batch([_ADDRESS])
+    office_by_field = {
+        "provider_id": _PROVIDER,
+        "location_id": UUID(int=1),
+        "matched_key": "one",
+        "address_key": UUID(canonical[0]["address_key"]),
+        "canonical_identity": canonical[0]["identity_key"] + "changed",
+    }
+    assert mapping._accepted_office_rows([office_by_field], canonical) == []
+    with pytest.raises(ValueError):
+        mapping._accepted_office_rows([office_by_field], [])
+    with pytest.raises(ValueError):
+        mapping._accepted_office_rows([office_by_field], [{**canonical[0], "address_key": "invalid"}])
 
 
 async def test_cancelled_partial_scan_rolls_back_lookup_tables(serving_schema, monkeypatch):

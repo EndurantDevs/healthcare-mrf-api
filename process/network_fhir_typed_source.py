@@ -12,7 +12,12 @@ from process.network_address_projection import _identifier
 from process.network_fhir_retained_capture_contract import registry_location_id
 from process.network_fhir_source_epoch_pin import _virtual_xid
 from process.network_fhir_source_witness_capture import _export_identity, _original_source_factory
-from process.network_fhir_source_witness_contract import database_identity, source_origin
+from process.network_fhir_source_witness_contract import (
+    database_identity,
+    is_completion_v3_origin,
+    source_origin,
+    source_resource_marker_valid,
+)
 from process.network_fhir_typed_contract import (
     _BRAND,
     ADDRESS_FIELDS,
@@ -129,10 +134,12 @@ def _page_rows(page, origin, counts, after):
         "page_bounds",
     )
     wire_rows = []
+    is_completion_v3 = is_completion_v3_origin(origin)
     for resource_row in page:
         require(type(resource_row) is dict and set(resource_row) == _RESOURCE_FIELDS, "resource_shape")
         require(
-            resource_row["dataset_id"] == origin.dataset_id and resource_row["acquired_resource_sha256"] is None,
+            resource_row["dataset_id"] == origin.dataset_id
+            and source_resource_marker_valid(resource_row["acquired_resource_sha256"], completion_v3=is_completion_v3),
             "resource_scope",
         )
         kind, identity = resource_row["resource_type"], resource_row["resource_id"]

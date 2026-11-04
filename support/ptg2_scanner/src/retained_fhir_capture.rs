@@ -106,6 +106,8 @@ struct Input<'a> {
     observed_at_pg_micros: i64,
     #[serde(borrow)]
     hash_contract: Cow<'a, str>,
+    #[serde(default)]
+    completion_required_version: Option<u8>,
     resource_types: Vec<String>,
     derive: bool,
     #[serde(borrow)]
@@ -123,8 +125,8 @@ struct Row<'a> {
     payload_hash: Cow<'a, str>,
     #[serde(borrow)]
     payload_json: Cow<'a, str>,
-    #[serde(rename = "acquired_resource_sha256")]
-    _acquired_resource_sha256: (),
+    #[serde(borrow)]
+    acquired_resource_sha256: &'a RawValue,
     #[serde(default, borrow)]
     site_id: Option<Cow<'a, str>>,
 }
@@ -191,6 +193,9 @@ fn encode(bytes: &[u8], flag: Option<&AtomicBool>) -> Result<RetainedFhirCapture
                 | "semantic_content_v3"
                 | "semantic_content_v4"
         )
+        || input
+            .completion_required_version
+            .is_some_and(|version| version != 3 || input.hash_contract != "transport_neutral_v2")
     {
         return Err(failure("invalid_context", None));
     }
@@ -273,6 +278,22 @@ impl Encoder<'_, '_> {
         if self.output.row_count == MAX_ROWS {
             return Err(failure("row_limit", index));
         }
+        let acquired: Option<Cow<'_, str>> =
+            serde_json::from_str(row.acquired_resource_sha256.get())
+                .map_err(|_| failure("invalid_rows", index))?;
+        let marker_valid = match (self.input.completion_required_version, acquired) {
+            (Some(3), Some(value)) => {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !marker_valid {
+            return Err(failure("invalid_rows", index));
+        }
         if !self
             .output
             .families
@@ -307,7 +328,12 @@ impl Encoder<'_, '_> {
             fallback = validate_values(payload, &mut self.items, self.flag)
                 .map_err(|code| failure(code, index))?;
             if !fallback {
-                match payload_hash(object, &self.input.hash_contract, &row.resource_type) {
+                match payload_hash(
+                    object,
+                    &self.input.hash_contract,
+                    &row.resource_type,
+                    self.input.completion_required_version == Some(3),
+                ) {
                     Ok(hash) if hash != row.payload_hash => {
                         return Err(failure("payload_hash", index))
                     }

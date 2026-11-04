@@ -195,6 +195,18 @@ class SourceWitnessCompletionOrigin(SourceWitnessOrigin):
         require(is_sha256(self.completion_sha256))
 
 
+def is_completion_v3_origin(origin):
+    """Select only the existing completion declaration authenticated by publication intake."""
+    if not is_dataclass(origin) or isinstance(origin, type) or "completion_sha256" not in origin.__dataclass_fields__:
+        return False
+    return type(source_origin(origin)) is SourceWitnessCompletionOrigin
+
+
+def source_resource_marker_valid(value, *, completion_v3):
+    """Completion rows require acquired digests; every older profile remains null-only."""
+    return is_sha256(value) if completion_v3 else value is None
+
+
 def _origin_families(origin):
     for name in ("resource_counts", "resource_hashes"):
         pairs = getattr(origin, name)
