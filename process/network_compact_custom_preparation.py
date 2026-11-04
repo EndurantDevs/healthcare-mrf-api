@@ -198,5 +198,12 @@ async def verify_compact_custom_contribution(
             binding_table="provider_location_binding",
             carrier=projection,
         )
-        await _complete_binding_domain(connection, receipt, projection)
+        from process.registry_typed_membership_parity import is_typed_candidate
+
+        if is_typed_candidate(candidate):
+            from process.registry_typed_office_parity import has_binding_domain_difference
+
+            _require(await has_binding_domain_difference(connection, receipt, projection) is False)
+        else:
+            await _complete_binding_domain(connection, receipt, projection)
         return custom
