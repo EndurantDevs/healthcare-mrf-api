@@ -341,32 +341,33 @@ async def _map_pair_rows(connection, stage, mapping, bindings, arguments):
 
 async def _map_provider_rows(connection, stage, mapping, bindings, arguments):
     origin = source_origin(stage.document["origin"])
-    after = ("", "")
-    while resource_rows := await connection.fetch(
-        "SELECT resource_type,resource_id FROM "
-        + stage.relation("cells")
-        + " WHERE resource_type IN ('PractitionerRole','OrganizationAffiliation') AND (resource_type,resource_id)>($1,$2) ORDER BY resource_type,resource_id LIMIT 128",
-        *after,
-    ):
-        last_keys = tuple(resource_rows[-1])
-        provider_sql = PROVIDER_ONLY_SQL.replace("{cells}", stage.relation("cells"))
-        # Shift Source query parameters after the closed approved coordinates and generation.
-        provider_sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + 8), provider_sql)
-        await connection.execute(
-            "WITH "
-            + bindings
-            + " INSERT INTO "
-            + mapping.relation("provider_only")
-            + " SELECT b.network_id,'npi',p.provider_id,encode(sha256(convert_to(jsonb_build_array('fhir-provider-only-v3',$8::text,p.resource_type,p.resource_id,p.network_source_key)::text,'UTF8')),'hex') FROM ("
-            + provider_sql
-            + ") p JOIN approved_network_bindings b ON b.record_json->>'source_key'=p.network_source_key ON CONFLICT DO NOTHING",
-            *arguments,
-            origin.source_uri.rstrip("/"),
-            date.fromisoformat(stage.document["membership_as_of"]),
+    provider_sql = PROVIDER_ONLY_SQL.replace("{cells}", stage.relation("cells"))
+    # Shift Source query parameters after the closed approved coordinates and generation.
+    provider_sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + 8), provider_sql)
+    for resource_type in ("OrganizationAffiliation", "PractitionerRole"):
+        after = (resource_type, "")
+        while resource_rows := await connection.fetch(
+            "SELECT resource_type,resource_id FROM "
+            + stage.relation("cells")
+            + " WHERE resource_type=$1 AND resource_id>$2 ORDER BY resource_id LIMIT 128",
             *after,
-            *last_keys,
-        )
-        after = last_keys
+        ):
+            last_keys = tuple(resource_rows[-1])
+            await connection.execute(
+                "WITH "
+                + bindings
+                + " INSERT INTO "
+                + mapping.relation("provider_only")
+                + " SELECT b.network_id,'npi',p.provider_id,encode(sha256(convert_to(jsonb_build_array('fhir-provider-only-v3',$8::text,p.resource_type,p.resource_id,p.network_source_key)::text,'UTF8')),'hex') FROM ("
+                + provider_sql
+                + ") p JOIN approved_network_bindings b ON b.record_json->>'source_key'=p.network_source_key ON CONFLICT DO NOTHING",
+                *arguments,
+                origin.source_uri.rstrip("/"),
+                date.fromisoformat(stage.document["membership_as_of"]),
+                *after,
+                *last_keys,
+            )
+            after = last_keys
 
 
 async def _require_mapping_counts(connection, stage, mapping, totals):

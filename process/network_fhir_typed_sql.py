@@ -149,12 +149,26 @@ _LOCATION_LOOKUP = (
     + " AND loc.location_status IS DISTINCT FROM 'inactive' OFFSET 0) loc ON true"
 )
 
+
+def _role_page_sql(first_parameter):
+    """Bound the driving relation before planning the reference joins."""
+    return f"""WITH role_page AS MATERIALIZED (
+ SELECT * FROM {{cells}}
+ WHERE resource_type IN ('PractitionerRole','OrganizationAffiliation')
+ AND resource_type=${first_parameter}::text AND resource_type=${first_parameter + 2}::text
+ AND resource_id>${first_parameter + 1}::text AND resource_id<=${first_parameter + 3}::text
+ ORDER BY resource_id LIMIT 128
+)
+"""
+
+
 PAIR_SQL = (
-    """SELECT nr.resource_id,'npi'::text,p.npi,l.site_id,a.address_key,a.canonical_identity,
+    _role_page_sql(3)
+    + """SELECT nr.resource_id,'npi'::text,p.npi,l.site_id,a.address_key,a.canonical_identity,
 r.resource_type,r.resource_id,l.resource_id,
 CASE WHEN r.resource_type='OrganizationAffiliation' THEN 'affiliation_network_participant_location'
  ELSE 'role_network_direct_location' END,nr.multiplicity*lr.multiplicity
-FROM {cells} r """
+FROM role_page r """
     + _PARENT_LOOKUP
     + """
 JOIN LATERAL (SELECT net.resource_id,count(*)::bigint multiplicity FROM unnest(r.network_refs) raw(ref)
@@ -185,11 +199,12 @@ CHECKER_DDL = """resource_type text NOT NULL,resource_id text NOT NULL,subject_k
 network_ids text[] NOT NULL,location_ids text[] NOT NULL,eligible boolean NOT NULL,valid_npi boolean NOT NULL,
 PRIMARY KEY(resource_type,resource_id)"""
 CHECKER_PAIR_SQL = (
-    """SELECT net.resource_id,'npi'::text,p.npi,l.site_id,a.address_key,a.canonical_identity,
+    _role_page_sql(1)
+    + """SELECT net.resource_id,'npi'::text,p.npi,l.site_id,a.address_key,a.canonical_identity,
 r.resource_type,r.resource_id,l.resource_id,
 CASE WHEN r.resource_type='OrganizationAffiliation' THEN 'affiliation_network_participant_location'
  ELSE 'role_network_direct_location' END,ni.multiplicity*li.multiplicity
-FROM {cells} r JOIN LATERAL (SELECT * FROM {checks} x WHERE (x.resource_type,x.resource_id)=(r.resource_type,r.resource_id) OFFSET 0) x ON true
+FROM role_page r JOIN LATERAL (SELECT * FROM {checks} x WHERE (x.resource_type,x.resource_id)=(r.resource_type,r.resource_id) OFFSET 0) x ON true
 JOIN LATERAL (SELECT * FROM {cells} p WHERE p.resource_type=x.subject_kind AND p.resource_id=x.subject_id OFFSET 0) p ON true
 JOIN LATERAL (SELECT * FROM {checks} px WHERE (px.resource_type,px.resource_id)=(p.resource_type,p.resource_id) OFFSET 0) px ON true
 CROSS JOIN LATERAL (SELECT id,count(*)::bigint multiplicity FROM unnest(x.location_ids) id GROUP BY id) li
@@ -208,8 +223,9 @@ AND a.canonical_identity LIKE '%|street'"""
 )
 
 PROVIDER_ONLY_SQL = (
-    """SELECT nr.resource_id AS network_source_key,p.npi AS provider_id,r.resource_type,r.resource_id
-FROM {cells} r """
+    _role_page_sql(3)
+    + """SELECT nr.resource_id AS network_source_key,p.npi AS provider_id,r.resource_type,r.resource_id
+FROM role_page r """
     + _PARENT_LOOKUP
     + """
 JOIN LATERAL (SELECT DISTINCT net.resource_id FROM unnest(r.network_refs) raw(ref)
