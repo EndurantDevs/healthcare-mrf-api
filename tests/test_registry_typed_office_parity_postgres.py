@@ -12,7 +12,11 @@ from process.network_custom_address_source import _APPROVED_CTE
 from process.network_initial_source_office_bindings import copy_source_office_binding_rows
 from process.registry_initial_source_composition import RegistryInitialSourceError
 from process.registry_source_office_custody import _binding_parity
-from process.registry_typed_office_parity import create_source_pair_index, typed_binding_parity
+from process.registry_typed_office_parity import (
+    create_source_pair_index,
+    has_binding_domain_difference,
+    typed_binding_parity,
+)
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 
 
@@ -149,6 +153,53 @@ async def _assert_dense_office_corruptions(connection, relations, site, check):
             await transaction.rollback()
 
 
+async def _check_complete_binding_domain(connection, control, name, reader, relations):
+    """Compare every domain arm, duplicate evidence, and missing native capabilities."""
+    _namespace, actual, source_relation, _expected, carried = relations
+    receipt = SimpleNamespace(target=SimpleNamespace(schema_name=name), control_schema=control, approved_revision=2)
+    carrier = SimpleNamespace(canonical_binding_sql=f"SELECT * FROM {carried}")
+
+    async def check(difference=False):
+        async with connection.transaction():
+            await connection.execute("SET LOCAL work_mem='4MB'")
+            await connection.execute("SET LOCAL temp_file_limit='256MB'")
+            await connection.execute(f'SET LOCAL ROLE "{reader}"')
+            assert await has_binding_domain_difference(connection, receipt, carrier) is difference
+
+    await check()
+    mutations = (
+        f"DELETE FROM {actual} WHERE location_id=(SELECT min(location_id::text)::uuid FROM {actual})",
+        f"INSERT INTO {source_relation} VALUES(1,'npi','zz-source-tail',md5('source-tail')::uuid,'extra')",
+        f"INSERT INTO {actual} VALUES('npi','zz-actual-tail',md5('actual-tail')::uuid,repeat('a',64),'npi','zz-actual-tail')",
+        f"INSERT INTO {carried} VALUES('npi','zz-carrier-tail',md5('carrier-tail')::uuid,repeat('a',64),'npi','zz-carrier-tail')",
+        f'''INSERT INTO "{control}".registry_approved_record VALUES
+          (2,'location',md5('custom-tail')::uuid::text,1,1,'{{}}'::jsonb),
+          (2,'membership','custom-tail',1,1,jsonb_build_object('archived',false,'memberships_json',
+            jsonb_build_array(jsonb_build_object('network_id',1,'provider_system','npi',
+              'provider_id','zz-custom-tail','location_id',md5('custom-tail')::uuid::text))))''',
+    )
+    for statement in mutations:
+        transaction = connection.transaction()
+        await transaction.start()
+        try:
+            await connection.execute(statement)
+            await check(True)
+        finally:
+            await transaction.rollback()
+    async with connection.transaction():
+        await connection.execute(f"INSERT INTO {source_relation} SELECT * FROM {source_relation} LIMIT 10000")
+        await check()
+    transaction = connection.transaction()
+    await transaction.start()
+    try:
+        await connection.execute(f'DROP INDEX "{name}".typed_source_office_idx')
+        with pytest.raises(ValueError, match="registry_typed_binding_domain_index_required"):
+            await check()
+    finally:
+        await transaction.rollback()
+    await check()
+
+
 @pytest.mark.asyncio
 async def test_typed_binding_parity_dense_aliases_custom_preservation_and_corruption(serving_schema, record_property):
     """Keep custom overrides, alias multiplicity and corruption refusal equal to legacy parity."""
@@ -173,12 +224,13 @@ async def test_typed_binding_parity_dense_aliases_custom_preservation_and_corrup
             )
 
         await check("valid")
+        await _check_complete_binding_domain(connection, control, name, reader, relations)
         await _assert_dense_office_corruptions(connection, relations, site, check)
         await check("restored")
         record_property("typed_office_parity_seconds", json.dumps(timings_by_case, sort_keys=True))
         record_property(
             "typed_office_parity_shape",
-            "20000 sites; one shared office; 40000 source rows; custom override; preserved overlap",
+            "20000 sites; one shared office; 50000 source rows; custom override; preserved overlap",
         )
     finally:
         await connection.execute(f"DROP SCHEMA IF EXISTS {namespace} CASCADE")
