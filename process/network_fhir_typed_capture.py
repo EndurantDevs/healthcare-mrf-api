@@ -60,7 +60,42 @@ class TypedGraphAnchor:
         require(canonical_timestamp(self.observed_at) == self.observed_at)
 
 
+def _validate_capture_content(document):
+    require(type(document["catalog"]) is dict and set(document["catalog"]) == {"schema_oid", "relation_oids", "sha256"})
+    require(type(document["content"]) is dict and set(document["content"]) == set(TABLES))
+    catalog = document["catalog"]
+    require(type(catalog["schema_oid"]) is int and 0 < catalog["schema_oid"] < 2**32)
+    require(type(catalog["relation_oids"]) is dict and set(catalog["relation_oids"]) == set(TABLES))
+    require(
+        all(type(oid) is int and 0 < oid < 2**32 for oid in catalog["relation_oids"].values())
+        and len(set(catalog["relation_oids"].values())) == len(TABLES)
+    )
+    hashes = [catalog["sha256"], document["capture_sha256"]]
+    for content in document["content"].values():
+        require(type(content) is dict and set(content) == {"rows", "sha256"})
+        require(type(content["rows"]) is int and 0 <= content["rows"] < 2**63)
+        hashes.append(content["sha256"])
+    require(all(type(hash_text) is str and re.fullmatch(r"[0-9a-f]{64}", hash_text) for hash_text in hashes))
+    require(
+        document["content"]["cells"]["rows"] == document["graph"]["counts"]["projected_rows"]
+        and document["content"]["pairs"]["rows"] == document["graph"]["counts"]["pair_rows"]
+    )
+
+
+def _validate_capture_roles(document):
+    roles = document["runtime_roles"]
+    require(
+        type(roles) is list
+        and 1 <= len(roles) <= 32
+        and roles == sorted(set(roles))
+        and document["owner_role"] not in roles
+    )
+    for role in roles:
+        _identifier(role)
+
+
 def validate_typed_capture(document):
+    """Reject descriptors whose closed fields, coordinates, counts or canonical hash differ."""
     require(
         type(document) is dict
         and set(document)
@@ -87,15 +122,7 @@ def validate_typed_capture(document):
     TypedGraphAnchor(document["capture_id"], document["observed_at"])
     require(document["schema_name"] == PREFIX + UUID(document["capture_id"]).hex)
     _identifier(document["owner_role"])
-    roles = document["runtime_roles"]
-    require(
-        type(roles) is list
-        and 1 <= len(roles) <= 32
-        and roles == sorted(set(roles))
-        and document["owner_role"] not in roles
-    )
-    for role in roles:
-        _identifier(role)
+    _validate_capture_roles(document)
     validate_graph_document(document["graph"])
     from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
     from process.network_fhir_typed_mapping import require_catalog_graph_scope
@@ -107,25 +134,7 @@ def validate_typed_capture(document):
         RegistryNetworkSourceCoordinates(**descriptor["coordinates"]),
         descriptor,
     )
-    require(type(document["catalog"]) is dict and set(document["catalog"]) == {"schema_oid", "relation_oids", "sha256"})
-    require(type(document["content"]) is dict and set(document["content"]) == set(TABLES))
-    catalog = document["catalog"]
-    require(type(catalog["schema_oid"]) is int and 0 < catalog["schema_oid"] < 2**32)
-    require(type(catalog["relation_oids"]) is dict and set(catalog["relation_oids"]) == set(TABLES))
-    require(
-        all(type(oid) is int and 0 < oid < 2**32 for oid in catalog["relation_oids"].values())
-        and len(set(catalog["relation_oids"].values())) == len(TABLES)
-    )
-    hashes = [catalog["sha256"], document["capture_sha256"]]
-    for content in document["content"].values():
-        require(type(content) is dict and set(content) == {"rows", "sha256"})
-        require(type(content["rows"]) is int and 0 <= content["rows"] < 2**63)
-        hashes.append(content["sha256"])
-    require(all(type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) for value in hashes))
-    require(
-        document["content"]["cells"]["rows"] == document["graph"]["counts"]["projected_rows"]
-        and document["content"]["pairs"]["rows"] == document["graph"]["counts"]["pair_rows"]
-    )
+    _validate_capture_content(document)
     origin = source_origin(document["graph"]["origin"])
     require(
         document["graph"]["membership_as_of"]
@@ -139,46 +148,41 @@ def validate_typed_capture(document):
         "database_identity",
     )
     require(
-        document["capture_sha256"] == digest({key: value for key, value in document.items() if key != "capture_sha256"})
+        document["capture_sha256"]
+        == digest({key: hash_text for key, hash_text in document.items() if key != "capture_sha256"})
     )
     return document
 
 
-async def _catalog(connection, schema, owner_role, runtime_roles):
-    relations = await _catalog_relations(connection, schema)
-    owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", owner_role)
-    require(
-        _protected_owner(owner) and tuple(row["relname"] for row in relations) == tuple(sorted(TABLES.values())),
-        "native_catalog",
-    )
-    inverse = {name: kind for kind, name in TABLES.items()}
-    for row in relations:
-        kind = inverse[row["relname"]]
+def _require_catalog_relations(relations, owner_oid, kinds_by_name):
+    for relation in relations:
+        kind = kinds_by_name[relation["relname"]]
         require(
-            row["relkind"] == b"r"
-            and row["relpersistence"] == b"p"
-            and row["relowner"] == row["nspowner"] == owner["oid"],
+            relation["relkind"] == b"r"
+            and relation["relpersistence"] == b"p"
+            and relation["relowner"] == relation["nspowner"] == owner_oid,
             "native_owner",
         )
         require(
             not any(
-                row[key] for key in ("relhastriggers", "relrowsecurity", "relforcerowsecurity", "inherited", "defaults")
+                relation[key]
+                for key in ("relhastriggers", "relrowsecurity", "relforcerowsecurity", "inherited", "defaults")
             ),
             "native_shape",
         )
-        columns = json.loads(row["columns"])
+        columns = json.loads(relation["columns"])
         require(
             tuple(column[0] for column in columns) == COLUMNS[kind]
             and all(not column[4] and not column[5] for column in columns),
             "native_columns",
         )
-        constraints, indexes = json.loads(row["constraints"]), json.loads(row["indexes"])
+        constraints, indexes = json.loads(relation["constraints"]), json.loads(relation["indexes"])
         require(len(constraints) == 1 and constraints[0][1] == "p", "native_constraints")
-        primary = [index for index in indexes if index["primary"]]
-        require(len(primary) == 1 and primary[0]["columns"] == list(KEYS[kind]), "native_keys")
+        primary_indexes = [index for index in indexes if index["primary"]]
+        require(len(primary_indexes) == 1 and primary_indexes[0]["columns"] == list(KEYS[kind]), "native_keys")
         require(
             all(
-                index["owner_oid"] == owner["oid"]
+                index["owner_oid"] == owner_oid
                 and index["method"] == "btree"
                 and index["valid"]
                 and index["ready"]
@@ -189,6 +193,19 @@ async def _catalog(connection, schema, owner_role, runtime_roles):
             ),
             "native_indexes",
         )
+
+
+async def _catalog(connection, schema, owner_role, runtime_roles):
+    """Require the closed native table, owner and runtime-role shape before hashing custody."""
+    relations = await _catalog_relations(connection, schema)
+    owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", owner_role)
+    require(
+        _protected_owner(owner)
+        and tuple(relation["relname"] for relation in relations) == tuple(sorted(TABLES.values())),
+        "native_catalog",
+    )
+    kinds_by_name = {name: kind for kind, name in TABLES.items()}
+    _require_catalog_relations(relations, owner["oid"], kinds_by_name)
     schema_oid = relations[0]["schema_oid"]
     require(
         await connection.fetchval(
@@ -206,32 +223,103 @@ async def _catalog(connection, schema, owner_role, runtime_roles):
         ),
         "native_runtime",
     )
-    rows = [
-        {key: value.decode("ascii") if type(value) is bytes else value for key, value in row.items()}
-        for row in relations
+    catalog_rows = [
+        {
+            key: catalog_value.decode("ascii") if type(catalog_value) is bytes else catalog_value
+            for key, catalog_value in relation.items()
+        }
+        for relation in relations
     ]
     return {
         "schema_oid": schema_oid,
-        "relation_oids": {inverse[row["relname"]]: row["oid"] for row in relations},
-        "sha256": digest(rows),
+        "relation_oids": {kinds_by_name[relation["relname"]]: relation["oid"] for relation in relations},
+        "sha256": digest(catalog_rows),
     }
 
 
 async def _content(connection, stage):
     """Hash ordered native binary packets without per-edge Python objects or JSON witnesses."""
-    content = {}
+    content_by_kind = {}
     for kind, keys in KEYS.items():
         folded = hashlib.sha256((COMPONENT + ":binary-v4:" + kind + "\0").encode())
         query = "SELECT " + ",".join(COLUMNS[kind]) + " FROM " + stage.relation(kind) + " ORDER BY " + ",".join(keys)
 
         async def consume(packet):
+            """Fold each ordered binary COPY packet into the table digest."""
             folded.update(packet)
 
         copied = await drain_operation(
             connection.copy_from_query(query, output=consume, format="binary"), preserve_cancellation=True
         )
-        content[kind] = {"rows": int(copied.removeprefix("COPY ")), "sha256": folded.hexdigest()}
-    return content
+        content_by_kind[kind] = {"rows": int(copied.removeprefix("COPY ")), "sha256": folded.hexdigest()}
+    return content_by_kind
+
+
+async def _create_capture_tables(writer, schema, owner_role, writer_role, original):
+    require(await writer.fetchval("SELECT to_regnamespace($1)", schema) is None, "restart_from_zero")
+    await writer.execute("CREATE SCHEMA " + _identifier(schema) + " AUTHORIZATION " + _identifier(owner_role))
+    await writer.execute("SET LOCAL ROLE " + _identifier(owner_role))
+    for kind, name in TABLES.items():
+        await writer.execute("CREATE TABLE " + _identifier(schema) + "." + _identifier(name) + "(" + _DDL[kind] + ")")
+    await writer.execute(
+        "CREATE INDEX ON " + _identifier(schema) + "." + _identifier(TABLES["addresses"]) + "(address_key)"
+    )
+    await writer.execute("GRANT USAGE ON SCHEMA " + _identifier(schema) + " TO " + writer_role)
+    for name in TABLES.values():
+        await writer.execute(
+            "GRANT SELECT,INSERT ON " + _identifier(schema) + "." + _identifier(name) + " TO " + writer_role
+        )
+    await writer.execute("SET LOCAL ROLE " + original)
+
+
+async def _seal_typed_capture(
+    writer, stage, graph, schema, expected_anchor, owner_role, runtime_roles, catalog_descriptor
+):
+    relations = await _catalog_relations(writer, schema)
+    await _transfer_and_grant(
+        writer,
+        SimpleNamespace(schema_name=schema),
+        {"owner_role": owner_role, "loader_roles": [], "reader_roles": list(runtime_roles)},
+        {
+            "namespace": {"oid": relations[0]["schema_oid"], "nspowner": relations[0]["nspowner"]},
+            "relations": [dict(relation) for relation in relations],
+            "heaps": {relation["relname"]: relation["oid"] for relation in relations},
+        },
+    )
+    await writer.execute("SET LOCAL ROLE " + _identifier(owner_role))
+    capture_by_field = {
+        "component": COMPONENT,
+        "descriptor_version": 4,
+        "capture_id": expected_anchor.capture_id,
+        "observed_at": expected_anchor.observed_at,
+        "schema_name": schema,
+        "owner_role": owner_role,
+        "runtime_roles": list(runtime_roles),
+        "catalog": await _catalog(writer, schema, owner_role, runtime_roles),
+        "content": await _content(writer, stage),
+        "graph": graph,
+        "catalog_descriptor": catalog_descriptor,
+    }
+    capture_by_field["capture_sha256"] = digest(capture_by_field)
+    validate_typed_capture(capture_by_field)
+    await writer.execute(
+        "COMMENT ON SCHEMA "
+        + _identifier(schema)
+        + " IS '"
+        + (COMMENT + canonical(capture_by_field)).replace("'", "''")
+        + "'"
+    )
+    stage.active = False
+    return capture_by_field
+
+
+@dataclass(frozen=True)
+class TypedGraphCaptureOptions:
+    """Caller-owned anchor and roles for closing one persistent typed graph."""
+
+    expected_anchor: TypedGraphAnchor
+    owner_role: str
+    runtime_roles: tuple
 
 
 async def capture_typed_source_graph(
@@ -241,12 +329,12 @@ async def capture_typed_source_graph(
     source_profile,
     reviewed_origin,
     membership_as_of,
-    expected_anchor,
-    owner_role,
-    runtime_roles,
+    capture_options,
     catalog_descriptor,
 ):
     """Produce and close one Source candidate; its consumer must independently reopen Source."""
+    expected_anchor = capture_options.expected_anchor
+    owner_role, runtime_roles = capture_options.owner_role, capture_options.runtime_roles
     require(
         type(expected_anchor) is TypedGraphAnchor
         and type(runtime_roles) is tuple
@@ -266,22 +354,7 @@ async def capture_typed_source_graph(
     writer_role = await writer.fetchval("SELECT quote_ident(session_user)")
     try:
         async with writer.transaction():
-            require(await writer.fetchval("SELECT to_regnamespace($1)", schema) is None, "restart_from_zero")
-            await writer.execute("CREATE SCHEMA " + _identifier(schema) + " AUTHORIZATION " + _identifier(owner_role))
-            await writer.execute("SET LOCAL ROLE " + _identifier(owner_role))
-            for kind, name in TABLES.items():
-                await writer.execute(
-                    "CREATE TABLE " + _identifier(schema) + "." + _identifier(name) + "(" + _DDL[kind] + ")"
-                )
-            await writer.execute(
-                "CREATE INDEX ON " + _identifier(schema) + "." + _identifier(TABLES["addresses"]) + "(address_key)"
-            )
-            await writer.execute("GRANT USAGE ON SCHEMA " + _identifier(schema) + " TO " + writer_role)
-            for name in TABLES.values():
-                await writer.execute(
-                    "GRANT SELECT,INSERT ON " + _identifier(schema) + "." + _identifier(name) + " TO " + writer_role
-                )
-            await writer.execute("SET LOCAL ROLE " + original)
+            await _create_capture_tables(writer, schema, owner_role, writer_role, original)
             stage = await bind_typed_graph_stage(writer, schema_name=schema, table_names=TABLES)
             graph = await produce_typed_source_graph(
                 source_export,
@@ -291,42 +364,9 @@ async def capture_typed_source_graph(
                 reviewed_origin=reviewed_origin,
                 membership_as_of=membership_as_of,
             )
-            relations = await _catalog_relations(writer, schema)
-            await _transfer_and_grant(
-                writer,
-                SimpleNamespace(schema_name=schema),
-                {"owner_role": owner_role, "loader_roles": [], "reader_roles": list(runtime_roles)},
-                {
-                    "namespace": {"oid": relations[0]["schema_oid"], "nspowner": relations[0]["nspowner"]},
-                    "relations": [dict(row) for row in relations],
-                    "heaps": {row["relname"]: row["oid"] for row in relations},
-                },
+            return await _seal_typed_capture(
+                writer, stage, graph, schema, expected_anchor, owner_role, runtime_roles, catalog_descriptor
             )
-            await writer.execute("SET LOCAL ROLE " + _identifier(owner_role))
-            document = {
-                "component": COMPONENT,
-                "descriptor_version": 4,
-                "capture_id": expected_anchor.capture_id,
-                "observed_at": expected_anchor.observed_at,
-                "schema_name": schema,
-                "owner_role": owner_role,
-                "runtime_roles": list(runtime_roles),
-                "catalog": await _catalog(writer, schema, owner_role, runtime_roles),
-                "content": await _content(writer, stage),
-                "graph": graph,
-                "catalog_descriptor": catalog_descriptor,
-            }
-            document["capture_sha256"] = digest(document)
-            validate_typed_capture(document)
-            await writer.execute(
-                "COMMENT ON SCHEMA "
-                + _identifier(schema)
-                + " IS '"
-                + (COMMENT + canonical(document)).replace("'", "''")
-                + "'"
-            )
-            stage.active = False
-            return document
     finally:
         if writer.is_in_transaction():
             await drain_operation(writer.execute("SET LOCAL ROLE " + original), preserve_cancellation=True)
@@ -389,8 +429,8 @@ async def resolve_typed_graph_capture_reference(
     expected_anchor.__post_init__()
     require(
         all(
-            type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value)
-            for value in (capture_sha256, catalog_generation)
+            type(hash_text) is str and re.fullmatch(r"[0-9a-f]{64}", hash_text)
+            for hash_text in (capture_sha256, catalog_generation)
         ),
         "reference_hash",
     )
@@ -433,12 +473,15 @@ class SealedTypedGraphRead:
 
     @property
     def document(self):
+        """Expose the retained graph descriptor without claiming independent Source verification."""
         return self.stage.document
 
     def relation(self, kind):
+        """Resolve a retained producer relation through its transaction-bound stage."""
         return self.stage.relation(kind)
 
     async def verify(self, connection):
+        """Recheck producer custody and the original transaction-bound stage."""
         require(self.seal is _SEALED_READ, "sealed_read")
         await self.stage.verify(connection, complete=False)
         validate_graph_document(self.document)

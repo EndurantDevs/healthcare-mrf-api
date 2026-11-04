@@ -4,7 +4,7 @@
 from uuid import UUID
 
 from process.network_address_projection import _identifier
-from process.registry_typed_membership_parity import COLUMNS, FIELDS, ORDER, _last_page_key, require_order_index
+from process.registry_typed_membership_parity import COLUMNS, ORDER, _last_page_key, require_order_index
 
 _DOMAIN = b"network-office-slice-v1\0"
 _METADATA_ROWS = 256

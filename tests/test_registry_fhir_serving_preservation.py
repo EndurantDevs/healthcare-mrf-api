@@ -608,9 +608,9 @@ async def test_typed_raw_parity_uses_bounded_indexed_multiset_check(monkeypatch,
     monkeypatch.setattr(typed, "is_typed_source_stage", lambda value: value is stage)
     monkeypatch.setattr(typed, "typed_stage_projection", lambda _: "SELECT * FROM exact_typed_stage")
     bounded = AsyncMock(return_value=corrupt)
-    monkeypatch.setattr(parity, "multiset_differs", bounded)
+    monkeypatch.setattr(parity, "has_multiset_difference", bounded)
     connection = SimpleNamespace(fetch=AsyncMock(side_effect=[[{"network_id": 1}, {"network_id": 9}], []]))
-    candidate = {
+    candidate_by_field = {
         "schema_name": "candidate",
         "source_generations": {"registry_source_membership": "a" * 64},
         "approved_custom_revision": 9,
@@ -618,7 +618,7 @@ async def test_typed_raw_parity_uses_bounded_indexed_multiset_check(monkeypatch,
     carried = SimpleNamespace(
         membership_query="SELECT * FROM exact_carry", predecessor=SimpleNamespace(approved_custom_revision=7)
     )
-    arguments = (connection, candidate, carried, stage, (1, 2 if mixed else 1), "control")
+    arguments = (connection, candidate_by_field, carried, stage, (1, 2 if mixed else 1), "control")
     if corrupt:
         with pytest.raises(FHIRServingPreservationError, match="membership_parity"):
             await preservation._current_raw_parity(*arguments)

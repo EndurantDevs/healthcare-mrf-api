@@ -168,23 +168,23 @@ async def verify_registry_composition_rows(connection, copy_target, candidate, c
     namespace = '"' + copy_target.schema_name + '"'
     expected = _allowed_source(namespace + "." + SOURCE_TABLE, command_stage)
     expected += " UNION ALL SELECT * FROM " + _relation(command_stage.add_table)
-    from process.registry_typed_membership_parity import multiset_differs, typed_candidate
+    from process.registry_typed_membership_parity import has_multiset_difference, is_typed_candidate
 
-    if typed_candidate(candidate):
+    if is_typed_candidate(candidate):
         from process.registry_typed_membership_parity import require_order_index
 
         await require_order_index(connection, namespace + ".network_membership")
         await require_order_index(connection, namespace + "." + SOURCE_TABLE)
-        counts = dict(
+        counts_by_kind = dict(
             await connection.fetchrow(
                 f"SELECT (SELECT count(*) FROM {_relation(command_stage.add_table)}) AS add_rows,(SELECT count(*) FROM {_relation(command_stage.remove_table)}) AS remove_rows,(SELECT count(*) FROM {namespace}.{SOURCE_TABLE}) AS source_rows,(SELECT count(*) FROM ({expected}) rows) AS effective_rows"
             )
         )
-        counts["differs"] = await multiset_differs(
+        counts_by_kind["differs"] = await has_multiset_difference(
             connection, "SELECT * FROM " + namespace + ".network_membership", expected
         )
     else:
-        counts = await connection.fetchrow(f"""WITH expected AS MATERIALIZED ({expected}), differences AS (
+        counts_by_kind = await connection.fetchrow(f"""WITH expected AS MATERIALIZED ({expected}), differences AS (
           (SELECT * FROM {namespace}.network_membership EXCEPT ALL SELECT * FROM expected)
           UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM {namespace}.network_membership))
           SELECT (SELECT count(*) FROM {_relation(command_stage.add_table)}) AS add_rows,
@@ -192,7 +192,9 @@ async def verify_registry_composition_rows(connection, copy_target, candidate, c
             (SELECT count(*) FROM {namespace}.{SOURCE_TABLE}) AS source_rows,
             (SELECT count(*) FROM expected) AS effective_rows,
             EXISTS(SELECT 1 FROM differences) AS differs""")
-    if counts["differs"] or any(counts[name] != receipt[name] for name in counts.keys() if name != "differs"):
+    if counts_by_kind["differs"] or any(
+        counts_by_kind[name] != receipt[name] for name in counts_by_kind.keys() if name != "differs"
+    ):
         raise RegistrySourceRetentionError("registry_composition_effective_parity_invalid")
 
 
@@ -208,9 +210,9 @@ async def materialize_registry_composition(connection, copy_target, command_stag
     await connection.execute(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE")
     if candidate["accepted_rows"] or await connection.fetchval(f"SELECT EXISTS(SELECT 1 FROM {table})"):
         raise RegistrySourceRetentionError("registry_composition_effective_not_empty")
-    from process.registry_typed_membership_parity import create_order_index, typed_candidate
+    from process.registry_typed_membership_parity import create_order_index, is_typed_candidate
 
-    if typed_candidate(candidate):
+    if is_typed_candidate(candidate):
         await create_order_index(connection, table, "typed_effective_membership_order_idx")
     source = '"' + copy_target.schema_name + '".' + SOURCE_TABLE
     status = await connection.execute(

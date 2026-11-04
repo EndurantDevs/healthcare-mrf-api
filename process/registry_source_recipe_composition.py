@@ -691,83 +691,59 @@ async def stage_verified_registry_source_recipes(
     )
 
 
-async def _stage_registry_source_recipes(
-    connection,
-    recipes,
-    approved,
-    *,
-    typed_stage_reader,
-    request_id,
-    control_schema,
-    read_context=None,
-    **contribution_options,
+async def _stage_mixed_source_recipes(
+    connection, recipes, approved, typed_stage_reader, request_id, control_schema, read_context, contribution_options
 ):
-    """Stage bounded source pages or authenticated retained facts; never publish.
+    from process.registry_typed_source_stage import combine_typed_source_stages
 
-    The caller owns repeatable isolation, admission and temporary-table cleanup.
-    Invalid selected evidence rejects the complete stage, including prior pages.
-    Legacy verified offices retain their mapping proof without fact receipts.
-    """
-    contribution_revision, inventory = _source_stage_options(contribution_options)
-    read_context = SourceRecipeReadContext() if read_context is None else read_context
-    if any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes):
-        from process.registry_typed_source_stage import combine_typed_source_stages
+    typed_recipes = tuple(recipe for recipe in recipes if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource)
+    legacy_recipes = tuple(
+        recipe for recipe in recipes if type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource
+    )
+    async with connection.transaction():
+        typed_stage = await typed_stage_reader(
+            connection,
+            typed_recipes,
+            approved,
+            request_id=request_id,
+            control_schema=control_schema,
+            read_context=read_context,
+        )
+        if not legacy_recipes:
+            return typed_stage
+        legacy_options_by_name = {**contribution_options, "contribution_revision": 2}
+        legacy_stage = await stage_registry_source_recipes(
+            connection,
+            legacy_recipes,
+            approved,
+            request_id=request_id,
+            control_schema=control_schema,
+            read_context=read_context,
+            **legacy_options_by_name,
+        )
+        return await combine_typed_source_stages(
+            connection,
+            typed_stage,
+            legacy_stage,
+            request_id=request_id,
+            recipes=recipes,
+            approved=approved,
+            control_schema=control_schema,
+        )
 
-        if not inventory or read_context.verified_office_inputs is None:
-            raise RegistrySourceCompositionError("registry_source_typed_inventory_scope_invalid")
-        typed_recipes = tuple(
-            recipe for recipe in recipes if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource
-        )
-        legacy_recipes = tuple(
-            recipe for recipe in recipes if type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource
-        )
-        async with connection.transaction():
-            typed_stage = await typed_stage_reader(
-                connection,
-                typed_recipes,
-                approved,
-                request_id=request_id,
-                control_schema=control_schema,
-                read_context=read_context,
-            )
-            if not legacy_recipes:
-                return typed_stage
-            legacy_options = {**contribution_options, "contribution_revision": 2}
-            legacy_stage = await stage_registry_source_recipes(
-                connection,
-                legacy_recipes,
-                approved,
-                request_id=request_id,
-                control_schema=control_schema,
-                read_context=read_context,
-                **legacy_options,
-            )
-            return await combine_typed_source_stages(
-                connection,
-                typed_stage,
-                legacy_stage,
-                request_id=request_id,
-                recipes=recipes,
-                approved=approved,
-                control_schema=control_schema,
-            )
+
+def _require_source_recipe_protocol(recipes, contribution_revision, inventory, read_context):
     if contribution_revision == 4:
         raise RegistrySourceCompositionError("registry_source_typed_inventory_scope_invalid")
     if any(getattr(recipe.source_pin, "source_witness_capture", None) is not None for recipe in recipes) and not (
         inventory and read_context.verified_office_inputs is not None
     ):
         raise RegistrySourceCompositionError("registry_source_witness_verified_inventory_required")
-    if inventory and read_context.verified_office_inputs is not None:
-        from process.registry_verified_witness_stage import stage_verified_witness_inventory
 
-        return await stage_verified_witness_inventory(
-            connection,
-            recipes,
-            approved,
-            request_id=request_id,
-            control_schema=control_schema,
-            read_context=read_context,
-        )
+
+async def _stage_legacy_source_snapshot(
+    connection, recipes, approved, request_id, control_schema, read_context, contribution_revision, inventory
+):
     await _require_source_stage_scope(connection, approved, request_id, contribution_revision)
     recipes, recipe_sha256 = _source_stage_recipes(recipes, inventory)
     control_schema = registry_schema() if control_schema is None else control_schema
@@ -794,6 +770,55 @@ async def _stage_registry_source_recipes(
         read_context,
         (recipe_sha256, contribution_revision, inventory),
         retained_by_capture,
+    )
+
+
+async def _stage_registry_source_recipes(
+    connection,
+    recipes,
+    approved,
+    *,
+    typed_stage_reader,
+    request_id,
+    control_schema,
+    read_context=None,
+    **contribution_options,
+):
+    """Stage bounded source pages or authenticated retained facts; never publish.
+
+    The caller owns repeatable isolation, admission and temporary-table cleanup.
+    Invalid selected evidence rejects the complete stage, including prior pages.
+    Legacy verified offices retain their mapping proof without fact receipts.
+    """
+    contribution_revision, inventory = _source_stage_options(contribution_options)
+    read_context = SourceRecipeReadContext() if read_context is None else read_context
+    if any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes):
+        if not inventory or read_context.verified_office_inputs is None:
+            raise RegistrySourceCompositionError("registry_source_typed_inventory_scope_invalid")
+        return await _stage_mixed_source_recipes(
+            connection,
+            recipes,
+            approved,
+            typed_stage_reader,
+            request_id,
+            control_schema,
+            read_context,
+            contribution_options,
+        )
+    _require_source_recipe_protocol(recipes, contribution_revision, inventory, read_context)
+    if inventory and read_context.verified_office_inputs is not None:
+        from process.registry_verified_witness_stage import stage_verified_witness_inventory
+
+        return await stage_verified_witness_inventory(
+            connection,
+            recipes,
+            approved,
+            request_id=request_id,
+            control_schema=control_schema,
+            read_context=read_context,
+        )
+    return await _stage_legacy_source_snapshot(
+        connection, recipes, approved, request_id, control_schema, read_context, contribution_revision, inventory
     )
 
 

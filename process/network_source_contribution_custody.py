@@ -87,17 +87,7 @@ def _source_stage_context(office_authority):
     )
 
 
-async def _independent_source_stage(
-    connection, copy_target, candidate, approved, *, expected, control_schema, office_authority, inventory=None
-):
-    """Rebuild selected Source facts with independent runtime, office and predecessor context."""
-    read_context = _source_stage_context(office_authority)
-    recipes = verify_registry_source_recipes(candidate) if inventory is None else inventory[1]
-    if not recipes:
-        generations = candidate.get("source_generations", {}) if inventory is not None else {}
-        generations = json.loads(generations) if type(generations) is str else generations
-        if inventory is None or "registry_source_membership" not in generations:
-            return await _retained_source_stage(connection, copy_target, candidate, control_schema)
+async def _legacy_independent_stage(connection, copy_target, candidate, approved, expected, control_schema, inventory):
     if inventory is None and expected is None:
         from process.registry_verified_office_policy import (
             reconstruct_legacy_verified_office_stage,
@@ -110,13 +100,32 @@ async def _independent_source_stage(
             )
             is not None
         ):
-            return await reconstruct_legacy_verified_office_stage(
+            return True, await reconstruct_legacy_verified_office_stage(
                 connection,
                 candidate,
                 approved,
                 control_schema=control_schema,
                 request_id=uuid5(UUID(copy_target.candidate_id), "independent-legacy-verified-source-v1"),
             )
+    return False, None
+
+
+async def _independent_source_stage(
+    connection, copy_target, candidate, approved, *, expected, control_schema, office_authority, inventory=None
+):
+    """Rebuild selected Source facts with independent runtime, office and predecessor context."""
+    read_context = _source_stage_context(office_authority)
+    recipes = verify_registry_source_recipes(candidate) if inventory is None else inventory[1]
+    if not recipes:
+        generations = candidate.get("source_generations", {}) if inventory is not None else {}
+        generations = json.loads(generations) if type(generations) is str else generations
+        if inventory is None or "registry_source_membership" not in generations:
+            return await _retained_source_stage(connection, copy_target, candidate, control_schema)
+    has_legacy_stage, legacy_stage = await _legacy_independent_stage(
+        connection, copy_target, candidate, approved, expected, control_schema, inventory
+    )
+    if has_legacy_stage:
+        return legacy_stage
     previous = None
     verified_inputs = None
     generations = candidate.get("source_generations", {})

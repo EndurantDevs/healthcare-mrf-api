@@ -11,7 +11,8 @@ COLUMNS = ",".join(FIELDS)
 _PARAMETERS = '($1::integer,$2::text COLLATE "C",$3::text COLLATE "C",$4::uuid,$5::text COLLATE "C")'
 
 
-def typed_candidate(candidate):
+def is_typed_candidate(candidate):
+    """Identify the typed contribution revision after validating its receipt."""
     from process.registry_source_contribution_store import verify_registry_source_contributions
 
     receipt = verify_registry_source_contributions(candidate)
@@ -56,7 +57,7 @@ async def _last_page_key(connection, query, after):
     )
 
 
-async def multiset_differs(connection, actual, expected):
+async def has_multiset_difference(connection, actual, expected):
     """Compare every full row and duplicate count using at most 5,000 distinct keys per side/range."""
     after = None
     while True:
@@ -65,9 +66,9 @@ async def multiset_differs(connection, actual, expected):
         if left is None and right is None:
             return False
         # PostgreSQL defines the ordering, including C-collated text and UUIDs; Python never sorts row keys.
-        choices = [tuple(value) for value in (left, right) if value is not None]
+        choices = [tuple(endpoint) for endpoint in (left, right) if endpoint is not None]
         if len(choices) == 2:
-            upper = tuple(
+            upper_keys = tuple(
                 await connection.fetchrow(
                     "SELECT "
                     + COLUMNS
@@ -81,7 +82,7 @@ async def multiset_differs(connection, actual, expected):
                 )
             )
         else:
-            upper = choices[0]
+            upper_keys = choices[0]
         low = "TRUE" if after is None else "(" + ORDER + ")>" + _PARAMETERS
         high_parameters = (
             _PARAMETERS
@@ -104,8 +105,13 @@ async def multiset_differs(connection, actual, expected):
             + ") SELECT EXISTS(SELECT FROM actual FULL JOIN expected USING("
             + COLUMNS
             + ") WHERE actual.amount IS DISTINCT FROM expected.amount)",
-            *((() if after is None else after) + upper),
+            *((() if after is None else after) + upper_keys),
         )
         if differs:
             return True
-        after = upper
+        after = upper_keys
+
+
+# Preserve existing imports while internal callers use explicit predicate names.
+typed_candidate = is_typed_candidate
+multiset_differs = has_multiset_difference

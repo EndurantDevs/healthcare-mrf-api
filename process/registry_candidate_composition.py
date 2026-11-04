@@ -1455,12 +1455,40 @@ async def _prepare_preserved_address_inputs(inputs, recipes, preservation, reque
     return verified_inputs, phase_artifact
 
 
+async def _stage_selected_sources(inputs, recipes, request_id, control_schema, revision, inventory, verified_inputs):
+    from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+
+    connection, approved, office_authority = inputs.connection, inputs.approved, inputs.office_context
+    source_manifest = inputs.source_manifest
+    source_stage = await stage_registry_source_recipes(
+        connection,
+        recipes,
+        approved,
+        request_id=request_id,
+        control_schema=control_schema,
+        contribution_revision=revision,
+        **{"inventory": True} if inventory else {},
+        read_context=SourceRecipeReadContext(
+            office_authority=office_authority,
+            source_manifest=source_manifest,
+            retained_fhir_reads=inputs.retained_fhir_reads,
+            verified_office_inputs=verified_inputs
+            if (
+                _retained_fhir_only(recipes)
+                or any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes)
+            )
+            and (inventory or approved.total_rows == 0)
+            else None,
+            source_witness_runtime=inputs.source_witness_runtime,
+        ),
+    )
+    return source_stage
+
+
 async def _prepare_selected_source_stage(
     inputs, request_scope, control_schema, selection, initial_recipes, inventory, artifact_inputs, generations_by_source
 ):
     """Stage the chosen recipe set and bind preservation after validating introduced offices."""
-    from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
-
     request_id, expected_head = request_scope
     retained, recipes, has_selection_changed = selection
     connection, approved, office_authority = inputs.connection, inputs.approved, inputs.office_context
@@ -1488,27 +1516,8 @@ async def _prepare_selected_source_stage(
         inputs, recipes, preservation, request_id, control_schema, artifact_inputs
     )
     revision = await _contribution_revision(connection, recipes, approved, request_id, expected_head, control_schema)
-    source_stage = await stage_registry_source_recipes(
-        connection,
-        recipes,
-        approved,
-        request_id=request_id,
-        control_schema=control_schema,
-        contribution_revision=revision,
-        **{"inventory": True} if inventory else {},
-        read_context=SourceRecipeReadContext(
-            office_authority=office_authority,
-            source_manifest=source_manifest,
-            retained_fhir_reads=inputs.retained_fhir_reads,
-            verified_office_inputs=verified_inputs
-            if (
-                _retained_fhir_only(recipes)
-                or any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes)
-            )
-            and (inventory or approved.total_rows == 0)
-            else None,
-            source_witness_runtime=inputs.source_witness_runtime,
-        ),
+    source_stage = await _stage_selected_sources(
+        inputs, recipes, request_id, control_schema, revision, inventory, verified_inputs
     )
     _bind_composition_stage(
         generations_by_source,

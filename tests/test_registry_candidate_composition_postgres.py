@@ -2017,14 +2017,14 @@ async def test_reviewed_subjects_require_exact_endpoint_coordinates(reviewed_fhi
     second = replace(coordinates, dataset_id="other-endpoint-edition")
     async with connection.transaction(isolation="repeatable_read"):
         await connection.execute(
-            "CREATE TEMP TABLE subject_inventory(side text,slot text,family jsonb,coordinates jsonb) ON COMMIT DROP"
+            "CREATE TEMP TABLE subject_inventory(side text,slot text,family jsonb,coordinates jsonb,endpoint text,successor_slot text) ON COMMIT DROP"
         )
         await connection.execute(
             "CREATE TEMP TABLE selected_subjects(network_id integer,slot text,organization_id text,supported boolean) ON COMMIT DROP"
         )
         for slot, edition in (("endpoint-a", coordinates), ("endpoint-b", second)):
             await connection.execute(
-                "INSERT INTO subject_inventory VALUES('previous',$1,$2::jsonb,$3::jsonb)",
+                "INSERT INTO subject_inventory(side,slot,family,coordinates) VALUES('previous',$1,$2::jsonb,$3::jsonb)",
                 slot,
                 json.dumps(family_coordinates),
                 json.dumps(edition.sql_parameters),

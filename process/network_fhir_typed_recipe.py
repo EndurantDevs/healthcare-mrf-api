@@ -61,10 +61,12 @@ class PinnedTypedFHIRMembershipSource:
 
     @property
     def generation_id(self):
+        """Return the retained capture hash without changing its historical encoding."""
         return self.capture["capture_sha256"]
 
     @property
     def catalog_generation(self):
+        """Return the exact sealed catalog generation bound to this recipe."""
         from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
 
         return fhir_catalog_source_generation(self.catalog_descriptor)
@@ -88,6 +90,7 @@ class TypedFHIRRecipeReference:
         _sha(self.catalog_generation)
 
     async def resolve(self, connection, runtime):
+        """Hydrate the exact sealed capture and catalog through the configured runtime."""
         from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
         from process.network_fhir_typed_capture import TypedGraphAnchor, resolve_typed_graph_capture_reference
         from process.registry_source_recipe_composition import SourceWitnessRuntime
