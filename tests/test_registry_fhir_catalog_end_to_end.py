@@ -25,6 +25,7 @@ from process.registry_fhir_catalog_identity import ALIAS_SCOPE
 from process.registry_fhir_catalog_worker import run_fhir_catalog_sync
 from tests import cms_npd_admission_postgres_support as imported
 from tests import cms_registry_complete_publication_postgres_support as native
+from tests import test_network_cms_registry_complete_publication_postgres as complete_publication
 from tests.fhir_catalog_serving_rollover_support import (
     OLD_PROVIDER,
     approve_edition,
@@ -791,6 +792,7 @@ async def test_import_sync_query_replay_and_disappearance(monkeypatch, tmp_path)
     if not os.getenv("NETWORK_REGISTRY_TEST_DSN"):
         pytest.skip("NETWORK_REGISTRY_TEST_DSN must select an owned PostgreSQL fixture")
     pytest.importorskip("ptg2_address_canon")
+    monkeypatch.setattr(complete_publication, "PROFILE_BUILD_SECONDS", complete_publication.SUCCESSOR_BUILD_SECONDS)
     separate_source_provider(monkeypatch)
     origin_cuts = _observe_origin_metadata_cut(monkeypatch)
     async with native_catalog_case(monkeypatch, tmp_path, serving_custody=True) as case:
