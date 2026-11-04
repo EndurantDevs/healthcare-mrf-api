@@ -415,16 +415,19 @@ async def _pairs(connection, stage, origin, as_of, *, checker=False):
     for name in ("cells", "addresses", "checks"):
         if "{" + name + "}" in query:
             query = query.replace("{" + name + "}", stage.relation(name))
-    after = ("", "")
-    while rows := await connection.fetch(
-        "SELECT resource_type,resource_id FROM "
-        + stage.relation("cells")
-        + " WHERE resource_type IN ('PractitionerRole','OrganizationAffiliation') AND (resource_type,resource_id)>($1,$2) ORDER BY resource_type,resource_id LIMIT 128",
-        *after,
-    ):
-        last_keys = tuple(rows[-1])
-        await connection.execute("INSERT INTO " + stage.relation("pairs") + " " + query, *arguments, *after, *last_keys)
-        after = last_keys
+    for resource_type in ("OrganizationAffiliation", "PractitionerRole"):
+        after = (resource_type, "")
+        while rows := await connection.fetch(
+            "SELECT resource_type,resource_id FROM "
+            + stage.relation("cells")
+            + " WHERE resource_type=$1 AND resource_id>$2 ORDER BY resource_id LIMIT 128",
+            *after,
+        ):
+            last_keys = tuple(rows[-1])
+            await connection.execute(
+                "INSERT INTO " + stage.relation("pairs") + " " + query, *arguments, *after, *last_keys
+            )
+            after = last_keys
 
 
 async def _same_rows(connection, left, right, columns, keys):
