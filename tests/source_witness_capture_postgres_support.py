@@ -18,7 +18,7 @@ from process import network_fhir_retained_capture as retained
 from process.registry_generic_accepted_capture import _admitted_summary, _current_header
 from tests import generic_source_successor_postgres_support as source
 
-SOURCE_PRODUCER_SHA256 = "3c7887829506146e44ddfb5a07e1a14063e52147978c432facabf0ebbfa3f73b"
+SOURCE_PRODUCER_SHA256 = "46011a12fe8c4ce5fbff5ea02469cf0f4a581c636543126315f8907c5c39edd2"
 _RESOURCE_FIELDS = (
     "dataset_id",
     "resource_type",

@@ -10,11 +10,17 @@ import asyncpg
 import pytest
 
 from process.network_address_projection import NetworkAddressProjectionError, _membership_accounting
+from process.network_compact_layout import CompactAddressRelation
+from process.network_compact_offices import CompactOfficeSources
 from process.network_membership_candidate_lifecycle import _create_raw_membership
+from process.network_membership_slices import NetworkMembershipSliceError
 from process.network_membership_validation import (
     NetworkMembershipValidationError,
     validate_network_membership_candidate,
 )
+from process.network_typed_membership_accounting import prepare_accounting_work
+from process.network_typed_slice_native import require_complete_facts
+from process.registry_typed_membership_parity import FIELDS, ORDER
 from tests.test_network_address_projection_postgres import projection_db
 from tests.test_network_serving_schema_postgres import serving_schema
 
@@ -605,3 +611,112 @@ async def test_indexed_accounting_preserves_duplicate_address_multiplicity(valid
     await fixture.connection.execute(f"DELETE FROM {membership}")
     empty = await _membership_accounting(fixture.connection, membership, bindings, addresses)
     assert empty["membership_rows"] == empty["distinct_memberships"] == empty["projected_locations"] == 0
+
+
+async def _typed_accounting_fixture(fixture):
+    membership, bindings, addresses = _accounting_relations(fixture)
+    await fixture.connection.execute(f"CREATE INDEX typed_membership_order ON {membership}({ORDER})")
+    await fixture.connection.execute(f"ALTER TABLE {bindings} ADD PRIMARY KEY(provider_system,provider_id,location_id)")
+    await fixture.connection.execute(f"ALTER TABLE {addresses} ADD row_origin text NOT NULL DEFAULT 'public'")
+    return CompactOfficeSources(fixture.address_source)
+
+
+async def _typed_counts(fixture, offices):
+    namespace = '"' + fixture.copy_target.schema_name + '"'
+    work, counts = await prepare_accounting_work(fixture.connection, namespace, offices)
+    await fixture.connection.execute(f"DROP TABLE {work}")
+    return counts
+
+
+@pytest.mark.asyncio
+async def test_typed_accounting_preserves_aliases_duplicates_and_unused_tail(validation_db):
+    fixture = validation_db
+    membership, bindings, addresses = _accounting_relations(fixture)
+    offices = await _typed_accounting_fixture(fixture)
+    async with fixture.connection.transaction():
+        await fixture.connection.execute(f"""INSERT INTO {bindings}
+            SELECT 'npi','alias-'||n,md5(n::text)::uuid,repeat('a',64),'npi','provider-a'
+            FROM generate_series(1,12) n;
+            INSERT INTO {membership}
+            SELECT CASE WHEN n%2=0 THEN 42 ELSE 88 END,'npi','alias-'||n,md5(n::text)::uuid,'duplicate'
+            FROM generate_series(1,12) n CROSS JOIN generate_series(1,1001) copies;
+            INSERT INTO {membership} SELECT 42,'npi','alias-1',md5('1')::uuid,'boundary'
+            FROM generate_series(1,6001);
+            INSERT INTO {bindings}
+            SELECT 'z-unused','tail-'||lpad(n::text,5,'0'),md5('tail-'||n)::uuid,
+                CASE WHEN n>6000 THEN 'missing' ELSE repeat('a',64) END,'npi','provider-a'
+            FROM generate_series(1,6003) n""")
+        expected_counts_by_field = dict(
+            await _membership_accounting(fixture.connection, membership, bindings, addresses)
+        )
+        counts = await _typed_counts(fixture, offices)
+        assert {field: counts[field] for field in expected_counts_by_field} == expected_counts_by_field
+        assert counts["orphan_bindings"] == 3 and counts["projected_locations"] == 2
+        require_complete_facts(counts, {"accepted_rows": 18017, "expected_rows": 18017}, None)
+        await fixture.connection.execute(f"DELETE FROM {membership}")
+        empty_counts_by_field = dict(await _membership_accounting(fixture.connection, membership, bindings, addresses))
+        empty = await _typed_counts(fixture, offices)
+        assert {field: empty[field] for field in empty_counts_by_field} == empty_counts_by_field
+        assert empty["orphan_bindings"] == 3 and empty["membership_rows"] == 0
+
+
+@pytest.mark.asyncio
+async def test_typed_accounting_preserves_duplicate_office_arms(validation_db):
+    fixture = validation_db
+    membership, bindings, addresses = _accounting_relations(fixture)
+    offices = await _typed_accounting_fixture(fixture)
+    # Component-only duplicate arms exercise multiplicity before independent office custody refuses them.
+    duplicate = CompactAddressRelation(
+        fixture.address_source.schema_name,
+        fixture.address_source.table_name,
+        await fixture.connection.fetchval("SELECT to_regclass($1)::oid", addresses),
+    )
+    async with fixture.connection.transaction():
+        expected_counts_by_field = dict(
+            await _membership_accounting(
+                fixture.connection,
+                membership,
+                bindings,
+                f"(SELECT * FROM {addresses} UNION ALL SELECT * FROM {addresses})",
+            )
+        )
+        counts = await _typed_counts(fixture, replace(offices, custom=duplicate))
+        assert {field: counts[field] for field in expected_counts_by_field} == expected_counts_by_field
+        assert counts["membership_rows"] == 8 and counts["distinct_memberships"] == 3
+        with pytest.raises(NetworkMembershipSliceError, match="accounting is incomplete"):
+            require_complete_facts(counts, {"accepted_rows": 4, "expected_rows": 4}, None)
+
+
+@pytest.mark.asyncio
+async def test_typed_accounting_refuses_nullable_keys_and_invalid_sites(validation_db):
+    fixture = validation_db
+    membership, bindings, addresses = _accounting_relations(fixture)
+    offices = await _typed_accounting_fixture(fixture)
+    async with fixture.connection.transaction():
+        for field in FIELDS:
+            with pytest.raises(ValueError, match="registry_typed_parity_not_null_required"):
+                async with fixture.connection.transaction():
+                    await fixture.connection.execute(f"ALTER TABLE {membership} ALTER COLUMN {field} DROP NOT NULL")
+                    await _typed_counts(fixture, offices)
+        for mutation in (
+            f"DELETE FROM {bindings} WHERE provider_id='provider-b'",
+            f"UPDATE {bindings} SET entity_id='different-provider' WHERE provider_id='provider-b'",
+        ):
+            with pytest.raises(NetworkAddressProjectionError, match="exact provider/site"):
+                async with fixture.connection.transaction():
+                    await fixture.connection.execute(mutation)
+                    await _typed_counts(fixture, offices)
+        with pytest.raises(NetworkMembershipSliceError, match="exact provider/site"):
+            async with fixture.connection.transaction():
+                await fixture.connection.execute(
+                    f"UPDATE {bindings} SET location_key='' WHERE location_key=repeat('a',64)"
+                )
+                await fixture.connection.execute(
+                    f"UPDATE {addresses} SET location_key='' WHERE location_key=repeat('a',64)"
+                )
+                counts = await _typed_counts(fixture, offices)
+                require_complete_facts(counts, {"accepted_rows": 4, "expected_rows": 4}, None)
+        counts = await _typed_counts(fixture, offices)
+        require_complete_facts(counts, {"accepted_rows": 4, "expected_rows": 4}, None)
+        with pytest.raises(NetworkMembershipSliceError, match="accounting is incomplete"):
+            require_complete_facts(counts, {"accepted_rows": 4, "expected_rows": 5}, None)

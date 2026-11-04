@@ -10,6 +10,8 @@ from process.network_compact_layout import CompactAddressRelation, CompactEdgeAr
 from process.network_compact_readiness import NetworkCompactReadinessError, compact_index_digest
 from process.network_compact_slice_validation import verify_compact_slice_contents
 from process.network_compact_validation import _actual_memberships, _membership_sets_differ
+from process.network_typed_slice_native import build_matched_facts, verify_digests, verify_work_refs
+from process.registry_typed_membership_parity import ORDER
 from tests.test_network_membership_slices_postgres import _candidate, _pin, _prepare, slice_db
 
 
@@ -31,6 +33,7 @@ async def test_independent_new_slice_verification_rejects_corruption(slice_db, c
         receipt = await _prepare(db, target)
         layout = await _layout(db, target, receipt)
         await verify_compact_slice_contents(db.connection, target, layout)
+        await verify_digests(db.connection, target)
     ns = '"' + target.schema_name + '"'
     mutation_sql_by_kind = {
         "digest": f"UPDATE {ns}.network_slice_ref SET content_sha256=repeat('a',64)",
@@ -46,6 +49,9 @@ async def test_independent_new_slice_verification_rejects_corruption(slice_db, c
     async with db.connection.transaction():
         with pytest.raises(NetworkCompactReadinessError):
             await verify_compact_slice_contents(db.connection, target, layout)
+        if corruption != "extra":
+            with pytest.raises(NetworkCompactReadinessError):
+                await verify_digests(db.connection, target)
 
 
 async def test_reused_slice_metadata_must_match_its_sealed_origin(slice_db):
@@ -183,3 +189,83 @@ async def test_compact_set_parity_preserves_readonly_without_reverse_index(slice
             finally:
                 db.connection.remove_query_logger(queries.append)
             assert any(" EXCEPT " in query.query for query in queries)
+
+
+async def _independent_native_work(db, target):
+    """Preserve genuine native facts for the subsequent read-only comparison."""
+    namespace = '"' + target.schema_name + '"'
+    async with db.connection.transaction():
+        await db.connection.execute(f"CREATE INDEX ON {namespace}.network_membership({ORDER})")
+        counts = await build_matched_facts(
+            db.connection, namespace, '"' + db.source_schema + '".retained_addresses', '"source_facts"', None
+        )
+        assert counts["invalid_memberships"] == counts["invalid_location_keys"] == 0
+        await db.connection.execute('CREATE TEMP TABLE independent_facts AS SELECT * FROM "source_facts"')
+        await db.connection.execute(
+            "ALTER TABLE independent_facts ADD PRIMARY KEY(network_id,office_bucket,location_key)"
+        )
+    return '"independent_facts"'
+
+
+def _reference_mutations(namespace):
+    refs = namespace + ".network_slice_ref"
+    tail = f"(SELECT network_id,office_bucket FROM {refs} ORDER BY network_id DESC,office_bucket DESC LIMIT 1)"
+    return (
+        f"DELETE FROM {refs} WHERE (network_id,office_bucket)={tail}",
+        f"INSERT INTO {refs} SELECT 2147483647,office_bucket,artifact_candidate_id,slice_id,row_count,content_sha256 FROM {refs} ORDER BY network_id,office_bucket LIMIT 1",
+        f"UPDATE {refs} SET network_id=2147483646 WHERE (network_id,office_bucket)={tail}",
+        f"UPDATE {refs} SET row_count=row_count+1 WHERE (network_id,office_bucket)={tail}",
+        f"UPDATE {refs} SET content_sha256=repeat('a',64) WHERE (network_id,office_bucket)={tail}",
+        "DELETE FROM independent_facts WHERE network_id=(SELECT max(network_id) FROM independent_facts)",
+    )
+
+
+@pytest.mark.parametrize("reuse", [False, True], ids=["new", "retained-and-new"])
+async def test_independent_work_requires_exact_reference_tails(slice_db, reuse):
+    db = slice_db
+    prior, artifacts = None, []
+    if reuse:
+        first = await _set_candidate(db, [(network, 0) for network in range(1, 258)])
+        async with db.connection.transaction():
+            first_receipt = await _prepare(db, first)
+        prior = _pin(first, first_receipt)
+        artifacts.append(CompactEdgeArtifact(first.candidate_id, first.schema_name, first_receipt.edge_heap_oid))
+    copy_target = await _set_candidate(db, [(network, 0) for network in range(1, 302)] + [(42, 0), (42, 1)])
+    async with db.connection.transaction():
+        receipt = await _prepare(db, copy_target, previous=prior)
+        artifacts.append(CompactEdgeArtifact(copy_target.candidate_id, copy_target.schema_name, receipt.edge_heap_oid))
+        layout = await _layout(db, copy_target, receipt, artifacts)
+        await verify_compact_slice_contents(db.connection, copy_target, layout)
+        await verify_digests(db.connection, copy_target)
+    assert receipt.distinct_memberships == 301 and receipt.membership_rows == 303
+    assert receipt.reused_slices == (257 if reuse else 0)
+    work = await _independent_native_work(db, copy_target)
+    async with db.connection.transaction(isolation="repeatable_read", readonly=True):
+        await verify_work_refs(db.connection, copy_target, work)
+    for statement in _reference_mutations('"' + copy_target.schema_name + '"'):
+        savepoint = db.connection.transaction()
+        await savepoint.start()
+        try:
+            await db.connection.execute(statement)
+            with pytest.raises(NetworkCompactReadinessError):
+                await verify_work_refs(db.connection, copy_target, work)
+        finally:
+            await savepoint.rollback()
+    await verify_work_refs(db.connection, copy_target, work)
+
+
+async def test_independent_work_checks_empty_reference_domain(slice_db):
+    db = slice_db
+    target = await _candidate(db, [])
+    async with db.connection.transaction():
+        await _prepare(db, target)
+    work = await _independent_native_work(db, target)
+    async with db.connection.transaction(isolation="repeatable_read", readonly=True):
+        await verify_work_refs(db.connection, target, work)
+    await db.connection.execute(
+        f"INSERT INTO \"{target.schema_name}\".network_slice_ref VALUES(1,0,$1,$2,1,repeat('a',64))",
+        UUID(target.candidate_id),
+        uuid4(),
+    )
+    with pytest.raises(NetworkCompactReadinessError):
+        await verify_work_refs(db.connection, target, work)

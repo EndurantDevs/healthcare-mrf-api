@@ -10,8 +10,8 @@ from process.network_compact_custom_preparation import prepare_compact_custom_co
 from process.network_compact_dependencies import capture_compact_edge_artifacts, compact_slice_ref_digest
 from process.network_compact_readiness import COMPONENT, compact_index_digest
 from process.network_membership_candidate_lifecycle import _locked_candidate
-from process.network_membership_slices import PinnedMembershipSlices, prepare_network_membership_slices
-from process.network_membership_validation import _scope_report, validate_network_membership_candidate
+from process.network_membership_slices import PinnedMembershipSlices, _prepare_slices
+from process.network_membership_validation import _scope_report, _validated_candidate
 
 
 async def _previous_slices(connection, candidate, control_schema):
@@ -49,6 +49,24 @@ def _require_address_origin(candidate, artifact):
         raise ValueError("registry_compact_address_origin_changed")
 
 
+async def _validated_slices(connection, copy_target, address_source, candidate, control_schema, offices):
+    """Consume fresh accounting only inside its validating transaction and savepoint."""
+    async with _validated_candidate(
+        connection, copy_target, address_source, control_schema=control_schema, office_sources=offices
+    ) as (report, prepared_work):
+        slices = await _prepare_slices(
+            connection,
+            copy_target,
+            address_source,
+            await _previous_slices(connection, candidate, control_schema),
+            None,
+            control_schema,
+            offices,
+            prepared_work,
+        )
+    return report, slices
+
+
 async def prepare_compact_network_readiness(
     connection, copy_target, address_source, *, runtime_roles, control_schema, office_authority=None, **source_options
 ):
@@ -70,16 +88,8 @@ async def prepare_compact_network_readiness(
     )
     offices = replace(offices, physical_base=physical)
     candidate = await _locked_candidate(connection, copy_target, _identifier(control_schema))
-    report = await validate_network_membership_candidate(
-        connection, copy_target, address_source, control_schema=control_schema, office_sources=offices
-    )
-    slices = await prepare_network_membership_slices(
-        connection,
-        copy_target,
-        address_source,
-        previous=await _previous_slices(connection, candidate, control_schema),
-        control_schema=control_schema,
-        office_sources=offices,
+    report, slices = await _validated_slices(
+        connection, copy_target, address_source, candidate, control_schema, offices
     )
     scope = _scope_report(candidate, address_source)
     canonical_readiness_by_field = _slice_readiness(scope, report, slices)

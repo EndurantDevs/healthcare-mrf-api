@@ -49,12 +49,17 @@ async def _insert_matched_page(connection, tables, bounds, affected):
     )
 
 
-async def matched_facts(connection, schema, addresses, work, candidate, affected):
+async def build_matched_facts(connection, schema, addresses, work, affected):
     """Count every duplicate in indexed inclusive ranges; aggregate only one key page."""
-    from process.network_membership_slices import NetworkMembershipSliceError
-
     membership = schema + ".network_membership"
     await require_order_index(connection, membership)
+    if not await connection.fetchval(
+        "SELECT count(*)=5 AND bool_and(attnotnull) FROM pg_attribute "
+        "WHERE attrelid=to_regclass($1) AND attname=ANY($2::text[]) AND NOT attisdropped",
+        membership,
+        COLUMNS.split(","),
+    ):
+        raise ValueError("registry_typed_parity_not_null_required")
     locations = _identifier(work.strip('"') + "_locations")
     await connection.execute(f"""CREATE TEMP TABLE {work}(network_id integer,location_key text COLLATE "C",office_bucket integer,membership_rows bigint NOT NULL,
       UNIQUE NULLS NOT DISTINCT(network_id,office_bucket,location_key)) ON COMMIT DROP""")
@@ -71,18 +76,35 @@ async def matched_facts(connection, schema, addresses, work, candidate, affected
             affected,
         )
         after = upper_keys
-    accounting = await connection.fetchrow(f"""SELECT COALESCE(sum(membership_rows),0)::bigint AS membership_rows,
-      COALESCE(sum(membership_rows) FILTER(WHERE network_id IS NULL OR network_id NOT BETWEEN 1 AND 2147483647 OR location_key IS NULL OR length(location_key) NOT BETWEEN 1 AND 64),0)::bigint AS invalid_memberships,
-      count(*) AS distinct_memberships,(SELECT count(*) FROM {locations}) AS matched_locations FROM {work}""")
-    if accounting["invalid_memberships"]:
-        raise NetworkMembershipSliceError("Selected memberships lack an exact provider/site/address binding")
-    if candidate["accepted_rows"] != candidate["expected_rows"] or (
-        affected is None and accounting["membership_rows"] != candidate["accepted_rows"]
-    ):
-        raise NetworkMembershipSliceError("Candidate membership accounting is incomplete")
+    accounting_by_field = dict(
+        await connection.fetchrow(f"""SELECT COALESCE(sum(membership_rows),0)::bigint AS membership_rows,
+      COALESCE(sum(membership_rows) FILTER(WHERE network_id IS NULL OR network_id<=0 OR location_key IS NULL),0)::bigint AS invalid_memberships,
+      COALESCE(sum(membership_rows) FILTER(WHERE length(location_key) NOT BETWEEN 1 AND 64),0)::bigint AS invalid_location_keys,
+      count(*) FILTER(WHERE location_key IS NOT NULL) AS distinct_memberships,
+      (SELECT count(*) FROM {locations}) AS matched_locations FROM {work}""")
+    )
     await connection.execute(f"DROP TABLE {locations}")
     await connection.execute(f"ANALYZE {work}")
-    return accounting
+    return accounting_by_field
+
+
+def require_complete_facts(accounting_by_field, candidate, affected):
+    """Require exact bindings and complete closed-row accounting before slice reuse."""
+    from process.network_membership_slices import NetworkMembershipSliceError
+
+    if accounting_by_field["invalid_memberships"] or accounting_by_field["invalid_location_keys"]:
+        raise NetworkMembershipSliceError("Selected memberships lack an exact provider/site/address binding")
+    if candidate["accepted_rows"] != candidate["expected_rows"] or (
+        affected is None and accounting_by_field["membership_rows"] != candidate["accepted_rows"]
+    ):
+        raise NetworkMembershipSliceError("Candidate membership accounting is incomplete")
+
+
+async def matched_facts(connection, schema, addresses, work, candidate, affected):
+    """Build exact native facts and enforce the complete selected-slice contract."""
+    accounting_by_field = await build_matched_facts(connection, schema, addresses, work, affected)
+    require_complete_facts(accounting_by_field, candidate, affected)
+    return accounting_by_field
 
 
 def _content_aggregate(key):
@@ -91,27 +113,51 @@ def _content_aggregate(key):
     return f"encode(sha256($3::bytea||coalesce(string_agg({frame},''::bytea ORDER BY {key} COLLATE \"C\"),''::bytea)),'hex')"
 
 
+async def _ref_metadata_page(connection, work, after):
+    return await connection.fetch(
+        f"""WITH keys AS MATERIALIZED (
+          SELECT network_id,office_bucket FROM {work} WHERE (network_id,office_bucket)>($1,$2)
+          GROUP BY network_id,office_bucket ORDER BY network_id,office_bucket LIMIT {_METADATA_ROWS})
+          SELECT keys.network_id,keys.office_bucket,facts.row_count,facts.content_sha256 FROM keys CROSS JOIN LATERAL (
+            SELECT count(*)::bigint AS row_count,{_content_aggregate("location_key")} AS content_sha256 FROM {work}
+            WHERE network_id=keys.network_id AND office_bucket=keys.office_bucket) facts ORDER BY keys.network_id,keys.office_bucket""",
+        *after,
+        _DOMAIN,
+    )
+
+
 async def prepare_refs(connection, target, work, previous):
     """Hash C-ordered int4-framed keys in PostgreSQL, returning only slice metadata."""
     from process.network_membership_slices import _copy_ref_page
 
     after, total, reused = (0, -1), 0, 0
     while True:
-        page = await connection.fetch(
-            f"""WITH keys AS MATERIALIZED (
-          SELECT network_id,office_bucket FROM {work} WHERE (network_id,office_bucket)>($1,$2)
-          GROUP BY network_id,office_bucket ORDER BY network_id,office_bucket LIMIT {_METADATA_ROWS})
-          SELECT keys.network_id,keys.office_bucket,facts.row_count,facts.content_sha256 FROM keys CROSS JOIN LATERAL (
-            SELECT count(*)::bigint AS row_count,{_content_aggregate("location_key")} AS content_sha256 FROM {work}
-            WHERE network_id=keys.network_id AND office_bucket=keys.office_bucket) facts ORDER BY keys.network_id,keys.office_bucket""",
-            *after,
-            _DOMAIN,
-        )
+        page = await _ref_metadata_page(connection, work, after)
         if not page:
             return total, reused
         reused += await _copy_ref_page(connection, target, [tuple(entry) for entry in page], previous)
         total += len(page)
         after = page[-1]["network_id"], page[-1]["office_bucket"]
+
+
+async def verify_work_refs(connection, target, work):
+    """Compare independent full facts with content-verified refs, including extra keys."""
+    from process.network_compact_readiness import _require
+
+    refs = _identifier(target.schema_name) + ".network_slice_ref"
+    after, total = (0, -1), 0
+    while page := await _ref_metadata_page(connection, work, after):
+        observed = await connection.fetch(
+            f"""SELECT r.network_id,r.office_bucket,r.row_count,r.content_sha256 FROM {refs} r
+            JOIN unnest($1::integer[],$2::integer[]) keys(network_id,office_bucket)
+            USING(network_id,office_bucket) ORDER BY r.network_id,r.office_bucket""",
+            [entry["network_id"] for entry in page],
+            [entry["office_bucket"] for entry in page],
+        )
+        _require(list(map(tuple, page)) == list(map(tuple, observed)))
+        total += len(page)
+        after = page[-1]["network_id"], page[-1]["office_bucket"]
+    _require(total == await connection.fetchval(f"SELECT count(*) FROM {refs}"))
 
 
 async def verify_digests(connection, target):
