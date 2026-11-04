@@ -16,7 +16,7 @@ from process.network_fhir_typed_mapping import (
     BINDING_COLUMNS,
     MEMBER_COLUMNS,
     TypedGraphApproval,
-    prepare_typed_graph_mapping,
+    map_typed_graph_batch,
 )
 from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.registry_source_recipe_composition import (
@@ -222,7 +222,7 @@ async def _map_typed_recipes(
     connection, recipes, approved, table, read_context, source_reader, retained_proofs, control_schema
 ):
     address_source, roles = read_context.verified_office_inputs
-    mappings, contributions, derivations, generations = [], [], [], []
+    inputs, contributions, derivations, generations = [], [], [], []
     for recipe in recipes:
         recipe_sha256 = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
         if retained_proofs is not None and recipe_sha256 in retained_proofs:
@@ -238,18 +238,25 @@ async def _map_typed_recipes(
             read = await source_reader(
                 connection, recipe, approved, control_schema, read_context.source_witness_runtime
             )
-        mapped = await prepare_typed_graph_mapping(
-            connection,
-            read,
-            approval=TypedGraphApproval(
-                approved_source=approved,
-                binding_coordinates=recipe.binding_coordinates,
-                catalog_descriptor=recipe.source_pin.catalog_descriptor,
-            ),
-            address_source=address_source,
-            runtime_roles=roles,
-            control_schema=control_schema,
+        inputs.append(
+            (
+                read,
+                TypedGraphApproval(
+                    approved_source=approved,
+                    binding_coordinates=recipe.binding_coordinates,
+                    catalog_descriptor=recipe.source_pin.catalog_descriptor,
+                ),
+                None,
+            )
         )
+    mappings = await map_typed_graph_batch(
+        connection,
+        inputs,
+        address_source=address_source,
+        runtime_roles=roles,
+        control_schema=control_schema,
+    )
+    for recipe, mapped in zip(recipes, mappings, strict=True):
         await connection.execute(
             "INSERT INTO pg_temp."
             + _identifier(table)
@@ -259,7 +266,6 @@ async def _map_typed_recipes(
             + mapped.relation("memberships")
         )
         contribution, derivation = _typed_mapping_documents(recipe, mapped)
-        mappings.append(mapped)
         contributions.append(contribution)
         derivations.append(derivation)
         generations.append(digest([contribution, derivation]))
