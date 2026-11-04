@@ -342,10 +342,43 @@ async def _finish_slice_relations(connection, copy_target, work_table, *, typed=
     return await _slice_relation_oids(connection, copy_target.schema_name)
 
 
-async def _prepare_slices(connection, copy_target, address_source, previous, affected, control_schema, office_sources):
+async def _slice_facts(connection, candidate, relations, affected, office_sources, prepared_work):
+    """Reuse only complete same-transaction facts; otherwise build the selected work."""
+    schema, address_table, office_relation = relations
+    is_typed = registry_typed_membership_parity.is_typed_candidate(candidate)
+    if prepared_work is not None:
+        from process.network_typed_slice_native import require_complete_facts
+
+        if not is_typed or affected is not None:
+            raise NetworkMembershipSliceError("Prepared accounting requires a complete typed candidate")
+        work_table, accounting = prepared_work
+        require_complete_facts(accounting, candidate, None)
+    else:
+        work_table = _identifier("network_slice_work_" + uuid4().hex)
+        if is_typed and office_sources is not None:
+            from process.network_compact_offices import compact_bound_office_sql
+
+            office_relation = compact_bound_office_sql(office_sources)
+        accounting = await _matched_facts(
+            connection, schema, address_table, work_table, candidate, affected, office_relation
+        )
+    return work_table, accounting, is_typed
+
+
+async def _carry_slice_refs(connection, schema, previous_table, affected_table):
+    if affected_table is None:
+        return 0
+    await connection.execute(f"""INSERT INTO {schema}.network_slice_ref SELECT p.* FROM {previous_table} p
+        WHERE NOT EXISTS(SELECT 1 FROM {affected_table} changed
+            WHERE changed.network_id=p.network_id AND changed.office_bucket=p.office_bucket)""")
+    return await connection.fetchval(f"SELECT count(*) FROM {schema}.network_slice_ref")
+
+
+async def _prepare_slices(
+    connection, copy_target, address_source, previous, affected, control_schema, office_sources, prepared_work=None
+):
     """Prepare one complete immutable slice payload and its physical receipt."""
     schema = _identifier(copy_target.schema_name)
-    work_table = _identifier("network_slice_work_" + uuid4().hex)
     async with connection.transaction():
         candidate = await _lock_candidate(connection, copy_target, address_source, control_schema)
         await connection.execute(
@@ -354,17 +387,16 @@ async def _prepare_slices(connection, copy_target, address_source, previous, aff
         previous_table = await _pin_previous(connection, previous, copy_target)
         affected_table = await _pin_affected(connection, affected, copy_target, previous)
         address_table, office_relation = await _office_relation(connection, copy_target, address_source, office_sources)
-        accounting = await _matched_facts(
-            connection, schema, address_table, work_table, candidate, affected_table, office_relation
+        work_table, accounting, is_typed = await _slice_facts(
+            connection,
+            candidate,
+            (schema, address_table, office_relation),
+            affected_table,
+            office_sources,
+            prepared_work,
         )
-        is_typed = registry_typed_membership_parity.is_typed_candidate(candidate)
         await _create_slice_relations(connection, schema, **({"typed": True} if is_typed else {}))
-        carried_slices = 0
-        if affected_table:
-            await connection.execute(f"""INSERT INTO {schema}.network_slice_ref SELECT p.* FROM {previous_table} p
-                WHERE NOT EXISTS(SELECT 1 FROM {affected_table} changed
-                    WHERE changed.network_id=p.network_id AND changed.office_bucket=p.office_bucket)""")
-            carried_slices = await connection.fetchval(f"SELECT count(*) FROM {schema}.network_slice_ref")
+        carried_slices = await _carry_slice_refs(connection, schema, previous_table, affected_table)
         total_slices, reused_slices = await _prepared_slice_refs(
             connection, copy_target, work_table, previous_table, is_typed
         )

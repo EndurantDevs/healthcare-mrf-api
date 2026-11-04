@@ -3,6 +3,7 @@
 
 import json
 import os
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 from db.registry_schema import registry_schema
@@ -239,7 +240,19 @@ def _validation_report(scope_report, address_counts, native_counts):
     return report_by_field
 
 
+async def _address_accounting(connection, copy_target, candidate, office_sources, relations):
+    from process.registry_typed_membership_parity import is_typed_candidate
+
+    if office_sources is not None and is_typed_candidate(candidate):
+        from process.network_typed_membership_accounting import prepare_accounting_work
+
+        prepared_work = await prepare_accounting_work(connection, _identifier(copy_target.schema_name), office_sources)
+        return prepared_work[1], prepared_work
+    return await _membership_accounting(connection, *relations), None
+
+
 async def _validate_sealed(connection, copy_target, address_source, control_schema, office_sources=None):
+    """Validate closed inputs, returning fresh work only for complete typed office facts."""
     from process.registry_source_contribution_store import verify_registry_source_contributions_rows
 
     candidate_by_field = dict(await _lock_candidate(connection, copy_target, address_source, control_schema))
@@ -262,7 +275,7 @@ async def _validate_sealed(connection, copy_target, address_source, control_sche
         except RegistrySourceRetentionError as error:
             raise NetworkMembershipValidationError(str(error)) from error
     if candidate_by_field["state"] == "validated":
-        return _validated_replay(candidate_by_field, scope_report)
+        return _validated_replay(candidate_by_field, scope_report), None
     candidate_schema = _identifier(copy_target.schema_name)
     membership_table = f"{candidate_schema}.network_membership"
     binding_table = f"{candidate_schema}.provider_location_binding"
@@ -281,7 +294,9 @@ async def _validate_sealed(connection, copy_target, address_source, control_sche
         f"CREATE INDEX IF NOT EXISTS network_membership_projection_idx ON {membership_table}"
         "(provider_system,provider_id,location_id,network_id)"
     )
-    address_counts = await _membership_accounting(connection, membership_table, binding_table, address_table)
+    address_counts, prepared_work = await _address_accounting(
+        connection, copy_target, candidate_by_field, office_sources, (membership_table, binding_table, address_table)
+    )
     native_counts = await _native_accounting(connection, membership_table, control_schema, copy_target.candidate_id)
     report = _validation_report(scope_report, address_counts, native_counts)
     retained = _json_object(candidate_by_field["validation_json"])
@@ -293,7 +308,32 @@ async def _validate_sealed(connection, copy_target, address_source, control_sche
         UUID(copy_target.candidate_id),
         json.dumps(report, sort_keys=True, separators=(",", ":")),
     )
-    return report
+    return report, prepared_work
+
+
+@asynccontextmanager
+async def _validated_candidate(connection, copy_target, source, *, control_schema=None, office_sources=None):
+    """Keep freshly verified typed work inside the validating savepoint."""
+    if type(copy_target) is not MembershipCopyTarget or type(source) is not PinnedAddressSource:
+        raise NetworkMembershipValidationError("Trusted candidate and pinned address source are required")
+    if not connection.is_in_transaction():
+        raise NetworkMembershipValidationError("Validation requires a caller-owned transaction")
+    if source.schema_name == copy_target.schema_name:
+        raise NetworkMembershipValidationError("Pinned source must be outside the validation candidate")
+    try:
+        async with connection.transaction():
+            report, prepared_work = await _validate_sealed(
+                connection,
+                copy_target,
+                source,
+                control_schema if control_schema is not None else registry_schema(),
+                office_sources,
+            )
+            yield report, prepared_work
+            if prepared_work is not None:
+                await connection.execute(f"DROP TABLE IF EXISTS {prepared_work[0]}")
+    except NetworkAddressProjectionError as error:
+        raise NetworkMembershipValidationError(str(error)) from error
 
 
 async def validate_network_membership_candidate(
@@ -306,20 +346,7 @@ async def validate_network_membership_candidate(
     transaction ownership; failed savepoints roll back candidate index creation.
     Exact validated replay trusts the integrating owner's immutable writer closure.
     """
-    if type(copy_target) is not MembershipCopyTarget or type(source) is not PinnedAddressSource:
-        raise NetworkMembershipValidationError("Trusted candidate and pinned address source are required")
-    if not connection.is_in_transaction():
-        raise NetworkMembershipValidationError("Validation requires a caller-owned transaction")
-    if source.schema_name == copy_target.schema_name:
-        raise NetworkMembershipValidationError("Pinned source must be outside the validation candidate")
-    try:
-        async with connection.transaction():
-            return await _validate_sealed(
-                connection,
-                copy_target,
-                source,
-                control_schema if control_schema is not None else registry_schema(),
-                office_sources,
-            )
-    except NetworkAddressProjectionError as error:
-        raise NetworkMembershipValidationError(str(error)) from error
+    async with _validated_candidate(
+        connection, copy_target, source, control_schema=control_schema, office_sources=office_sources
+    ) as (report, _):
+        return report

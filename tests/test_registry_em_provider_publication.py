@@ -110,7 +110,8 @@ async def test_scope_and_actual_validation_update_preserve_exact_receipt(monkeyp
         "_native_accounting",
         AsyncMock(return_value={name: 0 for name in ("raw_rows", "unknown_network_rows", "batch_rows", "batch_count")}),
     )
-    report = await validation._validate_sealed(conn, target, address, "registry")
+    report, prepared_work = await validation._validate_sealed(conn, target, address, "registry")
+    assert prepared_work is None
     assert report["em_provider_inputs"] == receipt
     stored = json.loads(conn.execute.await_args.args[2])
     assert stored["em_provider_inputs"] == receipt and stored["source_generations"] == candidate["source_generations"]

@@ -52,6 +52,21 @@ def compact_office_relation_sql(office_sources):
     return "(" + query + ")"
 
 
+def compact_bound_office_sql(office_sources):
+    """Keep each native office lookup inside its pinned physical UNION arm."""
+    fields = "a.location_key,a.entity_type,a.entity_id"
+    exact = "(" + fields + ")=(b.location_key,b.entity_type,b.entity_id)"
+    arms = [
+        f"SELECT {fields} FROM {compact_base_relation_sql(office_sources)} a "
+        f"WHERE a.row_origin<>'network_custom' AND {exact} OFFSET 0"
+    ]
+    if office_sources.custom is not None:
+        custom = office_sources.custom
+        table = _identifier(custom.schema_name) + "." + _identifier(custom.table_name)
+        arms.append(f"SELECT {fields} FROM {table} a WHERE {exact} OFFSET 0")
+    return "LATERAL (" + " UNION ALL ".join("(" + arm + ")" for arm in arms) + ")"
+
+
 async def _shape(connection, table_name):
     # LIKE can reset informational array dimensions without changing the native type.
     return await connection.fetch(

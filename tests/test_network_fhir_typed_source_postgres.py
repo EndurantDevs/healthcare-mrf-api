@@ -148,6 +148,9 @@ async def test_strict_subject_reference_and_acceptance_boundaries(monkeypatch):
 
 def _role_page_boundary_rows(edition, dataset):
     resource_rows = _ORIGINAL_ROWS(edition, dataset) + _affiliation_fixture_rows(dataset)
+    resource_rows.extend(
+        _resource("Organization", f"unused-{index:04d}", {"active": False}, dataset) for index in range(1000)
+    )
     for kind, subject, field in (
         ("OrganizationAffiliation", "Organization/provider-org", "participating_organization_ref"),
         ("PractitionerRole", "Practitioner/provider-one", "practitioner_ref"),
@@ -168,8 +171,40 @@ def _role_page_boundary_rows(edition, dataset):
     return resource_rows
 
 
+async def _assert_checker_lookup_indexes(connection, stage):
+    from process.network_fhir_typed_sql import CHECKER_PAIR_SQL
+
+    query = CHECKER_PAIR_SQL.format(**{name: stage.relation(name) for name in ("cells", "addresses", "checks")})
+    plan = await connection.fetchval(
+        "EXPLAIN (FORMAT JSON) " + query, "PractitionerRole", "", "PractitionerRole", "range-0127"
+    )
+    plan = json.loads(plan) if isinstance(plan, str) else plan
+    pending, checker_scans = [plan[0]["Plan"]], []
+    while pending:
+        node = pending.pop()
+        if node.get("Relation Name") == stage.names["checks"]:
+            checker_scans.append(node)
+        pending.extend(node.get("Plans", ()))
+    assert len(checker_scans) == 4
+    assert all(
+        scan["Node Type"] in {"Index Scan", "Index Only Scan"}
+        and all(field in scan.get("Index Cond", "") for field in ("resource_type", "resource_id"))
+        for scan in checker_scans
+    )
+
+
 async def test_role_pages_preserve_type_boundaries_and_reference_multiplicity(monkeypatch):
+    original_pairs, checked_plans = typed._pairs, []
+
+    async def indexed_pairs(connection, stage, origin, as_of, *, checker=False):
+        result = await original_pairs(connection, stage, origin, as_of, checker=checker)
+        if checker:
+            await _assert_checker_lookup_indexes(connection, stage)
+            checked_plans.append(True)
+        return result
+
     monkeypatch.setattr(source, "_edition_rows", _role_page_boundary_rows)
+    monkeypatch.setattr(typed, "_pairs", indexed_pairs)
     async with (
         source_witness_case(monkeypatch) as case,
         case.writer.transaction(isolation="repeatable_read"),
@@ -185,6 +220,7 @@ async def test_role_pages_preserve_type_boundaries_and_reference_multiplicity(mo
         expected_rows.extend(("PractitionerRole", f"range-{index:04d}", "1234567893", 6) for index in range(130))
         expected_rows.append(("PractitionerRole", "role-office", "1234567893", 1))
         assert [tuple(row) for row in rows] == expected_rows
+    assert checked_plans == [True]
 
 
 async def test_raw_checker_refuses_producer_npi_substitution(monkeypatch):
@@ -779,6 +815,23 @@ def _substitute_typed_mapping(monkeypatch):
     monkeypatch.setattr(staging, "map_typed_graph_batch", substitute)
 
 
+def _observe_typed_accounting(monkeypatch):
+    from process import network_typed_membership_accounting as accounting
+    from process import network_typed_slice_native as native
+
+    work_builds = []
+    original_build = native.build_matched_facts
+
+    async def observe(connection, schema, addresses, work, affected):
+        result = await original_build(connection, schema, addresses, work, affected)
+        work_builds.append((await connection.fetchval("SELECT session_user"), schema, work))
+        return result
+
+    monkeypatch.setattr(native, "build_matched_facts", observe)
+    monkeypatch.setattr(accounting, "build_matched_facts", observe)
+    return work_builds
+
+
 async def _assert_rejected_typed_publication(context, checked_actors):
     from tests import test_network_fhir_source_witness_publication_postgres as publication
 
@@ -837,6 +890,7 @@ async def test_typed_source_ordinary_compact_publication(monkeypatch, source_pro
         monkeypatch.setattr(legacy_fixture, "legacy_resources", resources_without_embedded_source)
 
     checked_actors = _observe_typed_verification(monkeypatch)
+    built_work = _observe_typed_accounting(monkeypatch)
     monkeypatch.setattr(publication, "_source_capture_for_workers", _typed_worker_capture)
     if substitute_execution_output:
         _substitute_typed_mapping(monkeypatch)
@@ -854,6 +908,8 @@ async def test_typed_source_ordinary_compact_publication(monkeypatch, source_pro
         assert manifest.compact_layout is not None and manifest.generation_id > 0
         assert checked_actors == [await context.operator.connection.fetchval("SELECT session_user")]
         assert context.worker.roles_by_kind["execution"] not in checked_actors
+        assert [actor for actor, _, _ in built_work] == [context.worker.roles_by_kind["execution"], checked_actors[0]]
+        assert len({work for _, _, work in built_work}) == 2
         await _assert_typed_candidate_counts(context)
         if not is_legacy:
             # A newer, unselected Source publication must not invalidate the last-good closed contribution.
