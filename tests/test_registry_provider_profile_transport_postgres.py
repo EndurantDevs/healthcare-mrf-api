@@ -18,10 +18,10 @@ from db.connection import Database
 from db.models import NPIData, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIDataTaxonomyGroup, system
 from process.provider_directory_cms_serving_receipt import read_serving_receipt
 from tests.test_network_catalog_routes import envelope, v2_envelope
-from tests.test_provider_directory_cms_resource_batch_postgres import cms_resource_template as cms_resource_template
+from tests.test_provider_directory_cms_resource_batch_postgres import cms_source_template as cms_source_template
 from tests.test_provider_profile_network_facts_postgres import published_profile_source as published_profile_source
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures(cms_source_template.__name__)]
 _PATH = "/api/v1/registry/serving/providers/profile"
 _AUTH = {"Authorization": "Bearer synthetic-profile-control"}
 _NPI = "1000000491"

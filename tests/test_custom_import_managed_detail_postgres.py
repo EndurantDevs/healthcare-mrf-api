@@ -33,11 +33,11 @@ from tests.custom_import_managed_detail_postgres_support import (
     publish_import,
     signed_headers,
 )
-from tests.test_provider_directory_cms_resource_batch_postgres import cms_resource_template as cms_resource_template
+from tests.test_provider_directory_cms_resource_batch_postgres import cms_source_template as cms_source_template
 from tests.test_provider_profile_network_facts_postgres import published_profile_source as published_profile_source
 from tests.test_registry_provider_profile_transport_postgres import profile_transport as profile_transport
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures(cms_source_template.__name__)]
 
 
 @pytest.fixture
