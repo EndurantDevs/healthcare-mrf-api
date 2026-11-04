@@ -97,3 +97,63 @@ async def test_approved_projection_preserves_history_and_rejects_payload_or_bind
             await preservation.carry_fhir_preservation_addresses(
                 connection, proof, "pg_temp", approved_context=(4, "pg_temp"), **target_options_by_name
             )
+
+
+@pytest.mark.asyncio
+async def test_coverage_digest_pages_preserve_order_and_empty_carry(serving_schema):
+    import hashlib
+
+    connection, _schema, _engine = serving_schema
+    async with connection.transaction():
+        await connection.execute("SET LOCAL work_mem='4MB'")
+        await connection.execute("""CREATE TEMP TABLE digest_coverage(
+          side text,slot text COLLATE "C",organization_id text COLLATE "C",payload_hash text,
+          PRIMARY KEY(side,slot,organization_id)) ON COMMIT DROP;
+          CREATE TEMP TABLE digest_missing(network_id integer PRIMARY KEY) ON COMMIT DROP""")
+        assert await preservation._coverage_digest(connection, "digest_coverage") == hashlib.sha256().hexdigest()
+        await connection.execute("""INSERT INTO digest_coverage
+          SELECT CASE WHEN i%2=0 THEN 'current' ELSE 'previous' END,
+            (ARRAY['a','A','é','z'])[1+i%4],
+            (ARRAY['A-','a.','Z-','z.'])[1+i%4]||lpad(i::text,10,'0'),repeat('b',64)
+          FROM generate_series(1,15003) i""")
+        query = (
+            "SELECT to_jsonb(row)::text FROM digest_coverage row "
+            'ORDER BY side,slot COLLATE "C",organization_id COLLATE "C"'
+        )
+        count, expected = await preservation._ordered_digest(connection, query)
+        assert count == 15003
+        assert await preservation._coverage_digest(connection, "digest_coverage") == expected
+        # These invalid queries must never execute when the exact missing set is empty.
+        counters, coverage = await preservation._carry_counters(
+            connection, "digest_missing", "digest_coverage", ("SELECT absent_column",) * 3
+        )
+        assert coverage == expected
+        assert all(counters[name] == 0 for name in ("missing_networks", "carried_rows", "binding_rows", "address_rows"))
+        assert all(
+            actual_digest == hashlib.sha256().hexdigest()
+            for name, actual_digest in counters.items()
+            if name.endswith("_sha256")
+        )
+        await connection.execute(
+            "UPDATE digest_coverage SET payload_hash=repeat('c',64) WHERE organization_id='a.0000000001'"
+        )
+        assert await preservation._coverage_digest(connection, "digest_coverage") != expected
+        await connection.execute("INSERT INTO digest_missing VALUES(7)")
+        duplicate = "SELECT 7 AS network_id,'same'::text AS evidence UNION ALL SELECT 7,'same'"
+        counters, _coverage = await preservation._carry_counters(
+            connection,
+            "digest_missing",
+            "digest_coverage",
+            (duplicate, duplicate, "SELECT * FROM (" + duplicate + ") carried WHERE $1::integer=1"),
+            (1,),
+        )
+        expected_count, expected_digest = await preservation._ordered_digest(
+            connection, f'SELECT to_jsonb(row)::text FROM ({duplicate}) row ORDER BY to_jsonb(row)::text COLLATE "C"'
+        )
+        assert expected_count == 2
+        for count_name, digest_name in (
+            ("carried_rows", "membership_sha256"),
+            ("binding_rows", "bindings_sha256"),
+            ("address_rows", "addresses_sha256"),
+        ):
+            assert counters[count_name] == expected_count and counters[digest_name] == expected_digest
