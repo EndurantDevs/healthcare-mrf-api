@@ -160,6 +160,8 @@ def _address_pin(configured):
 
 
 def _initial_sources(configured):
+    from process.registry_source_recipe_additions import _decode_added_recipes
+
     if configured is None:
         return None
     if (
@@ -192,7 +194,11 @@ def _initial_sources(configured):
         recipes = configured.get(phase, [])
         if type(recipes) is not list:
             _invalid()
-        recipes_by_phase[phase] = decode_registry_source_recipes(recipes)
+        recipes_by_phase[phase] = (
+            _decode_added_recipes(recipes)
+            if phase == "replacement_source_recipes"
+            else decode_registry_source_recipes(recipes)
+        )
     return RegistryCompositionAddressSources(
         _address_pin(configured["base_source"]),
         None if npi is None else _address_pin(npi),

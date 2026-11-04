@@ -9,6 +9,7 @@ import asyncpg
 import pytest
 
 from process.network_address_projection import _identifier
+from process.network_membership_writer_closure import NetworkWriterClosureError
 from process.network_serving_read import (
     NetworkServingReadUnavailable,
     parse_canonical_network_ids,
@@ -47,6 +48,84 @@ async def _resolve(fixture, generation_id=None, connection=None):
         return await resolve_network_serving_manifest(
             connection, generation_id=generation_id, control_schema=fixture.control_schema
         )
+
+
+async def test_retained_resolver_authenticates_unsealed_legacy_generation(read_component_db):
+    from process.network_membership_publication import _candidate_custody
+    from process.registry_retained_generation import resolve_registry_retained_generation
+
+    fixture = read_component_db
+    before = await _snapshot(fixture)
+    retained_locator_by_field = {
+        "source_generations": {"retained_network_source": fixture.read_manifest["manifest_sha256"]}
+    }
+    async with fixture.observer.transaction(isolation="repeatable_read", readonly=True):
+        manifest, candidate = await resolve_registry_retained_generation(
+            fixture.observer, retained_locator_by_field, control_schema=fixture.control_schema
+        )
+        assert await _candidate_custody(fixture.observer, candidate, fixture.control_schema) is None
+        assert manifest == await resolve_network_serving_manifest(
+            fixture.observer, generation_id=manifest.generation_id, control_schema=fixture.control_schema
+        )
+        catalog_rows = await fixture.observer.fetch(
+            "SELECT namespace.nspname,relation.relname,relation.oid::bigint "
+            "FROM pg_catalog.pg_class relation "
+            "JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace "
+            "WHERE namespace.nspname=$1 AND relation.relkind='r' ORDER BY relation.relname",
+            manifest.schema_name,
+        )
+        catalog_pins = tuple(map(tuple, catalog_rows))
+        assert catalog_pins
+        assert (
+            tuple((pin.schema_name, pin.table_name, pin.table_oid) for pin in manifest.candidate_relation_pins)
+            == catalog_pins
+        )
+        assert manifest.address_table_oid == next(
+            table_oid for _, table_name, table_oid in catalog_pins if table_name == "entity_address_unified"
+        )
+        assert manifest.custody_control is None and not hasattr(manifest, "_custody_seal_sha256")
+    assert await _snapshot(fixture) == before
+
+
+@pytest.mark.parametrize(
+    "damage,error_type,message",
+    [
+        (
+            "runtime_write",
+            NetworkServingReadUnavailable,
+            "^Network serving physical owner or runtime privileges are not protected$",
+        ),
+        ("closure_oid", NetworkWriterClosureError, "^Retained candidate object identity changed$"),
+    ],
+)
+async def test_retained_resolver_refuses_unsealed_legacy_closure_drift(read_component_db, damage, error_type, message):
+    from process.registry_retained_generation import resolve_registry_retained_generation
+
+    fixture = read_component_db
+    if damage == "runtime_write":
+        await fixture.connection.execute(
+            f'GRANT UPDATE ON "{fixture.copy_target.schema_name}".network_membership '
+            f'TO "{fixture.writer_roles["reader"]}"'
+        )
+    else:
+        namespace = _identifier(fixture.copy_target.schema_name)
+        await fixture.connection.execute(
+            f"ALTER TABLE {namespace}.entity_address_unified RENAME TO previous_address_identity"
+        )
+        await fixture.connection.execute(
+            f"CREATE TABLE {namespace}.entity_address_unified (LIKE {namespace}.previous_address_identity INCLUDING ALL)"
+        )
+        await fixture.connection.execute(
+            f'ALTER TABLE {namespace}.entity_address_unified OWNER TO "{fixture.writer_roles["owner"]}"'
+        )
+    retained_locator_by_field = {
+        "source_generations": {"retained_network_source": fixture.read_manifest["manifest_sha256"]}
+    }
+    async with fixture.observer.transaction(isolation="repeatable_read", readonly=True):
+        with pytest.raises(error_type, match=message):
+            await resolve_registry_retained_generation(
+                fixture.observer, retained_locator_by_field, control_schema=fixture.control_schema
+            )
 
 
 @pytest.mark.asyncio

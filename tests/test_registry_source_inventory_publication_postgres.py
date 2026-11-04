@@ -63,6 +63,36 @@ _HEAPS = {
 }
 
 
+async def test_retained_inventory_and_contributions_require_published_seal(compact_cms_source):
+    from process.network_candidate_custody import NetworkCandidateCustodyError
+    from process.registry_retained_generation import resolve_registry_retained_generation
+
+    context = compact_cms_source
+    fixture = context.fixture
+    await fixture.connection.execute(_migration()._ddl(fixture.control_schema))
+    target = await _compose(context, context.reviewed[5].approved_revision)
+    await _prepare(context, target)
+    _, manifest = await _publish(context, target)
+    candidate = await _candidate(context, target)
+    assert verify_source_recipe_metadata(candidate).inventory is not None
+    assert verify_registry_source_contributions(candidate) is not None
+    retained_locator_by_field = {"source_generations": {"retained_network_source": manifest.manifest_sha256}}
+    async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
+        retained, _ = await resolve_registry_retained_generation(
+            fixture.execution_connection, retained_locator_by_field, control_schema=fixture.control_schema
+        )
+        assert retained == manifest and retained.custody_control is not None
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        await fixture.connection.execute(
+            f'DELETE FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
+            UUID(target.candidate_id),
+        )
+        with pytest.raises(NetworkCandidateCustodyError):
+            await resolve_registry_retained_generation(
+                fixture.connection, retained_locator_by_field, control_schema=fixture.control_schema
+            )
+
+
 def _document(value):
     return json.loads(value) if type(value) is str else value
 

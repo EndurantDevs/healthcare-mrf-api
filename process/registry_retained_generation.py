@@ -27,8 +27,6 @@ async def resolve_registry_retained_generation(connection, candidate, *, control
         raise RegistryRetainedGenerationError("registry_retained_generation_unavailable")
     retained_candidate_by_field = dict(manifest_rows[0])
     custody = await _candidate_custody(connection, retained_candidate_by_field, control_schema)
-    if custody is None:
-        raise RegistryRetainedGenerationError("registry_retained_generation_unsealed")
     entry = await _read_manifest(
         connection,
         _identifier(control_schema),
