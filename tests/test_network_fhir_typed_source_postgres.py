@@ -146,6 +146,47 @@ async def test_strict_subject_reference_and_acceptance_boundaries(monkeypatch):
         assert stage.document["counts"]["provider_only_roles"] == 1
 
 
+def _role_page_boundary_rows(edition, dataset):
+    resource_rows = _ORIGINAL_ROWS(edition, dataset) + _affiliation_fixture_rows(dataset)
+    for kind, subject, field in (
+        ("OrganizationAffiliation", "Organization/provider-org", "participating_organization_ref"),
+        ("PractitionerRole", "Practitioner/provider-one", "practitioner_ref"),
+    ):
+        resource_rows.extend(
+            _resource(
+                kind,
+                f"range-{index:04d}",
+                {
+                    field: subject,
+                    "network_refs": ["Organization/network-one"] * 2,
+                    "location_refs": ["Location/office-one"] * 3,
+                },
+                dataset,
+            )
+            for index in range(130)
+        )
+    return resource_rows
+
+
+async def test_role_pages_preserve_type_boundaries_and_reference_multiplicity(monkeypatch):
+    monkeypatch.setattr(source, "_edition_rows", _role_page_boundary_rows)
+    async with (
+        source_witness_case(monkeypatch) as case,
+        case.writer.transaction(isolation="repeatable_read"),
+        typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)) as stage,
+    ):
+        rows = await case.writer.fetch(
+            "SELECT resource_type,resource_id,provider_id,reference_rows FROM "
+            + stage.relation("pairs")
+            + " ORDER BY resource_type,resource_id"
+        )
+        expected_rows = [("OrganizationAffiliation", "participant", "1000000004", 1)]
+        expected_rows.extend(("OrganizationAffiliation", f"range-{index:04d}", "1000000004", 6) for index in range(130))
+        expected_rows.extend(("PractitionerRole", f"range-{index:04d}", "1234567893", 6) for index in range(130))
+        expected_rows.append(("PractitionerRole", "role-office", "1234567893", 1))
+        assert [tuple(row) for row in rows] == expected_rows
+
+
 async def test_raw_checker_refuses_producer_npi_substitution(monkeypatch):
     original = typed._project_page
 
@@ -532,6 +573,69 @@ async def test_typed_approved_catalog_and_native_office_mapping(monkeypatch):
             changed["native_catalog_sha256"] = "0" * 64
             with pytest.raises(ValueError):
                 mapping.require_catalog_graph_scope(stage, coordinates, changed)
+            for name in graph_mapping.table_names.values():
+                await case.reader.execute('DROP TABLE "' + name + '"')
+
+
+def _provider_page_boundary_rows(edition, dataset, include_affiliations):
+    resource_rows = _role_page_boundary_rows(edition, dataset)
+    for kind, subject, field in (
+        ("OrganizationAffiliation", "Organization/provider-org", "participating_organization_ref"),
+        ("PractitionerRole", "Practitioner/provider-one", "practitioner_ref"),
+    ):
+        resource_rows.extend(
+            _resource(
+                kind,
+                f"provider-range-{index:04d}",
+                {field: subject, "network_refs": ["Organization/network-one"] * 2, "location_refs": []},
+                dataset,
+            )
+            for index in range(130)
+        )
+    if not include_affiliations:
+        resource_rows = [row for row in resource_rows if row["resource_type"] != "OrganizationAffiliation"]
+    return resource_rows
+
+
+@pytest.mark.parametrize("include_affiliations", [False, True])
+async def test_provider_only_pages_keep_networked_rows_and_type_boundaries(monkeypatch, include_affiliations):
+    """Retain distinct provider evidence without admitting networked offices as provider-only rows."""
+    from process import network_fhir_typed_mapping as mapping
+
+    monkeypatch.setattr(
+        source,
+        "_edition_rows",
+        lambda edition, dataset: _provider_page_boundary_rows(edition, dataset, include_affiliations),
+    )
+    async with (
+        source_witness_case(monkeypatch) as case,
+        source.generic_refresh_execution(case.fixture, monkeypatch) as (execution, serving, _stack, _head),
+    ):
+        descriptor, coordinates, _network, approved = await _approve_typed_catalog_network(case, serving)
+        async with (
+            case.reader.transaction(isolation="repeatable_read"),
+            typed.typed_source_graph(case.source_export, case.reader, **_arguments(case)) as stage,
+        ):
+            graph_mapping = await mapping.prepare_typed_graph_mapping(
+                case.reader,
+                stage,
+                approval=mapping.TypedGraphApproval(
+                    approved_source=approved, binding_coordinates=coordinates, catalog_descriptor=descriptor
+                ),
+                address_source=execution.address,
+                runtime_roles=(case.fixture.component.reader,),
+                control_schema=serving[1],
+            )
+            assert stage.document["counts"]["pair_rows"] == (262 if include_affiliations else 131)
+            provider_counts = await case.reader.fetch(
+                "SELECT provider_id,count(*),count(DISTINCT evidence_id) FROM "
+                + graph_mapping.relation("provider_only")
+                + " GROUP BY provider_id ORDER BY provider_id"
+            )
+            assert [tuple(provider_count) for provider_count in provider_counts] == [
+                ("1000000004", 131 if include_affiliations else 1, 131 if include_affiliations else 1),
+                ("1234567893", 130, 130),
+            ]
             for name in graph_mapping.table_names.values():
                 await case.reader.execute('DROP TABLE "' + name + '"')
 
