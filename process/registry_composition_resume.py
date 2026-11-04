@@ -212,7 +212,7 @@ async def resolve_registered_legacy_office_inputs(
 async def resolve_registered_verified_office_inputs(
     connection, request_id, approved_revision, expected_head, *, verified_office_inputs=None, control_schema=None
 ):
-    """Pin registered address inputs; open typed candidates must rebuild fresh native capabilities."""
+    """Pin registered inputs; unvalidated typed candidates rebuild fresh native capabilities."""
     registered = await _registered_candidate(connection, request_id, approved_revision, expected_head, control_schema)
     if registered is None:
         return None
@@ -229,7 +229,7 @@ async def resolve_registered_verified_office_inputs(
 
             from process.network_address_projection import PinnedAddressSource
 
-            if candidate["state"] == "open":
+            if candidate["state"] in {"open", "sealed"}:
                 if (
                     type(verified_office_inputs) is not tuple
                     or len(verified_office_inputs) != 2
