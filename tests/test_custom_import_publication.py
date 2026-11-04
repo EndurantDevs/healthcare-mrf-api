@@ -70,10 +70,13 @@ def test_seal_replay_refuses_unavailable_or_different_query_projection_evidence(
 
 
 async def test_projection_finality_failure_preserves_publication_error_contract(monkeypatch):
-    from process.custom_import import query_projection_finality
-    from process.custom_import.query_projection_binding import QueryProjectionUnavailable
+    from process.custom_import import query_projection_finality, read_identity
+    from process.custom_import.query_projection_binding import (
+        QueryProjectionUnavailable,
+    )
 
     failure = QueryProjectionUnavailable("synthetic projection unavailable")
+    monkeypatch.setattr(read_identity, "verify_generation_storage", AsyncMock())
     monkeypatch.setattr(query_projection_finality, "validate_sealed_projection", AsyncMock(side_effect=failure))
     with pytest.raises(PublicationConflict, match="synthetic projection unavailable") as caught:
         await publication._validate_sealed_projection(object(), object(), object())
@@ -956,14 +959,17 @@ async def test_existing_no_change_candidate_seal_requires_exact_authority(monkey
     seal.sealing_token_sha256 = request.token_sha256
     monkeypatch.setattr(publication, "_locked_generation_seal", AsyncMock(return_value=seal))
     monkeypatch.setattr(publication, "_validate_generation_seal_identity", lambda *_args: None)
+    monkeypatch.setattr(publication, "_validate_sealed_projection", AsyncMock())
     assert (
         await publication._seal_no_change_candidate(SimpleNamespace(), request, execution, SimpleNamespace(), candidate)
         is seal
     )
+    publication._validate_sealed_projection.assert_awaited_once()
 
     seal.sealing_fence += 1
     with pytest.raises(PublicationConflict, match="authority differs"):
         await publication._seal_no_change_candidate(SimpleNamespace(), request, execution, SimpleNamespace(), candidate)
+    publication._validate_sealed_projection.assert_awaited_once()
 
 
 def test_custom_import_schema_names_cannot_disagree(monkeypatch):

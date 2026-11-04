@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+from contextlib import asynccontextmanager
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 from process.custom_import.operator import (
     _NO_CHANGE_EVIDENCE_FIELDS,
@@ -38,18 +41,36 @@ class _Result:
             return []
         return list(self.row) if isinstance(self.row, tuple) else [self.row]
 
+    def scalar_one(self):
+        return self.row
+
 
 class _Session:
     def __init__(self, row, *, active: bool = True):
         self.row = row
         self.active = active
         self.statements = []
+        self.parameters = []
 
     def in_transaction(self):
         return self.active
 
-    async def execute(self, statement):
+    async def connection(self):
+        return SimpleNamespace(
+            sync_connection=SimpleNamespace(get_execution_options=lambda: {}), dialect=postgresql.dialect()
+        )
+
+    @asynccontextmanager
+    async def begin_nested(self):
+        yield
+
+    async def execute(self, statement, parameters=None):
         self.statements.append(statement)
+        self.parameters.append(parameters)
+        if parameters is not None:
+            assert "resolve_custom_import_generation_snapshot(" in str(statement)
+            assert set(parameters) == {"dataset_id", "generation_id", "definition_revision_id", "schema_revision_id"}
+            return _Result(None)
         return _Result(self.row)
 
 
@@ -323,12 +344,13 @@ async def test_inspection_requires_a_transaction_and_hides_dataset_mismatch():
 
 
 @pytest.mark.asyncio
-async def test_execution_evidence_is_one_safe_retained_snapshot():
+async def test_execution_evidence_is_safe_and_pins_retained_storage():
     session = _Session(_execution_evidence_row())
 
     evidence = await inspect_execution_evidence(session, dataset_id=3, execution_id=17)
 
-    assert len(session.statements) == 1
+    assert len(session.statements) == 2
+    assert "resolve_custom_import_generation_snapshot(" in str(session.statements[1])
     statement = session.statements[0]
     assert statement.get_execution_options()["autoflush"] is False
     assert evidence.execution.execution_id == 17
@@ -651,7 +673,7 @@ async def test_generation_status_distinguishes_durable_publication_states(row, e
 
     status = await inspect_generation(session, dataset_id=3, generation_id=19)
 
-    assert len(session.statements) == 1
+    assert len(session.statements) == 2
     assert status.publication_state == expected
     if expected == "unsealed" or status.seal is None:
         assert status.seal is None

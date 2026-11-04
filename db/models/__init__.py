@@ -7,7 +7,9 @@ from db.models.company_registry import *
 from db.models.company_registry_assertions import *
 from db.models.company_registry_links import *
 from db.models.custom_import import *
+from db.models.custom_import_build_scratch import *
 from db.models.custom_import_continuation import *
+from db.models.custom_import_post_seal_audit import *
 from db.models.custom_import_query_projection import *
 from db.models.custom_import_raw_capture import *
 from db.models.custom_import_storage import *

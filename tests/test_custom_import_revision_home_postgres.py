@@ -12,12 +12,32 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.custom_import import CustomImportChildRevision, CustomImportRootRevision
 from process.custom_import.materialization import persist_scalar_projections
 from process.custom_import.storage_layout import snapshot_schema
-from tests.custom_import_postgres_support import _migration, isolated_publication_case, lease_digest
-from tests.test_custom_import_materialization_postgres import _definition, _root_projection_rows
+from tests.custom_import_build_scratch_postgres import (
+    test_cleanup_is_atomic_pin_safe_and_preserves_retained_base_continuation as test_cleanup_is_atomic_pin_safe_and_preserves_retained_base_continuation,
+)
+from tests.custom_import_build_scratch_postgres import (
+    test_cleanup_owner_custody_and_changed_registry_refusal as test_cleanup_owner_custody_and_changed_registry_refusal,
+)
+from tests.custom_import_build_scratch_postgres import (
+    test_cleanup_refuses_phase_index_rebound_to_a_serving_table as test_cleanup_refuses_phase_index_rebound_to_a_serving_table,
+)
+from tests.custom_import_build_scratch_postgres import (
+    test_cleanup_refuses_unverified_and_manual_accepted_scratch as test_cleanup_refuses_unverified_and_manual_accepted_scratch,
+)
+from tests.custom_import_postgres_support import (
+    _migration,
+    isolated_publication_case,
+    lease_digest,
+)
+from tests.test_custom_import_materialization_postgres import (
+    _definition,
+    _root_projection_rows,
+)
 from tests.test_custom_import_materialization_set_postgres import _seed
 
 
@@ -198,3 +218,52 @@ async def test_native_materialization_functions_have_no_nonowner_execute_acl():
                 ),
                 dict(schema=case.schema_name),
             )
+
+
+async def test_inventory_supports_two_atomic_retirements_on_one_backend(monkeypatch):
+    from process.custom_import import retirement, retirement_inventory
+    from tests import custom_import_retirement_postgres as retirement_fixture
+    from tests.test_custom_import_snapshot_storage_postgres import (
+        _bounded,
+        _sealed_current_snapshot,
+    )
+
+    async with isolated_publication_case() as case, case.engine.connect() as connection:
+        _, _, first = await retirement_fixture._superseded_snapshot(case)
+        _, _, second = await retirement_fixture._superseded_snapshot(case)
+        _, _, kept = await _sealed_current_snapshot(case)
+        try:
+            async with AsyncSession(bind=connection) as session, session.begin():
+                await _bounded(session)
+                backend = await session.scalar(text("SELECT pg_backend_pid()"))
+                await retirement_inventory.prepare_frozen_reference_inventory(session)
+            original = retirement._revision_references
+            scans = []
+
+            async def record_reference_scan(session, family, *args, **kwargs):
+                scans.append((family.family_id, kwargs.get("include_canonical", True)))
+                await original(session, family, *args, **kwargs)
+
+            monkeypatch.setattr(retirement, "_revision_references", record_reference_scan)
+            for family_id in (first, second):
+                async with AsyncSession(bind=connection) as session, session.begin():
+                    await _bounded(session)
+                    receipt = await retirement.retire_snapshot_family(
+                        session,
+                        family_id,
+                        engine_id="synthetic",
+                        assert_external_unreferenced=retirement_fixture._published_fixture_check,
+                    )
+                    assert receipt.reason == "superseded" and not receipt.replayed
+                    assert await session.scalar(text("SELECT pg_backend_pid()")) == backend
+            assert scans == [(first, False), (first, True), (second, False), (second, True)]
+            async with AsyncSession(bind=connection) as session, session.begin():
+                assert (
+                    await session.scalar(text("SELECT to_regnamespace(:name)"), {"name": snapshot_schema(kept)})
+                    is not None
+                )
+        finally:
+            if connection.in_transaction():
+                await connection.rollback()
+            async with AsyncSession(bind=connection) as session, session.begin():
+                await retirement_inventory.cleanup_frozen_reference_inventory(session)

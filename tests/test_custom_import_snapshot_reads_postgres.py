@@ -17,15 +17,31 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import delete, event, select, text
 from sqlalchemy.exc import DBAPIError
 
 from db.models import custom_import as models
+from db.models.custom_import import CustomImportGeneration
 from db.models.custom_import_query_projection import CustomImportQueryProjection
+from db.models.custom_import_storage import (
+    CustomImportRevisionHome,
+    CustomImportSnapshotFamily,
+    CustomImportSnapshotRelation,
+)
 from process.custom_import import materialization as materialize
-from process.custom_import import read_core, read_identity, runner_codec
+from process.custom_import import (
+    operator,
+    publication,
+    read_core,
+    read_identity,
+    runner_codec,
+)
 from process.custom_import.family import RootFamily
 from process.custom_import.publication import activate_generation, seal_generation
+from process.custom_import.read_contracts import (
+    CustomImportReadUnavailableError,
+    PinnedReadTarget,
+)
 from process.custom_import.storage_layout import SNAPSHOT_MODELS, snapshot_schema
 from tests import custom_import_grouped_child_support as fixture
 from tests import test_custom_import_grouped_child_read_postgres as child_fixture
@@ -150,7 +166,13 @@ from tests.custom_import_query_projection_values_postgres import (
 from tests.custom_import_query_projection_verify_postgres import (
     test_native_comparison_preserves_nulls_values_and_multiplicity as test_native_comparison_preserves_nulls_values_and_multiplicity,
 )
-from tests.test_custom_import_snapshot_storage_postgres import _call
+from tests.test_custom_import_snapshot_storage_postgres import (
+    _attempt,
+    _call,
+    _create_snapshot,
+    _remember_retirement,
+    _sealed_current_snapshot,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -735,3 +757,124 @@ async def test_readonly_binding_holds_leaf_identity_against_alter_and_drop(ddl):
             finally:
                 await transaction.rollback()
                 await writer.rollback()
+
+
+async def _retire_empty_fixture(session, family_id):
+    """Remove only the exact empty fixture; production retirement is tested separately."""
+
+    await _remember_retirement(session, family_id)
+    await session.execute(text(f'DROP SCHEMA "{snapshot_schema(family_id)}" CASCADE'))
+    for model in (CustomImportRevisionHome, CustomImportSnapshotRelation, CustomImportSnapshotFamily):
+        await session.execute(delete(model).where(model.family_id == family_id))
+
+
+async def test_retired_storage_refuses_reads_finality_replay_and_history():
+    async with isolated_publication_case() as case:
+        graph, attempt, family_id = await _sealed_current_snapshot(case)
+        async with case.sessions() as session, session.begin():
+            retained_generation_status = await operator.inspect_generation(
+                session, dataset_id=graph.dataset_id, generation_id=attempt.generation_id
+            )
+            assert retained_generation_status.seal is not None
+        async with case.sessions() as session, session.begin():
+            await _retire_empty_fixture(session, family_id)
+        pinned_read_target = PinnedReadTarget(
+            graph.dataset_id, attempt.generation_id, graph.definition_revision_id, graph.schema_revision_id, "default"
+        )
+        with pytest.raises(CustomImportReadUnavailableError, match="storage is retired"):
+            async with case.sessions() as session, session.begin():
+                await read_identity.resolve_generation_snapshot(session, pinned_read_target)
+        for transition in (publication.activate_generation, publication.rollback_generation):
+            with pytest.raises(publication.PublicationConflict, match="storage is retired"):
+                async with case.sessions() as session, session.begin():
+                    await transition(
+                        session,
+                        dataset_id=graph.dataset_id,
+                        target_generation_id=attempt.generation_id,
+                        expected_generation_id=None,
+                        expected_pointer_version=0,
+                    )
+        with pytest.raises(publication.PublicationConflict, match="storage is retired"):
+            async with case.sessions() as session, session.begin():
+                await publication.seal_generation(
+                    session,
+                    dataset_id=graph.dataset_id,
+                    generation_id=attempt.generation_id,
+                    lease_fence=attempt.fence,
+                    lease_token=attempt.token,
+                )
+        for inspection, locator in (
+            (operator.inspect_generation, {"generation_id": attempt.generation_id}),
+            (operator.inspect_execution_evidence, {"execution_id": attempt.execution_id}),
+        ):
+            with pytest.raises(operator.OperatorObjectNotFound, match="storage is unavailable"):
+                async with case.sessions() as session, session.begin():
+                    await inspection(session, dataset_id=graph.dataset_id, **locator)
+
+
+async def test_unsealed_history_probe_preserves_outer_transaction_and_refuses_retirement():
+    async with isolated_publication_case() as case:
+        graph, attempt = await _attempt(case)
+        family_id = await _create_snapshot(case, attempt)
+        async with case.sessions() as session, session.begin():
+            await session.execute(text("SET TRANSACTION READ ONLY"))
+            status = await operator.inspect_generation(
+                session, dataset_id=graph.dataset_id, generation_id=attempt.generation_id
+            )
+            assert status.seal is None
+            assert (
+                await session.scalar(
+                    select(CustomImportGeneration.generation_id).where(
+                        CustomImportGeneration.generation_id == attempt.generation_id
+                    )
+                )
+                == attempt.generation_id
+            )
+        async with case.sessions() as session, session.begin():
+            await _remember_retirement(session, family_id, generation=False)
+        with pytest.raises(operator.OperatorObjectNotFound, match="storage is unavailable"):
+            async with case.sessions() as session, session.begin():
+                await operator.inspect_generation(
+                    session, dataset_id=graph.dataset_id, generation_id=attempt.generation_id
+                )
+
+
+async def test_prepared_read_context_is_not_reused_after_transaction_end_and_retirement():
+    from tests import custom_import_grouped_child_support as grouped
+    from tests import test_custom_import_provider_hydration_postgres as native
+
+    async with _pinned_read_case() as pinned:
+        service = native._service(pinned.target)
+        query = grouped.query(family_entitlement="full_family")
+        async with pinned.case.sessions() as reader:
+            async with reader.begin():
+                await reader.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+                await reader.execute(text(f'SET LOCAL ROLE "{pinned.role}"'))
+                prepared = await service.prepare_npi_entity_relation(
+                    reader, authorization=native._AUTHORIZATION, target=pinned.target, query=query
+                )
+                page = await service.hydrate_npi_page(
+                    reader,
+                    authorization=native._AUTHORIZATION,
+                    pinned_target=pinned.target,
+                    prepared=prepared,
+                    entity_values=(native._A,),
+                    query=query,
+                    full_family=True,
+                )
+                assert native._A in page
+            async with pinned.case.sessions() as owner, owner.begin():
+                await _remember_retirement(owner, pinned.family_id)
+            with pytest.raises(CustomImportReadUnavailableError, match="storage is retired"):
+                async with reader.begin():
+                    await reader.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+                    await reader.execute(text(f'SET LOCAL ROLE "{pinned.role}"'))
+                    await service.hydrate_npi_page(
+                        reader,
+                        authorization=native._AUTHORIZATION,
+                        pinned_target=pinned.target,
+                        prepared=prepared,
+                        entity_values=(native._A,),
+                        query=query,
+                        full_family=True,
+                    )

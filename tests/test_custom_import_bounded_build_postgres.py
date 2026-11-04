@@ -58,6 +58,7 @@ from process.custom_import.runner_codec import (
 )
 from tests.custom_import_postgres_support import (
     _migration,
+    install_snapshot_storage_migrations,
     isolated_publication_case,
     seed_publication_graph,
     seed_running_generation,
@@ -90,6 +91,11 @@ async def _case():
     async with isolated_publication_case(is_snapshot_storage_enabled=False) as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(_install, case.schema_name)
+            await connection.run_sync(
+                install_snapshot_storage_migrations,
+                case.schema_name,
+                ("20261005030000_custom_import_snapshot_storage",),
+            )
         yield case
 
 
