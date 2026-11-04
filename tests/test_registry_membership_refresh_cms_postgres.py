@@ -17,6 +17,7 @@ from process.network_fhir_membership_source import read_fhir_membership_fact_bat
 from process.network_registry_cms_source_attempt import RegistryCMSSourceAttempt
 from process.registry_company_approval_fence import registry_company_approval_transaction
 from tests import cms_registry_native_producer_postgres_support as producer
+from tests import test_network_cms_registry_complete_publication_postgres as complete_publication
 from tests.test_registry_cms_refresh_anchors_postgres import (
     _accepted_source,
 )
@@ -47,7 +48,7 @@ async def _publish_native_next(state, reader, monkeypatch, tmp_path):
             )
         if remaining is None or remaining <= 0:
             break
-        assert remaining <= 960, "unexpected capacity reservation in the owned fixture"
+        assert remaining <= complete_publication.SUCCESSOR_LEASE_SECONDS, "unexpected capacity reservation"
         # Preserve immutable consumption history and wait before issuing the next permit.
         await asyncio.sleep(min(float(remaining) + 0.1, 30))
     original = state.pair
@@ -165,6 +166,7 @@ async def _refresh_transport(state, monkeypatch):
 
 
 async def test_current_cms_edition_keeps_original_scope_and_pins_real_successor(monkeypatch, tmp_path):
+    monkeypatch.setattr(complete_publication, "PROFILE_BUILD_SECONDS", complete_publication.SUCCESSOR_BUILD_SECONDS)
     async with _accepted_source(monkeypatch, tmp_path) as (state, reader, child, _bindings), AsyncExitStack() as stack:
         await _grant_registry_reader(state, child)
         await _preflight_source_custody(state, monkeypatch)

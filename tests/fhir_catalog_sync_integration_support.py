@@ -38,7 +38,10 @@ from process.registry_fhir_catalog_worker import RegistryFHIRCatalogSyncConfig
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig
 from tests import cms_npd_admission_postgres_support as imported
 from tests import cms_registry_complete_publication_postgres_support as native
-from tests.test_network_cms_registry_complete_publication_postgres import _paired_native_execution
+from tests.test_network_cms_registry_complete_publication_postgres import (
+    SUCCESSOR_LEASE_SECONDS,
+    _paired_native_execution,
+)
 from tests.test_network_custom_address_source_postgres import (
     _restricted_artifact_context,
     _restricted_artifact_roles,
@@ -142,7 +145,7 @@ async def _import_source(case, directory, *, retain_old, revision):
             )
             if remaining is None or remaining <= 0:
                 break
-            assert remaining <= 960, "unexpected capacity reservation in the owned fixture"
+            assert remaining <= SUCCESSOR_LEASE_SECONDS, "unexpected capacity reservation in the owned fixture"
             # Keep the real quiescence guard and immutable lease ledger intact.
             await asyncio.sleep(min(float(remaining) + 0.1, 30))
         execution = await _paired_native_execution(case.settings, execution)
