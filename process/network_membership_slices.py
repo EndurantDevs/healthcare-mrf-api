@@ -272,33 +272,43 @@ async def _copy_changed_edges(connection, copy_target, work_table):
     from process.network_bootstrap_sources import NetworkBootstrapSourceError, _copy_native_batch
 
     ref_table = _identifier(copy_target.schema_name) + ".network_slice_ref"
+    await connection.execute(f"ANALYZE {ref_table}")
+    if not await connection.fetchval(
+        f"SELECT EXISTS(SELECT FROM {ref_table} WHERE artifact_candidate_id=$1)", UUID(copy_target.candidate_id)
+    ):
+        return 0
     last_network, last_bucket, last_key = 0, -1, ""
     copied_rows = 0
     while True:
-        selected = f"""SELECT f.network_id,f.office_bucket,f.location_key,r.slice_id FROM {work_table} f
-            JOIN {ref_table} r USING(network_id,office_bucket) WHERE r.artifact_candidate_id=$1
-                AND (f.network_id,f.office_bucket,f.location_key COLLATE "C")>($2,$3,$4 COLLATE "C")
-            ORDER BY f.network_id,f.office_bucket,f.location_key COLLATE "C" LIMIT {_BATCH_ROWS}"""
+        work_page = f"""SELECT network_id,office_bucket,location_key FROM {work_table}
+            WHERE (network_id,office_bucket,location_key COLLATE "C")>($2,$3,$4 COLLATE "C")
+            ORDER BY network_id,office_bucket,location_key COLLATE "C" LIMIT {_BATCH_ROWS}"""
+        changed_page = f"""SELECT f.network_id,f.office_bucket,f.location_key,r.slice_id FROM page f
+            JOIN {ref_table} r USING(network_id,office_bucket) WHERE r.artifact_candidate_id=$1"""
         arguments = (UUID(copy_target.candidate_id), last_network, last_bucket, last_key)
         bounds = await connection.fetchrow(
-            f"SELECT count(*) OVER() AS row_count,* FROM ({selected}) batch "
+            f"WITH page AS MATERIALIZED ({work_page}) SELECT "
+            f"(SELECT count(*) FROM ({changed_page}) changed) AS row_count,* FROM page "
             'ORDER BY network_id DESC,office_bucket DESC,location_key COLLATE "C" DESC LIMIT 1',
             *arguments,
         )
         if bounds is None:
             return copied_rows
-        try:
-            await _copy_native_batch(
-                connection,
-                f"SELECT slice_id,location_key FROM ({selected}) batch",
-                arguments,
-                copy_target.schema_name,
-                "network_office_edge",
-                bounds["row_count"],
-                byte_limit=_COPY_BYTE_LIMIT,
-            )
-        except NetworkBootstrapSourceError as error:
-            raise NetworkMembershipSliceError(str(error)) from error
+        if bounds["row_count"]:
+            try:
+                await _copy_native_batch(
+                    connection,
+                    f"WITH page AS MATERIALIZED ({work_page}) SELECT slice_id,location_key "
+                    f"FROM ({changed_page}) changed "
+                    'ORDER BY network_id,office_bucket,location_key COLLATE "C"',
+                    arguments,
+                    copy_target.schema_name,
+                    "network_office_edge",
+                    bounds["row_count"],
+                    byte_limit=_COPY_BYTE_LIMIT,
+                )
+            except NetworkBootstrapSourceError as error:
+                raise NetworkMembershipSliceError(str(error)) from error
         copied_rows += bounds["row_count"]
         last_network, last_bucket, last_key = bounds["network_id"], bounds["office_bucket"], bounds["location_key"]
 

@@ -339,13 +339,7 @@ def test_typed_office_summary_binds_the_registered_approval_and_address():
         verify_initial_source_office_receipt(candidate_by_field)
 
 
-@pytest.mark.asyncio
-async def test_registered_typed_resume_preserves_revision_and_office_pin(monkeypatch):
-    """Resume registered typed metadata with the same revision, source and office pins."""
-    from unittest.mock import AsyncMock
-    from uuid import uuid4
-
-    from process import registry_composition_resume as resume
+def _registered_typed_resume():
     from process.network_address_projection import PinnedAddressSource
     from process.registry_candidate_composition import _target
     from process.registry_initial_source_composition import SUMMARY_KEY as OFFICE_KEY
@@ -371,35 +365,147 @@ async def test_registered_typed_resume_preserves_revision_and_office_pin(monkeyp
         CONTRIBUTION_KEY: registry_source_contribution_sha256(contribution, inventory_root=reference.root),
         OFFICE_KEY: initial_source_office_receipt_sha256(office, inventory_root=reference.root),
     }
-    request = uuid4()
+    request = UUID(int=8)
     copy_target = _target(request, 1, 0, generations_by_kind)
     candidate_by_field = {
+        **{
+            field: getattr(copy_target, field)
+            for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
+        },
+        "bounded": True,
+        "state": "open",
+        "expected_head": 0,
         "source_recipes_json": reference.as_dict(),
         "source_generations": generations_by_kind,
         "approved_custom_revision": 1,
         "validation_json": {
             CONTRIBUTION_KEY: contribution,
             OFFICE_KEY: office,
-            "address_source": derivation["address_source"],
-            "writer_closure": {"loader_roles": ["writer"], "reader_roles": ["reader"]},
         },
     }
-    monkeypatch.setattr(resume, "_registered_candidate", AsyncMock(return_value=(copy_target, candidate_by_field)))
+    return request, copy_target, candidate_by_field, PinnedAddressSource(**derivation["address_source"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["open", "sealed", "validated", "ready", "published"])
+async def test_registered_typed_resume_preserves_revision_and_office_pin(state):
+    """Open registration rederives offices; closed registration retains its custody inputs."""
+    from dataclasses import asdict
+
+    from process import registry_composition_resume as resume
+    from tests.test_registry_composition_resume import _connection
+
+    request, copy_target, candidate, address_source = _registered_typed_resume()
+    candidate["state"] = state
+    fresh_inputs = (address_source, ("current_reader", "current_writer"))
+    expected = fresh_inputs
+    if state != "open":
+        candidate["validation_json"].update(
+            address_source=asdict(address_source),
+            writer_closure={"loader_roles": ["writer"], "reader_roles": ["reader"]},
+        )
+        expected = (address_source, ("reader", "writer"))
+    connection = _connection([candidate])
     assert await resume.resolve_registered_contribution_resume(
-        None, request, 1, 0
+        connection, request, 1, 0
     ) == resume.RegisteredContributionResume(copy_target, 4)
-    assert await resume.resolve_registered_office_summary_revision(None, request, 1, 0) == 6
-    assert await resume.resolve_registered_verified_office_inputs(None, request, 1, 0) == (
-        PinnedAddressSource(**derivation["address_source"]),
-        ("reader", "writer"),
+    assert await resume.resolve_registered_office_summary_revision(connection, request, 1, 0) == 6
+    assert (
+        await resume.resolve_registered_verified_office_inputs(
+            connection, request, 1, 0, verified_office_inputs=fresh_inputs
+        )
+        == expected
     )
-    assert await resume.resolve_registered_source_inventory(None, request, 1, 0) is True
-    candidate_by_field["validation_json"]["address_source"] = {
-        **derivation["address_source"],
-        "generation_id": "0" * 64,
-    }
+    assert await resume.resolve_registered_source_inventory(connection, request, 1, 0) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["absent", "shape", "roles", "schema_name", "table_name", "generation_id"])
+async def test_open_typed_resume_requires_current_inputs_matching_the_frozen_address(damage):
+    from process import registry_composition_resume as resume
+    from tests.test_registry_composition_resume import _connection
+
+    request, _target, candidate, address_source = _registered_typed_resume()
+    inputs = (address_source, ("reader", "writer"))
+    if damage == "absent":
+        inputs = None
+    elif damage == "shape":
+        inputs = (address_source,)
+    elif damage == "roles":
+        inputs = (address_source, ["reader"])
+    else:
+        inputs = (replace(address_source, **{damage: "changed"}), inputs[1])
+    with pytest.raises(resume.RegistryCompositionResumeError, match="verified_offices_differ"):
+        await resume.resolve_registered_verified_office_inputs(
+            _connection([candidate]), request, 1, 0, verified_office_inputs=inputs
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field", ["dataset_id", "schema_id", "producer_id", "approved_custom_revision", "expected_head"]
+)
+async def test_open_typed_resume_refuses_changed_request_identity(field):
+    from process import registry_composition_resume as resume
+    from tests.test_registry_composition_resume import _connection
+
+    request, _target, candidate, address_source = _registered_typed_resume()
+    candidate[field] = 2 if field in ("approved_custom_revision", "expected_head") else str(UUID(int=9))
+    with pytest.raises(resume.RegistryCompositionResumeError, match="scope_changed"):
+        await resume.resolve_registered_verified_office_inputs(
+            _connection([candidate]), request, 1, 0, verified_office_inputs=(address_source, ("reader",))
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["address_identity", "address_source", "inventory", "contribution", "generation"])
+async def test_open_typed_resume_refuses_changed_registered_commitments(damage):
+    from process import registry_composition_resume as resume
+    from process.registry_initial_source_composition import SUMMARY_KEY as OFFICE_KEY
+    from process.registry_source_contribution_store import SUMMARY_KEY as CONTRIBUTION_KEY
+    from tests.test_registry_composition_resume import _connection
+
+    request, _target, candidate, address_source = _registered_typed_resume()
+    match damage:
+        case "address_identity":
+            candidate["validation_json"][OFFICE_KEY]["context"]["address_identity"]["table_oid"] += 1
+        case "address_source":
+            candidate["validation_json"][OFFICE_KEY]["context"]["address_source"]["generation_id"] = "a" * 64
+        case "inventory":
+            candidate["source_recipes_json"] = []
+        case "contribution":
+            candidate["validation_json"][CONTRIBUTION_KEY]["revision"] = 4
+        case "generation":
+            candidate["source_generations"]["unified_address"] = "a" * 64
     with pytest.raises(ValueError):
-        await resume.resolve_registered_verified_office_inputs(None, request, 1, 0)
+        await resume.resolve_registered_verified_office_inputs(
+            _connection([candidate]), request, 1, 0, verified_office_inputs=(address_source, ("reader",))
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["sealed", "validated", "ready", "published"])
+@pytest.mark.parametrize("damage", ["address_source", "writer_closure", "address_changed"])
+async def test_closed_typed_resume_requires_retained_custody(state, damage):
+    from dataclasses import asdict
+
+    from process import registry_composition_resume as resume
+    from tests.test_registry_composition_resume import _connection
+
+    request, _target, candidate, address_source = _registered_typed_resume()
+    candidate["state"] = state
+    report = candidate["validation_json"]
+    report.update(
+        address_source=asdict(address_source), writer_closure={"loader_roles": ["writer"], "reader_roles": ["reader"]}
+    )
+    if damage == "address_changed":
+        report["address_source"]["generation_id"] = "a" * 64
+    else:
+        report.pop(damage)
+    with pytest.raises(resume.RegistryCompositionResumeError):
+        await resume.resolve_registered_verified_office_inputs(
+            _connection([candidate]), request, 1, 0, verified_office_inputs=(address_source, ("reader",))
+        )
 
 
 @pytest.mark.asyncio

@@ -1023,6 +1023,10 @@ async def _record_prepared_composition(inputs, copy_target, prepared_sources, co
             retain_source_bindings=False,
             source_stage=source_stage,
         )
+    await inputs.connection.execute(
+        f"CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
+        f"ON {_identifier(copy_target.schema_name)}.provider_location_binding USING hash(location_key)"
+    )
 
 
 async def _record_composition_address(connection, copy_target, address_source, control_schema):
@@ -1582,7 +1586,12 @@ async def _registered_composition_inputs(inputs, request_scope, address_sources,
             from process.registry_composition_resume import resolve_registered_verified_office_inputs
 
             verified_inputs = await resolve_registered_verified_office_inputs(
-                inputs.connection, request_id, approved_revision, expected_head, control_schema=control_schema
+                inputs.connection,
+                request_id,
+                approved_revision,
+                expected_head,
+                verified_office_inputs=inputs.verified_office_inputs,
+                control_schema=control_schema,
             )
         inputs = replace(inputs, verified_office_inputs=verified_inputs)
     return inputs, inventory

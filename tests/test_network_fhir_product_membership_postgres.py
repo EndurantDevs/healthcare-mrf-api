@@ -12,8 +12,11 @@ import asyncpg
 import pytest
 
 from process import network_fhir_typed_mapping as mapping
+from process import network_membership_slices as slices
 from process import registry_imported_selection_preview as preview
-from process.network_approved_membership_source import pin_approved_membership_source
+from process import registry_membership_composition_stage as composition
+from process import registry_typed_membership_parity as membership_parity
+from process.network_approved_membership_source import ApprovedMembershipSource, pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import (
     FHIRMembershipBatchBoundsError,
@@ -24,9 +27,11 @@ from process.network_fhir_membership_source import (
 from process.network_fhir_retained_capture_contract import PRODUCER
 from process.network_fhir_typed_contract import TypedFHIRGraphError
 from process.network_fhir_typed_sql import PAIR_DDL
+from process.network_membership_copy import MembershipCopyTarget
 from process.network_source_binding_store import NetworkSourceBindingBatchCommand, apply_network_source_binding_batch
 from process.registry_source_recipe_composition import _require_recipe_custody
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from process.registry_source_retention import RegistrySourceRetentionError, registry_source_retention_sha256
 from tests import test_network_fhir_retained_capture_postgres as retained
 from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
 from tests.test_network_provider_only_plan_postgres import planner_connection as planner_connection
@@ -408,3 +413,177 @@ async def test_pair_plan_real_cancellation_rolls_back_completed_pages(planner_co
         assert observed.pages == 2
         assert await connection.fetchval("SHOW enable_nestloop") == original
         assert await connection.fetchval("SELECT count(*) FROM " + selected.relation("memberships")) == 0
+
+
+def _composition_candidate(target, stage, additions, removals, effective_rows):
+    receipt_by_field = {
+        "component": "registry_source_retention",
+        "revision": 1,
+        "table_name": "network_membership_source",
+        "source_generation_sha256": "b" * 64,
+        "source_rows": 3,
+        "add_rows": additions,
+        "remove_rows": removals,
+        "suppressed_source_rows": 2 if removals else 0,
+        "effective_rows": effective_rows,
+    }
+    candidate_by_field = {
+        name: getattr(target, name)
+        for name in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
+    }
+    candidate_by_field.update(
+        expected_rows=effective_rows,
+        approved_custom_revision=2,
+        source_generations={
+            "custom_membership": stage.source.generation_id,
+            "registry_source_retention": registry_source_retention_sha256(receipt_by_field),
+        },
+        validation_json={"registry_source_retention": receipt_by_field},
+    )
+    return candidate_by_field
+
+
+@pytest.fixture
+async def composition_parity_case(planner_connection, request):
+    connection, admin = planner_connection
+    additions, removals = getattr(request, "param", (0, 0))
+    identities = [str(uuid4()) for _ in range(4)]
+    copy_target = MembershipCopyTarget(*identities, "network_candidate_" + UUID(identities[3]).hex)
+    schema = '"' + copy_target.schema_name + '"'
+    owner = await connection.fetchval("SELECT current_user")
+    source_rows = [
+        (1, "npi", "1234567893", UUID(int=1), "first"),
+        (1, "npi", "1234567893", UUID(int=1), "first"),
+        (1, "npi", "1234567893", UUID(int=2), "second"),
+    ]
+    added_row = (1, "npi", "1234567893", UUID(int=3), "custom")
+    suffix = uuid4().hex
+    stage = composition.RegistryMembershipCommandStage(
+        ApprovedMembershipSource(2, "a" * 64, additions + removals),
+        "registry_command_add_" + suffix,
+        "registry_command_remove_" + suffix,
+        additions,
+        removals,
+    )
+    ddl = "(network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,evidence_id text NOT NULL)"
+    try:
+        await admin.execute(f'CREATE SCHEMA {schema} AUTHORIZATION "{owner}"')
+        for table in ("network_membership_source", "network_membership"):
+            relation = schema + "." + table
+            await connection.execute("CREATE TABLE " + relation + ddl)
+            await membership_parity.create_order_index(connection, relation, table + "_order_idx")
+        for table in (stage.add_table, stage.remove_table):
+            await connection.execute('CREATE TEMP TABLE "' + table + '"' + ddl)
+        await connection.copy_records_to_table(
+            "network_membership_source", schema_name=copy_target.schema_name, records=source_rows
+        )
+        if additions:
+            await connection.copy_records_to_table(stage.add_table, schema_name="pg_temp", records=[added_row])
+        if removals:
+            await connection.copy_records_to_table(stage.remove_table, schema_name="pg_temp", records=source_rows[:1])
+        effective_rows = [source_row for source_row in source_rows if not removals or source_row[3] != UUID(int=1)]
+        effective_rows += [added_row] if additions else []
+        await connection.copy_records_to_table(
+            "network_membership", schema_name=copy_target.schema_name, records=effective_rows
+        )
+        candidate = _composition_candidate(copy_target, stage, additions, removals, len(effective_rows))
+        yield SimpleNamespace(
+            connection=connection, target=copy_target, candidate=candidate, stage=stage, schema=schema
+        )
+    finally:
+        await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+@pytest.mark.parametrize("composition_parity_case", [(0, 0), (1, 0), (0, 1), (1, 1)], indirect=True)
+@pytest.mark.parametrize("typed", [False, True])
+async def test_composition_empty_arms_keep_nonempty_intent_and_duplicate_evidence(
+    composition_parity_case, monkeypatch, typed
+):
+    fixture = composition_parity_case
+    monkeypatch.setattr(membership_parity, "is_typed_candidate", lambda _candidate: typed)
+    original = membership_parity.has_multiset_difference
+    compared_queries = []
+
+    async def compare(connection, actual, expected):
+        compared_queries.append(expected)
+        return await original(connection, actual, expected)
+
+    monkeypatch.setattr(membership_parity, "has_multiset_difference", compare)
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        await composition.verify_registry_composition_rows(
+            fixture.connection, fixture.target, fixture.candidate, fixture.stage
+        )
+    if typed:
+        assert len(compared_queries) == 1
+        assert (fixture.stage.add_table in compared_queries[0]) == bool(fixture.stage.add_rows)
+        assert (fixture.stage.remove_table in compared_queries[0]) == bool(fixture.stage.remove_rows)
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        await fixture.connection.execute(
+            f"DELETE FROM {fixture.schema}.network_membership WHERE ctid IN "
+            f"(SELECT ctid FROM {fixture.schema}.network_membership LIMIT 1)"
+        )
+        with pytest.raises(RegistrySourceRetentionError, match="effective_parity_invalid"):
+            await composition.verify_registry_composition_rows(
+                fixture.connection, fixture.target, fixture.candidate, fixture.stage
+            )
+
+
+@pytest.mark.parametrize("table_kind", ["add_table", "remove_table"])
+async def test_composition_fresh_command_counts_are_checked_before_pruning(
+    composition_parity_case, monkeypatch, table_kind
+):
+    fixture = composition_parity_case
+    monkeypatch.setattr(membership_parity, "is_typed_candidate", lambda _candidate: True)
+
+    async def unexpected_comparison(*_arguments):
+        pytest.fail("Changed command counts must refuse before choosing a multiset query")
+
+    monkeypatch.setattr(membership_parity, "has_multiset_difference", unexpected_comparison)
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        table = composition._relation(getattr(fixture.stage, table_kind))
+        await fixture.connection.execute(f"INSERT INTO {table} VALUES(1,'npi','1234567893',$1,'unexpected')", uuid4())
+        with pytest.raises(RegistrySourceRetentionError, match="effective_parity_invalid"):
+            await composition.verify_registry_composition_rows(
+                fixture.connection, fixture.target, fixture.candidate, fixture.stage
+            )
+
+
+@pytest.mark.parametrize("mode", ["changed", "reused", "mixed"])
+@pytest.mark.parametrize("page_size", [1, 3])
+async def test_changed_edges_advance_over_reused_work_pages(composition_parity_case, monkeypatch, mode, page_size):
+    fixture = composition_parity_case
+    connection = fixture.connection
+    monkeypatch.setattr(slices, "_BATCH_ROWS", page_size)
+    await slices._create_slice_relations(connection, fixture.schema, typed=True)
+    work_name = "slice_page_" + uuid4().hex
+    work = 'pg_temp."' + work_name + '"'
+    await connection.execute(
+        f'CREATE TEMP TABLE {work}(network_id integer,office_bucket integer,location_key text COLLATE "C",'
+        "PRIMARY KEY(network_id,office_bucket,location_key))"
+    )
+    work_rows = [(1, 0, office_key) for office_key in ("a", "b", "c")]
+    work_rows += [(2, 0, office_key) for office_key in ("d", "e", "f")] + [(3, 0, "g"), (4, 0, "h")]
+    await connection.copy_records_to_table(work_name, schema_name="pg_temp", records=work_rows)
+    expected_edges = []
+    for network_id in range(1, 5):
+        slice_id = uuid4()
+        is_changed = mode == "changed" or mode == "mixed" and network_id in (2, 4)
+        artifact_id = UUID(fixture.target.candidate_id) if is_changed else uuid4()
+        office_keys = [
+            office_key for selected_network, _bucket, office_key in work_rows if selected_network == network_id
+        ]
+        await connection.execute(
+            f"INSERT INTO {fixture.schema}.network_slice_ref VALUES($1,0,$2,$3,$4,$5)",
+            network_id,
+            artifact_id,
+            slice_id,
+            len(office_keys),
+            "a" * 64,
+        )
+        if is_changed:
+            expected_edges.extend((slice_id, office_key) for office_key in office_keys)
+    async with connection.transaction(isolation="repeatable_read"):
+        copied = await slices._copy_changed_edges(connection, fixture.target, work)
+    actual_edges = await connection.fetch(f"SELECT * FROM {fixture.schema}.network_office_edge")
+    assert copied == len(expected_edges) == len(actual_edges)
+    assert {tuple(edge_row) for edge_row in actual_edges} == set(expected_edges)
