@@ -15,6 +15,8 @@ from uuid import UUID
 import pytest
 
 from process import registry_publication_worker as worker
+from process import registry_source_witness_runtime as source_runtime
+from process.network_fhir_sampled_validation import SemanticSamplingPolicy
 from process.registry_source_witness_runtime import install_source_witness_runtime, parse_source_witness_config
 from tests.test_network_fhir_source_witness_custody import _profile
 from tests.test_registry_candidate_custody_runtime import _configured
@@ -38,6 +40,12 @@ def _document():
 
 def _config():
     return worker.parse_registry_publication_worker_config(json.dumps(_document()))
+
+
+def _sampling_document():
+    document = _document()
+    document["source_witness"]["semantic_validation"] = {"contract": "sampled-semantic-v1", "seed": "a" * 64}
+    return document
 
 
 def _factory(monkeypatch, events, *, exported=None, enter_failure=None, exit_failure=None):
@@ -66,8 +74,59 @@ def test_server_profile_is_typed_separate_from_recipes_and_redacted():
     assert [profile.document() for profile in config.source_witness.source_profiles] == [_profile().document()]
     assert config.source_witness.runtime_roles == _ACTORS
     assert config.source_witness.capture_owner_role == "capture_owner"
+    assert config.source_witness.semantic_policy is None
     assert config.initial_address_sources.source_witness_runtime is None
     assert "source_owner" not in repr(config) and "capture_owner" not in repr(config.source_witness)
+
+
+def test_omitted_policy_preserves_full_mode_and_original_profile_document():
+    document = _document()["source_witness"]
+    original = copy.deepcopy(document)
+    config = parse_source_witness_config(document)
+    assert config.semantic_policy is None and document == original
+    assert original == {
+        "source_profiles": [profile.document() for profile in config.source_profiles],
+        "capture_owner_role": config.capture_owner_role,
+        "runtime_roles": list(config.runtime_roles),
+    }
+
+
+def test_explicit_sampling_mode_is_typed_and_keeps_original_profiles():
+    document = _sampling_document()
+    config = worker.parse_registry_publication_worker_config(json.dumps(document))
+    assert type(config.source_witness.semantic_policy) is SemanticSamplingPolicy
+    assert config.source_witness.semantic_policy.seed == "a" * 64
+    assert [profile.document() for profile in config.source_witness.source_profiles] == [_profile().document()]
+
+
+@pytest.mark.parametrize(
+    "semantic_document",
+    (
+        None,
+        False,
+        {},
+        {"contract": "exhaustive", "seed": "a" * 64},
+        {"contract": "sampled-semantic-v1"},
+        {"contract": "sampled-semantic-v1", "seed": None},
+        {"contract": "sampled-semantic-v1", "seed": False},
+        {"contract": "sampled-semantic-v1", "seed": "A" * 64},
+        {"contract": "sampled-semantic-v1", "seed": "a" * 63},
+        {"contract": "sampled-semantic-v1", "seed": "g" * 64},
+        {"contract": "sampled-semantic-v1", "seed": "a" * 64, "series_count": 10},
+        {"contract": "sampled-semantic-v1", "seed": "a" * 64, "items_per_series": 100},
+    ),
+)
+def test_sampling_mode_refuses_null_wrong_contract_options_or_seed(semantic_document):
+    document = _document()["source_witness"]
+    document["semantic_validation"] = semantic_document
+    with pytest.raises(ValueError):
+        parse_source_witness_config(document)
+
+
+@pytest.mark.parametrize("policy", (False, object(), {"seed": "a" * 64}))
+def test_direct_settings_require_the_exact_typed_policy(policy):
+    with pytest.raises(ValueError, match="registry_source_witness_config_invalid"):
+        replace(_config().source_witness, semantic_policy=policy)
 
 
 @pytest.mark.parametrize(
@@ -96,8 +155,9 @@ def test_source_settings_reject_unbounded_or_ambiguous_authority(changes_by_fiel
 
 
 @pytest.mark.parametrize("missing", ("custody_dsn", "initial_address_sources", "compact"))
-def test_worker_requires_independent_custody_and_compact_inputs(missing):
-    document = _document()
+@pytest.mark.parametrize("sampled", (False, True))
+def test_worker_requires_independent_custody_and_compact_inputs(missing, sampled):
+    document = _sampling_document() if sampled else _document()
     if missing == "compact":
         document["initial_address_sources"]["compact"] = False
     else:
@@ -171,6 +231,33 @@ async def test_installer_owns_original_factory_without_opening_a_capture(monkeyp
         assert installed.source_witness is None and config.initial_address_sources.source_witness_runtime is None
         assert await install_source_witness_runtime(installed, stack) is installed
         assert events == ["source open"]
+    assert events == ["source open", "source close"]
+    factory.assert_called_once_with()
+    exported.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sampled", (False, True))
+async def test_installer_forwards_policy_only_for_explicit_server_mode(monkeypatch, sampled):
+    events = []
+    exported, factory = _factory(monkeypatch, events)
+    document = _sampling_document() if sampled else _document()
+    config = worker.parse_registry_publication_worker_config(json.dumps(document))
+    constructor = Mock(wraps=source_runtime.SourceWitnessRuntime)
+    monkeypatch.setattr(source_runtime, "SourceWitnessRuntime", constructor)
+    async with AsyncExitStack() as stack:
+        installed = await install_source_witness_runtime(config, stack)
+        runtime = installed.initial_address_sources.source_witness_runtime
+        assert runtime.semantic_policy is config.source_witness.semantic_policy
+        assert runtime.semantic_validation is None
+    expected_options = {"semantic_policy": config.source_witness.semantic_policy} if sampled else {}
+    constructor.assert_called_once_with(
+        exported,
+        config.source_witness.source_profiles,
+        config.source_witness.capture_owner_role,
+        config.source_witness.runtime_roles,
+        **expected_options,
+    )
     assert events == ["source open", "source close"]
     factory.assert_called_once_with()
     exported.assert_not_called()

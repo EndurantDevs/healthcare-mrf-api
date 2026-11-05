@@ -114,11 +114,25 @@ class SourceWitnessRuntime:
     source_profiles: tuple
     capture_owner_role: str
     runtime_roles: tuple[str, ...]
+    semantic_validation: object = None
+    semantic_policy: object = None
 
     def __post_init__(self):
         if not callable(self.source_export):
             raise RegistrySourceCompositionError("registry_source_witness_runtime_invalid")
         validate_source_witness_configuration(self.source_profiles, self.capture_owner_role, self.runtime_roles)
+        if self.semantic_policy is not None:
+            from process.network_fhir_sampled_validation import SemanticSamplingPolicy
+
+            if type(self.semantic_policy) is not SemanticSamplingPolicy or self.semantic_validation is not None:
+                raise RegistrySourceCompositionError("registry_source_sampling_policy_invalid")
+            self.semantic_policy.__post_init__()
+        if self.semantic_validation is not None:
+            from process.network_sampled_custody import SampledValidationRun
+
+            if type(self.semantic_validation) is not SampledValidationRun:
+                raise RegistrySourceCompositionError("registry_source_sampling_policy_invalid")
+            self.semantic_validation.__post_init__()
 
 
 def validate_source_witness_configuration(source_profiles, capture_owner_role, runtime_roles):
@@ -291,6 +305,26 @@ async def require_typed_source_read(
         if type(origin) is SourceWitnessCompletionOrigin
         else FHIRSourceMembershipInput
     )
+    if runtime.semantic_validation is not None:
+        from process.network_approved_source_bindings import APPROVED_NETWORK_BINDINGS_SQL
+        from process.network_fhir_sampled_validation import SampledCaptureScope, verify_sampled_typed_capture
+        from process.network_fhir_typed_mapping import _approved_graph_keys
+        from process.network_membership_candidate_lifecycle import _control_namespace
+
+        bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
+        arguments = (approved.approved_revision, *recipe.binding_coordinates.sql_parameters, pin.catalog_generation)
+        keys = await _approved_graph_keys(connection, bindings, arguments)
+        sampled = await verify_sampled_typed_capture(
+            runtime.source_export,
+            connection,
+            pin.capture,
+            policy=runtime.semantic_validation.policy,
+            scope=SampledCaptureScope(
+                profile, origin_type(**asdict(origin)), pin.anchor, tuple(sorted(keys)), replay_stage
+            ),
+        )
+        await runtime.semantic_validation.record(sampled, connection)
+        return sampled
     return await verify_typed_graph_capture(
         runtime.source_export,
         connection,
