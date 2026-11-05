@@ -2783,7 +2783,7 @@ def test_entity_address_unified_provider_directory_replacement_can_copy_into_hea
 def test_provider_directory_replacement_stage_rebuilds_indexes_after_promote():
     source = inspect.getsource(entity_address_unified.process_data)
     publish_source = inspect.getsource(entity_address_unified.publish_entity_address_unified_generation)
-    promote = "ALTER TABLE {db_schema}.{replacement_stage_table} RENAME TO {stage_table};"
+    promote = "await preparation_admission.replace_compacted_stage("
     invalidate = 'context["stage_indexes_prepared"] = False'
     rebuild = "await _create_stage_indexes(stage_cls, db_schema, context=context)"
 

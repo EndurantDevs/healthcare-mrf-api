@@ -41,6 +41,7 @@ class ProviderDirectoryAddressPreparationInput:
     address_alias_generation: int
     relation_overrides: tuple[tuple[str, str], ...] = ()
     semantic_as_of: str | None = None
+    ordinary_serving_peer_pins: tuple[ProviderDirectoryAddressDatasetPin, ...] = ()
 
 
 @dataclass
@@ -252,6 +253,11 @@ def validate_preparation_input(inputs: ProviderDirectoryAddressPreparationInput)
         raise ValueError("entity-address preparation alias generation is invalid")
     _validate_semantic_date(inputs.semantic_as_of)
     _validate_source_inputs(inputs.dataset_pins, inputs.relation_overrides)
+    _validate_source_inputs(inputs.ordinary_serving_peer_pins, ())
+    if inputs.ordinary_serving_peer_pins:
+        from process.provider_directory_published_replacement_inputs import validate_peer_preparation
+
+        validate_peer_preparation(inputs)
 
 
 def _validate_source_inputs(dataset_pins, relation_overrides) -> None:
@@ -312,19 +318,39 @@ def _pins_sql(inputs: ProviderDirectoryAddressPreparationInput) -> str:
     )
 
 
-def _desired_datasets_sql(db_schema: str) -> str:
+def _ordinary_serving_peers_sql(db_schema, pins):
+    """Retain the ordinary current-alias authority only for explicitly captured peers."""
+    if not pins:
+        return "FALSE"
+    source_ids = _native()._string_array_literal([pin.source_id for pin in pins])
+    return (
+        f"pin.source_id=ANY({source_ids}) AND dataset.status='published' AND dataset.is_current "
+        f"AND EXISTS(SELECT FROM ONLY {db_schema}.provider_directory_source serving_source "
+        "WHERE serving_source.source_id=pin.source_id AND serving_source.endpoint_id=dataset.endpoint_id)"
+    )
+
+
+def _desired_datasets_sql(db_schema: str, ordinary_serving_peer_pins=()) -> str:
+    membership = "(dataset.publication_metadata_json::jsonb -> 'source_ids') @> jsonb_build_array(pin.source_id)"
+    dataset_relation = f"{db_schema}.provider_directory_endpoint_dataset"
+    if ordinary_serving_peer_pins:
+        dataset_relation = "ONLY " + dataset_relation
+        membership = (
+            f"CASE WHEN {_ordinary_serving_peers_sql(db_schema, ordinary_serving_peer_pins)} THEN true "
+            "ELSE (dataset.publication_metadata_json -> 'source_ids')::jsonb @> jsonb_build_array(pin.source_id) END"
+        )
     return f"""SELECT pin.source_id, dataset.endpoint_id, dataset.dataset_id,
         dataset.acquisition_root_run_id AS run_id,
         COALESCE(dataset.published_at, dataset.validated_at) AS published_at
       FROM desired_dataset_pins AS pin
-      JOIN {db_schema}.provider_directory_endpoint_dataset AS dataset
+      JOIN {dataset_relation} AS dataset
         ON dataset.dataset_id = pin.dataset_id AND dataset.endpoint_id = pin.endpoint_id
        AND dataset.dataset_hash = pin.dataset_hash
        AND dataset.acquisition_root_run_id = pin.run_id
      WHERE dataset.validated_at IS NOT NULL AND dataset.superseded_at IS NULL
        AND ((dataset.status = 'validated' AND dataset.is_current IS FALSE AND dataset.published_at IS NULL)
          OR (dataset.status = 'published' AND dataset.is_current IS TRUE AND dataset.published_at IS NOT NULL))
-       AND (dataset.publication_metadata_json::jsonb -> 'source_ids') @> jsonb_build_array(pin.source_id)"""
+       AND {membership}"""
 
 
 def _pins_cte(inputs: ProviderDirectoryAddressPreparationInput) -> str:
@@ -336,7 +362,8 @@ def _pins_cte(inputs: ProviderDirectoryAddressPreparationInput) -> str:
 async def assert_dataset_pins(db_schema: str, inputs: ProviderDirectoryAddressPreparationInput) -> None:
     """Require every desired dataset to retain its exact admitted content identity."""
     matched = await _preparation_scalar(
-        f"WITH {_pins_cte(inputs)} SELECT count(*) FROM ({_desired_datasets_sql(db_schema)}) AS selected"
+        f"WITH {_pins_cte(inputs)} SELECT count(*) FROM "
+        f"({_desired_datasets_sql(db_schema, inputs.ordinary_serving_peer_pins)}) AS selected"
     )
     if matched != len(inputs.dataset_pins):
         raise RuntimeError("entity-address preparation dataset pins changed")
@@ -365,7 +392,7 @@ def desired_overlay_ctes(db_schema: str, *, source_ids=None, run_id=None, affect
         else ""
     )
     return f"""WITH {_pins_cte(inputs)}, desired_datasets AS MATERIALIZED (
-        {_desired_datasets_sql(db_schema)}
+        {_desired_datasets_sql(db_schema, getattr(inputs, "ordinary_serving_peer_pins", ()))}
     ), requested_sources AS MATERIALIZED (
         SELECT source_id, endpoint_id FROM desired_dataset_pins {source_filter}
     ), endpoint_aliases AS MATERIALIZED (

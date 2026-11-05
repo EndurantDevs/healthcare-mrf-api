@@ -4,11 +4,13 @@
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_profile_source_inputs as inputs
+from process import provider_directory_published_replacement_inputs as serving_inputs
+from process import provider_directory_published_source_replacement as replacement
 from process import provider_directory_serving_recovery as recovery
 from process.provider_directory_artifact_scratch_inputs import (
     _loading_projection,
@@ -66,7 +68,7 @@ def ordinary_overlay_followup(directory, task):
         _FOLLOWUP_PREFIX + name for name in markers_by_field
     }
     require_output(
-        set(task) - {"test_mode", "run_id"} == expected_fields
+        set(task) - {"test_mode", "run_id", recovery.GENERATION_PARAM} == expected_fields
         and task.get("test_mode", False) is False
         and (
             "run_id" not in task
@@ -93,6 +95,12 @@ def ordinary_overlay_followup(directory, task):
         and not directory.is_uhc_flex_profile_source(markers_by_field["source_id"]),
         "ordinary_overlay_request_invalid",
     )
+    if recovery.GENERATION_PARAM in task:
+        require_output(
+            task[recovery.GENERATION_PARAM]
+            == recovery.publication_generation({name: markers_by_field[name] for name in _FOLLOWUP_IDENTITIES}),
+            "ordinary_overlay_request_invalid",
+        )
     return {_FOLLOWUP_PREFIX + name: marker for name, marker in markers_by_field.items()}
 
 
@@ -115,7 +123,8 @@ def require_overlay_followup_fence(directory, fence, metrics):
         actual_by_field != expected_by_field
         or dataset.status != "published"
         or dataset.is_current is not True
-        or any(
+        or replacement.selected(directory, fence) is None
+        and any(
             (alias.serving_endpoint_id or alias.endpoint_id) != alias.endpoint_id
             for alias in fence.locked_alias_datasets
         )
@@ -301,6 +310,7 @@ class _Admission:
     producer: tuple | None
     prepared: object = None
     recovery: object = None
+    replacement_scope: object = None
 
 
 def current(directory):
@@ -313,7 +323,8 @@ def current(directory):
         and admission.factory is source._FACTORY.get()
         and admission.task is asyncio.current_task()
         and admission.producer == (source.source_producer_identity() if admission.factory is not None else None)
-        and admission.fence_hash == desired_fence_hash(admission.fence),
+        and admission.fence_hash == desired_fence_hash(admission.fence)
+        and admission.replacement_scope is replacement.selected(directory, admission.fence),
         "rest_artifact_admission_changed",
     )
     return admission
@@ -359,6 +370,174 @@ async def publish_bundle(directory, fence, request, *, artifact_resource_types, 
                 }
             await directory._refresh_bundle_profile_delta_metrics(bundle, metrics)
             return await directory._record_artifact_promotion_metrics(fence, metrics, promoted)
+
+
+@asynccontextmanager
+async def prepare_published_replacement(directory, request, *, artifact_resource_types):
+    """Expose existing stages to the common owner without an early alias cut."""
+    async with replacement.preparation_scope(directory, request.metrics) as fence:
+        directory._assert_provider_directory_artifact_target_dependencies(
+            fence,
+            publish_artifacts_targets=request.publish_artifacts_targets,
+            publish_corroboration=request.publish_corroboration,
+        )
+        await directory._publish_current_dataset_relation_artifacts(
+            fence,
+            run_id=request.run_id,
+            metrics=request.metrics,
+            publish_artifacts_targets=request.publish_artifacts_targets,
+        )
+        serving_snapshot = await serving_inputs.capture(directory, fence)
+        async with publication_scope(directory, fence, request, artifact_resource_types):
+            dataset = fence.datasets[0]
+            pin_by_field = dict(
+                source_id=dataset.source_id,
+                endpoint_id=dataset.endpoint_id,
+                dataset_id=dataset.dataset_id,
+                dataset_hash=dataset.dataset_hash,
+                parent_run_id=dataset.evidence_run_id,
+            )
+            from process.provider_directory_published_replacement_journal import generation
+
+            recovery_by_field = dict(
+                generation=generation(pin_by_field),
+                source=pin_by_field,
+                run_id=request.run_id,
+                serving_inputs=serving_snapshot,
+            )
+            async with directory.db.transaction():
+                require_output(
+                    not await recovery._load_history(
+                        directory.db, directory._schema(), recovery_by_field["generation"]
+                    ),
+                    "rest_artifact_replacement_already_recorded",
+                )
+            admission = current(directory)
+            token = _ACTIVE.set(replace(admission, recovery=recovery_by_field))
+            try:
+                async with directory._prepare_artifact_bundle_from_fence(
+                    fence,
+                    request,
+                    artifact_resource_types=artifact_resource_types,
+                ) as (bundle, metrics):
+                    recovery.attach_overlay_stage(directory, bundle)
+                    yield fence, bundle, metrics
+            finally:
+                _ACTIVE.reset(token)
+
+
+def _replacement_recovery_for_address(directory, fence, bundle, address):
+    """Bind the exact coupled bundle and prepared Address input before opening a writer."""
+    from process.entity_address_candidate_preparation import PreparedEntityAddressGeneration
+
+    admission = current(directory)
+    require_output(
+        admission is not None
+        and admission.factory is None
+        and admission.recovery is not None
+        and replacement.selected(directory, fence) is admission.replacement_scope
+        and admission.fence is fence
+        and directory._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get() is fence
+        and type(address) is PreparedEntityAddressGeneration
+        and directory.db._transaction_binding() is None
+        and len(address.swaps) == 1
+        and address.swaps[0].live_cls.__main_table__ == recovery.receipts.ROOTS[1],
+        "rest_artifact_replacement_preparation_required",
+    )
+    selected = admission.recovery
+    require_output(
+        selected.get("bundle") is bundle
+        and not bundle.promoted
+        and len(bundle.stages) == 1
+        and bundle.stages[0] is selected["stage"]
+        and bundle.profile_delta is None
+        and bundle.archive_delta is None,
+        "rest_artifact_replacement_bundle_changed",
+    )
+    serving_snapshot = selected.get("serving_inputs")
+    serving_inputs.validate(serving_snapshot, selected["source"])
+    require_output(
+        address.preparation_input.dataset_pins == serving_inputs.desired_pins(serving_snapshot)
+        and address.preparation_input.ordinary_serving_peer_pins == serving_inputs.peer_pins(serving_snapshot)
+        and address.preparation_input.overlay_table == selected["stage"].stage_table
+        and address.db_schema == directory._schema(),
+        "rest_artifact_replacement_address_changed",
+    )
+    return selected
+
+
+async def publish_prepared_replacement(directory, fence, bundle, address):
+    """Apply the real prepared overlay and Address result before the one owner commits."""
+    from process.entity_address_candidate_preparation import (
+        publish_prepared_entity_address_generation,
+    )
+    from process.entity_address_serving_receipt import ordinary_address_receipt_callbacks
+    from process.entity_address_unified import _sql_literal
+    from process.provider_directory_artifact_bundle_preparation import apply_prepared_artifact_bundle
+
+    selected = _replacement_recovery_for_address(directory, fence, bundle, address)
+    context = address.context
+    require_output(recovery.GENERATION_PARAM not in context, "rest_artifact_replacement_address_changed")
+    context[recovery.GENERATION_PARAM] = selected["generation"]
+    context["serving_recovery_run_id"] = selected["run_id"]
+    require_output(_TERMINAL.get() is None, "rest_artifact_terminal_changed")
+    async with recovery.address_transaction(directory.db, "500ms", _sql_literal, context):
+        await recovery.begin_overlay(directory, selected)
+        await recovery.prepare_replacement_address(directory.db, directory._schema(), address, context, selected)
+        wall = context["serving_recovery_wall"]
+        wall.reschedule(min(wall.when(), asyncio.get_running_loop().time() + 2.0))
+        await directory.db.status("SET LOCAL statement_timeout='1000ms'")
+        await serving_inputs.lock_and_check(directory, selected["serving_inputs"])
+        await directory._lock_and_verify_artifact_dataset_fence(fence, directory.db)
+        token = _TERMINAL.set((current(directory), _publication_session(directory.db)))
+        try:
+            await apply_prepared_artifact_bundle(
+                directory,
+                tuple(bundle.stages),
+                cutover_timeout=context["serving_recovery_wall"],
+                extra_live_relations=tuple(address.relation_names),
+            )
+        finally:
+            _TERMINAL.reset(token)
+        document = await recovery.finish_overlay(directory, selected)
+        callbacks = ordinary_address_receipt_callbacks(directory.db, directory._schema(), _sql_literal)
+        async with recovery.coupled_address_scope(directory, selected, address, document):
+            await publish_prepared_entity_address_generation(address, callbacks=callbacks)
+    await address.mark_committed()
+    await bundle.mark_promoted()
+    return {
+        "serving_recovery": {"generation": selected["generation"], "phase": "published"},
+        "result_generation": address.native_receipt,
+    }
+
+
+async def replay_published_replacement(directory, metrics):
+    """Resolve a completed coupled cut from its journal before recapturing an incumbent."""
+    pin = replacement._descriptor_fields(directory, metrics)
+    from process import provider_directory_published_replacement_journal as replacement_journal
+
+    generation = replacement_journal.generation(pin)
+    async with asyncio.timeout(recovery.receipts.PREPARATION_SECONDS), directory.db.transaction():
+        if not await recovery.replacement_journal_present(directory.db, directory._schema()):
+            return None
+        await directory.db.status("SET LOCAL lock_timeout='500ms'")
+        latest = await recovery._resume_state(directory, generation)
+    if latest is None:
+        return None
+    require_output(
+        latest["source"] == pin and latest["phase"] == "published", "rest_artifact_replacement_replay_changed"
+    )
+    return {
+        "address_overlay": {
+            "published": True,
+            "rows": latest["after"]["roots"][recovery.receipts.ROOTS[0]]["rows"],
+            "source_ids": [pin["source_id"]],
+        },
+        "artifact_dataset_ids": [pin["dataset_id"]],
+        "artifact_dataset_evidence_run_ids": [pin["parent_run_id"]],
+        "serving_recovery": {"generation": generation, "phase": "published"},
+        "result_generation": latest["after"]["metadata"]["address"],
+    }
 
 
 async def _catalog(directory, name):
@@ -544,9 +723,12 @@ def _require_published_overlay(directory, fence, request):
         and not directory.is_uhc_flex_profile_source(fence.datasets[0].source_id)
         and fence.datasets[0].status == "published"
         and fence.datasets[0].is_current is True
-        and all(
-            (alias_dataset.serving_endpoint_id or alias_dataset.endpoint_id) == alias_dataset.endpoint_id
-            for alias_dataset in fence.locked_alias_datasets
+        and (
+            replacement.selected(directory, fence) is not None
+            or all(
+                (alias_dataset.serving_endpoint_id or alias_dataset.endpoint_id) == alias_dataset.endpoint_id
+                for alias_dataset in fence.locked_alias_datasets
+            )
         ),
         "rest_artifact_published_overlay_required",
     )
@@ -576,7 +758,10 @@ def _publication_admission(directory, fence, request, resource_types):
     factory = source._FACTORY.get()
     if is_ordinary_followup:
         require_output(
-            request.metrics.get(recovery.GENERATION_PARAM) is None, "rest_artifact_recovery_admission_required"
+            request.metrics.get(recovery.GENERATION_PARAM) is None
+            or replacement.selected(directory, fence) is not None
+            and recovery.overlay_request(fence, request) is not None,
+            "rest_artifact_recovery_admission_required",
         )
         require_overlay_followup_fence(directory, fence, request.metrics)
     else:
@@ -591,6 +776,7 @@ def _publication_admission(directory, fence, request, resource_types):
         source.source_producer_identity() if factory is not None else None,
         {},
         None if is_ordinary_followup else recovery.overlay_request(fence, request),
+        replacement.selected(directory, fence),
     )
 
 
@@ -706,6 +892,19 @@ async def lock_address_source_fence(directory, database, schema, context):
         "address_source_fence_invalid",
     )
     _publication_session(database)
+    admission = current(directory)
+    if admission is not None and admission.replacement_scope is not None:
+        from process import provider_directory_published_replacement_journal as journal
+
+        selected = admission.recovery
+        require_output(
+            selected is not None
+            and (source_ids[0], dataset_id, root_run_id)
+            == tuple(selected["source"][field] for field in ("source_id", "dataset_id", "parent_run_id")),
+            "address_source_fence_changed",
+        )
+        await journal.check(directory, selected["source"], selected.get(journal.FIELD))
+        return
     fence = await directory._resolve_provider_directory_artifact_datasets(source_ids)
     require_output(
         len(fence.datasets) == 1
@@ -750,3 +949,44 @@ async def terminal_fence(directory):
             require_output(_publication_session(directory.db) is session, "rest_artifact_transaction_changed")
         finally:
             _TERMINAL.reset(token)
+
+
+def current_dataset_fence_query(db_schema: str) -> str:
+    """Build the immutable publication fence query for one source."""
+
+    return f"""
+        SELECT dataset.dataset_id
+          FROM {db_schema}.provider_directory_source AS source
+          JOIN {db_schema}.provider_directory_endpoint_dataset AS dataset
+            ON dataset.dataset_id = :expected_dataset_id
+         WHERE source.source_id = :source_id
+           AND dataset.acquisition_root_run_id = :expected_root_run_id
+           AND dataset.status = 'published'
+           AND dataset.is_current IS TRUE
+           AND dataset.published_at IS NOT NULL
+           AND dataset.superseded_at IS NULL
+           AND jsonb_typeof(
+                   dataset.publication_metadata_json::jsonb -> 'source_ids'
+               ) = 'array'
+           AND (
+                   dataset.publication_metadata_json::jsonb -> 'source_ids'
+               ) @> jsonb_build_array(source.source_id)
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM {db_schema}.provider_directory_endpoint_dataset AS competing
+                 WHERE competing.dataset_id <> dataset.dataset_id
+                   AND competing.status = 'published'
+                   AND competing.is_current IS TRUE
+                   AND competing.published_at IS NOT NULL
+                   AND competing.superseded_at IS NULL
+                   AND jsonb_typeof(
+                           competing.publication_metadata_json::jsonb
+                               -> 'source_ids'
+                       ) = 'array'
+                   AND (
+                           competing.publication_metadata_json::jsonb
+                               -> 'source_ids'
+                       ) @> jsonb_build_array(source.source_id)
+           )
+         LIMIT 1;
+        """

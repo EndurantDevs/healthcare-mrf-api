@@ -8606,6 +8606,9 @@ async def _install_provider_directory_prepared_stage(
 async def _finish_provider_directory_prepared_stage(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
+    from process.provider_directory_published_source_replacement import require_retained_output
+
+    await require_retained_output(sys.modules[__name__], stage)
     await db.status(_drop_address_corroboration_sql(stage.schema, f"{stage.target_relation}_old"))
     await stage.rename_stage_indexes(stage.schema, stage.stage_table)
     await _assert_provider_directory_logged_relation(stage.schema, stage.target_relation)
@@ -8645,35 +8648,9 @@ async def _verify_active_profile_selection_at_cutover() -> None:
 async def _cutover_provider_directory_artifact_sources(
     fence: ProviderDirectoryArtifactDatasetFence,
 ) -> None:
-    source_ref = _unscoped_qt(_schema(), ProviderDirectorySource.__tablename__)
-    for dataset in fence.locked_alias_datasets:
-        serving_endpoint_id = dataset.serving_endpoint_id or dataset.endpoint_id
-        if (
-            not (dataset.promote_on_cutover or dataset.reconcile_source_alias_on_cutover)
-            or serving_endpoint_id == dataset.endpoint_id
-        ):
-            continue
-        configured_endpoint_cas = (
-            "\n               AND metadata_json::jsonb"
-            f" ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}'"
-            " = :endpoint_id"
-            if dataset.completion_proof_required_version == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
-            else ""
-        )
-        updated_count = await db.status(
-            f"""
-            UPDATE {source_ref}
-               SET endpoint_id = :endpoint_id,
-                   updated_at = now()
-             WHERE source_id = :source_id
-               AND endpoint_id = :serving_endpoint_id{configured_endpoint_cas};
-            """,
-            source_id=dataset.source_id,
-            endpoint_id=dataset.endpoint_id,
-            serving_endpoint_id=serving_endpoint_id,
-        )
-        if _coerce_rowcount(updated_count) != 1:
-            raise ProviderDirectoryArtifactBuildStale("provider_directory_source_endpoint_dataset_changed")
+    from process.provider_directory_published_source_replacement import cutover_sources
+
+    await cutover_sources(sys.modules[__name__], fence)
 
 
 async def _supersede_artifact_dataset_incumbent(
@@ -13368,12 +13345,19 @@ class ProviderDirectoryArtifactDatasetFence:
         return sorted({dataset.source_id for dataset in self.locked_alias_datasets})
 
 
+class _PublishedSourceReplacementFence(ProviderDirectoryArtifactDatasetFence):
+    """Keep explicit replacement fences scope-required through dataclass copies."""
+
+
 def _provider_directory_artifact_dataset_selection_sql(
     source_ids: list[str] | tuple[str, ...] | None,
     *,
     should_select_validated_candidates: bool = False,
+    allow_published_replacement: bool = False,
 ) -> str:
     """Select one immutable dataset per endpoint with explicit fallback rules."""
+    if allow_published_replacement and (not source_ids or len(source_ids) != 1 or should_select_validated_candidates):
+        raise ValueError("provider_directory_published_replacement_scope_invalid")
     source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
     dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
     is_explicit_selection = source_ids is not None
@@ -13390,9 +13374,10 @@ def _provider_directory_artifact_dataset_selection_sql(
         dataset_ref,
         source_ref,
         is_explicit_selection=is_explicit_selection,
+        allow_published_replacement=allow_published_replacement,
     )
     selection_sql = (
-        _artifact_dataset_explicit_selection_sql(dataset_ref)
+        _artifact_dataset_explicit_selection_sql(dataset_ref, allow_published_replacement=allow_published_replacement)
         if is_explicit_selection
         else _artifact_dataset_all_source_selection_sql(dataset_ref)
     )
@@ -16212,6 +16197,7 @@ def _artifact_dataset_selection_scope_ctes(
     source_ref: str,
     *,
     is_explicit_selection: bool,
+    allow_published_replacement: bool = False,
 ) -> str:
     """Build source and alias choices without hydrating generic proofs."""
 
@@ -16219,7 +16205,9 @@ def _artifact_dataset_selection_scope_ctes(
     configured_endpoint = (
         f"NULLIF(source.metadata_json::jsonb ->> '{PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY}', '')"
     )
-    published_alias_scope = _artifact_published_alias_scope_ctes(dataset_ref, source_ref)
+    published_alias_scope = _artifact_published_alias_scope_ctes(
+        dataset_ref, source_ref, allow_published_replacement=allow_published_replacement
+    )
     candidate_metadata = "candidate_publication.full_metadata_jsonb"
     return f"""
         resolver_sources AS MATERIALIZED (
@@ -16278,6 +16266,8 @@ def _artifact_current_selection_metadata_sql(
 def _artifact_published_alias_scope_ctes(
     dataset_ref: str,
     source_ref: str,
+    *,
+    allow_published_replacement: bool = False,
 ) -> str:
     """Admit configured published aliases only inside their ID scope."""
 
@@ -16302,16 +16292,7 @@ def _artifact_published_alias_scope_ctes(
                AND dataset.status = :published_status
                AND dataset.published_at IS NOT NULL
                AND dataset.superseded_at IS NULL
-               AND NOT EXISTS (
-                    SELECT 1
-                      FROM {dataset_ref} AS serving_dataset
-                     WHERE serving_dataset.endpoint_id =
-                               source.serving_endpoint_id
-                       AND serving_dataset.is_current = true
-                       AND serving_dataset.status = :published_status
-                       AND serving_dataset.published_at IS NOT NULL
-                       AND serving_dataset.superseded_at IS NULL
-               )
+               {_artifact_serving_alias_exclusion_sql(dataset_ref, allow_published_replacement)}
         ), reviewed_published_aliases AS MATERIALIZED (
             SELECT dataset.dataset_id,
                    dataset.endpoint_id
@@ -16488,6 +16469,8 @@ def _artifact_dataset_projection_sql() -> str:
 
 def _artifact_dataset_explicit_selection_sql(
     dataset_ref: str,
+    *,
+    allow_published_replacement: bool = False,
 ) -> str:
     """Select only caller-requested aliases while retaining endpoint datasets."""
     return f"""
@@ -16507,7 +16490,7 @@ def _artifact_dataset_explicit_selection_sql(
                    source.source_record_json
               FROM resolver_sources AS source
               {_artifact_validated_candidate_alias_join_sql()}
-              {_artifact_published_alias_reconciliation_join_sql(dataset_ref)}
+              {_artifact_published_alias_reconciliation_join_sql(dataset_ref, allow_published_replacement=allow_published_replacement)}
         )
     """
 
@@ -16611,6 +16594,8 @@ def _artifact_validated_candidate_alias_join_sql() -> str:
 
 def _artifact_published_alias_reconciliation_join_sql(
     dataset_ref: str,
+    *,
+    allow_published_replacement: bool = False,
 ) -> str:
     """Match a proven publication only when its serving alias is orphaned."""
     published_metadata = _artifact_current_selection_metadata_sql("published_dataset")
@@ -16619,15 +16604,7 @@ def _artifact_published_alias_reconciliation_join_sql(
           ON published_alias.endpoint_id = source.configured_endpoint_id
          AND published_alias.endpoint_id IS DISTINCT FROM
                  source.serving_endpoint_id
-         AND NOT EXISTS (
-                SELECT 1
-                  FROM {dataset_ref} AS serving_dataset
-                 WHERE serving_dataset.endpoint_id = source.serving_endpoint_id
-                   AND serving_dataset.is_current = true
-                   AND serving_dataset.status = :published_status
-                   AND serving_dataset.published_at IS NOT NULL
-                   AND serving_dataset.superseded_at IS NULL
-             )
+         {_artifact_serving_alias_exclusion_sql(dataset_ref, allow_published_replacement)}
          AND EXISTS (
                 SELECT 1
                   FROM {dataset_ref} AS published_dataset
@@ -16643,6 +16620,12 @@ def _artifact_published_alias_reconciliation_join_sql(
                        @> jsonb_build_array(source.source_id)
              )
     """
+
+
+def _artifact_serving_alias_exclusion_sql(dataset_ref: str, allow_published_replacement: bool) -> str:
+    from process.provider_directory_published_source_replacement import serving_alias_exclusion_sql
+
+    return serving_alias_exclusion_sql(dataset_ref, allow_published_replacement)
 
 
 def _artifact_dataset_resource_profile(
@@ -18121,6 +18104,7 @@ async def _resolve_provider_directory_artifact_datasets(
     source_ids: list[str] | tuple[str, ...] | None,
     *,
     should_select_validated_candidates: bool = False,
+    allow_published_replacement: bool = False,
 ) -> ProviderDirectoryArtifactDatasetFence:
     is_explicit_selection = source_ids is not None
     cleaned_source_ids = _clean_source_id_list(source_ids)
@@ -18130,6 +18114,7 @@ async def _resolve_provider_directory_artifact_datasets(
         _provider_directory_artifact_dataset_selection_sql(
             cleaned_source_ids if is_explicit_selection else None,
             should_select_validated_candidates=(should_select_validated_candidates),
+            allow_published_replacement=allow_published_replacement,
         ),
         published_status=ENDPOINT_DATASET_PUBLISHED,
         validated_status=ENDPOINT_DATASET_VALIDATED,
@@ -18147,7 +18132,12 @@ async def _resolve_provider_directory_artifact_datasets(
         cleaned_source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
     )
-    return await _expand_reviewed_artifact_promotion_aliases(fence)
+    fence = await _expand_reviewed_artifact_promotion_aliases(fence)
+    if allow_published_replacement:
+        from process.provider_directory_published_source_replacement import mark_for_preparation
+
+        return mark_for_preparation(sys.modules[__name__], fence)
+    return fence
 
 
 async def ensure_provider_directory_published_source_alias(
@@ -20163,6 +20153,7 @@ async def _lock_and_verify_artifact_dataset_fence(
     executor: Any | None = None,
 ) -> None:
     """Fence alias and dataset identity while an artifact becomes live."""
+    from process import provider_directory_published_source_replacement as published_replacement
     from process.provider_directory_generic_source_artifacts import is_fence_held
 
     if not fence.datasets or is_fence_held(sys.modules[__name__], fence, executor):
@@ -20196,6 +20187,7 @@ async def _lock_and_verify_artifact_dataset_fence(
         query_executor,
     )
     await _assert_uhc_flex_profile_fence_ready(fence, query_executor)
+    await published_replacement.verify_locked(sys.modules[__name__], fence, query_executor)
 
 
 async def _assert_reviewed_activation_ready(
@@ -23671,25 +23663,10 @@ async def _publish_provider_directory_dataset_artifacts(
         raise RuntimeError("provider_directory_profile_global_target_required")
     if require_complete_global_profile_fence and _clean_source_id_list(source_ids):
         raise RuntimeError("provider_directory_profile_global_fence_required")
-    should_select_validated_candidates = _should_select_validated_artifacts(publish_artifacts_targets)
-    fence = await _prepare_artifact_publication_fence(
-        source_ids,
-        run_id=run_id,
-        metrics=metrics,
-        publish_artifacts_targets=publish_artifacts_targets,
-        publish_corroboration=publish_corroboration,
-        should_select_validated_candidates=should_select_validated_candidates,
-        validated_publication_candidate=validated_publication_candidate,
-    )
-    if _is_dataset_relation_only_artifact_target(publish_artifacts_targets):
-        metrics["publish_artifacts_targets"] = sorted(publish_artifacts_targets or ())
-        return metrics
-    artifact_resource_types = _provider_directory_artifact_resource_types(
-        publish_artifacts_targets,
-        publish_corroboration=publish_corroboration,
-    )
-    return await _publish_artifact_bundle_from_fence(
-        fence,
+    from process.provider_directory_published_replacement_followup import publish_dataset_artifacts
+
+    return await publish_dataset_artifacts(
+        sys.modules[__name__],
         ProviderDirectoryArtifactPublishRequest(
             run_id=run_id,
             metrics=metrics,
@@ -23698,7 +23675,7 @@ async def _publish_provider_directory_dataset_artifacts(
             publish_artifacts_targets=publish_artifacts_targets,
             full_address_artifact_rebuild=full_address_artifact_rebuild,
         ),
-        artifact_resource_types=artifact_resource_types,
+        validated_publication_candidate=validated_publication_candidate,
     )
 
 

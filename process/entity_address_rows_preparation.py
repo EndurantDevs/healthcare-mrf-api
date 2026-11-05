@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from db.plan_release_storage import storage_relation
+from process import entity_address_ordinary_preparation as ordinary_preparation
 from process import entity_address_preparation_admission as admission
 from process import entity_address_rows_native as rows
 from process.provider_directory_projection_stage import _copy_driver
@@ -66,7 +67,7 @@ async def _create_scratch(sql, schema, name, statement, oid_by_name, row_scratch
 
 
 async def _drop_scratch(sql, schema, names, oid_by_name):
-    scope = admission._ADMISSION.get()
+    scope = admission._ADMISSION.get() or ordinary_preparation.current()
     for name in reversed(names):
         if scope is not None:
             if name in scope.owned_oids:
@@ -89,6 +90,8 @@ async def _drop_scratch(sql, schema, names, oid_by_name):
 async def _scratch_tables(sql, schema, source_select, include_base_address_version, row_scratch):
     suffix = uuid4().hex
     names = (f"address_rows_input_{suffix}", f"address_rows_prepared_{suffix}")
+    if (owned := ordinary_preparation.current()) is not None:
+        owned.declare(names)
     candidate = storage_relation(schema, names[0])
     prepared = storage_relation(schema, names[1])
     oid_by_name = {}

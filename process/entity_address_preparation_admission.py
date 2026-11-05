@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
+from process import entity_address_ordinary_preparation as ordinary_preparation
 from process import entity_address_source_preparation as source_preparation
 from process.provider_directory_profile_temp_limit import apply_temp_file_limit
 
@@ -263,18 +264,22 @@ async def create_stage_table(db_schema, stage_cls, *, unlogged=False):
     _validate_row_context()
     native = _native()
     name = stage_cls.__tablename__
+
+    async def create(session):
+        """Capture model creation on the same transaction as its physical identity."""
+        connection = await session.connection()
+        await connection.run_sync(stage_cls.__table__.create, checkfirst=False)
+        if unlogged or _ADMISSION.get() is not None:
+            await native.db.status(native._set_unlogged_table_sql(db_schema, name))
+
     if _ADMISSION.get() is None:
+        if await ordinary_preparation.create(db_schema, name, create):
+            return
         await native.db.status(f"DROP TABLE IF EXISTS {db_schema}.{name};")
         await native.db.create_table(stage_cls.__table__, checkfirst=True)
         if unlogged:
             await native.db.status(native._set_unlogged_table_sql(db_schema, name))
         return
-
-    async def create(session):
-        """Create the model on the session that owns both DDL and its OID capture."""
-        connection = await session.connection()
-        await connection.run_sync(stage_cls.__table__.create, checkfirst=False)
-        await native.db.status(native._set_unlogged_table_sql(db_schema, name))
 
     await _finish_owned_operation(lambda: _create_owned_relation(db_schema, name, create))
 
@@ -285,11 +290,18 @@ async def create_stage_sql(db_schema, name, statement, *, row_scratch=None, **ph
     _validate_row_context()
     row_state = None if row_scratch is None else _row_scratch_state(row_scratch)
     if _ADMISSION.get() is None:
+
+        async def create_ordinary(_session):
+            """Keep existing progress and SQL bounds inside the creation transaction."""
+            if phase_options:
+                await native._run_sql_phase(statement, **phase_options)
+            else:
+                await native.db.status(statement)
+
+        if await ordinary_preparation.create(db_schema, name, create_ordinary):
+            return
         await native.db.status(f"DROP TABLE IF EXISTS {db_schema}.{name};")
-        if phase_options:
-            await native._run_sql_phase(statement, **phase_options)
-        else:
-            await native.db.status(statement)
+        await create_ordinary(None)
         return
 
     async def create(_session):
@@ -342,11 +354,17 @@ async def _lock_owned_stage(db_schema, name):
     return expected_oid
 
 
-async def drop_stage(db_schema, name):
+async def drop_stage(db_schema, name, **phase_options):
     """Retire an intermediate heap only under its exact captured physical ownership."""
     _validate_row_context()
     if _ADMISSION.get() is None:
-        await _native().db.status(f"DROP TABLE IF EXISTS {db_schema}.{name};")
+        if await ordinary_preparation.drop(db_schema, name):
+            return
+        statement = f"DROP TABLE IF EXISTS {db_schema}.{name};"
+        if phase_options:
+            await _native()._run_sql_phase(statement, **phase_options)
+        else:
+            await _native().db.status(statement)
         return
     await _finish_owned_operation(lambda: _drop_owned_relation(db_schema, name))
 
@@ -368,6 +386,8 @@ async def replace_compacted_stage(db_schema, stage, compact, context):
     _validate_row_context()
     native = _native()
     if _ADMISSION.get() is None:
+        if await ordinary_preparation.replace(db_schema, stage, compact):
+            return
         for statement in (f"DROP TABLE {db_schema}.{stage};", f"ALTER TABLE {db_schema}.{compact} RENAME TO {stage};"):
             await native._run_sql_phase(
                 statement, context=context, phase="entity-address-unified compacting hot rows swap"
@@ -423,8 +443,8 @@ async def _worker_slot():
 
 
 async def gather(*operations, return_exceptions=False):
-    """Drain failed admitted sibling producers before their owner can remove scratch."""
-    if _ADMISSION.get() is None:
+    """Drain failed owned sibling producers before their owner can remove scratch."""
+    if _ADMISSION.get() is None and ordinary_preparation.current() is None:
         return await asyncio.gather(*operations, return_exceptions=return_exceptions)
     async with asyncio.TaskGroup() as group:
         tasks = [group.create_task(_gather_result(operation, return_exceptions)) for operation in operations]
