@@ -386,44 +386,10 @@ def _validate_provider_directory_dataset_fence_scope(
 
 
 def _provider_directory_current_dataset_fence_query(db_schema: str) -> str:
-    """Build the immutable publication fence query for one source."""
+    """Keep the ordinary publication query on its shared source-fence helper."""
+    from process.provider_directory_generic_source_artifacts import current_dataset_fence_query
 
-    return f"""
-        SELECT dataset.dataset_id
-          FROM {db_schema}.provider_directory_source AS source
-          JOIN {db_schema}.provider_directory_endpoint_dataset AS dataset
-            ON dataset.dataset_id = :expected_dataset_id
-         WHERE source.source_id = :source_id
-           AND dataset.acquisition_root_run_id = :expected_root_run_id
-           AND dataset.status = 'published'
-           AND dataset.is_current IS TRUE
-           AND dataset.published_at IS NOT NULL
-           AND dataset.superseded_at IS NULL
-           AND jsonb_typeof(
-                   dataset.publication_metadata_json::jsonb -> 'source_ids'
-               ) = 'array'
-           AND (
-                   dataset.publication_metadata_json::jsonb -> 'source_ids'
-               ) @> jsonb_build_array(source.source_id)
-           AND NOT EXISTS (
-                SELECT 1
-                  FROM {db_schema}.provider_directory_endpoint_dataset AS competing
-                 WHERE competing.dataset_id <> dataset.dataset_id
-                   AND competing.status = 'published'
-                   AND competing.is_current IS TRUE
-                   AND competing.published_at IS NOT NULL
-                   AND competing.superseded_at IS NULL
-                   AND jsonb_typeof(
-                           competing.publication_metadata_json::jsonb
-                               -> 'source_ids'
-                       ) = 'array'
-                   AND (
-                           competing.publication_metadata_json::jsonb
-                               -> 'source_ids'
-                       ) @> jsonb_build_array(source.source_id)
-           )
-         LIMIT 1;
-        """
+    return current_dataset_fence_query(db_schema)
 
 
 async def _assert_current_provider_directory_dataset(
@@ -438,6 +404,18 @@ async def _assert_current_provider_directory_dataset(
         return await candidate_preparation.assert_selected_dataset(
             db_schema, source_id, expected_dataset_id, expected_root_run_id
         )
+
+    from process import provider_directory_published_source_replacement as replacement
+
+    directory = importlib.import_module("process.provider_directory_fhir")
+    if await replacement.is_address_selection_current(
+        directory,
+        db_schema,
+        source_id,
+        expected_dataset_id,
+        expected_root_run_id,
+    ):
+        return
 
     dataset_row = await preparation_admission.read_first(
         db,
@@ -2294,12 +2272,12 @@ async def _drop_stage_artifacts(
     *,
     extra_tables: Iterable[str] = (),
 ) -> None:
-    await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
+    await preparation_admission.drop_stage(db_schema, stage_cls.__tablename__)
     for stage_model in support_stage_class_map.values():
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_model.__tablename__};")
+        await preparation_admission.drop_stage(db_schema, stage_model.__tablename__)
     for table_name in extra_tables:
         if table_name:
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table_name};")
+            await preparation_admission.drop_stage(db_schema, table_name)
 
 
 async def _has_table(db_schema: str, table_name: str) -> bool:
@@ -11995,8 +11973,9 @@ async def process_entity_address_unified_data(ctx, task=None):
         affected_group_table = _partial_affected_group_table(stage_table)
         context["partial_provider_directory_affected_group_table"] = affected_group_table
         context["partial_affected_group_table"] = affected_group_table
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
-        await _run_sql_phase(
+        await preparation_admission.create_stage_sql(
+            db_schema,
+            affected_group_table,
             _prepare_partial_affected_groups_sql(
                 db_schema,
                 affected_group_table,
@@ -12992,7 +12971,7 @@ async def process_entity_address_unified_data(ctx, task=None):
         and not context.get("partial_support_patch_publish")
         and not context.get("partial_provider_directory_replacement_publish")
     ):
-        await db.status(f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};")
+        await preparation_admission.drop_stage(db_schema, affected_group_table)
 
     if (
         _is_env_enabled(
@@ -13049,19 +13028,9 @@ async def process_entity_address_unified_data(ctx, task=None):
             await _ensure_entity_address_unified_live_columns(db_schema)
         replacement_stage_table = _provider_directory_replacement_stage_table_name(stage_table)
         context["partial_provider_directory_replacement_stage_table"] = replacement_stage_table
-        await _run_sql_phase(
-            f"DROP TABLE IF EXISTS {db_schema}.{replacement_stage_table};",
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified preparing Provider Directory replacement heap",
-            unit="tables",
-            done=0,
-            total=1,
-            pct=90,
-            message="dropping stale Provider Directory replacement heap",
-            emit_done=True,
-        )
-        await _run_sql_phase(
+        await preparation_admission.create_stage_sql(
+            db_schema,
+            replacement_stage_table,
             _create_provider_directory_replacement_stage_sql(
                 db_schema,
                 replacement_stage_table=replacement_stage_table,
@@ -13080,19 +13049,9 @@ async def process_entity_address_unified_data(ctx, task=None):
         await preparation_admission.stage_status(_disable_autovacuum_sql(db_schema, replacement_stage_table))
         affected_live_location_table = _affected_live_location_table(stage_table)
         context["partial_provider_directory_affected_live_location_table"] = affected_live_location_table
-        await _run_sql_phase(
-            f"DROP TABLE IF EXISTS {db_schema}.{affected_live_location_table};",
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified preparing Provider Directory affected locations",
-            unit="tables",
-            done=0,
-            total=1,
-            pct=90,
-            message="dropping stale Provider Directory affected location stage",
-            emit_done=True,
-        )
-        await _run_sql_phase(
+        await preparation_admission.create_stage_sql(
+            db_schema,
+            affected_live_location_table,
             _prepare_affected_live_locations_sql(
                 db_schema,
                 live_table=EntityAddressUnified.__main_table__,
@@ -13186,35 +13145,13 @@ async def process_entity_address_unified_data(ctx, task=None):
         )
         context["partial_provider_directory_affected_stage_rows_copied"] = int(affected_stage_rows or 0)
         context["partial_provider_directory_replacement_rows"] = int(copied_rows or 0) + int(affected_stage_rows or 0)
-        await _run_sql_phase(
-            f"DROP TABLE {db_schema}.{stage_table};",
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified swapping Provider Directory replacement stage",
-            unit="tables",
-            done=0,
-            total=1,
-            pct=90,
-            message="dropping affected-only stage",
-            emit_done=True,
-        )
-        await _run_sql_phase(
-            f"ALTER TABLE {db_schema}.{replacement_stage_table} RENAME TO {stage_table};",
-            context=context,
-            run_id=run_id,
-            phase="entity-address-unified swapping Provider Directory replacement stage",
-            unit="tables",
-            done=1,
-            total=1,
-            pct=90,
-            message="promoting Provider Directory replacement stage",
-            emit_done=True,
-        )
+        await preparation_admission.replace_compacted_stage(db_schema, stage_table, replacement_stage_table, context)
         context["stage_indexes_prepared"] = False
         context["partial_provider_directory_replacement_stage_indexes_invalidated"] = True
         await _ensure_stage_primary_key(stage_cls, db_schema, context=context)
-        await _run_sql_phase(
-            f"DROP TABLE IF EXISTS {db_schema}.{affected_group_table};",
+        await preparation_admission.drop_stage(
+            db_schema,
+            affected_group_table,
             context=context,
             run_id=run_id,
             phase="entity-address-unified dropping affected Provider Directory groups",
@@ -13586,8 +13523,9 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     await _create_stage_indexes(stage_cls, db_schema, context=context)
     context["stage_indexes_prepared"] = True
     if coordinate_scope_table:
-        await _run_sql_phase(
-            f"DROP TABLE IF EXISTS {db_schema}.{coordinate_scope_table};",
+        await preparation_admission.drop_stage(
+            db_schema,
+            coordinate_scope_table,
             context=context,
             run_id=run_id,
             phase="entity-address-unified dropping Provider Directory post-build scope",
