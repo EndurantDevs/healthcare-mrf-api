@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
+from asyncpg import InsufficientPrivilegeError
 
 from process import network_fhir_sampled_validation as sampled
 from process import network_fhir_typed_capture as capture
@@ -307,6 +308,77 @@ async def test_candidate_second_pass_filters_native_batch_before_semantic_replay
     assert len(native.candidate_selected_indices.call_args.args[0]) == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selected_counts", "batch_sizes"),
+    [((1, 0, 2), [3]), ((500, 501), [1000, 1]), ((1000, 1000), [1000, 1000]), ((0, 0), [])],
+    ids=("sparse", "final-partial", "dense", "empty"),
+)
+async def test_candidate_replay_batches_selected_rows_across_cursor_pages(monkeypatch, selected_counts, batch_sizes):
+    pages = [
+        [
+            dict(
+                zip(
+                    PAIR_COLUMNS,
+                    (
+                        *_pair(page * 1000 + index),
+                        "PractitionerRole",
+                        f"role-{page}-{index}",
+                        "office-one",
+                        "direct",
+                        1,
+                    ),
+                    strict=True,
+                )
+            )
+            for index in range(1000)
+        ]
+        for page in range(len(selected_counts))
+    ]
+    # Duplicate provenance must survive a cursor-page boundary without changing its order.
+    pages[-1][0] = pages[0][0]
+    indices = [list(range(count)) for count in selected_counts]
+    expected_rows = [page[index] for page, selected in zip(pages, indices, strict=True) for index in selected]
+    cursor = SimpleNamespace(fetch=AsyncMock(side_effect=[*pages, []]))
+    connection = SimpleNamespace(cursor=AsyncMock(return_value=cursor))
+    native = SimpleNamespace(candidate_selected_indices=Mock(side_effect=indices))
+    batches = []
+
+    async def record_batch(_export, _connection, _replay, pair_rows, *_arguments):
+        batches.append(list(pair_rows))
+
+    monkeypatch.setattr(sampled, "_candidate_coverage", Mock(return_value={}))
+    monkeypatch.setattr(sampled, "_candidate_batch", record_batch)
+    await sampled._candidate_direction(
+        {}, connection, SimpleNamespace(relation=lambda _: "closed.pairs"), object(), _origin(), None, native
+    )
+    assert [len(batch) for batch in batches] == batch_sizes
+    assert [pair_by_field for batch in batches for pair_by_field in batch] == expected_rows
+    assert native.candidate_selected_indices.call_count == len(pages)
+    assert all(call.args == (1000,) for call in cursor.fetch.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ("cursor", "replay"))
+async def test_candidate_replay_cancellation_never_flushes_pending_again(monkeypatch, cancel_at):
+    pair_by_field = dict(zip(sampled._PAIR_FIELDS, _pair(1), strict=True))
+    pages = [[pair_by_field] * 1000, asyncio.CancelledError()] if cancel_at == "cursor" else [[pair_by_field] * 1000]
+    cursor = SimpleNamespace(fetch=AsyncMock(side_effect=pages))
+    connection = SimpleNamespace(cursor=AsyncMock(return_value=cursor))
+    native = SimpleNamespace(
+        candidate_selected_indices=Mock(return_value=[0] if cancel_at == "cursor" else list(range(1000)))
+    )
+    replay = AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(sampled, "_candidate_coverage", Mock(return_value={}))
+    monkeypatch.setattr(sampled, "_candidate_batch", replay)
+    with pytest.raises(asyncio.CancelledError):
+        await sampled._candidate_direction(
+            {}, connection, SimpleNamespace(relation=lambda _: "closed.pairs"), object(), _origin(), None, native
+        )
+    assert replay.await_count == (cancel_at == "replay")
+    assert cursor.fetch.await_count == (2 if cancel_at == "cursor" else 1)
+
+
 @pytest.mark.parametrize("population", [0, 1, 99, 100, 101, 1000, 1700])
 def test_source_selection_declares_actual_role_coverage(population):
     networks = sampled._source_selection(
@@ -440,6 +512,117 @@ async def test_missing_sampled_role_refuses_before_dependency_replay(monkeypatch
             required=True,
         )
     connection.execute.assert_awaited_once_with("DELETE FROM pg_temp.cells")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bound_fanout", "role_count", "fits"), [(True, 2, False), (True, 2, True), (True, 1, False), (False, 2, False)]
+)
+async def test_candidate_fanout_budget_follows_complete_role_stream(monkeypatch, bound_fanout, role_count, fits):
+    roles = [("PractitionerRole", f"role-{index}") for index in range(role_count)]
+    events = []
+
+    async def resources(keys):
+        yield tuple(
+            {
+                "dataset_id": _origin().dataset_id,
+                "resource_type": kind,
+                "resource_id": identity,
+                "payload_hash": "a" * 64,
+                "payload_json": "{}",
+                "acquired_resource_sha256": None,
+            }
+            for kind, identity in keys
+        )
+        events.append("source-eof")
+
+    async def budget(query, limit):
+        assert events == ["source-eof"] and limit == 100_000
+        assert "cardinality(network_ids)::bigint * cardinality(location_ids)" in query
+        assert query.endswith("FROM pg_temp.checks")
+        events.append("budget")
+        return fits
+
+    async def dependencies(*_args, **_kwargs):
+        events.append("dependencies")
+        if False:
+            yield
+
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(side_effect=budget), cursor=dependencies)
+    replay = SimpleNamespace(verify=AsyncMock(), names={"checks": "checks"}, relation=lambda kind: "pg_temp." + kind)
+    monkeypatch.setattr(sampled, "_check_page", AsyncMock())
+    monkeypatch.setattr(sampled, "_canonicalize", AsyncMock())
+    monkeypatch.setattr(sampled, "_pairs", AsyncMock())
+    replay_outcome = await sampled._replay_roles(
+        {"resources": resources}, connection, replay, roles, _origin(), None, required=False, bound_fanout=bound_fanout
+    )
+    is_refused = bound_fanout and role_count > 1 and not fits
+    assert (replay_outcome is False) == is_refused
+    assert ("dependencies" in events) == (not is_refused)
+    assert connection.fetchval.await_count == (bound_fanout and role_count > 1)
+    assert sampled._pairs.await_count == (not is_refused)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", (None, "missing", "cancel", "source-error"))
+async def test_candidate_fanout_retry_rolls_back_before_ordered_halves(monkeypatch, fault):
+    pair_rows = [
+        dict(
+            zip(PAIR_COLUMNS, (*_pair(index), "PractitionerRole", f"role-{index}", "office", "direct", 1), strict=True)
+        )
+        for index in range(3)
+    ]
+    pair_rows.insert(2, pair_rows[1])
+    scope = SimpleNamespace(is_active=False, opened=0, closed=0, completed_roles=[], selected_roles=[])
+
+    @asynccontextmanager
+    async def rollback_scope(*_args):
+        assert not scope.is_active
+        scope.is_active = True
+        scope.opened += 1
+        try:
+            yield
+        finally:
+            scope.is_active = False
+            scope.closed += 1
+
+    async def replay_roles(_export, _connection, _replay, roles, *_args, **kwargs):
+        assert scope.is_active and kwargs == {"required": False, "bound_fanout": True}
+        if len(roles) > 1:
+            return False
+        scope.selected_roles = roles
+        if roles[0][1] == "role-1":
+            if fault == "cancel":
+                raise asyncio.CancelledError()
+            if fault == "source-error":
+                raise InsufficientPrivilegeError("synthetic Source refusal")
+        scope.completed_roles.extend(roles)
+        return None
+
+    async def actual_pairs(*_args):
+        assert scope.is_active
+        return [
+            pair_by_field
+            for pair_by_field in pair_rows
+            if (pair_by_field["resource_type"], pair_by_field["resource_id"]) in scope.selected_roles
+            and not (fault == "missing" and pair_by_field["resource_id"] == "role-1")
+        ]
+
+    monkeypatch.setattr(sampled, "_sample_replay_batch", rollback_scope)
+    monkeypatch.setattr(sampled, "_replay_roles", replay_roles)
+    directions_by_network = {"network-one": {"witness_rows": 0, "failures": 0}}
+    connection = SimpleNamespace(fetch=actual_pairs)
+    replay = SimpleNamespace(relation=lambda _: "pg_temp.pairs")
+    operation = sampled._candidate_batch({}, connection, replay, pair_rows, _origin(), None, directions_by_network)
+    if fault in {"cancel", "source-error"}:
+        with pytest.raises(asyncio.CancelledError if fault == "cancel" else InsufficientPrivilegeError):
+            await operation
+        assert directions_by_network["network-one"]["witness_rows"] == 1
+    else:
+        await operation
+        assert scope.completed_roles == [(pair["resource_type"], pair["resource_id"]) for pair in pair_rows]
+        assert directions_by_network["network-one"] == {"witness_rows": 4, "failures": 2 if fault == "missing" else 0}
+    assert not scope.is_active and scope.opened == scope.closed
 
 
 @pytest.mark.asyncio

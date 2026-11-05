@@ -170,6 +170,53 @@ async def test_sampled_capture_preserves_native_custody(monkeypatch, fault, fail
         assert await _immutable_publication(case, capture) == before
 
 
+async def test_candidate_budget_splits_after_source_eof_without_losing_provenance(monkeypatch):
+    """Retry bounded scratch work while preserving the original Source and selected pair."""
+    from tests import generic_source_successor_postgres_support as source
+
+    edition_rows = source._edition_rows
+
+    def additional_role(edition, dataset):
+        resource_rows = edition_rows(edition, dataset)
+        original = next(row for row in resource_rows if row["resource_id"] == "role-office")
+        payload = {**original["payload_json"], "resource_id": "role-office-alias"}
+        resource_rows.append(
+            {
+                **original,
+                "resource_id": payload["resource_id"],
+                "payload_json": payload,
+                "payload_hash": source.directory.resource_payload_sha256_for_contract(
+                    payload,
+                    source.directory.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+                    resource_type="PractitionerRole",
+                ),
+            }
+        )
+        return resource_rows
+
+    replay_roles, candidate_batches = sampled._replay_roles, []
+
+    async def observe(*arguments, **options):
+        result = await replay_roles(*arguments, **options)
+        if options.get("bound_fanout"):
+            candidate_batches.append((len(arguments[3]), result is False))
+        return result
+
+    monkeypatch.setattr(source, "_edition_rows", additional_role)
+    monkeypatch.setattr(sampled, "_replay_roles", observe)
+    monkeypatch.setattr(sampled, "_CANDIDATE_REPLAY_BUDGET", 4)
+    async with source_witness_case(monkeypatch) as case:
+        capture, anchor = await _capture_candidate(case, monkeypatch, None)
+        before = await _immutable_publication(case, capture)
+        async with _reader_replay(case) as replay:
+            receipt = await _verify_candidate(case, capture, anchor, replay, None)
+            direction = receipt["networks"][0]["candidate_to_source"]
+            assert (direction["selected"], direction["provenance_rows"], direction["witness_rows"]) == (1, 2, 2)
+            assert direction["failures"] == 0
+        assert candidate_batches == [(2, True), (1, False), (1, False)]
+        assert await _immutable_publication(case, capture) == before
+
+
 async def test_sampled_publication_keeps_proof_mode_on_retained_successor(monkeypatch):
     """Publish through original actors and retain sampled provenance without replay or promotion."""
     from process import network_candidate_custody
