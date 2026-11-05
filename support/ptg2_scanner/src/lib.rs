@@ -31,6 +31,7 @@ pub mod manifest;
 pub mod naic_company_registry;
 pub mod network_membership_codec;
 pub mod network_source_binding_values;
+pub mod network_validation_sample;
 pub mod normalize;
 mod npi_identifier;
 pub mod output;
@@ -636,6 +637,7 @@ mod python_api {
 
     #[pymodule]
     fn ptg2_address_canon(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_class::<crate::network_validation_sample::NetworkValidationSampler>()?;
         m.add_function(wrap_pyfunction!(
             crate::registry_ptg_graph_python::locator,
             m
@@ -730,6 +732,83 @@ mod python_api {
 
         include!("python_hospital_price_tests.rs");
         include!("python_registry_tests.rs");
+
+        #[test]
+        fn python_network_validation_sampler_registration_and_bounds() {
+            Python::initialize();
+            Python::attach(|py| {
+                let module = PyModule::new(py, "ptg2_address_canon").unwrap();
+                ptg2_address_canon(&module).unwrap();
+                let class = module.getattr("NetworkValidationSampler").unwrap();
+                let sampler = class
+                    .call1(("candidate-pair", "0".repeat(64), ("a",)))
+                    .unwrap();
+                sampler
+                    .call_method1("add_candidate_batch", ((("a", "id", "1", "l", "a", "c"),),))
+                    .unwrap();
+                let selected: Vec<Vec<String>> = sampler
+                    .call_method1("selected", ("a",))
+                    .unwrap()
+                    .extract()
+                    .unwrap();
+                assert_eq!(selected, vec![vec!["a", "id", "1", "l", "a", "c"]]);
+                let indices: Vec<usize> = sampler
+                    .call_method1(
+                        "candidate_selected_indices",
+                        ((
+                            ("other", "id", "1", "l", "a", "c"),
+                            ("a", "id", "1", "l", "a", "c"),
+                        ),),
+                    )
+                    .unwrap()
+                    .extract()
+                    .unwrap();
+                assert_eq!(indices, vec![1]);
+                let coverage = sampler.call_method1("coverage", ("a",)).unwrap();
+                assert_eq!(
+                    coverage
+                        .get_item("provenance_rows")
+                        .unwrap()
+                        .extract::<u64>()
+                        .unwrap(),
+                    1
+                );
+                assert!(sampler
+                    .call_method1(
+                        "add_candidate_batch",
+                        (vec![("a", "id", "1", "l", "a", "c")],)
+                    )
+                    .is_err());
+                assert!(sampler
+                    .call_method1("add_candidate_batch", ((("a", "id", 1, "l", "a", "c"),),))
+                    .is_err());
+                assert!(class.call1(("unknown", "0".repeat(64), ("a",))).is_err());
+                let source = class
+                    .call1((
+                        "source-role-witness",
+                        "0".repeat(64),
+                        ("a",),
+                        "https://example.org/fhir",
+                    ))
+                    .unwrap();
+                source
+                    .call_method1(
+                        "add_source_batch",
+                        ((("PractitionerRole", "p", "[\"Organization/a\"]"),),),
+                    )
+                    .unwrap();
+                let selected: Vec<Vec<String>> = source
+                    .call_method1("selected", ("a",))
+                    .unwrap()
+                    .extract()
+                    .unwrap();
+                assert_eq!(selected, vec![vec!["PractitionerRole", "p"]]);
+                source
+                    .call_method1("add_source_batch", ((("PractitionerRole", "bad", "{}"),),))
+                    .unwrap_err();
+                assert!(source.call_method1("coverage", ("a",)).is_err());
+            });
+        }
 
         #[test]
         fn python_module_exports_real_address_contact_and_version_payloads() {

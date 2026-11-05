@@ -104,6 +104,7 @@ async def verify_typed_stage_offices(connection, stage, address_source, runtime_
 
 async def verify_independent_typed_source_stage(connection, stage):
     """The publication custodian may consume only a raw-Source-checked stage, never an E load capability."""
+    from process.network_fhir_sampled_validation import SampledTypedGraphRead
     from process.network_fhir_typed_contract import TypedFHIRGraphStage
 
     require(is_typed_source_stage(stage), "stage_kind")
@@ -112,6 +113,7 @@ async def verify_independent_typed_source_stage(connection, stage):
 
         require(
             type(mapping.source_stage) is RetainedTypedGraphRead
+            or type(mapping.source_stage) is SampledTypedGraphRead
             or (type(mapping.source_stage) is TypedFHIRGraphStage and mapping.source_stage.checked),
             "independent_source_required",
         )
@@ -169,7 +171,14 @@ async def stage_verified_typed_source_recipes(
     from process.registry_source_recipe_composition import require_typed_source_read
     from process.registry_typed_retained_source import retained_typed_source_proofs
 
-    proofs = await retained_typed_source_proofs(connection, read_context.source_manifest, recipes, control_schema)
+    sampling = getattr(read_context.source_witness_runtime, "semantic_validation", None)
+    proofs = await retained_typed_source_proofs(
+        connection,
+        read_context.source_manifest,
+        recipes,
+        control_schema,
+        **({"allow_sampled": True} if sampling is not None else {}),
+    )
     return await _stage_typed_source_recipes(
         connection,
         recipes,
@@ -225,7 +234,9 @@ async def _map_typed_recipes(
     inputs, contributions, derivations, generations = [], [], [], []
     for recipe in recipes:
         recipe_sha256 = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
-        if retained_proofs is not None and recipe_sha256 in retained_proofs:
+        if retained_proofs and await _has_retained_sample_coverage(
+            connection, recipe, approved, control_schema, retained_proofs.get(recipe_sha256)
+        ):
             from process.registry_source_recipe_composition import load_typed_source_read
             from process.registry_typed_retained_source import RetainedTypedGraphRead
 
@@ -234,6 +245,9 @@ async def _map_typed_recipes(
             )
             read = RetainedTypedGraphRead(loaded, retained_proofs[recipe_sha256])
             await read.verify(connection)
+            sampling = getattr(read_context.source_witness_runtime, "semantic_validation", None)
+            if sampling is not None:
+                await sampling.record_retained(read.proof, connection)
         else:
             read = await source_reader(
                 connection, recipe, approved, control_schema, read_context.source_witness_runtime
@@ -270,6 +284,33 @@ async def _map_typed_recipes(
         derivations.append(derivation)
         generations.append(digest([contribution, derivation]))
     return mappings, contributions, derivations, generations
+
+
+async def _has_retained_sample_coverage(connection, recipe, approved, control_schema, proof):
+    """A widened approval requires fresh samples for previously uncovered Source networks."""
+    if proof is None:
+        return False
+    if proof.semantic_receipt is None:
+        return True
+    from process.network_approved_source_bindings import (
+        APPROVED_NETWORK_BINDINGS_SQL,
+        require_approved_network_source_bindings,
+    )
+    from process.network_fhir_typed_mapping import _approved_graph_keys
+    from process.network_membership_candidate_lifecycle import _control_namespace
+
+    await require_approved_network_source_bindings(
+        connection, approved, recipe.binding_coordinates, control_schema=control_schema
+    )
+    bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
+    arguments = (
+        approved.approved_revision,
+        *recipe.binding_coordinates.sql_parameters,
+        recipe.source_pin.catalog_generation,
+    )
+    current_keys = await _approved_graph_keys(connection, bindings, arguments)
+    sampled_keys = {network["network_source_key"] for network in proof.semantic_receipt["networks"]}
+    return set(current_keys) <= sampled_keys
 
 
 async def _typed_office_matches(connection, mappings, recipe_hash, approved, address_source, roles, control_schema):
