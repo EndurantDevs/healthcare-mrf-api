@@ -29,6 +29,7 @@ ALGORITHM = "sha256-bottom-k-v1"
 SERIES_COUNT = 10
 ITEMS_PER_SERIES = 100
 _LIMIT = SERIES_COUNT * ITEMS_PER_SERIES
+_CANDIDATE_REPLAY_BUDGET = 100_000
 _PAIR_FIELDS = PAIR_COLUMNS[:6]
 _PAIR_KEYS = ("resource_type", "resource_id", "network_source_key", "location_resource_id")
 _ROLE_KINDS = {"OrganizationAffiliation", "PractitionerRole"}
@@ -331,12 +332,25 @@ async def _fetch_resources(export, connection, replay, keys, origin, as_of):
     return present
 
 
-async def _replay_roles(export, connection, replay, roles, origin, as_of, *, required):
+async def _replay_roles(export, connection, replay, roles, origin, as_of, *, required, bound_fanout=False):
     await replay.verify(connection, complete=False)
     for kind in replay.names:
         await connection.execute("DELETE FROM " + replay.relation(kind))
     present = await _fetch_resources(export, connection, replay, roles, origin, as_of)
     require(not required or present == set(roles), "sample_role_missing")
+    if bound_fanout and len(roles) > 1:
+        # Raw checked references bound both the dependency UNION and pair expansion.
+        # A single role retains the existing replay behavior.
+        within_budget = await connection.fetchval(
+            "SELECT coalesce(sum((subject_id IS NOT NULL)::integer + cardinality(network_ids)::bigint "
+            "+ cardinality(location_ids)),0)<=$1::bigint AND "
+            "coalesce(sum(cardinality(network_ids)::bigint * cardinality(location_ids)),0)<=$1::bigint FROM "
+            + replay.relation("checks"),
+            _CANDIDATE_REPLAY_BUDGET,
+        )
+        require(type(within_budget) is bool, "sample_replay_budget")
+        if not within_budget:
+            return False
     dependencies = (
         "SELECT subject_kind kind,subject_id id FROM {checks} WHERE subject_id IS NOT NULL UNION "
         "SELECT 'Organization',unnest(network_ids) FROM {checks} UNION SELECT 'Location',unnest(location_ids) FROM {checks}"
@@ -352,6 +366,7 @@ async def _replay_roles(export, connection, replay, roles, origin, as_of, *, req
         await _fetch_resources(export, connection, replay, pending_rows, origin, as_of)
     await _canonicalize(connection, replay)
     await _pairs(connection, replay, origin, as_of, checker=True)
+    return None
 
 
 async def _sample_replay_indexes(connection, replay):
@@ -444,26 +459,37 @@ async def _source_direction(export, connection, sealed, replay, origin, as_of, n
     return direction_by_field
 
 
-async def _candidate_batch(export, connection, replay, rows, origin, as_of, directions_by_network):
-    roles = sorted({(row["resource_type"], row["resource_id"]) for row in rows})
-    keys = [[row[field] for row in rows] for field in _PAIR_KEYS]
+async def _candidate_batch(export, connection, replay, selected_rows, origin, as_of, directions_by_network):
+    roles = sorted({(pair["resource_type"], pair["resource_id"]) for pair in selected_rows})
+    keys = [[pair[field] for pair in selected_rows] for field in _PAIR_KEYS]
     join = " AND ".join("pair." + key + "=chosen." + key for key in _PAIR_KEYS)
     async with _sample_replay_batch(connection, replay):
-        await _replay_roles(export, connection, replay, roles, origin, as_of, required=False)
-        actual = await connection.fetch(
-            "SELECT pair.* FROM "
-            + replay.relation("pairs")
-            + " pair JOIN unnest($1::text[],$2::text[],$3::text[],$4::text[]) chosen("
-            + ",".join(_PAIR_KEYS)
-            + ") ON "
-            + join,
-            *keys,
+        completed = await _replay_roles(
+            export, connection, replay, roles, origin, as_of, required=False, bound_fanout=True
         )
-    by_key = {tuple(row[field] for field in _PAIR_KEYS): tuple(row[field] for field in PAIR_COLUMNS) for row in actual}
-    for row in rows:
-        direction = directions_by_network[row["network_source_key"]]
+        if completed is not False:
+            actual = await connection.fetch(
+                "SELECT pair.* FROM "
+                + replay.relation("pairs")
+                + " pair JOIN unnest($1::text[],$2::text[],$3::text[],$4::text[]) chosen("
+                + ",".join(_PAIR_KEYS)
+                + ") ON "
+                + join,
+                *keys,
+            )
+    if completed is False:
+        middle = len(selected_rows) // 2
+        require(middle > 0, "sample_replay_budget")
+        await _candidate_batch(export, connection, replay, selected_rows[:middle], origin, as_of, directions_by_network)
+        await _candidate_batch(export, connection, replay, selected_rows[middle:], origin, as_of, directions_by_network)
+        return
+    by_key = {
+        tuple(pair[field] for field in _PAIR_KEYS): tuple(pair[field] for field in PAIR_COLUMNS) for pair in actual
+    }
+    for pair in selected_rows:
+        direction = directions_by_network[pair["network_source_key"]]
         direction["witness_rows"] += 1
-        if by_key.get(tuple(row[field] for field in _PAIR_KEYS)) != tuple(row[field] for field in PAIR_COLUMNS):
+        if by_key.get(tuple(pair[field] for field in _PAIR_KEYS)) != tuple(pair[field] for field in PAIR_COLUMNS):
             direction["failures"] += 1
 
 
@@ -485,11 +511,16 @@ async def _candidate_direction(export, connection, sealed, replay, origin, as_of
     directions_by_network = _candidate_coverage(sampler)
     query = "SELECT " + ",".join(PAIR_COLUMNS) + " FROM " + sealed.relation("pairs")
     cursor = await connection.cursor(query)
+    pending_rows = []
     while rows := await cursor.fetch(1000):
         selected_indices = sampler.candidate_selected_indices(_candidate_wire_rows(rows))
-        if selected_indices:
-            selected_rows = [rows[index] for index in selected_indices]
-            await _candidate_batch(export, connection, replay, selected_rows, origin, as_of, directions_by_network)
+        for index in selected_indices:
+            pending_rows.append(rows[index])
+            if len(pending_rows) == 1000:
+                await _candidate_batch(export, connection, replay, pending_rows, origin, as_of, directions_by_network)
+                pending_rows = []
+    if pending_rows:
+        await _candidate_batch(export, connection, replay, pending_rows, origin, as_of, directions_by_network)
     return directions_by_network
 
 
