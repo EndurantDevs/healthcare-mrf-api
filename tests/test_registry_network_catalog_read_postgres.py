@@ -1545,40 +1545,32 @@ async def test_native_autocomplete_closed_binding_only_changes_after_approval(ca
 @pytest.fixture
 async def legacy_catalog_http(catalog_db, monkeypatch):
     """Serve the actual pinned legacy reader through its restricted native role."""
-    from sanic import Blueprint, Sanic
+    from sanic import Blueprint
     from sqlalchemy import event
-    from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from api.endpoint import network_catalog as endpoint
-    from tests.test_network_serving_routes_postgres import _reader_engine
+    from api.request_lifecycle import RequestLifecycleSanic
+    from db.connection import db
+    from tests.request_reader_transport_support import attach_request_database_hooks
+    from tests.test_network_serving_routes_postgres import _request_reader_database
 
     fixture = catalog_db
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-catalog-control-token")
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.control_schema)
-    engine = _reader_engine(fixture.engine, fixture.roles["reader"])
-    sessions = async_sessionmaker(engine)
     statements = []
+    async with _request_reader_database(fixture.engine, fixture.connection, fixture.roles["reader"], monkeypatch):
+        await db.connect()
+        reader = await db._connect_reader()
 
-    @event.listens_for(engine.sync_engine, "before_cursor_execute")
-    def record_statement(_connection, _cursor, statement, _parameters, _context, _many):
-        statements.append(statement)
+        @event.listens_for(reader.engine.sync_engine, "before_cursor_execute")
+        def record_statement(_connection, _cursor, statement, _parameters, _context, _many):
+            statements.append(statement)
 
-    app = Sanic("native_legacy_catalog_" + uuid4().hex)
-    app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
-    endpoint.register_network_catalog_private_responses(app)
-
-    @app.middleware("request")
-    async def open_session(request):
-        request.ctx.sa_session = sessions()
-
-    @app.middleware("response")
-    async def close_session(request, _response):
-        await request.ctx.sa_session.close()
-
-    try:
+        app = RequestLifecycleSanic("native_legacy_catalog_" + uuid4().hex)
+        attach_request_database_hooks(db, app)
+        app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
+        endpoint.register_network_catalog_private_responses(app)
         yield SimpleNamespace(app=app, fixture=fixture, statements=statements)
-    finally:
-        await engine.dispose()
 
 
 async def _legacy_http_reply(context, document, *, authorized=True):

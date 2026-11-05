@@ -23,7 +23,7 @@ from api.network_provider_read import (
 from api.network_provider_read import (
     _selector as validate_provider_identity,
 )
-from api.network_serving_read_context import network_serving_read_context
+from api.network_serving_read_context import bind_network_request_reader, network_serving_read_context
 from process.network_serving_read import (
     NetworkServingReadUnavailable,
     parse_canonical_network_ids,
@@ -142,7 +142,7 @@ async def _provider_response(request, *, provider_system=None, provider_id=None)
     except ValueError:
         return _error(400)
     try:
-        session = request.ctx.sa_session
+        session = await bind_network_request_reader(request)
         async with network_serving_read_context(session) as driver:
             manifest = await resolve_network_serving_manifest(
                 driver, generation_id=parameters_by_name["generation_id"], api_read=True

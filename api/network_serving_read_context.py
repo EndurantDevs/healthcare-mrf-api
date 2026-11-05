@@ -4,9 +4,10 @@
 from contextlib import asynccontextmanager, nullcontext
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from api.network_read_execution import _original_read_driver
-from db.connection import _READER, current_session
+from db.connection import _READER, current_session, db
 from process.network_serving_read import NetworkServingReadUnavailable
 
 _IDENTITY_FIELDS = ("role_oid", "database_oid", "server_address", "server_port", "backend_pid")
@@ -16,6 +17,14 @@ _SNAPSHOT_SQL = (
     "(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()),"
     "host(inet_server_addr()),inet_server_port(),pg_backend_pid()"
 )
+
+
+async def bind_network_request_reader(request):
+    """Bind an authenticated request to its existing configured genuine Reader."""
+    try:
+        return await db.bind_request_reader(request)
+    except (RuntimeError, SQLAlchemyError, OSError) as error:
+        raise NetworkServingReadUnavailable("Network serving request Reader is unavailable") from error
 
 
 def _require_reader_owner(session, reader):

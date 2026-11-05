@@ -8,7 +8,7 @@ from sanic import Blueprint, response
 from sqlalchemy.exc import SQLAlchemyError
 
 from api.control_auth import require_registry_auth
-from api.network_serving_read_context import network_serving_read_context
+from api.network_serving_read_context import bind_network_request_reader, network_serving_read_context
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 
 blueprint = Blueprint("network_serving", url_prefix="/registry/serving", version=1)
@@ -46,9 +46,9 @@ async def serving_manifest(request):
     except ValueError:
         return _error(400)
     try:
-        session = request.ctx.sa_session
+        session = await bind_network_request_reader(request)
         async with network_serving_read_context(session) as driver:
-            manifest = await resolve_network_serving_manifest(driver, generation_id=generation_id)
+            manifest = await resolve_network_serving_manifest(driver, generation_id=generation_id, api_read=True)
         identity_by_name = {
             field: getattr(manifest, field)
             for field in (

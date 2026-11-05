@@ -14,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from api.control_auth import require_registry_auth
 from api.network_catalog_fhir_query import FHIRCatalogSelection, parse_fhir_catalog_query
-from api.network_serving_read_context import network_serving_read_context
+from api.network_serving_read_context import bind_network_request_reader, network_serving_read_context
 from api.provider_collection_network_contract import parse_managed_collection_query
 from api.provider_collection_network_read import ProviderCollectionServiceRefusal, read_managed_provider_collection
 from api.provider_detail_network_contract import parse_managed_detail_query
@@ -401,7 +401,7 @@ def _detail_absence_response(error, kind, visibility, policy_by_field, scope):
 
 async def _read_catalog_snapshot(request, kind, selector, generation, excluded, options):
     """Read the selected catalog within one request-owned, read-only snapshot."""
-    session = request.ctx.sa_session
+    session = await bind_network_request_reader(request)
     async with network_serving_read_context(session) as driver:
         return await _read_catalog_page(driver, kind, selector, generation, excluded, options)
 
