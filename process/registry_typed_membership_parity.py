@@ -39,7 +39,7 @@ async def require_order_index(connection, relation):
 
 async def _last_page_key(connection, query, after):
     condition = "TRUE" if after is None else "(" + ORDER + ")>" + _PARAMETERS
-    return await connection.fetchrow(
+    page = await connection.prepare(
         "SELECT "
         + COLUMNS
         + " FROM (SELECT "
@@ -52,7 +52,9 @@ async def _last_page_key(connection, query, after):
         + ORDER
         + " LIMIT 5000) page ORDER BY "
         + ",".join(term + " DESC" for term in ORDER.split(","))
-        + " LIMIT 1",
+        + " LIMIT 1"
+    )
+    return await page.fetchrow(
         *(() if after is None else after),
     )
 
@@ -97,14 +99,17 @@ async def has_multiset_difference(connection, actual, expected):
         grouped = lambda query: (
             "SELECT " + ORDER + ",count(*) AS amount FROM (" + query + ") rows WHERE " + scope + " GROUP BY " + ORDER
         )
-        differs = await connection.fetchval(
+        # Plan each range for its actual bounds instead of reusing a broad generic scan.
+        comparison = await connection.prepare(
             "WITH actual AS ("
             + grouped(actual)
             + "),expected AS ("
             + grouped(expected)
             + ") SELECT EXISTS(SELECT FROM actual FULL JOIN expected USING("
             + COLUMNS
-            + ") WHERE actual.amount IS DISTINCT FROM expected.amount)",
+            + ") WHERE actual.amount IS DISTINCT FROM expected.amount)"
+        )
+        differs = await comparison.fetchval(
             *((() if after is None else after) + upper_keys),
         )
         if differs:

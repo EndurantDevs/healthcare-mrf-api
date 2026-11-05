@@ -164,6 +164,8 @@ async def retain_registry_source_memberships(connection, copy_target, stage, *, 
                 await connection.execute(
                     f"INSERT INTO {source_relation} {_stage_projection(stage_relation, stage=stage)}"
                 )
+                if is_typed_candidate(candidate):
+                    await connection.execute(f"ANALYZE {source_relation}")
             await verify_registry_source_retention_rows(connection, copy_target, candidate, source_stage=stage)
         except asyncpg.PostgresError as error:
             raise RegistrySourceRetentionError("registry_source_retention_source_invalid") from error
