@@ -50,6 +50,7 @@ async def test_profile_full_policy_and_normalized_query_use_no_request_writer(pr
     assert (query.page_category, query.page_limit) == ("languages", 1)
     assert options == {"excluded_network_ids": (84,), "access_scope_sha256": document["access_scope_sha256"]}
     assert profile_context.session.events == []
+    profile_context.bind_reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio

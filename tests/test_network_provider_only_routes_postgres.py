@@ -1,28 +1,46 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Closed provider-only HTTP requests on the same protected serving transaction."""
 
+from contextlib import aclosing
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from sanic import Blueprint, Sanic
+from sanic import Blueprint
 from sqlalchemy import event
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api.endpoint import network_providers as providers
 from api.network_address_scope import current_network_address_scope
+from api.request_lifecycle import RequestLifecycleSanic
+from db.connection import db
 from tests.test_network_provider_only_read_postgres import cms_recipe_database as cms_recipe_database
 from tests.test_network_provider_only_read_postgres import cms_recipe_template as cms_recipe_template
 from tests.test_network_provider_only_read_postgres import custom_db as custom_db
 from tests.test_network_provider_only_read_postgres import provider_only_db as provider_only_db
-from tests.test_network_provider_only_read_postgres import provider_only_source as provider_only_source
+from tests.test_network_provider_only_read_postgres import provider_only_source as _provider_only_source
 from tests.test_network_provider_only_read_postgres import serving_schema as serving_schema
 from tests.test_network_provider_routes_postgres import _durable_state
-from tests.test_network_serving_routes_postgres import _reader_engine
+from tests.test_network_serving_routes_postgres import _reader_engine, _request_reader_database
 
 pytestmark = pytest.mark.asyncio
 _AUTH = {"Authorization": "Bearer synthetic-provider-only-token"}
 _PATH = "/api/v1/registry/serving/providers"
+
+
+@pytest.fixture
+async def provider_only_source(custom_db, cms_recipe_database, serving_schema, monkeypatch, tmp_path):
+    """Admit fixed-schema metadata access before Source custody records its ACLs."""
+    connection, reader_role = custom_db.connection, custom_db.roles["reader"]
+    assert not await connection.fetchval("SELECT has_schema_privilege($1,'mrf','USAGE')", reader_role)
+    await connection.execute(f'GRANT USAGE ON SCHEMA "mrf" TO "{reader_role}"')
+    try:
+        async with aclosing(
+            _provider_only_source.__wrapped__(cms_recipe_database, serving_schema, monkeypatch, tmp_path)
+        ) as source:
+            yield await anext(source)
+    finally:
+        await connection.execute(f'REVOKE USAGE ON SCHEMA "mrf" FROM "{reader_role}"')
 
 
 @pytest.fixture
@@ -31,22 +49,12 @@ async def provider_only_app(provider_only_db, monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-provider-only-token")
     fixture = context.fixture
     engine = _reader_engine(fixture.engine, fixture.roles["reader"])
-    sessions = async_sessionmaker(engine)
-    app = Sanic("network_provider_only_http_" + uuid4().hex)
-    app.blueprint(Blueprint.group([providers.blueprint], version_prefix="/api/v"))
-
-    @app.middleware("request")
-    async def open_session(request):
-        """Keep invalid selectors from acquiring a native connection."""
-        request.ctx.sa_session = sessions()
-
-    @app.middleware("response")
-    async def close_session(request, _response):
-        """Release every request-owned transaction and scope."""
-        await request.ctx.sa_session.close()
-
     try:
-        yield SimpleNamespace(app=app, context=context, engine=engine)
+        async with _request_reader_database(fixture.engine, fixture.connection, fixture.roles["reader"], monkeypatch):
+            app = RequestLifecycleSanic("network_provider_only_http_" + uuid4().hex)
+            db.init_app(app)
+            app.blueprint(Blueprint.group([providers.blueprint], version_prefix="/api/v"))
+            yield SimpleNamespace(app=app, context=context, engine=engine)
     finally:
         await engine.dispose()
 
@@ -88,9 +96,13 @@ async def test_provider_mode_keeps_private_pinned_transaction_and_office_shape(p
     assert await _durable_state(context.fixture) == before
 
 
-async def test_provider_mode_rejects_detail_and_office_service_pricing_criteria_before_database(provider_only_app):
+async def test_provider_mode_rejects_detail_and_office_service_pricing_criteria_before_database(
+    provider_only_app, monkeypatch
+):
     application = provider_only_app
     statements = []
+    reader_connect = AsyncMock(wraps=db._connect_reader)
+    monkeypatch.setattr(db, "_connect_reader", reader_connect)
     event.listen(
         application.engine.sync_engine, "before_cursor_execute", lambda *arguments: statements.append(arguments[2])
     )
@@ -129,6 +141,7 @@ async def test_provider_mode_rejects_detail_and_office_service_pricing_criteria_
         _, denied = await application.app.asgi_client.get(prefix, headers=headers)
         assert denied.status == 403 and denied.headers["Cache-Control"] == "private, no-store"
     assert statements == []
+    reader_connect.assert_not_awaited()
 
 
 async def test_provider_mode_does_not_fabricate_coverage_for_retained_or_unknown_network(provider_only_app):

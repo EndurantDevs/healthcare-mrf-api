@@ -10,9 +10,10 @@ It combines multiple public programs into one operational service so application
 statistics requests through a separate database login. Configure
 `HLTHPRT_DB_READER_USER` and `HLTHPRT_DB_READER_PASSWORD` for that login; the user
 must differ from `HLTHPRT_DB_USER`. Reader sessions never fall back to Writer
-credentials. Independent PTG network reads and provider-profile snapshots also
-require this Reader login. Existing control, import and explicit background
-mutation paths retain their Writer connection.
+credentials. Canonical network-filtered requests and registry serving reads
+require this Reader login independently of that flag, as do independent PTG
+network reads and provider-profile snapshots. Control mutations, imports and
+explicit background writes retain their Writer connection.
 
 The Reader pool uses `HLTHPRT_DB_READER_POOL_MIN_SIZE` (default 1) and
 `HLTHPRT_DB_READER_POOL_MAX_SIZE` (default 5), in addition to the existing Writer

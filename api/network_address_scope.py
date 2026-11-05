@@ -667,19 +667,11 @@ def _network_scope_claim(request, args):
 
 
 async def _pin_network_scope(request, args):
+    from api.network_serving_read_context import bind_network_request_reader
     from process.network_serving_read import resolve_network_serving_manifest
 
     network_ids, access_scope_sha256, legacy_checksums, generation = _network_scope_claim(request, args)
-    session = request.ctx.sa_session
-    if (
-        getattr(request.ctx, "_sa_session_token", None) is not None
-        and getattr(request.ctx, "_sa_reader_scope", None) is None
-        and not session.in_transaction()
-    ):
-        from db.connection import current_session
-
-        if current_session() is session:
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+    session = await bind_network_request_reader(request)
     await session.execute(text("SET LOCAL lock_timeout='1s'"))
     connection = await session.connection()
     driver = (await connection.get_raw_connection()).driver_connection

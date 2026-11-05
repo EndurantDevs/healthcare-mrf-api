@@ -2,27 +2,29 @@
 """Protected provider-plan HTTP reads through ordinary native reader sessions."""
 
 import json
-import secrets
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from sanic import Blueprint, Sanic
+from sanic import Blueprint
 from sqlalchemy import event
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.endpoint import network_catalog as endpoint
+from api.request_lifecycle import RequestLifecycleSanic
+from db.connection import db
 from process import reference_family_archive as archive
 from process.network_address_projection import PinnedAddressSource
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_record_store import RegistryRecordCommand
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests import test_registry_provider_plan_read_postgres as source_fixtures
+from tests.request_reader_transport_support import attach_request_database_hooks
 from tests.test_network_catalog_routes import v2_envelope
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_initial_source_office_bindings_postgres import _prepare_addresses
 from tests.test_network_legacy_membership_source_postgres import _aca_binding, _write_aca_bindings
+from tests.test_network_serving_routes_postgres import _request_reader_database
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command
 from tests.test_registry_candidate_composition_postgres import (
@@ -46,43 +48,38 @@ _AUTH = {"Authorization": "Bearer synthetic-provider-plan-control"}
 async def transport_db(provider_plans_db, monkeypatch):
     """Authenticate directly as the disposable Reader; retain real endpoint ownership."""
     fixture, source_pin, networks, copy_target = provider_plans_db
-    password = secrets.token_urlsafe(24)
-    role = fixture.roles["reader"]
-    await fixture.connection.execute(f"ALTER ROLE \"{role}\" LOGIN PASSWORD '{password}'")
-    engine = create_async_engine(fixture.engine.url.set(username=role, password=password), pool_size=1, max_overflow=0)
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
     starts, snapshots, requests = [], [], []
-
-    @event.listens_for(engine.sync_engine, "begin")
-    def record_begin(connection):
-        starts.append(id(connection))
-
-    @event.listens_for(engine.sync_engine, "after_cursor_execute")
-    def record_native_scope(connection, cursor, statement, parameters, context, executemany):
-        if statement == "SET LOCAL lock_timeout='1s'":
-            cursor.execute(
-                "SELECT current_user,current_setting('transaction_read_only'),"
-                "current_setting('transaction_isolation'),pg_backend_pid(),"
-                "(SELECT rolsuper FROM pg_roles WHERE rolname=current_user)"
-            )
-            snapshots.append(cursor.fetchone())
-
-    app = Sanic("native_provider_plans_" + uuid4().hex)
-    app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
-    endpoint.register_network_catalog_private_responses(app)
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-provider-plan-control")
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.control_schema)
+    monkeypatch.setenv("HLTHPRT_DB_READER_POOL_MIN_SIZE", "1")
+    monkeypatch.setenv("HLTHPRT_DB_READER_POOL_MAX_SIZE", "1")
+    async with _request_reader_database(fixture.engine, fixture.connection, fixture.roles["reader"], monkeypatch):
+        await db.connect()
+        reader = await db._connect_reader()
 
-    @app.middleware("request")
-    async def attach_session(request):
-        request.ctx.sa_session = sessions()
-        requests.append((request.method, request.path, request.ctx.sa_session))
+        @event.listens_for(reader.engine.sync_engine, "begin")
+        def record_begin(connection):
+            starts.append(id(connection))
 
-    @app.middleware("response")
-    async def close_session(request, response):
-        await request.ctx.sa_session.close()
+        @event.listens_for(reader.engine.sync_engine, "after_cursor_execute")
+        def record_native_scope(connection, cursor, statement, parameters, context, executemany):
+            if statement == "SET LOCAL lock_timeout='1s'":
+                cursor.execute(
+                    "SELECT current_user,current_setting('transaction_read_only'),"
+                    "current_setting('transaction_isolation'),pg_backend_pid(),"
+                    "(SELECT rolsuper FROM pg_roles WHERE rolname=current_user)"
+                )
+                snapshots.append(cursor.fetchone())
 
-    try:
+        app = RequestLifecycleSanic("native_provider_plans_" + uuid4().hex)
+        attach_request_database_hooks(db, app)
+        app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
+        endpoint.register_network_catalog_private_responses(app)
+
+        @app.middleware("response")
+        async def observe_session(request, response):
+            requests.append((request.method, request.path, request.ctx.sa_session))
+
         yield SimpleNamespace(
             app=app,
             fixture=fixture,
@@ -93,10 +90,6 @@ async def transport_db(provider_plans_db, monkeypatch):
             snapshots=snapshots,
             requests=requests,
         )
-    finally:
-        for method, path, session in requests:
-            await session.close()
-        await engine.dispose()
 
 
 async def _post(context, document, *, headers=None):

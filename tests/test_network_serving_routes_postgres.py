@@ -3,16 +3,20 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
-from sanic import Blueprint, Sanic
+from sanic import Blueprint
 from sqlalchemy import event, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from api.endpoint import network_serving as serving
+from api.request_lifecycle import RequestLifecycleSanic
+from db.connection import db
 from process.network_address_projection import project_network_address_arrays
 from process.network_membership_candidate_indexes import prepare_network_candidate_indexes
 from process.network_membership_validation import validate_network_membership_candidate
@@ -52,6 +56,38 @@ def _reader_engine(source_engine, reader_role):
     return engine
 
 
+@asynccontextmanager
+async def _request_reader_database(source_engine, owner, reader, monkeypatch):
+    """Restore the existing native role after using the actual request Reader login."""
+    url, password = source_engine.url, uuid4().hex
+    assert tuple(await owner.fetchrow("SELECT rolcanlogin,rolpassword FROM pg_authid WHERE rolname=$1", reader)) == (
+        False,
+        None,
+    )
+    await db.disconnect()
+    for field, setting in {
+        "HOST": url.host,
+        "PORT": url.port or 5432,
+        "DATABASE": url.database,
+        "DATABASE_OVERRIDE": url.database,
+        "USER": url.username,
+        "PASSWORD": url.password or "",
+        "READER_USER": reader,
+        "READER_PASSWORD": password,
+    }.items():
+        monkeypatch.setenv("HLTHPRT_DB_" + field, str(setting))
+    monkeypatch.setenv("HLTHPRT_API_READER_ENABLED", "false")
+    await owner.execute(f"ALTER ROLE \"{reader}\" LOGIN PASSWORD '{password}'")
+    try:
+        yield
+    finally:
+        await db.disconnect()
+        await owner.execute(f'ALTER ROLE "{reader}" NOLOGIN PASSWORD NULL')
+        assert tuple(
+            await owner.fetchrow("SELECT rolcanlogin,rolpassword FROM pg_authid WHERE rolname=$1", reader)
+        ) == (False, None)
+
+
 @pytest.fixture
 async def manifest_app(serving_indexes_db, serving_schema, monkeypatch):
     fixture = serving_indexes_db
@@ -64,22 +100,14 @@ async def manifest_app(serving_indexes_db, serving_schema, monkeypatch):
             async with fixture.connection.transaction():
                 fixture.published_manifest = await _publish(fixture)
             engine = _reader_engine(source_engine, fixture.writer_roles["reader"])
-            sessions = async_sessionmaker(engine)
-            app = Sanic("network_serving_http_" + uuid4().hex)
-            app.blueprint(Blueprint.group([serving.blueprint], version_prefix="/api/v"))
-
-            @app.middleware("request")
-            async def open_session(request):
-                """Give each request its own lazily connected reader session."""
-                request.ctx.sa_session = sessions()
-
-            @app.middleware("response")
-            async def close_session(request, _response):
-                """Release the native transaction and reader connection after this response."""
-                await request.ctx.sa_session.close()
-
             try:
-                yield app, fixture, engine
+                async with _request_reader_database(
+                    source_engine, fixture.connection, fixture.writer_roles["reader"], monkeypatch
+                ):
+                    app = RequestLifecycleSanic("network_serving_http_" + uuid4().hex)
+                    db.init_app(app)
+                    app.blueprint(Blueprint.group([serving.blueprint], version_prefix="/api/v"))
+                    yield app, fixture, engine
             finally:
                 await engine.dispose()
     finally:
@@ -192,6 +220,8 @@ async def test_current_head_advance_keeps_explicit_old_generation(manifest_app, 
 async def test_control_auth_and_invalid_inputs_precede_native_reads(manifest_app, monkeypatch):
     app, fixture, engine = manifest_app
     statements = []
+    reader_connect = AsyncMock(wraps=db._connect_reader)
+    monkeypatch.setattr(db, "_connect_reader", reader_connect)
     event.listen(engine.sync_engine, "before_cursor_execute", lambda *arguments: statements.append(arguments[2]))
     for headers in ({}, {"Authorization": "Bearer incorrect-token"}):
         _, denied = await app.asgi_client.get(_PATH + "?network_generation=0", headers=headers)
@@ -220,6 +250,7 @@ async def test_control_auth_and_invalid_inputs_precede_native_reads(manifest_app
     monkeypatch.delenv("HLTHPRT_CONTROL_API_TOKEN")
     _, unconfigured = await app.asgi_client.get(_PATH, headers=_AUTH)
     assert unconfigured.status == 403 and statements == []
+    reader_connect.assert_not_awaited()
     assert (await _snapshot(fixture))["manifests"] == 1
 
 

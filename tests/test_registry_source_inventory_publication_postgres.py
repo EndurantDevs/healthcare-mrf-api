@@ -3,7 +3,7 @@
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -11,7 +11,6 @@ import asyncpg
 import pytest
 from sanic import response
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.network_address_scope import (
     canonical_network_read,
@@ -24,6 +23,7 @@ from api.network_compact_address import compact_address_native_sql
 from api.network_provider_only_read import read_network_provider_only_page
 from api.network_provider_read import NetworkOfficeSelection, NetworkProviderReadUnavailable, read_network_provider_page
 from api.network_read_execution import execute_network_read
+from db.connection import db
 from process.network_address_projection import _identifier
 from process.network_candidate_custody import verify_network_candidate_read_metadata
 from process.network_membership_pipeline import prepare_and_publish_network_candidate, prepare_network_candidate
@@ -46,8 +46,9 @@ from tests.cms_registry_recipe_postgres_support import serving_schema as serving
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_initial_source_office_bindings_postgres import cms_full_office_source as cms_full_office_source
 from tests.test_network_provider_only_read_postgres import provider_only_source as provider_only_source
+from tests.test_network_serving_routes_postgres import _request_reader_database
 from tests.test_registry_compact_source_offices_postgres import _rebind
-from tests.test_registry_compact_source_offices_postgres import compact_cms_source as compact_cms_source
+from tests.test_registry_compact_source_offices_postgres import compact_cms_source as _compact_cms_source
 from tests.test_registry_fhir_empty_carry_postgres import (
     carry_case as carry_case,
 )
@@ -73,6 +74,28 @@ _HEAPS = {
     "network_slice_ref",
     "network_office_edge",
 }
+
+
+@pytest.fixture
+async def compact_cms_source(cms_full_office_source, provider_only_source, custom_db, monkeypatch):
+    """Establish the API Reader's fixed control scope before artifact and custody capture."""
+    namespace, reader_role = _identifier(custom_db.control_schema), _identifier(custom_db.roles["reader"])
+    await custom_db.connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {reader_role}")
+    for table in (
+        "network_membership_candidate",
+        "network_serving_manifest",
+        "network_serving_control",
+        "network_candidate_custody",
+        "registry_approved_record",
+    ):
+        await custom_db.connection.execute(f"GRANT SELECT ON {namespace}.{_identifier(table)} TO {reader_role}")
+    async with (
+        _request_reader_database(custom_db.engine, custom_db.connection, custom_db.roles["reader"], monkeypatch),
+        aclosing(
+            _compact_cms_source.__wrapped__(cms_full_office_source, provider_only_source, custom_db, monkeypatch)
+        ) as source,
+    ):
+        yield await anext(source)
 
 
 async def test_retained_inventory_and_contributions_require_published_seal(compact_cms_source):
@@ -297,58 +320,51 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-read-token")
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", context.fixture.control_schema)
     network_id = context.reviewed[2][0]["record_id"]
-    engine = create_async_engine(context.fixture.execution_url)
-    try:
-        async with async_sessionmaker(engine)() as session, session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            driver = (await (await session.connection()).get_raw_connection()).driver_connection
-            statements = []
-            with driver.query_logger(statements.append):
-                api_manifest = await resolve_network_serving_manifest(
-                    driver,
-                    generation_id=manifest.generation_id,
-                    control_schema=context.fixture.control_schema,
-                    api_read=True,
-                )
-                assert api_manifest == manifest
-                metadata = await verify_network_candidate_read_metadata(
-                    driver, copy_target, control_schema=context.fixture.control_schema
-                )
-                candidate_by_field = await _candidate(context, copy_target)
-                inventory, entries = await load_source_inventory_for_api(
-                    driver, copy_target, candidate_by_field, control_schema=context.fixture.control_schema
-                )
-                assert inventory.root == source_inventory_root(entries) and len(entries) == 1
-                await _assert_canonical_locations(session, manifest, network_id)
-                await asyncio.sleep(0)
-            assert metadata["seal_sha256"] == manifest._custody_seal_sha256
-            assert not any(
-                query_event.query.lstrip().upper().startswith("LOCK TABLE")
-                or "pg_advisory" in query_event.query.lower()
-                for query_event in statements
+    async with db.reader_session() as session:
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        statements = []
+        with driver.query_logger(statements.append):
+            api_manifest = await resolve_network_serving_manifest(
+                driver,
+                generation_id=manifest.generation_id,
+                control_schema=context.fixture.control_schema,
+                api_read=True,
             )
-            request = SimpleNamespace(
-                query_string=f"network_ids={network_id}",
-                headers={"Authorization": "Bearer synthetic-network-read-token"},
-                ctx=SimpleNamespace(sa_session=session),
+            assert api_manifest == manifest
+            metadata = await verify_network_candidate_read_metadata(
+                driver, copy_target, control_schema=context.fixture.control_schema
             )
+            candidate_by_field = await _candidate(context, copy_target)
+            inventory, entries = await load_source_inventory_for_api(
+                driver, copy_target, candidate_by_field, control_schema=context.fixture.control_schema
+            )
+            assert inventory.root == source_inventory_root(entries) and len(entries) == 1
+            await _assert_canonical_locations(session, manifest, network_id)
+            await asyncio.sleep(0)
+        assert metadata["seal_sha256"] == manifest._custody_seal_sha256
+        assert not any(
+            query_event.query.lstrip().upper().startswith("LOCK TABLE") or "pg_advisory" in query_event.query.lower()
+            for query_event in statements
+        )
+        request = SimpleNamespace(
+            query_string=f"network_ids={network_id}",
+            headers={"Authorization": "Bearer synthetic-network-read-token"},
+            ctx=SimpleNamespace(sa_session=session),
+        )
 
-            read_addresses = _canonical_address_handler(session, manifest)
+        read_addresses = _canonical_address_handler(session, manifest)
 
-            with driver.query_logger(statements.append):
-                http_response = await read_addresses(request)
-                await asyncio.sleep(0)
-            assert not any(
-                query_event.query.lstrip().upper().startswith("LOCK TABLE")
-                or "pg_advisory" in query_event.query.lower()
-                for query_event in statements
-            )
-            assert http_response.status == 200 and json.loads(http_response.body) == {"locations": ["a" * 64]}
-            assert http_response.headers["X-Network-Generation"] == str(manifest.generation_id)
-            assert http_response.headers["Cache-Control"] == "private, no-store"
-            assert current_network_address_scope() is None and session.in_transaction()
-    finally:
-        await engine.dispose()
+        with driver.query_logger(statements.append):
+            http_response = await read_addresses(request)
+            await asyncio.sleep(0)
+        assert not any(
+            query_event.query.lstrip().upper().startswith("LOCK TABLE") or "pg_advisory" in query_event.query.lower()
+            for query_event in statements
+        )
+        assert http_response.status == 200 and json.loads(http_response.body) == {"locations": ["a" * 64]}
+        assert http_response.headers["X-Network-Generation"] == str(manifest.generation_id)
+        assert http_response.headers["Cache-Control"] == "private, no-store"
+        assert current_network_address_scope() is None and session.in_transaction()
 
 
 async def _maintenance_inventory(context, copy_target):
