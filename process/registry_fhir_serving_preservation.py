@@ -686,7 +686,8 @@ def _carry_queries(predecessor, missing, raw, address_relation=None):
     prior = storage_identifier(predecessor.schema_name)
     membership_query = f"SELECT m.* FROM {raw} m JOIN {missing} ids USING(network_id)"
     binding_query = f"""SELECT DISTINCT b.* FROM {prior}.provider_location_binding b
-      WHERE EXISTS(SELECT FROM ({membership_query}) m WHERE
+      WHERE EXISTS(SELECT FROM {missing})
+      AND EXISTS(SELECT FROM ({membership_query}) m WHERE
         (m.provider_system,m.provider_id,m.location_id)=(b.provider_system,b.provider_id,b.location_id))"""
     addresses = address_relation or prior + ".entity_address_unified"
     address_query = f"""SELECT a.* FROM {addresses} a
