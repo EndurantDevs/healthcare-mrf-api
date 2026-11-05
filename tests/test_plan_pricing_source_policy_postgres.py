@@ -28,12 +28,10 @@ from tests.ptg2_factorized_card_support import card_pagination, provider_cell_ro
 from tests.test_network_catalog_routes import v2_envelope
 from tests.test_plan_pricing_projection_postgres import _create_import_run_stub, _migration_statements
 from tests.test_plan_pricing_projection_v3_postgres import _factorized_migration_statements
+from tests.test_provider_directory_cms_resource_batch_postgres import cms_source_template as cms_source_template
 from tests.test_provider_service_source_policy_postgres import (
     _reader_identity,
     _selection,
-)
-from tests.test_provider_service_source_policy_postgres import (
-    cms_resource_template as cms_resource_template,
 )
 from tests.test_provider_service_source_policy_postgres import (
     profile_transport as profile_transport,
@@ -46,7 +44,7 @@ from tests.test_provider_service_source_policy_postgres import (
 )
 from tests.test_ptg2_factorized_card_postgres import _insert_factorized_card_fixture
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures(cms_source_template.__name__)]
 PROJECTION_ID = "d" * 64
 
 

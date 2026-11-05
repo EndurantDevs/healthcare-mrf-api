@@ -348,9 +348,18 @@ async def retained_catalog(monkeypatch):
 
 @asynccontextmanager
 async def _catalog_reader_pair(database, jit, has_caller_savepoint):
+    """Compare both implementations against one genuine retained Reader snapshot."""
     async with AsyncExitStack() as stack:
         original = await stack.enter_async_context(database.reader_session(independent=True))
-        candidate = await stack.enter_async_context(database.reader_session(independent=True))
+        snapshot = (await original.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
+
+        async def import_snapshot(session):
+            """Import before Reader verification captures an independent snapshot."""
+            await session.execute(text(f"SET TRANSACTION SNAPSHOT '{snapshot}'"))
+
+        candidate = await stack.enter_async_context(
+            database.reader_session(independent=True, temporary_setup=import_snapshot)
+        )
         for session in (original, candidate):
             await session.execute(text("SELECT set_config('jit',:jit,true)"), {"jit": jit})
             await session.execute(text("SET LOCAL max_parallel_workers_per_gather = 1"))

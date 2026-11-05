@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from process import live_progress
+from process import provider_directory_published_replacement_journal as replacement_journal
 from process import provider_directory_serving_recovery_receipts as receipts
 from process.provider_directory_output_snapshot_catalog import decoded, encoded
 
@@ -17,6 +18,7 @@ OPERATION_PARAM = "provider_directory_serving_operation"
 DESCRIPTOR_FIELD = "serving_recovery_generation"
 _PIN_FIELDS = ("source_id", "endpoint_id", "dataset_id", "dataset_hash", "parent_run_id")
 _UUID_DOMAIN = "provider-directory-serving-recovery/v1:"
+_COUPLED_ADDRESS = contextvars.ContextVar("provider_directory_coupled_address", default=None)
 _JOURNAL_CHECKS = {
     "pd_serving_recovery_phase": "CHECK ((phase = ANY (ARRAY['overlay'::text, 'published'::text, 'recovered'::text])))",
     "pd_serving_recovery_document": "CHECK (((jsonb_typeof(document) = 'object'::text) AND ((document ->> 'version'::text) = '1'::text) AND (octet_length((document)::text) <= 2097152)))",
@@ -88,6 +90,13 @@ def is_recovery_request(importer, params):
     return True
 
 
+async def replacement_journal_present(database, schema):
+    """Keep optional replacement replay compatible with unmigrated ordinary callers."""
+    return await database.scalar(
+        "SELECT to_regclass(:relation) IS NOT NULL", relation=receipts.qualified(schema, receipts.JOURNAL)
+    )
+
+
 async def _journal(database, schema):
     """Require the migration's fixed ordinary table before reading any authority."""
     native = (await receipts.catalog(database, schema, (receipts.JOURNAL,)))[receipts.JOURNAL]
@@ -153,10 +162,27 @@ def _document(document_by_field, phase, generation, source_id):
         and type(document_by_field["source"]) is dict
         and set(document_by_field["source"]) == set(_PIN_FIELDS)
         and document_by_field["source"]["source_id"] == source_id
-        and publication_generation(document_by_field["source"]) == generation,
+        and type(document_by_field["preparation"]) is dict,
         "journal_document_changed",
     )
     _require_transition(phase, document_by_field["before"], document_by_field["after"])
+    receipts.require(type(document_by_field["preparation"]) is dict, "journal_preparation_changed")
+    receipts.require(
+        replacement_journal.FIELD not in document_by_field["preparation"]
+        or document_by_field["preparation"][replacement_journal.FIELD] is not None,
+        "replacement_binding_invalid",
+    )
+    replacement_journal.validate(
+        document_by_field["preparation"].get(replacement_journal.FIELD),
+        document_by_field["source"],
+        before=document_by_field["before"] if phase == "overlay" else None,
+    )
+    generation_for_source = (
+        replacement_journal.generation(document_by_field["source"])
+        if replacement_journal.FIELD in document_by_field["preparation"]
+        else publication_generation(document_by_field["source"])
+    )
+    receipts.require(generation_for_source == generation, "journal_generation_changed")
     receipts.require(
         type(document_by_field["writer"]) is dict
         and set(document_by_field["writer"]) == {"session", "current", "owner", "backend", "xid", "database_oid"}
@@ -198,8 +224,8 @@ def _require_transition(phase, before, after):
     receipts.require(all(old[key] == new[key] for key in stable_keys), "unrelated_state_changed")
 
 
-async def _load_history(database, schema, generation, *, for_update=False):
-    native = await _journal(database, schema)
+async def _load_history(database, schema, generation, *, for_update=False, _native=None):
+    native = await _journal(database, schema) if _native is None else _native
     _session, driver, _actor = await receipts.ordinary(database)
     event_rows = await driver.fetch(
         "SELECT phase,source_id,document,document_sha256,document_sha256="
@@ -236,12 +262,24 @@ async def _load_history(database, schema, generation, *, for_update=False):
             == events_by_phase["overlay"]["document"]["before"]["roots"],
             "journal_inverse_changed",
         )
+    if "overlay" in events_by_phase:
+        original = events_by_phase["overlay"]["document"]
+        source_binding = original["preparation"].get(replacement_journal.FIELD)
+        replacement_journal.validate(source_binding, original["source"], before=original["before"])
+        receipts.require(
+            all(
+                event["document"]["preparation"].get(replacement_journal.FIELD) == source_binding
+                and event["document"]["source"] == original["source"]
+                for event in events_by_phase.values()
+            ),
+            "replacement_history_changed",
+        )
     return events_by_phase
 
 
 async def _append(database, schema, generation, phase, publication_pin, before, after, *, preparation=None):
     native = await _journal(database, schema)
-    history = await _load_history(database, schema, generation, for_update=True)
+    history = await _load_history(database, schema, generation, for_update=True, _native=native)
     receipts.require(phase not in history, "phase_already_recorded")
     predecessor = None
     if phase != "overlay":
@@ -249,6 +287,16 @@ async def _append(database, schema, generation, phase, publication_pin, before, 
         receipts.require(previous in history, "journal_history_changed")
         predecessor = history[previous]["sha256"]
     _session, driver, actor = await receipts.ordinary(database)
+    preparation_by_field = dict(preparation or {})
+    if phase != "overlay":
+        original_binding = history["overlay"]["document"]["preparation"].get(replacement_journal.FIELD)
+        receipts.require(
+            replacement_journal.FIELD not in preparation_by_field
+            or preparation_by_field[replacement_journal.FIELD] == original_binding,
+            "replacement_history_changed",
+        )
+        if original_binding is not None:
+            preparation_by_field[replacement_journal.FIELD] = original_binding
     document_by_field = dict(
         version=1,
         generation=generation,
@@ -259,10 +307,11 @@ async def _append(database, schema, generation, phase, publication_pin, before, 
         writer=actor,
         predecessor=predecessor,
         journal=native,
-        preparation={} if preparation is None else preparation,
+        preparation=preparation_by_field,
     )
     _document(document_by_field, phase, generation, publication_pin["source_id"])
     table = receipts.qualified(schema, receipts.JOURNAL)
+    document = encoded(document_by_field)
     await driver.execute(
         f"INSERT INTO {table}(generation,phase,source_id,document,document_sha256) "
         "SELECT $1::uuid,$2,$3,value,encode(sha256(convert_to(value::text,'UTF8')),'hex') "
@@ -270,8 +319,9 @@ async def _append(database, schema, generation, phase, publication_pin, before, 
         UUID(generation),
         phase,
         publication_pin["source_id"],
-        encoded(document_by_field),
+        document,
     )
+    return document
 
 
 def overlay_request(fence, request):
@@ -327,6 +377,7 @@ def attach_overlay_stage(directory, bundle):
         "prepared_stage_changed",
     )
     recovery["stage"] = stage
+    recovery["bundle"] = bundle
 
 
 def preparation_timeout(directory, ordinary_timeout):
@@ -362,6 +413,12 @@ async def begin_overlay(directory, recovery):
         _progress(recovery["run_id"], "Preparing previous " + root.replace("_", " "))
         proofs_by_root[root] = await receipts.prepare_relation(directory.db, directory._schema(), root)
     recovery["before"] = await receipts.prepared_state(directory.db, directory._schema(), proofs_by_root)
+    from process import provider_directory_generic_source_artifacts as artifacts
+
+    admission = artifacts.current(directory)
+    recovery[replacement_journal.FIELD] = (
+        replacement_journal.capture(directory, admission.fence, recovery["before"]) if admission is not None else None
+    )
     recovery["proofs"] = proofs_by_root
     _progress(recovery["run_id"], "Preparing replacement provider address overlay")
     from process.provider_directory_artifact_read_access import prepare_ordinary_artifact_reads
@@ -427,7 +484,7 @@ async def finish_overlay(directory, recovery):
     receipts.require((await receipts.ordinary(directory.db))[2] == recovery["actor"], "writer_changed")
     proofs_by_root = {**recovery["proofs"], receipts.ROOTS[0]: recovery["successor"]}
     after = await receipts.prepared_state(directory.db, directory._schema(), proofs_by_root)
-    await _append(
+    return await _append(
         directory.db,
         directory._schema(),
         recovery["generation"],
@@ -436,6 +493,11 @@ async def finish_overlay(directory, recovery):
         recovery["before"],
         after,
         preparation={
+            **(
+                {replacement_journal.FIELD: recovery[replacement_journal.FIELD]}
+                if recovery.get(replacement_journal.FIELD) is not None
+                else {}
+            ),
             "elapsed_seconds": recovery["preparation_seconds"],
             "digests": {
                 **{root: receipts.preparation_metrics(proof) for root, proof in recovery["proofs"].items()},
@@ -453,11 +515,15 @@ async def _resume_state(directory, generation):
         return None
     receipts.require("recovered" not in history, "operation_recovered")
     source = history["overlay"]["document"]["source"]
-    await _source_fence(directory, source)
+    is_replacement = _replacement_binding(history) is not None
+    if not is_replacement:
+        await _source_fence(directory, source, history=history)
     await receipts.lock(database, schema, receipts.ROOTS, mode="SHARE")
     history = await _load_history(database, schema, generation, for_update=True)
     latest = history.get("published", history["overlay"])["document"]
     current = await receipts.state(database, schema)
+    if is_replacement:
+        await _finish_replacement_read(directory, source, history, current)
     receipts.require(current == latest["after"], "current_serving_changed")
     return latest
 
@@ -503,6 +569,10 @@ def address_request(context, task):
 
 async def resume_address(database, ctx, task):
     """Keep ordinary task context and resolve only an already committed Address cut."""
+    from process.provider_directory_published_replacement_address_followup import resume_address as resume_replacement
+
+    if (replacement_result := await resume_replacement(database, ctx, task)) is not None:
+        return replacement_result
     address_request(ctx.setdefault("context", {}), task)
     if task.get(GENERATION_PARAM) is None:
         return None
@@ -560,6 +630,7 @@ async def address_transaction(database, lock_timeout, quote_literal, context):
                     "serving_recovery_proofs",
                     "serving_recovery_stage",
                     "serving_recovery_read_access",
+                    "serving_recovery_prepared_address",
                 ):
                     context.pop(key, None)
     except Exception as error:
@@ -571,10 +642,144 @@ async def address_transaction(database, lock_timeout, quote_literal, context):
         raise
 
 
+def _coupled_context(context):
+    """Snapshot only the immutable publication coordinates used by the prepared cut."""
+    return encoded(
+        {
+            key: context.get(key)
+            for key in (
+                GENERATION_PARAM,
+                "partial_provider_directory_source_ids",
+                "partial_provider_directory_dataset_id",
+                "partial_provider_directory_run_id",
+            )
+        }
+    )
+
+
+def _coupled_prepared_identity(prepared):
+    """Keep the exact original proof objects, rather than admitting a substituted proof set."""
+    receipts.require(
+        type(prepared) is dict
+        and set(prepared) == {"proofs", "read_access", "stage"}
+        and type(prepared["proofs"]) is dict
+        and set(prepared["proofs"]) == set(receipts.ROOTS)
+        and type(prepared["read_access"]) in {tuple, list},
+        "coupled_preparation_changed",
+    )
+    return (
+        prepared["proofs"],
+        *(prepared["proofs"][root] for root in receipts.ROOTS),
+        prepared["read_access"],
+        *prepared["read_access"],
+        prepared["stage"],
+    )
+
+
+@asynccontextmanager
+async def coupled_address_scope(directory, selected, address, document):
+    """Reuse only this writer's just-inserted overlay receipt during its prepared Address call."""
+    from process import provider_directory_generic_source_artifacts as artifacts
+
+    receipts.require(type(document) is str, "coupled_preparation_changed")
+    admission = artifacts.current(directory)
+    session, _driver, actor = await receipts.ordinary(directory.db)
+    entry = _document(document, "overlay", selected["generation"], selected["source"]["source_id"])
+    prepared = address.context.get("serving_recovery_prepared_address")
+    receipts.require(
+        _COUPLED_ADDRESS.get() is None
+        and admission is not None
+        and admission.factory is None
+        and admission.recovery is selected
+        and entry["source"] == selected["source"]
+        and entry["before"] == selected["before"]
+        and entry["writer"] == selected["actor"] == actor
+        and entry["preparation"].get(replacement_journal.FIELD) == selected[replacement_journal.FIELD]
+        and address.db_schema == directory._schema()
+        and len(address.swaps) == 1
+        and address.swaps[0].live_cls.__main_table__ == receipts.ROOTS[1]
+        and address.context.get(GENERATION_PARAM) == selected["generation"]
+        and address.context.get("partial_provider_directory_source_ids") == [entry["source"]["source_id"]]
+        and address.context.get("partial_provider_directory_dataset_id") == entry["source"]["dataset_id"]
+        and address.context.get("partial_provider_directory_run_id") == entry["source"]["parent_run_id"],
+        "coupled_preparation_changed",
+    )
+    state_by_field = dict(
+        directory=directory,
+        admission=admission,
+        recovery=selected,
+        address=address,
+        context=address.context,
+        swaps=address.swaps,
+        preparation_input=address.preparation_input,
+        prepared=prepared,
+        prepared_identity=_coupled_prepared_identity(prepared),
+        session=session,
+        actor=encoded(actor),
+        task=asyncio.current_task(),
+        context_pin=_coupled_context(address.context),
+        document=document,
+    )
+    token = _COUPLED_ADDRESS.set(state_by_field)
+    try:
+        yield
+    finally:
+        _COUPLED_ADDRESS.reset(token)
+
+
+async def _prepare_coupled_address(database, schema, swaps, context):
+    """Skip duplicate preparation only inside the original coupled native publication call."""
+    state_by_field = _COUPLED_ADDRESS.get()
+    if state_by_field is None:
+        return None
+    from process import provider_directory_generic_source_artifacts as artifacts
+
+    started = time.monotonic()
+    directory, address = state_by_field["directory"], state_by_field["address"]
+    proof_parts = _coupled_prepared_identity(state_by_field["prepared"])
+    original_parts = state_by_field["prepared_identity"]
+    receipts.require(
+        state_by_field["task"] is asyncio.current_task()
+        and database is directory.db
+        and schema == directory._schema() == address.db_schema
+        and context is state_by_field["context"] is address.context
+        and swaps is state_by_field["swaps"] is address.swaps
+        and address.preparation_input is state_by_field["preparation_input"]
+        and artifacts.current(directory) is state_by_field["admission"]
+        and state_by_field["admission"].recovery is state_by_field["recovery"]
+        and _coupled_context(context) == state_by_field["context_pin"]
+        and context.get("serving_recovery_prepared_address") is state_by_field["prepared"]
+        and len(proof_parts) == len(original_parts)
+        and all(actual is original for actual, original in zip(proof_parts, original_parts, strict=True)),
+        "coupled_preparation_changed",
+    )
+    session, _driver, actor = await receipts.ordinary(database)
+    entry = decoded(state_by_field["document"])
+    receipts.require(
+        session is state_by_field["session"]
+        and encoded(actor) == state_by_field["actor"]
+        and state_by_field["recovery"]["source"] == entry["source"]
+        and state_by_field["recovery"]["generation"] == entry["generation"],
+        "coupled_preparation_changed",
+    )
+    prepared = state_by_field["prepared"]
+    await receipts.recheck_prepared(database, prepared["stage"], swaps[0].stage_cls.__tablename__)
+    context.update(
+        serving_recovery_preparation_started=True,
+        serving_recovery_before=entry["after"],
+        serving_recovery_writer=actor,
+        serving_recovery_proofs=prepared["proofs"],
+        serving_recovery_read_access=prepared["read_access"],
+        serving_recovery_stage=prepared["stage"],
+        serving_recovery_preparation_seconds=time.monotonic() - started,
+    )
+    return prepared
+
+
 async def prepare_address(database, schema, swaps, context):
     """Freeze and hash actual old/new heaps before any live AccessExclusive lock."""
     generation = context.get(GENERATION_PARAM)
-    if generation is None:
+    if await _prepare_coupled_address(database, schema, swaps, context) is not None or generation is None:
         return
     started = time.monotonic()
     history = await _load_history(database, schema, generation, for_update=True)
@@ -592,14 +797,16 @@ async def prepare_address(database, schema, swaps, context):
     )
     directory = importlib.import_module("process.provider_directory_fhir")
     receipts.require(directory.db is database, "database_changed")
-    await _source_fence(directory, pin)
+    await _source_fence(directory, pin, history=history)
     stage_name = swaps[0].stage_cls.__tablename__
     await receipts.lock(database, schema, (*receipts.ROOTS, stage_name), mode="SHARE")
     context["serving_recovery_preparation_started"] = True
-    proofs_by_root = {}
-    for root in receipts.ROOTS:
-        _progress(context.get("serving_recovery_run_id"), "Preparing previous " + root.replace("_", " "))
-        proofs_by_root[root] = await receipts.prepare_relation(database, schema, root)
+    prepared_address = context.get("serving_recovery_prepared_address")
+    proofs_by_root = {} if prepared_address is None else prepared_address["proofs"]
+    if prepared_address is None:
+        for root in receipts.ROOTS:
+            _progress(context.get("serving_recovery_run_id"), "Preparing previous " + root.replace("_", " "))
+            proofs_by_root[root] = await receipts.prepare_relation(database, schema, root)
     current = await receipts.prepared_state(database, schema, proofs_by_root)
     receipts.require(current == entry["after"], "current_serving_changed")
     context["serving_recovery_before"] = current
@@ -608,14 +815,38 @@ async def prepare_address(database, schema, swaps, context):
     _progress(context.get("serving_recovery_run_id"), "Preparing replacement provider addresses")
     from process.provider_directory_artifact_read_access import prepare_ordinary_read_access
 
-    context["serving_recovery_read_access"] = await prepare_ordinary_read_access(database, schema, swaps)
-    context["serving_recovery_stage"] = await receipts.prepare_relation(database, schema, stage_name)
+    context["serving_recovery_read_access"] = (
+        await prepare_ordinary_read_access(database, schema, swaps)
+        if prepared_address is None
+        else prepared_address["read_access"]
+    )
+    context["serving_recovery_stage"] = (
+        await receipts.prepare_relation(database, schema, stage_name)
+        if prepared_address is None
+        else prepared_address["stage"]
+    )
+    if prepared_address is not None:
+        await receipts.recheck_prepared(database, prepared_address["stage"], stage_name)
     context["serving_recovery_preparation_seconds"] = time.monotonic() - started
     await database.status("SET LOCAL statement_timeout='1000ms'")
-    context["serving_recovery_wall"].reschedule(asyncio.get_running_loop().time() + 2.0)
+    deadline = asyncio.get_running_loop().time() + 2.0
+    context["serving_recovery_wall"].reschedule(min(context["serving_recovery_wall"].when(), deadline))
     await receipts.lock_metadata(database, schema)
     receipts.require(
         await receipts.prepared_state(database, schema, proofs_by_root) == current, "current_serving_changed"
+    )
+
+
+async def prepare_replacement_address(database, schema, address, context, selected_recovery):
+    """Hash the private Address stage while the original serving heaps still admit readers."""
+    from process.provider_directory_artifact_read_access import prepare_ordinary_read_access
+
+    stage_name = address.swaps[0].stage_cls.__tablename__
+    await receipts.lock(database, schema, (stage_name,), mode="SHARE")
+    context["serving_recovery_prepared_address"] = dict(
+        proofs={**selected_recovery["proofs"], receipts.ROOTS[0]: selected_recovery["successor"]},
+        read_access=await prepare_ordinary_read_access(database, schema, address.swaps),
+        stage=await receipts.prepare_relation(database, schema, stage_name),
     )
 
 
@@ -695,10 +926,15 @@ async def after_address(database, schema, context):
     }
 
 
-async def _source_fence(directory, source):
+async def _source_fence(directory, source, *, history=None):
     """Fence only the recorded current raw tuple using the ordinary committing session."""
     from process.provider_directory_generic_source_artifacts import lock_address_source_fence
 
+    if history is not None:
+        binding = history["overlay"]["document"]["preparation"].get(replacement_journal.FIELD)
+        if binding is not None:
+            await replacement_journal.check(directory, source, binding, restored="recovered" in history)
+            return
     fence_context_by_field = dict(
         partial_provider_directory_dataset_id=source["dataset_id"],
         partial_provider_directory_source_ids=[source["source_id"]],
@@ -719,14 +955,30 @@ async def _source_fence(directory, source):
     receipts.require(actual == source, "current_source_changed")
 
 
-async def _lock_recovery(directory, source, baseline, forward, *, mode="SHARE"):
+def _replacement_binding(history):
+    return None if history is None else history["overlay"]["document"]["preparation"].get(replacement_journal.FIELD)
+
+
+async def _finish_replacement_read(directory, source, history, current):
+    """Join hashed heaps with simultaneously current Source and fixed metadata, without rescanning."""
+    async with asyncio.timeout(2.0):
+        await directory.db.status("SET LOCAL statement_timeout='1000ms'")
+        await _source_fence(directory, source, history=history)
+        await receipts.lock_metadata(directory.db, directory._schema())
+        receipts.require(
+            await receipts.metadata(directory.db, directory._schema()) == current["metadata"], "current_serving_changed"
+        )
+
+
+async def _lock_recovery(directory, source, baseline, forward, *, mode="SHARE", history=None):
     """Use ordinary Source/alias order, then pin every native serving dependency."""
     from process import provider_directory_cms_serving_receipt as common
     from process.ext import address_alias_sql
 
     database, schema = directory.db, directory._schema()
-    await _source_fence(directory, source)
-    await database.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
+    if _replacement_binding(history) is None:
+        await _source_fence(directory, source, history=history)
+        await database.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
     _session, driver, _actor = await receipts.ordinary(database)
     dependencies = set(common._NATIVE_RELATIONS) - set(receipts.ROOTS)
     existing = await driver.fetch(
@@ -799,6 +1051,11 @@ async def _inverse(directory, history, generation, current, proofs_by_root, reta
     after = await receipts.prepared_state(database, schema, restored_by_root)
     for root in receipts.ROOTS:
         receipts.require_relation(baseline["roots"][root], after["roots"][root])
+    await replacement_journal.restore(
+        directory,
+        forward["document"]["source"],
+        history["overlay"]["document"]["preparation"].get(replacement_journal.FIELD),
+    )
     await _append(
         database,
         schema,
@@ -823,6 +1080,32 @@ def _outcome(generation, source, state):
     }
 
 
+async def _prepare_inverse_receipts(directory, baseline, forward, run_id):
+    """Hash current and retained heaps before any short final Source freeze."""
+    database, schema = directory.db, directory._schema()
+    started = time.monotonic()
+    proofs_by_root, retained_by_root = {}, {}
+    for root in receipts.ROOTS:
+        _progress(run_id, "Verifying current " + root.replace("_", " "))
+        proofs_by_root[root] = await receipts.prepare_relation(database, schema, root)
+        previous_oid = baseline["roots"][root]["native"]["oid"]
+        if previous_oid != forward["roots"][root]["native"]["oid"]:
+            _progress(run_id, "Verifying retained " + root.replace("_", " "))
+            retained_by_root[root] = await receipts.prepare_relation(
+                database, schema, receipts.retained_name(previous_oid)
+            )
+            old = decoded(retained_by_root[root].receipt_json)
+            receipts.require_relation(baseline["roots"][root], old, renamed=True)
+    preparation_by_field = {
+        "elapsed_seconds": time.monotonic() - started,
+        "digests": {
+            **{root: receipts.preparation_metrics(proof) for root, proof in proofs_by_root.items()},
+            **{"retained_" + root: receipts.preparation_metrics(proof) for root, proof in retained_by_root.items()},
+        },
+    }
+    return proofs_by_root, retained_by_root, preparation_by_field
+
+
 async def _recover_once(directory, task):
     """Keep the journal, exact inverse and native receipt in one ordinary transaction."""
     from process import provider_directory_generic_source_policy as source_policy
@@ -837,40 +1120,26 @@ async def _recover_once(directory, task):
         receipts.require(task["source_ids"] == [publication_pin["source_id"]], "source_changed")
         baseline = history["overlay"]["document"]["before"]
         forward = history.get("recovered", history.get("published", history["overlay"]))["document"]["after"]
-        names = await _lock_recovery(directory, publication_pin, baseline, forward)
+        names = await _lock_recovery(directory, publication_pin, baseline, forward, history=history)
         history = await _load_history(database, schema, generation, for_update=True)
         if "recovered" in history:
             state = await receipts.state(database, schema)
+            if _replacement_binding(history) is not None:
+                await _finish_replacement_read(directory, publication_pin, history, state)
             receipts.require(state == history["recovered"]["document"]["after"], "current_serving_changed")
         else:
-            started = time.monotonic()
-            proofs_by_root, retained_by_root = {}, {}
-            for root in receipts.ROOTS:
-                _progress(task.get("run_id"), "Verifying current " + root.replace("_", " "))
-                proofs_by_root[root] = await receipts.prepare_relation(database, schema, root)
-                previous_oid = baseline["roots"][root]["native"]["oid"]
-                if previous_oid != forward["roots"][root]["native"]["oid"]:
-                    _progress(task.get("run_id"), "Verifying retained " + root.replace("_", " "))
-                    retained_by_root[root] = await receipts.prepare_relation(
-                        database, schema, receipts.retained_name(previous_oid)
-                    )
-                    old = decoded(retained_by_root[root].receipt_json)
-                    receipts.require_relation(baseline["roots"][root], old, renamed=True)
-            current = await receipts.prepared_state(database, schema, proofs_by_root)
-            preparation_by_field = {
-                "elapsed_seconds": time.monotonic() - started,
-                "digests": {
-                    **{root: receipts.preparation_metrics(proof) for root, proof in proofs_by_root.items()},
-                    **{
-                        "retained_" + root: receipts.preparation_metrics(proof)
-                        for root, proof in retained_by_root.items()
-                    },
-                },
-            }
+            proofs_by_root, retained_by_root, preparation_by_field = await _prepare_inverse_receipts(
+                directory, baseline, forward, task.get("run_id")
+            )
             from process.entity_address_cutover_contract import lock_live_serving_relations
 
             wall.reschedule(asyncio.get_running_loop().time() + 2.0)
             await database.status("SET LOCAL statement_timeout='1000ms'")
+            if _replacement_binding(history) is not None:
+                from process.ext import address_alias_sql
+
+                await _source_fence(directory, publication_pin, history=history)
+                await database.scalar(address_alias_sql.alias_advisory_xact_lock_sql())
             await receipts.lock_metadata(database, schema)
             current = await receipts.prepared_state(database, schema, proofs_by_root)
             receipts.require(current == forward, "current_serving_changed")
@@ -894,10 +1163,14 @@ async def _verify_recovered(directory, task):
             return None
         source = history["recovered"]["document"]["source"]
         receipts.require(task["source_ids"] == [source["source_id"]], "source_changed")
-        await _source_fence(directory, source)
+        is_replacement = _replacement_binding(history) is not None
+        if not is_replacement:
+            await _source_fence(directory, source, history=history)
         await receipts.lock(database, schema, receipts.ROOTS, mode="SHARE")
         history = await _load_history(database, schema, generation, for_update=True)
         state = await receipts.state(database, schema)
+        if is_replacement:
+            await _finish_replacement_read(directory, source, history, state)
         receipts.require(state == history["recovered"]["document"]["after"], "current_serving_changed")
         return _outcome(generation, source, state)
 

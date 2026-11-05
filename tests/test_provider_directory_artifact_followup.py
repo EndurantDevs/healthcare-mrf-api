@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import provider_directory_generic_source_artifacts as source_artifacts
+from process import provider_directory_published_replacement_followup as replacement_followup
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -15,9 +16,12 @@ importer = importlib.import_module("process.provider_directory_fhir")
 def _overlay_followup_params():
     """Match the existing source-scoped followup, including exact publication markers."""
     return {
-        "publish_artifacts_only": True, "publish_artifacts_targets": "address_overlay",
-        "source_ids": ["source-current"], "publish_corroboration": False,
-        "probe": False, "import_resources": False,
+        "publish_artifacts_only": True,
+        "publish_artifacts_targets": "address_overlay",
+        "source_ids": ["source-current"],
+        "publish_corroboration": False,
+        "probe": False,
+        "import_resources": False,
         "provider_directory_dataset_followup_version": 1,
         "provider_directory_dataset_followup_stage": "address_overlay",
         "provider_directory_dataset_followup_source_id": "source-current",
@@ -33,7 +37,11 @@ def _overlay_followup_params():
 def overlay_entry(monkeypatch):
     """Keep real task parsing, preflight and fences; stop at the staging boundary."""
     dataset = importer.ProviderDirectoryArtifactDataset(
-        "source-current", "endpoint-current", "dataset-current", "run-root", dataset_hash="a" * 64,
+        "source-current",
+        "endpoint-current",
+        "dataset-current",
+        "run-root",
+        dataset_hash="a" * 64,
     )
     fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
     resolve_fence = AsyncMock(return_value=fence)
@@ -46,9 +54,15 @@ def overlay_entry(monkeypatch):
     monkeypatch.setattr(importer, "_resolve_provider_directory_artifact_datasets", resolve_fence)
     monkeypatch.setattr(importer, "_publish_current_dataset_relation_artifacts", relation_builder)
     monkeypatch.setattr(importer, "_publish_artifact_bundle_from_fence", bundle_publisher)
+    monkeypatch.setattr(source_artifacts, "replay_published_replacement", AsyncMock(return_value=None))
+    monkeypatch.setattr(replacement_followup, "_has_valid_incumbent", AsyncMock(return_value=False))
     return SimpleNamespace(
-        context={"control_run_id": "run-overlay", "context": {}}, dataset=dataset, fence=fence,
-        resolve_fence=resolve_fence, relation_builder=relation_builder, bundle_publisher=bundle_publisher,
+        context={"control_run_id": "run-overlay", "context": {}},
+        dataset=dataset,
+        fence=fence,
+        resolve_fence=resolve_fence,
+        relation_builder=relation_builder,
+        bundle_publisher=bundle_publisher,
     )
 
 
@@ -83,9 +97,15 @@ async def test_overlay_followup_rejects_stale_pin(overlay_entry, field):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed_fields", [
-    {"status": "validated"}, {"is_current": False}, {"promote_on_cutover": True}, {"serving_endpoint_id": "changed"},
-])
+@pytest.mark.parametrize(
+    "changed_fields",
+    [
+        {"status": "validated"},
+        {"is_current": False},
+        {"promote_on_cutover": True},
+        {"serving_endpoint_id": "changed"},
+    ],
+)
 async def test_overlay_followup_requires_published_current(overlay_entry, changed_fields):
     """An overlay can never promote a candidate or reuse a superseded selection."""
     changed_dataset = replace(overlay_entry.dataset, **changed_fields)
@@ -125,7 +145,8 @@ async def test_overlay_selection_refresh_remains_fenced(overlay_entry):
     """A valid initial marker does not permit a changed selection after relation checks."""
     replacement = replace(overlay_entry.dataset, dataset_id="replacement")
     overlay_entry.resolve_fence.side_effect = [
-        overlay_entry.fence, importer.ProviderDirectoryArtifactDatasetFence((replacement,)),
+        overlay_entry.fence,
+        importer.ProviderDirectoryArtifactDatasetFence((replacement,)),
     ]
     with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="artifact_dataset_selection_changed"):
         await importer.process_data(overlay_entry.context, _overlay_followup_params())
@@ -133,14 +154,26 @@ async def test_overlay_selection_refresh_remains_fenced(overlay_entry):
     overlay_entry.bundle_publisher.assert_not_awaited()
 
 
-@pytest.mark.parametrize("changed_fields", [
-    {"import_resources": True}, {"publish_artifacts_only": 1}, {"probe": 0}, {"test_mode": True},
-    {"provider_directory_dataset_followup_version": True}, {"provider_directory_dataset_followup_attempt": True},
-    {"provider_directory_dataset_followup_dataset_hash": "bad"}, {"provider_directory_dataset_followup_endpoint_id": " "},
-    {"publish_targets": "profile"}, {"validated_publication_candidate": {}}, {"full_refresh": False},
-    {"cms_npd_retained_release_id": "release"}, {"provider_directory_serving_generation": "generation"},
-    {"source_ids": ["other"]}, {"run_id": " "},
-])
+@pytest.mark.parametrize(
+    "changed_fields",
+    [
+        {"import_resources": True},
+        {"publish_artifacts_only": 1},
+        {"probe": 0},
+        {"test_mode": True},
+        {"provider_directory_dataset_followup_version": True},
+        {"provider_directory_dataset_followup_attempt": True},
+        {"provider_directory_dataset_followup_dataset_hash": "bad"},
+        {"provider_directory_dataset_followup_endpoint_id": " "},
+        {"publish_targets": "profile"},
+        {"validated_publication_candidate": {}},
+        {"full_refresh": False},
+        {"cms_npd_retained_release_id": "release"},
+        {"provider_directory_serving_generation": "generation"},
+        {"source_ids": ["other"]},
+        {"run_id": " "},
+    ],
+)
 def test_overlay_followup_refuses_parameter_mixing(changed_fields):
     """Only the exact overlay contract may use ordinary canonical preflight."""
     with pytest.raises(RuntimeError, match="ordinary_overlay_request_invalid"):
