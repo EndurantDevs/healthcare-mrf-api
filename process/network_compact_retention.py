@@ -78,19 +78,33 @@ def _page_sql(namespace):
     )
 
 
-async def _authenticated_candidate(connection, control, row):
-    _require(row["candidate_id"] is not None and row["bounded"] is True, "candidate_evidence_invalid")
-    seal_by_field = {field: row[field] for field in ("seal_sha256", "receipt_json")}
-    receipt = custody._sealed_receipt(seal_by_field)
-    candidate_by_field = {field: row[field] for field in custody._STABLE + ("state",)}
-    _require(receipt["control"] == custody._control_identity(control, receipt["revision"]), "control_changed")
+async def _authenticated_candidate(connection, control, candidate_record):
     _require(
-        receipt["candidate_sha256"]
-        == custody._digest(custody._evidence(candidate_by_field, revision=receipt["revision"])),
+        candidate_record["candidate_id"] is not None and candidate_record["bounded"] is True,
+        "candidate_evidence_invalid",
+    )
+    seal_by_field = {field: candidate_record[field] for field in ("seal_sha256", "receipt_json")}
+    custody_receipt = custody._sealed_receipt(seal_by_field)
+    candidate_by_field = {field: candidate_record[field] for field in custody._STABLE + ("state",)}
+    _require(
+        custody_receipt["control"] == custody._control_identity(control, custody_receipt["revision"]), "control_changed"
+    )
+    _require(
+        custody_receipt["candidate_sha256"]
+        == custody._digest(custody._evidence(candidate_by_field, revision=custody_receipt["revision"])),
         "candidate_evidence_changed",
     )
-    _require((receipt["revision"] == 4) == is_compact_candidate(candidate_by_field), "candidate_contract_changed")
-    roles = receipt["runtime_roles"]
+    _require(
+        (custody_receipt["revision"] in (4, 5)) == is_compact_candidate(candidate_by_field),
+        "candidate_contract_changed",
+    )
+    if custody_receipt["revision"] == 5:
+        from process.network_sampled_custody import validate_sampled_custody
+
+        validate_sampled_custody(
+            custody_receipt["semantic_validation"], candidate_id=str(candidate_by_field["candidate_id"])
+        )
+    roles = custody_receipt["runtime_roles"]
     _require(type(roles) is list and 0 < len(roles) <= 128 and roles == sorted(set(roles)), "roles_invalid")
     for role in roles:
         _identifier(role)
@@ -104,7 +118,7 @@ async def _authenticated_candidate(connection, control, row):
         },
         roles,
     )
-    return candidate_by_field, receipt
+    return candidate_by_field, custody_receipt
 
 
 def _dependencies(candidate, receipt):
@@ -187,7 +201,7 @@ async def require_network_compact_artifacts_unreferenced(connection, relation_oi
             candidate, receipt = await _authenticated_candidate(connection, control, sealed_row)
             source_oids = await _source_fact_dependencies(connection, schema, candidate, receipt)
             _require(not requested_oids.intersection(source_oids), "artifact_referenced")
-            if receipt["revision"] == 4:
+            if receipt["revision"] in (4, 5):
                 _require(not requested_oids.intersection(_dependencies(candidate, receipt)), "artifact_referenced")
         after = sealed_rows[-1]["seal_candidate_id"]
     _require(await custody._control(connection, schema) == control, "control_changed")

@@ -29,7 +29,7 @@ async def _retained_edge(connection, candidate_id, control_schema, *, api_read=F
     )
     verifier = verify_network_candidate_read_metadata if api_read else verify_network_candidate_custody
     seal = await verifier(connection, target, control_schema=control_schema)
-    _require(seal["receipt"]["revision"] == 4)
+    _require(seal["receipt"]["revision"] in (4, 5))
     return {
         "candidate_id": target.candidate_id,
         "schema_name": target.schema_name,

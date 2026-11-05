@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -235,17 +236,17 @@ def _source_event_assertion(report):
 
 
 def _evidence(candidate, *, revision=1):
-    _require(type(revision) is int and revision in (1, 2, 3, 4))
+    _require(type(revision) is int and revision in (1, 2, 3, 4, 5))
     evidence_by_name = {}
     _require(set(candidate) == set(_STABLE) | {"state"})
     for field in _STABLE:
         field_value = candidate[field]
         if field in ("source_generations", "source_recipes_json", "validation_json") and type(field_value) is str:
             field_value = json.loads(field_value)
-        if field == "validation_json" and revision in (2, 3, 4):
+        if field == "validation_json" and revision in (2, 3, 4, 5):
             _require(type(field_value) is dict)
         if field == "validation_json" and (
-            revision == 2 or (revision in (3, 4) and SOURCE_EVENT_ASSERTION in field_value)
+            revision == 2 or (revision in (3, 4, 5) and SOURCE_EVENT_ASSERTION in field_value)
         ):
             key, checkpoint = _source_event_assertion(field_value)
             _require(candidate["state"] != "published" or key in field_value)
@@ -478,6 +479,7 @@ async def _final_proof(
     """Reconstruct the complete closed candidate under independent Source and office context."""
     _require(set(source_options) <= {"source_witness_runtime"})
     from process.network_membership_publication import _publication_readiness, _verify_provider_custody
+    from process.network_sampled_custody import inherit_preserved_sampling
 
     readiness = _publication_readiness(candidate)
     report = _json_object(candidate["validation_json"])
@@ -485,6 +487,7 @@ async def _final_proof(
     async with _preservation_scope(
         connection, copy_target, candidate, schema, inventory_entries, **source_options
     ) as preservation:
+        await inherit_preserved_sampling(connection, preservation, source_options.get("source_witness_runtime"), schema)
         await verify_registry_source_retention_rows(connection, copy_target, candidate)
         from process.network_source_contribution_custody import verify_independent_source_contributions
 
@@ -516,20 +519,19 @@ async def _final_proof(
 
             proof_options_by_name = {"control_schema": schema, "office_authority": office_authority, **source_options}
             await verify_compact_final_proof(connection, copy_target, candidate, **proof_options_by_name)
-            await _verify_provider_custody(connection, candidate, readiness[3])
-            return
-        # Unlike the READY public replay, this helper reruns complete accounting and parity.
-        await _matching_inputs(connection, candidate, copy_target, address_source, schema)
-        await _source_semantics(
-            connection,
-            f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}",
-            f"{_identifier(copy_target.schema_name)}.entity_address_unified",
-            replay=True,
-        )
-        _require(
-            await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
-            == readiness[2]["index_definition_sha256"]
-        )
+        else:
+            # Unlike READY replay, this branch reruns complete accounting and parity.
+            await _matching_inputs(connection, candidate, copy_target, address_source, schema)
+            await _source_semantics(
+                connection,
+                f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}",
+                f"{_identifier(copy_target.schema_name)}.entity_address_unified",
+                replay=True,
+            )
+            _require(
+                await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
+                == readiness[2]["index_definition_sha256"]
+            )
         await _verify_provider_custody(connection, candidate, readiness[3])
 
 
@@ -633,19 +635,24 @@ def _sealed_receipt(seal):
             "index_definition_sha256",
             "runtime_roles",
         }
+        | ({"semantic_validation"} if receipt_by_name.get("revision") == 5 else set())
     )
     _require(
         receipt_by_name["component"] == "network_candidate_custody"
         and type(receipt_by_name["revision"]) is int
-        and receipt_by_name["revision"] in (1, 2, 3, 4)
+        and receipt_by_name["revision"] in (1, 2, 3, 4, 5)
         and _digest(receipt_by_name) == seal["seal_sha256"]
     )
+    if receipt_by_name["revision"] == 5:
+        from process.network_sampled_custody import validate_sampled_custody
+
+        validate_sampled_custody(receipt_by_name["semantic_validation"])
     return receipt_by_name
 
 
 def _control_identity(control, revision):
     keys = ("database_oid", "database_name", "schema_oid", "owner_oid", "candidate_table_oid", "seal_table_oid")
-    if revision in (3, 4):
+    if revision in (3, 4, 5):
         if revision == 3:
             _require(control["schema_owner_oid"] != control["owner_oid"])
         keys += ("schema_owner_oid", "schema_owner_role", "candidate_owner_oid", "candidate_owner_role")
@@ -653,7 +660,7 @@ def _control_identity(control, revision):
         # Old seals bind the single owner and cannot survive a ledger-only transfer.
         _require(control["schema_owner_oid"] == control["candidate_owner_oid"] == control["owner_oid"])
     identity_by_name = {key: control[key] for key in keys}
-    if revision in (3, 4):
+    if revision in (3, 4, 5):
         identity_by_name["owner_role"] = control["rolname"]
     return identity_by_name
 
@@ -673,7 +680,11 @@ async def _verify(connection, copy_target, schema, control, candidate, seal, *, 
     receipt = _sealed_receipt(seal)
     from process.network_compact_readiness import is_compact_candidate
 
-    _require((receipt["revision"] == 4) == is_compact_candidate(candidate))
+    _require((receipt["revision"] in (4, 5)) == is_compact_candidate(candidate))
+    if receipt["revision"] == 5:
+        from process.network_sampled_custody import validate_sampled_custody
+
+        validate_sampled_custody(receipt["semantic_validation"], candidate_id=copy_target.candidate_id)
     control_identity_by_name = _control_identity(control, receipt["revision"])
     _require(
         receipt["control"] == control_identity_by_name
@@ -768,21 +779,35 @@ async def verify_network_candidate_custody(connection, copy_target, *, control_s
     return result
 
 
-async def _store_candidate_seal(
+@dataclass(frozen=True)
+class _CandidateSealOptions:
+    """Independent enrollment and semantic-proof options for one stored seal."""
+
+    pre_enrolled_only: bool = False
+    semantic_validation: dict | None = None
+
+
+async def _candidate_seal_receipt(
     connection,
     copy_target,
     candidate,
     control,
-    control_schema,
     runtime_roles,
     final_closure,
-    *,
-    pre_enrolled_only=False,
+    semantic_validation,
 ):
+    """Encode a new proof revision only when sampled semantics are explicitly bound."""
     from process.network_compact_readiness import is_compact_candidate
 
+    if semantic_validation is not None:
+        from process.network_sampled_custody import validate_sampled_custody
+
+        _require(is_compact_candidate(candidate))
+        validate_sampled_custody(semantic_validation, candidate_id=copy_target.candidate_id)
     revision = (
-        4
+        5
+        if semantic_validation is not None
+        else 4
         if is_compact_candidate(candidate)
         else 3
         if control["schema_owner_oid"] != control["owner_oid"]
@@ -799,8 +824,22 @@ async def _store_candidate_seal(
         "closure": final_closure,
         "index_definition_sha256": await _candidate_index_digest(connection, candidate),
     }
+    if semantic_validation is not None:
+        receipt_by_name["semantic_validation"] = semantic_validation
     _require(len(_encoded(receipt_by_name)) <= MAX_RECEIPT_BYTES)
-    if pre_enrolled_only:
+    return receipt_by_name
+
+
+async def _store_candidate_seal(
+    connection, copy_target, candidate, control, control_schema, runtime_roles, final_closure, *, options=None
+):
+    """Store bound custody using the caller's existing ledger enrollment policy."""
+    options = _CandidateSealOptions() if options is None else options
+    _require(type(options) is _CandidateSealOptions and type(options.pre_enrolled_only) is bool)
+    receipt_by_name = await _candidate_seal_receipt(
+        connection, copy_target, candidate, control, runtime_roles, final_closure, options.semantic_validation
+    )
+    if options.pre_enrolled_only:
         await _require_reader_enrollment(connection, final_closure["reader_roles"], control_schema)
     async with _control_owner(connection, control["rolname"]):
         await connection.execute(
@@ -810,7 +849,7 @@ async def _store_candidate_seal(
             _digest(receipt_by_name),
             _encoded(receipt_by_name).decode(),
         )
-        if not pre_enrolled_only:
+        if not options.pre_enrolled_only:
             for role in final_closure["reader_roles"]:
                 await connection.execute(
                     f"GRANT SELECT ON {_identifier(control_schema)}.network_candidate_custody TO {_identifier(role)}"
@@ -874,6 +913,10 @@ async def _seal_ready_candidate(
     await _check_closed(connection, roles, closed)
     await _census_closed(connection, control, closed, runtime_roles)
     await _address_runtime_closure(connection, candidate, runtime_roles)
+    semantic_validation = None
+    source_runtime = seal_options.get("source_witness_runtime")
+    if source_runtime is not None and source_runtime.semantic_validation is not None:
+        semantic_validation = await source_runtime.semantic_validation.finish(connection, copy_target.candidate_id)
     return await _store_candidate_seal(
         connection,
         copy_target,
@@ -882,7 +925,7 @@ async def _seal_ready_candidate(
         control_schema,
         runtime_roles,
         after,
-        pre_enrolled_only=pre_enrolled_only,
+        options=_CandidateSealOptions(pre_enrolled_only, semantic_validation),
     )
 
 
@@ -910,6 +953,9 @@ async def _prove_ready_candidate(
         _require(type(source_witness_runtime) is SourceWitnessRuntime)
         source_witness_runtime.__post_init__()
         _require(set(runtime_roles) | {actor["current"]} <= set(source_witness_runtime.runtime_roles))
+        if source_witness_runtime.semantic_validation is not None:
+            _require(source_witness_runtime.semantic_validation.candidate_id == copy_target.candidate_id)
+            await source_witness_runtime.semantic_validation._bind(connection)
     catalog = await _lock_objects(connection, copy_target, candidate, exclusive=True, assume_owner=True)
     retained = _publication_writer_closure(candidate, _json_object(candidate["validation_json"]))
     prepared_roles_by_group = {name: retained[name] for name in ("owner_role", "loader_roles", "reader_roles")}
@@ -962,6 +1008,11 @@ async def _seal_or_verify_candidate(
         sealed_result = await _verify(
             connection, copy_target, control_schema, control, candidate, existing, operator=True
         )
+        if sealed_result["receipt"]["revision"] == 5:
+            source_runtime = seal_options.get("source_witness_runtime")
+            sampling = None if source_runtime is None else source_runtime.semantic_validation
+            _require(sampling is not None)
+            _require(sampling.policy.seed == sealed_result["receipt"]["semantic_validation"]["seed"])
         _require(sealed_result["receipt"]["runtime_roles"] == sorted(runtime_roles))
         if pre_enrolled_only:
             await _require_reader_enrollment(
@@ -995,6 +1046,24 @@ def _seal_options(runtime_roles, authorize, pre_enrolled_only):
         _identifier(role)
 
 
+def _candidate_source_runtime(runtime, copy_target):
+    """Instantiate a fresh sampling run only from trusted server policy and the exact candidate."""
+    if runtime is None:
+        return None
+    from process.network_sampled_custody import SampledValidationRun
+    from process.registry_source_recipe_composition import SourceWitnessRuntime
+
+    _require(type(runtime) is SourceWitnessRuntime)
+    runtime.__post_init__()
+    if runtime.semantic_policy is None:
+        return runtime
+    return replace(
+        runtime,
+        semantic_policy=None,
+        semantic_validation=SampledValidationRun(runtime.semantic_policy, copy_target.candidate_id),
+    )
+
+
 async def _seal_in_transaction(
     connection,
     copy_target,
@@ -1014,6 +1083,7 @@ async def _seal_in_transaction(
     actor = await _original_actor(connection)
     control = await _control(connection, control_schema)
     _require(await authorize(connection, copy_target) is True)
+    source_witness_runtime = _candidate_source_runtime(source_witness_runtime, copy_target)
     _require(await connection.fetchval("SELECT pg_has_role(current_user,$1::oid,'SET')", control["owner_oid"]))
     if control["schema_owner_oid"] != control["owner_oid"]:
         candidate = await _candidate(connection, copy_target, control_schema, lock=True)
