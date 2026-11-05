@@ -852,6 +852,16 @@ async def _assert_rejected_typed_publication(context, checked_actors):
 
 async def _assert_typed_candidate_counts(context):
     candidate = context.ready_targets[-1]
+    estimates = await context.worker.fixture.connection.fetch(
+        "SELECT c.relname,c.reltuples FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname=$1 AND c.relname=ANY($2::text[])",
+        candidate.schema_name,
+        ["network_membership", "network_membership_source"],
+    )
+    assert {row["relname"]: row["reltuples"] for row in estimates} == {
+        "network_membership": 1,
+        "network_membership_source": 1,
+    }
     assert (
         await context.worker.fixture.connection.fetchval(
             'SELECT count(*) FROM "' + candidate.schema_name + '".network_membership'
@@ -1298,6 +1308,8 @@ async def test_typed_bounded_multiset_parity_hot_duplicate_bucket(monkeypatch):
                 + name
                 + " SELECT 1,'npi','1234567893','00000000-0000-4000-8000-000000000001'::uuid,repeat('a',900) FROM generate_series(1,20000) UNION ALL SELECT 1,'provider_directory',repeat('z',900)||n::text,md5(n::text)::uuid,repeat('b',900) FROM generate_series(1,12000) n"
             )
+            await case.writer.execute("CREATE INDEX ON " + name + "(network_id)")
+            await case.writer.execute("ANALYZE " + name)
         actual, expected = "SELECT * FROM typed_parity_actual", "SELECT * FROM typed_parity_expected"
         for memory in ("4MB", "16MB"):
             await case.writer.execute("SET LOCAL work_mem='" + memory + "'")
