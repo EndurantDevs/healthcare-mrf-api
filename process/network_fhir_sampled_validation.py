@@ -5,12 +5,21 @@ import json
 import re
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+from types import SimpleNamespace
+from uuid import uuid4
 
+from process.network_address_projection import _identifier
 from process.network_fhir_source_epoch import _borrowed_epoch_settings, _set_content_settings
 from process.network_fhir_source_witness_capture import _original_source_factory
 from process.network_fhir_source_witness_contract import canonical, database_identity, digest, source_origin
 from process.network_fhir_typed_capture import SealedTypedGraphRead, TypedGraphAnchor, load_typed_graph_capture
-from process.network_fhir_typed_contract import PAIR_COLUMNS, TypedFHIRGraphError, policy_date, require
+from process.network_fhir_typed_contract import (
+    PAIR_COLUMNS,
+    TypedFHIRGraphError,
+    TypedFHIRGraphStage,
+    policy_date,
+    require,
+)
 from process.network_fhir_typed_source import _canonicalize, _check_page, _page_rows, _pairs, _workspace
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
@@ -345,6 +354,64 @@ async def _replay_roles(export, connection, replay, roles, origin, as_of, *, req
     await _pairs(connection, replay, origin, as_of, checker=True)
 
 
+async def _sample_replay_indexes(connection, replay):
+    require(type(replay) is TypedFHIRGraphStage, "replay_workspace")
+    await replay.verify(connection, complete=False)
+    require(
+        replay.schema_name == "pg_temp"
+        and set(replay.names) == set(replay.oids) == {"cells", "checks", "pairs", "addresses"},
+        "replay_workspace",
+    )
+    indexes = await connection.fetch(
+        "SELECT i.indrelid::bigint table_oid,c.relname index_name FROM pg_index i "
+        "JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid "
+        "JOIN pg_roles owner ON owner.oid=t.relowner WHERE i.indrelid=ANY($1::oid[]) "
+        "AND i.indisprimary AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive "
+        "AND t.relpersistence='t' AND t.relkind='r' AND t.relnamespace=pg_my_temp_schema() "
+        "AND c.relowner=t.relowner AND c.relnamespace=t.relnamespace "
+        "AND owner.rolname=session_user AND current_user=session_user",
+        list(replay.oids.values()),
+    )
+    indexes_by_oid = {index["table_oid"]: index["index_name"] for index in indexes}
+    require(len(indexes) == 4 and set(indexes_by_oid) == set(replay.oids.values()), "replay_workspace")
+    require(
+        await connection.fetchval(
+            "SELECT " + " AND ".join("NOT EXISTS(SELECT FROM " + replay.relation(kind) + ")" for kind in replay.names)
+        ),
+        "restart_from_zero",
+    )
+    return indexes_by_oid
+
+
+@asynccontextmanager
+async def _sample_replay_batch(connection, replay):
+    """Discard each batch's temp files without changing the Reader's transaction or sample."""
+    indexes_by_oid = await _sample_replay_indexes(connection, replay)
+    savepoint, state = _identifier("sample_replay_" + uuid4().hex), SimpleNamespace(started=False)
+
+    async def _start_savepoint():
+        await connection.execute("SAVEPOINT " + savepoint)
+        state.started = True
+
+    try:
+        await drain_operation(_start_savepoint(), preserve_cancellation=True)
+        # Rollback restores the original empty files instead of accumulating deleted heap versions.
+        for kind, oid in replay.oids.items():
+            await connection.execute("CLUSTER " + replay.relation(kind) + " USING " + _identifier(indexes_by_oid[oid]))
+        yield
+    finally:
+        if state.started:
+            try:
+                # ROLLBACK TO alone leaves an open savepoint; RELEASE alone retains committed subtransaction IDs.
+                await drain_operation(
+                    connection.execute("ROLLBACK TO SAVEPOINT " + savepoint + "; RELEASE SAVEPOINT " + savepoint),
+                    preserve_cancellation=True,
+                )
+            except BaseException:
+                connection.terminate()
+                raise
+
+
 async def _source_direction(export, connection, sealed, replay, origin, as_of, network):
     roles = [tuple(role) for series in network["series"] for role in series]
     direction_by_field = {
@@ -357,39 +424,41 @@ async def _source_direction(export, connection, sealed, replay, origin, as_of, n
     }
     if not roles:
         return direction_by_field
-    await _replay_roles(export, connection, replay, roles, origin, as_of, required=True)
     equal = " AND ".join(
         "actual." + field + ("=expected." if field in _PAIR_KEYS else " IS NOT DISTINCT FROM expected.") + field
         for field in PAIR_COLUMNS
     )
-    counts = await connection.fetchrow(
-        "SELECT count(*)::bigint total,count(*) FILTER(WHERE NOT EXISTS(SELECT FROM "
-        + sealed.relation("pairs")
-        + " actual WHERE "
-        + equal
-        + "))::bigint failures FROM "
-        + replay.relation("pairs")
-        + " expected WHERE expected.network_source_key=$1",
-        network["network_source_key"],
-    )
+    async with _sample_replay_batch(connection, replay):
+        await _replay_roles(export, connection, replay, roles, origin, as_of, required=True)
+        counts = await connection.fetchrow(
+            "SELECT count(*)::bigint total,count(*) FILTER(WHERE NOT EXISTS(SELECT FROM "
+            + sealed.relation("pairs")
+            + " actual WHERE "
+            + equal
+            + "))::bigint failures FROM "
+            + replay.relation("pairs")
+            + " expected WHERE expected.network_source_key=$1",
+            network["network_source_key"],
+        )
     direction_by_field.update(derived_pair_rows=counts["total"], failures=counts["failures"])
     return direction_by_field
 
 
 async def _candidate_batch(export, connection, replay, rows, origin, as_of, directions_by_network):
     roles = sorted({(row["resource_type"], row["resource_id"]) for row in rows})
-    await _replay_roles(export, connection, replay, roles, origin, as_of, required=False)
     keys = [[row[field] for row in rows] for field in _PAIR_KEYS]
     join = " AND ".join("pair." + key + "=chosen." + key for key in _PAIR_KEYS)
-    actual = await connection.fetch(
-        "SELECT pair.* FROM "
-        + replay.relation("pairs")
-        + " pair JOIN unnest($1::text[],$2::text[],$3::text[],$4::text[]) chosen("
-        + ",".join(_PAIR_KEYS)
-        + ") ON "
-        + join,
-        *keys,
-    )
+    async with _sample_replay_batch(connection, replay):
+        await _replay_roles(export, connection, replay, roles, origin, as_of, required=False)
+        actual = await connection.fetch(
+            "SELECT pair.* FROM "
+            + replay.relation("pairs")
+            + " pair JOIN unnest($1::text[],$2::text[],$3::text[],$4::text[]) chosen("
+            + ",".join(_PAIR_KEYS)
+            + ") ON "
+            + join,
+            *keys,
+        )
     by_key = {tuple(row[field] for field in _PAIR_KEYS): tuple(row[field] for field in PAIR_COLUMNS) for row in actual}
     for row in rows:
         direction = directions_by_network[row["network_source_key"]]
