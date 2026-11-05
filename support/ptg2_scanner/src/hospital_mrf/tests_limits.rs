@@ -249,7 +249,7 @@
         let mut understated = archive.clone();
         zip_field(&mut understated, b"PK\x03\x04", 22, max_bytes as u32);
         zip_field(&mut understated, b"PK\x01\x02", 24, max_bytes as u32);
-        assert_zip_import_error(&understated, max_bytes, "decompressed data exceeds");
+        assert_zip_import_error(&understated, max_bytes, "larger than its declared uncompressed size");
 
         let mut bad_crc = archive;
         zip_field(&mut bad_crc, b"PK\x03\x04", 14, 0);
