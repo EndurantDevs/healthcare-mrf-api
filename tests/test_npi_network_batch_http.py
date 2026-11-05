@@ -27,6 +27,8 @@ def native_network_batch(monkeypatch):
     session = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()))
     driver = session.connection.return_value.get_raw_connection.return_value.driver_connection
     mock_approved_control_metadata(monkeypatch)
+    bind_reader = AsyncMock(return_value=session)
+    monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", bind_reader)
     resolve = AsyncMock(return_value=manifest)
     monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", resolve)
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-batch-token")
@@ -72,6 +74,7 @@ def native_network_batch(monkeypatch):
         session=session,
         resolve=resolve,
         driver=driver,
+        bind_reader=bind_reader,
     )
 
 
@@ -166,10 +169,30 @@ async def test_plain_and_native_batches_share_scoped_metadata_projection(
     assert reply.status == 200
     office = reply.json["items"][0]["provider"]["address_list"][0]
     if scoped:
+        context.bind_reader.assert_awaited_once()
         projection.assert_awaited_once()
         assert "plans_network_array" not in office
         assert office["network_memberships"] == [{"network_id": 42, "location_id": context.retained["address_key"]}]
         assert reply.headers["X-Network-Generation"] == "12"
     else:
+        context.bind_reader.assert_not_awaited()
         assert office["plans_network_array"] == [-17] and "network_memberships" not in office
         assert "X-Network-Generation" not in reply.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["authorization", "selector"])
+async def test_canonical_batch_admission_precedes_reader_binding(native_network_batch, refusal):
+    """A bad token or selector cannot open the Reader or resolve retained metadata."""
+    context = native_network_batch
+    headers = {"Authorization": "Bearer synthetic-network-batch-token"} if refusal == "selector" else {}
+    generation = "01" if refusal == "selector" else "12"
+    _, reply = await context.app.asgi_client.post(
+        "/npi/id/batch?network_ids=42&network_generation=" + generation,
+        headers=headers,
+        json={"npis": [context.member]},
+    )
+    assert reply.status == (400 if refusal == "selector" else 403)
+    context.bind_reader.assert_not_awaited()
+    context.resolve.assert_not_awaited()
+    context.hydration.assert_not_awaited()

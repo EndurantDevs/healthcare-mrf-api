@@ -40,7 +40,7 @@ from tests.test_network_membership_publication_postgres import (
 )
 from tests.test_network_membership_serving_indexes_postgres import _full_source
 from tests.test_network_provider_routes_postgres import inflight_provider_http
-from tests.test_network_serving_routes_postgres import _reader_engine
+from tests.test_network_serving_routes_postgres import _reader_engine, _request_reader_database
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _create, _draft
 
@@ -303,21 +303,21 @@ async def admitted_nearby_app(serving_schema, monkeypatch):
         actor = _actor()
         network = await _draft(source_engine, schema, _create("network"), actor)
         approval = await _approve(connection, schema, await _command(connection, schema, network), actor)
-        fixture.network_id = int(network["record_id"])
-        fixture.approved_revision = approval["approved_revision"]
+        fixture.network_id, fixture.approved_revision = int(network["record_id"]), approval["approved_revision"]
         assert fixture.approved_revision > network["custom_revision"] > 0
         fixture.copy_target = await _admit(fixture, "a", 0)
         async with _candidate_writer_roles(fixture, freeze=False), _nearby_control_owner(fixture):
+            reader_role = fixture.writer_roles["reader"]
             for name in ("npi", "npi_taxonomy", "nucc_taxonomy"):
                 await connection.execute(f'GRANT SELECT ON "mrf"."{name}" TO "{fixture.writer_roles["reader"]}"')
             await connection.execute(f'GRANT USAGE ON SCHEMA "mrf" TO "{fixture.writer_roles["reader"]}"')
             fixture.published_manifest = await _publish(fixture, fixture.copy_target)
             assert fixture.published_manifest["approved_custom_revision"] == fixture.approved_revision
             monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-nearby-token")
-            reader_engine = _reader_engine(source_engine, fixture.writer_roles["reader"])
-            http_context = _http_context(fixture, reader_engine)
+            reader_engine = _reader_engine(source_engine, reader_role)
             try:
-                yield http_context
+                async with _request_reader_database(source_engine, connection, reader_role, monkeypatch):
+                    yield _http_context(fixture, reader_engine)
             finally:
                 await reader_engine.dispose()
                 reader_engine = None

@@ -45,6 +45,11 @@ def request(checksums=None, *, query="network_ids=42&network_generation=7", auth
 def approved_metadata(monkeypatch):
     mock_approved_control_metadata(monkeypatch)
 
+    async def bind_reader(incoming):
+        return incoming.ctx.sa_session
+
+    monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", bind_reader)
+
 
 def test_legacy_predicate_keeps_authorization_but_does_not_require_canonical_office_coverage():
     keys = set()
@@ -190,26 +195,18 @@ async def test_header_requires_one_value_and_both_trusted_pins(monkeypatch, miss
     driver.fetchrow.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "active,reader_scope,current_owner,configure",
-    [(False, None, True, True), (True, None, True, False), (False, object(), True, False), (False, None, False, False)],
-)
-async def test_http_snapshot_setup_leaves_active_and_unowned_sessions_unchanged(
-    monkeypatch, active, reader_scope, current_owner, configure
-):
-    from db import connection
-
+async def test_http_pin_uses_bound_reader_instead_of_configuring_writer(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-legacy-token")
     pin = AsyncMock(return_value=MANIFEST)
     monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", pin)
     incoming, driver = request()
-    session = incoming.ctx.sa_session
-    session.in_transaction = lambda: active
-    incoming.ctx._sa_session_token = object()
-    incoming.ctx._sa_reader_scope = reader_scope
-    monkeypatch.setattr(connection, "current_session", lambda: session if current_owner else object())
+    ordinary = incoming.ctx.sa_session
+    reader = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()), driver=driver)
+    binder = AsyncMock(return_value=reader)
+    monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", binder)
     await scope._pin_network_scope(incoming, scope._request_selector(incoming, None))
-    statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    expected = ["SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"] if configure else []
-    assert statements == expected + ["SET LOCAL lock_timeout='1s'"]
-    pin.assert_awaited_once_with(driver.native, generation_id=7, api_read=True)
+    binder.assert_awaited_once_with(incoming)
+    ordinary.execute.assert_not_awaited()
+    assert [str(call.args[0]) for call in reader.execute.await_args_list] == ["SET LOCAL lock_timeout='1s'"]
+    reader_driver = reader.connection.return_value.get_raw_connection.return_value.driver_connection
+    pin.assert_awaited_once_with(reader_driver, generation_id=7, api_read=True)

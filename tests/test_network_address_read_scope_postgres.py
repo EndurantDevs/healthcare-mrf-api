@@ -9,13 +9,14 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from sanic import Sanic, response
+from sanic import response
 from sanic.compat import Header
 from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import MetaData, event, func, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from api import network_serving_read_context as serving_reads
 from api.endpoint import npi, plan
 from api.network_address_scope import (
     _request_selector,
@@ -245,20 +246,10 @@ async def test_all_phone_classification_counts_use_retained_offices(serving_inde
             assert json.loads(result.body) == {"rows": expected}
 
 
-def _canonical_read_app(engine, invoked_generations):
+def _canonical_read_app(_engine, invoked_generations):
     """Register request sessions and actual shared hydration for native HTTP proof."""
-    app = Sanic("canonical_network_read_" + uuid4().hex)
-    sessions = async_sessionmaker(engine.execution_options(isolation_level="REPEATABLE READ", postgresql_readonly=True))
-
-    @app.middleware("request")
-    async def open_session(request):
-        """Reuse the request-owned SQLAlchemy/native connection boundary."""
-        request.ctx.sa_session = sessions()
-
-    @app.middleware("response")
-    async def close_session(request, result):
-        """Release any pinned heap after the complete handler result."""
-        await request.ctx.sa_session.close()
+    app = RequestLifecycleSanic("canonical_network_read_" + uuid4().hex)
+    db.init_app(app)
 
     @app.get("/addresses")
     @canonical_network_read
@@ -380,35 +371,8 @@ async def test_registered_http_wrapper_uses_verified_manifest_and_no_fallback(pr
 
 @pytest.fixture
 async def request_snapshot_database(protected_provider_app, monkeypatch):
-    """Use real middleware pools and restore the fixture's exact temporary login."""
-    context = protected_provider_app
-    url, owner = context.fixture.engine.url, context.fixture.connection
-    reader, password = context.fixture.roles["reader"], uuid4().hex
-    assert tuple(await owner.fetchrow("SELECT rolcanlogin,rolpassword FROM pg_authid WHERE rolname=$1", reader)) == (
-        False,
-        None,
-    )
-    await db.disconnect()
-    for field, setting in {
-        "HOST": url.host,
-        "PORT": url.port or 5432,
-        "DATABASE": url.database,
-        "DATABASE_OVERRIDE": url.database,
-        "USER": url.username,
-        "PASSWORD": url.password or "",
-        "READER_USER": reader,
-        "READER_PASSWORD": password,
-    }.items():
-        monkeypatch.setenv("HLTHPRT_DB_" + field, str(setting))
-    await owner.execute(f"ALTER ROLE \"{reader}\" LOGIN PASSWORD '{password}'")
-    try:
-        yield context
-    finally:
-        await db.disconnect()
-        await owner.execute(f'ALTER ROLE "{reader}" NOLOGIN PASSWORD NULL')
-        assert tuple(
-            await owner.fetchrow("SELECT rolcanlogin,rolpassword FROM pg_authid WHERE rolname=$1", reader)
-        ) == (False, None)
+    """Borrow the provider fixture's exact temporary login and real middleware pools."""
+    yield protected_provider_app
 
 
 async def _network_request_snapshot(session):
@@ -497,10 +461,7 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
             request, reply = await app.asgi_client.get(path + "&ending=" + ending, headers=headers_by_name)
             assert reply.status == status, reply.text
             assert observations[-1][2][2:] == ("repeatable read", "on")
-            expected_role = (
-                context.fixture.roles["reader"] if middleware_enabled else context.fixture.engine.url.username
-            )
-            assert observations[-1][2][0] == expected_role
+            assert observations[-1][2][0] == context.fixture.roles["reader"]
             assert reply.headers["X-Network-Generation"] == str(
                 current_generation := await context.fixture.connection.fetchval(
                     f'SELECT generation_id FROM "{context.fixture.control_schema}".network_serving_control WHERE id=1'
@@ -526,8 +487,8 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_only", [False, True])
-async def test_network_snapshot_preserves_active_borrowed_session(protected_provider_app, read_only):
-    """Native callers retain their transaction and modes, including a refused RW read."""
+async def test_network_snapshot_refuses_active_unowned_session(protected_provider_app, read_only):
+    """Active native sessions confer no request Reader ownership, even in read-only mode."""
     context = protected_provider_app
     async with async_sessionmaker(context.engine)() as session, session.begin():
         await session.execute(
@@ -540,15 +501,11 @@ async def test_network_snapshot_preserves_active_borrowed_session(protected_prov
             ctx=SimpleNamespace(sa_session=session),
         )
         handler = AsyncMock(return_value=response.json({"ok": True}))
-        if read_only:
-            assert (await canonical_network_read(handler)(request)).status == 200
-            handler.assert_awaited_once()
-        else:
-            from sanic.exceptions import ServiceUnavailable
+        from sanic.exceptions import ServiceUnavailable
 
-            with pytest.raises(ServiceUnavailable):
-                await canonical_network_read(handler)(request)
-            handler.assert_not_awaited()
+        with pytest.raises(ServiceUnavailable):
+            await canonical_network_read(handler)(request)
+        handler.assert_not_awaited()
         assert await _network_request_snapshot(session) == before
         assert session.in_transaction() and before[1].is_in_transaction()
 
@@ -1432,6 +1389,7 @@ async def test_native_legacy_header_mapping_component_scope(
         transaction = session.get_transaction()
         driver = (await (await session.connection()).get_raw_connection()).driver_connection
         backend_pid = driver.get_server_pid()
+        monkeypatch.setattr(serving_reads, "bind_network_request_reader", AsyncMock(return_value=session))
         actual_manifest, network_ids, _, actual_checksums = await _pin_network_scope(
             request, {"network_ids": ids, "network_generation": "1"}
         )

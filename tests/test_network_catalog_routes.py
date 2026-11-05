@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -105,6 +106,8 @@ def context(batch_boundary, monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-catalog-control-token")
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "sample_control")
     session = Session(driver)
+    bind_reader = AsyncMock(return_value=session)
+    monkeypatch.setattr(endpoint, "bind_network_request_reader", bind_reader)
     app = Sanic("catalog_routes_" + uuid4().hex)
     app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
     endpoint.register_network_catalog_private_responses(app)
@@ -113,7 +116,9 @@ def context(batch_boundary, monkeypatch):
     async def lazy_session(request):
         request.ctx.sa_session = session
 
-    return SimpleNamespace(app=app, session=session, driver=driver, manifest=manifest, revisions=revisions)
+    return SimpleNamespace(
+        app=app, session=session, driver=driver, manifest=manifest, revisions=revisions, bind_reader=bind_reader
+    )
 
 
 async def send(context, document=None, *, path=_PATH, headers=None, raw=None):
@@ -132,6 +137,7 @@ async def test_authentication_precedes_invalid_body_and_database(context, header
     http_response = await send(context, raw=b"\xff", headers=headers)
     assert http_response.status == 403 and http_response.json == {"error": {"code": "network_catalog_forbidden"}}
     assert context.session.events == [] and context.driver.calls == []
+    context.bind_reader.assert_not_awaited()
     assert "X-Network-Generation" not in http_response.headers
 
 
@@ -174,6 +180,7 @@ async def test_actual_reader_pins_retained_revision_and_policy_before_count_page
     ).hexdigest()
     assert http_response.headers["X-Network-Access-Scope"] == expected
     assert context.session.events == _OWNED_READ_EVENTS
+    context.bind_reader.assert_awaited_once()
     assert len(context.session.snapshot_queries) == 3
     sql, parameters = context.driver.calls[-1]
     assert parameters == (4, (2, 5), None, "Alias", source_coordinates().sql_parameters, None, 0, 1, 1048576, None)

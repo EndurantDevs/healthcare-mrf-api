@@ -5,6 +5,7 @@ import asyncio
 import json
 from contextlib import aclosing, asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4, uuid5
 
 import pytest
@@ -15,6 +16,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from api import network_provider_read as native_providers
 from api.endpoint import network_providers as providers
 from api.network_address_scope import current_network_address_scope
+from api.request_lifecycle import RequestLifecycleSanic
+from db.connection import db
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
@@ -23,7 +26,7 @@ from process.registry_candidate_composition import (
     compose_registry_membership_candidate,
 )
 from tests.test_network_custom_address_source_postgres import _seed, custom_db
-from tests.test_network_serving_routes_postgres import _reader_engine
+from tests.test_network_serving_routes_postgres import _reader_engine, _request_reader_database
 from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_candidate_composition_postgres import _imported_candidate, _remove_candidates, _roles
 
@@ -79,29 +82,19 @@ async def provider_app(custom_db, monkeypatch):
             f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.control_schema}" TO "{fixture.roles["reader"]}"'
         )
         engine = _reader_engine(fixture.engine, fixture.roles["reader"])
-        sessions = async_sessionmaker(engine)
-        app = Sanic("network_providers_http_" + uuid4().hex)
-        app.blueprint(Blueprint.group([providers.blueprint], version_prefix="/api/v"))
-
-        @app.middleware("request")
-        async def open_session(request):
-            """Create a lazy session so rejected requests acquire no database connection."""
-            request.ctx.sa_session = sessions()
-
-        @app.middleware("response")
-        async def close_session(request, _response):
-            """Release every request-owned read transaction after success or failure."""
-            await request.ctx.sa_session.close()
-
-        yield SimpleNamespace(
-            app=app,
-            fixture=fixture,
-            engine=engine,
-            seed=seed,
-            source_manifest=source_manifest,
-            source_network_id=source_network_id,
-            current_schema=copy_targets[-1].schema_name,
-        )
+        async with _request_reader_database(fixture.engine, fixture.connection, fixture.roles["reader"], monkeypatch):
+            app = RequestLifecycleSanic("network_providers_http_" + uuid4().hex)
+            db.init_app(app)
+            app.blueprint(Blueprint.group([providers.blueprint], version_prefix="/api/v"))
+            yield SimpleNamespace(
+                app=app,
+                fixture=fixture,
+                engine=engine,
+                seed=seed,
+                source_manifest=source_manifest,
+                source_network_id=source_network_id,
+                current_schema=copy_targets[-1].schema_name,
+            )
     finally:
         if engine is not None:
             await engine.dispose()
@@ -302,9 +295,11 @@ async def test_current_and_retained_generations_keep_exact_identity_namespaces(p
         assert missing.headers["X-Network-Generation"] == str(current.json["generation_id"])
 
 
-async def test_auth_and_closed_request_validation_precede_database_access(provider_app):
+async def test_auth_and_closed_request_validation_precede_database_access(provider_app, monkeypatch):
     context = provider_app
     statements = []
+    reader_connect = AsyncMock(wraps=db._connect_reader)
+    monkeypatch.setattr(db, "_connect_reader", reader_connect)
     event.listen(
         context.engine.sync_engine, "before_cursor_execute", lambda *arguments: statements.append(arguments[2])
     )
@@ -352,6 +347,7 @@ async def test_auth_and_closed_request_validation_precede_database_access(provid
     assert invalid_header.status == 400
     _, body = await context.app.asgi_client.request("GET", _PATH + "?network_ids=1", headers=_AUTH, content=b"{}")
     assert body.status == 400 and statements == []
+    reader_connect.assert_not_awaited()
 
 
 @pytest.mark.parametrize("damage", ["retired", "digest", "oid", "permission", "identity", "missing_generation"])

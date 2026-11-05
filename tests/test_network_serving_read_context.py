@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sanic.exceptions import Forbidden
+from sqlalchemy.exc import SQLAlchemyError
 
 from api import network_serving_read_context as reads
 from api.endpoint import network_catalog, network_providers, network_serving
@@ -97,7 +99,7 @@ class _Session:
 def _bound_reader(session):
     session.info["api_reader_verified"] = True
     session.info["api_reader_identity"] = dict(zip(reads._IDENTITY_FIELDS, session.driver.identity, strict=True))
-    binding = database._TransactionBinding(1, session, asyncio.current_task())
+    binding = database._TransactionBinding(id(reads.db), session, asyncio.current_task())
     session_token = database._SESSION.set(session)
     reader_token = database._READER.set(binding)
     try:
@@ -319,3 +321,43 @@ async def test_handlers_keep_refusal_private(route, monkeypatch):
     assert reply.status == 503 and json.loads(reply.body) == {"error": {"code": prefix + "_unavailable"}}
     assert reply.headers["Cache-Control"] == "private, no-store"
     assert session.driver.active and session.begins == session.rollbacks == session.commits == 0
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("unavailable"), SQLAlchemyError("unavailable")])
+@pytest.mark.parametrize("route", ["catalog", "providers", "manifest"])
+async def test_reader_binding_failure_never_queries_ordinary_session(route, failure, monkeypatch):
+    session = _Session()
+    bind_reader = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(reads.db, "bind_request_reader", bind_reader)
+    reply = await _call_route(session, route, monkeypatch)
+    assert reply.status == 503 and reply.headers["Cache-Control"] == "private, no-store"
+    bind_reader.assert_awaited_once()
+    assert session.statements == [] and session.driver.checks == session.begins == 0
+
+
+@pytest.mark.parametrize("route", ["catalog", "providers", "manifest"])
+@pytest.mark.parametrize("refusal", ["auth", "parameters"])
+async def test_handler_auth_and_parameters_precede_reader(route, refusal, monkeypatch):
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "fixture-token")
+    bind_reader = AsyncMock(side_effect=AssertionError("Reader opened before admission"))
+    monkeypatch.setattr(reads.db, "bind_request_reader", bind_reader)
+    session = _Session()
+    request = _request(session, route)
+    if refusal == "auth":
+        request.headers = {}
+    else:
+        request.query_string = "unknown=1"
+    if route == "catalog":
+        reply = await network_catalog._catalog_response(request, "list")
+    else:
+        handler = network_providers.network_provider_page if route == "providers" else network_serving.serving_manifest
+        if refusal == "auth":
+            with pytest.raises(Forbidden):
+                await handler(request)
+            reply = None
+        else:
+            reply = await handler(request)
+    if reply is not None:
+        assert reply.status == (403 if refusal == "auth" else 400)
+    bind_reader.assert_not_awaited()
+    assert session.statements == [] and session.driver.checks == 0

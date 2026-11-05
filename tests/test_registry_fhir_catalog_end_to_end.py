@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """A real admitted import keeps the searchable catalog and retained serving data."""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -13,12 +14,13 @@ from uuid import UUID, uuid4, uuid5
 import asyncpg
 import pytest
 from aiohttp import web
-from sanic import Blueprint, Sanic
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sanic import Blueprint
 
 from api.endpoint import network_catalog
 from api.network_address_scope import network_address_read_scope
 from api.network_provider_read import read_network_provider_page
+from api.request_lifecycle import RequestLifecycleSanic
+from db.connection import db
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import POLICY_V2
 from process.registry_fhir_catalog_identity import ALIAS_SCOPE
@@ -40,6 +42,7 @@ from tests.fhir_catalog_sync_integration_support import (
     native_catalog_case,
     source_resources,
 )
+from tests.request_reader_transport_support import attach_request_database_hooks
 from tests.test_network_registry_cms_prepared_pair_postgres import (
     _origin_native_acl_refusals,
     _origin_pair_read,
@@ -54,36 +57,88 @@ from tests.test_registry_publication_worker_permissions_postgres import _login a
 
 @asynccontextmanager
 async def core_server(case):
-    app = Sanic("catalog_integration_" + uuid4().hex)
+    """Keep the existing fixture login in the real request-owned Reader lifecycle."""
+    app = RequestLifecycleSanic("catalog_integration_" + uuid4().hex)
     app.blueprint(Blueprint.group([network_catalog.blueprint], version_prefix="/api/v"))
     network_catalog.register_network_catalog_private_responses(app)
-    engine = create_async_engine(case.reader_url)
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
-
-    @app.middleware("request")
-    async def open_session(request):
-        request.ctx.sa_session = sessions()
-
-    @app.middleware("response")
-    async def close_session(request, _response):
-        if hasattr(request.ctx, "sa_session"):
-            await request.ctx.sa_session.close()
 
     async def forward(request):
         _, response = await app.asgi_client.post(request.path, data=await request.read(), headers=request.headers)
         return web.Response(status=response.status, body=response.body, headers=dict(response.headers))
 
-    bridge = web.Application()
-    bridge.router.add_post("/{path:.*}", forward)
-    runner = web.AppRunner(bridge)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
+    with case.settings.context() as settings:
+        for key, setting in {
+            "HOST": case.reader_url.host,
+            "PORT": case.reader_url.port or 5432,
+            "DATABASE_OVERRIDE": case.reader_url.database,
+            "READER_USER": case.reader_url.username,
+            "READER_PASSWORD": case.reader_url.password,
+        }.items():
+            settings.setenv("HLTHPRT_DB_" + key, str(setting))
+        settings.setenv("HLTHPRT_API_READER_ENABLED", "false")
+        await db.disconnect()
+        await db.connect()
+        attach_request_database_hooks(db, app)
+        bridge = web.Application()
+        bridge.router.add_post("/{path:.*}", forward)
+        runner = web.AppRunner(bridge)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        try:
+            await site.start()
+            yield app, "http://127.0.0.1:" + str(site._server.sockets[0].getsockname()[1])
+        finally:
+            await runner.cleanup()
+            await db.disconnect()
+
+
+async def _refresh_source_in_own_reader(case, directory):
+    """Separate fixture pools when the same process performs the next Source import."""
+    await db.disconnect()
     try:
-        yield app, "http://127.0.0.1:" + str(site._server.sockets[0].getsockname()[1])
+        with case.settings.context() as settings:
+            settings.setenv("HLTHPRT_DB_READER_USER", case.config.source_url.username)
+            settings.setenv("HLTHPRT_DB_READER_PASSWORD", case.config.source_url.password or "")
+            return await import_source(case, directory, retain_old=False, revision="two")
     finally:
-        await runner.cleanup()
-        await engine.dispose()
+        await db.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, ValueError, asyncio.CancelledError])
+async def test_source_refresh_restores_api_reader_and_closes_pools(monkeypatch, tmp_path, failure):
+    """The Source transition restores only its Reader settings even on failure or cancellation."""
+    monkeypatch.setenv("HLTHPRT_DB_READER_USER", "api_reader")
+    monkeypatch.setenv("HLTHPRT_DB_READER_PASSWORD", "api")
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "unchanged_schema")
+    case = SimpleNamespace(
+        settings=monkeypatch,
+        config=SimpleNamespace(source_url=SimpleNamespace(username="source_reader", password="source")),
+    )
+    events = []
+
+    async def disconnect():
+        events.append(("close", os.environ["HLTHPRT_DB_READER_USER"]))
+
+    async def refresh(supplied, directory, **options):
+        assert supplied is case and directory == tmp_path and options == {"retain_old": False, "revision": "two"}
+        assert os.environ["HLTHPRT_DB_READER_PASSWORD"] == "source"
+        events.append(("source", os.environ["HLTHPRT_DB_READER_USER"]))
+        if failure is not None:
+            raise failure("synthetic refresh failure")
+        return {"completed": True}
+
+    monkeypatch.setattr(db, "disconnect", disconnect)
+    monkeypatch.setattr(__name__ + ".import_source", refresh)
+    if failure is not None:
+        with pytest.raises(failure):
+            await _refresh_source_in_own_reader(case, tmp_path)
+    else:
+        assert await _refresh_source_in_own_reader(case, tmp_path) == {"completed": True}
+    assert events == [("close", "api_reader"), ("source", "source_reader"), ("close", "api_reader")]
+    assert os.environ["HLTHPRT_DB_READER_USER"] == "api_reader"
+    assert os.environ["HLTHPRT_DB_READER_PASSWORD"] == "api"
+    assert os.environ["HLTHPRT_DB_SCHEMA"] == "unchanged_schema"
 
 
 def policy(query):
@@ -755,7 +810,7 @@ async def _ordinary_rebuild(case, pair, app, url):
 
 
 async def _disappearance_and_rebuild(case, tmp_path, app, url):
-    admission = await import_source(case, tmp_path / "second", retain_old=False, revision="two")
+    admission = await _refresh_source_in_own_reader(case, tmp_path / "second")
     proof, _ = await native.committed_publication_proof(case.administrator, admission)
     async with native.retained_pair(case.administrator, proof) as pair:
         await _successor_directory(case, pair)
@@ -798,6 +853,7 @@ async def test_import_sync_query_replay_and_disappearance(monkeypatch, tmp_path)
     async with native_catalog_case(monkeypatch, tmp_path, serving_custody=True) as case:
         monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", case.fixture.control_schema)
         monkeypatch.setenv("HLTHPRT_REGISTRY_CONTROL_API_TOKEN", "synthetic-catalog-control-token")
+        await case.fixture.connection.execute(f'GRANT USAGE ON SCHEMA mrf TO "{case.reader_url.username}"')
         try:
             proof = await _first_import(case, tmp_path)
             async with native.retained_pair(case.administrator, proof, expected_address_rows=3) as pair:
