@@ -203,7 +203,7 @@ async def test_compact_final_proof_keeps_carry_scope_through_last_proof_and_retu
     from process import network_compact_validation as compact
     from process import network_membership_publication as publication
 
-    events, proof, entries = [], object(), object()
+    events, proof, entries = [], SimpleNamespace(receipt={"carried_rows": 0}), object()
 
     @asynccontextmanager
     async def scope(*arguments):

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Synthetic sampling and refusal checks; these confer no native capture custody."""
 
+import asyncio
 import copy
 import hashlib
 import heapq
@@ -25,6 +26,22 @@ from tests.test_network_fhir_source_witness_contract import database_fields, ori
 
 _SEED = "1" * 64
 _NETWORKS = ("network-one",)
+
+
+@pytest.fixture
+def sample_scope(monkeypatch):
+    state = SimpleNamespace(active=False)
+
+    @asynccontextmanager
+    async def replay_scope(connection, replay):
+        state.active = True
+        try:
+            yield
+        finally:
+            state.active = False
+
+    monkeypatch.setattr(sampled, "_sample_replay_batch", replay_scope)
+    return state
 
 
 class _BottomPairs:
@@ -444,8 +461,12 @@ async def test_sampler_preserves_standing_spill_cap(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_source_omission_check_uses_independent_roles_and_indexed_pair_keys(monkeypatch):
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={"total": 2, "failures": 1}))
+async def test_source_omission_check_uses_independent_roles_and_indexed_pair_keys(monkeypatch, sample_scope):
+    async def counts(*arguments):
+        assert sample_scope.active
+        return {"total": 2, "failures": 1}
+
+    connection = SimpleNamespace(fetchrow=AsyncMock(side_effect=counts))
     replay, sealed = (
         SimpleNamespace(relation=lambda _: "pg_temp.raw_pairs"),
         SimpleNamespace(relation=lambda _: "closed.pairs"),
@@ -465,7 +486,7 @@ async def test_source_omission_check_uses_independent_roles_and_indexed_pair_key
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["missing", "invented", "multiplicity", "valid"])
-async def test_candidate_selected_provenance_compares_every_strict_pair_field(monkeypatch, damage):
+async def test_candidate_selected_provenance_compares_every_strict_pair_field(monkeypatch, damage, sample_scope):
     pair_by_field = dict(
         zip(
             PAIR_COLUMNS,
@@ -478,7 +499,12 @@ async def test_candidate_selected_provenance_compares_every_strict_pair_field(mo
         actual_by_field["provider_id"] = "1000000004"
     elif damage == "multiplicity":
         actual_by_field["reference_rows"] = 2
-    connection = SimpleNamespace(fetch=AsyncMock(return_value=[] if damage == "missing" else [actual_by_field]))
+
+    async def actual_pairs(*arguments):
+        assert sample_scope.active
+        return [] if damage == "missing" else [actual_by_field]
+
+    connection = SimpleNamespace(fetch=AsyncMock(side_effect=actual_pairs))
     monkeypatch.setattr(sampled, "_replay_roles", AsyncMock())
     directions_by_network = {"network-one": _direction(source=False)}
     directions_by_network["network-one"]["witness_rows"] = 0
@@ -493,6 +519,41 @@ async def test_candidate_selected_provenance_compares_every_strict_pair_field(mo
     )
     assert directions_by_network["network-one"]["witness_rows"] == 1
     assert directions_by_network["network-one"]["failures"] == (damage != "valid")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_still_closes_savepoint(monkeypatch):
+    parent, commands = asyncio.current_task(), []
+
+    async def execute(query):
+        commands.append(query)
+        if query.startswith("SAVEPOINT "):
+            parent.cancel()
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(sampled, "_sample_replay_indexes", AsyncMock(return_value={}))
+    connection = SimpleNamespace(execute=execute, terminate=Mock())
+    with pytest.raises(asyncio.CancelledError):
+        async with sampled._sample_replay_batch(connection, SimpleNamespace(oids={})):
+            pytest.fail("cancelled batch started replay")
+    while parent.cancelling():
+        parent.uncancel()
+    assert len(commands) == 2
+    savepoint = commands[0].removeprefix("SAVEPOINT ")
+    assert commands[1] == "ROLLBACK TO SAVEPOINT " + savepoint + "; RELEASE SAVEPOINT " + savepoint
+    connection.terminate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sample_cleanup_failure_closes_connection(monkeypatch):
+    monkeypatch.setattr(sampled, "_sample_replay_indexes", AsyncMock(return_value={}))
+    connection = SimpleNamespace(
+        execute=AsyncMock(side_effect=[None, RuntimeError("cleanup failed")]), terminate=Mock()
+    )
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        async with sampled._sample_replay_batch(connection, SimpleNamespace(oids={})):
+            assert connection.execute.await_count == 1
+    connection.terminate.assert_called_once_with()
 
 
 def test_receipt_is_closed_bound_and_contains_no_provider_payload():

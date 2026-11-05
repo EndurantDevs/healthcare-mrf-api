@@ -247,10 +247,10 @@ impl NetworkValidationSampler {
         candidate_rows_valid(rows)?;
         let mut selected = Vec::new();
         for (index, row) in rows.iter().enumerate() {
-            if let Some(network) = self.networks.get(row[0]) {
-                if network.keys.contains(candidate_key(row)?.as_str()) {
-                    selected.push(index);
-                }
+            if let Some(network) = self.networks.get(row[0])
+                && network.keys.contains(candidate_key(row)?.as_str())
+            {
+                selected.push(index);
             }
         }
         Ok(selected)
@@ -286,10 +286,11 @@ impl NetworkValidationSampler {
                     let reference = reference.as_str().ok_or(ERROR)?;
                     let prefix = self.source_prefix.as_deref().ok_or(ERROR)?;
                     let relative = reference.strip_prefix(prefix).unwrap_or(reference);
-                    if let Some(network) = relative.strip_prefix("Organization/") {
-                        if identity(network) && self.networks.contains_key(network) {
-                            targets.insert(network.to_owned());
-                        }
+                    if let Some(network) = relative.strip_prefix("Organization/")
+                        && identity(network)
+                        && self.networks.contains_key(network)
+                    {
+                        targets.insert(network.to_owned());
                     }
                 }
             }
