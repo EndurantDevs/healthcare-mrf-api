@@ -234,6 +234,8 @@ async def materialize_registry_composition(connection, copy_target, command_stag
     )
     if status != f"INSERT 0 {receipt['effective_rows']}":
         raise RegistrySourceRetentionError("registry_composition_command_accounting_invalid")
+    if is_typed_candidate(candidate):
+        await connection.execute(f"ANALYZE {table}")
     await verify_registry_composition_rows(connection, copy_target, candidate, command_stage)
     await connection.execute(
         f"UPDATE {namespace}.network_membership_candidate SET accepted_rows=$2 WHERE candidate_id=$1",

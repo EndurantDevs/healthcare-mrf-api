@@ -31,7 +31,7 @@ async def _insert_matched_page(connection, tables, bounds, affected):
         else f"EXISTS(SELECT FROM {affected} changed WHERE changed.network_id=m.network_id AND changed.office_bucket=(get_byte(sha256(convert_to(b.location_key,'UTF8')),0)&63))"
     )
     ordered_fields = ",".join("m." + term for term in ORDER.split(","))
-    await connection.execute(
+    statement = await connection.prepare(
         f"""WITH source_page AS NOT MATERIALIZED (
       SELECT m.* FROM {membership} m WHERE {condition} ORDER BY {ordered_fields} FETCH FIRST 5000 ROWS WITH TIES
     ), matched AS NOT MATERIALIZED (
@@ -44,7 +44,9 @@ async def _insert_matched_page(connection, tables, bounds, affected):
       FROM matched GROUP BY network_id,location_key,office_bucket
       ON CONFLICT(network_id,office_bucket,location_key) DO UPDATE SET membership_rows=prior.membership_rows+excluded.membership_rows
       RETURNING location_key
-    ) INSERT INTO {locations} SELECT DISTINCT location_key FROM accumulated WHERE location_key IS NOT NULL ON CONFLICT DO NOTHING""",
+    ) INSERT INTO {locations} SELECT DISTINCT location_key FROM accumulated WHERE location_key IS NOT NULL ON CONFLICT DO NOTHING"""
+    )
+    await statement.fetch(
         *arguments,
     )
 
