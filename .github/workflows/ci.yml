@@ -204,7 +204,7 @@ jobs:
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
     - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
         digest-mismatch: error
@@ -608,7 +608,7 @@ jobs:
     - name: Install PostgreSQL client
       run: bash "$CI_ROOT/scripts/install_postgres_client"
     - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
         digest-mismatch: error
@@ -951,7 +951,7 @@ jobs:
       run: bash "$CI_ROOT/scripts/install_postgres_client"
       if: steps.catalog-capability.outputs.present == 'true'
     - name: Download exact-source Rust test binaries
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
         digest-mismatch: error
@@ -1039,7 +1039,7 @@ jobs:
       run: python3 "$CI_ROOT/scripts/common_test_verify.py" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA"
         --output "$RUNNER_TEMP/common-test-current-verification.json"
     - name: Download immutable measurement artifacts
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ needs.python-tests.outputs.artifact_0 }},${{ needs.python-tests.outputs.artifact_1 }},${{ needs.python-tests.outputs.artifact_2
           }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.python-tests.outputs.artifact_4 }},${{ needs.python-tests.outputs.artifact_5
@@ -1167,7 +1167,7 @@ jobs:
       run: python3 ci/scripts/source_image.py prepare
     - name: Download validated image archive
       if: steps.image.outputs.publish == 'true'
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
       with:
         artifact-ids: ${{ steps.image.outputs.artifact_id }}
         digest-mismatch: error
