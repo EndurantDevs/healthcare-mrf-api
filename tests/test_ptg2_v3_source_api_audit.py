@@ -17,7 +17,6 @@ import pytest
 
 from scripts.validation import ptg2_v3_source_api_audit as audit
 
-
 NPIS = (1111111111, 2222222222, 3333333333)
 MALFORMED_NPI_STRING_FIXTURE = (
     "111111111",
@@ -38,9 +37,7 @@ def _source_identity_payload(
     trace_set_hash=None,
 ):
     trace_id = trace_id or f"source-file-{source_artifact_key}"
-    trace_set_hash = trace_set_hash or audit.sha256_text(
-        f"trace-set:{source_artifact_key}"
-    )
+    trace_set_hash = trace_set_hash or audit.sha256_text(f"trace-set:{source_artifact_key}")
     identity_by_field = {
         "source_artifact_key": source_artifact_key,
         "source_type": "in_network",
@@ -116,15 +113,11 @@ def _source_document(*, references_before: bool, duplicate_price: bool = True):
     ]
     source_document_by_field = {"reporting_entity_type": "issuer"}
     if references_before:
-        source_document_by_field["provider_references"] = [
-            provider_reference_by_field
-        ]
+        source_document_by_field["provider_references"] = [provider_reference_by_field]
         source_document_by_field["in_network"] = in_network_entries
     else:
         source_document_by_field["in_network"] = in_network_entries
-        source_document_by_field["provider_references"] = [
-            provider_reference_by_field
-        ]
+        source_document_by_field["provider_references"] = [provider_reference_by_field]
     return source_document_by_field
 
 
@@ -200,9 +193,7 @@ def test_source_index_supports_reference_order_and_magic_detected_encoding(
 
 def test_source_index_rejects_wrong_json_field_types_from_coverage(tmp_path):
     payload = _source_document(references_before=True, duplicate_price=False)
-    payload["in_network"][0]["negotiated_rates"][0]["negotiated_prices"][0][
-        "negotiated_rate"
-    ] = "123"
+    payload["in_network"][0]["negotiated_rates"][0]["negotiated_prices"][0]["negotiated_rate"] = "123"
     source_path = _write_source_fixture(
         tmp_path / "source.json",
         references_before=True,
@@ -213,9 +204,7 @@ def test_source_index_rejects_wrong_json_field_types_from_coverage(tmp_path):
     with _open_source_index(tmp_path, source_path) as index:
         assert index.metrics["invalid_field_types"] == 1
         assert index.metrics["invalid_prices"] == 1
-        assert sum(
-            index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0])).values()
-        ) == 0
+        assert sum(index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0])).values()) == 0
 
 
 @pytest.mark.parametrize(
@@ -239,9 +228,7 @@ def test_source_index_rejects_malformed_price_container_shapes(
     malformed_value,
 ):
     payload = _source_document(references_before=True, duplicate_price=False)
-    payload["in_network"][0]["negotiated_rates"][0]["negotiated_prices"][0][
-        field_name
-    ] = malformed_value
+    payload["in_network"][0]["negotiated_rates"][0]["negotiated_prices"][0][field_name] = malformed_value
     source_path = _write_source_fixture(
         tmp_path / f"malformed-{field_name}.json",
         references_before=True,
@@ -252,9 +239,7 @@ def test_source_index_rejects_malformed_price_container_shapes(
     with _open_source_index(tmp_path, source_path) as index:
         assert index.metrics["invalid_field_types"] >= 1
         assert index.metrics["invalid_prices"] == 1
-        assert not index.expected_tuples(
-            audit.QueryKey("CPT", "99213", NPIS[0])
-        )
+        assert not index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
 
 
 def test_source_index_strictly_validates_procedure_and_network_metadata_types(
@@ -263,9 +248,7 @@ def test_source_index_strictly_validates_procedure_and_network_metadata_types(
     payload = _source_document(references_before=True, duplicate_price=False)
     payload["provider_references"][0]["network_name"] = {"invalid": "object"}
     payload["in_network"][0]["name"] = 123
-    payload["in_network"][1]["negotiated_rates"][0]["network_names"] = {
-        "invalid": "object"
-    }
+    payload["in_network"][1]["negotiated_rates"][0]["network_names"] = {"invalid": "object"}
     source_path = _write_source_fixture(
         tmp_path / "invalid-metadata-types.json",
         references_before=True,
@@ -275,9 +258,7 @@ def test_source_index_strictly_validates_procedure_and_network_metadata_types(
 
     with _open_source_index(tmp_path, source_path) as index:
         assert index.metrics["invalid_field_types"] == 3
-        assert not index.expected_tuples(
-            audit.QueryKey("CPT", "99213", NPIS[0])
-        )
+        assert not index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
 
 
 def _conflicting_provider_reference_definitions(
@@ -307,9 +288,7 @@ def _conflicting_provider_reference_definitions(
 def test_source_index_unions_same_scope_provider_reference_fragments(tmp_path):
     source_document = _source_document(references_before=True, duplicate_price=False)
     tax_identity_by_field = {"type": " EIN ", "value": "00-000-0001"}
-    source_document["provider_references"][0]["provider_groups"] = [
-        {"npi": [NPIS[0]], "tin": tax_identity_by_field}
-    ]
+    source_document["provider_references"][0]["provider_groups"] = [{"npi": [NPIS[0]], "tin": tax_identity_by_field}]
     source_document["provider_references"].append(
         {
             "provider_group_id": 7,
@@ -342,9 +321,7 @@ def test_source_index_quarantines_unreferenced_cross_scope_provider_id(
     reverse,
 ):
     source_document = _source_document(references_before=True, duplicate_price=False)
-    conflicting_definitions = _conflicting_provider_reference_definitions(
-        99, NPIS[0], 1, NPIS[1], 2
-    )
+    conflicting_definitions = _conflicting_provider_reference_definitions(99, NPIS[0], 1, NPIS[1], 2)
     if reverse:
         conflicting_definitions.reverse()
     source_document["provider_references"].extend(conflicting_definitions)
@@ -444,9 +421,7 @@ def test_source_index_scopes_same_conflicting_id_to_each_raw_source(tmp_path):
         source_document = _source_document(references_before=True, duplicate_price=False)
         source_document["reporting_entity_name"] = f"synthetic source {source_index}"
         source_document["provider_references"].extend(
-            _conflicting_provider_reference_definitions(
-                99, NPIS[0], tin_suffix, NPIS[1], tin_suffix + 1
-            )
+            _conflicting_provider_reference_definitions(99, NPIS[0], tin_suffix, NPIS[1], tin_suffix + 1)
         )
         source_paths.append(
             _write_source_fixture(
@@ -469,12 +444,8 @@ def test_source_index_scopes_same_conflicting_id_to_each_raw_source(tmp_path):
 
     assert quarantine["provider_group_conflict_count"] == 2
     assert quarantine["provider_group_conflicting_definition_count"] == 4
-    assert {
-        conflict["provider_group_id_sha256"]
-        for conflict in quarantine["provider_group_definition_conflicts"]
-    } == {
-        audit.provider_group_conflict_identity(spec.content_sha256, "99")
-        for spec in specs
+    assert {conflict["provider_group_id_sha256"] for conflict in quarantine["provider_group_definition_conflicts"]} == {
+        audit.provider_group_conflict_identity(spec.content_sha256, "99") for spec in specs
     }
 
 
@@ -512,9 +483,7 @@ def test_provider_tin_event_detection_covers_object_and_fields(
 
 def test_source_index_counts_referenced_tin_only_group(tmp_path):
     payload = _source_document(references_before=True, duplicate_price=False)
-    payload["provider_references"][0]["provider_groups"] = [
-        {"npi": [], "tin": {"type": "ein", "value": "000000001"}}
-    ]
+    payload["provider_references"][0]["provider_groups"] = [{"npi": [], "tin": {"type": "ein", "value": "000000001"}}]
     source_path = _write_source_fixture(
         tmp_path / "source.json",
         references_before=True,
@@ -551,9 +520,7 @@ def test_source_index_counts_referenced_mixed_tin_and_valid_npi_group(tmp_path):
         assert index.metrics["provider_reference_tin_markers"] == 1
         assert index.metrics["rates_with_tin_markers"] == 1
         assert index.metrics.get("tin_only_rates", 0) == 0
-        assert index.expected_tuples(
-            audit.QueryKey("CPT", "99213", NPIS[0])
-        )
+        assert index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
 
 
 def test_source_index_counts_inline_tin_only_group(tmp_path):
@@ -573,9 +540,7 @@ def test_source_index_counts_inline_tin_only_group(tmp_path):
         assert index.metrics["inline_rate_tin_markers"] == 1
         assert index.metrics["rates_with_tin_markers"] == 1
         assert index.metrics["tin_only_rates"] == 1
-        assert not index.expected_tuples(
-            audit.QueryKey("HCPCS", "A1234", NPIS[2])
-        )
+        assert not index.expected_tuples(audit.QueryKey("HCPCS", "A1234", NPIS[2]))
 
 
 def test_source_index_counts_inline_mixed_tin_and_valid_npi_group(tmp_path):
@@ -597,19 +562,13 @@ def test_source_index_counts_inline_mixed_tin_and_valid_npi_group(tmp_path):
         assert index.metrics["inline_rate_tin_markers"] == 1
         assert index.metrics["rates_with_tin_markers"] == 1
         assert index.metrics.get("tin_only_rates", 0) == 0
-        assert index.expected_tuples(
-            audit.QueryKey("HCPCS", "A1234", NPIS[2])
-        )
+        assert index.expected_tuples(audit.QueryKey("HCPCS", "A1234", NPIS[2]))
 
 
 def test_source_index_accepts_exact_string_npis(tmp_path):
     payload = _source_document(references_before=True, duplicate_price=False)
-    payload["provider_references"][0]["provider_groups"][0]["npi"] = [
-        str(value) for value in NPIS[:2]
-    ]
-    payload["in_network"][1]["negotiated_rates"][0]["provider_groups"][0][
-        "npi"
-    ] = [str(NPIS[2])]
+    payload["provider_references"][0]["provider_groups"][0]["npi"] = [str(value) for value in NPIS[:2]]
+    payload["in_network"][1]["negotiated_rates"][0]["provider_groups"][0]["npi"] = [str(NPIS[2])]
     source_path = _write_source_fixture(
         tmp_path / "string-npis.json",
         references_before=True,
@@ -631,9 +590,7 @@ def test_source_index_does_not_publish_or_quarantine_zero_npi(
     zero_marker,
 ):
     payload = _source_document(references_before=True, duplicate_price=False)
-    payload["provider_references"][0]["provider_groups"] = [
-        {"npi": [zero_marker]}
-    ]
+    payload["provider_references"][0]["provider_groups"] = [{"npi": [zero_marker]}]
     source_path = _write_source_fixture(
         tmp_path / f"zero-npi-{type(zero_marker).__name__}.json",
         references_before=True,
@@ -671,9 +628,7 @@ def test_source_index_rejects_non_singleton_zero_npi_marker(
     if provider_form == "referenced":
         payload["provider_references"][0]["provider_groups"] = provider_groups
     else:
-        payload["in_network"][1]["negotiated_rates"][0][
-            "provider_groups"
-        ] = provider_groups
+        payload["in_network"][1]["negotiated_rates"][0]["provider_groups"] = provider_groups
     source_path = _write_source_fixture(
         tmp_path / f"{provider_form}-invalid-zero.json",
         references_before=True,
@@ -693,9 +648,9 @@ def test_source_index_quarantines_malformed_integer_but_keeps_valid_npi(tmp_path
             "tin": {"type": "ein", "value": "000000001"},
         }
     ]
-    source_document["in_network"][1]["negotiated_rates"][0]["provider_groups"][0][
-        "npi"
-    ].extend(MALFORMED_NPI_STRING_FIXTURE)
+    source_document["in_network"][1]["negotiated_rates"][0]["provider_groups"][0]["npi"].extend(
+        MALFORMED_NPI_STRING_FIXTURE
+    )
     source_path = _write_source_fixture(
         tmp_path / "mixed-valid-malformed-npi.json",
         references_before=True,
@@ -731,9 +686,7 @@ def test_source_index_quarantines_noncanonical_npi_text_without_membership(tmp_p
         NPIS[0],
         malformed,
     ]
-    source_document["in_network"][1]["negotiated_rates"][0]["provider_groups"][
-        0
-    ]["npi"] = [NPIS[2], malformed]
+    source_document["in_network"][1]["negotiated_rates"][0]["provider_groups"][0]["npi"] = [NPIS[2], malformed]
     source_path = _write_source_fixture(
         tmp_path / "mixed-valid-noncanonical-string-npi.json",
         references_before=True,
@@ -771,9 +724,7 @@ def test_source_audit_combined_v2_digest_matches_scanner_contract():
         {"1" * 64: {"2" * 64, "3" * 64}},
     )
 
-    assert payload["sha256"] == (
-        "4648d8c0bd10e0f69cd6c54d8d11a186c9f960847059855fd55fa3b76778a537"
-    )
+    assert payload["sha256"] == ("4648d8c0bd10e0f69cd6c54d8d11a186c9f960847059855fd55fa3b76778a537")
 
 
 def test_provider_identifier_quarantine_rejects_new_identity_at_capacity():
@@ -784,13 +735,9 @@ def test_provider_identifier_quarantine_rejects_new_identity_at_capacity():
         audit.SourceFormatError,
         match="provider_identifier_quarantine_exceeds_1024_distinct_values",
     ):
-        audit._record_quarantined_provider_identifier(
-            integer_counts, len(text_counts), -1_024
-        )
+        audit._record_quarantined_provider_identifier(integer_counts, len(text_counts), -1_024)
 
-    audit._record_quarantined_provider_identifier(
-        integer_counts, len(text_counts), -1
-    )
+    audit._record_quarantined_provider_identifier(integer_counts, len(text_counts), -1)
     assert integer_counts[-1] == 2
 
 
@@ -883,9 +830,7 @@ def test_same_rate_from_two_raw_source_containers_remains_two_occurrences(tmp_pa
 
     assert len(expected) == 2
     assert sorted(expected.values()) == [1, 1]
-    assert {
-        json.loads(key)["raw_container_sha256"] for key in expected
-    } == {spec.content_sha256 for spec in specs}
+    assert {json.loads(key)["raw_container_sha256"] for key in expected} == {spec.content_sha256 for spec in specs}
 
 
 def test_rate_network_names_keep_otherwise_equal_occurrences_distinct(tmp_path):
@@ -951,12 +896,25 @@ def test_referenced_network_names_are_unioned_with_rate_names(tmp_path):
     ]
 
 
+def test_null_referenced_network_name_preserves_rate_network(tmp_path):
+    payload = _source_document(references_before=True, duplicate_price=False)
+    payload["provider_references"][0]["network_name"] = None
+    payload["in_network"][0]["negotiated_rates"][0]["network_names"] = ["Rate Network"]
+    source_path = _write_source_fixture(
+        tmp_path / "null-reference.json.gz", references_before=True, source_document=payload
+    )
+
+    with _open_source_index(tmp_path, source_path) as index:
+        expected = index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
+        assert index.metrics["invalid_field_types"] == 0
+        assert sum(expected.values()) == 1
+        assert json.loads(next(iter(expected)))["network_names"] == ["Rate Network"]
+
+
 def test_scalar_referenced_network_name_is_a_singleton_name(tmp_path):
     payload = _source_document(references_before=True, duplicate_price=False)
     payload["provider_references"][0]["network_name"] = " Reference Network "
-    payload["in_network"][0]["negotiated_rates"][0]["network_names"] = [
-        "Rate Network"
-    ]
+    payload["in_network"][0]["negotiated_rates"][0]["network_names"] = ["Rate Network"]
     source_path = _write_source_fixture(
         tmp_path / "scalar-referenced-network.json",
         references_before=True,
@@ -966,9 +924,7 @@ def test_scalar_referenced_network_name_is_a_singleton_name(tmp_path):
     )
 
     with _open_source_index(tmp_path, source_path) as index:
-        expected = index.expected_tuples(
-            audit.QueryKey("CPT", "99213", NPIS[0])
-        )
+        expected = index.expected_tuples(audit.QueryKey("CPT", "99213", NPIS[0]))
 
     tuple_payload = json.loads(next(iter(expected)))
     assert tuple_payload["network_names"] == [
@@ -1046,12 +1002,10 @@ def test_canonicalization_is_exact_and_rejects_invalid_dates():
     assert audit.canonical_catalog_code("MS_DRG", "7") == "007"
     assert audit.canonical_npi("1111111111.0") == NPIS[0]
     assert audit.canonical_price_payload(_negotiated_price())["setting"] == "office"
-    assert audit.canonical_price_payload(_negotiated_price())["service_code"] == [
-        "01"
-    ]
-    assert audit.canonical_price_payload(
-        _negotiated_price(billing_code_modifier=["tc, 26", "26"])
-    )["billing_code_modifier"] == ["26", "TC"]
+    assert audit.canonical_price_payload(_negotiated_price())["service_code"] == ["01"]
+    assert audit.canonical_price_payload(_negotiated_price(billing_code_modifier=["tc, 26", "26"]))[
+        "billing_code_modifier"
+    ] == ["26", "TC"]
     with pytest.raises(ValueError, match="invalid_iso_date"):
         audit.canonical_date("2027-02-30")
     with pytest.raises(ValueError, match="non_finite_decimal"):
@@ -1102,20 +1056,14 @@ def test_random_api_request_plan_is_deterministic_and_samples_with_replacement()
         audit.SourceOccurrence("b" * 64, query_b, "tuple-b"),
     ]
 
-    first = audit.build_random_api_requests(
-        occurrences, count=20, max_limit=7, seed="same-seed"
-    )
-    second = audit.build_random_api_requests(
-        occurrences, count=20, max_limit=7, seed="same-seed"
-    )
+    first = audit.build_random_api_requests(occurrences, count=20, max_limit=7, seed="same-seed")
+    second = audit.build_random_api_requests(occurrences, count=20, max_limit=7, seed="same-seed")
 
     assert first == second
     assert len(first) == 20
     assert len({request.query.stable_key for request in first}) <= len(occurrences)
     assert all(1 <= request.page_size <= 7 for request in first)
-    assert sum(request.phase == "cold" for request in first) == len(
-        {request.query.stable_key for request in first}
-    )
+    assert sum(request.phase == "cold" for request in first) == len({request.query.stable_key for request in first})
 
 
 def _canonical_tuple(
@@ -1170,9 +1118,7 @@ def test_counter_comparison_classifies_altered_missing_and_fake_tuples():
     )
     comparison = audit.compare_tuple_counters(
         query,
-        collections.Counter(
-            {altered_source.stable_key: 1, missing.stable_key: 1}
-        ),
+        collections.Counter({altered_source.stable_key: 1, missing.stable_key: 1}),
         collections.Counter({altered_api.stable_key: 1, fake.stable_key: 1}),
     )
 
@@ -1277,9 +1223,7 @@ def test_api_tuple_extraction_requires_arrangement_and_strict_types():
 def test_wrong_standard_api_source_attribution_fails_exact_comparison():
     query = audit.QueryKey("CPT", "99213", NPIS[0])
     canonical_tuple = _canonical_tuple(query)
-    expected = collections.Counter(
-        {audit.canonical_occurrence_key(canonical_tuple, "1" * 64): 1}
-    )
+    expected = collections.Counter({audit.canonical_occurrence_key(canonical_tuple, "1" * 64): 1})
     item = _api_item_for_tuple(canonical_tuple, raw_sha256="2" * 64)
 
     extracted = audit.extract_api_tuples([item])
@@ -1318,27 +1262,17 @@ def test_snapshot_wide_source_trace_union_is_rejected():
     )
 
     assert sum(extracted.counter.values()) == 1
-    assert extracted.schema_errors == (
-        "source_trace_union_mapped_to_multiple_source_artifact_keys",
-    )
+    assert extracted.schema_errors == ("source_trace_union_mapped_to_multiple_source_artifact_keys",)
 
 
 def test_source_artifact_key_and_raw_container_mapping_is_one_to_one():
     registry = audit.SourceIdentityRegistry()
-    registry.register(
-        _source_identity(raw_sha256="1" * 64, source_artifact_key=0)
-    )
+    registry.register(_source_identity(raw_sha256="1" * 64, source_artifact_key=0))
 
-    with pytest.raises(
-        audit.ApiSchemaError, match="source_artifact_key_mapping_changed"
-    ):
-        registry.register(
-            _source_identity(raw_sha256="2" * 64, source_artifact_key=0)
-        )
+    with pytest.raises(audit.ApiSchemaError, match="source_artifact_key_mapping_changed"):
+        registry.register(_source_identity(raw_sha256="2" * 64, source_artifact_key=0))
     with pytest.raises(audit.ApiSchemaError, match="raw_container_mapped"):
-        registry.register(
-            _source_identity(raw_sha256="1" * 64, source_artifact_key=1)
-        )
+        registry.register(_source_identity(raw_sha256="1" * 64, source_artifact_key=1))
 
 
 def test_dense_artifact_key_is_required_and_logical_source_key_is_optional():
@@ -1361,9 +1295,7 @@ def test_dense_artifact_key_is_required_and_logical_source_key_is_optional():
 
     missing_artifact_key = _source_identity_payload(source_key="logical-source")
     missing_artifact_key.pop("source_artifact_key")
-    with pytest.raises(
-        audit.ApiSchemaError, match="source_artifact_key_must_be_integer"
-    ):
+    with pytest.raises(audit.ApiSchemaError, match="source_artifact_key_must_be_integer"):
         audit.extract_source_identity(missing_artifact_key, field_prefix="test")
 
     numeric_logical_key = _source_identity_payload()
@@ -1375,17 +1307,13 @@ def test_dense_artifact_key_is_required_and_logical_source_key_is_optional():
 def test_optional_logical_source_key_does_not_replace_dense_mapping_key():
     registry = audit.SourceIdentityRegistry()
     registry.register(_source_identity(source_artifact_key=3))
-    registry.register(
-        _source_identity(source_artifact_key=3, source_key="logical-source")
-    )
+    registry.register(_source_identity(source_artifact_key=3, source_key="logical-source"))
 
     with pytest.raises(
         audit.ApiSchemaError,
         match="logical_source_key_changed_within_report",
     ):
-        registry.register(
-            _source_identity(source_artifact_key=3, source_key="different-logical-source")
-        )
+        registry.register(_source_identity(source_artifact_key=3, source_key="different-logical-source"))
 
 
 @pytest.mark.parametrize(
@@ -1585,9 +1513,7 @@ def test_release_cli_rejects_caller_seed_search_and_uses_fixed_precommitment():
         "audit-token",
         "--validated-candidate",
     ]
-    searched = parser.parse_args(
-        [*required_arguments, "--seed", "caller-searched-seed"]
-    )
+    searched = parser.parse_args([*required_arguments, "--seed", "caller-searched-seed"])
     with pytest.raises(
         audit.ConfigurationError,
         match="release_seed_caller_override_forbidden",
@@ -1633,11 +1559,14 @@ def test_diagnostic_cli_retains_explicit_seed_for_reproduction():
     config = audit._audit_config(args)
 
     assert config.seed == "diagnostic-seed"
-    assert audit.sampling_seed_evidence(
-        config.profile,
-        config.seed,
-        None,
-    )["contract"] == audit.DIAGNOSTIC_SEED_CONTRACT
+    assert (
+        audit.sampling_seed_evidence(
+            config.profile,
+            config.seed,
+            None,
+        )["contract"]
+        == audit.DIAGNOSTIC_SEED_CONTRACT
+    )
 
 
 def _page_contract(config: audit.AuditConfig, *, matched: bool) -> audit.PageContract:
@@ -1734,17 +1663,12 @@ class _MappingFetcher:
         self.request_count += len(page_latencies)
         return audit.FetchResult(
             items=tuple(response_items),
-            contracts=tuple(
-                _page_contract(self.config, matched=bool(response_items))
-                for _page in page_latencies
-            ),
+            contracts=tuple(_page_contract(self.config, matched=bool(response_items)) for _page in page_latencies),
             page_latencies_ms=page_latencies,
             total_latency_ms=total_latency,
             pages=len(page_latencies),
             retries=0,
-            response_fingerprint=audit.sha256_text(
-                audit.canonical_json(response_items)
-            ),
+            response_fingerprint=audit.sha256_text(audit.canonical_json(response_items)),
         )
 
 
@@ -1818,9 +1742,7 @@ def test_random_api_request_fails_on_multiplicity_change():
     config = _audit_config()
     query = audit.QueryKey("CPT", "99213", NPIS[0])
     canonical_tuple = _canonical_tuple(query)
-    occurrence_key = audit.canonical_occurrence_key(
-        canonical_tuple, DEFAULT_RAW_SHA256
-    )
+    occurrence_key = audit.canonical_occurrence_key(canonical_tuple, DEFAULT_RAW_SHA256)
     expected = collections.Counter({occurrence_key: 2})
     fetcher = _MappingFetcher(
         {query.stable_key: collections.Counter({occurrence_key: 1})},
@@ -1834,9 +1756,7 @@ def test_random_api_request_fails_on_multiplicity_change():
         phase="cold",
     )
 
-    result = audit._audit_random_api_request(
-        request, expected, fetcher=fetcher, config=config
-    )
+    result = audit._audit_random_api_request(request, expected, fetcher=fetcher, config=config)
 
     assert result.failure_counts == {"duplicate_count": 1}
     assert result.response_occurrences == 1
@@ -1867,9 +1787,7 @@ def _multi_arrangement_source_document():
                 "negotiated_rates": [
                     {
                         "provider_groups": [{"npi": [NPIS[0]]}],
-                        "negotiated_prices": [
-                            _negotiated_price(negotiated_rate=200)
-                        ],
+                        "negotiated_prices": [_negotiated_price(negotiated_rate=200)],
                     }
                 ],
             },
@@ -1917,21 +1835,15 @@ def test_random_api_request_accepts_multi_arrangement_items_and_source_multiplic
 
 
 def _api_occurrences_from_source(source_occurrences):
-    raw_hashes = sorted(
-        {json.loads(occurrence.tuple_key)["raw_container_sha256"] for occurrence in source_occurrences}
-    )
-    artifact_key_by_hash = {
-        raw_sha: index for index, raw_sha in enumerate(raw_hashes)
-    }
+    raw_hashes = sorted({json.loads(occurrence.tuple_key)["raw_container_sha256"] for occurrence in source_occurrences})
+    artifact_key_by_hash = {raw_sha: index for index, raw_sha in enumerate(raw_hashes)}
     return [
         audit.ApiOccurrence(
             occurrence_id=audit.sha256_text(f"api:{occurrence.occurrence_id}"),
             canonical_tuple=_tuple_from_key(occurrence.tuple_key),
             source_identity=_source_identity(
                 raw_sha256=json.loads(occurrence.tuple_key)["raw_container_sha256"],
-                source_artifact_key=artifact_key_by_hash[
-                    json.loads(occurrence.tuple_key)["raw_container_sha256"]
-                ],
+                source_artifact_key=artifact_key_by_hash[json.loads(occurrence.tuple_key)["raw_container_sha256"]],
             ),
         )
         for occurrence in source_occurrences
@@ -1941,9 +1853,7 @@ def _api_occurrences_from_source(source_occurrences):
 def _response_counters(index, queries):
     return {
         query.stable_key: index.expected_tuples(query)
-        for query in {
-            candidate.stable_key: candidate for candidate in queries
-        }.values()
+        for query in {candidate.stable_key: candidate for candidate in queries}.values()
     }
 
 
@@ -1984,28 +1894,21 @@ def _assert_independent_occurrence_audit(
         "source_set_validated": True,
         "selected_occurrences": 3,
     }
-    assert report["reproducibility"]["sampling"]["api_sample_source"] == (
-        "persisted_publish_time_served_occurrences"
-    )
-    assert any(
-        "complete served occurrence population" in limitation
-        for limitation in report["limitations"]
-    )
+    assert report["reproducibility"]["sampling"]["api_sample_source"] == ("persisted_publish_time_served_occurrences")
+    assert any("complete served occurrence population" in limitation for limitation in report["limitations"])
     assert query_scans >= report["checks"]["positive_queries"]
-    assert query_scans <= (
-        report["checks"]["positive_queries"] + config.random_api_calls
-    )
-    expected_fetch_calls = (
-        report["checks"]["positive_queries"] + report["checks"]["negative_queries"]
-    ) * 2
+    assert query_scans <= (report["checks"]["positive_queries"] + config.random_api_calls)
+    expected_fetch_calls = (report["checks"]["positive_queries"] + report["checks"]["negative_queries"]) * 2
     assert len(fetcher.calls) == expected_fetch_calls + config.random_api_calls
     assert api_occurrence_source.calls == [(3, "test-seed")]
-    assert report["latency"]["cold"]["first_page_first_observation"][
-        "count"
-    ] == report["checks"]["positive_matched_first_observation_query_keys"]
-    assert report["latency"]["cold"]["logical_query"]["count"] == report[
-        "checks"
-    ]["positive_matched_first_observation_query_keys"]
+    assert (
+        report["latency"]["cold"]["first_page_first_observation"]["count"]
+        == report["checks"]["positive_matched_first_observation_query_keys"]
+    )
+    assert (
+        report["latency"]["cold"]["logical_query"]["count"]
+        == report["checks"]["positive_matched_first_observation_query_keys"]
+    )
     assert report["random_api_requests"]["planned_logical_request_count"] == 6
     assert report["random_api_requests"]["actual_http_request_count"] >= 6
     assert report["http"]["standard_api_actual_http_requests"] == fetcher.request_count
@@ -2068,9 +1971,7 @@ def _random_reservation_audit(tmp_path):
             max_limit=config.random_api_max_limit,
             seed=config.seed,
         )
-        random_query_keys = {
-            request.query.stable_key for request in random_plan
-        }
+        random_query_keys = {request.query.stable_key for request in random_plan}
         fetcher, api_occurrence_source = _audit_runner_dependencies(
             index,
             config,
@@ -2095,78 +1996,48 @@ def _assert_cold_before_warm(fetcher, random_query_keys) -> None:
 
     random_calls = [
         (position, query, phase)
-        for position, (query, phase, page_size) in enumerate(
-            fetcher.detailed_calls
-        )
+        for position, (query, phase, page_size) in enumerate(fetcher.detailed_calls)
         if page_size is not None
     ]
-    random_cold_positions = [
-        position for position, _query, phase in random_calls if phase == "cold"
-    ]
-    random_warm_positions = [
-        position for position, _query, phase in random_calls if phase == "warm"
-    ]
-    assert {
-        query.stable_key
-        for _position, query, phase in random_calls
-        if phase == "cold"
-    } == random_query_keys
+    random_cold_positions = [position for position, _query, phase in random_calls if phase == "cold"]
+    random_warm_positions = [position for position, _query, phase in random_calls if phase == "warm"]
+    assert {query.stable_key for _position, query, phase in random_calls if phase == "cold"} == random_query_keys
     assert max(random_cold_positions) < min(random_warm_positions)
 
 
 def _assert_random_key_call_order(fetcher, random_plan, random_query_keys) -> None:
     for query_key in random_query_keys:
         cold_request = next(
-            request
-            for request in random_plan
-            if request.query.stable_key == query_key
-            and request.phase == "cold"
+            request for request in random_plan if request.query.stable_key == query_key and request.phase == "cold"
         )
         calls_for_key_list = [
             (position, phase, page_size)
-            for position, (query, phase, page_size) in enumerate(
-                fetcher.detailed_calls
-            )
+            for position, (query, phase, page_size) in enumerate(fetcher.detailed_calls)
             if query.stable_key == query_key
         ]
         assert calls_for_key_list[0][1:] == ("cold", cold_request.page_size)
-        assert any(
-            phase == "warm" and page_size is None
-            for _position, phase, page_size in calls_for_key_list
-        )
+        assert any(phase == "warm" and page_size is None for _position, phase, page_size in calls_for_key_list)
 
 
 def _assert_random_reservation_report(report: dict, random_query_keys: set) -> None:
     assert report["status"] == "pass"
-    assert report["checks"]["positive_queries_executed"] == report["checks"][
-        "positive_queries"
-    ]
+    assert report["checks"]["positive_queries_executed"] == report["checks"]["positive_queries"]
     assert report["checks"]["source_to_api_exact_matches"] == 3
     assert report["checks"]["api_to_source_exact_matches"] == 3
-    assert report["checks"]["positive_matched_query_keys"] == report["checks"][
-        "positive_queries"
-    ]
-    assert report["checks"]["positive_first_observation_query_keys"] + report[
-        "checks"
-    ]["positive_reserved_for_random_query_keys"] == report["checks"][
-        "positive_queries"
-    ]
-    assert report["random_api_requests"]["first_observation_query_count"] == len(
-        random_query_keys
+    assert report["checks"]["positive_matched_query_keys"] == report["checks"]["positive_queries"]
+    assert (
+        report["checks"]["positive_first_observation_query_keys"]
+        + report["checks"]["positive_reserved_for_random_query_keys"]
+        == report["checks"]["positive_queries"]
     )
-    assert report["random_api_requests"][
-        "reserved_from_positive_first_observation_count"
-    ] == len(random_query_keys)
-    assert "reserved query key" in report["random_api_requests"]["latency"][
-        "semantics"
-    ]
+    assert report["random_api_requests"]["first_observation_query_count"] == len(random_query_keys)
+    assert report["random_api_requests"]["reserved_from_positive_first_observation_count"] == len(random_query_keys)
+    assert "reserved query key" in report["random_api_requests"]["latency"]["semantics"]
 
 
 def test_runner_reserves_random_keys_until_true_first_observation(tmp_path):
     """Ensure random keys remain unused until their measured cold request."""
-    _config, fetcher, random_plan, random_query_keys, report = (
-        _random_reservation_audit(tmp_path)
-    )
+    _config, fetcher, random_plan, random_query_keys, report = _random_reservation_audit(tmp_path)
     _assert_cold_before_warm(fetcher, random_query_keys)
     _assert_random_key_call_order(fetcher, random_plan, random_query_keys)
     _assert_random_reservation_report(report, random_query_keys)
@@ -2228,14 +2099,9 @@ def test_release_runner_enforces_observed_http_request_floor(tmp_path):
         ).execute_audit(started_at=dt.datetime.now(dt.timezone.utc))
 
     assert report["http"]["standard_api_actual_http_requests"] < 3_000
-    assert "actual_http_requests_below_release_minimum" in report["coverage"][
-        "failures"
-    ]
+    assert "actual_http_requests_below_release_minimum" in report["coverage"]["failures"]
     assert audit.RELEASE_MIN_DISTINCT_MATCHED_QUERY_KEYS == 100
-    assert (
-        "distinct_matched_positive_query_keys_below_release_minimum"
-        in report["coverage"]["failures"]
-    )
+    assert "distinct_matched_positive_query_keys_below_release_minimum" in report["coverage"]["failures"]
 
 
 @pytest.mark.parametrize(
@@ -2288,9 +2154,7 @@ def test_release_runner_rejects_only_tin_only_rates(
     if provider_form == "referenced":
         source_document["provider_references"][0]["provider_groups"] = provider_groups
     else:
-        source_document["in_network"][1]["negotiated_rates"][0][
-            "provider_groups"
-        ] = provider_groups
+        source_document["in_network"][1]["negotiated_rates"][0]["provider_groups"] = provider_groups
     source_path = _write_source_fixture(
         tmp_path / f"{provider_form}-tin.json.gz",
         references_before=True,
@@ -2314,9 +2178,7 @@ def test_release_runner_rejects_only_tin_only_rates(
     assert report["source"]["totals"][marker_metric] == 1
     assert report["source"]["totals"].get("tin_only_rates", 0) == expected_tin_only
     assert report["source"]["totals"]["rates_with_tin_markers"] == 1
-    assert (
-        "tin_only_rates_not_npi_verifiable" in report["coverage"]["failures"]
-    ) is bool(expected_tin_only)
+    assert ("tin_only_rates_not_npi_verifiable" in report["coverage"]["failures"]) is bool(expected_tin_only)
     if expected_tin_only:
         assert report["release_gate_eligible"] is False
 
@@ -2343,9 +2205,7 @@ def test_api_only_tuple_is_detected_outside_source_sample(tmp_path):
             source_identity=_source_identity(),
         )
         responses = _response_counters(index, [source_occurrence.query])
-        responses[fake_query.stable_key] = collections.Counter(
-            {fake_tuple.stable_key: 1}
-        )
+        responses[fake_query.stable_key] = collections.Counter({fake_tuple.stable_key: 1})
         fetcher = _MappingFetcher(responses, config)
         report = audit.AuditRunner(
             index,
@@ -2395,9 +2255,7 @@ def test_runner_gates_first_page_and_logical_query_latency_separately(
                 cold_pages=cold_pages,
                 cold_total=cold_total,
             ),
-            _StaticApiOccurrenceSource(
-                _api_occurrences_from_source(source_occurrences)
-            ),
+            _StaticApiOccurrenceSource(_api_occurrences_from_source(source_occurrences)),
             config,
         ).execute_audit(started_at=dt.datetime.now(dt.timezone.utc))
 
@@ -2432,27 +2290,20 @@ def test_positive_first_page_p95_excludes_negative_and_random_latency(
         report = audit.AuditRunner(
             index,
             _AdversarialLatencyFetcher(responses, config),
-            _StaticApiOccurrenceSource(
-                _api_occurrences_from_source(source_occurrences)
-            ),
+            _StaticApiOccurrenceSource(_api_occurrences_from_source(source_occurrences)),
             config,
         ).execute_audit(started_at=dt.datetime.now(dt.timezone.utc))
 
-    positive_latency = report["latency"]["cold"][
-        "first_page_first_observation"
-    ]
-    assert positive_latency["count"] == report["checks"][
-        "positive_matched_first_observation_query_keys"
-    ]
-    assert positive_latency["count"] < report["checks"][
-        "positive_matched_query_keys"
-    ]
+    positive_latency = report["latency"]["cold"]["first_page_first_observation"]
+    assert positive_latency["count"] == report["checks"]["positive_matched_first_observation_query_keys"]
+    assert positive_latency["count"] < report["checks"]["positive_matched_query_keys"]
     assert positive_latency["p95_ms"] == 60.0
     assert report["random_api_requests"]["latency"]["cold"]["p95_ms"] == 0.1
     assert report["failures"]["counts"]["first_page_latency"] == 1
-    assert "random requests are reported in separate classes" in report[
-        "latency"
-    ]["semantics"]["first_page_first_observation"]
+    assert (
+        "random requests are reported in separate classes"
+        in report["latency"]["semantics"]["first_page_first_observation"]
+    )
 
 
 def test_slow_negative_queries_are_gated_without_polluting_positive_latency(
@@ -2473,9 +2324,7 @@ def test_slow_negative_queries_are_gated_without_polluting_positive_latency(
         report = audit.AuditRunner(
             index,
             _SlowNegativeFetcher(responses, config),
-            _StaticApiOccurrenceSource(
-                _api_occurrences_from_source(source_occurrences)
-            ),
+            _StaticApiOccurrenceSource(_api_occurrences_from_source(source_occurrences)),
             config,
         ).execute_audit(started_at=dt.datetime.now(dt.timezone.utc))
 
@@ -2505,18 +2354,14 @@ def test_random_cold_first_pages_have_an_independent_40ms_gate(tmp_path):
         report = audit.AuditRunner(
             index,
             _SlowRandomFirstPageFetcher(responses, config),
-            _StaticApiOccurrenceSource(
-                _api_occurrences_from_source(source_occurrences)
-            ),
+            _StaticApiOccurrenceSource(_api_occurrences_from_source(source_occurrences)),
             config,
         ).execute_audit(started_at=dt.datetime.now(dt.timezone.utc))
 
     failures = report["failures"]["counts"]
     assert failures["random_first_page_latency"] == 1
     assert "first_page_latency" not in failures
-    first_page_by_class = report["latency"]["cold"][
-        "first_page_first_observation"
-    ]["by_class"]
+    first_page_by_class = report["latency"]["cold"]["first_page_first_observation"]["by_class"]
     assert first_page_by_class["matched_positive"]["p95_ms"] == 7.0
     assert first_page_by_class["random_positive"]["p95_ms"] == 60.0
 
@@ -2590,9 +2435,7 @@ def _persisted_audit_sample(total, *, items=None, **overrides):
         "format_version": audit.AUDIT_SAMPLE_FORMAT_VERSION,
         "method": audit.AUDIT_SAMPLE_METHOD,
         "sample_count": total,
-        "sample_digest": (
-            _persisted_sample_digest(items) if items is not None else "ab" * 32
-        ),
+        "sample_digest": (_persisted_sample_digest(items) if items is not None else "ab" * 32),
         "occurrence_identity": audit.AUDIT_SAMPLE_OCCURRENCE_IDENTITY,
         "serving_multiplicity_semantics": audit.AUDIT_SAMPLE_MULTIPLICITY,
         "complete_population": False,
@@ -2640,10 +2483,7 @@ def test_http_fetcher_pages_by_offset_and_requires_provenance():
 
     assert offsets == [0, 1]
     assert [page_item["page"] for page_item in fetch_result.items] == [0, 1]
-    assert (
-        fetch_result.contracts[0].provenance_arch_version
-        == audit.EXPECTED_ARCHITECTURE
-    )
+    assert fetch_result.contracts[0].provenance_arch_version == audit.EXPECTED_ARCHITECTURE
 
     def missing_provenance(_request):
         page_document = _api_page_document(
@@ -2779,8 +2619,7 @@ def _persisted_occurrence_item(index: int):
 
 def test_release_auditor_digest_matches_sealed_v2_contract_vector():
     assert _persisted_sample_digest([_persisted_occurrence_item(0)]) == (
-        "bb59fa17e792f7508bc4cae8d0e69a79"
-        "bf1f7962c29319baf53f769d736f6d9d"
+        "bb59fa17e792f7508bc4cae8d0e69a79bf1f7962c29319baf53f769d736f6d9d"
     )
 
 
@@ -2814,9 +2653,7 @@ def test_http_api_occurrence_source_streams_all_pages_with_bounded_calls():
     fetcher.client.close()
     fetcher.client = httpx.Client(transport=httpx.MockTransport(handler))
     try:
-        sample = audit.HttpApiOccurrenceSource(
-            fetcher, config, DEFAULT_SOURCE_SET
-        ).sample_occurrences(
+        sample = audit.HttpApiOccurrenceSource(fetcher, config, DEFAULT_SOURCE_SET).sample_occurrences(
             sample_target=2,
             seed="sample-seed",
         )
@@ -2827,9 +2664,7 @@ def test_http_api_occurrence_source_streams_all_pages_with_bounded_calls():
     assert sample.sample_count == 5
     assert sample.pages == math.ceil(5 / 2)
     assert len(sample.occurrences) == 2
-    assert len(
-        {occurrence.occurrence_id for occurrence in sample.occurrences}
-    ) == 2
+    assert len({occurrence.occurrence_id for occurrence in sample.occurrences}) == 2
     assert sample.contract == audit.AUDIT_SAMPLE_CONTRACT
     assert sample.method == audit.AUDIT_SAMPLE_METHOD
     assert sample.sample_count == 5
@@ -2912,9 +2747,7 @@ def test_source_set_preflight_precedes_local_occurrence_sampling(tmp_path):
             api_path="/audit",
         )
         audit_fetcher.client.close()
-        audit_fetcher.client = httpx.Client(
-            transport=httpx.MockTransport(handler)
-        )
+        audit_fetcher.client = httpx.Client(transport=httpx.MockTransport(handler))
         occurrence_source = audit.HttpApiOccurrenceSource(
             audit_fetcher,
             config,
@@ -2963,9 +2796,7 @@ def test_http_api_occurrence_source_rejects_same_count_digest_tampering():
             audit.ApiSchemaError,
             match="audit_sample_digest_does_not_match_returned_rows",
         ):
-            audit.HttpApiOccurrenceSource(
-                fetcher, config, DEFAULT_SOURCE_SET
-            ).sample_occurrences(
+            audit.HttpApiOccurrenceSource(fetcher, config, DEFAULT_SOURCE_SET).sample_occurrences(
                 sample_target=1,
                 seed="sample-seed",
             )
@@ -3028,9 +2859,7 @@ def test_http_api_occurrence_source_requires_persisted_sample_contract(
     fetcher.client = httpx.Client(transport=httpx.MockTransport(handler))
     try:
         with pytest.raises(audit.ApiSchemaError, match=error):
-            audit.HttpApiOccurrenceSource(
-                fetcher, config, DEFAULT_SOURCE_SET
-            ).sample_occurrences(
+            audit.HttpApiOccurrenceSource(fetcher, config, DEFAULT_SOURCE_SET).sample_occurrences(
                 sample_target=1,
                 seed="sample-seed",
             )
@@ -3061,9 +2890,7 @@ def test_http_api_occurrence_source_rejects_non_monotonic_ids():
     fetcher.client = httpx.Client(transport=httpx.MockTransport(handler))
     try:
         with pytest.raises(audit.ApiSchemaError, match="not_strictly_increasing"):
-            audit.HttpApiOccurrenceSource(
-                fetcher, config, DEFAULT_SOURCE_SET
-            ).sample_occurrences(
+            audit.HttpApiOccurrenceSource(fetcher, config, DEFAULT_SOURCE_SET).sample_occurrences(
                 sample_target=1,
                 seed="sample-seed",
             )
@@ -3092,9 +2919,7 @@ def test_api_audit_page_size_defaults_to_persisted_sample_page_limit():
     assert args.min_random_api_calls == audit.RELEASE_MIN_RANDOM_API_CALLS
     assert audit.AUDIT_SAMPLE_CONTRACT == "persisted_served_occurrence_sample_v2"
     assert audit.AUDIT_SAMPLE_FORMAT_VERSION == 2
-    assert _audit_config().api_params(audit.QueryKey("CPT", "99213", NPIS[0]))[
-        "include_sources"
-    ] == "true"
+    assert _audit_config().api_params(audit.QueryKey("CPT", "99213", NPIS[0]))["include_sources"] == "true"
 
 
 def test_validated_candidate_cli_adds_bound_header_and_requires_exact_scope():
@@ -3179,13 +3004,9 @@ def test_release_cli_rejects_insecure_transport_and_nonstandard_paths():
     with pytest.raises(audit.ConfigurationError, match="tls_verification"):
         audit._audit_config(parser.parse_args([*base_args, "--insecure"]))
     with pytest.raises(audit.ConfigurationError, match="standard_api_path"):
-        audit._audit_config(
-            parser.parse_args([*base_args, "--api-path", "/custom/pricing"])
-        )
+        audit._audit_config(parser.parse_args([*base_args, "--api-path", "/custom/pricing"]))
     with pytest.raises(audit.ConfigurationError, match="audit_api_path"):
-        audit._audit_config(
-            parser.parse_args([*base_args, "--api-audit-path", "/custom/audit"])
-        )
+        audit._audit_config(parser.parse_args([*base_args, "--api-audit-path", "/custom/audit"]))
 
 
 def test_fatal_report_contains_only_safe_error_metadata(tmp_path):
@@ -3229,6 +3050,4 @@ def test_fatal_report_preserves_only_stable_configuration_reason(tmp_path):
         specs=audit.source_specs([source]),
     )
 
-    assert report["failures"]["examples"][0]["reason"] == (
-        "release_api_base_url_must_be_https_origin"
-    )
+    assert report["failures"]["examples"][0]["reason"] == ("release_api_base_url_must_be_https_origin")
