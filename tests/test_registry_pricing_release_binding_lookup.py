@@ -10,11 +10,13 @@ import asyncpg
 import pytest
 
 from api import plan_release_pricing_projection as projection
+from api import plan_release_supporting_metadata as supporting
 from process import registry_pricing_release_binding_lookup as lookup
 from process import registry_required_target_coverage as coverage
 from process.network_approved_catalog_evidence import ApprovedNetworkCatalogEvidenceRecord
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_plan_release_serving import PLAN_RELEASE_ID, _binding_row
+from tests.test_plan_release_supporting_metadata import _committed_rows, commitment_page
 
 REFERENCE = {
     "healthporta_plan_id": "hpplan_" + "1" * 26,
@@ -71,6 +73,11 @@ class Driver:
     async def fetch(self, sql, *parameters):
         self.calls.append((sql, parameters))
         self.tasks.append(asyncio.current_task())
+        if "supporting_commitments AS MATERIALIZED" in sql:
+            import json
+
+            requested_ids = {entry["plan_release_id"] for entry in json.loads(parameters[0])}
+            return commitment_page([binding for binding in self.rows if binding["plan_release_id"] in requested_ids])
         if "AS storage_present" in sql:
             return []
         if self.failure:
@@ -224,6 +231,133 @@ async def test_additive_absence_and_report_budget_preserve_directory(retained_ex
     result = await append(driver)
     assert len(driver.calls) == 1 and result["targets"] == REPORT["targets"]
     assert await append(Driver(), limit=1) == REPORT
+
+
+@pytest.fixture
+def supporting_page_driver(monkeypatch):
+    from tests.test_plan_release_source_bindings import header
+
+    monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "sample_registry")
+    custody = AsyncMock()
+    monkeypatch.setattr(lookup, "require_source_binding_custody_fetch", custody)
+    legacy_id = "hprelease_" + "4" * 26
+    driver = Driver()
+    driver.supporting_pages = None
+    original_fetch = driver.fetch
+
+    async def fetch(sql, *parameters):
+        if "AS storage_present" in sql:
+            driver.calls.append((sql, parameters))
+            headers = [header(expected_binding_count=2), header(plan_release_id=legacy_id, storage_present=False)]
+            return [entry for entry in headers if entry["plan_release_id"] in parameters[0]]
+        if "supporting_commitments AS MATERIALIZED" in sql:
+            driver.calls.append((sql, parameters))
+            return driver.supporting_pages
+        return await original_fetch(sql, *parameters)
+
+    driver.fetch = fetch
+    return driver, custody, legacy_id
+
+
+@pytest.mark.asyncio
+async def test_supporting_limit_keeps_the_entire_batch_unavailable(
+    retained_export, supporting_page_driver, monkeypatch
+):
+    import json
+
+    from process.registry_pricing_snapshot_rows import read_pricing_snapshot_row_checks
+
+    monkeypatch.setattr(lookup, "read_pricing_snapshot_row_checks", read_pricing_snapshot_row_checks)
+    driver, custody, legacy_id = supporting_page_driver
+    requests, _ = retained_export
+    requests[0]["pricing_refs"].append({**REFERENCE, "plan_release_id": legacy_id})
+    commitments = _committed_rows()
+    metadata = commitments[1]["supporting_metadata"]
+    metadata["supporting_rate_file_receipts"][0]["validation_context"]["note"] = "x" * 10_000
+    marker = supporting.pricing_control_digest(
+        [["in_network", 1, metadata]], domain="hp_supporting_binding_metadata_v1"
+    )
+    for commitment in commitments:
+        commitment["marker"] = marker
+    supporting.require_supporting_metadata_commitment(commitments)
+    maximum = 8_000
+    assert len(json.dumps(commitments).encode()) > maximum
+    driver.supporting_pages = [{"bounded": False, "rows_json": None}]
+    enriched_report = await append(driver, limit=maximum)
+    assert enriched_report["targets"] == REPORT["targets"] and enriched_report["totals"] == REPORT["totals"]
+    assert enriched_report["assessment"] == REPORT["assessment"]
+    assert enriched_report["provenance"]["original"] == "retained"
+    provenance = enriched_report["provenance"]["pricing_binding_metadata"]
+    assert provenance["release_metadata"] == {PLAN_RELEASE_ID: None, legacy_id: None}
+    references = provenance["networks"][0]["pricing_refs"]
+    assert [entry["reference"] for entry in references] == requests[0]["pricing_refs"]
+    assert all(entry["resolved"] is False and entry["binding_metadata_match"] is False for entry in references)
+    assert provenance["full_readiness"] == "not_assessed"
+    assert provenance["snapshot_row_checks"] == {}
+    assert not any("bindings AS MATERIALIZED" in sql for sql, _ in driver.calls)
+    assert "supporting_rate_file_receipts" not in json.dumps(enriched_report)
+    assert driver.lifecycle == ["start", "release"] and driver.is_in_transaction()
+    custody.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pages",
+    [
+        [],
+        [{"bounded": False, "rows_json": None}] * 2,
+        [{"bounded": None, "rows_json": None}],
+        [{"bounded": 0, "rows_json": None}],
+        [{"bounded": False}],
+        [{"bounded": False, "rows_json": "[]"}],
+        [{"bounded": True, "rows_json": None}],
+        [{"bounded": True, "rows_json": " " * 10_001}],
+        [{"bounded": True, "rows_json": "{"}],
+        [{"bounded": True, "rows_json": "{}"}],
+    ],
+)
+async def test_malformed_supporting_page_is_not_optional(retained_export, supporting_page_driver, pages):
+    driver, custody, _ = supporting_page_driver
+    driver.supporting_pages = pages
+    with pytest.raises(ValueError) as caught:
+        await append(driver, limit=10_000)
+    assert not isinstance(caught.value, supporting.SupportingMetadataResourceLimit)
+    assert driver.lifecycle == ["start", "rollback"] and driver.is_in_transaction()
+    assert not any("bindings AS MATERIALIZED" in sql for sql, _ in driver.calls)
+    custody.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage,message",
+    (
+        ("marker", "plan_release_supporting_metadata_commitment_changed"),
+        ("erased", "plan_release_supporting_metadata_commitment_invalid"),
+        ("missing", "plan_release_source_binding_incomplete"),
+        ("revision", "plan_release_supporting_identity_invalid"),
+    ),
+)
+async def test_changed_supporting_proof_is_not_optional(retained_export, supporting_page_driver, damage, message):
+    import json
+
+    driver, custody, _ = supporting_page_driver
+    commitments = _committed_rows()
+    if damage == "marker":
+        for commitment in commitments:
+            commitment["marker"] = "0" * 64
+    elif damage == "erased":
+        commitments[1]["supporting_metadata"] = {}
+    elif damage == "missing":
+        commitments.pop()
+    else:
+        commitments[1]["serving_revision_id"] = "hpserve_" + "9" * 26
+    driver.supporting_pages = [{"bounded": True, "rows_json": json.dumps(commitments)}]
+    with pytest.raises(ValueError, match="^" + message + "$") as caught:
+        await append(driver)
+    assert not isinstance(caught.value, supporting.SupportingMetadataResourceLimit)
+    assert driver.lifecycle == ["start", "rollback"] and driver.is_in_transaction()
+    assert not any("bindings AS MATERIALIZED" in sql for sql, _ in driver.calls)
+    custody.assert_awaited_once()
 
 
 @pytest.mark.asyncio

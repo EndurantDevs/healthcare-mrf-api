@@ -128,19 +128,23 @@ async def native_case():
         await _create_input_relations(native, role_by_kind)
         yield await _input_case(native, url, database_name, role_by_kind, password)
     finally:
-        if native is not None:
-            await native.close()
-        if has_attempted_database:
-            await admin.execute(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
-            assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_database WHERE datname=$1)", database_name)
-            assert not await admin.fetchval(
-                "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", database_name
-            )
-        for name in reversed(created_roles):
-            await admin.execute(f'DROP ROLE IF EXISTS "{name}"')
-            assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", name)
-        await admin.close()
-        assert admin.is_closed()
+        try:
+            if native is not None:
+                await native.close()
+            if has_attempted_database:
+                await admin.execute(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)')
+                assert not await admin.fetchval(
+                    "SELECT EXISTS(SELECT FROM pg_database WHERE datname=$1)", database_name
+                )
+                assert not await admin.fetchval(
+                    "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE datname=$1)", database_name
+                )
+            for name in reversed(created_roles):
+                await admin.execute(f'DROP ROLE IF EXISTS "{name}"')
+                assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", name)
+        finally:
+            await admin.close()
+            assert admin.is_closed()
 
 
 @asynccontextmanager

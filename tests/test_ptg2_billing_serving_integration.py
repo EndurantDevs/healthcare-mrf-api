@@ -211,10 +211,11 @@ def _install_billing_stubs(monkeypatch, representation="direct_v1") -> AsyncMock
         member_lookup = AsyncMock(
             side_effect=[
                 {7: (10,), 8: (20,), 9: (30,)},
-                {10: (3, 5), 20: (4, 6), 30: (7,)},
+                {10: (3,), 20: (4,), 30: ()},
             ]
         )
         monkeypatch.setattr(serving, "lookup_v4_relation_members", member_lookup)
+        monkeypatch.setattr(serving, "lookup_v4_relation_intersections", member_lookup)
         return member_lookup
     intersection = AsyncMock(return_value={3: (7,), 4: (8,)})
     monkeypatch.setattr(serving, "lookup_v4_relation_intersections", intersection)
@@ -350,6 +351,7 @@ async def test_v4_exact_npi_search_attaches_intersected_billing_associations(
     if representation == "pattern_v1":
         assert [call.kwargs["relation"] for call in graph_lookup.await_args_list] == ["group_patterns", "pattern_sets"]
         assert graph_lookup.await_args_list[0].kwargs["owner_keys"] == (7, 8, 9)
+        assert graph_lookup.await_args_list[1].kwargs["allowed_member_keys"] == (3, 4)
     else:
         graph_lookup.assert_awaited_once()
         assert graph_lookup.await_args.kwargs["relation"] == "set_groups_direct"

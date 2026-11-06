@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import struct
 from contextlib import contextmanager
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,7 +13,8 @@ import pytest
 from api import ptg2_serving as serving
 from api import ptg2_v4_graph as graph
 from api.ptg2_v4_graph import V4GraphRoot
-from tests.ptg2_v4_provider_prefix_support import sealed_v4_hot_prefix
+from tests.ptg2_v4_provider_prefix_support import Coordinate, sealed_v4_hot_prefix
+from tests.test_ptg2_v4_graph import _RegularIntersectionFixture
 
 
 def _tables() -> serving.PTG2ServingTables:
@@ -86,23 +89,21 @@ async def test_exact_billing_groups_read_only_exact_group_incidence(
             return {7: (10,), 8: (20,), 9: (10,)}
         assert kwargs["relation"] == "pattern_sets"
         assert kwargs["owner_keys"] == (10, 20)
-        return {10: (3, 4, 5), 20: (4,)}
+        assert kwargs["allowed_member_keys"] == (3, 4)
+        return {10: (3, 4), 20: (4,)}
 
     member_lookup = AsyncMock(side_effect=lookup)
+    intersection = AsyncMock(side_effect=lookup)
     monkeypatch.setattr(serving, "lookup_v4_relation_members", member_lookup)
-    monkeypatch.setattr(
-        serving,
-        "lookup_v4_relation_intersections",
-        AsyncMock(side_effect=AssertionError("must not expand unrelated pattern groups")),
-    )
+    monkeypatch.setattr(serving, "lookup_v4_relation_intersections", intersection)
 
     assert await serving._v4_exact_groups_by_set(
         object(), _tables(), provider_set_keys=(4, 3), exact_group_keys=(9, 7, 8)
     ) == {3: (7, 9), 4: (7, 8, 9)}
-    assert [call.kwargs["max_members"] for call in member_lookup.await_args_list] == [
-        2048,
-        8192,
-    ]
+    member_lookup.assert_awaited_once()
+    intersection.assert_awaited_once()
+    assert member_lookup.await_args.kwargs["max_members"] == 2048
+    assert intersection.await_args.kwargs["max_members"] == 8192
 
 
 @pytest.mark.asyncio
@@ -128,7 +129,12 @@ async def test_exact_billing_groups_reject_incomplete_pattern_incidence(
     monkeypatch.setattr(
         serving,
         "lookup_v4_relation_members",
-        AsyncMock(side_effect=[patterns_by_group, sets_by_pattern]),
+        AsyncMock(return_value=patterns_by_group),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        AsyncMock(return_value=sets_by_pattern),
     )
 
     with pytest.raises(serving.PTG2ManifestArtifactError, match="incomplete"):
@@ -149,12 +155,12 @@ async def test_shared_pattern_fanout_cannot_exceed_association_edge_cap(
     monkeypatch.setattr(
         serving,
         "lookup_v4_relation_members",
-        AsyncMock(
-            side_effect=[
-                {key: (30,) for key in exact_group_keys},
-                {30: provider_set_keys},
-            ]
-        ),
+        AsyncMock(return_value={key: (30,) for key in exact_group_keys}),
+    )
+    monkeypatch.setattr(
+        serving,
+        "lookup_v4_relation_intersections",
+        AsyncMock(return_value={30: provider_set_keys}),
     )
 
     with pytest.raises(serving.PTG2ManifestArtifactError, match="edge limit"):
@@ -164,6 +170,129 @@ async def test_shared_pattern_fanout_cannot_exceed_association_edge_cap(
             provider_set_keys=provider_set_keys,
             exact_group_keys=exact_group_keys,
         )
+
+
+class _LargePatternFixture(_RegularIntersectionFixture):
+    """Reuse the graph transport fixture with a real paged pattern vector."""
+
+    def __init__(self) -> None:
+        self.members = tuple(range(8193))
+        self.locator_count = len(self.members)
+        self.member_page_reads: list[int] = []
+        self.raw_work: list[tuple[int, int, int]] = []
+
+    async def root(self, *_args, **_kwargs):
+        return V4GraphRoot(17, "pattern_v1", b"r" * 32)
+
+    async def manifest(self, *_args, **_kwargs):
+        return graph.V4RelationManifest(
+            snapshot_key=17,
+            relation="pattern_sets",
+            member_object_kind="v4_pattern_sets_members_v1",
+            locator_object_kind="v4_pattern_sets_locators_v1",
+            owner_base=0,
+            owner_count=3,
+            logical_member_count=len(self.members),
+            vector_member_count=len(self.members),
+            member_width=4,
+            member_page_bytes=4096,
+            locator_page_bytes=36,
+            locator_owner_span=3,
+        )
+
+    async def coordinates(self, *_args, **kwargs):
+        if kwargs["object_kind"].endswith("locators_v1"):
+            return {0: Coordinate(0, b"l" * 32, 3)}
+        return {
+            key: Coordinate(key, key.to_bytes(32, "little"), min(1024, len(self.members) - key))
+            for key in kwargs["block_keys"]
+        }
+
+    async def blocks(self, *_args, **kwargs):
+        kind = kwargs["object_kind"]
+        if kind.endswith("locators_v1"):
+            payload = struct.pack("<QI", 0, 0) * 2 + struct.pack("<QI", 0, self.locator_count)
+            return {b"l" * 32: graph._CachedPhysicalBlock(b"l" * 32, kind, 3, payload)}
+        work = graph._ACTIVE_V4_HOT_SOURCE_WORK.get()
+        self.raw_work.append((work.members, work.pages, work.bytes))
+        blocks_by_hash = {}
+        for coordinate in kwargs["coordinates"]:
+            self.member_page_reads.append(coordinate.block_key)
+            members = self.members[coordinate.block_key : coordinate.block_key + coordinate.entry_count]
+            payload = struct.pack(f"<{len(members)}I", *members)
+            blocks_by_hash[coordinate.block_hash] = graph._CachedPhysicalBlock(
+                coordinate.block_hash, kind, coordinate.entry_count, payload
+            )
+        return blocks_by_hash
+
+    def install(self, monkeypatch) -> None:
+        super().install(monkeypatch)
+        monkeypatch.setattr(serving, "load_v4_graph_root", self.root)
+
+        async def groups(*_args, **kwargs):
+            assert kwargs["relation"] == "group_patterns"
+            return {key: (2,) for key in kwargs["owner_keys"]}
+
+        monkeypatch.setattr(serving, "lookup_v4_relation_members", groups)
+
+
+@pytest.mark.asyncio
+async def test_billing_pattern_retains_selected_sets(monkeypatch) -> None:
+    fixture = _LargePatternFixture()
+    fixture.install(monkeypatch)
+    assert await serving._v4_exact_groups_by_set(
+        object(), _tables(), provider_set_keys=(8192,), exact_group_keys=(8, 7)
+    ) == {8192: (7, 8)}
+    assert sorted(fixture.member_page_reads) == list(range(0, 8193, 1024))
+    assert fixture.raw_work == [(8193, 10, 36900)]
+
+
+@pytest.mark.asyncio
+async def test_billing_pattern_refuses_edge_overflow(monkeypatch) -> None:
+    fixture = _LargePatternFixture()
+    fixture.install(monkeypatch)
+    with pytest.raises(serving.PTG2ManifestArtifactError, match="edge limit"):
+        await serving._v4_exact_groups_by_set(
+            object(), _tables(), provider_set_keys=range(2048), exact_group_keys=range(5)
+        )
+    assert fixture.member_page_reads
+
+
+@pytest.mark.asyncio
+async def test_billing_pattern_authenticates_unselected_members(monkeypatch) -> None:
+    fixture = _LargePatternFixture()
+    fixture.members = (*fixture.members[:1024], 1023, *fixture.members[1025:])
+    fixture.install(monkeypatch)
+    with pytest.raises(graph.PTG2SharedBlockError, match="unique and ordered"):
+        await serving._v4_exact_groups_by_set(object(), _tables(), provider_set_keys=(8192,), exact_group_keys=(7,))
+    assert len(fixture.member_page_reads) == 9
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dimension", "maximum"),
+    [("members", 8192), ("pages", 9), ("bytes", 36899)],
+)
+async def test_billing_pattern_preserves_work_limits(monkeypatch, dimension, maximum) -> None:
+    fixture = _LargePatternFixture()
+    fixture.install(monkeypatch)
+    tables = replace(
+        _tables(),
+        provider_graph_v4_hot_prefix=sealed_v4_hot_prefix(**{f"max_online_source_{dimension}_per_set": maximum}),
+    )
+    with pytest.raises(graph.PTG2SharedBlockError, match="sealed limit"):
+        await serving._v4_exact_groups_by_set(object(), tables, provider_set_keys=(8192,), exact_group_keys=(7,))
+    assert not fixture.member_page_reads
+
+
+@pytest.mark.asyncio
+async def test_billing_pattern_refuses_invalid_locator(monkeypatch) -> None:
+    fixture = _LargePatternFixture()
+    fixture.locator_count += 1
+    fixture.install(monkeypatch)
+    with pytest.raises(graph.PTG2SharedBlockError, match="locator range exceeds"):
+        await serving._v4_exact_groups_by_set(object(), _tables(), provider_set_keys=(8192,), exact_group_keys=(7,))
+    assert not fixture.member_page_reads
 
 
 @pytest.mark.parametrize("relation", ["group_patterns", "pattern_sets"])
