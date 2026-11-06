@@ -106,7 +106,7 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
 
 def _assert_current_registry_head(script):
     """Keep the complete catalog refresh and inventory revision chain explicit."""
-    assert script.get_heads() == ["20261102040000_custom_import_post_seal_audit"]
+    assert script.get_heads() == ["20261104010000_custom_import_unlogged_landing"]
     assert (
         script.get_revision("20261029010000_registry_source_inventory").down_revision
         == "20261028020000_registry_membership_refresh"
