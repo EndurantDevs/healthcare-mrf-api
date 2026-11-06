@@ -202,6 +202,7 @@ async def test_compact_final_proof_keeps_carry_scope_through_last_proof_and_retu
     from process import network_compact_readiness as readiness
     from process import network_compact_validation as compact
     from process import network_membership_publication as publication
+    from process import network_sampled_custody as sampled
 
     events, proof, entries = [], SimpleNamespace(receipt={"carried_rows": 0}), object()
 
@@ -216,6 +217,8 @@ async def test_compact_final_proof_keeps_carry_scope_through_last_proof_and_retu
 
     def recorder(event):
         async def record(*arguments, **options):
+            if event == "sampling":
+                assert arguments[1] is proof
             if event == "current":
                 assert options["preservation"] is proof and options["inventory_entries"] is entries
             events.append(event)
@@ -232,6 +235,7 @@ async def test_compact_final_proof_keeps_carry_scope_through_last_proof_and_retu
         }
     }
     monkeypatch.setattr(final, "_preservation_scope", scope)
+    monkeypatch.setattr(sampled, "inherit_preserved_sampling", recorder("sampling"))
     monkeypatch.setattr(final, "verify_registry_source_retention_rows", recorder("retention"))
     monkeypatch.setattr(publication, "_publication_readiness", lambda _candidate: (None, None, None, {}))
     monkeypatch.setattr(publication, "_verify_provider_custody", recorder("provider"))
@@ -239,7 +243,7 @@ async def test_compact_final_proof_keeps_carry_scope_through_last_proof_and_retu
     monkeypatch.setattr(readiness, "is_compact_candidate", lambda _candidate: True)
     monkeypatch.setattr(compact, "verify_compact_final_proof", recorder("compact"))
     await final._final_proof(object(), _target(), candidate_by_field, "controls", inventory_entries=entries)
-    assert events == ["enter", "retention", "current", "compact", "provider", "cleanup"]
+    assert events == ["enter", "sampling", "retention", "current", "compact", "provider", "cleanup"]
 
 
 @pytest.mark.parametrize("carried", [0, 3])
