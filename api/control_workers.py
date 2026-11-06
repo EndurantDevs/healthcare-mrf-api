@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Any
 
 from api import (
+    cigna_collection_worker,
     npi_source_worker,
+    plan_pricing_worker_policy,
     provider_directory_cms_registry_stop,
     provider_directory_source_publication,
     provider_directory_source_worker,
@@ -60,6 +62,7 @@ class _AdmittedWorkerRequest(dict[str, Any]):
     """Carry an observed queue identity outside the serialized launch request."""
 
     admitted_job: tuple[str, str, str, str, str] | None = None
+    cigna_collection_job: object | None = None
     cms_registry_launch: object | None = None
     reference_source_launch: object | None = None
     aca_source_launch: object | None = None
@@ -348,6 +351,7 @@ async def _admit_source_worker_launches(worker_payload, admitted_run):
             worker_payload.aca_source_launch = registry_aca_source_worker.admit_aca_source_worker_launch(admitted_run)
         except ValueError, RuntimeError:
             return _failed_worker_admission(worker_payload, "ACA source worker admission is unavailable")
+        return cigna_collection_worker.admit_collection_worker(admitted_run, worker_payload)
     return None
 
 
@@ -819,6 +823,11 @@ def _configured_worker_job_image(spec: WorkerSpec, launch_request: dict[str, Any
         if provider_directory_source_worker._IMAGE.fullmatch(image) is None:
             raise ValueError("fhir_profile_worker_image_unavailable")
         return image
+    collection_image = cigna_collection_worker.configured_collection_worker_image(spec, launch_request)
+    if collection_image is not None:
+        return collection_image
+    if release_image := plan_pricing_worker_policy.configured_release_worker_image(spec, launch_request):
+        return release_image
     if (spec.worker_class, spec.importers) == ("process.RegistryFHIRCatalogSync", ("registry-fhir-catalog-sync",)):
         return os.getenv("HLTHPRT_REGISTRY_FHIR_CATALOG_WORKER_IMAGE", "").strip() or generic_image
     if spec.importers == ("mrf-source-discovery",):
@@ -1035,6 +1044,15 @@ def _kubernetes_worker_base(spec: WorkerSpec) -> dict[str, Any]:
     }
 
 
+def _is_scoped_job_set_matching(spec, request, jobs):
+    """Recheck each scoped image and its native target before Job reuse."""
+    return (
+        provider_directory_source_worker.is_fhir_job_set_matching(spec, request, jobs)
+        and cigna_collection_worker.collection_job_set_matches(spec, request, jobs)
+        and plan_pricing_worker_policy.release_worker_job_set_matches(spec, request, jobs)
+    )
+
+
 def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> dict[str, Any]:
     """Summarize Kubernetes jobs matching a worker spec and optional run."""
     state_base_dict = _kubernetes_worker_base(spec)
@@ -1080,7 +1098,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
         not registry_aca_source_worker.is_aca_source_job_matching(job, aca_launch) for job in jobs
     ):
         return {**state_base_dict, "job_status": "purpose_mismatch"}
-    if not provider_directory_source_worker.is_fhir_job_set_matching(spec, launch_request, jobs):
+    if not _is_scoped_job_set_matching(spec, launch_request, jobs):
         return {**state_base_dict, "job_status": "purpose_mismatch"}
     npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
     if npi_launch is not None and any(
@@ -1874,7 +1892,8 @@ def _admitted_source_job_target(spec, payload):
     fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, payload)
     if fhir_launch is not None:
         return fhir_launch.job_id
-    return None
+    collection_job = cigna_collection_worker.authorized_collection_worker_job(spec, payload)
+    return collection_job.identity[4] if collection_job is not None else None
 
 
 def _single_job_worker_target(

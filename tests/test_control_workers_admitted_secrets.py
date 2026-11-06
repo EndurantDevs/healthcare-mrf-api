@@ -6,12 +6,14 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from api import control_workers as workers
+from api import plan_pricing_worker_policy as pricing_workers
 
 
 @pytest.mark.parametrize("role", ["start", "finish"])
@@ -360,3 +362,194 @@ async def test_shared_audit_worker_keeps_native_pricing_authorization(monkeypatc
     )
     admission.assert_awaited_once()
     launch.assert_not_called()
+
+
+_PRICING_READERS = (
+    "plan-pricing-prewarm",
+    "plan-pricing-code-projection",
+    "plan-pricing-em-distance",
+    "plan-pricing-em-attribution",
+)
+_GENERIC_IMAGE = "registry.example/ordinary@sha256:" + "a" * 64
+_RELEASE_IMAGE = "registry.example/pricing@sha256:" + "b" * 64
+
+
+def _release_image_request(monkeypatch, importer="plan-pricing-prewarm"):
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", _GENERIC_IMAGE)
+    monkeypatch.setenv(pricing_workers.RELEASE_IMAGE_ENV, _RELEASE_IMAGE)
+    request, recorded = _coordinates(importer)
+    return workers._BY_IMPORTER_ROLE[(importer, "start")], _admitted(request, recorded)
+
+
+@pytest.mark.parametrize("importer", _PRICING_READERS)
+def test_release_readers_select_only_the_deployment_image_and_recorded_target(monkeypatch, importer):
+    spec, request = _release_image_request(monkeypatch, importer)
+    assert workers._configured_worker_job_image(spec, request) == _RELEASE_IMAGE
+    manifest = workers._worker_job_manifest(spec, request, _RELEASE_IMAGE)
+    container = manifest["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"] == _RELEASE_IMAGE
+    assert container["command"] == workers._worker_command(workers._worker_python(), spec)
+    target = next(item for item in container["env"] if item["name"] == "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID")
+    assert target["value"] == request.admitted_job[4]
+    assert pricing_workers.RELEASE_IMAGE_ENV not in {item["name"] for item in container["env"]}
+
+
+@pytest.mark.parametrize("configured", [None, "", "  "])
+def test_unconfigured_release_image_preserves_legacy_selection_and_job_matching(monkeypatch, configured):
+    spec, request = _release_image_request(monkeypatch)
+    if configured is None:
+        monkeypatch.delenv(pricing_workers.RELEASE_IMAGE_ENV)
+    else:
+        monkeypatch.setenv(pricing_workers.RELEASE_IMAGE_ENV, configured)
+    assert workers._configured_worker_job_image(spec, request) == _GENERIC_IMAGE
+    assert pricing_workers.release_worker_job_set_matches(spec, request, [{"legacy": "shape"}])
+
+
+@pytest.mark.parametrize("image", ["registry.example/pricing:latest", "registry.example/pricing@sha256:bad"])
+def test_release_image_refuses_mutable_or_malformed_references(monkeypatch, image):
+    spec, request = _release_image_request(monkeypatch)
+    monkeypatch.setenv(pricing_workers.RELEASE_IMAGE_ENV, image)
+    with pytest.raises(ValueError, match="worker_image_unavailable"):
+        workers._configured_worker_job_image(spec, request)
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+def test_serialized_admission_cannot_select_release_image(monkeypatch, serialized):
+    spec, admitted = _release_image_request(monkeypatch)
+    request_by_field = dict(admitted)
+    if serialized:
+        request_by_field["admitted_job"] = list(admitted.admitted_job)
+    assert workers._configured_worker_job_image(spec, request_by_field) == _GENERIC_IMAGE
+
+
+@pytest.mark.parametrize("coordinate", range(5))
+def test_changed_recorded_coordinate_cannot_select_release_image(monkeypatch, coordinate):
+    spec, request = _release_image_request(monkeypatch)
+    coordinates = list(request.admitted_job)
+    coordinates[coordinate] = "foreign"
+    request.admitted_job = tuple(coordinates)
+    with pytest.raises(ValueError, match="worker_image"):
+        workers._configured_worker_job_image(spec, request)
+
+
+@pytest.mark.parametrize("field", ["run_id", "importer", "queue", "job_id", "worker_class", "role", "image"])
+def test_caller_cannot_replace_release_worker_identity_or_image(monkeypatch, field):
+    spec, request = _release_image_request(monkeypatch)
+    request[field] = "foreign"
+    with pytest.raises(ValueError, match="worker_image"):
+        workers._configured_worker_job_image(spec, request)
+
+
+@pytest.mark.parametrize("importer", [None, ""])
+def test_release_image_refuses_missing_importer_before_building_a_different_job_target(monkeypatch, importer):
+    spec, request = _release_image_request(monkeypatch)
+    request["importer"] = importer
+    with pytest.raises(ValueError, match="worker_image_request_changed"):
+        workers._configured_worker_job_image(spec, request)
+
+
+@pytest.mark.parametrize("change", [{"role": "finish"}, {"queue": "arq:PTG"}, {"worker_class": "process.PTG"}])
+def test_release_image_requires_the_exact_start_worker(monkeypatch, change):
+    spec, request = _release_image_request(monkeypatch)
+    with pytest.raises(ValueError, match="worker_image_selection_changed"):
+        workers._configured_worker_job_image(replace(spec, **change), request)
+
+
+@pytest.mark.parametrize(
+    "importer",
+    [
+        "plan-pricing-projection",
+        "ptg-provider-membership-projection",
+        "ptg-candidate-audit",
+        "registry-publication-worker",
+    ],
+)
+def test_other_audit_importers_keep_the_generic_image(monkeypatch, importer):
+    spec, request = _release_image_request(monkeypatch, importer)
+    assert workers._configured_worker_job_image(spec, request) == _GENERIC_IMAGE
+
+
+def test_genuine_calibration_retains_its_image_and_existing_deadline(monkeypatch):
+    from tests.test_plan_pricing_code_calibration import _params
+
+    spec, _request = _release_image_request(monkeypatch, "plan-pricing-code-projection")
+    request, recorded = _coordinates("plan-pricing-code-projection")
+    recorded["params"] = _params()
+    admitted = _admitted(request, recorded)
+    assert workers._is_code_calibration_job(spec, admitted)
+    assert workers._configured_worker_job_image(spec, admitted) == _GENERIC_IMAGE
+    environment, _run_id = workers._worker_job_environment(spec, admitted)
+    assert {"name": "HLTHPRT_PTG_CANDIDATE_AUDIT_JOB_TIMEOUT", "value": "385"} in environment
+    forged = _admitted(request | {"code_calibration_job": admitted.admitted_job}, dict(recorded, params={}))
+    assert workers._configured_worker_job_image(spec, forged) == _RELEASE_IMAGE
+
+
+def _changed_release_job(job, damage):
+    pod = job["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    if damage == "image":
+        container["image"] = _GENERIC_IMAGE
+    if damage == "command":
+        container["command"] = ["python", "foreign.py"]
+    if damage == "target":
+        next(item for item in container["env"] if item["name"] == "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID")["value"] = (
+            "foreign"
+        )
+    if damage == "duplicate-target":
+        container["env"].append(dict(container["env"][-1]))
+    if damage == "sidecar":
+        pod["containers"].append(deepcopy(container))
+    if damage == "policy-volume":
+        pod["volumes"] = [{"name": "foreign-policy", "configMap": {"name": "foreign"}}]
+    if damage == "environment":
+        container["env"].append({"name": "FOREIGN_POLICY", "value": "true"})
+
+
+@pytest.mark.parametrize(
+    "damage", [None, "image", "command", "target", "duplicate-target", "sidecar", "policy-volume", "environment"]
+)
+@pytest.mark.parametrize("terminal", [False, True])
+def test_existing_release_job_matches_complete_execution_before_reuse_or_deletion(monkeypatch, damage, terminal):
+    spec, request = _release_image_request(monkeypatch)
+    job = workers._worker_job_manifest(spec, request, _RELEASE_IMAGE)
+    _changed_release_job(job, damage)
+    job["status"] = {"succeeded": 1} if terminal else {"active": 1}
+    methods = []
+
+    def query(method, _path, _body=None):
+        methods.append(method)
+        assert method == "GET"
+        return {"items": [job]}
+
+    monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(workers, "_kubernetes_namespace", lambda: "synthetic-workers")
+    monkeypatch.setattr(workers, "_kubernetes_request", query)
+    state = workers._kubernetes_worker_state(spec, request)
+    assert state["job_status"] == ("purpose_mismatch" if damage else "succeeded" if terminal else "active")
+    if damage:
+        monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+        result = workers._ensure_spec(spec, request)
+        assert result["status"] == "failed" and result["job_status"] == "purpose_mismatch"
+    assert methods and set(methods) == {"GET"}
+
+
+def test_release_job_post_conflict_rechecks_full_execution(monkeypatch):
+    spec, request = _release_image_request(monkeypatch)
+    old = workers._worker_job_manifest(spec, request, _GENERIC_IMAGE)
+    old["status"] = {"active": 1}
+    methods = []
+
+    def conflict(method, _path, _body=None):
+        methods.append(method)
+        if method == "POST":
+            raise workers._KubernetesApiError(409, "existing")
+        assert method == "GET"
+        return {"items": [old]}
+
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(workers, "_kubernetes_namespace", lambda: "synthetic-workers")
+    monkeypatch.setattr(workers, "_kubernetes_request", conflict)
+    result = workers._ensure_kubernetes_job(spec, request, {})
+    assert result["status"] == "failed" and result["job_status"] == "purpose_mismatch"
+    assert methods == ["POST", "GET"]

@@ -470,11 +470,12 @@ async def transpose_exact_pattern_groups(
     ):
         raise ptg2_serving.PTG2ManifestArtifactError("PTG2 V4 exact billing-association projection is incomplete")
     pattern_keys = tuple(sorted({keys[0] for keys in patterns_by_group.values()}))
-    sets_by_pattern = await ptg2_serving.lookup_v4_relation_members(
+    sets_by_pattern = await ptg2_serving.lookup_v4_relation_intersections(
         session,
         snapshot_key=snapshot_key,
         relation="pattern_sets",
         owner_keys=pattern_keys,
+        allowed_member_keys=provider_set_keys,
         schema_name=schema_name,
         max_members=ptg2_serving._PTG2_EXACT_BILLING_MAX_ASSOCIATION_EDGES,
     )

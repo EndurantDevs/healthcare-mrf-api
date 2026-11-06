@@ -205,6 +205,7 @@ async def load_source_binding_rows(session, schema, admission, *, include_pricin
     """Return a complete independently committed cohort, or refuse it as a whole."""
     from api.plan_release_pricing_projection import source_plan_release_serving_sql
     from api.plan_release_source_binding_custody import require_source_binding_custody
+    from api.plan_release_supporting_metadata import require_session_supporting_metadata
 
     await require_source_binding_custody(session, schema, admission)
     result = await session.execute(
@@ -214,6 +215,7 @@ async def load_source_binding_rows(session, schema, admission, *, include_pricin
     rows = [dict(getattr(row, "_mapping", row)) for row in result]
     if len(rows) != admission.expected_binding_count:
         raise ValueError("plan_release_source_binding_incomplete")
+    await require_session_supporting_metadata(session, schema, required_registry_schema(), admission)
     return rows
 
 

@@ -191,13 +191,13 @@ def _alembic_head_environment(dsn: str, schema: str) -> dict[str, str]:
     return environment
 
 
-async def _upgrade_disposable_schema_to_head(dsn: str, schema: str) -> None:
-    """Apply the CI-supported migration baseline through repository head."""
+async def _upgrade_disposable_schema_to_head(dsn: str, schema: str, *, target_revision: str = "head") -> None:
+    """Apply the CI-supported migration baseline through the requested revision."""
 
     environment = _alembic_head_environment(dsn, schema)
     for alembic_arguments in (
         ("stamp", _ALEMBIC_ADOPTION_BASE_REVISION),
-        ("upgrade", "head"),
+        ("upgrade", target_revision),
     ):
         process = await asyncio.create_subprocess_exec(
             sys.executable,

@@ -88,3 +88,38 @@ The configured bundle and COPY byte limits remain unchanged.
 Sealed legacy bundles retain their original contract. A digest-only bundle does
 not supply missing canonical preimages or authorize a witness upgrade; replay
 must authenticate the original retained captures and their encoding first.
+
+## Release-reading pricing worker image
+
+Set the optional `HLTHPRT_PLAN_RELEASE_WORKER_IMAGE` to an immutable
+`repository@sha256:digest` reference for admitted prewarm, code-projection,
+E&M distance and E&M attribution jobs. Selection requires the persisted run,
+canonical queue/function/job target and matching worker selection. A caller
+cannot supply its own image. Existing Jobs must match the complete expected
+execution manifest before reuse.
+
+Unset or blank configuration preserves the generic image. Initial pricing
+projection, provider-membership projection, code calibration and unrelated
+importers keep their existing image selection. This changes no credentials,
+native admission, pricing policy, command or target.
+
+## Collection worker image
+
+Set the optional `HLTHPRT_CIGNA_COLLECTION_WORKER_IMAGE` to an immutable
+`repository@sha256:digest` reference for admitted Cigna collection PTG jobs.
+Selection requires the persisted validated collection proof, source-attempt
+identity and exact recorded queue/function/job target. Request fields cannot
+provide this capability or override the image. A conflicting caller job,
+source, proof or image refuses the scoped launch.
+
+The five existing PTG size workers retain their queues, commands and single-job
+targets. Acquisition and internal finalization run in the same PTG image; this
+setting does not select candidate-audit or pricing jobs. An unset or blank value
+keeps the generic image fallback. Invalid configured pins refuse collection
+launches. With the scoped image configured, an existing Job must match its
+expected runtime, source and canonical target before reuse. Other importers and
+authorized source-worker image priorities remain unchanged. The process launcher and API image/default are unaffected.
+
+This is image selection for an already admitted run. It does not authorize
+additional imports, change database permissions, attest audit/pricing children,
+or establish that no older untargeted consumer exists on a shared queue.
