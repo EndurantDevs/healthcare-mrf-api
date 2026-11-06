@@ -3,7 +3,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -213,7 +213,7 @@ async def _renew_active_lease(connection, config, request_record):
 
 
 async def _publication_address_sources(connection, expected_head, config, initial_address_sources):
-    """Resolve the retained base and reject any replacement that changes its authority."""
+    """Resolve retained inputs or an explicitly selected indexed equivalent."""
     source_pin = None
     if expected_head:
         async with connection.transaction(isolation="repeatable_read", readonly=True):
@@ -230,6 +230,16 @@ async def _publication_address_sources(connection, expected_head, config, initia
         address_sources = await _source_rollback_address_sources(
             connection, source_pin, config.control_schema, **({"compact_upgrade": True} if compact_upgrade else {})
         )
+        if (
+            initial_address_sources is not None
+            and initial_address_sources.compact
+            and address_sources.compact
+            and source_pin.compact_layout is not None
+        ):
+            from process.network_indexed_address_artifact import is_indexed_address_source
+
+            if is_indexed_address_source(initial_address_sources.base_source):
+                address_sources = replace(address_sources, base_source=initial_address_sources.base_source)
         if initial_address_sources is not None and (
             initial_address_sources.replacement_source_recipes or initial_address_sources.source_recipe_additions
         ):
@@ -364,58 +374,59 @@ async def _execute_publication_request(
     request_record,
     authorize,
     initial_address_sources,
+    cleanup,
     plan_metadata_client=None,
     authorize_commit=None,
 ):
-    async with execution_pool.acquire() as connection:
-        try:
-            await _verify_execution(connection, config)
-        except ValueError:
-            raise RuntimeError("registry_publication_consumer_unavailable") from None
-        command_by_name = _document(request_record["command_json"])
-        operation = command_by_name.get("operation")
-        if operation == "refresh_memberships":
-            if config.membership_refresh_runtime is None or not callable(authorize_commit):
-                raise ValueError("registry_membership_refresh_runtime_unavailable")
-            return await complete_queued_membership_refresh(
-                connection,
-                request_record,
-                runtime=config.membership_refresh_runtime,
-                writer_context=config,
-                authorize=authorize,
-                authorize_commit=authorize_commit,
-            )
-        if operation == "publish_fhir_catalog":
-            return await _execute_catalog_request(connection, config, request_record)
-        if operation in (None, "publish_source_binding_batch", "approve_source_binding_batch"):
-            return await _execute_approval_request(
-                connection, request_record, authorize, config, initial_address_sources, plan_metadata_client
-            )
-        options_by_name = dict(authorize=authorize, control_schema=config.control_schema)
-        if operation == "publish_initial_inventory":
-            return await complete_queued_registry_initial_inventory(
-                connection,
-                request_record["request_id"],
-                request_record["lease_id"],
-                authorize=authorize,
-                writer_context=config,
-                initial_address_sources=initial_address_sources,
-            )
-        if operation == "reactivate_generation":
-            complete = complete_queued_registry_reactivation
-        elif operation == "prepare_source_rollback":
-            complete = complete_queued_registry_source_rollback_preview
-            options_by_name["writer_roles"] = config.writer_roles
-            options_by_name["composition_runtime"] = config.composition_runtime
-            options_by_name["seal_candidate"] = config.seal_candidate
-            if config.prepare_address_sources is not None:
-                options_by_name["prepare_address_sources"] = config.prepare_address_sources
-        elif operation == "publish_source_rollback":
-            complete = complete_queued_registry_source_rollback_publication
-            options_by_name["writer_roles"] = config.writer_roles
-        else:
-            raise ValueError("registry_publication_operation_invalid")
-        return await complete(connection, request_record["request_id"], request_record["lease_id"], **options_by_name)
+    connection = await cleanup.enter_async_context(execution_pool.acquire())
+    try:
+        await _verify_execution(connection, config)
+    except ValueError:
+        raise RuntimeError("registry_publication_consumer_unavailable") from None
+    command_by_name = _document(request_record["command_json"])
+    operation = command_by_name.get("operation")
+    if operation == "refresh_memberships":
+        if config.membership_refresh_runtime is None or not callable(authorize_commit):
+            raise ValueError("registry_membership_refresh_runtime_unavailable")
+        return await complete_queued_membership_refresh(
+            connection,
+            request_record,
+            runtime=config.membership_refresh_runtime,
+            writer_context=config,
+            authorize=authorize,
+            authorize_commit=authorize_commit,
+        )
+    if operation == "publish_fhir_catalog":
+        return await _execute_catalog_request(connection, config, request_record)
+    if operation in (None, "publish_source_binding_batch", "approve_source_binding_batch"):
+        return await _execute_approval_request(
+            connection, request_record, authorize, config, initial_address_sources, plan_metadata_client
+        )
+    options_by_name = dict(authorize=authorize, control_schema=config.control_schema)
+    if operation == "publish_initial_inventory":
+        return await complete_queued_registry_initial_inventory(
+            connection,
+            request_record["request_id"],
+            request_record["lease_id"],
+            authorize=authorize,
+            writer_context=config,
+            initial_address_sources=initial_address_sources,
+        )
+    if operation == "reactivate_generation":
+        complete = complete_queued_registry_reactivation
+    elif operation == "prepare_source_rollback":
+        complete = complete_queued_registry_source_rollback_preview
+        options_by_name["writer_roles"] = config.writer_roles
+        options_by_name["composition_runtime"] = config.composition_runtime
+        options_by_name["seal_candidate"] = config.seal_candidate
+        if config.prepare_address_sources is not None:
+            options_by_name["prepare_address_sources"] = config.prepare_address_sources
+    elif operation == "publish_source_rollback":
+        complete = complete_queued_registry_source_rollback_publication
+        options_by_name["writer_roles"] = config.writer_roles
+    else:
+        raise ValueError("registry_publication_operation_invalid")
+    return await complete(connection, request_record["request_id"], request_record["lease_id"], **options_by_name)
 
 
 async def _execute_approval_request(connection, request_record, authorize, config, initial_sources, metadata_client):
@@ -464,32 +475,35 @@ async def _run_with_heartbeat(
             config.membership_refresh_runtime.authorize.authorize_commit, stopped, request_by_name
         )
 
-    work = asyncio.create_task(
-        _execute_publication_request(
-            execution_pool,
-            config,
-            request_record,
-            fresh_authorize,
-            initial_address_sources,
-            plan_metadata_client,
-            fresh_commit_authorize,
+    # Release the execution connection only after lease maintenance has stopped.
+    async with AsyncExitStack() as cleanup:
+        work = asyncio.create_task(
+            _execute_publication_request(
+                execution_pool,
+                config,
+                request_record,
+                fresh_authorize,
+                initial_address_sources,
+                cleanup,
+                plan_metadata_client,
+                fresh_commit_authorize,
+            )
         )
-    )
-    heartbeat = asyncio.create_task(_heartbeat(lifecycle_pool, config, request_record))
-    try:
-        done, _ = await asyncio.wait((work, heartbeat), return_when=asyncio.FIRST_COMPLETED)
-        if work in done:
-            return await work
-        stopped.set()
-        work.cancel()
-        with suppress(asyncio.CancelledError):
-            await work
-        return await heartbeat
-    finally:
-        stopped.set()
-        for task in (work, heartbeat):
-            task.cancel()
-        await asyncio.gather(work, heartbeat, return_exceptions=True)
+        heartbeat = asyncio.create_task(_heartbeat(lifecycle_pool, config, request_record))
+        try:
+            done, _ = await asyncio.wait((work, heartbeat), return_when=asyncio.FIRST_COMPLETED)
+            if work in done:
+                return await work
+            stopped.set()
+            work.cancel()
+            with suppress(asyncio.CancelledError):
+                await work
+            return await heartbeat
+        finally:
+            stopped.set()
+            for task in (work, heartbeat):
+                task.cancel()
+            await asyncio.gather(work, heartbeat, return_exceptions=True)
 
 
 async def _reject(lifecycle_pool, config, request_record):

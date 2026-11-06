@@ -8,9 +8,11 @@ import pytest
 
 from process import network_bootstrap_sources as bootstrap
 from process import network_compact_custom_preparation as custom
-from process.registry_publication_queue import publication_json
+from process.network_address_projection import PinnedAddressSource
 from process.registry_publication_execution import _compact_address_sources
+from process.registry_publication_queue import publication_json
 from tests.test_network_bootstrap_address_artifact import _descriptor, _receipt
+from tests.test_network_indexed_address_artifact import _descriptor as indexed_descriptor
 
 
 @pytest.mark.parametrize("with_custom", [False, True])
@@ -57,3 +59,41 @@ def test_other_compact_address_contract_keeps_existing_npi_behavior(monkeypatch,
     )
     candidate_by_name = {"validation_json": {"serving_readiness": {"address_artifact": {"contract": "other"}}}}
     assert _compact_address_sources(candidate_by_name, receipt.address_source).npi_source == npi
+
+
+@pytest.mark.parametrize("custom_state", ["absent", "empty", "npi"])
+def test_compact_indexed_source_recovers_original_npi_without_reverting_base(monkeypatch, custom_state):
+    descriptor = indexed_descriptor()
+    address = PinnedAddressSource(
+        descriptor["namespace"]["name"], "entity_address_unified", descriptor["generation_id"]
+    )
+    npi = _receipt().npi_source
+    monkeypatch.setattr(
+        custom,
+        "compact_custom_receipt",
+        lambda _: (
+            None if custom_state == "absent" else SimpleNamespace(npi_source=npi if custom_state == "npi" else None)
+        ),
+    )
+    candidate_by_name = {"validation_json": {"serving_readiness": {"address_artifact": descriptor}}}
+    sources = _compact_address_sources(candidate_by_name, address)
+    assert sources.base_source == address and sources.npi_source == npi and sources.compact
+
+
+@pytest.mark.parametrize("changed", ["address", "namespace", "npi"])
+def test_compact_indexed_source_refuses_another_address_or_npi_pin(monkeypatch, changed):
+    descriptor = indexed_descriptor()
+    address = PinnedAddressSource(
+        descriptor["namespace"]["name"], "entity_address_unified", descriptor["generation_id"]
+    )
+    npi = _receipt().npi_source
+    if changed == "address":
+        address = replace(address, generation_id="e" * 64)
+    elif changed == "namespace":
+        address = replace(address, schema_name="network_candidate_" + "3" * 32)
+    else:
+        npi = replace(npi, generation_id="e" * 64)
+    monkeypatch.setattr(custom, "compact_custom_receipt", lambda _: SimpleNamespace(npi_source=npi))
+    candidate_by_name = {"validation_json": {"serving_readiness": {"address_artifact": descriptor}}}
+    with pytest.raises(ValueError, match="registry_source_rollback_address_changed"):
+        _compact_address_sources(candidate_by_name, address)

@@ -125,7 +125,7 @@ def validate_fhir_catalog_sync_params(params):
         raise ValueError("registry_fhir_catalog_sync_parameters_invalid")
 
 
-async def run_fhir_catalog_sync(config, *, source_export=None):
+async def run_fhir_catalog_sync(config, *, source_export=None, source_companies_only=False):
     """Load the connected batch pipeline only after configuration is validated."""
     from process.registry_fhir_catalog_sync import reconcile_fhir_catalog
 
@@ -136,10 +136,10 @@ async def run_fhir_catalog_sync(config, *, source_export=None):
             report.select_endpoints(config.source_endpoint_ids)
         report.progress("discovery")
         async with asyncio.timeout(config.operation_seconds):
-            if source_export is None:
-                result = await reconcile_fhir_catalog(config)
-            else:
-                result = await reconcile_fhir_catalog(config, source_export=source_export)
+            options = {"source_export": source_export} if source_export is not None else {}
+            if source_companies_only:
+                options["source_companies_only"] = True
+            result = await reconcile_fhir_catalog(config, **options)
         report.finish(result["state"])
         return {**result, "audit": report.audit}
 

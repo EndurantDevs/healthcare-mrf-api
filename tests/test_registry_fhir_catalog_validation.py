@@ -14,6 +14,7 @@ from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
 from process.registry_fhir_catalog_sources import fhir_catalog_source_digest
 from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
 from tests.test_registry_fhir_catalog_read import relationship_document
+from tests.test_registry_fhir_catalog_source_companies import source_company
 from tests.test_registry_fhir_catalog_sources import descriptor
 
 
@@ -229,6 +230,55 @@ def test_source_vector_enforces_serialized_byte_bound_before_iteration(monkeypat
     monkeypatch.setattr(validation, "PAGE_BYTES", size - 1)
     with pytest.raises(ValueError, match="registry_fhir_catalog_inputs_invalid"):
         validation.validate_fhir_catalog_source_vector(source_entries)
+
+
+@pytest.mark.parametrize("with_transform", [False, True])
+def test_source_vector_accepts_registered_company_metadata_with_existing_transform_contract(with_transform):
+    entry_by_field = {
+        "source_generation": "a" * 64,
+        "source_id": validation.UHC_PROVIDER_FILE_SOURCE_ID,
+        "status": "current",
+        "source_companies": [source_company()],
+    }
+    if with_transform:
+        entry_by_field["extraction_transform"] = validation.TRANSFORM_VERSION
+    validation.validate_fhir_catalog_source_vector([entry_by_field])
+    entry_by_field["source_companies"] = []
+    validation.validate_fhir_catalog_source_vector([entry_by_field])
+
+
+@pytest.mark.parametrize("companies", [None, (), [source_company(company_id="unknown")]])
+def test_source_vector_rejects_malformed_company_metadata(companies):
+    with pytest.raises(ValueError):
+        validation.validate_fhir_catalog_source_vector(
+            [
+                {
+                    "source_generation": "a" * 64,
+                    "source_id": "source-a",
+                    "status": "current",
+                    "source_companies": companies,
+                }
+            ]
+        )
+
+
+def test_registered_label_changes_metadata_generation_without_changing_source_generation():
+    selected_descriptor = descriptor()
+    original_descriptor = copy.deepcopy(selected_descriptor)
+    selected = snapshot(standing_grant(), (selected_descriptor,))
+    original_metadata_generation = selected["metadata_generation"]
+    original_source_generation = selected["source_vector_json"][0]["source_generation"]
+    assert validation.metadata_generation(selected) == original_metadata_generation
+    selected["source_vector_json"][0]["source_companies"] = [source_company()]
+    labeled_generation = validation.metadata_generation(selected)
+    assert labeled_generation != original_metadata_generation
+    selected["source_vector_json"][0]["source_companies"][0]["display_name"] = "Example Mutual"
+    assert validation.metadata_generation(selected) != labeled_generation
+    assert selected["source_vector_json"][0]["source_generation"] == original_source_generation
+    assert selected_descriptor == original_descriptor
+    assert fhir_catalog_source_digest(selected_descriptor) == original_source_generation
+    del selected["source_vector_json"][0]["source_companies"]
+    assert validation.metadata_generation(selected) == original_metadata_generation
 
 
 @pytest.mark.asyncio

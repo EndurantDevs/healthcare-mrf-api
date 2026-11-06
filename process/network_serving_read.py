@@ -63,6 +63,11 @@ class PinnedNetworkServingManifest:
         return getattr(self, "_compact_layout", None)
 
     @property
+    def supports_location_lookup(self):
+        """Only independently verified indexed dependencies permit bounded probes."""
+        return getattr(self, "_supports_location_lookup", False) is True
+
+    @property
     def candidate_relation_pins(self):
         """Verified candidate data identities, outside the public manifest wire format."""
         return getattr(self, "_candidate_relation_pins", ())
@@ -228,7 +233,14 @@ def _attach_manifest_custody(pinned, custody, readiness, is_compact):
         object.__setattr__(pinned, "_custody_seal_sha256", custody["seal_sha256"])
         object.__setattr__(pinned, "_custody_control", dict(custody["receipt"]["control"]))
     if is_compact:
+        from process.network_indexed_address_artifact import CONTRACT as INDEXED_ADDRESS_CONTRACT
+
         object.__setattr__(pinned, "_compact_layout", custody["compact_layout"])
+        object.__setattr__(
+            pinned,
+            "_supports_location_lookup",
+            readiness[2]["address_artifact"].get("contract") == INDEXED_ADDRESS_CONTRACT,
+        )
 
 
 async def resolve_network_serving_manifest(

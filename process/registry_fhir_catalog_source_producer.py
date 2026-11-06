@@ -99,9 +99,10 @@ async def open_source_owned_catalog_export(factory, profile, registry_connection
     if not callable(factory):
         raise ValueError("registry_fhir_catalog_source_export_factory_invalid")
     async with factory(source_profile=profile) as export:
-        if type(export) is not dict or set(export) != _OPERATIONS | {"database_identity"}:
+        required = _OPERATIONS | {"database_identity"}
+        if type(export) is not dict or set(export) not in (required, required | {"source_companies"}):
             raise ValueError("registry_fhir_catalog_source_export_invalid")
-        if any(not callable(export[name]) for name in _OPERATIONS):
+        if any(not callable(callback) for name, callback in export.items() if name != "database_identity"):
             raise ValueError("registry_fhir_catalog_source_export_invalid")
         identity = export["database_identity"]
         if (

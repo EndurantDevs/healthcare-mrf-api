@@ -35,6 +35,7 @@ from process.registry_fhir_catalog_retained import (
     retained_fhir_catalog_read_source,
     retained_fhir_catalog_recipe,
 )
+from process.registry_fhir_catalog_source_companies import collect_fhir_catalog_source_companies
 from process.registry_fhir_catalog_source_fence import fhir_catalog_source_publication_fence
 from process.registry_fhir_catalog_source_producer import open_source_owned_catalog_export
 from process.registry_fhir_catalog_sources import (
@@ -334,7 +335,8 @@ async def _protected_snapshot(connection, proposed, grant, *, generation=None, p
     return stored
 
 
-async def _descriptors(connection, snapshot, vector):
+async def load_fhir_catalog_source_descriptors(connection, snapshot, vector):
+    """Read bounded closed descriptors and reject missing or changed vector identities."""
     expected_by_generation = {entry["source_generation"]: entry for entry in vector}
     descriptors_by_generation = {}
     generations = sorted(expected_by_generation)
@@ -365,7 +367,11 @@ async def _descriptors(connection, snapshot, vector):
     return descriptors_by_generation
 
 
-def _admitted_current(grant, vector, descriptors):
+_descriptors = load_fhir_catalog_source_descriptors
+
+
+def fhir_catalog_admitted_current_sources(grant, vector, descriptors):
+    """Check current admission and return native descriptors that require a SourceReader fence."""
     allowed_profiles = {canonical_json(profile.document()) for profile in grant.source_profiles}
     selected_descriptors = []
     for entry in vector:
@@ -388,7 +394,11 @@ def _admitted_current(grant, vector, descriptors):
     return tuple(selected_descriptors)
 
 
-def _admitted_retained(grant, vector, descriptors):
+_admitted_current = fhir_catalog_admitted_current_sources
+
+
+def fhir_catalog_admitted_retained_sources(grant, vector, descriptors):
+    """Require retained status, policy and source URI before returning native capture descriptors."""
     if any(
         entry["status"] != "last_good" and descriptors[entry["source_generation"]]["profile"] == "retained_normalized"
         for entry in vector
@@ -417,6 +427,9 @@ def _admitted_retained(grant, vector, descriptors):
     return retained_descriptors
 
 
+_admitted_retained = fhir_catalog_admitted_retained_sources
+
+
 async def _retained_sources(connection, command, snapshot, grant, vector, descriptors):
     retained_entries = [
         entry
@@ -424,17 +437,55 @@ async def _retained_sources(connection, command, snapshot, grant, vector, descri
         if entry["status"] == "last_good"
         and descriptors[entry["source_generation"]]["profile"] != "retained_normalized"
     ]
-    if not retained_entries:
-        return
+    labeled_history = any(entry["status"] == "last_good" and "source_companies" in entry for entry in vector)
     previous = command["expected_metadata_generation"]
+    if (
+        not retained_entries
+        and not labeled_history
+        and (previous is None or not any(entry["status"] == "last_good" for entry in vector))
+    ):
+        return
     if previous is None:
         _fail("history_required")
     prior = await _protected_snapshot(connection, snapshot, grant, generation=previous, published=True)
-    admitted_sources = {
-        (entry["source_generation"], entry["source_id"]) for entry in snapshot_inputs(prior)["source_vector_json"]
-    }
+    prior_vector = snapshot_inputs(prior)["source_vector_json"]
+    _verify_retained_source_companies(vector, prior_vector)
+    admitted_sources = {(entry["source_generation"], entry["source_id"]) for entry in prior_vector}
     if any((entry["source_generation"], entry["source_id"]) not in admitted_sources for entry in retained_entries):
         _fail("history_changed")
+
+
+def _verify_retained_source_companies(vector, prior_vector):
+    prior_by_generation = {entry["source_generation"]: entry for entry in prior_vector}
+    for entry in vector:
+        if entry["status"] != "last_good":
+            continue
+        prior = prior_by_generation.get(entry["source_generation"], {})
+        if ("source_companies" in entry) != ("source_companies" in prior) or entry.get("source_companies") != prior.get(
+            "source_companies"
+        ):
+            _fail("source_companies_history_changed")
+
+
+def require_fhir_catalog_company_refresh_inputs(snapshot, prior):
+    """Require the prior projector and exact source vector except refreshed source-company assertions."""
+    if prior is None:
+        _fail("source_companies_history_required")
+    if (
+        any(
+            entry["status"] == "current" and "source_companies" not in entry for entry in snapshot["source_vector_json"]
+        )
+        or snapshot["projector_version"] != prior["projector_version"]
+        or [
+            {key: value for key, value in entry.items() if key != "source_companies"}
+            for entry in snapshot["source_vector_json"]
+        ]
+        != [
+            {key: value for key, value in entry.items() if key != "source_companies"}
+            for entry in snapshot_inputs(prior)["source_vector_json"]
+        ]
+    ):
+        _fail("source_companies_history_changed")
 
 
 def _active_context(connection, snapshot, grant, *, required=True):
@@ -522,6 +573,7 @@ async def _readonly_snapshot(reader):
 class _GrantCallbacks:
     grant: FHIRCatalogStandingGrant
     source_reader_pool: object = field(repr=False)
+    source_companies_only: bool = False
 
     async def authorize_metadata(self, *, command, snapshot, connection):
         """Bind one service command to protected metadata and explicit standing policy."""
@@ -551,6 +603,12 @@ class _GrantCallbacks:
         if retained:
             await require_retained_fhir_catalog_sources(connection, retained, control_schema=self.grant.control_schema)
         await _retained_sources(connection, command, stored, self.grant, vector, descriptors)
+        if self.source_companies_only:
+            previous = command["expected_metadata_generation"]
+            if previous is None:
+                _fail("source_companies_history_required")
+            prior = await _protected_snapshot(connection, stored, self.grant, generation=previous, published=True)
+            require_fhir_catalog_company_refresh_inputs({**stored, "source_vector_json": vector}, prior)
         context = _active_context(connection, stored, self.grant, required=False)
         if context is not None:
             _CONTEXT.set(replace(context, authorized=True))
@@ -639,13 +697,15 @@ class _GrantCallbacks:
         return True
 
 
-def build_fhir_catalog_publication_runtime(grant, source_reader_pool, *, source_export=None):
+def build_fhir_catalog_publication_runtime(
+    grant, source_reader_pool, *, source_export=None, source_companies_only=False
+):
     """Build existing publication callbacks; the caller owns pool credentials/lifetime."""
     if type(grant) is not FHIRCatalogStandingGrant:
         _fail()
     if source_export is not None and not callable(source_export):
         _fail("source_export_invalid")
-    callbacks = _GrantCallbacks(grant, source_reader_pool)
+    callbacks = _GrantCallbacks(grant, source_reader_pool, source_companies_only)
     return FHIRCatalogPublicationRuntime(
         authorize_metadata=callbacks.authorize_metadata,
         verify_sources=callbacks.is_source_snapshot_current,
@@ -761,7 +821,9 @@ async def _verify_observation_replay(connection, snapshot, generation, descripto
         _fail("observation_facts_changed")
 
 
-async def _verify_retained_product_observations(connection, snapshot, grant, reader, workspace, descriptors):
+async def _verify_retained_product_observations(
+    connection, snapshot, grant, reader, workspace, descriptors, *, source_companies_only=False
+):
     from process.registry_fhir_catalog_extraction import RESOURCE_TYPES
     from process.registry_fhir_catalog_products import selected_reviewed_fhir_catalog_product_sources
     from process.registry_fhir_catalog_projection_validation import require_fhir_catalog_registry_reader
@@ -781,6 +843,8 @@ async def _verify_retained_product_observations(connection, snapshot, grant, rea
     )
     if not selected:
         return
+    if source_companies_only:
+        _fail("source_companies_retained_products_unsupported")
     if reader is None or workspace is None:
         _fail("retained_reader_required")
     source_entries = [
@@ -809,7 +873,13 @@ async def _verify_retained_product_observations(connection, snapshot, grant, rea
 
 
 def build_fhir_catalog_observation_verifier(
-    grant, source_reader_pool, *, registry_reader=None, registry_workspace=None, source_export=None
+    grant,
+    source_reader_pool,
+    *,
+    registry_reader=None,
+    registry_workspace=None,
+    source_export=None,
+    source_companies_only=False,
 ):
     """Bind trusted collection/replay to writer closure, independently of Loader claims."""
     if type(grant) is not FHIRCatalogStandingGrant:
@@ -822,32 +892,29 @@ def build_fhir_catalog_observation_verifier(
         if standing_grant.sha256 != grant.sha256 or copy_target.schema_name != snapshot["schema_name"]:
             _fail("policy_changed")
         vector = snapshot_inputs(snapshot)["source_vector_json"]
-        descriptors = await _descriptors(connection, snapshot, vector)
+        descriptors = await load_fhir_catalog_source_descriptors(connection, snapshot, vector)
         prior, previous = await _prior_observations(connection, snapshot, grant)
+        _verify_retained_source_companies(vector, snapshot_inputs(prior)["source_vector_json"] if prior else [])
+        if source_companies_only:
+            await _verify_committed_source_history(connection, snapshot, prior, vector, descriptors)
         if not set(previous) <= set(descriptors):
             _fail("observation_history_changed")
-        fresh_sources = []
-        for entry in vector:
-            generation = entry["source_generation"]
-            descriptor = descriptors[generation]
-            if not _is_observed_source(descriptor):
-                continue
-            from process.registry_fhir_plan_tier import needs_plan_tier_refresh
-
-            if generation in previous and descriptor != previous[generation]:
-                _fail("observation_history_changed")
-            if generation in previous and not needs_plan_tier_refresh(prior, snapshot, descriptor):
-                await _verify_carried_observation(connection, snapshot, prior, generation)
-            else:
-                if entry["status"] != "current":
-                    _fail("observation_history_required")
-                fresh_sources.append((generation, descriptor))
+        fresh_sources = await _verify_cached_observations(
+            connection, snapshot, prior, vector, descriptors, previous, source_companies_only=source_companies_only
+        )
         if fresh_sources:
             await _replay_registered_observations(
                 source_reader_pool, connection, snapshot, grant, fresh_sources, source_export=source_export
             )
+        await verify_current_fhir_catalog_source_companies(source_export, connection, vector, descriptors, grant)
         await _verify_retained_product_observations(
-            connection, snapshot, grant, registry_reader, registry_workspace, descriptors
+            connection,
+            snapshot,
+            grant,
+            registry_reader,
+            registry_workspace,
+            descriptors,
+            **({"source_companies_only": True} if source_companies_only else {}),
         )
         from process.registry_fhir_catalog_validation import validate_fhir_catalog_observed_projection
 
@@ -863,6 +930,68 @@ def build_fhir_catalog_observation_verifier(
             return await verify_inputs(**arguments)
 
     return verify
+
+
+async def _verify_committed_source_history(connection, snapshot, prior, vector, descriptors):
+    """Refuse metadata-only repair unless both vector identity and every committed descriptor remain exact."""
+    require_fhir_catalog_company_refresh_inputs({**snapshot, "source_vector_json": vector}, prior)
+    prior_descriptors = await load_fhir_catalog_source_descriptors(
+        connection, prior, snapshot_inputs(prior)["source_vector_json"]
+    )
+    if descriptors != prior_descriptors:
+        _fail("source_companies_history_changed")
+
+
+async def _verify_cached_observations(
+    connection, snapshot, prior, vector, descriptors, previous, *, source_companies_only
+):
+    """Verify carried facts against prior custody and return only sources requiring independent replay."""
+    from process.registry_fhir_plan_tier import needs_plan_tier_refresh
+
+    fresh_sources = []
+    for entry in vector:
+        generation = entry["source_generation"]
+        descriptor = descriptors[generation]
+        if source_companies_only:
+            await _verify_carried_observation(connection, snapshot, prior, generation)
+            continue
+        if not _is_observed_source(descriptor):
+            continue
+        if generation in previous and descriptor != previous[generation]:
+            _fail("observation_history_changed")
+        if generation in previous and not needs_plan_tier_refresh(prior, snapshot, descriptor):
+            await _verify_carried_observation(connection, snapshot, prior, generation)
+        else:
+            if entry["status"] != "current":
+                _fail("observation_history_required")
+            fresh_sources.append((generation, descriptor))
+    return fresh_sources
+
+
+async def verify_current_fhir_catalog_source_companies(source_export, connection, vector, descriptors, grant):
+    """Independently reread every current registered label under its admitted Source profile and identity."""
+    labeled_entries = [entry for entry in vector if entry["status"] == "current" and "source_companies" in entry]
+    if not labeled_entries:
+        return
+    _admitted_current(grant, vector, descriptors)
+    if source_export is None:
+        raise ValueError("registry_fhir_catalog_source_companies_unavailable")
+    sources_by_profile = {}
+    for entry in labeled_entries:
+        descriptor = descriptors[entry["source_generation"]]
+        if not _is_observed_source(descriptor):
+            _fail("source_not_admitted")
+        sources_by_profile.setdefault(canonical_json(descriptor["native_read_profile"]), []).append(entry)
+    for profile_key, entries in sources_by_profile.items():
+        profile = source_profile(json.loads(profile_key))
+        async with open_source_owned_catalog_export(source_export, profile, connection) as export:
+            for entry in entries:
+                descriptor = descriptors[entry["source_generation"]]
+                if descriptor["database_oid"] != export["database_identity"]["database_oid"]:
+                    _fail("database_changed")
+                labels = await collect_fhir_catalog_source_companies(export, descriptor, required=True)
+                if labels != entry["source_companies"]:
+                    _fail("source_companies_changed")
 
 
 async def _replay_registered_observations(source_pool, connection, snapshot, grant, sources, *, source_export=None):

@@ -48,7 +48,7 @@ class NetworkProviderNotFound(LookupError):
 _PROVIDERS_SQL = """WITH selected_addresses AS NOT MATERIALIZED (
   SELECT location_key,entity_type,entity_id,entity_name,npi,first_line,second_line,city_name,state_name,
     postal_code,country_code,lat,long FROM {addresses}
-  WHERE canonical_network_ids && $1::text::integer[]
+  WHERE {address_membership}
 ), selected_memberships AS MATERIALIZED (
   SELECT DISTINCT provider_system,provider_id,location_id FROM ONLY {namespace}.network_membership
   WHERE network_id=ANY($1::text::integer[])
@@ -267,7 +267,14 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
         relations = _provider_read_relations(current)
         backend_pid = connection.get_server_pid()
         receipt = await connection.fetchrow(
-            _PROVIDERS_SQL.format(namespace=_identifier(current.schema_name), addresses=addresses),
+            _PROVIDERS_SQL.format(
+                namespace=_identifier(current.schema_name),
+                addresses=addresses,
+                # Compact addresses already select the same networks through pinned edges.
+                address_membership="TRUE"
+                if current.compact_layout is not None
+                else "canonical_network_ids && $1::text::integer[]",
+            ),
             "{" + ",".join(str(network_id) for network_id in scope.network_ids) + "}",
             *selector,
             limit,

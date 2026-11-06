@@ -652,7 +652,7 @@ async def test_observation_seal_rejects_changed_policy_or_storage_before_source_
         await callback(
             connection=case.connection, copy_target=target, snapshot=case.snapshot, standing_grant=actual_grant
         )
-    grants._descriptors.assert_not_awaited()
+    grants.load_fhir_catalog_source_descriptors.assert_not_awaited()
     case.factory.assert_not_called()
     case.pool.acquire.assert_not_called()
 
@@ -703,3 +703,254 @@ async def test_scoped_source_requires_native_reader_instead_of_source_export(mon
     with pytest.raises(grants.FHIRCatalogGrantError, match="reader_required"):
         await verify(case)
     case.factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary,reason", [("missing_export", "source_companies_unavailable"), ("database", "database_changed")]
+)
+async def test_cached_label_seal_requires_export_and_the_committed_database(monkeypatch, boundary, reason):
+    from process import registry_fhir_catalog_validation as validation
+    from tests.test_registry_fhir_catalog_source_companies import source_company
+    from tests.test_registry_fhir_catalog_source_producer_grant import verifier_case
+
+    case = verifier_case(monkeypatch)
+    prior = copy.deepcopy(case.snapshot)
+    grants._prior_observations.return_value = (prior, case.descriptors)
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    case.snapshot["metadata_generation"] = metadata_generation(case.snapshot)
+    case.export["source_companies"] = AsyncMock(return_value=(source_company(),))
+    if boundary == "database":
+        case.export["database_identity"]["database_oid"] += 1
+        case.connection.fetchrow.return_value = dict(case.export["database_identity"])
+    callback = grants.build_fhir_catalog_observation_verifier(
+        case.grant, case.pool, source_export=None if boundary == "missing_export" else case.factory
+    )
+    with pytest.raises(ValueError, match=reason):
+        await callback(
+            connection=case.connection, copy_target=case.target, snapshot=case.snapshot, standing_grant=case.grant
+        )
+    assert case.factory.call_count == int(boundary == "database")
+    case.export["source_companies"].assert_not_awaited()
+    case.export["replay"].assert_not_awaited()
+    case.pool.acquire.assert_not_called()
+    validation.validate_fhir_catalog_observed_projection.assert_not_awaited()
+    if boundary == "database":
+        assert case.events[-1] == ("exit",)
+
+
+@pytest.mark.asyncio
+async def test_native_source_admission_does_not_authorize_registered_label_refresh(monkeypatch):
+    from process import registry_fhir_catalog_validation as validation
+    from tests.test_registry_fhir_catalog_source_companies import source_company
+    from tests.test_registry_fhir_catalog_source_producer_grant import verifier_case, verify
+
+    case = verifier_case(monkeypatch, (descriptor(),))
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    case.snapshot["metadata_generation"] = metadata_generation(case.snapshot)
+    case.export["source_companies"] = AsyncMock(return_value=(source_company(),))
+    with pytest.raises(grants.FHIRCatalogGrantError, match="source_not_admitted"):
+        await verify(case)
+    case.factory.assert_not_called()
+    case.export["source_companies"].assert_not_awaited()
+    case.export["replay"].assert_not_awaited()
+    case.pool.acquire.assert_not_called()
+    validation.validate_fhir_catalog_observed_projection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_seal_requires_history_before_source_entry(monkeypatch):
+    from tests.test_registry_fhir_catalog_source_companies import source_company
+    from tests.test_registry_fhir_catalog_source_producer_grant import verifier_case, verify
+
+    case = verifier_case(monkeypatch)
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    case.snapshot["metadata_generation"] = metadata_generation(case.snapshot)
+    with pytest.raises(grants.FHIRCatalogGrantError, match="source_companies_history_required"):
+        await verify(case, source_companies_only=True)
+    case.factory.assert_not_called()
+    case.export["replay"].assert_not_awaited()
+    grants._verify_retained_product_observations.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "builder", [grants.build_fhir_catalog_publication_runtime, grants.build_fhir_catalog_observation_verifier]
+)
+def test_invalid_source_factory_refuses_before_building_publication_callbacks(builder):
+    with pytest.raises(grants.FHIRCatalogGrantError, match="source_export_invalid"):
+        builder(standing_grant(), None, source_export=object())
+
+
+@pytest.mark.asyncio
+async def test_reader_transaction_start_failure_keeps_original_error_without_spurious_rollback():
+    original = PermissionError("snapshot unavailable")
+    transaction = Mock(start=AsyncMock(side_effect=original), rollback=AsyncMock())
+    reader = Mock(
+        transaction=Mock(return_value=transaction),
+        execute=AsyncMock(),
+        is_in_transaction=Mock(return_value=False),
+        terminate=Mock(),
+    )
+    with pytest.raises(PermissionError) as caught:
+        async with grants._readonly_snapshot(reader):
+            pytest.fail("failed snapshot entered Source reads")
+    assert caught.value is original
+    transaction.rollback.assert_not_awaited()
+    reader.execute.assert_not_awaited()
+    reader.terminate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_prior_observation_custody_refuses_deleted_networks_before_descriptor_reads(custody, monkeypatch):
+    grant = standing_grant()
+    prior = snapshot(grant, (descriptor(),))
+    prior["published_at"] = "2026-01-01T00:00:00Z"
+    selected = snapshot(grant, (descriptor(),), as_of=date(2026, 1, 2))
+    writer = CatalogConnection((prior, selected), (descriptor(),))
+    writer.fetchval = AsyncMock(side_effect=[prior["metadata_generation"], True])
+    monkeypatch.setattr(grants, "_descriptors", AsyncMock())
+    with pytest.raises(grants.FHIRCatalogGrantError, match="observation_history_changed"):
+        await grants._prior_observations(writer, selected, grant)
+    assert "current.network_id IS NULL" in writer.fetchval.await_args.args[0]
+    grants._descriptors.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cached_observation_descriptor_drift_refuses_before_replay_or_projection(monkeypatch):
+    from tests.test_registry_fhir_catalog_source_producer_grant import verifier_case, verify
+
+    case = verifier_case(monkeypatch)
+    previous = copy.deepcopy(case.descriptors)
+    next(iter(previous.values()))["source_uri"] = "https://other.test/fhir/"
+    grants._prior_observations.return_value = (copy.deepcopy(case.snapshot), previous)
+    with pytest.raises(grants.FHIRCatalogGrantError, match="observation_history_changed"):
+        await verify(case)
+    case.factory.assert_not_called()
+    case.export["replay"].assert_not_awaited()
+    grants._observation_accounting.assert_not_awaited()
+    grants._verify_retained_product_observations.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fresh_native_observation_descriptor_drift_refuses_before_fact_replay(monkeypatch):
+    from process import registry_fhir_catalog_observed_source as observed
+    from process import registry_fhir_catalog_sync as sync
+    from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor
+
+    selected = observed_descriptor()
+    changed = copy.deepcopy(selected)
+    changed["source_uri"] = "https://other.test/fhir/"
+    monkeypatch.setattr(
+        observed, "collect_fhir_catalog_observation", AsyncMock(return_value=SimpleNamespace(descriptor=changed))
+    )
+    monkeypatch.setattr(sync, "replay_fhir_catalog_observations", AsyncMock())
+    with pytest.raises(grants.FHIRCatalogGrantError, match="observation_source_changed"):
+        await grants._verify_fresh_observation(
+            object(), object(), {}, grants.fhir_catalog_source_generation(selected), selected, object()
+        )
+    assert observed.collect_fhir_catalog_observation.await_args.kwargs["require_current"] is False
+    sync.replay_fhir_catalog_observations.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registered_native_replay_cannot_borrow_the_candidate_writer_as_reader(monkeypatch):
+    from tests.test_registry_fhir_catalog_source_producer_grant import scoped_observed_descriptor, verifier_case, verify
+
+    selected, profile = scoped_observed_descriptor()
+    case = verifier_case(monkeypatch, (selected,), (profile,))
+
+    @asynccontextmanager
+    async def acquire():
+        yield case.connection
+
+    case.pool = SimpleNamespace(acquire=acquire)
+    with pytest.raises(grants.FHIRCatalogGrantError, match="reader_required"):
+        await verify(case)
+    case.factory.assert_not_called()
+    case.export["replay"].assert_not_awaited()
+    grants._verify_retained_product_observations.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["reader", "workspace"])
+async def test_retained_product_replay_requires_both_pinned_reader_and_workspace(monkeypatch, missing):
+    from process import registry_fhir_catalog_products as products
+    from process import registry_fhir_catalog_projection_validation as validation
+    from tests.test_registry_fhir_catalog_retained import descriptor_fixture
+
+    retained, _, _ = await descriptor_fixture(monkeypatch)
+    generation = grants.fhir_catalog_source_generation(retained.descriptor)
+    selected = snapshot(standing_grant())
+    monkeypatch.setattr(validation, "require_fhir_catalog_registry_reader", AsyncMock())
+    monkeypatch.setattr(grants, "catalog_projection_generations", AsyncMock(return_value=(generation,)))
+    monkeypatch.setattr(
+        products,
+        "selected_reviewed_fhir_catalog_product_sources",
+        AsyncMock(return_value={generation: retained.descriptor}),
+    )
+    monkeypatch.setattr(grants, "require_retained_fhir_catalog_sources", AsyncMock())
+    with pytest.raises(grants.FHIRCatalogGrantError, match="retained_reader_required"):
+        await grants._verify_retained_product_observations(
+            object(),
+            selected,
+            standing_grant(),
+            None if missing == "reader" else object(),
+            None if missing == "workspace" else object(),
+            {generation: retained.descriptor},
+        )
+    grants.require_retained_fhir_catalog_sources.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_reader", [False, True])
+async def test_retained_source_fence_pins_capture_until_authorized_verification(custody, monkeypatch, same_reader):
+    from tests.test_registry_fhir_catalog_retained import catalog_connection, descriptor_fixture
+
+    retained, _, _ = await descriptor_fixture(monkeypatch)
+    grant = standing_grant(retained_source_recipes=True)
+    generation = grants.fhir_catalog_source_generation(retained.descriptor)
+    selected = snapshot(
+        grant,
+        source_vector_json=[
+            {
+                "source_generation": generation,
+                "source_id": retained.descriptor["coordinates"]["source_id"],
+                "status": "last_good",
+            }
+        ],
+    )
+    writer = catalog_connection(selected, retained.descriptor)
+    transaction = Mock(start=AsyncMock(), rollback=AsyncMock())
+    reader = (
+        writer
+        if same_reader
+        else Mock(
+            transaction=Mock(return_value=transaction),
+            execute=AsyncMock(),
+            is_in_transaction=Mock(return_value=True),
+        )
+    )
+
+    @asynccontextmanager
+    async def acquire():
+        yield reader
+
+    pinned = SimpleNamespace(capture=object(), verify=AsyncMock())
+    monkeypatch.setattr(grants, "pin_retained_fhir_catalog_source", AsyncMock(return_value=pinned))
+    monkeypatch.setattr(grants, "_reader_identity", AsyncMock())
+    monkeypatch.setattr(grants, "require_retained_fhir_catalog_sources", AsyncMock())
+    runtime = grants.build_fhir_catalog_publication_runtime(grant, SimpleNamespace(acquire=acquire))
+    if same_reader:
+        with pytest.raises(grants.FHIRCatalogGrantError, match="reader_required"):
+            async with runtime.source_fence(snapshot=selected, connection=writer):
+                pytest.fail("writer reused as independent retained reader")
+        grants.pin_retained_fhir_catalog_source.assert_not_awaited()
+    else:
+        async with runtime.source_fence(snapshot=selected, connection=writer):
+            await runtime.authorize_metadata(command=command(grant, selected), snapshot=selected, connection=writer)
+            assert await runtime.verify_sources(snapshot=selected, connection=writer) is True
+            pinned.verify.assert_awaited_once_with(reader, pinned.capture)
+            transaction.rollback.assert_not_awaited()
+        grants.pin_retained_fhir_catalog_source.assert_awaited_once_with(reader, retained.descriptor)
+        transaction.rollback.assert_awaited_once()
+    assert grants._CONTEXT.get() is None

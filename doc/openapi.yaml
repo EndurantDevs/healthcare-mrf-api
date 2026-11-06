@@ -15558,8 +15558,6 @@ components:
                 type: string
               network_checksum:
                 type: object
-            additionalProperties:
-              type: string
             additionalProperties: true
     PlanDrugRecord:
       type: object

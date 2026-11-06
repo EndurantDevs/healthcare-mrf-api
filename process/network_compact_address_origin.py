@@ -67,5 +67,22 @@ async def resolve_compact_address_origin(connection, candidate, source, *, runti
     retained = await _retained_origin(connection, candidate, source, runtime_roles, control_schema)
     if retained is not None:
         return retained
+    from process import network_indexed_address_artifact as indexed
+
+    if indexed.is_indexed_address_source(source):
+        descriptor = await indexed.capture_indexed_address_artifact(
+            connection, source, runtime_roles=runtime_roles, control_schema=control_schema
+        )
+        previous = await resolve_registry_retained_generation(connection, candidate, control_schema=control_schema)
+        if previous is not None:
+            previous_manifest, previous_candidate = previous
+            previous_artifact = (
+                _json_object(previous_candidate["validation_json"]).get("serving_readiness", {}).get("address_artifact")
+            )
+            _require(previous_manifest.compact_layout is not None and type(previous_artifact) is dict)
+            if previous_artifact.get("contract") == indexed.CONTRACT:
+                previous_artifact = previous_artifact["origin_artifact"]
+            _require(descriptor["origin_artifact"] == previous_artifact)
+        return descriptor, CompactAddressRelation(source.schema_name, source.table_name, descriptor["table"]["oid"])
     descriptor = await capture_network_address_artifact(connection, source, runtime_roles=runtime_roles)
     return descriptor, CompactAddressRelation(source.schema_name, source.table_name, descriptor["table"]["oid"])
