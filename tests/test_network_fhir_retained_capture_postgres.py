@@ -383,6 +383,17 @@ async def _cleanup_capture_fixture(admin, schema, role_by_kind, readers, capture
     await admin.close()
 
 
+def _capture_connection_factory(dsn, role_by_kind, password, readers):
+    async def connect(role):
+        connection = await asyncpg.connect(
+            dsn.replace("postgresql+asyncpg://", "postgresql://"), user=role_by_kind[role], password=password
+        )
+        readers.append(connection)
+        return connection
+
+    return connect
+
+
 @pytest.fixture
 async def legacy_capture_db(request):
     """Create exact disposable native roles and register cleanup before setup."""
@@ -426,19 +437,14 @@ async def legacy_capture_db(request):
         await admin.execute("RESET ROLE")
         origin = await _legacy_input(admin, schema, role_by_kind["reader"], metadata, summary, modern=is_modern)
 
-        async def connect(role):
-            connection = await asyncpg.connect(
-                dsn.replace("postgresql+asyncpg://", "postgresql://"), user=role_by_kind[role], password=password
-            )
-            readers.append(connection)
-            return connection
-
         yield SimpleNamespace(
             admin=admin,
+            dsn=dsn,
+            role_password=password,
             schema=schema,
             role_by_kind=role_by_kind,
             origin=origin,
-            connect=connect,
+            connect=_capture_connection_factory(dsn, role_by_kind, password, readers),
             captures=captures,
             metadata=metadata,
         )

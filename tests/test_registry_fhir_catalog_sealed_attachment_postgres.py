@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from sqlalchemy.engine import make_url
 
 from process.network_candidate_custody import NetworkCandidateCustodyError, seal_network_candidate_custody
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
@@ -20,11 +21,18 @@ from process.registry_fhir_catalog_permissions import (
     install_fhir_catalog_publication_permissions,
     verify_fhir_catalog_preparation_permissions,
 )
+from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_connection,
+    fhir_catalog_registry_reads,
+)
 from process.registry_fhir_catalog_sync import (
+    _catalog_registry_head,
+    _publish_catalog_snapshot,
     prepare_fhir_catalog_snapshot,
     resolve_fhir_catalog_projection_generations,
 )
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig
+from tests.fhir_catalog_registry_reader_support import configured_catalog_reader
 from tests.registry_candidate_custody_split_postgres_support import _assert_handoff, _login, _relations
 from tests.registry_candidate_custody_split_postgres_support import split_db as split_db
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
@@ -117,6 +125,56 @@ async def test_sealed_attachment_projection_uses_repeatable_read_registry_snapsh
         assert not await fixture.fixture.connection.fetchval(lock_query, reader_pid, copy_target.schema_name)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "actor", "database", "transaction"])
+async def test_configured_registry_reader_keeps_native_identity_and_commit_lifetime(split_db, monkeypatch, damage):
+    fixture = split_db
+    manifest, directory_target = await _publish_sealed_attachment(fixture)
+    grant = FHIRCatalogStandingGrant("registry-reader", 1, fixture.fixture.control_schema, ())
+    dsn = make_url(fixture.dsn)
+    if damage == "database":
+        dsn = dsn.set(database="postgres")
+    role = fixture.roles_by_kind["execution" if damage == "actor" else "reader"]
+    async with (
+        configured_catalog_reader(
+            monkeypatch, dsn.render_as_string(hide_password=False), role, fixture.role_password
+        ) as database,
+        _login(fixture, "execution") as writer,
+    ):
+        if damage == "transaction":
+            reader_pool = await database._connect_reader()
+            reader_pool.engine.update_execution_options(isolation_level="READ COMMITTED", postgresql_readonly=False)
+        if damage is not None:
+            with pytest.raises(ValueError, match="registry_reader_changed"):
+                async with fhir_catalog_registry_reads(writer), writer.transaction(isolation="repeatable_read"):
+                    await _catalog_registry_head(writer, grant)
+        else:
+            lock_query = (
+                "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=$1 AND relation=to_regclass($2) "
+                "AND mode='AccessShareLock' AND granted)"
+            )
+            async with fhir_catalog_registry_reads(writer):
+                async with writer.transaction(isolation="repeatable_read"):
+                    _, current, _ = await _catalog_registry_head(writer, grant)
+                    assert current.manifest_sha256 == manifest["manifest_sha256"]
+                    reader = await fhir_catalog_registry_connection(writer)
+                    pid = reader.get_server_pid()
+                    relation = f'"{directory_target.schema_name}".network_membership'
+                    assert await fixture.fixture.connection.fetchval(lock_query, pid, relation)
+                assert not writer.is_in_transaction()
+                assert await fixture.fixture.connection.fetchval(lock_query, pid, relation)
+            assert not await fixture.fixture.connection.fetchval(lock_query, pid, relation)
+    assert (
+        await fixture.fixture.connection.fetchval(
+            f'SELECT generation_id FROM "{fixture.fixture.control_schema}".network_serving_control WHERE id=1'
+        )
+        == manifest["generation_id"]
+    )
+    assert not await fixture.fixture.connection.fetchval(
+        f'SELECT EXISTS(SELECT FROM "{fixture.fixture.control_schema}".registry_fhir_catalog_snapshot)'
+    )
+
+
 @asynccontextmanager
 async def _catalog_roles(fixture):
     """Own only isolated catalog identities and their exact candidate schemas."""
@@ -181,10 +239,6 @@ async def _prepare_observed_catalog_roles(fixture, observed_source, roles_by_kin
         metadata_runtime=build_fhir_catalog_publication_runtime(grant, None),
         metadata_only=True,
     )
-    for kind in ("loader", "sealer", "execution"):
-        await connection.execute(
-            f'GRANT "{fixture.fixture.roles["reader"]}" TO "{roles_by_kind[kind]}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
-        )
     async with connection.transaction():
         await install_fhir_catalog_preparation_permissions(
             connection, consumer, loader_role=roles_by_kind["loader"], sealer_role=roles_by_kind["sealer"]
@@ -234,41 +288,112 @@ async def _assert_committed_observed_catalog(fixture, loader, snapshot_by_field,
         await loader.execute(f"DELETE FROM {schema}.registry_fhir_catalog_observation WHERE false")
 
 
+async def _assert_catalog_writer_permissions(logins, directory_target, config, loader, sealer_pool):
+    for kind in ("loader", "sealer", "execution"):
+        async with _login(logins, kind) as actor:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await actor.fetchval(f'SELECT count(*) FROM "{directory_target.schema_name}".network_membership')
+    permission_options_by_name = {
+        "loader_role": logins.roles_by_kind["loader"],
+        "sealer_role": logins.roles_by_kind["sealer"],
+    }
+    async with loader.transaction(readonly=True):
+        await verify_fhir_catalog_preparation_permissions(
+            loader, config.consumer, **permission_options_by_name, role=logins.roles_by_kind["loader"]
+        )
+    async with sealer_pool.acquire() as sealer, sealer.transaction(readonly=True):
+        await verify_fhir_catalog_preparation_permissions(
+            sealer, config.consumer, **permission_options_by_name, role=logins.roles_by_kind["sealer"]
+        )
+
+
+async def _assert_publication_loses_custody(
+    config, loader, snapshot_by_field, previous, runtime, lifecycle_pool, execution_pool, monkeypatch
+):
+    from process import registry_fhir_catalog_publication as publication
+
+    finish = publication.finish_registry_publication_request
+    ended_calls = []
+
+    async def finish_without_custody(writer, *args, **kwargs):
+        await finish(writer, *args, **kwargs)
+        reader = await fhir_catalog_registry_connection(writer)
+        await reader.execute("ROLLBACK")
+        ended_calls.append(True)
+
+    monkeypatch.setattr(publication, "finish_registry_publication_request", finish_without_custody)
+    with pytest.raises(ValueError, match="registry_publication_request_refused"):
+        await _publish_catalog_snapshot(
+            config, loader, snapshot_by_field, previous, runtime, lifecycle_pool, execution_pool
+        )
+    assert ended_calls == [True]
+
+
+def _catalog_pool(fixture, role, max_size):
+    return asyncpg.create_pool(fixture.dsn, user=role, password=fixture.role_password, min_size=1, max_size=max_size)
+
+
 @pytest.mark.asyncio
-async def test_observed_catalog_prepares_with_native_sealed_directory(split_db, observed_source_db):
-    """Compose real collection, two-slot sealing and native attachment custody under prepared roles."""
-    fixture, observed_source = split_db, observed_source_db
-    manifest, directory_target = await _publish_sealed_attachment(fixture)
-    connection, control = fixture.fixture.connection, fixture.fixture.control_schema
-    original_relations = await _relations(connection, directory_target.schema_name)
-    original_seal = await connection.fetchrow(f'SELECT * FROM "{control}".network_candidate_custody')
-    original_head = await connection.fetchrow(f'SELECT * FROM "{control}".network_serving_control')
-    async with _catalog_roles(fixture) as roles_by_kind:
-        config = await _prepare_observed_catalog_roles(fixture, observed_source, roles_by_kind)
-        logins = SimpleNamespace(dsn=fixture.dsn, roles_by_kind=roles_by_kind, role_password=fixture.role_password)
-        source_pool = SimpleNamespace(acquire=lambda: _observed_reader(observed_source))
-        permission_options_by_name = {"loader_role": roles_by_kind["loader"], "sealer_role": roles_by_kind["sealer"]}
+@pytest.mark.parametrize("reader_ended", [False, True])
+async def test_observed_catalog_prepares_with_native_sealed_directory(
+    split_db, observed_source_db, monkeypatch, reader_ended
+):
+    """Publish through Reader custody while every catalog writer lacks membership SELECT."""
+    manifest, directory_target = await _publish_sealed_attachment(split_db)
+    connection, control = split_db.fixture.connection, split_db.fixture.control_schema
+    incumbent = SimpleNamespace(
+        relations=await _relations(connection, directory_target.schema_name),
+        seal=await connection.fetchrow(f'SELECT * FROM "{control}".network_candidate_custody'),
+        head=await connection.fetchrow(f'SELECT * FROM "{control}".network_serving_control'),
+    )
+    async with _catalog_roles(split_db) as roles_by_kind:
+        config = await _prepare_observed_catalog_roles(split_db, observed_source_db, roles_by_kind)
+        logins = SimpleNamespace(dsn=split_db.dsn, roles_by_kind=roles_by_kind, role_password=split_db.role_password)
+        source_pool = SimpleNamespace(acquire=lambda: _observed_reader(observed_source_db))
         async with (
+            configured_catalog_reader(
+                monkeypatch, split_db.dsn, split_db.roles_by_kind["reader"], split_db.role_password
+            ),
             _login(logins, "loader") as loader,
-            asyncpg.create_pool(
-                fixture.dsn, user=roles_by_kind["sealer"], password=fixture.role_password, min_size=1, max_size=2
-            ) as sealer_pool,
+            _catalog_pool(split_db, roles_by_kind["sealer"], 2) as sealer_pool,
+            _catalog_pool(split_db, split_db.roles_by_kind["lifecycle"], 1) as lifecycle_pool,
+            _catalog_pool(split_db, roles_by_kind["execution"], 1) as execution_pool,
         ):
-            async with loader.transaction(readonly=True):
-                await verify_fhir_catalog_preparation_permissions(
-                    loader, config.consumer, **permission_options_by_name, role=roles_by_kind["loader"]
-                )
-            async with sealer_pool.acquire() as sealer, sealer.transaction(readonly=True):
-                await verify_fhir_catalog_preparation_permissions(
-                    sealer, config.consumer, **permission_options_by_name, role=roles_by_kind["sealer"]
-                )
+            await _assert_catalog_writer_permissions(logins, directory_target, config, loader, sealer_pool)
             snapshot_by_field, previous, accounting = await prepare_fhir_catalog_snapshot(
                 config, loader, source_pool, sealer_pool
             )
             assert snapshot_by_field is not None and previous is None
             assert accounting["accepted_sources"] == 1 and accounting["unavailable_sources"] == 0
             assert sealer_pool.get_size() == sealer_pool.get_max_size() == 2
-            await _assert_committed_observed_catalog(fixture, loader, snapshot_by_field, manifest)
-    assert await _relations(connection, directory_target.schema_name) == original_relations
-    assert await connection.fetchrow(f'SELECT * FROM "{control}".network_candidate_custody') == original_seal
-    assert await connection.fetchrow(f'SELECT * FROM "{control}".network_serving_control') == original_head
+            await _assert_committed_observed_catalog(split_db, loader, snapshot_by_field, manifest)
+            runtime = build_fhir_catalog_publication_runtime(config.grant, source_pool)
+            if reader_ended:
+                await _assert_publication_loses_custody(
+                    config, loader, snapshot_by_field, previous, runtime, lifecycle_pool, execution_pool, monkeypatch
+                )
+                await _assert_committed_observed_catalog(split_db, loader, snapshot_by_field, manifest)
+            else:
+                publication_receipt = await _publish_catalog_snapshot(
+                    config, loader, snapshot_by_field, previous, runtime, lifecycle_pool, execution_pool
+                )
+                assert publication_receipt["state"] == "completed"
+                unchanged, previous, _ = await prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool)
+                assert unchanged is None and previous["metadata_generation"] == snapshot_by_field["metadata_generation"]
+    await _assert_directory_unchanged(
+        split_db,
+        directory_target,
+        incumbent,
+        incumbent.head["metadata_generation"] if reader_ended else snapshot_by_field["metadata_generation"],
+    )
+
+
+async def _assert_directory_unchanged(fixture, directory_target, incumbent, expected_metadata):
+    connection, control = fixture.fixture.connection, fixture.fixture.control_schema
+    assert await _relations(connection, directory_target.schema_name) == incumbent.relations
+    assert await connection.fetchrow(f'SELECT * FROM "{control}".network_candidate_custody') == incumbent.seal
+    head_by_field = dict(await connection.fetchrow(f'SELECT * FROM "{control}".network_serving_control'))
+    assert head_by_field.pop("metadata_generation") == expected_metadata
+    assert head_by_field == {
+        key: field_value for key, field_value in dict(incumbent.head).items() if key != "metadata_generation"
+    }

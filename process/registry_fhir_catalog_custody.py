@@ -95,7 +95,12 @@ async def freeze_fhir_catalog_snapshot(
     standing_grant=None,
     observation_verifier=None,
 ):
-    """Close writers, validate the final fresh postimage, then attest its exact inputs."""
+    """Close writers, validate the final fresh postimage, then attest its exact inputs.
+
+    Enclose the caller transaction in ``fhir_catalog_registry_reads`` for the
+    Sealer and any separate projection reader, and verify before commit.
+    Retained directory custody must outlive the writer transaction.
+    """
     if not connection.is_in_transaction() or type(copy_target) is not FHIRCatalogTarget:
         raise ValueError("registry_fhir_catalog_transaction_required")
     if await connection.fetchval("SELECT current_setting('transaction_isolation')") != "read committed":

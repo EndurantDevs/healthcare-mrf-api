@@ -2,8 +2,10 @@
 """Set-based fingerprints of compact approved maps, never provider/address heaps."""
 
 from db.plan_release_storage import storage_identifier
-from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_fhir_catalog_identity import ALIAS_SCOPE
+from process.registry_fhir_catalog_registry_reader import (
+    resolve_fhir_catalog_network_manifest as resolve_network_serving_manifest,
+)
 
 METADATA_KINDS = ("company", "group", "network", "company_links", "network_binding")
 MEMBERSHIP_KINDS = ("provider", "location", "site_binding", "membership", "network_binding")

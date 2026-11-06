@@ -142,7 +142,12 @@ async def test_actual_canonical_scope_enforces_mapping_before_handler(monkeypatc
     if outcome == "native":
         delegate.side_effect = asyncpg.InsufficientPrivilegeError("synthetic")
     session.driver.delegate = SimpleNamespace(fetchrow=delegate)
-    monkeypatch.setattr(addresses, "_pin_network_scope", AsyncMock(return_value=(_manifest(), (42,), "a" * 64, (-17,))))
+    session.execute = AsyncMock()
+    monkeypatch.setattr(addresses, "_network_scope_claim", lambda *_: ((42,), "a" * 64, (-17,), 1))
+    monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", AsyncMock(return_value=session))
+    monkeypatch.setattr(
+        "process.network_serving_read.resolve_network_serving_manifest", AsyncMock(return_value=_manifest())
+    )
     mock_approved_control_metadata(monkeypatch)
     reached_checksums = []
 

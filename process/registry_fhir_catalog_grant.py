@@ -25,10 +25,13 @@ from process.registry_fhir_catalog_publication import (
     validated_fhir_catalog_command,
 )
 from process.registry_fhir_catalog_published_read import fhir_catalog_published_reads
+from process.registry_fhir_catalog_registry_reader import (
+    catalog_projection_generations,
+    require_retained_fhir_catalog_sources,
+)
 from process.registry_fhir_catalog_retained import (
     normalize_fhir_catalog_retained_source_uri,
     pin_retained_fhir_catalog_source,
-    require_retained_fhir_catalog_sources,
     retained_fhir_catalog_read_source,
     retained_fhir_catalog_recipe,
 )
@@ -762,13 +765,10 @@ async def _verify_retained_product_observations(connection, snapshot, grant, rea
     from process.registry_fhir_catalog_extraction import RESOURCE_TYPES
     from process.registry_fhir_catalog_products import selected_reviewed_fhir_catalog_product_sources
     from process.registry_fhir_catalog_projection_validation import require_fhir_catalog_registry_reader
-    from process.registry_fhir_catalog_sync import (
-        replay_fhir_catalog_observations,
-        resolve_fhir_catalog_projection_generations,
-    )
+    from process.registry_fhir_catalog_sync import replay_fhir_catalog_observations
 
     await require_fhir_catalog_registry_reader(connection, reader, snapshot, grant)
-    active = await resolve_fhir_catalog_projection_generations(
+    active = await catalog_projection_generations(
         reader if reader is not None else connection, snapshot, grant=grant, descriptors=descriptors
     )
 

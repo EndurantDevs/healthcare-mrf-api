@@ -96,7 +96,13 @@ async def test_retained_batch_never_ranks_or_pages_a_live_outside_office(native_
     assert provider_by_field["address_pagination"]["total"] == 1
     context.overlay.assert_not_awaited()
     assert context.hydration.await_args.kwargs["session"] is context.session
-    context.resolve.assert_awaited_once_with(context.driver, generation_id=12, api_read=True)
+    context.resolve.assert_awaited_once()
+    assert context.resolve.await_args.args == (context.driver,)
+    assert {"control_schema": None, **context.resolve.await_args.kwargs} == {
+        "generation_id": 12,
+        "control_schema": None,
+        "api_read": True,
+    }
     assert network_address_scope.current_network_address_scope() is None
 
 

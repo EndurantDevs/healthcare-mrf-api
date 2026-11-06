@@ -30,6 +30,10 @@ from process.registry_fhir_catalog_publication import (
 )
 from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catalog
 from process.registry_fhir_catalog_reference_rollup import fhir_catalog_reference_workspace
+from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_reads,
+    verify_fhir_catalog_registry_reads,
+)
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation, iter_fhir_catalog_sources
 from process.registry_fhir_catalog_store import copy_fhir_catalog_snapshot, create_fhir_catalog_indexes
 from process.registry_fhir_catalog_sync import (
@@ -192,13 +196,14 @@ async def _publish(case, snapshot, previous=None):
         "expected_approved_revision": 6,
         "standing_grant_sha256": case.grant.sha256,
     }
-    async with connection.transaction():
+    async with fhir_catalog_registry_reads(connection), connection.transaction():
         request = await enqueue_fhir_catalog_publication(
             connection, command_by_field, authorize_metadata=runtime.authorize_metadata, control_schema=control
         )
         claimed = await claim_registry_publication_request(
             connection, operation_family="publication", allow_metadata=True, control_schema=control
         )
+        await verify_fhir_catalog_registry_reads()
     assert str(claimed["request_id"]) == request["request_id"]
     publication_result = await complete_queued_fhir_catalog_publication(
         connection,
@@ -479,8 +484,8 @@ async def _forge_organization(case, target):
 
 
 async def _freeze(case, target, snapshot, *, with_verifier=True):
-    async with case.fixture.publisher.transaction():
-        return await freeze_fhir_catalog_snapshot(
+    async with fhir_catalog_registry_reads(case.fixture.publisher), case.fixture.publisher.transaction():
+        receipt = await freeze_fhir_catalog_snapshot(
             case.fixture.publisher,
             target,
             writer_roles=writer_role_names(
@@ -493,6 +498,8 @@ async def _freeze(case, target, snapshot, *, with_verifier=True):
             if with_verifier
             else None,
         )
+        await verify_fhir_catalog_registry_reads()
+        return receipt
 
 
 @pytest.mark.parametrize("forged", [True, False])

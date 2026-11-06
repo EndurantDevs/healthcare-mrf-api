@@ -58,3 +58,4 @@ def mock_approved_control_metadata(monkeypatch, *, events=None):
         return None, CompactAddressRelation("registry_control", "registry_approved_record", 99)
 
     monkeypatch.setattr("process.network_approved_membership_source.pin_api_retained_approved_membership_source", pin)
+    monkeypatch.setattr("process.network_approved_membership_source._pin_verified_api_approved_source", pin)

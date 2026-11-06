@@ -458,8 +458,10 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
             assert not any(sql.startswith("SET TRANSACTION") for sql in statements)
             await _assert_request_snapshot_closed(context, request)
         for ending, status in (("success", 200), ("error", 404)):
+            resolved_before = len(observations)
             request, reply = await app.asgi_client.get(path + "&ending=" + ending, headers=headers_by_name)
             assert reply.status == status, reply.text
+            assert len(observations) == resolved_before + 1
             assert observations[-1][2][2:] == ("repeatable read", "on")
             assert observations[-1][2][0] == context.fixture.roles["reader"]
             assert reply.headers["X-Network-Generation"] == str(
@@ -480,6 +482,7 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        assert len(observations) == 3
         await _assert_request_snapshot_closed(context, app.asgi_client.last_request)
     finally:
         event.remove(Engine, "before_cursor_execute", record)
@@ -1354,8 +1357,7 @@ async def test_native_legacy_header_mapping_component_scope(
     serving_indexes_db, serving_schema, monkeypatch, checksums, ids, denied
 ):
     """Native mapping/consumption only; the existing manifest double supplies no Source authority."""
-    from api.network_address_scope import _pin_network_scope
-    from process import network_serving_read
+    from api.network_address_scope import _network_scope_claim
     from process.network_address_projection import _identifier
     from process.network_compact_layout import CompactAddressRelation
     from process.network_read_identity import verify_consumed_network_relations
@@ -1365,7 +1367,6 @@ async def test_native_legacy_header_mapping_component_scope(
     manifest = replace(await _manifest(fixture), approved_custom_revision=4)
     _, schema, engine = serving_schema
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-read-token")
-    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", AsyncMock(return_value=manifest))
     approved_records = _legacy_header_mapping_records(denied and checksums == ids == "42")
     for kind, key, document in approved_records:
         await fixture.connection.execute(
@@ -1389,11 +1390,10 @@ async def test_native_legacy_header_mapping_component_scope(
         transaction = session.get_transaction()
         driver = (await (await session.connection()).get_raw_connection()).driver_connection
         backend_pid = driver.get_server_pid()
-        monkeypatch.setattr(serving_reads, "bind_network_request_reader", AsyncMock(return_value=session))
-        actual_manifest, network_ids, _, actual_checksums = await _pin_network_scope(
+        network_ids, _, actual_checksums, generation = _network_scope_claim(
             request, {"network_ids": ids, "network_generation": "1"}
         )
-        assert actual_manifest is manifest and network_ids == tuple(map(int, ids.split(",")))
+        assert generation == manifest.generation_id and network_ids == tuple(map(int, ids.split(",")))
         assert actual_checksums == tuple(map(int, checksums.split(",")))
         oid = await driver.fetchval("SELECT to_regclass($1)::oid::bigint", schema + ".registry_approved_record")
         mapping = await driver.fetchrow(

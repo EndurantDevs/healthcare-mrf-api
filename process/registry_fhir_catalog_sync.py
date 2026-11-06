@@ -52,6 +52,11 @@ from process.registry_fhir_catalog_reference_rollup import (
     staged_fhir_catalog_references,
     staged_plan_tier_references,
 )
+from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_connection,
+    fhir_catalog_registry_reads,
+    verify_fhir_catalog_registry_reads,
+)
 from process.registry_fhir_catalog_reporting import current_fhir_catalog_report
 from process.registry_fhir_catalog_retained import (
     pin_retained_fhir_catalog_source,
@@ -127,14 +132,7 @@ async def reconcile_fhir_catalog(config, *, source_export=None):
         source_pool, loader_pool, sealer_pool, lifecycle_pool, execution_pool = pools
         runtime = build_fhir_catalog_publication_runtime(config.grant, source_pool, **producer_options)
         async with loader_pool.acquire() as loader:
-            async with loader.transaction(isolation="repeatable_read", readonly=True):
-                await verify_fhir_catalog_preparation_permissions(
-                    loader,
-                    replace(config.consumer, metadata_runtime=runtime, metadata_only=True),
-                    loader_role=config.loader_role,
-                    sealer_role=config.sealer_url.username,
-                    role=config.loader_role,
-                )
+            await _preflight_catalog_reader(config, loader, runtime)
             lock_key = "registry-fhir-catalog:" + config.grant.control_schema
             locked = await loader.fetchval("SELECT pg_try_advisory_lock(hashtextextended($1,0))", lock_key)
             if not locked:
@@ -160,6 +158,19 @@ async def reconcile_fhir_catalog(config, *, source_export=None):
                 await loader.execute("SELECT pg_advisory_unlock(hashtextextended($1,0))", lock_key)
 
 
+async def _preflight_catalog_reader(config, loader, runtime):
+    """Refuse missing registry custody before discovery, then release its short snapshot."""
+    async with fhir_catalog_registry_reads(loader), loader.transaction(isolation="repeatable_read", readonly=True):
+        await verify_fhir_catalog_preparation_permissions(
+            loader,
+            replace(config.consumer, metadata_runtime=runtime, metadata_only=True),
+            loader_role=config.loader_role,
+            sealer_role=config.sealer_url.username,
+            role=config.loader_role,
+        )
+        await _catalog_registry_head(loader, config.grant)
+
+
 async def _publish_catalog_snapshot(
     config, loader, snapshot, previous, runtime, lifecycle_pool, execution_pool, *, expected_approved_revision=None
 ):
@@ -174,13 +185,14 @@ async def _publish_catalog_snapshot(
         else expected_approved_revision,
         "standing_grant_sha256": config.grant.sha256,
     }
-    async with loader.transaction(isolation="repeatable_read"):
+    async with fhir_catalog_registry_reads(loader), loader.transaction(isolation="repeatable_read"):
         request = await enqueue_fhir_catalog_publication(
             loader,
             command_by_field,
             authorize_metadata=runtime.authorize_metadata,
             control_schema=config.grant.control_schema,
         )
+        await verify_fhir_catalog_registry_reads()
     consumer = replace(
         config.consumer, metadata_runtime=runtime, metadata_only=True, only_request_id=UUID(request["request_id"])
     )
@@ -264,10 +276,9 @@ async def _prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_poo
             for disposition in unavailable
         ):
             raise ValueError("registry_fhir_catalog_all_source_observations_failed")
-        async with loader.transaction(isolation="repeatable_read"):
+        async with fhir_catalog_registry_reads(loader), loader.transaction(isolation="repeatable_read"):
             head, manifest, previous = await _catalog_registry_head(loader, config.grant)
-            retained_sources = await _retained_catalog_sources(loader, config.grant, manifest)
-            _report_retained_sources(retained_sources)
+            retained_sources = await _collect_retained_catalog_inputs(loader, config.grant, manifest)
             accepted.extend(retained_sources)
             _validate_catalog_sources(accepted, previous)
             snapshot, current_by_generation = await _catalog_snapshot_inputs(
@@ -302,6 +313,7 @@ async def _prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_poo
                     config, loader, source_reads, copy_target, snapshot, previous, current_by_generation
                 )
             )
+            await verify_fhir_catalog_registry_reads()
     if report := current_fhir_catalog_report():
         report.progress("sealing")
     await _seal_catalog_snapshot(
@@ -309,6 +321,16 @@ async def _prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_poo
     )
     accounting_by_phase["prepare_seconds"] = perf_counter() - started
     return snapshot, previous, accounting_by_phase
+
+
+async def _collect_retained_catalog_inputs(loader, grant, manifest):
+    """Authenticate retained inputs on the phase Reader and report the admitted sources."""
+    reader = (
+        await fhir_catalog_registry_connection(loader) if manifest is not None or grant.retained_sources else loader
+    )
+    retained_sources = await _retained_catalog_sources(reader, grant, manifest)
+    _report_retained_sources(retained_sources)
+    return retained_sources
 
 
 def _report_retained_sources(retained_sources):
@@ -371,7 +393,11 @@ async def _catalog_registry_head(loader, grant):
     if head is None:
         raise ValueError("registry_fhir_catalog_registry_unavailable")
     manifest = (
-        await resolve_network_serving_manifest(loader, control_schema=grant.control_schema)
+        await resolve_network_serving_manifest(
+            await fhir_catalog_registry_connection(loader),
+            generation_id=head["generation_id"],
+            control_schema=grant.control_schema,
+        )
         if head["generation_id"] is not None
         else None
     )
@@ -720,6 +746,7 @@ async def _seal_catalog_snapshot(config, copy_target, snapshot, sealer_pool, *, 
         fhir_catalog_reference_workspace(registry_reader) as registry_workspace,
         registry_reader.transaction(isolation="repeatable_read", readonly=True),
         sealer_pool.acquire() as sealer,
+        fhir_catalog_registry_reads(sealer, registry_reader),
         sealer.transaction(),
     ):
         receipt = await freeze_fhir_catalog_snapshot(
@@ -750,6 +777,7 @@ async def _seal_catalog_snapshot(config, copy_target, snapshot, sealer_pool, *, 
             f"({','.join(columns)}) VALUES({parameters})",
             *(canonical_json(snapshot[key]) if key in json_columns else snapshot[key] for key in columns),
         )
+        await verify_fhir_catalog_registry_reads()
 
 
 async def project_manual_fhir_catalog(connection, target, snapshot, *, loader_role, control_schema):

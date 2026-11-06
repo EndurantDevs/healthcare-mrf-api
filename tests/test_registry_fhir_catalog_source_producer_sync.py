@@ -57,6 +57,7 @@ def reconciliation_case(monkeypatch, source_case):
 
     monkeypatch.setattr(sync.asyncpg, "create_pool", Mock(side_effect=open_pool))
     monkeypatch.setattr(sync, "verify_fhir_catalog_preparation_permissions", AsyncMock())
+    monkeypatch.setattr(sync, "_catalog_registry_head", AsyncMock())
     runtime = FHIRCatalogPublicationRuntime(AsyncMock(), AsyncMock(), AsyncMock())
     monkeypatch.setattr(sync, "build_fhir_catalog_publication_runtime", Mock(return_value=runtime))
     monkeypatch.setattr(sync, "prepare_fhir_catalog_snapshot", AsyncMock())
@@ -112,6 +113,19 @@ async def test_reconciliation_reports_publication_only_after_preparation(reconci
         assert report.document["publication_state"] == "in_progress"
     assert result == {"state": "completed", **accounting_by_phase}
     assert sync._publish_catalog_snapshot.await_args.kwargs["expected_approved_revision"] == 7
+    assert events == ["opened"] * 4 + ["closed"] * 4
+
+
+@pytest.mark.asyncio
+async def test_registry_reader_preflight_refuses_before_source_discovery_or_writes(reconciliation_case):
+    case, events = reconciliation_case
+    sync._catalog_registry_head.side_effect = ValueError("registry_fhir_catalog_registry_reader_changed")
+    with pytest.raises(ValueError, match="registry_reader_changed"):
+        await sync.reconcile_fhir_catalog(case.config, source_export=case.factory)
+    sync.prepare_fhir_catalog_snapshot.assert_not_awaited()
+    sync._publish_catalog_snapshot.assert_not_awaited()
+    case.factory.assert_not_called()
+    case.loader.execute.assert_not_awaited()
     assert events == ["opened"] * 4 + ["closed"] * 4
 
 
@@ -753,6 +767,7 @@ async def test_producer_only_reconcile_omits_source_pool_and_preserves_publicati
     pool = SimpleNamespace(acquire=lambda: _scope(source_case.loader))
     monkeypatch.setattr(sync.asyncpg, "create_pool", Mock(side_effect=lambda *_args, **_kwargs: _scope(pool)))
     monkeypatch.setattr(sync, "verify_fhir_catalog_preparation_permissions", AsyncMock())
+    monkeypatch.setattr(sync, "_catalog_registry_head", AsyncMock())
     runtime = object()
     monkeypatch.setattr(sync, "build_fhir_catalog_publication_runtime", Mock(return_value=runtime))
     monkeypatch.setattr(sync, "prepare_fhir_catalog_snapshot", AsyncMock(return_value=({"sealed": True}, None, {})))

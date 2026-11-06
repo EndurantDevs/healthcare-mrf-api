@@ -96,10 +96,20 @@ existing API grants. It creates no roles or credentials and grants no Source
 access. Alias values remain trusted application validation, not row-scoped ACLs.
 The worker verifies the prepared privileges before creating a candidate.
 
-The Sealer keeps a separate authenticated, read-only repeatable-read connection
-open through candidate closure and commit. That connection verifies the exact
-directory attachment and retained inputs; current candidate reads and temporary
-projection replay remain on the fresh read-committed Sealer transaction.
+Attached and retained catalog operations use the existing configured Reader pool
+(`HLTHPRT_DB_READER_USER` and `HLTHPRT_DB_READER_PASSWORD`, with the ordinary
+`HLTHPRT_DB_HOST`, `HLTHPRT_DB_PORT` and database selectors). The worker checks
+the directory head before Source discovery, closes that short snapshot, then
+owns fresh repeatable-read, read-only Reader transactions through each writer
+commit. Native directory and retained-capture custody keep their locking checks;
+catalog writers need no membership SELECT. Missing Reader configuration or
+changed login, database, backend or transaction identity refuses the operation.
+
+The Sealer retains its separate same-actor repeatable-read connection for input
+replay. Current candidate reads and temporary projection replay remain on the
+fresh read-committed Sealer transaction. The configured registry Reader neither
+changes Source ownership nor supplies publication authority; Execution keeps
+the approved-revision, serving-generation and previous-metadata head checks.
 
 The metadata-only standing grant may select
 `registry-fhir-catalog-observation-v1` as its `observation_contract`. This
