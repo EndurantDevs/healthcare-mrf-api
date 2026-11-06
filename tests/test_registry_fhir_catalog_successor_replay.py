@@ -217,7 +217,7 @@ async def test_product_verifier_selects_active_generation_and_counts_physical_ro
     active = (generation,)
     resolver = AsyncMock(return_value=active)
     selector = AsyncMock(return_value=descriptors_by_generation)
-    monkeypatch.setattr(sync, "resolve_fhir_catalog_projection_generations", resolver)
+    monkeypatch.setattr(grants, "catalog_projection_generations", resolver)
     monkeypatch.setattr(products, "selected_reviewed_fhir_catalog_product_sources", selector)
     monkeypatch.setattr(projection, "require_fhir_catalog_registry_reader", AsyncMock())
     monkeypatch.setattr(grants, "require_retained_fhir_catalog_sources", AsyncMock())
@@ -267,7 +267,7 @@ async def test_product_verifier_checks_registry_reader_before_resolving_authorit
     denied = AsyncMock(side_effect=ValueError("synthetic reader refusal"))
     resolver = AsyncMock()
     monkeypatch.setattr(projection, "require_fhir_catalog_registry_reader", denied)
-    monkeypatch.setattr(sync, "resolve_fhir_catalog_projection_generations", resolver)
+    monkeypatch.setattr(grants, "catalog_projection_generations", resolver)
     connection, reader, selected, grant = object(), object(), object(), object()
     with pytest.raises(ValueError, match="synthetic reader refusal"):
         await grants._verify_retained_product_observations(connection, selected, grant, reader, object(), {})

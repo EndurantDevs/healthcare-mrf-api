@@ -13,6 +13,7 @@ import pytest
 
 from process import registry_fhir_catalog_products as products
 from process import registry_fhir_catalog_projection_validation as validation
+from process import registry_fhir_catalog_registry_reader as registry_reads
 from process import registry_fhir_catalog_sync as sync
 from process.registry_fhir_catalog_retained import _descriptor
 from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
@@ -207,7 +208,7 @@ async def test_replay_resolves_active_generations_once_and_passes_them_to_produc
     replay.sources = {source["generation"]: source for source in connection.sources}
     active = (connection.generation,)
     resolver = AsyncMock(return_value=active)
-    monkeypatch.setattr(sync, "resolve_fhir_catalog_projection_generations", resolver)
+    monkeypatch.setattr(registry_reads, "catalog_projection_generations", resolver)
     for method in ("inputs", "create", "manual", "networks", "relationships", "products", "compare"):
         monkeypatch.setattr(replay, method, AsyncMock())
     await replay.run()

@@ -25,6 +25,10 @@ from process.registry_fhir_catalog_grant import (
     FHIRCatalogStandingGrant,
     build_fhir_catalog_publication_runtime,
 )
+from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_reads,
+    verify_fhir_catalog_registry_reads,
+)
 from process.registry_fhir_catalog_validation import metadata_generation
 from process.registry_publication_queue import (
     claim_registry_publication_request,
@@ -210,10 +214,12 @@ async def test_numeric_authorization_refuses():
 
 
 async def _enqueue(fixture, authorize=_authorize):
-    async with fixture.connection.transaction():
-        return await publication.enqueue_fhir_catalog_publication(
+    async with fhir_catalog_registry_reads(fixture.connection), fixture.connection.transaction():
+        receipt = await publication.enqueue_fhir_catalog_publication(
             fixture.connection, fixture.command, authorize_metadata=authorize, control_schema=fixture.control_schema
         )
+        await verify_fhir_catalog_registry_reads()
+        return receipt
 
 
 async def _claim_exact(fixture, receipt):

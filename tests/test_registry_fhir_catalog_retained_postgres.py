@@ -33,11 +33,16 @@ from process.registry_fhir_catalog_publication import (
     enqueue_fhir_catalog_publication,
 )
 from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catalog
+from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_reads,
+    verify_fhir_catalog_registry_reads,
+)
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
 from process.registry_fhir_catalog_store import discard_fhir_catalog_candidate
 from process.registry_fhir_catalog_sync import prepare_fhir_catalog_snapshot
 from process.registry_publication_queue import claim_registry_publication_request
 from tests import test_network_fhir_retained_capture_postgres as retained_fixtures
+from tests.fhir_catalog_registry_reader_support import configured_catalog_reader
 from tests.test_network_fhir_retained_capture_postgres import _approved_capture_recipe, _capture, _retained_addresses
 from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
@@ -217,7 +222,7 @@ async def _publish_catalog(connection, config, source_pool, snapshot, previous):
         "expected_approved_revision": snapshot["metadata_approved_revision"],
         "standing_grant_sha256": config.grant.sha256,
     }
-    async with connection.transaction(isolation="repeatable_read"):
+    async with fhir_catalog_registry_reads(connection), connection.transaction(isolation="repeatable_read"):
         queued = await enqueue_fhir_catalog_publication(
             connection,
             command_by_field,
@@ -232,6 +237,7 @@ async def _publish_catalog(connection, config, source_pool, snapshot, previous):
             request_id=UUID(queued["request_id"]),
             control_schema=config.grant.control_schema,
         )
+        await verify_fhir_catalog_registry_reads()
     return await complete_queued_fhir_catalog_publication(
         connection,
         claimed["request_id"],
@@ -292,23 +298,27 @@ async def _retained_roundtrip_case(source_fixture, serving, metadata, *, attach_
         source_fixture, metadata, serving, retained_sources=() if attach_directory else (recipe,)
     )
     try:
-        yield SimpleNamespace(
-            source=source_fixture,
-            serving=serving,
-            connection=connection,
-            control=control,
-            capture=capture,
-            recipe=recipe,
-            approved=approved,
-            canonical_id=canonical_id,
-            canonical_name=canonical_name,
-            addresses=addresses,
-            manifest=manifest,
-            config=config,
-            reader=reader,
-            source_pool=source_pool,
-            sealer_pool=sealer_pool,
-        )
+        with pytest.MonkeyPatch.context() as settings:
+            async with configured_catalog_reader(
+                settings, source_fixture.dsn, source_fixture.role_by_kind["reader"], source_fixture.role_password
+            ):
+                yield SimpleNamespace(
+                    source=source_fixture,
+                    serving=serving,
+                    connection=connection,
+                    control=control,
+                    capture=capture,
+                    recipe=recipe,
+                    approved=approved,
+                    canonical_id=canonical_id,
+                    canonical_name=canonical_name,
+                    addresses=addresses,
+                    manifest=manifest,
+                    config=config,
+                    reader=reader,
+                    source_pool=source_pool,
+                    sealer_pool=sealer_pool,
+                )
     finally:
         schemas = await connection.fetch(
             "SELECT nspname FROM pg_namespace WHERE nspowner=ANY(SELECT oid FROM pg_roles WHERE rolname=ANY($1::text[]))",

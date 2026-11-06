@@ -14,11 +14,22 @@ from process.registry_fhir_catalog_custody import PHYSICAL_TABLES
 from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catalog
 from process.registry_fhir_catalog_worker import run_fhir_catalog_sync
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
+from tests.fhir_catalog_registry_reader_support import configured_catalog_reader
 from tests.fhir_catalog_sync_integration_support import adopt_existing_network, import_source, native_catalog_case
 
 
 def _decoded(value):
     return json.loads(value) if isinstance(value, str) else value
+
+
+async def _sync_catalog(case, config):
+    async with configured_catalog_reader(
+        case.settings,
+        case.reader_url.render_as_string(hide_password=False),
+        case.reader_url.username,
+        case.reader_url.password,
+    ):
+        return await run_fhir_catalog_sync(config)
 
 
 async def _schema_state(connection, schema):
@@ -103,7 +114,7 @@ async def _metadata_reader_refusal(case, config, execution, connection, original
         grant=replace(config.grant, version=config.grant.version + 1),
     )
     with pytest.raises(RuntimeError, match="registry_publication_consumer_unavailable") as refused:
-        await run_fhir_catalog_sync(bad)
+        await _sync_catalog(case, bad)
     assert "42501" in _sqlstates(refused.value)
     assert await _head(case) == original_head
     snapshots = await _snapshots(case)
@@ -126,7 +137,7 @@ async def _metadata_reader_refusal(case, config, execution, connection, original
     return bad, snapshots, failed, failed_physical
 
 
-async def _restore_metadata_reader(config, bad, execution, initial):
+async def _restore_metadata_reader(case, config, bad, execution, initial):
     """Restore only the reader and grant version before normal publication."""
     fixed = replace(
         bad,
@@ -141,7 +152,7 @@ async def _restore_metadata_reader(config, bad, execution, initial):
     } == {
         field_name: field_value for field_name, field_value in bad.grant.document().items() if field_name != "version"
     }
-    sync_receipt = await run_fhir_catalog_sync(fixed)
+    sync_receipt = await _sync_catalog(case, fixed)
     assert sync_receipt["state"] == "completed" and sync_receipt["accepted_sources"] == initial["accepted_sources"]
     assert sync_receipt["result"]["memberships_reused"] and sync_receipt["result"]["addresses_reused"]
     assert (
@@ -201,7 +212,7 @@ async def _publish_without_api_reader(case, config, api, execution, incumbent, c
         grant=replace(config.grant, version=2),
     )
     assert execution in missing_api.reader_roles
-    first = await run_fhir_catalog_sync(missing_api)
+    first = await _sync_catalog(case, missing_api)
     assert first["state"] == "completed" and first["accepted_sources"] > 0
     original_head = await _head(case)
     assert original_head[0] == incumbent.generation_id
@@ -228,7 +239,7 @@ async def _restore_api_reader(case, config, api, execution, missing_api, first, 
         for field_name, field_value in missing_api.grant.document().items()
         if field_name != "version"
     }
-    sync_receipt = await run_fhir_catalog_sync(fixed)
+    sync_receipt = await _sync_catalog(case, fixed)
     assert sync_receipt["state"] == "completed" and sync_receipt["accepted_sources"] == first["accepted_sources"]
     assert sync_receipt["result"]["memberships_reused"] and sync_receipt["result"]["addresses_reused"]
     assert (
@@ -261,7 +272,7 @@ async def test_metadata_execution_reader_successor_preserves_incumbent(monkeypat
             incumbent = await resolve_network_serving_manifest(connection, control_schema=case.fixture.control_schema)
             source_before = await _schema_state(connection, "mrf")
             membership_before = await _schema_state(connection, incumbent.schema_name)
-        initial = await run_fhir_catalog_sync(config)
+        initial = await _sync_catalog(case, config)
         assert initial["state"] == "completed" and initial["accepted_sources"] > 0
         assert initial["result"]["memberships_reused"] and initial["result"]["addresses_reused"]
         original_head = await _head(case)
@@ -273,7 +284,7 @@ async def test_metadata_execution_reader_successor_preserves_incumbent(monkeypat
             case, config, execution, connection, original_head, old
         )
 
-        fixed = await _restore_metadata_reader(config, bad, execution, initial)
+        fixed = await _restore_metadata_reader(case, config, bad, execution, initial)
         head = await _head(case)
         assert head[0] == original_head[0] and head[1] not in snapshots
         final = await _snapshots(case)
@@ -293,7 +304,7 @@ async def test_metadata_execution_reader_successor_preserves_incumbent(monkeypat
                 await resolve_network_serving_manifest(connection, control_schema=case.fixture.control_schema)
                 == incumbent
             )
-        assert (await run_fhir_catalog_sync(fixed))["state"] == "unchanged"
+        assert (await _sync_catalog(case, fixed))["state"] == "unchanged"
         _record_metadata_reader_evidence(record_property)
 
 
@@ -353,7 +364,7 @@ async def test_api_reader_successor_preserves_incumbent(monkeypatch, tmp_path, r
         assert await _schema_state(connection, old["schema_name"]) == old_physical
         assert await _schema_state(connection, incumbent.schema_name) == membership_before
         assert await _schema_state(connection, "mrf") == source_before
-        assert (await run_fhir_catalog_sync(fixed))["state"] == "unchanged"
+        assert (await _sync_catalog(case, fixed))["state"] == "unchanged"
         record_property(
             "api_reader_native",
             json.dumps(

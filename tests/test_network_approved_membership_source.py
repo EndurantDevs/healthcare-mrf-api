@@ -96,8 +96,9 @@ async def test_api_pin_re_resolves_the_exact_manifest_before_reading_control_poi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owned", [False, True])
 @pytest.mark.parametrize("fault", ["physical_pointer", "source_generation"])
-async def test_api_pin_rejects_consumed_heap_or_approved_generation_drift(monkeypatch, fault):
+async def test_api_pin_rejects_consumed_heap_or_approved_generation_drift(monkeypatch, fault, owned):
     from process import network_candidate_custody as custody
     from process import network_serving_read as serving
 
@@ -119,7 +120,12 @@ async def test_api_pin_rejects_consumed_heap_or_approved_generation_drift(monkey
         ),
     )
     with pytest.raises(approved.ApprovedMembershipSourceError, match="prerequisites|generation differs"):
-        await approved.pin_api_retained_approved_membership_source(connection, manifest, control_schema="registry")
+        if owned:
+            await approved.resolve_api_retained_approved_membership_source(
+                connection, generation_id=manifest.generation_id, control_schema="registry"
+            )
+        else:
+            await approved.pin_api_retained_approved_membership_source(connection, manifest, control_schema="registry")
     assert connection.fetchrow.await_count == 2
     assert connection.fetchrow.await_args.args[1:4] == (['"registry"."registry_approved_record"'], [42], 41)
 
@@ -128,7 +134,8 @@ async def test_api_pin_rejects_consumed_heap_or_approved_generation_drift(monkey
 @pytest.mark.parametrize(
     "failure", [asyncpg.PostgresError("read unavailable"), ValueError("invalid catalog"), asyncio.CancelledError()]
 )
-async def test_api_pin_preserves_cancellation_and_closes_other_resolver_failures(monkeypatch, failure):
+@pytest.mark.parametrize("owned", [False, True])
+async def test_api_pin_preserves_cancellation_and_closes_other_resolver_failures(monkeypatch, failure, owned):
     from process import network_serving_read as serving
 
     monkeypatch.setattr(serving, "resolve_network_serving_manifest", AsyncMock(side_effect=failure))
@@ -138,7 +145,10 @@ async def test_api_pin_preserves_cancellation_and_closes_other_resolver_failures
         else approved.ApprovedMembershipSourceError
     )
     with pytest.raises(expected) as rejected:
-        await approved.pin_api_retained_approved_membership_source(object(), _manifest(), control_schema="registry")
+        if owned:
+            await approved.resolve_api_retained_approved_membership_source(object(), control_schema="registry")
+        else:
+            await approved.pin_api_retained_approved_membership_source(object(), _manifest(), control_schema="registry")
     if isinstance(failure, asyncio.CancelledError):
         assert rejected.value is failure
     else:
@@ -164,3 +174,19 @@ async def test_bounded_page_failure_retains_its_native_cause_without_returning_p
     with pytest.raises(approved.ApprovedMembershipSourceError, match="page is unavailable") as rejected:
         await approved.read_approved_membership_batch(connection, source, control_schema="registry")
     assert rejected.value.__cause__ is error and connection.fetchrow.await_count == 2
+
+
+@pytest.mark.parametrize("generation", [None, 7])
+async def test_owned_api_pin_resolves_once_before_approved_custody(monkeypatch, generation):
+    from process import network_serving_read as serving
+
+    connection, manifest, source, relation = object(), _manifest(), object(), object()
+    resolve = AsyncMock(return_value=manifest)
+    control_pin = AsyncMock(return_value=(source, relation))
+    monkeypatch.setattr(serving, "resolve_network_serving_manifest", resolve)
+    monkeypatch.setattr(approved, "_pin_verified_api_approved_source", control_pin)
+    assert await approved.resolve_api_retained_approved_membership_source(
+        connection, generation_id=generation, control_schema="registry"
+    ) == (manifest, source, relation)
+    resolve.assert_awaited_once_with(connection, generation_id=generation, control_schema="registry", api_read=True)
+    control_pin.assert_awaited_once_with(connection, manifest, control_schema="registry")

@@ -338,32 +338,48 @@ async def network_address_read_session_scope(
     legacy_checksums=None,
 ):
     """Authenticate control pins and guard actual buffered reads on the original Reader."""
-    from api.network_read_execution import _original_read_driver, network_read_name_inventory
+    from api.network_read_execution import _original_read_driver
     from process.network_approved_membership_source import pin_api_retained_approved_membership_source
 
     transaction = session.get_transaction()
     try:
         driver, backend_pid = await _original_read_driver(session)
         _approved, approved_relation = await pin_api_retained_approved_membership_source(driver, manifest)
-        current_driver, current_pid = await _original_read_driver(session)
-        if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
-            raise ServiceUnavailable(
-                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
-            )
     except (ValueError, TypeError, KeyError) as error:
         raise ServiceUnavailable(
             "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
         ) from error
+    async with _bound_address_read_session_scope(
+        session,
+        transaction,
+        driver,
+        backend_pid,
+        manifest,
+        approved_relation,
+        network_ids,
+        access_scope_sha256=access_scope_sha256,
+        excluded_network_ids=excluded_network_ids,
+        organization_policy=organization_policy,
+        legacy_checksums=legacy_checksums,
+    ) as scope:
+        yield scope
+
+
+@asynccontextmanager
+async def _bound_address_read_session_scope(
+    session, transaction, driver, backend_pid, manifest, approved_relation, network_ids, **scope_options
+):
+    """Keep the verified pin on the same Reader until all buffered reads finish."""
+    from api.network_read_execution import _original_read_driver, network_read_name_inventory
+
+    current_driver, current_pid = await _original_read_driver(session)
+    if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
+        raise ServiceUnavailable(
+            "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+        )
     with network_read_name_inventory(driver, (*manifest.candidate_relation_pins, approved_relation)):
-        with network_address_read_scope(
-            manifest,
-            network_ids,
-            access_scope_sha256=access_scope_sha256,
-            excluded_network_ids=excluded_network_ids,
-            organization_policy=organization_policy,
-            legacy_checksums=legacy_checksums,
-        ) as scope:
-            if legacy_checksums is not None:
+        with network_address_read_scope(manifest, network_ids, **scope_options) as scope:
+            if scope.legacy_checksums is not None:
                 await _require_legacy_mapping(
                     session,
                     driver,
@@ -372,7 +388,7 @@ async def network_address_read_session_scope(
                     approved_relation,
                     manifest,
                     network_ids,
-                    legacy_checksums,
+                    scope.legacy_checksums,
                 )
             yield scope
 
@@ -666,17 +682,37 @@ def _network_scope_claim(request, args):
     return network_ids, access_scope_sha256, legacy_checksums, generation
 
 
+@asynccontextmanager
 async def _pin_network_scope(request, args):
+    from api.network_read_execution import _original_read_driver
     from api.network_serving_read_context import bind_network_request_reader
-    from process.network_serving_read import resolve_network_serving_manifest
+    from process.network_approved_membership_source import resolve_api_retained_approved_membership_source
 
     network_ids, access_scope_sha256, legacy_checksums, generation = _network_scope_claim(request, args)
     session = await bind_network_request_reader(request)
     await session.execute(text("SET LOCAL lock_timeout='1s'"))
-    connection = await session.connection()
-    driver = (await connection.get_raw_connection()).driver_connection
-    manifest = await resolve_network_serving_manifest(driver, generation_id=generation, api_read=True)
-    return manifest, network_ids, access_scope_sha256, legacy_checksums
+    transaction = session.get_transaction()
+    try:
+        driver, backend_pid = await _original_read_driver(session)
+        manifest, _approved, approved_relation = await resolve_api_retained_approved_membership_source(
+            driver, generation_id=generation
+        )
+    except (ValueError, TypeError, KeyError) as error:
+        raise ServiceUnavailable(
+            "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+        ) from error
+    async with _bound_address_read_session_scope(
+        session,
+        transaction,
+        driver,
+        backend_pid,
+        manifest,
+        approved_relation,
+        network_ids,
+        access_scope_sha256=access_scope_sha256,
+        legacy_checksums=legacy_checksums,
+    ) as scope:
+        yield scope
 
 
 def canonical_network_read(handler):
@@ -695,7 +731,8 @@ def canonical_network_read(handler):
         from process.network_serving_read import NetworkServingReadUnavailable
 
         try:
-            manifest, network_ids, access_scope_sha256, legacy_checksums = await _pin_network_scope(request, selector)
+            async with _pin_network_scope(request, selector) as scope:
+                return await _canonical_network_response(handler, request, args, kwargs, scope)
         except SanicException as refusal:
             refusal.headers = {**(refusal.headers or {}), "Cache-Control": "private, no-store"}
             raise
@@ -703,29 +740,24 @@ def canonical_network_read(handler):
             raise ServiceUnavailable(
                 "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
             ) from error
-        async with network_address_read_session_scope(
-            request.ctx.sa_session,
-            manifest,
-            network_ids,
-            access_scope_sha256=access_scope_sha256,
-            legacy_checksums=legacy_checksums,
-        ):
-            pinned_headers_by_name = {
-                "X-Network-Generation": str(manifest.generation_id),
-                "Cache-Control": "private, no-store",
-            }
-            if legacy_checksums is not None:
-                pinned_headers_by_name["X-Network-Legacy-Checksums"] = ",".join(map(str, legacy_checksums))
-            try:
-                http_response = await handler(request, *args, **kwargs)
-            except SanicException as error:
-                error.headers = {**(error.headers or {}), **pinned_headers_by_name}
-                raise
-            except (asyncpg.PostgresError, DBAPIError) as error:
-                raise ServiceUnavailable(
-                    "Canonical network data is unavailable.", headers=pinned_headers_by_name
-                ) from error
-            http_response.headers.update(pinned_headers_by_name)
-            return http_response
 
     return wrapped
+
+
+async def _canonical_network_response(handler, request, args, kwargs, scope):
+    """Preserve generation and legacy acknowledgements on both success and refusal."""
+    pinned_headers_by_name = {
+        "X-Network-Generation": str(scope.manifest.generation_id),
+        "Cache-Control": "private, no-store",
+    }
+    if scope.legacy_checksums is not None:
+        pinned_headers_by_name["X-Network-Legacy-Checksums"] = ",".join(map(str, scope.legacy_checksums))
+    try:
+        http_response = await handler(request, *args, **kwargs)
+    except SanicException as error:
+        error.headers = {**(error.headers or {}), **pinned_headers_by_name}
+        raise
+    except (asyncpg.PostgresError, DBAPIError) as error:
+        raise ServiceUnavailable("Canonical network data is unavailable.", headers=pinned_headers_by_name) from error
+    http_response.headers.update(pinned_headers_by_name)
+    return http_response

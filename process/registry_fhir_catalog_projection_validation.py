@@ -491,10 +491,10 @@ class _ProjectionReplay:
 
     async def run(self):
         """Replay production ordering and remove only this verification's temporary heaps."""
-        from process.registry_fhir_catalog_sync import resolve_fhir_catalog_projection_generations
+        from process.registry_fhir_catalog_registry_reader import catalog_projection_generations
 
         await self.inputs()
-        active = await resolve_fhir_catalog_projection_generations(
+        active = await catalog_projection_generations(
             self.registry_reader,
             self.snapshot,
             grant=self.grant,
