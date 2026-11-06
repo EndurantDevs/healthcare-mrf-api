@@ -50,6 +50,31 @@ from tests.test_custom_import_writer_cutover_postgres import _before_cutover, _r
 from tests.test_custom_import_writer_cutover_postgres import _install as _install_cutover
 from tests.test_custom_import_writer_cutover_postgres import _refresh as _refresh_rejections
 
+
+async def test_logged_family_survives_unlogged_landing_migration():
+    from tests.custom_import_unlogged_landing_postgres import (
+        test_logged_family_survives_migration_with_all_function_metadata_exact as verify,
+    )
+
+    await verify()
+
+
+async def test_unlogged_landing_rolls_back_promotion_and_replays_committed_prefix(monkeypatch):
+    from tests.custom_import_unlogged_landing_postgres import (
+        test_new_landing_rolls_back_promoted_batch_and_replays_committed_prefix as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_unlogged_landing_does_not_allow_unlogged_serving_leaves():
+    from tests.custom_import_unlogged_landing_postgres import (
+        test_unlogged_serving_leaf_is_still_rejected_and_rolls_back as verify,
+    )
+
+    await verify()
+
+
 _PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20261009000000_custom_import_child_presence_decode.py"
 
 
