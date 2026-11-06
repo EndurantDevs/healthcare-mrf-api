@@ -2321,7 +2321,7 @@ fn validate_provider_group(
 
 fn provider_reference_network_names(provider_ref: &Value) -> io::Result<Vec<String>> {
     match provider_ref.get("network_name") {
-        None => Ok(Vec::new()),
+        None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::String(value)) => Ok(vec![value.clone()]),
         Some(Value::Array(values)) if values.iter().all(Value::is_string) => Ok(values
             .iter()
@@ -2334,7 +2334,7 @@ fn provider_reference_network_names(provider_ref: &Value) -> io::Result<Vec<Stri
         )),
         Some(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "provider reference network_name must be a string or an array of strings",
+            "provider reference network_name must be a string, an array of strings, or null",
         )),
     }
 }

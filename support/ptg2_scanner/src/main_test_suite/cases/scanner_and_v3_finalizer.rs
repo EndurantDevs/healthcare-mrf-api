@@ -240,7 +240,6 @@ fn strict_provider_definition_rejects_malformed_tin_and_network_metadata() {
     }
 
     for invalid_network_name in [
-        Value::Null,
         json!(true),
         json!(7),
         json!({}),
@@ -251,6 +250,13 @@ fn strict_provider_definition_rejects_malformed_tin_and_network_metadata() {
         provider_ref["network_name"] = invalid_network_name;
         assert!(provider_ref_definition(&provider_ref).is_err());
     }
+
+    let mut provider_ref = valid_provider_reference();
+    let omitted = provider_ref_definition(&provider_ref).unwrap();
+    provider_ref["network_name"] = Value::Null;
+    let explicit_null = provider_ref_definition(&provider_ref).unwrap();
+    assert!(explicit_null.1.network_names.is_empty());
+    assert_eq!(explicit_null, omitted);
 
     let mut scalar_provider_ref = valid_provider_reference();
     scalar_provider_ref["network_name"] = json!(" network one ");
