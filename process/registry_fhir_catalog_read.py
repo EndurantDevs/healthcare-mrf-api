@@ -320,9 +320,15 @@ def _nested_document(document, validator, offset):
 
 
 def _network_item(document, query):
-    _object(document, _NETWORK_FIELDS)
+    from process.registry_fhir_catalog_source_companies import validate_fhir_catalog_source_company_records
+
+    _object(document, _NETWORK_FIELDS | ({"source_companies"} if "source_companies" in document else set()))
+    if "source_companies" in document:
+        validate_fhir_catalog_source_company_records(document["source_companies"])
     legacy_by_field = {
-        key: entry for key, entry in document.items() if key not in {"matching_relationships", "source_bindings"}
+        key: entry
+        for key, entry in document.items()
+        if key not in {"matching_relationships", "source_bindings", "source_companies"}
     }
     catalog_network_document({**legacy_by_field, "companies": [], "source_bindings": []})
     _nested_document(document["matching_relationships"], _relationship_document, query.relationship_offset)
@@ -455,12 +461,20 @@ _DIRECTORY_AVAILABLE_SQL = """EXISTS(SELECT 1 FROM (
 
 
 _PAGE_SQL = r"""
-WITH searched_edges AS MATERIALIZED (
+WITH source_companies AS MATERIALIZED (
+ SELECT source.source_generation,source.status,company.source_id,company.display_name,
+   jsonb_build_object('source_id',company.source_id,'endpoint_id',company.endpoint_id,
+     'display_name',company.display_name,'provenance',company.provenance) AS document
+ FROM jsonb_to_recordset($19::jsonb) source(source_generation text,status text,source_companies jsonb)
+ CROSS JOIN LATERAL jsonb_to_recordset(source.source_companies)
+   company(source_id text,endpoint_id text,display_name text,provenance text)
+ WHERE $12::text[] IS NULL OR company.source_id=($12::text[])[2]
+), searched_edges AS MATERIALIZED (
  SELECT edge.network_id,edge.relationship_id FROM {control}.registry_fhir_catalog_relationship edge
  WHERE edge.metadata_generation=$1
    AND (edge.company_search LIKE $10 ESCAPE '\' OR edge.plan_search LIKE $10 ESCAPE '\')
 ), matching_edges AS NOT MATERIALIZED (
- SELECT edge.network_id,edge.relationship_id,
+ SELECT edge.network_id,edge.relationship_id,edge.source_generation,binding.binding_id,
    CASE WHEN edge.group_id=ANY($4::uuid[]) THEN
      (edge.document_json-'relationship_id') || jsonb_build_object('group',NULL)
    ELSE edge.document_json-'relationship_id' END AS visible_document,
@@ -474,7 +488,12 @@ WITH searched_edges AS MATERIALIZED (
    AND (edge.company_id IS NULL OR NOT edge.company_id=ANY($3::uuid[]))
    AND ($5::uuid IS NULL OR edge.company_id=$5)
    AND ($6::uuid IS NULL OR (edge.group_id=$6 AND NOT edge.group_id=ANY($4::uuid[])))
-   AND ($7::text IS NULL OR edge.company_search LIKE $7 ESCAPE '\')
+   AND ($7::text IS NULL OR edge.company_search LIKE $7 ESCAPE '\'
+     OR ($5::uuid IS NULL AND $6::uuid IS NULL AND edge.source_id<>'registry-manual'
+       AND EXISTS(SELECT 1 FROM source_companies company
+         WHERE company.source_generation=edge.source_generation
+           AND company.source_generation=split_part(binding.document_json->>'evidence_id',':',1)
+           AND lower(company.display_name) LIKE $7 ESCAPE '\')))
    AND ($8::text IS NULL OR edge.plan_search LIKE $8 ESCAPE '\')
    AND ($12::text[] IS NULL OR ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
      binding.document_json->>'dataset_schema',binding.document_json->>'dataset_id',
@@ -484,13 +503,26 @@ WITH searched_edges AS MATERIALIZED (
    visible_document || jsonb_build_object('relationship_id',CASE WHEN redacted THEN
      encode(sha256(convert_to(visible_document::text,'UTF8')),'hex') ELSE relationship_id END) AS document
  FROM matching_edges ORDER BY network_id,visible_document,redacted DESC,relationship_id
+), source_label_networks AS MATERIALIZED (
+ SELECT DISTINCT binding.network_id,lower(company.display_name) LIKE $10 ESCAPE '\' AS broad_match
+ FROM {control}.registry_fhir_catalog_binding binding
+ JOIN source_companies company ON company.source_generation=split_part(binding.document_json->>'evidence_id',':',1)
+ WHERE binding.metadata_generation=$1 AND $5::uuid IS NULL AND $6::uuid IS NULL
+   AND ($7::text IS NULL OR lower(company.display_name) LIKE $7 ESCAPE '\')
+   AND ($12::text[] IS NULL OR ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
+     binding.document_json->>'dataset_schema',binding.document_json->>'dataset_id',
+     binding.document_json->>'producer_id',binding.document_json->>'edition_id']=$12)
+   AND ($8::text IS NULL OR EXISTS(SELECT 1 FROM matching_edges edge
+     WHERE edge.network_id=binding.network_id AND edge.binding_id=binding.binding_id
+       AND edge.source_generation=company.source_generation))
 ), filtered AS MATERIALIZED (
  SELECT network.* FROM {control}.registry_fhir_catalog_network network
  WHERE network.metadata_generation=$1 AND NOT network.network_id=ANY($2::integer[])
    AND ($9::boolean IS NULL OR network.archived=$9)
    AND ($10::text IS NULL OR network.search_name LIKE $10 ESCAPE '\'
      OR network.network_id IN (SELECT edge.network_id FROM matching_edges edge
-       JOIN searched_edges searched USING(network_id,relationship_id)))
+       JOIN searched_edges searched USING(network_id,relationship_id))
+     OR network.network_id IN (SELECT network_id FROM source_label_networks WHERE broad_match))
    AND ($11::text IS NULL OR $11=ANY(network.benefit_codes))
    AND ($12::text[] IS NULL OR EXISTS(SELECT 1 FROM {control}.registry_fhir_catalog_binding binding
      WHERE binding.metadata_generation=$1 AND binding.network_id=network.network_id
@@ -499,7 +531,8 @@ WITH searched_edges AS MATERIALIZED (
          binding.document_json->>'producer_id',binding.document_json->>'edition_id']=$12))
    AND ($13::integer IS NULL OR network.network_id=$13)
    AND (($5::uuid IS NULL AND $6::uuid IS NULL AND $7::text IS NULL AND $8::text IS NULL)
-     OR EXISTS(SELECT 1 FROM visible_edges edge WHERE edge.network_id=network.network_id))
+     OR EXISTS(SELECT 1 FROM visible_edges edge WHERE edge.network_id=network.network_id)
+     OR ($7::text IS NOT NULL AND network.network_id IN (SELECT network_id FROM source_label_networks)))
 ), page AS MATERIALIZED (
  SELECT * FROM filtered ORDER BY lower(display_name) COLLATE "C",network_id OFFSET $14 LIMIT $15
 ), documents AS MATERIALIZED (
@@ -507,6 +540,16 @@ WITH searched_edges AS MATERIALIZED (
    'network_id',page.network_id,'display_name',page.display_name,'aliases',page.aliases,
    'archived',page.archived,'revision',page.revision,'priceable',NULL,'benefit_codes',page.benefit_codes,
    'directory_available',{directory_available},
+   'source_companies',coalesce((SELECT jsonb_agg(selected.document ORDER BY selected.source_id COLLATE "C")
+     FROM (SELECT DISTINCT ON (company.source_id COLLATE "C") company.source_id,company.document
+       FROM source_companies company JOIN {control}.registry_fhir_catalog_binding binding
+         ON company.source_generation=split_part(binding.document_json->>'evidence_id',':',1)
+       WHERE binding.metadata_generation=$1 AND binding.network_id=page.network_id
+         AND ($12::text[] IS NULL OR ARRAY[binding.document_json->>'source_system',binding.document_json->>'source_id',
+           binding.document_json->>'dataset_schema',binding.document_json->>'dataset_id',
+           binding.document_json->>'producer_id',binding.document_json->>'edition_id']=$12)
+       ORDER BY company.source_id COLLATE "C",(company.status='current') DESC,
+         company.source_generation COLLATE "C") selected),'[]'::jsonb),
    'matching_relationships',jsonb_build_object('total',relationships.total,'offset',$16::integer,
      'limit',5,'items',relationships.documents,'next_offset',
        CASE WHEN $16+jsonb_array_length(relationships.documents)<relationships.total
@@ -544,7 +587,7 @@ def _catalog_page_statement(snapshot, manifest):
     parameters, relations = (), ()
     directory_available = "false"
     if manifest is not None:
-        addresses, parameters, relations = catalog_directory_relation(manifest, first_parameter=19)
+        addresses, parameters, relations = catalog_directory_relation(manifest, first_parameter=20)
         directory_available = _DIRECTORY_AVAILABLE_SQL.format(
             candidate=storage_identifier(manifest.schema_name), addresses=addresses
         )
@@ -555,12 +598,35 @@ def _catalog_page_statement(snapshot, manifest):
     )
 
 
+def _source_company_parameters(snapshot, policy):
+    """Read only immutable labels, hiding unlinked assertions under organization restrictions."""
+    from process.registry_fhir_catalog_source_companies import validate_fhir_catalog_source_companies
+
+    if policy.excluded_company_ids or policy.excluded_group_ids:
+        return "[]"
+    vector = snapshot["source_vector_json"]
+    if type(vector) is str:
+        vector = json.loads(vector)
+    rows = [
+        {
+            "source_generation": entry["source_generation"],
+            "status": entry["status"],
+            "source_companies": validate_fhir_catalog_source_companies(entry["source_companies"]),
+        }
+        for entry in vector
+        if "source_companies" in entry
+    ]
+    return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+
+
 def _visible_items(documents, query, exclusions, policy):
     networks = tuple(_network_item(document, query) for document in documents)
     if len({network["network_id"] for network in networks}) != len(networks):
         _invalid()
     for network in networks:
         if network["network_id"] in exclusions:
+            _invalid("policy_invalid")
+        if (policy.excluded_company_ids or policy.excluded_group_ids) and network.get("source_companies"):
             _invalid("policy_invalid")
         for relationship in network["matching_relationships"]["items"]:
             company, group = relationship["company"], relationship["group"]
@@ -638,6 +704,7 @@ async def read_fhir_catalog(
             connection,
             sql,
             _query_parameters(query, snapshot["metadata_generation"], exclusions, policy, network_id)
+            + (_source_company_parameters(snapshot, policy),)
             + address_parameters,
             relations,
         )

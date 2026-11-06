@@ -1,9 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import asyncio
 import json
 import re
 import types
-import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -81,6 +81,111 @@ async def test_get_all_include_total_false_skips_count_query(monkeypatch):
     assert response_body["total_source"] == "estimated_page_floor"
 
 
+@pytest.mark.asyncio
+async def test_get_all_unfiltered_include_total_false_skips_fast_count(monkeypatch):
+    conn = RecordingConnection()
+    count = AsyncMock(side_effect=AssertionError("count was disabled"))
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_fast_primary_npi_count", count)
+
+    result = await get_all(types.SimpleNamespace(args={"limit": "1", "include_total": "0"}))
+
+    assert result.status == 200 and json.loads(result.body)["total_source"] == "estimated_page_floor"
+    count.assert_not_awaited()
+    assert conn.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count_only", [False, True])
+async def test_get_all_unfiltered_legacy_count_is_cancelled_on_deadline(monkeypatch, count_only):
+    conn = RecordingConnection()
+    cancellations = []
+
+    async def blocked_count(**_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancellations.append(True)
+
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_fast_primary_npi_count", blocked_count)
+    monkeypatch.setattr(npi_module, "_NPI_ALL_TOTAL_TIMEOUT_SECONDS", 0.1)
+    query_by_name = {"limit": "1"}
+    if count_only:
+        query_by_name["count_only"] = "1"
+
+    result = await get_all(types.SimpleNamespace(args=query_by_name))
+    body = json.loads(result.body)
+
+    assert cancellations == [True]
+    if count_only:
+        assert result.status == 503 and body["error"] == "count_timeout" and "rows" not in body
+    else:
+        assert result.status == 200 and body["total_source"] == "estimated_timeout_floor"
+        assert conn.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classification", ["Family Medicine", "Unknown example classification"])
+@pytest.mark.parametrize("primary_only", ["true", "false"])
+async def test_get_all_zip_taxonomy_bounds_ordering_and_guards_empty_codes(monkeypatch, classification, primary_only):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
+    await get_all(
+        types.SimpleNamespace(
+            args={
+                "classification": classification,
+                "zip_code": "12345",
+                "primary_only": primary_only,
+                "include_total": "1",
+            }
+        )
+    )
+    page = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    count = next(sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
+    guard = "EXISTS (SELECT 1 FROM mrf.nucc_taxonomy WHERE classification = :classification)"
+    assert guard in page and guard in count
+    assert "SELECT * FROM (" in page and ") AS eligible_npi" in page and "ORDER BY npi + 0" in page
+    for statement in (page, count):
+        assert "c.taxonomy_array && q.int_codes" not in statement
+        assert ("healthcare_provider_primary_taxonomy_switch, '')) = 'Y'" in statement) is (primary_only == "true")
+
+
+@pytest.mark.asyncio
+async def test_get_all_zip_code_only_filters_keep_direct_taxonomy_matching(monkeypatch):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
+    await get_all(types.SimpleNamespace(args={"codes": "207Q00000X", "zip_code": "12345", "include_total": "1"}))
+    statements = [sql for sql, _params in conn.sql_calls if "page_npis AS" in sql or "SELECT COUNT(DISTINCT" in sql]
+    assert len(statements) == 2
+    assert all("FROM mrf.nucc_taxonomy" not in sql for sql in statements)
+    assert all("provider_taxonomy.healthcare_provider_taxonomy_code IN (" in sql for sql in statements)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_args, selected",
+    [({"q": "example"}, False), ({"q": "example", "order_by": "relevance"}, False), ({}, True)],
+)
+async def test_get_all_zip_ordering_preserves_name_and_selected_paths(monkeypatch, extra_args, selected):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
+    if selected:
+        monkeypatch.setattr(npi_module, "current_network_address_scope", lambda: object())
+    await get_all(
+        types.SimpleNamespace(
+            args={"classification": "Family Medicine", "zip_code": "12345", "include_total": "0", **extra_args}
+        )
+    )
+    page = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
+    assert "ORDER BY npi + 0" not in page
+    if selected:
+        assert "EXISTS (SELECT 1 FROM mrf.nucc_taxonomy" not in page
+
+
 @pytest.mark.parametrize(
     ("request_args", "message"),
     [
@@ -152,15 +257,10 @@ async def test_get_all_unified_phone_list_and_count_bind_candidate_limit(monkeyp
     )
 
     assert json.loads(response.body)["total"] == 5
-    phone_candidate_calls = [
-        params
-        for sql, params in conn.sql_calls
-        if "LIMIT :candidate_limit" in sql
-    ]
+    phone_candidate_calls = [params for sql, params in conn.sql_calls if "LIMIT :candidate_limit" in sql]
     assert {params["candidate_limit"] for params in phone_candidate_calls} == {100, 500}
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
     assert "provider_total" not in page_sql
-
 
 
 @pytest.mark.asyncio
@@ -192,6 +292,7 @@ async def test_get_all_sitemap_mode_allows_20000_limit(
     async def fake_npi_list(*_args, **kwargs):
         primary_only_calls.append(kwargs["primary_only"])
         return list(range(1_000_000_000, 1_000_030_000))
+
     monkeypatch.setattr(
         npi_module,
         "_get_classification_npi_list",
@@ -240,11 +341,7 @@ async def test_get_all_q_filter(monkeypatch):
     assert response_body["page"] == 1
     assert response_body["limit"] == 50
     assert response_body["offset"] == 0
-    data_calls = [
-        (sql, params)
-        for sql, params in conn.sql_calls
-        if "COUNT(DISTINCT c.npi)" not in sql
-    ]
+    data_calls = [(sql, params) for sql, params in conn.sql_calls if "COUNT(DISTINCT c.npi)" not in sql]
     assert len(data_calls) == 1
     data_sql, data_params = data_calls[0]
     assert "b.npi" in data_sql
@@ -265,9 +362,7 @@ async def test_get_all_count_only_supports_response_format_alias(monkeypatch):
     conn = MappingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
-    request = types.SimpleNamespace(
-        args={"count_only": "1", "response_format": "full_taxonomy"}
-    )
+    request = types.SimpleNamespace(args={"count_only": "1", "response_format": "full_taxonomy"})
     resp = await get_all(request)
     response_body = json.loads(resp.body)
     assert response_body["rows"]["taxonomy_a"] == 3
@@ -352,9 +447,7 @@ async def test_get_all_deduplicates_q_and_legacy_name_like(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
-    request = types.SimpleNamespace(
-        args={"q": "clinic", "name_like": "CLINIC", "limit": "5", "start": "0"}
-    )
+    request = types.SimpleNamespace(args={"q": "clinic", "name_like": "CLINIC", "limit": "5", "start": "0"})
     resp = await get_all(request)
     response_body = json.loads(resp.body)
 
@@ -371,9 +464,7 @@ async def test_get_all_broad_q_explicit_include_total_still_skips_slow_count(mon
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
-    request = types.SimpleNamespace(
-        args={"q": "silver", "limit": "5", "start": "0", "include_total": "true"}
-    )
+    request = types.SimpleNamespace(args={"q": "silver", "limit": "5", "start": "0", "include_total": "true"})
     resp = await get_all(request)
     response_body = json.loads(resp.body)
 
@@ -393,11 +484,7 @@ async def test_get_all_broad_name_page_bounds_before_address_hydration(
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
-    await get_all(
-        types.SimpleNamespace(
-            args={**search_args, "limit": "5", "start": "10"}
-        )
-    )
+    await get_all(types.SimpleNamespace(args={**search_args, "limit": "5", "start": "10"}))
 
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
     assert "filtered_npi AS MATERIALIZED" not in page_sql
@@ -448,10 +535,7 @@ async def test_get_all_zip_taxonomy_uses_location_first_probe(monkeypatch):
     page_sql = conn.sql_calls[-1][0]
     assert "JOIN LATERAL" in page_sql
     assert "FROM mrf.npi_taxonomy AS provider_taxonomy" in page_sql
-    assert (
-        "provider_taxonomy.healthcare_provider_taxonomy_code "
-        "IN (:page_provider_taxonomy_code_0)"
-    ) in page_sql
+    assert ("provider_taxonomy.healthcare_provider_taxonomy_code IN (:page_provider_taxonomy_code_0)") in page_sql
     assert "c.taxonomy_array && q.int_codes" not in page_sql
     assert "sex_provider.provider_sex_code = :provider_sex_code" in page_sql
     assert conn.sql_calls[-1][1]["page_provider_taxonomy_code_0"] == "207Q00000X"
@@ -485,10 +569,7 @@ async def test_get_all_name_taxonomy_materializes_taxonomy_driven_name_match(mon
     assert "FROM mrf.npi AS b" in page_sql
     assert "FROM mrf.npi_taxonomy AS provider_taxonomy" not in page_sql
     assert "FROM mrf.nucc_taxonomy" not in page_sql
-    assert (
-        "b.search_taxonomy_codes && "
-        "ARRAY[:page_name_provider_taxonomy_code_0]::varchar[]"
-    ) in page_sql
+    assert ("b.search_taxonomy_codes && ARRAY[:page_name_provider_taxonomy_code_0]::varchar[]") in page_sql
     assert conn.sql_calls[-1][1]["page_name_provider_taxonomy_code_0"] == "207Q00000X"
     assert "LOWER(COALESCE(b.provider_last_name, ''))" in page_sql
     assert "AS provider_taxonomy_match ON TRUE" not in page_sql
@@ -522,18 +603,13 @@ async def test_get_all_name_taxonomy_count_closes_the_cte_list(monkeypatch):
     response_body = json.loads(response.body)
     assert response_body["total"] == 5
     assert response_body["total_source"] == "computed"
-    count_sql = next(
-        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
-    )
+    count_sql = next(sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
     assert "filtered_npi AS MATERIALIZED" not in count_sql
     assert "taxonomy_matched_npi AS MATERIALIZED" in count_sql
     assert "FROM mrf.npi AS b" in count_sql
     assert "FROM mrf.npi_taxonomy AS provider_taxonomy" not in count_sql
     assert "FROM mrf.nucc_taxonomy" not in count_sql
-    assert (
-        "b.search_taxonomy_codes && "
-        "ARRAY[:count_name_provider_taxonomy_code_0]::varchar[]"
-    ) in count_sql
+    assert ("b.search_taxonomy_codes && ARRAY[:count_name_provider_taxonomy_code_0]::varchar[]") in count_sql
     assert not re.search(r"\)\s*,\s*SELECT\s+COUNT", count_sql, flags=re.IGNORECASE)
 
 
@@ -579,13 +655,9 @@ async def test_get_all_applies_primary_taxonomy_to_page_and_count(
 
     await get_all(types.SimpleNamespace(args=request_args_by_name))
 
-    primary_predicate = (
-        "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
-    )
+    primary_predicate = "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
-    count_sql = next(
-        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
-    )
+    count_sql = next(sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
     assert (primary_predicate in page_sql) is expects_primary_predicate
     assert (primary_predicate in count_sql) is expects_primary_predicate
 
@@ -612,13 +684,9 @@ async def test_get_all_location_first_classification_honors_primary_only(
 
     await get_all(types.SimpleNamespace(args=request_args_by_name))
 
-    primary_predicate = (
-        "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
-    )
+    primary_predicate = "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
-    count_sql = next(
-        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
-    )
+    count_sql = next(sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
     for sql in (page_sql, count_sql):
         assert "AS provider_taxonomy_match ON TRUE" in sql
         assert (primary_predicate in sql) is expects_primary_predicate
@@ -647,11 +715,7 @@ async def test_get_all_classification_count_allows_non_primary_taxonomies(monkey
 @pytest.mark.asyncio
 async def test_get_all_rejects_invalid_primary_only():
     with pytest.raises(sanic.exceptions.InvalidUsage, match="primary_only.*boolean"):
-        await get_all(
-            types.SimpleNamespace(
-                args={"codes": "207Q00000X", "primary_only": "sometimes"}
-            )
-        )
+        await get_all(types.SimpleNamespace(args={"codes": "207Q00000X", "primary_only": "sometimes"}))
 
 
 @pytest.mark.asyncio
@@ -663,8 +727,7 @@ async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch):
         "_plan_release_npi_scope",
         AsyncMock(
             return_value=(
-                "SELECT npi FROM mrf.ptg2_v3_npi_scope "
-                "WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_0)",
+                "SELECT npi FROM mrf.ptg2_v3_npi_scope WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_0)",
                 {"plan_scope_snapshot_keys_0": [17]},
             )
         ),
@@ -683,15 +746,10 @@ async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch):
 
     scoped_sql = "IN (SELECT npi FROM mrf.ptg2_v3_npi_scope"
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
-    count_sql = next(
-        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
-    )
+    count_sql = next(sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
     assert scoped_sql in page_sql
     assert scoped_sql in count_sql
-    assert all(
-        params["plan_scope_snapshot_keys_0"] == [17]
-        for _sql, params in conn.sql_calls
-    )
+    assert all(params["plan_scope_snapshot_keys_0"] == [17] for _sql, params in conn.sql_calls)
 
 
 @pytest.mark.asyncio
@@ -773,9 +831,7 @@ async def test_plan_release_npi_scope_requires_session():
         (
             types.SimpleNamespace(
                 in_network_bindings=(types.SimpleNamespace(snapshot_id="snapshot"),),
-                network_tables_by_snapshot=lambda: {
-                    "snapshot": types.SimpleNamespace(shared_snapshot_key=None)
-                },
+                network_tables_by_snapshot=lambda: {"snapshot": types.SimpleNamespace(shared_snapshot_key=None)},
             ),
             "not bound to strict shared-block storage",
         ),
@@ -878,27 +934,33 @@ async def test_name_taxonomy_projection_enabled_requires_sealed_current_gin(monk
     await npi_module._assert_npi_search_taxonomy_projection_ready()
 
 
-@pytest.mark.asyncio
-async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypatch):
-    """Keep taxonomy, status, and enrichment reads concurrent after paging."""
-    provider_npi = 1000000049
-    request_session = object()
+def _name_taxonomy_provider_record(provider_npi):
     provider_record_map = _provider_directory_row_mapping()
-    provider_record = (
+    return (
         (provider_npi,)
         + tuple(provider_record_map.get(column.key) for column in npi_module._npi_serving_columns())
         + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
         + (1, 52)
     )
+
+
+@pytest.mark.asyncio
+async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypatch):
+    """Keep taxonomy, status, and enrichment reads concurrent after paging."""
+    provider_npi = 1000000049
+    request_session = object()
+    provider_record = _name_taxonomy_provider_record(provider_npi)
     status_started = asyncio.Event()
     enrichment_started = asyncio.Event()
     taxonomy_started = asyncio.Event()
+
     async def fake_apply_location_statuses(locations, *, session=None):
         assert session is request_session
         status_started.set()
         await asyncio.wait_for(asyncio.gather(enrichment_started.wait(), taxonomy_started.wait()), timeout=1)
         for location in locations:
             location["location_status"] = "active"
+
     async def fake_fetch_enrichment(npis, *, include_chain=False, session=None):
         assert npis == [provider_npi]
         assert include_chain is False
@@ -946,13 +1008,7 @@ async def test_get_all_name_taxonomy_cancels_sibling_reads_on_failure(monkeypatc
     """Finish sibling cancellation before propagating a taxonomy read failure."""
     provider_npi = 1000000049
     request_session = object()
-    provider_record_map = _provider_directory_row_mapping()
-    provider_record = (
-        (provider_npi,)
-        + tuple(provider_record_map.get(column.key) for column in npi_module._npi_serving_columns())
-        + tuple(provider_record_map.get(column.key) for column in npi_module.NPIAddress.__table__.columns)
-        + (1, 52)
-    )
+    provider_record = _name_taxonomy_provider_record(provider_npi)
     status_started = asyncio.Event()
     enrichment_started = asyncio.Event()
     never_finishes = asyncio.Event()
@@ -987,10 +1043,12 @@ async def test_get_all_name_taxonomy_cancels_sibling_reads_on_failure(monkeypatc
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
     with pytest.raises(RuntimeError, match="taxonomy read failed"):
-        await get_all(types.SimpleNamespace(
-            ctx=types.SimpleNamespace(sa_session=request_session),
-            args={"q": "smith", "codes": "1223E0200X", "limit": "10"},
-        ))
+        await get_all(
+            types.SimpleNamespace(
+                ctx=types.SimpleNamespace(sa_session=request_session),
+                args={"q": "smith", "codes": "1223E0200X", "limit": "10"},
+            )
+        )
     assert cancelled_reads == {"status", "enrichment"}
 
 
@@ -1051,13 +1109,8 @@ async def test_get_all_name_taxonomy_unified_join_matches_serving_index(monkeypa
     )
 
     page_sql = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
-    count_sql = next(
-        sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql
-    )
-    expected_join = (
-        "join mrf.entity_address_unified as c "
-        "on coalesce(c.npi, c.inferred_npi) = fn.npi"
-    )
+    count_sql = next(sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
+    expected_join = "join mrf.entity_address_unified as c on coalesce(c.npi, c.inferred_npi) = fn.npi"
     for query_sql in (count_sql, page_sql):
         normalized_sql = " ".join(query_sql.lower().split())
         assert "taxonomy_matched_npi as materialized" in normalized_sql
@@ -1091,9 +1144,7 @@ async def test_get_all_unified_network_filter_matches_serving_index(monkeypatch)
         )
     )
 
-    page_sql, params = next(
-        call for call in conn.sql_calls if "plans_network_array &&" in call[0]
-    )
+    page_sql, params = next(call for call in conn.sql_calls if "plans_network_array &&" in call[0])
     normalized_sql = " ".join(page_sql.lower().split())
     assert "c.type in ('primary', 'secondary', 'practice', 'site')" in normalized_sql
     assert "plans_network_array && :plan_network_array" in normalized_sql
@@ -1157,11 +1208,7 @@ async def test_get_all_applies_provider_sex_before_pagination(
     )
 
     assert json.loads(response.body)["total_source"] == "estimated_page_floor"
-    page_sql, page_params = next(
-        (sql, params)
-        for sql, params in conn.sql_calls
-        if "page_npis AS" in sql
-    )
+    page_sql, page_params = next((sql, params) for sql, params in conn.sql_calls if "page_npis AS" in sql)
     sex_predicate = "sex_provider.provider_sex_code = :provider_sex_code"
     assert sex_predicate in page_sql
     assert page_sql.index(sex_predicate) < page_sql.index("LIMIT :limit")
@@ -1187,10 +1234,7 @@ async def test_get_all_provider_sex_filter_is_used_for_count_and_rows(monkeypatc
     sex_predicate = "sex_provider.provider_sex_code = :provider_sex_code"
     assert len(conn.sql_calls) == 2
     assert all(sex_predicate in sql for sql, _params in conn.sql_calls)
-    assert all(
-        params["provider_sex_code"] == "F"
-        for _sql, params in conn.sql_calls
-    )
+    assert all(params["provider_sex_code"] == "F" for _sql, params in conn.sql_calls)
 
 
 @pytest.mark.asyncio
@@ -1199,11 +1243,7 @@ async def test_get_all_rejects_invalid_provider_sex_code():
         sanic.exceptions.InvalidUsage,
         match="provider_sex_code must be one of",
     ):
-        await get_all(
-            types.SimpleNamespace(
-                args={"city": "Chicago", "provider_sex_code": "female"}
-            )
-        )
+        await get_all(types.SimpleNamespace(args={"city": "Chicago", "provider_sex_code": "female"}))
 
 
 @pytest.mark.asyncio
@@ -1283,10 +1323,7 @@ async def test_get_all_unified_pages_distinct_npis_and_uses_zip5(monkeypatch):
     assert "JOIN LATERAL" in page_sql
     assert "AND COALESCE(c.npi, c.inferred_npi) = pn.npi" in page_sql
     assert "c.type IN" in page_sql
-    assert all(
-        f"'{location_type}'" in page_sql
-        for location_type in ("primary", "secondary", "practice", "site")
-    )
+    assert all(f"'{location_type}'" in page_sql for location_type in ("primary", "secondary", "practice", "site"))
     assert "COALESCE(c.zip5, LEFT(COALESCE(c.postal_code, ''), 5)) = :zip_code" in page_sql
     assert "phone_candidates AS MATERIALIZED" in page_sql
     assert "provider_directory_address_overlay AS overlay" in page_sql
@@ -1377,9 +1414,7 @@ def _provider_directory_fallback_record(*, premise_key=None):
         else "e4cd3105-5ce1-efd3-3f31-d48bfa864a13",
         "location_key": "00000000-0000-0000-0000-000000000011",
         "address_sources": ["provider_directory_fhir"],
-        "source_record_ids": [
-            "provider_directory_fhir:practitioner_role:synthetic_directory:role-1:loc-1"
-        ],
+        "source_record_ids": ["provider_directory_fhir:practitioner_role:synthetic_directory:role-1:loc-1"],
         "source_count": 1,
         "taxonomy_array": [],
         "plans_network_array": [],
@@ -1428,9 +1463,7 @@ async def _empty_provider_directory_enrichment(*_args, **_kwargs):
 
 
 def _install_provider_directory_fallback(monkeypatch, *, premise_key=None):
-    connection = _ProviderDirectoryFallbackConnection(
-        _provider_directory_fallback_record(premise_key=premise_key)
-    )
+    connection = _ProviderDirectoryFallbackConnection(_provider_directory_fallback_record(premise_key=premise_key))
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     monkeypatch.setattr(
         npi_module,
@@ -1491,10 +1524,7 @@ def test_provider_list_phone_candidate_limit_covers_page_window_and_stays_bounde
     assert npi_module._provider_list_phone_candidate_limit(5) == 100
     assert npi_module._provider_list_phone_candidate_limit(20, 20) == 320
     assert npi_module._provider_list_phone_candidate_limit(200, 200) == 500
-    assert (
-        npi_module._provider_list_phone_candidate_limit(5, count_query=True)
-        == 500
-    )
+    assert npi_module._provider_list_phone_candidate_limit(5, count_query=True) == 500
 
 
 @pytest.mark.asyncio
@@ -1577,6 +1607,7 @@ async def test_get_all_rejects_invalid_npi_filter(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_all_unified_exact_lookup_can_include_provider_directory_source_summary(monkeypatch):
     """Verify get all unified exact lookup can include provider directory source summary."""
+
     async def fake_source_detail_map(source_ids, **_kwargs):
         assert source_ids == ["synthetic_directory"]
         return {
@@ -1608,11 +1639,11 @@ async def test_get_all_unified_exact_lookup_can_include_provider_directory_sourc
     assert conn.sql_calls
 
     assert provider_record_map["provider_directory_sources"] == [
-            {
-                "source": "provider_directory_fhir",
-                "source_ids": ["synthetic_directory"],
-                "endpoint_id": "synthetic_endpoint",
-                "catalog_aliases_verified": False,
+        {
+            "source": "provider_directory_fhir",
+            "source_ids": ["synthetic_directory"],
+            "endpoint_id": "synthetic_endpoint",
+            "catalog_aliases_verified": False,
             "catalog_aliases": [
                 {
                     "source_id": "synthetic_directory",
@@ -1658,12 +1689,15 @@ async def test_get_all_applies_procedure_and_medication_all_match_filters(monkey
     monkeypatch.setattr(
         npi_module,
         "_resolve_npi_filter_capabilities",
-        lambda: asyncio.sleep(0, result={
-            "npi_procedures_array_available": True,
-            "npi_medications_array_available": True,
-            "pricing_provider_procedure_available": False,
-            "pricing_provider_prescription_available": False,
-        }),
+        lambda: asyncio.sleep(
+            0,
+            result={
+                "npi_procedures_array_available": True,
+                "npi_medications_array_available": True,
+                "pricing_provider_procedure_available": False,
+                "pricing_provider_prescription_available": False,
+            },
+        ),
     )
 
     request = types.SimpleNamespace(
@@ -1729,12 +1763,15 @@ async def test_get_all_falls_back_to_exists_when_arrays_unavailable(monkeypatch)
     monkeypatch.setattr(
         npi_module,
         "_resolve_npi_filter_capabilities",
-        lambda: asyncio.sleep(0, result={
-            "npi_procedures_array_available": False,
-            "npi_medications_array_available": False,
-            "pricing_provider_procedure_available": True,
-            "pricing_provider_prescription_available": True,
-        }),
+        lambda: asyncio.sleep(
+            0,
+            result={
+                "npi_procedures_array_available": False,
+                "npi_medications_array_available": False,
+                "pricing_provider_procedure_available": True,
+                "pricing_provider_prescription_available": True,
+            },
+        ),
     )
 
     request = types.SimpleNamespace(
@@ -1825,18 +1862,10 @@ async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkey
         )
     )
 
-    page_sql = next(
-        sql_text
-        for sql_text, _params in conn.sql_calls
-        if "page_npis AS" in sql_text
-    )
+    page_sql = next(sql_text for sql_text, _params in conn.sql_calls if "page_npis AS" in sql_text)
     assert "similarity(" in page_sql
     assert "ORDER BY relevance_score DESC, npi ASC" in page_sql
-    page_params = next(
-        params
-        for sql_text, params in conn.sql_calls
-        if "page_npis AS" in sql_text
-    )
+    page_params = next(params for sql_text, params in conn.sql_calls if "page_npis AS" in sql_text)
     assert page_params["relevance_q"] == "smith adam"
 
 
@@ -1951,9 +1980,10 @@ async def test_get_all_keeps_each_positional_rows_own_address(monkeypatch):
     )
     provider_match = json.loads(response.body)["rows"][0]
 
-    assert [
-        location["first_line"] for location in provider_match["address_list"]
-    ] == ["100 First Avenue", "200 Second Avenue"]
+    assert [location["first_line"] for location in provider_match["address_list"]] == [
+        "100 First Avenue",
+        "200 Second Avenue",
+    ]
 
 
 class _MappedProviderDirectoryRow:
@@ -1981,10 +2011,7 @@ class _MultiLocationMappedConnection:
         sql_text = str(sql)
         self.sql_calls.append((sql_text, dict(params)))
         if "FROM mrf.npi_taxonomy AS taxonomy" in sql_text:
-            return [
-                _MappedProviderDirectoryRow(row)
-                for row in self.taxonomy_rows
-            ]
+            return [_MappedProviderDirectoryRow(row) for row in self.taxonomy_rows]
         if "page_npis AS" not in sql_text:
             return []
         return [_MappedProviderDirectoryRow(row) for row in self.rows]
@@ -2002,19 +2029,10 @@ class _HydratingMultiLocationConnection(_MultiLocationMappedConnection):
         sql_text = str(sql)
         self.sql_calls.append((sql_text, dict(params)))
         if "FROM mrf.npi_taxonomy AS taxonomy" in sql_text:
-            return [
-                _MappedProviderDirectoryRow(row)
-                for row in self.taxonomy_rows
-            ]
+            return [_MappedProviderDirectoryRow(row) for row in self.taxonomy_rows]
         if "SELECT c.*" in sql_text:
-            selected_keys = {
-                str(value) for value in (params.get("location_keys") or [])
-            }
-            return [
-                row
-                for row in self.hydrated_rows
-                if str(row.get("location_key") or "") in selected_keys
-            ]
+            selected_keys = {str(value) for value in (params.get("location_keys") or [])}
+            return [row for row in self.hydrated_rows if str(row.get("location_key") or "") in selected_keys]
         if "page_npis AS" in sql_text:
             return [_MappedProviderDirectoryRow(row) for row in self.rows]
         return []
@@ -2101,7 +2119,9 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     monkeypatch.setattr(npi_module, "_table_columns", _provider_directory_test_columns)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", _empty_provider_enrichment_summary)
-    monkeypatch.setattr(npi_module, "_fetch_provider_directory_source_detail_map", _provider_directory_source_detail_map)
+    monkeypatch.setattr(
+        npi_module, "_fetch_provider_directory_source_detail_map", _provider_directory_source_detail_map
+    )
     monkeypatch.setattr(
         npi_module,
         "_fetch_location_status_by_record_id",
@@ -2128,11 +2148,11 @@ async def test_npi_all_includes_fhir_sources(monkeypatch):
     assert "private-tin-sentinel" not in json.dumps(provider_match)
 
     assert provider_match["provider_directory_sources"] == [
-            {
-                "source": "provider_directory_fhir",
-                "source_ids": ["synthetic_directory"],
-                "endpoint_id": "synthetic_endpoint",
-                "catalog_aliases_verified": False,
+        {
+            "source": "provider_directory_fhir",
+            "source_ids": ["synthetic_directory"],
+            "endpoint_id": "synthetic_endpoint",
+            "catalog_aliases_verified": False,
             "catalog_aliases": [
                 {
                     "source_id": "synthetic_directory",
@@ -2163,9 +2183,7 @@ def _ranked_location_maps():
             "address_key": f"00000000-0000-0000-0000-00000000010{index}",
             "premise_key": f"00000000-0000-0000-0000-00000000020{index}",
             "address_sources": ["provider_directory_fhir"],
-            "source_record_ids": [
-                f"provider_directory_fhir:practitioner_role:synthetic:role-1:loc-{index}"
-            ],
+            "source_record_ids": [f"provider_directory_fhir:practitioner_role:synthetic:role-1:loc-{index}"],
             "source_count": 1,
             "provider_address_total": 4,
         }
@@ -2234,10 +2252,7 @@ def _assert_ranked_location_query_contract(connection):
     )
     assert "select sub_s.*, t.*" not in page_sql.lower()
     assert "c.type IN" in page_sql
-    assert all(
-        f"'{location_type}'" in page_sql
-        for location_type in ("primary", "secondary", "practice", "site")
-    )
+    assert all(f"'{location_type}'" in page_sql for location_type in ("primary", "secondary", "practice", "site"))
     assert "LIMIT :locations_per_provider" not in page_sql
     assert "locations_per_provider" not in page_params
 
@@ -2260,9 +2275,7 @@ async def test_npi_all_returns_three_ranked_locations_with_honest_total(monkeypa
     )
     status_by_record_id = {
         location_maps[index]["source_record_ids"][0]: location_status
-        for index, location_status in enumerate(
-            ("active", "unknown", "unknown", "active")
-        )
+        for index, location_status in enumerate(("active", "unknown", "unknown", "active"))
     }
     _install_multi_location_dependencies(
         monkeypatch,
@@ -2273,9 +2286,11 @@ async def test_npi_all_returns_three_ranked_locations_with_honest_total(monkeypa
         {"name_like": "sample", "limit": "5", "start": "0", "include_total": "0"}
     )
 
-    assert [
-        location["first_line"] for location in provider_match["address_list"]
-    ] == ["100 Example Ave", "400 Example Ave", "200 Example Ave"]
+    assert [location["first_line"] for location in provider_match["address_list"]] == [
+        "100 Example Ave",
+        "400 Example Ave",
+        "200 Example Ave",
+    ]
     assert provider_match["address_pagination"] == {
         "limit": 3,
         "offset": 0,
@@ -2284,13 +2299,8 @@ async def test_npi_all_returns_three_ranked_locations_with_honest_total(monkeypa
         "has_more": True,
     }
     assert provider_match["location_status"] == "active"
-    assert provider_match["taxonomy_list"] == [
-        {"healthcare_provider_taxonomy_code": "207Q00000X"}
-    ]
-    assert all(
-        "source_record_ids" not in location
-        for location in provider_match["address_list"]
-    )
+    assert provider_match["taxonomy_list"] == [{"healthcare_provider_taxonomy_code": "207Q00000X"}]
+    assert all("source_record_ids" not in location for location in provider_match["address_list"])
     _assert_ranked_location_query_contract(connection)
 
 
@@ -2403,9 +2413,7 @@ def _fallback_location_maps():
             "address_key": f"00000000-0000-0000-0000-00000000030{index}",
             "location_key": f"00000000-0000-0000-0000-00000000035{index}",
             "premise_key": f"00000000-0000-0000-0000-00000000040{index}",
-            "source_record_ids": [
-                f"provider_directory_fhir:practitioner_role:synthetic:role-2:loc-{index}"
-            ],
+            "source_record_ids": [f"provider_directory_fhir:practitioner_role:synthetic:role-2:loc-{index}"],
             "provider_address_total": 4,
         }
         for index in range(1, 5)
@@ -2416,10 +2424,7 @@ def _fallback_location_maps():
 async def test_npi_all_profile_only_fallback_groups_three_locations(monkeypatch):
     fallback_locations = _fallback_location_maps()
     connection = _FallbackMultiLocationConnection(fallback_locations)
-    status_by_record_id = {
-        location["source_record_ids"][0]: "active"
-        for location in fallback_locations
-    }
+    status_by_record_id = {location["source_record_ids"][0]: "active" for location in fallback_locations}
     _install_multi_location_dependencies(
         monkeypatch,
         connection,
@@ -2430,14 +2435,9 @@ async def test_npi_all_profile_only_fallback_groups_three_locations(monkeypatch)
     )
 
     assert provider_match["npi"] == 1000000015
-    assert all(
-        location["npi"] == 1000000015
-        for location in provider_match["address_list"]
-    )
+    assert all(location["npi"] == 1000000015 for location in provider_match["address_list"])
 
-    assert [
-        location["first_line"] for location in provider_match["address_list"]
-    ] == [
+    assert [location["first_line"] for location in provider_match["address_list"]] == [
         "1 Fallback Avenue",
         "2 Fallback Avenue",
         "3 Fallback Avenue",
@@ -2491,14 +2491,12 @@ async def test_npi_all_exact_provider_page_collects_direct_and_inferred_location
     )
 
     assert provider_match["npi"] == provider_npi
-    assert [
-        location["first_line"]
-        for location in provider_match["address_list"]
-    ] == ["100 Example Ave", "200 Example Ave", "300 Example Ave"]
-    assert all(
-        location["npi"] == provider_npi
-        for location in provider_match["address_list"]
-    )
+    assert [location["first_line"] for location in provider_match["address_list"]] == [
+        "100 Example Ave",
+        "200 Example Ave",
+        "300 Example Ave",
+    ]
+    assert all(location["npi"] == provider_npi for location in provider_match["address_list"])
     assert provider_match["address_pagination"] == {
         "limit": 3,
         "offset": 0,
@@ -2598,10 +2596,7 @@ def _search_location_status_map():
     return {
         "synthetic:role:active-a": "active",
         "synthetic:role:unknown-b": "unknown",
-        **{
-            f"synthetic:role:active-{index}": "active"
-            for index in range(2, 5)
-        },
+        **{f"synthetic:role:active-{index}": "active" for index in range(2, 5)},
     }
 
 
@@ -2634,9 +2629,7 @@ def _assert_hydrated_primary_location(provider_match):
 
 def _hydration_query_details(connection):
     page_sql = next(
-        statement_sql
-        for statement_sql, _statement_params in connection.sql_calls
-        if "page_npis AS" in statement_sql
+        statement_sql for statement_sql, _statement_params in connection.sql_calls if "page_npis AS" in statement_sql
     )
     hydration_sql, hydration_params = next(
         (statement_sql, statement_params)
@@ -2677,9 +2670,7 @@ async def test_npi_all_search_hydrates_selected_locations_and_merges_base_eviden
     assert "c.aca_plan_array" not in page_sql
     assert "c.procedures_array" not in page_sql
     assert "c.location_key = ANY(:location_keys)" in hydration_sql
-    assert {"synthetic-location-a", "synthetic-location-b"}.issubset(
-        set(hydration_params["location_keys"])
-    )
+    assert {"synthetic-location-a", "synthetic-location-b"}.issubset(set(hydration_params["location_keys"]))
     assert "synthetic-location-4" not in hydration_params["location_keys"]
 
 
@@ -2709,10 +2700,7 @@ async def test_npi_all_search_degrades_when_selected_hydration_fails(monkeypatch
     assert len(provider_match["address_list"]) == 3
     assert provider_match["address_pagination"]["total"] == 4
     assert provider_match["address_pagination"]["has_more"] is True
-    assert all(
-        "procedures_array" not in location
-        for location in provider_match["address_list"]
-    )
+    assert all("procedures_array" not in location for location in provider_match["address_list"])
 
 
 def _large_system_location_maps(provider_npi):
@@ -2727,9 +2715,7 @@ def _large_system_location_maps(provider_npi):
             "city_name": "Example City",
             "state_name": "UT",
             "postal_code": "84101",
-            "address_key": (
-                f"00000000-0000-0000-0001-{index:012d}"
-            ),
+            "address_key": (f"00000000-0000-0000-0001-{index:012d}"),
             "location_key": f"synthetic-large-{index:04d}",
             "provider_address_total": 1000,
         }
@@ -2785,9 +2771,7 @@ def test_overlay_row_merges_by_key():
                 "address_key": address_key,
                 "first_line": "510 E 8TH ST",
                 "address_sources": ["provider_directory_fhir"],
-                "source_record_ids": [
-                    "provider_directory_fhir:organization_address:pdfhir_source:org-1:1"
-                ],
+                "source_record_ids": ["provider_directory_fhir:organization_address:pdfhir_source:org-1:1"],
                 "source_count": 1,
             },
         ]

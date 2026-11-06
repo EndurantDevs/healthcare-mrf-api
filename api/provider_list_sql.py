@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from typing import Any
 
-from sqlalchemy import BigInteger, bindparam, column, select, table, text
+from sqlalchemy import BigInteger, bindparam, column, func, literal_column, select, table, text
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from api.custom_import_provider_sql import ProviderImportQuery, merge_native_params
@@ -20,11 +22,13 @@ from api.network_address_scope import (
     scoped_address_parameters,
 )
 from api.network_read_execution import NetworkReadConnectionProxy
+from api.provider_profile_snapshot import provider_read_savepoint
 from db.connection import ConnectionProxy
-from db.models import EntityAddressUnified
+from db.models import EntityAddressUnified, NPIAddress
 from process.custom_import.read_core import _local_statement_timeout
 
 _LOGGER = logging.getLogger(__name__)
+_NPI_COUNT_READ_SCOPE: ContextVar[tuple[Any, float] | None] = ContextVar("npi_count_read_scope", default=None)
 
 _CUSTOM_IMPORT_PROVIDER_RELATION = "custom_import_provider_relation"
 _NATIVE_PROVIDER_RELATION = "native_eligible_npis"
@@ -289,6 +293,67 @@ async def _provider_list_connection(
             raise RuntimeError("custom-import provider query requires a request session")
         raise RuntimeError("canonical provider query requires a request session")
     yield NetworkReadConnectionProxy(database, request_session, None)
+
+
+async def _npi_count_read(read: Callable[[], Awaitable[Any]]):
+    """Share the count deadline across metadata and aggregate reads."""
+    scope = _NPI_COUNT_READ_SCOPE.get()
+    if scope is None:
+        return await read()
+    session, deadline = scope
+    remaining_ms = math.ceil((deadline - time.monotonic()) * 1000)
+    if remaining_ms <= 0:
+        raise TimeoutError("provider count deadline expired")
+    async with _local_statement_timeout(session, timeout_ms=remaining_ms):
+        result = await read()
+    if time.monotonic() >= deadline:
+        raise TimeoutError("provider count deadline expired")
+    return result
+
+
+async def _bounded_provider_list_count(count, *, session, has_reader: bool, timeout: float):
+    """Bound one ordinary count phase and recover its pinned Reader on timeout."""
+    timeout = max(0.1, timeout)
+    if not has_reader:
+        async with asyncio.timeout(timeout):
+            return await count()
+    deadline = time.monotonic() + timeout
+    token = _NPI_COUNT_READ_SCOPE.set((session, deadline))
+    try:
+        async with provider_read_savepoint(session):
+            count_rows = await count(deadline=deadline)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("provider count deadline expired")
+            return count_rows
+    finally:
+        _NPI_COUNT_READ_SCOPE.reset(token)
+
+
+def _provider_list_total_statement(address_model, *, has_insurance=False, city=None, state=None):
+    """Count distinct unified providers or the legacy one-row-per-NPI primary heap."""
+    address_table = address_model.__table__
+    provider_npi = address_table.c.npi
+    if address_model is EntityAddressUnified:
+        provider_npi = func.coalesce(address_table.c.npi, address_table.c.inferred_npi)
+        is_serving_type = address_table.c.type.in_(GEO_SERVICE_LOCATION_TYPES)
+    else:
+        is_serving_type = address_table.c.type == "primary"
+    if not has_insurance:
+        if address_model is EntityAddressUnified:
+            return select(func.count(func.distinct(provider_npi))).where(is_serving_type, provider_npi.is_not(None))
+        return select(func.count()).select_from(address_table).where(is_serving_type)
+    conditions = [
+        is_serving_type,
+        provider_npi.is_not(None),
+        literal_column("NOT (plans_network_array @@ '0'::query_int)"),
+    ]
+    if city:
+        conditions.append(address_table.c.city_name == city)
+    if state:
+        conditions.append(address_table.c.state_name == state)
+    if city is None and state is None and address_model is NPIAddress:
+        return select(func.count()).select_from(address_table).where(*conditions)
+    return select(func.count(func.distinct(provider_npi))).where(*conditions)
 
 
 async def _provider_list_count(connection, query, parameters, session, *, deadline=None):

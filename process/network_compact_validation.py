@@ -82,6 +82,12 @@ async def verify_compact_final_proof(
     scope = _scope_report(candidate, address_source)
     _, serving = compact_readiness(candidate, report, scope)
     layout = await capture_compact_dependencies(connection, candidate, control_schema=control_schema)
+    from process import network_indexed_address_artifact as indexed
+
+    if serving["address_artifact"].get("contract") == indexed.CONTRACT:
+        await indexed.prove_new_indexed_address_dependency(
+            connection, candidate, serving["address_artifact"], control_schema=control_schema
+        )
     await _verify_custom_contribution(
         connection,
         candidate,

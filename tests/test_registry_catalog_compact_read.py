@@ -173,15 +173,15 @@ def test_shared_relation_reuses_typed_layout_and_exact_consumed_pins(batch_bound
     assert '"' + manifest.schema_name + '".entity_address_unified' not in sql
 
 
-def test_fhir_statement_appends_artifacts_after_its_eighteen_existing_binds(page_boundary, batch_boundary):
+def test_fhir_statement_appends_artifacts_after_its_nineteen_existing_binds(page_boundary, batch_boundary):
     _, _, snapshot = page_boundary
     _, manifest, _ = batch_boundary
     _compact(manifest)
     sql, parameters, relations = fhir._catalog_page_statement(snapshot, manifest)
-    addresses, expected, pins = catalog.catalog_directory_relation(manifest, first_parameter=19)
+    addresses, expected, pins = catalog.catalog_directory_relation(manifest, first_parameter=20)
     assert parameters == expected and relations == pins
     assert "JOIN " + addresses + " address" in sql
-    assert "$19" in sql and "$20" in sql
+    assert "$20" in sql and "$21" in sql
     _directory_shape(sql, manifest)
 
 
@@ -241,7 +241,8 @@ async def test_fhir_filters_and_exclusions_keep_their_original_positions(request
     assert parameters[1] == (8,) and parameters[2:4] == [(UUID(COMPANY),), (UUID(GROUP),)]
     assert parameters[4:6] == [UUID(COMPANY), UUID(GROUP)]
     assert parameters[7] == "%gold%" and parameters[10] == "medical" and parameters[11] == source.sql_parameters
-    assert tuple(parameters[18:]) == tuple(artifact.candidate_id for artifact in manifest.compact_layout.artifacts)
+    assert parameters[18] == "[]"
+    assert tuple(parameters[19:]) == tuple(artifact.candidate_id for artifact in manifest.compact_layout.artifacts)
     assert "edge.company_id=$5" in sql and "edge.plan_search LIKE $8" in sql
     assert "NOT network.network_id=ANY($2::integer[])" in sql and "OFFSET $14 LIMIT $15" in sql
     _directory_shape(sql, manifest)

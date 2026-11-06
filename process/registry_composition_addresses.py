@@ -377,7 +377,15 @@ def _require_source_recipe_phase(address_sources, source_manifest, expected_head
             )
         )
         if address_sources.base_source != retained_address:
-            raise RegistryCompositionError("registry_composition_source_address_mismatch")
+            from process.network_indexed_address_artifact import is_indexed_address_source
+
+            # Native origin equivalence is checked before compact preparation accepts this transition.
+            if not (
+                address_sources.compact
+                and source_manifest.compact_layout is not None
+                and is_indexed_address_source(address_sources.base_source)
+            ):
+                raise RegistryCompositionError("registry_composition_source_address_mismatch")
 
 
 async def _resolve_source_recipe_additions(connection, address_sources, source_manifest, expected_head, control_schema):

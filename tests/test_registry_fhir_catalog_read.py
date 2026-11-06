@@ -192,6 +192,7 @@ def page_boundary(monkeypatch):
         "metadata_approved_revision": 6,
         "schema_name": "sample_metadata",
         "custody_json": {},
+        "source_vector_json": [],
     }
     monkeypatch.setattr(catalog, "catalog_pin", AsyncMock(return_value=manifest))
     monkeypatch.setattr(catalog, "_metadata_pin", AsyncMock(return_value=snapshot_by_field))
@@ -238,6 +239,117 @@ def test_literal_unicode_search_and_continuation():
 )
 def test_human_search_matches_ordered_literal_terms(text, pattern):
     assert catalog._literal_pattern(text) == pattern
+
+
+def source_company_document(source_id="sample-fhir", name="Example Carrier"):
+    return {
+        "source_id": source_id,
+        "endpoint_id": "sample-endpoint",
+        "display_name": name,
+        "provenance": "source_registration",
+    }
+
+
+@pytest.mark.parametrize("restricted", ["company", "group", None])
+def test_source_labels_are_pinned_metadata_and_hidden_under_organization_restrictions(restricted):
+    snapshot_by_field = {
+        "source_vector_json": [
+            {
+                "source_generation": "c" * 64,
+                "source_id": "sample-fhir",
+                "status": "last_good",
+                "source_companies": [source_company_document()],
+            }
+        ]
+    }
+    policy = RegistryOrganizationVisibility(
+        (COMPANY,) if restricted == "company" else (), (GROUP,) if restricted == "group" else ()
+    )
+    labels = json.loads(catalog._source_company_parameters(snapshot_by_field, policy))
+    if restricted:
+        assert labels == []
+    else:
+        assert labels == [
+            {"source_generation": "c" * 64, "status": "last_good", "source_companies": [source_company_document()]}
+        ]
+    encoded_snapshot_by_field = {"source_vector_json": json.dumps(snapshot_by_field["source_vector_json"])}
+    assert json.loads(catalog._source_company_parameters(encoded_snapshot_by_field, policy)) == labels
+
+
+def test_source_company_field_is_optional_and_does_not_claim_legal_ownership():
+    document = network_document()
+    assert catalog._network_item(document, catalog.FHIRCatalogQuery()) == document
+    document["source_companies"] = [source_company_document()]
+    assert catalog._network_item(document, catalog.FHIRCatalogQuery()) == document
+    document["matching_relationships"]["items"][0]["company"] = None
+    document["matching_relationships"]["items"][0]["group"] = None
+    document["matching_relationships"]["items"][0]["organization_reference"] = None
+    document["matching_relationships"]["items"][0]["resolution_status"] = "unresolved"
+    document["matching_relationships"]["items"][0]["resolution_reason"] = "company_reference_missing"
+    assert catalog._network_item(document, catalog.FHIRCatalogQuery())["source_companies"]
+    for policy in (RegistryOrganizationVisibility((COMPANY,), ()), RegistryOrganizationVisibility((), (GROUP,))):
+        with pytest.raises(catalog.RegistryNetworkCatalogError, match="policy_invalid"):
+            catalog._visible_items([document], catalog.FHIRCatalogQuery(), (), policy)
+
+
+def _merged_source_company_document(snapshot, count=1001):
+    records = [
+        {**source_company_document(f"source-{index:04}"), "endpoint_id": f"endpoint-{index // 100}"}
+        for index in range(count)
+    ]
+    snapshot["source_vector_json"] = [
+        {
+            "source_generation": f"{start + 1:064x}",
+            "source_id": records[start]["source_id"],
+            "status": "current",
+            "source_companies": [dict(record) for record in records[start : start + 100]],
+        }
+        for start in range(0, count, 100)
+    ]
+    return {**network_document(), "source_companies": records}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("network_id", [None, 7])
+async def test_merged_source_labels_above_one_source_limit_fit_list_and_detail(page_boundary, network_id):
+    connection, _, snapshot = page_boundary
+    document = _merged_source_company_document(snapshot)
+    connection.fetchrow.return_value["rows_json"] = json.dumps([document])
+    page = await catalog.read_fhir_catalog(
+        connection, catalog.FHIRCatalogQuery(), excluded_network_ids=(), network_id=network_id
+    )
+    assert page["items"][0]["source_companies"] == document["source_companies"]
+    assert len(page["items"][0]["source_companies"]) == 1001
+    assert len(json.dumps(page).encode()) < catalog.MAX_CORE_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("network_id", [None, 7])
+@pytest.mark.parametrize("damage", ["type", "duplicate", "order", "field", "text", "bytes"])
+async def test_merged_source_labels_keep_record_order_and_page_bounds(page_boundary, network_id, damage):
+    connection, _, snapshot = page_boundary
+    document = _merged_source_company_document(snapshot, 1500 if damage == "bytes" else 1001)
+    records = document["source_companies"]
+    if damage == "type":
+        document["source_companies"] = {}
+    if damage == "duplicate":
+        records[500] = dict(records[499])
+    if damage == "order":
+        records[499], records[500] = records[500], records[499]
+    if damage == "field":
+        records[-1]["company_id"] = COMPANY
+    if damage == "text":
+        records[-1]["display_name"] = "Invalid\nCarrier"
+    if damage == "bytes":
+        for record in records:
+            record["display_name"] = "é" * 256
+    encoded = json.dumps([document], ensure_ascii=False)
+    assert (len(encoded.encode()) > catalog.MAX_CORE_BYTES) is (damage == "bytes")
+    connection.fetchrow.return_value["rows_json"] = encoded
+    with pytest.raises(catalog.RegistryNetworkCatalogError):
+        await catalog.read_fhir_catalog(
+            connection, catalog.FHIRCatalogQuery(), excluded_network_ids=(), network_id=network_id
+        )
 
 
 @pytest.mark.asyncio

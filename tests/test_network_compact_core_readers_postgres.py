@@ -273,3 +273,58 @@ async def test_historical_custom_offices_cannot_reappear_through_old_edges(compa
         for options in ({"visible_membership_sql": "TRUE"}, {"network_ids": (42,)}):
             relation, arguments = compact_address_native_sql(manifest.compact_layout, first_parameter=1, **options)
             assert await driver.fetchval(f"SELECT count(*) FROM {relation} addresses", *arguments) == 0
+
+
+@pytest.mark.asyncio
+async def test_compact_provider_selection_preserves_counts_and_source_aliases(compact_core_db):
+    fixture = compact_core_db
+    async with publication._reader(fixture) as (_connection, driver):
+        manifest = await resolve_network_serving_manifest(driver, control_schema=fixture.control_schema)
+        with network_address_read_scope(manifest, (42,)) as scope:
+            original = await read_network_provider_page(driver, scope, control_schema=fixture.control_schema)
+    namespace = f'"{manifest.schema_name}"'
+    assert (
+        await fixture.connection.execute(
+            f"""INSERT INTO {namespace}.provider_location_binding
+        SELECT provider_system,provider_id,$1,location_key,entity_type,entity_id
+        FROM {namespace}.provider_location_binding WHERE location_key=$2""",
+            uuid4(),
+            original["providers"][0]["locations"][0]["location_key"],
+        )
+        == "INSERT 0 1"
+    )
+    pages_by_network = {}
+    async with publication._reader(fixture) as (_connection, driver):
+        for network_ids, location_count in (((42,), 1), ((88,), 1), ((42, 88), 2), ((99,), 0)):
+            with network_address_read_scope(manifest, network_ids) as scope:
+                page = await read_network_provider_page(driver, scope, control_schema=fixture.control_schema)
+                pages_by_network[network_ids] = page
+                assert page["total_count"] == int(location_count > 0)
+                assert sum(len(provider["locations"]) for provider in page["providers"]) == location_count
+                assert {provider["provider_id"] for provider in page["providers"]} == (
+                    {"1234567893"} if location_count else set()
+                )
+                empty = await read_network_provider_page(driver, scope, offset=1, control_schema=fixture.control_schema)
+                assert empty["total_count"] == page["total_count"] and empty["providers"] == []
+    assert pages_by_network[(42,)] == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing_binding", "conflicting_binding"])
+async def test_compact_provider_integrity_refuses_even_an_empty_page(compact_core_db, damage):
+    fixture = compact_core_db
+    namespace = f'"{fixture.target.schema_name}"'
+    if damage == "missing_binding":
+        await fixture.connection.execute(f"DELETE FROM {namespace}.provider_location_binding")
+    else:
+        await fixture.connection.execute(
+            f"""INSERT INTO {namespace}.provider_location_binding
+            SELECT 'provider_directory','another-provider',$1,location_key,entity_type,entity_id
+            FROM {namespace}.provider_location_binding LIMIT 1""",
+            uuid4(),
+        )
+    async with publication._reader(fixture) as (_connection, driver):
+        manifest = await resolve_network_serving_manifest(driver, control_schema=fixture.control_schema)
+        with network_address_read_scope(manifest, (42, 88)) as scope:
+            with pytest.raises(NetworkProviderReadUnavailable):
+                await read_network_provider_page(driver, scope, offset=1, control_schema=fixture.control_schema)

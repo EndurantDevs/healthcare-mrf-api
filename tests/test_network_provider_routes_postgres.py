@@ -203,7 +203,13 @@ async def _provider_child_relations(context, network_id):
 async def _assert_inherited_provider_leak(connection, manifest, network_id, provider_id, original_guard):
     addresses, address_arguments = native_providers._provider_addresses(manifest, (network_id,))
     inherited_query = (
-        native_providers._PROVIDERS_SQL.format(namespace=f'"{manifest.schema_name}"', addresses=addresses)
+        native_providers._PROVIDERS_SQL.format(
+            namespace=f'"{manifest.schema_name}"',
+            addresses=addresses,
+            address_membership="TRUE"
+            if manifest.compact_layout is not None
+            else "canonical_network_ids && $1::text::integer[]",
+        )
         .replace("FROM ONLY ", "FROM ")
         .replace("JOIN ONLY ", "JOIN ")
     )

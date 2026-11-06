@@ -427,8 +427,10 @@ async def _require_legacy_mapping(
         )
 
 
-def scoped_address_relation_sql(table_ref):
+def scoped_address_relation_sql(table_ref, *, location_lookup=False):
     """Return a parameterized filtered relation only for the unified table."""
+    if type(location_lookup) is not bool:
+        raise ValueError("network_address_lookup_invalid")
     scope = _SCOPE.get()
     if scope is None or not table_ref.endswith(".entity_address_unified"):
         return table_ref
@@ -441,6 +443,7 @@ def scoped_address_relation_sql(table_ref):
             visible_membership_sql="TRUE"
             if scope.legacy_checksums is not None
             else (_visible_membership_predicate() if scope.network_ids is None else None),
+            location_lookup=location_lookup and scope.manifest.supports_location_lookup,
         )
         if scope.legacy_checksums is not None:
             relation = (
@@ -470,7 +473,10 @@ def scoped_address_relation_sql(table_ref):
 def is_scoped_address_relation(table_ref):
     """Recognize exactly the filtered relation bound in this request."""
     scope = _SCOPE.get()
-    return scope is not None and table_ref == scoped_address_relation_sql("mrf.entity_address_unified")
+    return scope is not None and any(
+        table_ref == scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=lookup)
+        for lookup in (False, True)
+    )
 
 
 def _is_reserved_parameter_equal(provided, expected):

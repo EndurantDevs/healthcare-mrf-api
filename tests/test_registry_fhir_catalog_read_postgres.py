@@ -15,7 +15,13 @@ from db.registry_fhir_catalog import MAX_CORE_BYTES, table_sql
 from process import registry_fhir_catalog_read as catalog
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.registry_catalog_policy import RegistryOrganizationVisibility
-from tests.test_registry_fhir_catalog_read import COMPANY, GROUP, binding_document, relationship_document
+from tests.test_registry_fhir_catalog_read import (
+    COMPANY,
+    GROUP,
+    binding_document,
+    catalog_binding_document,
+    relationship_document,
+)
 
 SECOND_COMPANY = "22222222-2222-4222-8222-222222222222"
 SECOND_GROUP = "55555555-5555-4555-8555-555555555555"
@@ -43,6 +49,7 @@ async def catalog_database(monkeypatch):
         "schema_name": metadata,
         "network_generation": 9,
         "manifest_sha256": "f" * 64,
+        "source_vector_json": [],
     }
     fixture = SimpleNamespace(
         connection=connection, metadata=metadata, memberships=memberships, snapshot=snapshot_by_field
@@ -100,7 +107,9 @@ async def _network(fixture, network_id, name, aliases=()):
     )
 
 
-async def _edge(fixture, network_id, document, *, plan_search=None, company_search=None, binding_id=None):
+async def _edge(
+    fixture, network_id, document, *, plan_search=None, company_search=None, binding_id=None, source_generation="e" * 64
+):
     company, group = document["company"], document["group"]
     binding_id = binding_id or await _source_binding(fixture, network_id, document["source_id"])
     await fixture.connection.execute(
@@ -116,7 +125,7 @@ async def _edge(fixture, network_id, document, *, plan_search=None, company_sear
         (company_search or (company["display_name"] if company else "")).lower(),
         (plan_search or (document["plan"]["display_name"] if document["plan"] else "")).lower(),
         json.dumps(document),
-        "e" * 64,
+        source_generation,
         binding_id,
     )
 
@@ -158,6 +167,297 @@ async def _read(fixture, query=None, policy=None, network_id=None, *, control_sc
             control_schema=control_schema,
             network_id=network_id,
         )
+
+
+def _registered_source(generation, source_id, name, *, status="current"):
+    return {
+        "source_generation": generation,
+        "source_id": source_id,
+        "status": status,
+        "source_companies": [
+            {
+                "source_id": source_id,
+                "endpoint_id": "endpoint-" + source_id,
+                "display_name": name,
+                "provenance": "source_registration",
+            }
+        ],
+    }
+
+
+async def _source_plan(fixture, network_id, generation, source_id, plan_name):
+    document = catalog_binding_document()
+    document.update(
+        binding_id=str(uuid4()),
+        source_id=source_id,
+        dataset_id="dataset-" + source_id,
+        edition_id="dataset-" + source_id,
+        source_key="network-" + source_id,
+        source_scope={"organization_id": "network-" + source_id, "source_generation": generation},
+        evidence_id=generation + ":Organization/network-" + source_id,
+    )
+    binding_id = await _binding(fixture, network_id, document)
+    relationship = relationship_document()
+    relationship.update(
+        relationship_id=uuid4().hex * 2,
+        source_id=source_id,
+        company=None,
+        group=None,
+        organization_reference=None,
+        resolution_status="unresolved",
+        resolution_reason="company_reference_missing",
+    )
+    relationship["plan"]["display_name"] = plan_name
+    await _edge(fixture, network_id, relationship, binding_id=binding_id, source_generation=generation)
+
+
+@pytest.mark.asyncio
+async def test_registered_company_filters_share_the_actual_plan_binding(catalog_database, tmp_path):
+    fixture = catalog_database
+    await _network(fixture, 70, "National PPO Network")
+    await _source_plan(fixture, 70, "c" * 64, "source-alpha", "Preferred PPO")
+    await _source_plan(fixture, 70, "d" * 64, "source-beta", "Regional HMO")
+    query = catalog.FHIRCatalogQuery(company_search="Example Carrier", plan_search="PPO", limit=1)
+    assert (await _read(fixture, query))["total"] == 0
+    fixture.snapshot["source_vector_json"] = [
+        _registered_source("c" * 64, "source-alpha", "Example General Carrier"),
+        _registered_source("d" * 64, "source-beta", "Other Carrier"),
+    ]
+    matched = await _read(fixture, query)
+    assert matched["total"] == 1
+    network = matched["items"][0]
+    assert network["network_id"] == 70 and network["directory_available"] is False
+    assert network["source_companies"][0]["display_name"] == "Example General Carrier"
+    assert {edge["source_id"] for edge in network["matching_relationships"]["items"]} == {"source-alpha"}
+    assert all(edge["company"] is None for edge in network["matching_relationships"]["items"])
+    assert (await _read(fixture, replace(query, plan_search="HMO")))["total"] == 0
+    assert (await _read(fixture, replace(query, company_search="Other", plan_search="HMO")))["total"] == 1
+    assert (await _read(fixture, replace(query, company_id=COMPANY)))["total"] == 0
+    assert (await _read(fixture, replace(query, group_id=GROUP)))["total"] == 0
+
+    selected = RegistryNetworkSourceCoordinates(
+        "fhir",
+        "source-alpha",
+        "sample_source",
+        "dataset-source-alpha",
+        "registry-fhir-catalog-v1",
+        "dataset-source-alpha",
+    )
+    scoped = await _read(fixture, replace(query, source=selected))
+    assert [company["source_id"] for company in scoped["items"][0]["source_companies"]] == ["source-alpha"]
+    for policy in (RegistryOrganizationVisibility((COMPANY,), ()), RegistryOrganizationVisibility((), (GROUP,))):
+        assert (await _read(fixture, query, policy))["total"] == 0
+        unrestricted_text = await _read(fixture, catalog.FHIRCatalogQuery(search="National PPO"), policy)
+        assert unrestricted_text["items"][0]["source_companies"] == []
+
+    wire_by_field = {**matched, "client_id": "client_42", "policy_revision": "7"}
+    (tmp_path / "source-company-core-page.json").write_text(json.dumps(wire_by_field, sort_keys=True) + "\n")
+
+
+@pytest.mark.asyncio
+async def test_source_only_names_keep_empty_edges_searchable_and_last_good(catalog_database):
+    fixture = catalog_database
+    await _network(fixture, 71, "Standalone PPO")
+    binding = catalog_binding_document()
+    binding["binding_id"] = str(uuid4())
+    binding["status"] = "last_good"
+    await _binding(fixture, 71, binding)
+    fixture.snapshot["source_vector_json"] = [
+        _registered_source("c" * 64, "sample-fhir", "Example General Carrier", status="last_good")
+    ]
+    query = catalog.FHIRCatalogQuery(company_search="Example Carrier", search="Standalone PPO")
+    page = await _read(fixture, query)
+    assert page["total"] == 1 and page["items"][0]["network_id"] == 71
+    assert page["items"][0]["matching_relationships"]["total"] == 0
+    assert page["items"][0]["source_companies"][0]["provenance"] == "source_registration"
+    assert (await _read(fixture, replace(query, plan_search="PPO")))["total"] == 0
+    assert (await _read(fixture, catalog.FHIRCatalogQuery(search="Example Carrier")))["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_registered_aliases_respect_source_and_network_exclusions(catalog_database):
+    fixture = catalog_database
+    await _network(fixture, 72, "Alias Network")
+    await _source_plan(fixture, 72, "c" * 64, "source-alpha", "Preferred PPO")
+    source_by_field = _registered_source("c" * 64, "source-alpha", "Example Carrier")
+    source_by_field["source_companies"].append(
+        {
+            **source_by_field["source_companies"][0],
+            "source_id": "source-alpha-alias",
+            "display_name": "Registered Brand",
+        }
+    )
+    fixture.snapshot["source_vector_json"] = [source_by_field]
+    query = catalog.FHIRCatalogQuery(company_search="Registered Brand")
+    unscoped = await _read(fixture, query)
+    assert [company["source_id"] for company in unscoped["items"][0]["source_companies"]] == [
+        "source-alpha",
+        "source-alpha-alias",
+    ]
+    selected = RegistryNetworkSourceCoordinates(
+        "fhir",
+        "source-alpha",
+        "sample_source",
+        "dataset-source-alpha",
+        "registry-fhir-catalog-v1",
+        "dataset-source-alpha",
+    )
+    assert (await _read(fixture, replace(query, source=selected)))["total"] == 0
+    scoped = await _read(fixture, replace(query, company_search="Example Carrier", source=selected))
+    assert [company["source_id"] for company in scoped["items"][0]["source_companies"]] == ["source-alpha"]
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        denied = await catalog.read_fhir_catalog(
+            fixture.connection, query, excluded_network_ids=(72,), control_schema="sample_control"
+        )
+    assert denied["total"] == 0 and not denied["items"]
+
+
+@pytest.mark.asyncio
+async def test_source_company_order_uses_raw_identifiers(catalog_database):
+    fixture = catalog_database
+    await _network(fixture, 73, "Mixed Alias Network")
+    await _source_plan(fixture, 73, "c" * 64, "Z", "Preferred PPO")
+    await _source_plan(fixture, 73, "d" * 64, "a", "Preferred PPO")
+    fixture.snapshot["source_vector_json"] = [
+        _registered_source("c" * 64, "Z", "Upper Registered Carrier"),
+        _registered_source("d" * 64, "a", "Lower Registered Carrier"),
+    ]
+    page = await _read(fixture, catalog.FHIRCatalogQuery(company_search="Registered Carrier"))
+    assert page["total"] == 1
+    assert [company["source_id"] for company in page["items"][0]["source_companies"]] == ["Z", "a"]
+
+
+_COMPANY_COPY_COLUMNS = {
+    "network": (
+        "metadata_generation",
+        "network_id",
+        "display_name",
+        "aliases",
+        "archived",
+        "revision",
+        "benefit_codes",
+        "search_name",
+    ),
+    "binding": ("metadata_generation", "network_id", "binding_id", "source_id", "document_json"),
+    "relationship": (
+        "metadata_generation",
+        "relationship_id",
+        "network_id",
+        "source_id",
+        "source_generation",
+        "binding_id",
+        "company_id",
+        "group_id",
+        "company_search",
+        "plan_search",
+        "document_json",
+    ),
+}
+
+
+def _company_copy_rows(index, source_count):
+    source_index = index % source_count
+    generation, source_id = f"{source_index + 1:064x}", f"source-{source_index:02}"
+    network_id, organization = 10000 + index, f"network-{index}"
+    name = f"Network {index:04}"
+    binding = catalog_binding_document()
+    binding.update(
+        binding_id=str(uuid4()),
+        source_id=source_id,
+        source_key=organization,
+        source_scope={"organization_id": organization, "source_generation": generation},
+        evidence_id=f"{generation}:Organization/{organization}",
+    )
+    edge = relationship_document()
+    edge.update(
+        relationship_id=f"{index + 1:064x}",
+        source_id=source_id,
+        company=None,
+        group=None,
+        organization_reference=None,
+        resolution_status="unresolved",
+        resolution_reason="company_reference_missing",
+    )
+    edge["plan"]["display_name"] = "Preferred PPO" if index % 2 == 0 else "Regional HMO"
+    return {
+        "network": (GENERATION, network_id, name, "[]", False, 1, None, name.lower()),
+        "binding": (GENERATION, network_id, UUID(binding["binding_id"]), source_id, json.dumps(binding)),
+        "relationship": (
+            GENERATION,
+            edge["relationship_id"],
+            network_id,
+            source_id,
+            generation,
+            UUID(binding["binding_id"]),
+            None,
+            None,
+            "",
+            edge["plan"]["display_name"].lower(),
+            json.dumps(edge),
+        ),
+    }
+
+
+async def _copy_company_population(fixture, source_count, network_count):
+    copy_rows_by_table = {kind: [] for kind in _COMPANY_COPY_COLUMNS}
+    for index in range(network_count):
+        for kind, copy_row in _company_copy_rows(index, source_count).items():
+            copy_rows_by_table[kind].append(copy_row)
+    for kind, copy_rows in copy_rows_by_table.items():
+        await fixture.connection.copy_records_to_table(
+            "registry_fhir_catalog_" + kind,
+            schema_name=fixture.metadata,
+            columns=_COMPANY_COPY_COLUMNS[kind],
+            records=copy_rows,
+        )
+
+
+async def _all_company_pages(fixture, monkeypatch):
+    statements, original = [], catalog.catalog_directory_fetchrow
+
+    async def counted_read(*args, **kwargs):
+        statements.append(args[1])
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(catalog, "catalog_directory_fetchrow", counted_read)
+    page = await _read(fixture, catalog.FHIRCatalogQuery(limit=100))
+    network_documents = list(page["items"])
+    while page["next_offset"] is not None:
+        page = await _read(
+            fixture,
+            catalog.FHIRCatalogQuery(
+                limit=100,
+                offset=page["next_offset"],
+                metadata_generation=GENERATION,
+                continuation_scope_sha256=page["continuation_scope_sha256"],
+            ),
+        )
+        network_documents.extend(page["items"])
+    return network_documents, statements
+
+
+@pytest.mark.asyncio
+async def test_company_projection_covers_every_network_with_batched_reads(catalog_database, monkeypatch):
+    fixture = catalog_database
+    source_count, network_count = 31, 3001
+    fixture.snapshot["source_vector_json"] = [
+        _registered_source(
+            f"{source_index + 1:064x}", f"source-{source_index:02}", f"Example Carrier {source_index:02}"
+        )
+        for source_index in range(source_count)
+    ]
+    await _copy_company_population(fixture, source_count, network_count)
+    network_documents, statements = await _all_company_pages(fixture, monkeypatch)
+    imported_networks = [network for network in network_documents if network["network_id"] >= 10000]
+    assert len(imported_networks) == len({network["network_id"] for network in imported_networks}) == network_count
+    for network in imported_networks:
+        source_index = (network["network_id"] - 10000) % source_count
+        assert network["source_companies"] == fixture.snapshot["source_vector_json"][source_index]["source_companies"]
+        assert network["directory_available"] is False
+    assert len(statements) == (network_count + 3 + 99) // 100
+    filtered_page = await _read(fixture, catalog.FHIRCatalogQuery(company_search="Carrier 07", plan_search="PPO"))
+    expected_count = sum(index % source_count == 7 and index % 2 == 0 for index in range(network_count))
+    assert filtered_page["total"] == expected_count
 
 
 @pytest.mark.asyncio
@@ -480,6 +780,7 @@ async def test_representative_query_uses_trigram(catalog_database):
         explained = await fixture.connection.fetchval(
             "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + sql,
             *parameters,
+            "[]",
             *address_parameters,
         )
         names = _plan_names(json.loads(explained))
@@ -536,8 +837,9 @@ async def _prepare_metadata_pin_fixture(fixture, monkeypatch):
       INSERT INTO {namespace}.network_serving_control VALUES(1,'{"a" * 64}',10)""")
     await fixture.connection.execute(
         f"INSERT INTO {namespace}.registry_fhir_catalog_snapshot "
-        "(metadata_generation,network_generation,manifest_sha256,metadata_approved_revision,schema_name,custody_json,published_at) "
-        "VALUES($1,9,$2,6,$3,'{}'::jsonb,NULL)",
+        "(metadata_generation,network_generation,manifest_sha256,metadata_approved_revision,schema_name,custody_json,"
+        "published_at,source_vector_json) "
+        "VALUES($1,9,$2,6,$3,'{}'::jsonb,NULL,'[]'::jsonb)",
         GENERATION,
         "f" * 64,
         fixture.metadata,
@@ -583,8 +885,9 @@ async def test_unpublished_and_changed_pin_refuse(catalog_database, monkeypatch)
     assert retained["metadata_generation"] == GENERATION
     await fixture.connection.execute(
         f"INSERT INTO {namespace}.registry_fhir_catalog_snapshot "
-        "(metadata_generation,network_generation,manifest_sha256,metadata_approved_revision,schema_name,custody_json,published_at) "
-        "VALUES($1,10,$2,6,$3,'{}'::jsonb,clock_timestamp())",
+        "(metadata_generation,network_generation,manifest_sha256,metadata_approved_revision,schema_name,custody_json,"
+        "published_at,source_vector_json) "
+        "VALUES($1,10,$2,6,$3,'{}'::jsonb,clock_timestamp(),'[]'::jsonb)",
         "c" * 64,
         "e" * 64,
         fixture.metadata,

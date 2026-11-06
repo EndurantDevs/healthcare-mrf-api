@@ -71,11 +71,10 @@ _NATIVE_SQL = """WITH heaps AS (SELECT * FROM pg_class WHERE relnamespace=$1::oi
  constraints AS (SELECT k.* FROM pg_constraint k WHERE k.conrelid IN (SELECT oid FROM heaps)
  OR k.confrelid IN (SELECT oid FROM heaps)),
  defaults AS (SELECT d.* FROM pg_attrdef d JOIN heaps h ON h.oid=d.adrelid),
- objects(classid,objid) AS (
- SELECT 'pg_constraint'::regclass,oid FROM constraints
- UNION SELECT 'pg_attrdef'::regclass,oid FROM defaults
- UNION SELECT 'pg_class'::regclass,indexrelid FROM indexes),
- dependencies AS (SELECT d.* FROM objects x JOIN pg_depend d ON (d.classid,d.objid)=(x.classid,x.objid)),
+ dependencies AS (SELECT d.* FROM pg_depend d WHERE
+ (d.classid='pg_constraint'::regclass AND d.objid=ANY(ARRAY(SELECT oid FROM constraints)))
+ OR (d.classid='pg_attrdef'::regclass AND d.objid=ANY(ARRAY(SELECT oid FROM defaults)))
+ OR (d.classid='pg_class'::regclass AND d.objid=ANY(ARRAY(SELECT indexrelid FROM indexes)))),
  types AS (SELECT DISTINCT t.* FROM attributes a JOIN pg_type t ON t.oid=a.atttypid OR t.oid=
  (SELECT typelem FROM pg_type WHERE oid=a.atttypid))
 SELECT jsonb_build_object(

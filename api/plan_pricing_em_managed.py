@@ -82,7 +82,7 @@ def _page_sql(inputs, rates_relation):
     evidence = geo_projection.legacy_evidence_source_id_sql(
         "addr", schema_name=SCHEMA, dependency_bindings=bindings, unified_schema_name=scope.manifest.schema_name
     )
-    address = scoped_address_relation_sql("mrf.entity_address_unified")
+    address = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
     # Match the retained serving heap's GiST expression exactly.
     geography = "public.Geography(public.ST_MakePoint((addr.long)::double precision,(addr.lat)::double precision))"
     return _PAGE_SQL.format(

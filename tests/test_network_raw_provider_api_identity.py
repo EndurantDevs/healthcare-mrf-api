@@ -107,6 +107,9 @@ async def test_office_page_guards_only_rendered_relations(monkeypatch, compact, 
         expected.update((103, 301))
     assert {relation.table_oid for relation in relations} == expected
     assert 999 not in expected
+    query, *arguments = connection.fetchrow.await_args.args
+    assert ("WHERE canonical_network_ids && $1::text::integer[]" in query) is not compact
+    assert arguments[0] == "{11}"
     connection.acquire.assert_not_called()
 
 
