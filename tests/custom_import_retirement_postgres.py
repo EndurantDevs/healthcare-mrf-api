@@ -641,6 +641,44 @@ async def test_retirement_preserves_completed_projection_history_and_removes_its
             )
 
 
+async def _assert_commit_closure_deadline(case, family_id, monkeypatch):
+    """Exhaust the real commit deadline and verify its transaction rolls back."""
+    original_closure = retirement._commit_reference_closure
+    original_reference_check = retirement._revision_references
+    flags_by_phase = {"closure": False, "blocked": False}
+
+    async def tracked_closure(*args, **kwargs):
+        flags_by_phase["closure"] = True
+        return await original_closure(*args, **kwargs)
+
+    async def blocked_references(*args, **kwargs):
+        if flags_by_phase["closure"]:
+            flags_by_phase["blocked"] = True
+            await asyncio.Event().wait()
+        return await original_reference_check(*args, **kwargs)
+
+    assert retirement.MAX_REFERENCE_CLOSURE_SECONDS == 1
+    with monkeypatch.context() as deadline:
+        deadline.setattr(retirement, "_commit_reference_closure", tracked_closure)
+        deadline.setattr(retirement, "_revision_references", blocked_references)
+        # An outer witness must fail if the inner deadline is missing; it cannot satisfy raises.
+        async with asyncio.timeout(10):
+            with pytest.raises(TimeoutError):
+                async with case.sessions() as session, session.begin():
+                    await _bounded(session)
+                    await retirement.retire_snapshot_family(
+                        session, family_id, engine_id="synthetic", assert_external_unreferenced=_published_fixture_check
+                    )
+    assert flags_by_phase == {"closure": True, "blocked": True}
+    async with case.sessions() as session, session.begin():
+        assert await session.get(CustomImportSnapshotFamily, family_id) is not None
+        assert await session.get(CustomImportSnapshotRetirement, family_id) is None
+        assert (
+            await session.scalar(text("SELECT to_regnamespace(:name)"), {"name": retirement.snapshot_schema(family_id)})
+            is not None
+        )
+
+
 async def test_retirement_preserves_closed_continuation_history_but_refuses_active_authority(monkeypatch):
     from db.models.custom_import_continuation import CustomImportBuildContinuation
     from process.custom_import import build_output
@@ -669,6 +707,7 @@ async def test_retirement_preserves_closed_continuation_history_but_refuses_acti
         from tests.test_custom_import_build_output_postgres import _records
 
         await _supersede_build(case, request, family.generation_id, _records(2, 3))
+        await _assert_commit_closure_deadline(case, family_id, monkeypatch)
         # Keep bounded DDL headroom while the separate deadline proof checks refusal.
         with monkeypatch.context() as patch:
             patch.setattr(retirement, "MAX_REFERENCE_CLOSURE_SECONDS", 3)

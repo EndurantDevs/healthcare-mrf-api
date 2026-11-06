@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.sql import quoted_name
 
 from db.models.custom_import import (
     CustomImportCapture,
@@ -313,7 +314,8 @@ async def isolated_publication_case(
     raw_engine = create_async_engine(_database_url(), pool_pre_ping=True)
     schema_name = f"custom_import_publication_{uuid.uuid4().hex[:16]}"
     quoted_schema = _quoted_publication_schema(schema_name)
-    engine = raw_engine.execution_options(schema_translate_map={"mrf": schema_name})
+    # Keep SQLAlchemy's model-schema type so isolated fixtures exercise the same owner guard.
+    engine = raw_engine.execution_options(schema_translate_map={"mrf": quoted_name(schema_name, quote=None)})
     sessions = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     is_schema_created = False
     try:
