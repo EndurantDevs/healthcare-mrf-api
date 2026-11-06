@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -1378,10 +1378,16 @@ async def test_execution_dispatch_cannot_invent_a_refresh_runtime_or_operation(m
     monkeypatch.setattr(consumer, "_verify_execution", AsyncMock())
     execute = AsyncMock()
     monkeypatch.setattr(consumer, "complete_queued_membership_refresh", execute)
-    with pytest.raises(ValueError, match="refresh_runtime_unavailable|publication_operation_invalid"):
-        await consumer._execute_publication_request(
-            SimpleNamespace(acquire=acquire), configured, {"command_json": {"operation": operation}}, AsyncMock(), None
-        )
+    async with AsyncExitStack() as cleanup:
+        with pytest.raises(ValueError, match="refresh_runtime_unavailable|publication_operation_invalid"):
+            await consumer._execute_publication_request(
+                SimpleNamespace(acquire=acquire),
+                configured,
+                {"command_json": {"operation": operation}},
+                AsyncMock(),
+                None,
+                cleanup,
+            )
     assert close_events == [True]
     execute.assert_not_awaited()
 

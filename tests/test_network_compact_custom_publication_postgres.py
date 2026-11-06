@@ -7,13 +7,15 @@ from uuid import uuid4
 
 import pytest
 
+from api.network_address_scope import network_address_read_scope
+from api.network_provider_read import read_network_provider_detail, read_network_provider_page
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
 from process.registry_publication_execution import _source_rollback_address_sources
-from tests.test_network_compact_publication_postgres import _assert_readonly_replay, _read, _seal
+from tests.test_network_compact_publication_postgres import _assert_readonly_replay, _read, _reader, _seal
 from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
 from tests.test_network_custom_address_source_postgres import _draft, _seed
 from tests.test_registry_approval_store_postgres import _approve, _command
@@ -56,6 +58,26 @@ async def _publish_registered(fixture, copy_target):
     )
 
 
+async def _assert_manual_provider_reads(fixture, manifest, network_id, seed):
+    """Keep compact manual list/detail responses tied to the exact selected office."""
+    async with _reader(fixture) as (_connection, driver):
+        with network_address_read_scope(manifest, (network_id,)) as scope:
+            page = await read_network_provider_page(driver, scope, control_schema=fixture.control_schema)
+            assert page["total_count"] == 1 and len(page["providers"]) == 1
+            provider = page["providers"][0]
+            assert provider["provider_system"] == "manual" and provider["provider_id"] == seed.provider["record_id"]
+            assert provider["npi"] is None
+            assert [office["location_id"] for office in provider["locations"]] == [seed.first["record_id"]]
+            detail = await read_network_provider_detail(
+                driver,
+                scope,
+                provider_system="manual",
+                provider_id=provider["provider_id"],
+                control_schema=fixture.control_schema,
+            )
+            assert detail == {"generation_id": page["generation_id"], "provider": provider}
+
+
 async def test_manual_office_publication_removal_and_pinned_old_reader(compact_publication_db):
     fixture = compact_publication_db
     await fixture.connection.execute(f'CREATE TABLE "{fixture.address.schema}".npi(npi bigint PRIMARY KEY)')
@@ -76,6 +98,7 @@ async def test_manual_office_publication_removal_and_pinned_old_reader(compact_p
     assert office_rows[0]["npi"] is None and office_rows[0]["canonical_network_ids"] == [network]
     assert office_rows[0]["second_line"] == "Suite 2"
     assert pin.compact_layout.custom.table_oid != pin.compact_layout.base.table_oid
+    await _assert_manual_provider_reads(fixture, pin, network, seed)
     await _assert_readonly_replay(fixture, first, publication)
     corrected = await _draft(
         approval,

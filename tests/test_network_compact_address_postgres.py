@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import MetaData, select, text
 from sqlalchemy.dialects.postgresql import dialect
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateTable
 
@@ -22,19 +22,22 @@ from api.network_address_scope import (
 )
 from api.network_compact_address import (
     _membership_arms,
+    compact_address_native_sql,
     compact_address_parameters,
     compact_address_relation_sql,
     compact_address_selectable,
 )
 from api.network_read_execution import network_read_relations
 from db.models import EntityAddressUnified
+from process import network_indexed_address_artifact as indexed
 from process.network_compact_layout import (
     CompactAddressRelation,
     CompactEdgeArtifact,
     CompactNetworkLayout,
     verify_compact_layout_catalog,
 )
-from process.network_serving_read import PinnedNetworkServingManifest
+from process.network_serving_read import PinnedNetworkServingManifest, _attach_manifest_custody
+from tests import test_custom_import_provider_geo_sql as geo
 from tests.test_network_membership_slices_postgres import _candidate, _pin, _prepare, slice_db
 
 _VISIBLE_MEMBERSHIP = """EXISTS(SELECT 1 FROM unnest(canonical_network_ids) visible_network(network_id)
@@ -486,3 +489,123 @@ async def test_legacy_scope_and_manifest_wire_stay_unchanged(compact_db):
     assert scoped_address_relation_sql("mrf.entity_address_unified") == "mrf.entity_address_unified"
     statement = select(EntityAddressUnified.__table__)
     assert scoped_address_statement(statement) is statement
+
+
+async def _lookup_rows(db, layout, network_ids):
+    options_by_name = {"network_ids": network_ids, "location_lookup": True}
+    raw = compact_address_relation_sql(layout, **options_by_name)
+    typed = compact_address_selectable(layout, **options_by_name)
+    native, arguments = compact_address_native_sql(layout, first_parameter=2, **options_by_name)
+    parameters_by_name = {**compact_address_parameters(layout), "_canonical_network_ids": list(network_ids)}
+    async with db.engine.connect() as connection:
+        raw_rows = [
+            dict(entry)
+            for entry in (
+                await connection.execute(text(f"SELECT * FROM {raw} office ORDER BY location_key"), parameters_by_name)
+            ).mappings()
+        ]
+        typed_rows = [
+            dict(entry)
+            for entry in (
+                await connection.execute(select(typed).order_by(typed.c.location_key), parameters_by_name)
+            ).mappings()
+        ]
+    native_rows = [
+        dict(entry)
+        for entry in await db.connection.fetch(
+            f"SELECT * FROM {native} office WHERE office.location_key<>$1::text ORDER BY location_key", "", *arguments
+        )
+    ]
+    assert raw_rows == typed_rows == native_rows
+    return raw_rows
+
+
+@pytest.mark.asyncio
+async def test_lookup_matches_complete_compact_rows(compact_db):
+    db = compact_db
+    for layout in (db.first_layout, db.second_layout, replace(db.second_layout, custom=None)):
+        for network_ids in ((42,), (7, 42), (42, 99), (88,), (99,), (2147483647,)):
+            assert await _lookup_rows(db, layout, network_ids) == await _read(db, layout, network_ids=network_ids)
+    overlap = await _lookup_rows(db, db.second_layout, (7, 42))
+    assert len(overlap) == 1 and overlap[0]["entity_name"] == "manual override"
+    assert overlap[0]["canonical_network_ids"] == [7, 42]
+    assert await _lookup_rows(db, replace(db.second_layout, artifacts=()), (42,)) == []
+
+
+@pytest.mark.asyncio
+async def test_lookup_keeps_custom_geo_precedence(compact_db):
+    db, layout = compact_db, compact_db.second_layout
+    for relation in (layout.base, layout.custom):
+        await db.connection.execute(f'UPDATE "{relation.schema_name}"."{relation.table_name}" SET lat=0,long=0')
+    await db.connection.execute(
+        f'UPDATE "{layout.custom.schema_name}"."{layout.custom.table_name}" SET lat=10,long=10 WHERE location_key=$1',
+        db.keys[0],
+    )
+    predicate = "ST_DWithin(geography(ST_MakePoint(long::float8,lat::float8)),geography(ST_MakePoint(0,0)),1609.34)"
+    for network_ids, expected in (((42,), []), ((99,), [db.keys[2]]), ((42, 99), [db.keys[2]])):
+        for lookup in (False, True):
+            relation, arguments = compact_address_native_sql(
+                layout, first_parameter=1, network_ids=network_ids, location_lookup=lookup
+            )
+            keys = await db.connection.fetch(
+                f"SELECT location_key FROM {relation} office WHERE {predicate} ORDER BY location_key", *arguments
+            )
+            assert [entry["location_key"] for entry in keys] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direction", ["asc", "desc"])
+@pytest.mark.parametrize("require_match", [False, True])
+async def test_compact_imported_geo_page_parity(compact_db, monkeypatch, direction, require_match):
+    db, layout = compact_db, compact_db.second_layout
+    monkeypatch.setattr(geo.provider_list_sql, "NetworkReadConnectionProxy", geo._PostgresGeoProxy)
+    monkeypatch.setattr(geo.npi_module, "_plan_release_npi_scope", geo._empty_plan_scope)
+    page_pairs = []
+    async with AsyncSession(db.engine) as session:
+        await geo._seed_geo_tables(session)
+        for relation in (layout.base, layout.custom):
+            await session.execute(
+                text(f'''UPDATE "{relation.schema_name}"."{relation.table_name}"
+                  SET lat=0,long=0,type='primary',address_precision='street',
+                    npi=CASE WHEN location_key=:selected THEN 1000000003 ELSE 1000000002 END,
+                    address_key=CASE WHEN location_key=:selected THEN CAST(:ranked AS uuid) ELSE CAST(:unranked AS uuid) END'''),
+                {"selected": db.keys[0], "ranked": geo._THIRD_ADDRESS_KEY, "unranked": geo._SECOND_ADDRESS_KEY},
+            )
+        for lookup in (False, True):
+
+            def address_relation(reference, **options):
+                assert options["location_lookup"] is True
+                relation = scoped_address_relation_sql(reference, location_lookup=lookup)
+                assert ("bucket_members OFFSET 0" in relation) is lookup
+                assert ("ref.office_bucket=(get_byte(sha256(" in relation) is lookup
+                return relation
+
+            monkeypatch.setattr(geo.npi_module, "scoped_address_relation_sql", address_relation)
+            with network_address_read_scope(_lookup_manifest(layout), (7, 42, 99)):
+                first = await geo._read_postgres_geo_page(session, direction, require_match=require_match)
+                anchor = geo._provider_identities(first)[0]
+                second = await geo._read_postgres_geo_page(
+                    session, direction, (str(anchor[0]), anchor[1]), require_match=require_match
+                )
+            page_pairs.append((first, second))
+    assert page_pairs[0] == page_pairs[1]
+    first, second = page_pairs[1]
+    assert first["total_count"] == second["total_count"] == 2
+    assert geo._provider_identities(first) == [
+        (1000000003, geo._THIRD_ADDRESS_KEY),
+        (1000000002, geo._SECOND_ADDRESS_KEY),
+    ]
+    assert geo._provider_identities(second) == [(1000000002, geo._SECOND_ADDRESS_KEY)]
+
+
+def _lookup_manifest(layout, contract=indexed.CONTRACT):
+    manifest = _manifest(layout)
+    closure_by_field = {"relation_oids": {"network_slice_ref": layout.ref_map.table_oid}}
+    custody_by_field = {
+        "receipt": {"closure": closure_by_field, "control": {}},
+        "seal_sha256": "b" * 64,
+        "compact_layout": layout,
+    }
+    readiness = (None, None, {"address_artifact": {"contract": contract}}, closure_by_field)
+    _attach_manifest_custody(manifest, custody_by_field, readiness, True)
+    return manifest

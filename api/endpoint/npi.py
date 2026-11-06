@@ -27,6 +27,7 @@ from sanic import Blueprint, response
 from sqlalchemy import JSON as SQLAlchemyJSON
 from sqlalchemy import false, func, or_, select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import literal_column, text, tuple_
 
 from api import provider_detail_network_metadata
@@ -54,7 +55,7 @@ from api.npi_detail_cache_identity import (
 from api.npi_detail_cache_identity import (
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
-from api.npi_native_cache_identity import npi_publication_cache_identity
+from api.npi_native_cache_identity import npi_canonical_publication_identity
 from api.provider_demographic_filters import normalize_provider_sex_code
 from api.provider_detail_sql import _npi_detail_address_filters, _npi_detail_taxonomy_aggregate
 from api.provider_directory_dataset_sql import (
@@ -86,6 +87,7 @@ from api.provider_geo_sql import (
 from api.provider_list_sql import (
     _CUSTOM_IMPORT_PROVIDER_RELATION,
     _NATIVE_PROVIDER_RELATION,
+    _NPI_COUNT_READ_SCOPE,
     MAX_PROVIDER_LIST_PHONE_CANDIDATES,
     MIN_PROVIDER_LIST_PHONE_CANDIDATES,
     _address_npi_filter,
@@ -94,8 +96,10 @@ from api.provider_list_sql import (
     _address_phone_digits_filter,
     _address_site_key_filter,
     _address_zip5_filter,
+    _bounded_provider_list_count,
     _extract_name_filters,
     _is_unified_address_table,
+    _npi_count_read,
     _primary_address_order_clause,
     _provider_import_count_page,
     _provider_import_match_clause,
@@ -108,6 +112,7 @@ from api.provider_list_sql import (
     _provider_list_parameters,
     _provider_list_phone_candidate_limit,
     _provider_list_statement,
+    _provider_list_total_statement,
     _provider_native_entity_scope,
     _sql_with_ctes,
     _sql_with_prefix_ctes,
@@ -191,6 +196,7 @@ from db.models import (
 )
 from db.provider_directory_readiness import READINESS_INDEXES
 from process import provider_directory_profile as profile_artifact
+from process.custom_import.read_core import _is_statement_timeout
 from process.ext.address_format import (
     ADDRESS_FORMAT_FUNCTION,
     ADDRESS_FORMAT_SOURCE,
@@ -4364,7 +4370,7 @@ async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict
 
     stmt, params = scoped_address_statement(stmt), scoped_address_parameters(params or {})
     if session is None and not has_network_read_guard(stmt):
-        return await db.execute(stmt, **(params or {}))
+        return await _npi_count_read(lambda: db.execute(stmt, **(params or {})))
     if session is None:
         from db.connection import current_session
 
@@ -4372,7 +4378,7 @@ async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict
             session = current_session()
         except RuntimeError as error:
             raise sanic.exceptions.ServiceUnavailable("Canonical network Reader is unavailable.") from error
-    return await execute_network_read(session, stmt, params)
+    return await _npi_count_read(lambda: execute_network_read(session, stmt, params))
 
 
 def _normalize_provider_enrichment_show_mode(raw_value: Any) -> str:
@@ -4685,71 +4691,48 @@ async def _fetch_ffs_summary_overrides(
     return summary_overrides_by_npi
 
 
-async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -> int:
+async def _fast_has_insurance_count(city: Optional[str], state: Optional[str], *, session=None, deadline=None) -> int:
     required_columns = {"npi", "type", "plans_network_array"}
     if city:
         required_columns.add("city_name")
     if state:
         required_columns.add("state_name")
-    address_model = await _address_serving_model(required_columns)
-    publication_identity = await _npi_count_cache_identity(address_model)
+    metadata_options = {"session": session} if session is not None else {}
+    address_model = await _address_serving_model(required_columns, **metadata_options)
+    publication_identity = await _npi_count_cache_identity(address_model, **metadata_options)
     has_cached_insurance_count = (
         _has_insurance_total_cache_get(publication_identity, city, state) if publication_identity is not None else None
     )
     if has_cached_insurance_count is not None:
         return has_cached_insurance_count
-    table = address_model.__table__
-    provider_npi = table.c.npi
-    if address_model is EntityAddressUnified:
-        provider_npi = func.coalesce(table.c.npi, table.c.inferred_npi)
-        is_serving_type = table.c.type.in_(GEO_SERVICE_LOCATION_TYPES)
+    stmt = _provider_list_total_statement(address_model, has_insurance=True, city=city, state=state)
+    if deadline is not None:
+        async with _provider_list_connection(db, None, session) as conn:
+            count = int(await _provider_list_count(conn, stmt, {}, session, deadline=deadline))
     else:
-        is_serving_type = table.c.type == "primary"
-    conditions = [
-        is_serving_type,
-        provider_npi.is_not(None),
-        literal_column("NOT (plans_network_array @@ '0'::query_int)"),
-    ]
-    if city:
-        conditions.append(table.c.city_name == city)
-    if state:
-        conditions.append(table.c.state_name == state)
-
-    # Legacy primary rows are one-per-NPI, so COUNT(*) avoids DISTINCT sorting.
-    # Unified serving has one primary row per canonical address and must count NPIs.
-    if city is None and state is None and address_model is NPIAddress:
-        stmt = select(func.count()).select_from(table).where(*conditions)
-    else:
-        stmt = select(func.count(func.distinct(provider_npi))).where(*conditions)
-    async with db.session() as session:
-        count_result = await execute_network_read(session, stmt)
-        count = int(count_result.scalar() or 0)
-        if publication_identity is None:
-            return count
-        return _has_insurance_total_cache_set(
-            publication_identity,
-            city,
-            state,
-            count,
-        )
+        async with db.session() as count_session:
+            count_result = await execute_network_read(count_session, stmt)
+            count = int(count_result.scalar() or 0)
+    if publication_identity is None:
+        return count
+    return _has_insurance_total_cache_set(publication_identity, city, state, count)
 
 
-async def _fast_primary_npi_count() -> int:
-    address_model = await _address_serving_model({"type"})
-    publication_identity = await _npi_count_cache_identity(address_model)
+async def _fast_primary_npi_count(*, session=None, deadline=None) -> int:
+    metadata_options = {"session": session} if session is not None else {}
+    address_model = await _address_serving_model({"type"}, **metadata_options)
+    publication_identity = await _npi_count_cache_identity(address_model, **metadata_options)
     cached = _primary_total_cache_get(publication_identity) if publication_identity is not None else None
     if cached is not None:
         return cached
-    table = address_model.__table__
-    if address_model is EntityAddressUnified:
-        provider_npi = func.coalesce(table.c.npi, table.c.inferred_npi)
-        stmt = select(func.count(func.distinct(provider_npi))).where(
-            table.c.type.in_(GEO_SERVICE_LOCATION_TYPES),
-            provider_npi.is_not(None),
-        )
-    else:
-        stmt = select(func.count()).select_from(table).where(table.c.type == "primary")
+    stmt = _provider_list_total_statement(address_model)
     scalar_fn = getattr(db, "scalar", None)
+    if deadline is not None:
+        async with _provider_list_connection(db, None, session) as conn:
+            count = int(await _provider_list_count(conn, stmt, {}, session, deadline=deadline))
+        if publication_identity is None:
+            return count
+        return _primary_total_cache_set(publication_identity, count)
     if scalar_fn is not None:
         try:
             scalar_value = await scalar_fn(stmt)
@@ -4760,6 +4743,8 @@ async def _fast_primary_npi_count() -> int:
         except sanic.exceptions.ServiceUnavailable:
             raise
         except Exception as exc:  # pragma: no cover - fallback for lightweight test doubles
+            if isinstance(exc, TimeoutError) or (isinstance(exc, DBAPIError) and _is_statement_timeout(exc)):
+                raise
             logger.debug(
                 "Primary NPI count scalar path failed; using acquire path (%s)",
                 type(exc).__name__,
@@ -5141,6 +5126,8 @@ async def _is_table_available(table_name: str, *, session: Any = None) -> bool:
     except sanic.exceptions.ServiceUnavailable:
         raise
     except Exception:  # pragma: no cover - defensive fallback for transient DB states
+        if _NPI_COUNT_READ_SCOPE.get() is not None:
+            raise
         return False
 
 
@@ -5197,11 +5184,11 @@ async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
         return _model_table_columns(EntityAddressUnified)
     cache_key = _schema_cache_key(table_name)
     has_guarded_read = has_network_read_inventory(session)
-    cached = None if has_guarded_read else _cache_get(_TABLE_COLUMNS_CACHE, cache_key)
-    if cached is not None:
-        return set(cached)
+    cached_columns = None if has_guarded_read else _cache_get(_TABLE_COLUMNS_CACHE, cache_key)
+    if cached_columns is not None:
+        return set(cached_columns)
     try:
-        result = await _execute_stmt(
+        column_result = await _execute_stmt(
             text(
                 """
                 SELECT column_name
@@ -5213,12 +5200,14 @@ async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
             session=session,
             params={"table_name": table_name},
         )
-        rows = result.all()
-        columns = {str(row[0]) for row in rows if row and row[0]}
+        column_rows = column_result.all()
+        columns = {str(column_row[0]) for column_row in column_rows if column_row and column_row[0]}
         return columns if has_guarded_read else set(_cache_set(_TABLE_COLUMNS_CACHE, cache_key, columns))
     except sanic.exceptions.ServiceUnavailable:
         raise
     except Exception:  # pragma: no cover - defensive fallback for transient DB states
+        if _NPI_COUNT_READ_SCOPE.get() is not None:
+            raise
         return set()
 
 
@@ -7969,6 +7958,13 @@ async def list_providers(
     response_format = args.get("format") or args.get("response_format")
     response_format = str(response_format).strip().lower() if response_format else None
     request_session = _request_session(request)
+    is_ordinary_provider_query = (
+        native_args is None
+        and import_context is None
+        and native_npis is None
+        and native_scope_preparer is None
+        and current_network_address_scope() is None
+    )
     legacy_name_like = _extract_name_filters(request, args=args)
     # Explicit access for route collectors / OpenAPI parity.
     # Imported calls use ``native_args`` but must retain the real request object.
@@ -8551,6 +8547,8 @@ async def list_providers(
             address_clauses.append(import_membership_clause)
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
+        if use_taxonomy_filter and is_ordinary_provider_query and not (codes and len(taxonomy_filters) == 1):
+            address_clauses.append(f"EXISTS (SELECT 1 FROM mrf.nucc_taxonomy WHERE {taxonomy_conditions})")
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
         taxonomy_join = f"CROSS JOIN {taxonomy_subquery}"
         taxonomy_parameters_by_name: dict[str, str] = {}
@@ -8706,7 +8704,7 @@ async def list_providers(
                 "SELECT classification AS key, COUNT(*) AS value FROM mrf.nucc_taxonomy GROUP BY classification"
             )
         async with db.acquire() as conn:
-            formatted_count_records = await conn.all(formatted_count_query)
+            formatted_count_records = await _npi_count_read(lambda: conn.all(formatted_count_query))
         return {count_record[0]: count_record[1] for count_record in formatted_count_records}
 
     async def get_classification_count_map(filters_by_name) -> dict:
@@ -8872,7 +8870,7 @@ async def list_providers(
             )
         query_parameters_by_name = _provider_list_parameters(query_parameters_by_name, import_context)
         async with _provider_list_connection(db, import_context, request_session) as conn:
-            classification_count_records = await conn.all(query, **query_parameters_by_name)
+            classification_count_records = await _npi_count_read(lambda: conn.all(query, **query_parameters_by_name))
         return {
             count_record[0]: count_record[1]
             for count_record in classification_count_records
@@ -8898,20 +8896,42 @@ async def list_providers(
             default=str,
         )
 
-    if is_count_only and not simple_filter_present and not has_insurance and not city and not state:
-        return response.json({"rows": await _fast_primary_npi_count()}, default=str)
+    async def _count_rows(*, deadline=None):
+        count_options = {"session": request_session, "deadline": deadline} if deadline is not None else {}
+        if not simple_filter_present and not has_insurance and not city and not state:
+            return await _fast_primary_npi_count(**count_options)
+        if is_count_only:
+            if has_insurance and not simple_filter_present:
+                return await _fast_has_insurance_count(city, state, **count_options)
+            if response_format == "all":
+                return await get_classification_count_map(filters_by_name)
+            if response_format in {"full_taxonomy", "classification"}:
+                return await get_formatted_count(response_format)
+        return await get_count(filters_by_name, deadline=deadline)
 
-    if is_count_only and has_insurance and not simple_filter_present:
-        insurance_provider_count = await _fast_has_insurance_count(city, state)
-        return response.json({"rows": insurance_provider_count}, default=str)
+    async def _bounded_count_rows():
+        if import_context is not None or native_npis is not None:
+            return await _count_rows()
+        return await _bounded_provider_list_count(
+            _count_rows,
+            session=request_session,
+            has_reader=has_reader_session(db),
+            timeout=_NPI_ALL_TOTAL_TIMEOUT_SECONDS,
+        )
 
-    if is_count_only and response_format == "all":
-        mapping = await get_classification_count_map(filters_by_name)
-        return response.json({"rows": mapping}, default=str)
-
-    if is_count_only and response_format in {"full_taxonomy", "classification"}:
-        mapping = await get_formatted_count(response_format)
-        return response.json({"rows": mapping}, default=str)
+    if is_count_only:
+        try:
+            count_rows = await _bounded_count_rows()
+        except (TimeoutError, DBAPIError) as exc:
+            if import_context is not None or native_npis is not None:
+                raise
+            if isinstance(exc, DBAPIError) and not _is_statement_timeout(exc):
+                raise
+            return response.json(
+                {"error": "count_timeout", "message": "The exact provider count exceeded its time limit."},
+                status=503,
+            )
+        return response.json({"rows": count_rows}, default=str)
 
     async def get_sitemap_results(
         start_offset: int, page_limit: int, classification_value: str
@@ -9031,6 +9051,7 @@ async def list_providers(
         if codes:
             taxonomy_clauses.append("code = ANY(:codes)")
         use_taxonomy_filter = bool(taxonomy_clauses)
+        taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
         use_location_first_taxonomy = _is_location_first_taxonomy_filter(
             use_taxonomy_filter,
             (
@@ -9046,6 +9067,8 @@ async def list_providers(
         )
         if use_taxonomy_filter and not use_location_first_taxonomy:
             address_clauses.insert(0, "c.taxonomy_array && q.int_codes")
+        if use_taxonomy_filter and is_ordinary_provider_query and not (codes and len(taxonomy_clauses) == 1):
+            address_clauses.append(f"EXISTS (SELECT 1 FROM mrf.nucc_taxonomy WHERE {taxonomy_filter})")
         if plan_network_ids:
             address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
@@ -9130,7 +9153,6 @@ async def list_providers(
         )
         search_npi_projection = ", ".join(f"b.{column_name}" for column_name in search_npi_column_names)
 
-        taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
         taxonomy_parameters_by_name: dict[str, str] = {}
         taxonomy_code_placeholders: tuple[str, ...] = ()
         if npi_where and codes and len(taxonomy_clauses) == 1:
@@ -9215,6 +9237,9 @@ async def list_providers(
         else:
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
         address_order = _primary_address_order_clause("c", address_table_sql)
+        use_computed_page_order = bool(plan_network_ids) or (
+            is_ordinary_provider_query and zip_code and use_taxonomy_filter and not npi_where and order_by == "npi"
+        )
         if order_by == "relevance":
             eligible_npis_sql = f"""
             SELECT {provider_npi_sql} AS npi,
@@ -9237,7 +9262,7 @@ async def list_providers(
               FROM {address_source}
              WHERE {" and ".join(eligible_address_clauses)}
             """
-            page_order_sql = "ORDER BY npi + 0" if plan_network_ids else "ORDER BY npi"
+            page_order_sql = "ORDER BY npi + 0" if use_computed_page_order else "ORDER BY npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
         native_eligible_cte = None
@@ -9258,7 +9283,7 @@ async def list_providers(
             sub_s_page_position_projection = ""
         else:
             page_npis_sql = f"""
-            {f"SELECT * FROM ({eligible_npis_sql}) AS eligible_npi" if plan_network_ids else eligible_npis_sql}
+            {f"SELECT * FROM ({eligible_npis_sql}) AS eligible_npi" if use_computed_page_order else eligible_npis_sql}
             {page_order_sql}
             LIMIT :limit OFFSET :start
             """
@@ -9670,10 +9695,6 @@ async def list_providers(
             _redact_internal_address_fields(provider_result)
         return provider_results, provider_total, summary_map
 
-    if is_count_only:
-        count_rows = await get_count(filters_by_name)
-        return response.json({"rows": count_rows}, default=str)
-
     async def _count_with_timeout(*, allow_inline_total: bool = True) -> Optional[int]:
         if not include_total:
             return None
@@ -9689,15 +9710,8 @@ async def list_providers(
                 include_total_raw is not None,
             )
             return None
-        if not simple_filter_present and not has_insurance and not city and not state:
-            return await _fast_primary_npi_count()
         try:
-            if has_reader_session(db):
-                deadline = time.monotonic() + max(0.1, _NPI_ALL_TOTAL_TIMEOUT_SECONDS)
-                async with provider_read_savepoint(request_session):
-                    return await get_count(filters_by_name, deadline=deadline)
-            async with asyncio.timeout(max(0.1, _NPI_ALL_TOTAL_TIMEOUT_SECONDS)):
-                return await get_count(filters_by_name)
+            return await _bounded_count_rows()
         except asyncio.TimeoutError:
             logger.warning(
                 "NPI /all total count timed out; offset=%s limit=%s",
@@ -10494,7 +10508,6 @@ async def get_near_npi(
             else:
                 capability_by_name = await _resolve_npi_filter_capabilities()
 
-        # If only zip was provided, resolve to coordinates before constructing geo SQL.
         if not has_coordinates and zip_codes and zip_codes[0]:
             async with _provider_list_connection(db, import_context, request_session) as conn_zip:
                 zip_rows = await conn_zip.all(canonical_zip_anchor_statement(), zip_code=zip_codes[0])
@@ -10506,9 +10519,10 @@ async def get_near_npi(
                     in_lat = float(coordinate_record[0])
                     in_long = float(coordinate_record[1])
 
-        address_table_sql = await _address_serving_table_sql(
-            _public_address_serving_column_keys(),
-            session=request_session,
+        address_table_sql = (
+            scoped_address_relation_sql(f"{_runtime_db_schema()}.entity_address_unified", location_lookup=True)
+            if current_network_address_scope() is not None and in_long is not None and in_lat is not None
+            else await _address_serving_table_sql(_public_address_serving_column_keys(), session=request_session)
         )
         plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
             request_session,
@@ -13126,56 +13140,23 @@ async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str,
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 
 
-async def _npi_canonical_publication_identity(
-    *,
-    session: Any = None,
-) -> str | None:
+async def _npi_canonical_publication_identity(*, session: Any = None) -> str | None:
     """Return the uncached receipt identity for the six current NPI tables."""
-
-    schema = _runtime_db_schema()
-    receipt_table = _schema_cache_key("npi_canonical_publication_receipt")
-    seal_table = _schema_cache_key("npi_canonical_publication_receipt_seal")
-    live_table_by_oid_column = (
-        ("npi_table_oid", "npi"),
-        ("npi_address_table_oid", "npi_address"),
-        ("npi_taxonomy_table_oid", "npi_taxonomy"),
-        ("npi_taxonomy_group_table_oid", "npi_taxonomy_group"),
-        ("npi_other_identifier_table_oid", "npi_other_identifier"),
-        ("npi_phone_staffing_table_oid", "npi_phone_staffing"),
+    return await npi_canonical_publication_identity(
+        _execute_stmt,
+        _runtime_db_schema(),
+        logger,
+        receipt_table=_schema_cache_key("npi_canonical_publication_receipt"),
+        seal_table=_schema_cache_key("npi_canonical_publication_receipt_seal"),
+        session=session,
     )
-    relation_predicates = " AND ".join(
-        f"receipt.{oid_column}=to_regclass(:{table_name}_ref)::oid"
-        for oid_column, table_name in live_table_by_oid_column
-    )
-    parameters_by_name = {f"{table_name}_ref": f"{schema}.{table_name}" for _, table_name in live_table_by_oid_column}
-    try:
-        identity_result = await _execute_stmt(
-            text(
-                f"SELECT receipt.publication_generation, receipt.publication_ref "
-                f"FROM {receipt_table} AS receipt "
-                f"JOIN {seal_table} AS sealed USING (publication_ref) "
-                f"WHERE {relation_predicates} "
-                "ORDER BY receipt.publication_generation DESC LIMIT 2"
-            ),
-            session=session,
-            params=parameters_by_name,
-        )
-        identity_rows = identity_result.all()
-    except sanic.exceptions.ServiceUnavailable:
-        raise
-    except Exception as exc:
-        logger.debug(
-            "Canonical NPI publication identity unavailable; bypassing cache (%s)",
-            type(exc).__name__,
-        )
-        return None
-    return await npi_publication_cache_identity(identity_rows, _execute_stmt, schema, logger, session=session)
 
 
-async def _npi_count_cache_identity(address_model: Any) -> str | None:
+async def _npi_count_cache_identity(address_model: Any, *, session=None) -> str | None:
     """Bind count caches to both canonical NPI and address-serving generations."""
 
-    publication_identity = await _npi_canonical_publication_identity()
+    metadata_options = {"session": session} if session is not None else {}
+    publication_identity = await _npi_canonical_publication_identity(**metadata_options)
     if publication_identity is None:
         return None
     if current_network_address_scope() is not None:
@@ -13187,12 +13168,15 @@ async def _npi_count_cache_identity(address_model: Any) -> str | None:
     try:
         relation_result = await _execute_stmt(
             text("SELECT to_regclass(:table_ref)::oid::bigint"),
+            session=session,
             params={"table_ref": _schema_cache_key(address_model.__tablename__)},
         )
         relation_oid = relation_result.scalar()
     except sanic.exceptions.ServiceUnavailable:
         raise
     except Exception:
+        if _NPI_COUNT_READ_SCOPE.get() is not None:
+            raise
         return None
     if type(relation_oid) is not int or relation_oid < 1:
         return None

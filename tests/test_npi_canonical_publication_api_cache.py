@@ -152,7 +152,39 @@ async def test_publication_identity_query_failure_bypasses_cache(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_primary_count_cache_misses_after_publication_change(monkeypatch):
+@pytest.mark.parametrize("failure", ["unavailable", "deadline", "statement_timeout", "cancellation", "other"])
+async def test_native_identity_fallback_preserves_read_failure_boundaries(monkeypatch, failure):
+    import asyncio
+    import logging
+
+    from sanic.exceptions import ServiceUnavailable
+    from sqlalchemy.exc import DBAPIError
+
+    from api import npi_native_cache_identity as identity
+
+    error_by_failure = {
+        "unavailable": ServiceUnavailable("synthetic reader unavailable"),
+        "deadline": TimeoutError("synthetic metadata deadline"),
+        "cancellation": asyncio.CancelledError(),
+        "other": RuntimeError("synthetic optional metadata absent"),
+    }
+    driver_error = RuntimeError("synthetic statement timeout")
+    driver_error.sqlstate = "57014"
+    error_by_failure["statement_timeout"] = DBAPIError(None, None, driver_error)
+    error = error_by_failure[failure]
+    monkeypatch.setattr(identity, "npi_native_cache_identity", AsyncMock(side_effect=error))
+    if failure == "other":
+        assert (
+            await identity.npi_publication_cache_identity([], AsyncMock(), "mrf", logging.getLogger(__name__)) is None
+        )
+    else:
+        with pytest.raises(type(error)):
+            await identity.npi_publication_cache_identity([], AsyncMock(), "mrf", logging.getLogger(__name__))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bounded", [False, True])
+async def test_primary_count_cache_misses_after_publication_change(monkeypatch, bounded):
     monkeypatch.setattr(npi_module, "ENABLE_NPI_SCHEMA_CACHE", True)
     monkeypatch.setattr(
         npi_module,
@@ -171,15 +203,23 @@ async def test_primary_count_cache_misses_after_publication_change(monkeypatch):
     )
     scalar = AsyncMock(side_effect=[11, 22])
     monkeypatch.setattr(npi_module.db, "scalar", scalar)
+    count_options_by_name = {}
+    if bounded:
+        from tests.test_npi_all_names_like import FakeAcquire
 
-    assert await npi_module._fast_primary_npi_count() == 11
-    assert await npi_module._fast_primary_npi_count() == 11
-    assert await npi_module._fast_primary_npi_count() == 22
+        monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(object()))
+        monkeypatch.setattr(npi_module, "_provider_list_count", scalar)
+        count_options_by_name = {"session": object(), "deadline": 10.0}
+
+    assert await npi_module._fast_primary_npi_count(**count_options_by_name) == 11
+    assert await npi_module._fast_primary_npi_count(**count_options_by_name) == 11
+    assert await npi_module._fast_primary_npi_count(**count_options_by_name) == 22
     assert scalar.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_primary_count_cache_misses_after_unified_address_swap(monkeypatch):
+@pytest.mark.parametrize("bounded", [False, True])
+async def test_primary_count_cache_misses_after_unified_address_swap(monkeypatch, bounded):
     monkeypatch.setattr(npi_module, "ENABLE_NPI_SCHEMA_CACHE", True)
     monkeypatch.setattr(
         npi_module,
@@ -203,15 +243,47 @@ async def test_primary_count_cache_misses_after_unified_address_swap(monkeypatch
     )
     scalar = AsyncMock(side_effect=[11, 22])
     monkeypatch.setattr(npi_module.db, "scalar", scalar)
+    count_options_by_name = {}
+    if bounded:
+        from tests.test_npi_all_names_like import FakeAcquire
 
-    assert await npi_module._fast_primary_npi_count() == 11
-    assert await npi_module._fast_primary_npi_count() == 11
-    assert await npi_module._fast_primary_npi_count() == 22
+        monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(object()))
+        monkeypatch.setattr(npi_module, "_provider_list_count", scalar)
+        count_options_by_name = {"session": object(), "deadline": 10.0}
+
+    assert await npi_module._fast_primary_npi_count(**count_options_by_name) == 11
+    assert await npi_module._fast_primary_npi_count(**count_options_by_name) == 11
+    assert await npi_module._fast_primary_npi_count(**count_options_by_name) == 22
     assert scalar.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_insurance_count_cache_misses_after_publication_change(monkeypatch):
+@pytest.mark.parametrize("failure", ["deadline", "statement_timeout"])
+async def test_primary_count_timeout_never_retries_scalar_as_aggregate(monkeypatch, failure):
+    from sqlalchemy.exc import DBAPIError
+
+    error = TimeoutError("synthetic count deadline")
+    if failure == "statement_timeout":
+        driver_error = RuntimeError("synthetic query cancellation")
+        driver_error.sqlstate = "57014"
+        error = DBAPIError(None, None, driver_error)
+    monkeypatch.setattr(npi_module, "_address_serving_model", AsyncMock(return_value=npi_module.NPIAddress))
+    monkeypatch.setattr(npi_module, "_npi_count_cache_identity", AsyncMock(return_value=None))
+    scalar = AsyncMock(side_effect=error)
+    acquire = AsyncMock(side_effect=AssertionError("count retried"))
+    monkeypatch.setattr(npi_module.db, "scalar", scalar)
+    monkeypatch.setattr(npi_module.db, "acquire", acquire)
+
+    with pytest.raises(type(error)):
+        await npi_module._fast_primary_npi_count()
+
+    scalar.assert_awaited_once()
+    acquire.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bounded", [False, True])
+async def test_insurance_count_cache_misses_after_publication_change(monkeypatch, bounded):
     counts = iter((31, 42))
     execute = AsyncMock(side_effect=lambda _statement, _parameters=None: SimpleNamespace(scalar=lambda: next(counts)))
 
@@ -239,11 +311,23 @@ async def test_insurance_count_cache_misses_after_publication_change(monkeypatch
         "db",
         SimpleNamespace(session=lambda: _SessionContext()),
     )
+    count_options_by_name = {}
+    if bounded:
+        from tests.test_npi_all_names_like import FakeAcquire
 
-    assert await npi_module._fast_has_insurance_count(None, None) == 31
-    assert await npi_module._fast_has_insurance_count(None, None) == 31
-    assert await npi_module._fast_has_insurance_count(None, None) == 42
-    assert execute.await_count == 2
+        count_read = AsyncMock(side_effect=[31, 42])
+        monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(object()), raising=False)
+        monkeypatch.setattr(npi_module, "_provider_list_count", count_read)
+        count_options_by_name = {"session": object(), "deadline": 10.0}
+
+    assert await npi_module._fast_has_insurance_count(None, None, **count_options_by_name) == 31
+    assert await npi_module._fast_has_insurance_count(None, None, **count_options_by_name) == 31
+    assert await npi_module._fast_has_insurance_count(None, None, **count_options_by_name) == 42
+    if bounded:
+        assert count_read.await_count == 2
+        execute.assert_not_awaited()
+    else:
+        assert execute.await_count == 2
 
 
 @pytest.mark.asyncio

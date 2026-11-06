@@ -44,3 +44,13 @@ async def test_producer_failure_and_cancellation_remain_original(monkeypatch, er
 def test_client_parameters_cannot_inject_producer():
     with pytest.raises(ValueError, match="parameters_invalid"):
         worker.validate_fhir_catalog_sync_params({"source_export": "synthetic"})
+
+
+async def test_metadata_only_mode_is_internal_and_forwarded_explicitly(monkeypatch):
+    reconcile = AsyncMock(return_value={"state": "unchanged"})
+    monkeypatch.setattr(sync, "reconcile_fhir_catalog", reconcile)
+    config, producer = _config(), Mock()
+    await worker.run_fhir_catalog_sync(config, source_export=producer, source_companies_only=True)
+    reconcile.assert_awaited_once_with(config, source_export=producer, source_companies_only=True)
+    with pytest.raises(ValueError, match="parameters_invalid"):
+        worker.validate_fhir_catalog_sync_params({"source_companies_only": True})

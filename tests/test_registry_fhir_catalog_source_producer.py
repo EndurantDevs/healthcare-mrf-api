@@ -174,7 +174,9 @@ async def test_nonmapping_export_refuses_and_exits_the_source(export):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["missing", "extra", "inventory", "replay", "legacy_bindings", "identity_shape"])
+@pytest.mark.parametrize(
+    "damage", ["missing", "extra", "inventory", "replay", "legacy_bindings", "source_companies", "identity_shape"]
+)
 async def test_invalid_export_refuses_before_inventory_and_closes_source(damage):
     factory, export, connection, events = _boundary()
     inventory = export["inventory"]
@@ -192,6 +194,17 @@ async def test_invalid_export_refuses_before_inventory_and_closes_source(damage)
     inventory.assert_not_called()
     connection.fetchrow.assert_not_awaited()
     assert [event[0] for event in events] == ["enter", "error", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_export_accepts_only_the_optional_source_company_callback_without_invoking_it():
+    factory, export, connection, events = _boundary()
+    export["source_companies"] = AsyncMock(return_value=())
+    async with open_source_owned_catalog_export(factory, read_profile(), connection) as selected:
+        assert selected is export
+    export["source_companies"].assert_not_awaited()
+    export["inventory"].assert_not_called()
+    assert [event[0] for event in events] == ["enter", "exit"]
 
 
 @pytest.mark.asyncio

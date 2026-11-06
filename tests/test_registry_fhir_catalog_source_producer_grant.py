@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from process.registry_fhir_catalog_sources import (
 )
 from tests.test_registry_fhir_catalog_grant import CatalogConnection, command, snapshot, standing_grant
 from tests.test_registry_fhir_catalog_observation import _receipt
+from tests.test_registry_fhir_catalog_source_companies import source_company
 from tests.test_registry_fhir_catalog_source_producer import _boundary
 from tests.test_registry_fhir_catalog_sources import descriptor, read_profile, scoped_read_profile
 
@@ -116,14 +118,14 @@ def verifier_case(monkeypatch, descriptors=None, profiles=None):
         assert schema_name == selected["schema_name"]
         return compact_digest(compact_rows(by_generation[source_generation]))
 
-    async def retained(*_args):
+    async def retained(*_args, **_kwargs):
         events.append(("retained",))
 
     async def projection(*_args, **_kwargs):
         events.append(("projection",))
 
     export["replay"].side_effect = replay
-    monkeypatch.setattr(grants, "_descriptors", AsyncMock(return_value=by_generation))
+    monkeypatch.setattr(grants, "load_fhir_catalog_source_descriptors", AsyncMock(return_value=by_generation))
     monkeypatch.setattr(grants, "_prior_observations", AsyncMock(return_value=(None, {})))
     monkeypatch.setattr(grants, "_observation_accounting", AsyncMock(side_effect=accounting))
     monkeypatch.setattr(grants, "fhir_catalog_observation_digest", AsyncMock(side_effect=digest))
@@ -398,7 +400,7 @@ async def test_replay_keeps_strict_primary_key_order_across_batches(monkeypatch)
 @pytest.mark.asyncio
 async def test_carried_observations_keep_prior_verification_without_source_export(monkeypatch):
     case = verifier_case(monkeypatch)
-    prior_snapshot_by_field = {"schema_name": "prior_catalog"}
+    prior_snapshot_by_field = {**case.snapshot, "schema_name": "prior_catalog"}
     grants._prior_observations.return_value = (prior_snapshot_by_field, case.descriptors)
     carried = AsyncMock()
     monkeypatch.setattr(grants, "_verify_carried_observation", carried)
@@ -498,3 +500,199 @@ async def test_mixed_profiles_keep_scoped_replay_on_required_native_reader(monke
         reader, case.connection, case.snapshot, fhir_catalog_source_generation(scoped), scoped, workspace
     )
     assert case.events[-3:] == [("exit",), ("retained",), ("projection",)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["none", "changed", "unavailable", "header"])
+async def test_cached_current_labels_are_independently_read_during_seal(monkeypatch, drift):
+    case = verifier_case(monkeypatch)
+    prior = deepcopy(case.snapshot)
+    grants._prior_observations.return_value = (prior, case.descriptors)
+    monkeypatch.setattr(grants, "_verify_carried_observation", AsyncMock())
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    labels = source_company(display_name="Example Mutual") if drift == "changed" else source_company()
+    callback = AsyncMock(return_value=(labels,))
+    if drift == "header":
+        callback.side_effect = ValueError("source descriptor changed")
+    if drift != "unavailable":
+        case.export["source_companies"] = callback
+    if drift == "none":
+        await verify(case)
+        callback.assert_awaited_once_with(next(iter(case.descriptors.values())))
+    else:
+        with pytest.raises(
+            ValueError, match="source_companies_changed|source_companies_unavailable|source descriptor changed"
+        ):
+            await verify(case)
+        validation.validate_fhir_catalog_observed_projection.assert_not_awaited()
+    case.export["inventory"].assert_not_called()
+    case.export["replay"].assert_not_awaited()
+    grants._verify_carried_observation.assert_awaited_once()
+    assert case.events[-1] in (("exit",), ("projection",))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["none", "changed", "removed", "added"])
+async def test_last_good_label_history_is_exact_and_never_refreshed(monkeypatch, change):
+    case = verifier_case(monkeypatch)
+    case.snapshot["source_vector_json"][0]["status"] = "last_good"
+    prior = deepcopy(case.snapshot)
+    prior["source_vector_json"][0]["source_companies"] = [source_company()]
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    if change == "changed":
+        case.snapshot["source_vector_json"][0]["source_companies"][0]["display_name"] = "Example Mutual"
+    elif change == "removed":
+        del case.snapshot["source_vector_json"][0]["source_companies"]
+    elif change == "added":
+        del prior["source_vector_json"][0]["source_companies"]
+    grants._prior_observations.return_value = (prior, case.descriptors)
+    monkeypatch.setattr(grants, "_verify_carried_observation", AsyncMock())
+    case.export["source_companies"] = AsyncMock(side_effect=AssertionError("historical callback"))
+    if change == "none":
+        await verify(case)
+    else:
+        with pytest.raises(grants.FHIRCatalogGrantError, match="source_companies_history_changed"):
+            await verify(case)
+    case.factory.assert_not_called()
+    case.export["source_companies"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_seal_reuses_exact_prior_facts_and_keeps_projection_verification(monkeypatch):
+    case = verifier_case(monkeypatch)
+    prior = deepcopy(case.snapshot)
+    grants._prior_observations.return_value = (prior, case.descriptors)
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    case.export["source_companies"] = AsyncMock(return_value=(source_company(),))
+    carried = AsyncMock()
+    monkeypatch.setattr(grants, "_verify_carried_observation", carried)
+    case.export["inventory"].side_effect = AssertionError("Source inventory")
+    case.export["replay"].side_effect = AssertionError("Source replay")
+    await verify(case, source_companies_only=True)
+    carried.assert_awaited_once_with(case.connection, case.snapshot, prior, next(iter(case.descriptors)))
+    validation.validate_fhir_catalog_observed_projection.assert_awaited_once()
+    case.export["source_companies"].assert_awaited_once()
+    case.export["inventory"].assert_not_called()
+    case.export["replay"].assert_not_awaited()
+    assert grants._verify_retained_product_observations.await_args.kwargs == {"source_companies_only": True}
+
+
+@pytest.mark.parametrize("change", ["status", "generation", "source_id", "projector", "transform", "missing_labels"])
+def test_metadata_only_input_guard_refuses_any_source_or_extractor_change(change):
+    selected = snapshot(standing_grant(), (observed_descriptor(),))
+    prior = deepcopy(selected)
+    selected["source_vector_json"][0]["source_companies"] = [source_company()]
+    entry = selected["source_vector_json"][0]
+    if change == "projector":
+        selected["projector_version"] = "fhir-catalog/v1"
+    elif change == "transform":
+        entry["extraction_transform"] = validation.TRANSFORM_VERSION
+    elif change == "missing_labels":
+        del entry["source_companies"]
+    else:
+        entry[{"status": "status", "generation": "source_generation", "source_id": "source_id"}[change]] = {
+            "status": "last_good",
+            "generation": "f" * 64,
+            "source_id": "another-source",
+        }[change]
+    with pytest.raises(grants.FHIRCatalogGrantError, match="source_companies_history_changed"):
+        grants.require_fhir_catalog_company_refresh_inputs(selected, prior)
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_seal_refuses_descriptor_drift_before_callback(monkeypatch):
+    case = verifier_case(monkeypatch)
+    prior = deepcopy(case.snapshot)
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    grants._prior_observations.return_value = (prior, case.descriptors)
+    previous_descriptors = deepcopy(case.descriptors)
+    next(iter(previous_descriptors.values()))["endpoint_id"] = "changed-endpoint"
+    grants.load_fhir_catalog_source_descriptors.side_effect = [case.descriptors, previous_descriptors]
+    with pytest.raises(grants.FHIRCatalogGrantError, match="source_companies_history_changed"):
+        await verify(case, source_companies_only=True)
+    case.factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_publication_requires_exact_previous_vector(monkeypatch):
+    case = verifier_case(monkeypatch)
+    prior = deepcopy(case.snapshot)
+    prior["published_at"] = datetime(2026, 1, 1)
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    case.snapshot["metadata_generation"] = validation.metadata_generation(case.snapshot)
+    writer = CatalogConnection((prior, case.snapshot), tuple(case.descriptors.values()))
+    monkeypatch.setattr(grants, "verify_fhir_catalog_snapshot", AsyncMock())
+    runtime = grants.build_fhir_catalog_publication_runtime(
+        case.grant, case.pool, source_export=case.factory, source_companies_only=True
+    )
+    await runtime.authorize_metadata(
+        command=command(case.grant, case.snapshot, previous=prior["metadata_generation"]),
+        snapshot=case.snapshot,
+        connection=writer,
+    )
+    with pytest.raises(grants.FHIRCatalogGrantError, match="source_companies_history_required"):
+        await runtime.authorize_metadata(
+            command=command(case.grant, case.snapshot), snapshot=case.snapshot, connection=writer
+        )
+    case.factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_seal_refuses_retained_product_replay(monkeypatch):
+    from process import registry_fhir_catalog_products as products
+    from process import registry_fhir_catalog_projection_validation as projection
+    from process import registry_fhir_catalog_sync as sync
+
+    selected = snapshot(standing_grant())
+    identity = "a" * 64
+    monkeypatch.setattr(projection, "require_fhir_catalog_registry_reader", AsyncMock())
+    monkeypatch.setattr(grants, "catalog_projection_generations", AsyncMock(return_value=(identity,)))
+    monkeypatch.setattr(
+        products, "selected_reviewed_fhir_catalog_product_sources", AsyncMock(return_value={identity: {}})
+    )
+    monkeypatch.setattr(
+        sync, "replay_fhir_catalog_observations", AsyncMock(side_effect=AssertionError("retained replay"))
+    )
+    with pytest.raises(grants.FHIRCatalogGrantError, match="source_companies_retained_products_unsupported"):
+        await grants._verify_retained_product_observations(
+            object(), selected, standing_grant(), object(), object(), {}, source_companies_only=True
+        )
+    sync.replay_fhir_catalog_observations.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_seal_refreshes_every_current_source_including_cached_sources(monkeypatch):
+    descriptors = (observed_descriptor(dataset="dataset-one"), observed_descriptor(dataset="dataset-two"))
+    case = verifier_case(monkeypatch, descriptors)
+    prior = deepcopy(case.snapshot)
+    grants._prior_observations.return_value = (prior, case.descriptors)
+    monkeypatch.setattr(grants, "_verify_carried_observation", AsyncMock())
+    for entry in case.snapshot["source_vector_json"]:
+        entry["source_companies"] = [source_company()]
+    case.export["source_companies"] = AsyncMock(return_value=(source_company(),))
+    await verify(case)
+    assert case.export["source_companies"].await_count == 2
+    assert {call.args[0]["coordinates"]["dataset_id"] for call in case.export["source_companies"].await_args_list} == {
+        "dataset-one",
+        "dataset-two",
+    }
+    assert grants._verify_carried_observation.await_count == 2
+    case.export["replay"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publication_cannot_drop_labels_from_a_native_retained_source(monkeypatch):
+    selected = snapshot(standing_grant(), (observed_descriptor(),), status="last_good")
+    prior = deepcopy(selected)
+    prior["source_vector_json"][0]["source_companies"] = [source_company()]
+    generation = selected["source_vector_json"][0]["source_generation"]
+    monkeypatch.setattr(grants, "_protected_snapshot", AsyncMock(return_value=prior))
+    with pytest.raises(grants.FHIRCatalogGrantError, match="source_companies_history_changed"):
+        await grants._retained_sources(
+            object(),
+            command(standing_grant(), selected, previous=prior["metadata_generation"]),
+            selected,
+            standing_grant(),
+            selected["source_vector_json"],
+            {generation: {"profile": "retained_normalized"}},
+        )

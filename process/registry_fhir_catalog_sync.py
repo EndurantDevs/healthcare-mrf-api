@@ -41,6 +41,11 @@ from process.registry_fhir_catalog_fingerprints import (
 from process.registry_fhir_catalog_grant import (
     build_fhir_catalog_observation_verifier,
     build_fhir_catalog_publication_runtime,
+    fhir_catalog_admitted_current_sources,
+    fhir_catalog_admitted_retained_sources,
+    load_fhir_catalog_source_descriptors,
+    require_fhir_catalog_company_refresh_inputs,
+    verify_current_fhir_catalog_source_companies,
 )
 from process.registry_fhir_catalog_identity import FHIRNetworkIdentityInput, allocate_fhir_catalog_network_ids
 from process.registry_fhir_catalog_permissions import verify_fhir_catalog_preparation_permissions
@@ -65,6 +70,7 @@ from process.registry_fhir_catalog_retained import (
     retained_fhir_catalog_read_source,
     retained_fhir_catalog_recipe,
 )
+from process.registry_fhir_catalog_source_companies import collect_fhir_catalog_source_companies
 from process.registry_fhir_catalog_source_producer import (
     iter_source_owned_catalog_legacy_bindings,
     open_source_owned_catalog_export,
@@ -87,7 +93,7 @@ from process.registry_fhir_catalog_store import (
     write_fhir_catalog_rows,
 )
 from process.registry_fhir_catalog_validation import canonical_json, metadata_generation
-from process.registry_fhir_plan_tier import needs_plan_tier_refresh, supports_plan_tiers
+from process.registry_fhir_plan_tier import extraction_transform, needs_plan_tier_refresh, supports_plan_tiers
 from process.registry_publication_consumer import consume_registry_publication_once
 
 PAGE_ROWS = 1000
@@ -104,11 +110,13 @@ def _snapshot(record):
     return snapshot_by_field
 
 
-async def reconcile_fhir_catalog(config, *, source_export=None):
+async def reconcile_fhir_catalog(config, *, source_export=None, source_companies_only=False):
     """Run one catalog reconciliation and publish only its exact queued request."""
     if config.source_url is None and source_export is None:
         raise ValueError("registry_fhir_catalog_source_reader_required")
     producer_options = {"source_export": source_export} if source_export is not None else {}
+    if source_companies_only:
+        producer_options["source_companies_only"] = True
     async with AsyncExitStack() as resources:
         pools = []
         for url in (
@@ -139,11 +147,7 @@ async def reconcile_fhir_catalog(config, *, source_export=None):
                 raise ValueError("registry_fhir_catalog_sync_already_running")
             try:
                 snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
-                    config,
-                    loader,
-                    source_pool,
-                    sealer_pool,
-                    **producer_options,
+                    config, loader, source_pool, sealer_pool, **producer_options
                 )
                 if snapshot is None:
                     return {"state": "unchanged", **accounting}
@@ -209,11 +213,15 @@ async def _publish_catalog_snapshot(
     return published
 
 
-async def prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool, *, source_export=None):
+async def prepare_fhir_catalog_snapshot(
+    config, loader, source_pool, sealer_pool, *, source_export=None, source_companies_only=False
+):
     """Build and seal one isolated candidate; the current reader pointer stays intact."""
     staged_by_kind = {}
     try:
         options_by_name = {"source_export": source_export} if source_export is not None else {}
+        if source_companies_only:
+            options_by_name["source_companies_only"] = True
         return await _prepare_fhir_catalog_snapshot(
             config, loader, source_pool, sealer_pool, staged_by_kind, **options_by_name
         )
@@ -262,58 +270,25 @@ async def _catalog_source_reads(source_pool, sealer_pool, grant, source_export):
         yield source_connection, workspace, exports_by_profile
 
 
-async def _prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool, staged, *, source_export=None):
+async def _prepare_fhir_catalog_snapshot(
+    config, loader, source_pool, sealer_pool, staged, *, source_export=None, source_companies_only=False
+):
     """Pin source and registry reads, prepare privately, then seal the candidate."""
     started = perf_counter()
     producer_options = {"source_export": source_export} if source_export is not None else {}
+    if source_companies_only:
+        if source_export is None:
+            raise ValueError("registry_fhir_catalog_source_companies_unavailable")
+        producer_options["source_companies_only"] = True
     async with _catalog_source_reads(source_pool, sealer_pool, config.grant, source_export) as source_reads:
-        export_options = {"exports_by_profile": source_reads[2]} if source_reads[2] is not None else {}
-        if (endpoint_ids := getattr(config, "source_endpoint_ids", None)) is not None:
-            export_options["endpoint_ids"] = endpoint_ids
-        accepted, unavailable = await _discover_catalog_sources(source_reads[0], config.grant, **export_options)
-        if not accepted and any(
-            disposition.reason in {"catalog_observation_unavailable", "catalog_observation_timeout"}
-            for disposition in unavailable
-        ):
-            raise ValueError("registry_fhir_catalog_all_source_observations_failed")
+        dispositions = await _preparation_source_inventory(config, source_reads, source_companies_only)
         async with fhir_catalog_registry_reads(loader), loader.transaction(isolation="repeatable_read"):
-            head, manifest, previous = await _catalog_registry_head(loader, config.grant)
-            retained_sources = await _collect_retained_catalog_inputs(loader, config.grant, manifest)
-            accepted.extend(retained_sources)
-            _validate_catalog_sources(accepted, previous)
-            snapshot, current_by_generation = await _catalog_snapshot_inputs(
-                loader, config.grant, head, manifest, previous, accepted
-            )
-            if report := current_fhir_catalog_report():
-                report.inventory_ready(current_by_generation, previous)
-            accounting_by_phase = {
-                "accepted_sources": len(accepted),
-                "unavailable_sources": len(unavailable),
-                "publication_approved_revision": head["approved_revision"],
-                "mapping_approved_revision": snapshot["metadata_approved_revision"],
-            }
-            if previous and snapshot["metadata_generation"] == previous["metadata_generation"]:
-                return None, previous, accounting_by_phase
-            if manifest is not None:
-                await require_fhir_catalog_membership_reuse(
-                    loader, manifest, snapshot, control_schema=config.grant.control_schema
-                )
-            retained = await _reusable_catalog_snapshot(loader, config.grant, snapshot["metadata_generation"])
-            if retained is not None:
-                accounting_by_phase["resumed_snapshot"] = True
-                return retained, previous, accounting_by_phase
-            candidate = uuid4()
-            copy_target = FHIRCatalogTarget(
-                str(uuid4()), str(uuid4()), str(uuid4()), str(candidate), "fhir_catalog_" + candidate.hex
-            )
-            staged["target"] = copy_target
-            snapshot["schema_name"] = copy_target.schema_name
-            accounting_by_phase.update(
-                await _build_source_catalog_candidate(
-                    config, loader, source_reads, copy_target, snapshot, previous, current_by_generation
-                )
+            snapshot, previous, accounting_by_phase, copy_target = await _stage_catalog_candidate(
+                config, loader, source_reads, sealer_pool, staged, dispositions, **producer_options
             )
             await verify_fhir_catalog_registry_reads()
+    if copy_target is None:
+        return snapshot, previous, accounting_by_phase
     if report := current_fhir_catalog_report():
         report.progress("sealing")
     await _seal_catalog_snapshot(
@@ -331,6 +306,170 @@ async def _collect_retained_catalog_inputs(loader, grant, manifest):
     retained_sources = await _retained_catalog_sources(reader, grant, manifest)
     _report_retained_sources(retained_sources)
     return retained_sources
+
+
+async def _preparation_source_inventory(config, source_reads, source_companies_only):
+    """Discover normal inputs before Loader RR; metadata-only repair never opens inventory."""
+    if source_companies_only:
+        return [], []
+    export_options = {"exports_by_profile": source_reads[2]} if source_reads[2] is not None else {}
+    if (endpoint_ids := getattr(config, "source_endpoint_ids", None)) is not None:
+        export_options["endpoint_ids"] = endpoint_ids
+    accepted, unavailable = await _discover_catalog_sources(source_reads[0], config.grant, **export_options)
+    if not accepted and any(
+        disposition.reason in {"catalog_observation_unavailable", "catalog_observation_timeout"}
+        for disposition in unavailable
+    ):
+        raise ValueError("registry_fhir_catalog_all_source_observations_failed")
+    return accepted, unavailable
+
+
+async def _preparation_catalog_sources(config, loader, manifest, previous, accepted, *, source_companies_only=False):
+    """Preserve discovery/retained admission, or require the complete committed endpoint scope."""
+    if source_companies_only:
+        accepted = await _committed_catalog_sources(loader, config.grant, previous)
+        _report_retained_sources(accepted)
+        if (endpoint_ids := getattr(config, "source_endpoint_ids", None)) is not None and set(endpoint_ids) != {
+            disposition.endpoint_id
+            for disposition in accepted
+            if disposition.descriptor["profile"] != "retained_normalized"
+        }:
+            raise ValueError("registry_fhir_catalog_source_endpoint_scope_changed")
+        return accepted
+    retained_sources = await _collect_retained_catalog_inputs(loader, config.grant, manifest)
+    accepted.extend(retained_sources)
+    return accepted
+
+
+async def _stage_catalog_candidate(
+    config, loader, source_reads, sealer_pool, staged, dispositions, *, source_export=None, source_companies_only=False
+):
+    """Stage one isolated postimage under Loader RR, retaining exact reusable custody when possible."""
+    accepted, unavailable = dispositions
+    head, manifest, previous = await _catalog_registry_head(loader, config.grant)
+    accepted = await _preparation_catalog_sources(
+        config, loader, manifest, previous, accepted, source_companies_only=source_companies_only
+    )
+    _validate_catalog_sources(accepted, previous)
+    labels = await _collect_catalog_source_companies(source_reads, accepted, previous, required=source_companies_only)
+    input_options = {"source_companies": labels} if labels else {}
+    if source_companies_only:
+        input_options["source_companies_only"] = True
+    snapshot, current_by_generation = await _catalog_snapshot_inputs(
+        loader, config.grant, head, manifest, previous, accepted, **input_options
+    )
+    if report := current_fhir_catalog_report():
+        report.inventory_ready(current_by_generation, previous)
+    accounting_by_phase = {
+        "accepted_sources": len(accepted),
+        "unavailable_sources": len(unavailable),
+        "publication_approved_revision": head["approved_revision"],
+        "mapping_approved_revision": snapshot["metadata_approved_revision"],
+    }
+    if previous and snapshot["metadata_generation"] == previous["metadata_generation"]:
+        return None, previous, accounting_by_phase, None
+    if manifest is not None:
+        await require_fhir_catalog_membership_reuse(
+            loader, manifest, snapshot, control_schema=config.grant.control_schema
+        )
+    retained = await _reusable_catalog_snapshot(loader, config.grant, snapshot["metadata_generation"])
+    if retained is not None:
+        await _verify_reused_source_companies(loader, config.grant, retained, sealer_pool, source_export)
+        accounting_by_phase["resumed_snapshot"] = True
+        return retained, previous, accounting_by_phase, None
+    candidate = uuid4()
+    copy_target = FHIRCatalogTarget(
+        str(uuid4()), str(uuid4()), str(uuid4()), str(candidate), "fhir_catalog_" + candidate.hex
+    )
+    staged["target"] = copy_target
+    snapshot["schema_name"] = copy_target.schema_name
+    accounting_by_phase.update(
+        await _build_source_catalog_candidate(
+            config,
+            loader,
+            source_reads,
+            copy_target,
+            snapshot,
+            previous,
+            current_by_generation,
+            **({"source_companies_only": True} if source_companies_only else {}),
+        )
+    )
+    return snapshot, previous, accounting_by_phase, copy_target
+
+
+async def _verify_reused_source_companies(loader, grant, snapshot, sealer_pool, source_export):
+    """Independently reread current labels before reusing an already sealed candidate."""
+    vector = snapshot["source_vector_json"]
+    if not any(entry["status"] == "current" and "source_companies" in entry for entry in vector):
+        return
+    descriptors = await load_fhir_catalog_source_descriptors(loader, snapshot, vector)
+    async with (
+        sealer_pool.acquire() as registry_reader,
+        registry_reader.transaction(isolation="repeatable_read", readonly=True),
+    ):
+        await verify_current_fhir_catalog_source_companies(source_export, registry_reader, vector, descriptors, grant)
+
+
+async def _committed_catalog_sources(loader, grant, previous):
+    """Reuse only the exact descriptors and source statuses of the verified serving snapshot."""
+    if previous is None:
+        raise ValueError("registry_fhir_catalog_source_companies_history_required")
+    vector = previous["source_vector_json"]
+    descriptors = await load_fhir_catalog_source_descriptors(loader, previous, vector)
+    fhir_catalog_admitted_current_sources(grant, vector, descriptors)
+    fhir_catalog_admitted_retained_sources(grant, vector, descriptors)
+    accepted_at = await loader.fetch(
+        f"SELECT source_generation,accepted_at FROM {storage_identifier(previous['schema_name'])}."
+        "registry_fhir_catalog_source WHERE source_generation=ANY($1::text[]) ORDER BY source_generation LIMIT 1001",
+        [entry["source_generation"] for entry in vector],
+    )
+    times_by_generation = {source_time["source_generation"]: source_time["accepted_at"] for source_time in accepted_at}
+    if len(accepted_at) != len(vector) or set(times_by_generation) != set(descriptors):
+        raise ValueError("registry_fhir_catalog_source_companies_history_changed")
+    accepted_sources = []
+    for entry in vector:
+        descriptor = descriptors[entry["source_generation"]]
+        if entry["status"] == "current" or descriptor["profile"] == "retained_normalized":
+            accepted_sources.append(
+                FHIRCatalogSourceDisposition(
+                    descriptor["endpoint_id"],
+                    descriptor["coordinates"]["dataset_id"],
+                    tuple(descriptor["source_aliases"]),
+                    len(descriptor["source_aliases"]),
+                    "accepted",
+                    None,
+                    descriptor,
+                    times_by_generation[entry["source_generation"]],
+                )
+            )
+    return accepted_sources
+
+
+async def _collect_catalog_source_companies(source_reads, accepted, previous, *, required=False):
+    labels_by_generation = {}
+    prior_vector = previous["source_vector_json"] if previous else []
+    prior_current_labels = any(entry["status"] == "current" and "source_companies" in entry for entry in prior_vector)
+    for disposition in accepted:
+        descriptor = disposition.descriptor
+        if descriptor["profile"] == "retained_normalized":
+            continue
+        was_labeled = any(
+            entry["status"] == "current"
+            and "source_companies" in entry
+            and (
+                entry["source_id"] in descriptor["source_aliases"]
+                or any(label["endpoint_id"] == descriptor["endpoint_id"] for label in entry["source_companies"])
+            )
+            for entry in prior_vector
+        )
+        export = _source_catalog_export(descriptor, source_reads[2])
+        labels = await collect_fhir_catalog_source_companies(
+            export or {}, descriptor, required=required or was_labeled or export is not None and prior_current_labels
+        )
+        if labels is not None:
+            labels_by_generation[fhir_catalog_source_generation(descriptor)] = labels
+    return labels_by_generation
 
 
 def _report_retained_sources(retained_sources):
@@ -497,7 +636,9 @@ async def _reusable_catalog_snapshot(loader, grant, generation):
     return retained
 
 
-async def _catalog_snapshot_inputs(loader, grant, head, manifest, previous, accepted):
+async def _catalog_snapshot_inputs(
+    loader, grant, head, manifest, previous, accepted, *, source_companies=None, source_companies_only=False
+):
     vector_by_generation = (
         {entry["source_generation"]: {**entry, "status": "last_good"} for entry in previous["source_vector_json"]}
         if previous
@@ -515,12 +656,20 @@ async def _catalog_snapshot_inputs(loader, grant, head, manifest, previous, acce
         )
     }
     for generation, disposition in current_by_generation.items():
+        prior = vector_by_generation.get(generation, {})
         vector_by_generation[generation] = {
             "source_generation": generation,
             "source_id": disposition.descriptor["coordinates"]["source_id"],
             "status": "last_good" if disposition.descriptor["profile"] == "retained_normalized" else "current",
         }
-        if supports_plan_tiers(disposition.descriptor):
+        if disposition.descriptor["profile"] == "retained_normalized" and "source_companies" in prior:
+            vector_by_generation[generation]["source_companies"] = prior["source_companies"]
+        if source_companies is not None and generation in source_companies:
+            vector_by_generation[generation]["source_companies"] = source_companies[generation]
+        if source_companies_only:
+            if "extraction_transform" in prior:
+                vector_by_generation[generation]["extraction_transform"] = prior["extraction_transform"]
+        elif supports_plan_tiers(disposition.descriptor):
             vector_by_generation[generation]["extraction_transform"] = PROJECTOR_VERSION
     mapping_revision, mapping = await select_fhir_catalog_mapping(
         loader, head["approved_revision"], manifest, control_schema=grant.control_schema
@@ -535,10 +684,12 @@ async def _catalog_snapshot_inputs(loader, grant, head, manifest, previous, acce
         "source_vector_json": sorted(
             vector_by_generation.values(), key=lambda entry: (entry["source_id"], entry["source_generation"])
         ),
-        "projector_version": PROJECTOR_VERSION,
+        "projector_version": previous["projector_version"] if source_companies_only else PROJECTOR_VERSION,
         "as_of": datetime.now(timezone.utc).date(),
     }
     inputs_by_field["metadata_generation"] = metadata_generation(inputs_by_field)
+    if source_companies_only:
+        require_fhir_catalog_company_refresh_inputs(inputs_by_field, previous)
     return inputs_by_field, current_by_generation
 
 
@@ -557,7 +708,7 @@ async def _build_catalog_candidate(
 
 
 async def _build_source_catalog_candidate(
-    config, loader, source_reads, copy_target, snapshot, previous, current_by_generation
+    config, loader, source_reads, copy_target, snapshot, previous, current_by_generation, *, source_companies_only=False
 ):
     options_by_name = {"loader_role": config.loader_role, "control_schema": config.grant.control_schema}
     await create_fhir_catalog_candidate(loader, copy_target, **options_by_name)
@@ -567,25 +718,33 @@ async def _build_source_catalog_candidate(
             loader, previous, copy_target, snapshot["metadata_generation"], **options_by_name
         )
     accounting_by_phase["manual"] = await project_manual_fhir_catalog(loader, copy_target, snapshot, **options_by_name)
-    accounting_by_phase["sources"] = await _project_catalog_sources(
-        config, loader, source_reads, copy_target, snapshot, previous, current_by_generation
-    )
-    accounting_by_phase["carried_relationships"] = await refresh_carried_fhir_catalog_relationships(
-        loader,
-        copy_target,
-        snapshot,
-        current_generations=tuple(current_by_generation),
-        grant=config.grant,
-        loader_role=config.loader_role,
-    )
-    accounting_by_phase["products"] = await project_reviewed_fhir_catalog_products(
-        loader,
-        copy_target,
-        snapshot,
-        grant=config.grant,
-        loader_role=config.loader_role,
-        source_generations=tuple(current_by_generation),
-    )
+    with extraction_transform(snapshot["projector_version"]):
+        accounting_by_phase["sources"] = await _project_catalog_sources(
+            config,
+            loader,
+            source_reads,
+            copy_target,
+            snapshot,
+            previous,
+            current_by_generation,
+            **({"source_companies_only": True} if source_companies_only else {}),
+        )
+        accounting_by_phase["carried_relationships"] = await refresh_carried_fhir_catalog_relationships(
+            loader,
+            copy_target,
+            snapshot,
+            current_generations=tuple(current_by_generation),
+            grant=config.grant,
+            loader_role=config.loader_role,
+        )
+        accounting_by_phase["products"] = await project_reviewed_fhir_catalog_products(
+            loader,
+            copy_target,
+            snapshot,
+            grant=config.grant,
+            loader_role=config.loader_role,
+            source_generations=tuple(current_by_generation),
+        )
     await loader.execute(
         f"UPDATE {storage_identifier(copy_target.schema_name)}.registry_fhir_catalog_binding "
         "SET document_json=jsonb_set(document_json,'{status}',to_jsonb(CASE WHEN "
@@ -664,8 +823,13 @@ async def _project_current_sources(
 
 
 async def _project_catalog_sources(
-    config, loader, source_reads, copy_target, snapshot, previous, current_by_generation
+    config, loader, source_reads, copy_target, snapshot, previous, current_by_generation, *, source_companies_only=False
 ):
+    """Project admitted inputs normally, or reuse exact cached facts without Source calls or allocation."""
+    if source_companies_only:
+        return await _project_cached_catalog_sources(
+            config, loader, copy_target, snapshot, previous, current_by_generation
+        )
     source_connection, reference_workspace, exports_by_profile = source_reads
     cached_generations = {entry["source_generation"] for entry in previous["source_vector_json"]} if previous else set()
     projection_receipts = []
@@ -699,15 +863,7 @@ async def _project_catalog_sources(
                 **export_options,
             )
         elif disposition.descriptor["profile"] == "retained_normalized":
-            accepted_at = await loader.fetchval(
-                f"UPDATE {storage_identifier(copy_target.schema_name)}.registry_fhir_catalog_source "
-                "SET descriptor_json=$2::jsonb WHERE source_generation=$1 RETURNING accepted_at",
-                generation,
-                canonical_json(disposition.descriptor),
-            )
-            if accepted_at is None:
-                raise ValueError("registry_fhir_catalog_retained_source_missing")
-            disposition = replace(disposition, accepted_at=accepted_at)
+            disposition = await _refresh_retained_descriptor(loader, copy_target, generation, disposition)
         projection = await project_fhir_catalog_source(
             loader,
             copy_target,
@@ -721,6 +877,52 @@ async def _project_catalog_sources(
         projection_receipts.append({"extraction": extraction_by_kind, "projection": projection})
         if report:
             report.source_prepared(generation, extraction_by_kind, projection)
+    return projection_receipts
+
+
+async def _refresh_retained_descriptor(loader, copy_target, generation, disposition):
+    """Refresh a retained locator while keeping its committed acceptance timestamp and source identity."""
+    accepted_at = await loader.fetchval(
+        f"UPDATE {storage_identifier(copy_target.schema_name)}.registry_fhir_catalog_source "
+        "SET descriptor_json=$2::jsonb WHERE source_generation=$1 RETURNING accepted_at",
+        generation,
+        canonical_json(disposition.descriptor),
+    )
+    if accepted_at is None:
+        raise ValueError("registry_fhir_catalog_retained_source_missing")
+    return replace(disposition, accepted_at=accepted_at)
+
+
+async def _project_cached_catalog_sources(config, loader, copy_target, snapshot, previous, current_by_generation):
+    """Refresh relationships from copied facts while preserving all network identities and extraction pins."""
+    cached_generations = {entry["source_generation"] for entry in previous["source_vector_json"]} if previous else set()
+    projection_receipts = []
+    for generation, disposition in current_by_generation.items():
+        if generation not in cached_generations or needs_plan_tier_refresh(previous, snapshot, disposition.descriptor):
+            raise ValueError("registry_fhir_catalog_source_companies_history_changed")
+        projection = await project_fhir_catalog_relationships(
+            loader,
+            copy_target,
+            disposition,
+            snapshot,
+            grant=config.grant,
+            loader_role=config.loader_role,
+            status="last_good" if disposition.descriptor["profile"] == "retained_normalized" else "current",
+        )
+        if disposition.descriptor["profile"] != "retained_normalized" and supports_plan_tiers(disposition.descriptor):
+            context = _source_projection_context(disposition, snapshot, generation, "current")
+            projection += await _carried_plan_tier_relationships(
+                loader,
+                copy_target,
+                disposition.descriptor,
+                context,
+                snapshot,
+                config.grant,
+                {"loader_role": config.loader_role, "control_schema": config.grant.control_schema},
+            )
+        projection_receipts.append(
+            {"extraction": {"reused_observations": True}, "projection": {"relationships": projection}}
+        )
     return projection_receipts
 
 
@@ -740,7 +942,9 @@ def _source_catalog_export(descriptor, exports_by_profile):
     return export
 
 
-async def _seal_catalog_snapshot(config, copy_target, snapshot, sealer_pool, *, source_pool=None, source_export=None):
+async def _seal_catalog_snapshot(
+    config, copy_target, snapshot, sealer_pool, *, source_pool=None, source_export=None, source_companies_only=False
+):
     async with (
         sealer_pool.acquire() as registry_reader,
         fhir_catalog_reference_workspace(registry_reader) as registry_workspace,
@@ -764,6 +968,7 @@ async def _seal_catalog_snapshot(config, copy_target, snapshot, sealer_pool, *, 
                 registry_reader=registry_reader,
                 registry_workspace=registry_workspace,
                 **({"source_export": source_export} if source_export is not None else {}),
+                **({"source_companies_only": True} if source_companies_only else {}),
             ),
         )
         snapshot.update(custody_json=receipt, accounting_json=receipt["validation"]["tables"])

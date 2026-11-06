@@ -3,7 +3,7 @@
 
 import hashlib
 import json
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -286,14 +286,16 @@ async def test_service_sentinel_cannot_bypass_standing_grant_or_use_human_author
 
     monkeypatch.setattr(consumer, "_verify_execution", AsyncMock())
     before = await _state(fixture)
-    with pytest.raises(FHIRCatalogGrantError, match="policy_changed"):
-        await consumer._execute_publication_request(
-            Pool(),
-            SimpleNamespace(metadata_runtime=metadata_runtime, control_schema=fixture.control_schema),
-            request_record,
-            human_authorize,
-            None,
-        )
+    async with AsyncExitStack() as cleanup:
+        with pytest.raises(FHIRCatalogGrantError, match="policy_changed"):
+            await consumer._execute_publication_request(
+                Pool(),
+                SimpleNamespace(metadata_runtime=metadata_runtime, control_schema=fixture.control_schema),
+                request_record,
+                human_authorize,
+                None,
+                cleanup,
+            )
     assert await _state(fixture) == before
     assert before["metadata_generation"] is None and before["published_at"] is None and before["state"] == "running"
     human_authorize.assert_not_awaited()

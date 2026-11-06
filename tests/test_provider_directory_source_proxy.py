@@ -626,7 +626,15 @@ async def test_origin_and_ambiguous_proxy_errors_do_not_rotate(monkeypatch, erro
 @pytest.mark.asyncio
 async def test_all_blocked_stops_with_earliest_reset_and_preserves_cooldowns(monkeypatch):
     configure(monkeypatch)
-    started = datetime.datetime.now(datetime.UTC)
+    started = datetime.datetime(2035, 1, 1, tzinfo=datetime.UTC)
+
+    class FixedDatetime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return started.astimezone(tz) if tz is not None else started.replace(tzinfo=None)
+
+    monkeypatch.setattr(datetime, "datetime", FixedDatetime)
+    monkeypatch.setattr(proxy, "_utcnow", lambda: started)
     async with scope(monkeypatch, [quota(100), quota(20), quota(50)]) as (run, session):
         metrics_by_key = {}
         run.attach_audit(metrics_by_key)
@@ -640,7 +648,9 @@ async def test_all_blocked_stops_with_earliest_reset_and_preserves_cooldowns(mon
         )
         assert 0 <= (retry_at - expected).total_seconds() < 3
         snapshot = run.bindings[SOURCE["source_id"]].cooldown_snapshot()
-        earliest = min(datetime.datetime.fromisoformat(item["retry_not_before"]) for item in snapshot["cooldowns"])
+        earliest = min(
+            datetime.datetime.fromisoformat(cooldown["retry_not_before"]) for cooldown in snapshot["cooldowns"]
+        )
         assert 0 <= (retry_at - earliest).total_seconds() <= 1
         assert len(snapshot["cooldowns"]) == 3 and metrics_by_key["source_http_proxy"]["cooldowns"] == snapshot
     monkeypatch.setenv(adapter.COOLDOWNS_ENV, json.dumps(snapshot))

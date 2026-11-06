@@ -472,10 +472,44 @@ async def test_pricing_statistics_queries_stay_on_reader_owner(monkeypatch):
         assert len(session.executed) == 5
 
 
-def _optional_count_reader(monkeypatch, failure):
-    """Bind the real provider caller to a Reader and record its savepoint boundary."""
+def _optional_count_read(session, events, failure):
+    """Emulate count failures while checking savepoint and page ordering."""
     from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
+    from api.endpoint import npi
+
+    async def read(sql, **_params):
+        assert current_session() is session
+        if "page_npis AS" not in str(sql) and "count(" in str(sql).lower():
+            assert events == ["savepoint"]
+            session.count_reads += 1
+            if failure == "cancellation":
+                raise asyncio.CancelledError
+            if failure == "unavailable":
+                from sanic.exceptions import ServiceUnavailable
+
+                raise ServiceUnavailable("synthetic reader unavailable")
+            if failure == "statement_timeout":
+                error = RuntimeError("query cancelled")
+                error.sqlstate = "57014"
+                raise DBAPIError(None, None, error)
+            if failure is None:
+                return [(12,)]
+            raise SQLAlchemyError("optional count failed")
+        if failure is None:
+            assert events in (["savepoint"], ["savepoint", "nested rollback"])
+        else:
+            assert events == ["savepoint", "nested rollback"]
+        assert npi._NPI_COUNT_READ_SCOPE.get() is None
+        assert session.in_transaction() and not session.rolled_back
+        events.append("page")
+        return []
+
+    return read
+
+
+def _optional_count_reader(monkeypatch, failure, *, unfiltered=False):
+    """Bind the real provider caller to a Reader and record its savepoint boundary."""
     from api import provider_list_sql
     from api.endpoint import npi
     from tests.test_npi_all_names_like import FakeAcquire, RecordingConnection
@@ -495,6 +529,13 @@ def _optional_count_reader(monkeypatch, failure):
         yield
 
     monkeypatch.setattr(provider_list_sql, "_local_statement_timeout", native_timeout)
+    session.count_reads = 0
+    if unfiltered:
+        monkeypatch.setattr(npi, "_address_serving_model", AsyncMock(return_value=npi.NPIAddress))
+        monkeypatch.setattr(npi, "_npi_count_cache_identity", AsyncMock(return_value="synthetic-publication"))
+        monkeypatch.setattr(npi, "_NPI_PRIMARY_TOTAL_CACHE_STATE", {"entry": None})
+        monkeypatch.setattr(npi, "ENABLE_NPI_SCHEMA_CACHE", True)
+        monkeypatch.setattr(database, "scalar", AsyncMock(side_effect=AssertionError("unbounded count")))
 
     @asynccontextmanager
     async def savepoint():
@@ -505,24 +546,8 @@ def _optional_count_reader(monkeypatch, failure):
             events.append("nested rollback")
             raise
 
-    async def read(sql, **_params):
-        assert current_session() is session
-        if "SELECT COUNT(DISTINCT" in str(sql):
-            assert events == ["savepoint"]
-            if failure == "cancellation":
-                raise asyncio.CancelledError
-            if failure == "statement_timeout":
-                error = RuntimeError("query cancelled")
-                error.sqlstate = "57014"
-                raise DBAPIError(None, None, error)
-            raise SQLAlchemyError("optional count failed")
-        assert events == ["savepoint", "nested rollback"]
-        assert session.in_transaction() and not session.rolled_back
-        events.append("page")
-        return []
-
     monkeypatch.setattr(session, "begin_nested", savepoint)
-    monkeypatch.setattr(connection, "all", read)
+    monkeypatch.setattr(connection, "all", _optional_count_read(session, events, failure))
     return database, session, events
 
 
@@ -547,6 +572,341 @@ async def test_npi_optional_count_recovers_savepoint_before_reader_page(monkeypa
             response = await npi.get_all(request)
             assert response.status == 200 and events == ["savepoint", "nested rollback", "page"]
             assert current_session() is session and not session.rolled_back
+
+
+@pytest.mark.parametrize("explicit_total", [None, "1"])
+@pytest.mark.parametrize("failure", [None, "sql", "statement_timeout", "cancellation", "unavailable"])
+async def test_npi_unfiltered_count_uses_reader_budget_and_recovers_page(monkeypatch, failure, explicit_total):
+    import json
+
+    from sanic.exceptions import ServiceUnavailable
+
+    from api.endpoint import npi
+
+    database, session, events = _optional_count_reader(monkeypatch, failure, unfiltered=True)
+    query_by_name = {"limit": "1"}
+    if explicit_total is not None:
+        query_by_name["include_total"] = explicit_total
+    request = SimpleNamespace(args=query_by_name, ctx=SimpleNamespace(sa_session=session))
+    error = asyncio.CancelledError if failure == "cancellation" else ServiceUnavailable
+    if failure in {"cancellation", "unavailable"}:
+        with pytest.raises(error):
+            async with database.reader_session():
+                await npi.get_all(request)
+        assert events == ["savepoint", "nested rollback"]
+    else:
+        async with database.reader_session():
+            response = await npi.get_all(request)
+            body = json.loads(response.body)
+            assert response.status == 200
+            assert body["total_source"] == ("computed" if failure is None else "estimated_timeout_floor")
+            assert body["total"] == (12 if failure is None else 0)
+            assert events[-1] == "page" and not session.rolled_back
+    assert session.count_reads == 1
+    database.scalar.assert_not_awaited()
+    assert (npi._NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] is not None) is (failure is None)
+    assert npi._NPI_COUNT_READ_SCOPE.get() is None
+
+
+@pytest.mark.parametrize("failure", [None, "statement_timeout", "cancellation", "unavailable"])
+@pytest.mark.parametrize("filtered", [False, True])
+async def test_npi_count_only_is_exact_or_bounded(monkeypatch, failure, filtered):
+    import json
+
+    from sanic.exceptions import ServiceUnavailable
+
+    from api.endpoint import npi
+
+    database, session, events = _optional_count_reader(monkeypatch, failure, unfiltered=not filtered)
+    query_by_name = {"count_only": "1"}
+    if filtered:
+        query_by_name.update(classification="Pharmacy", city="Synthetic")
+    request = SimpleNamespace(args=query_by_name, ctx=SimpleNamespace(sa_session=session))
+    if failure in {"cancellation", "unavailable"}:
+        error = asyncio.CancelledError if failure == "cancellation" else ServiceUnavailable
+        with pytest.raises(error):
+            async with database.reader_session():
+                await npi.get_all(request)
+    else:
+        async with database.reader_session():
+            response = await npi.get_all(request)
+            body = json.loads(response.body)
+            if failure is None:
+                assert response.status == 200 and body == {"rows": 12}
+            else:
+                assert response.status == 503 and body["error"] == "count_timeout" and "rows" not in body
+            assert not session.rolled_back
+    assert session.count_reads == 1 and "page" not in events
+    if not filtered:
+        database.scalar.assert_not_awaited()
+    assert npi._NPI_COUNT_READ_SCOPE.get() is None
+
+
+async def test_npi_unfiltered_timeout_restores_native_ceiling_before_page(monkeypatch):
+    from api import provider_list_sql
+    from api.endpoint import npi
+    from process.custom_import.read_core import _local_statement_timeout
+
+    database, session, events = _optional_count_reader(monkeypatch, "statement_timeout", unfiltered=True)
+    execute = session.execute
+    settings = SimpleNamespace(timeout_text="7000", timeout_milliseconds="7000")
+    timeout_values = []
+
+    async def execute_with_settings(statement, params=None):
+        if "AS timeout_text" in str(statement):
+            return SimpleNamespace(one_or_none=lambda: settings)
+        if "set_config(" in str(statement):
+            setting, timeout_value, local = statement.compile().params.values()
+            assert setting == "statement_timeout" and local is True
+            settings.timeout_text = settings.timeout_milliseconds = timeout_value
+            timeout_values.append(int(timeout_value))
+            return None
+        return await execute(statement, params)
+
+    monkeypatch.setattr(session, "execute", execute_with_settings)
+    monkeypatch.setattr(provider_list_sql, "_local_statement_timeout", _local_statement_timeout)
+    request = SimpleNamespace(args={"limit": "1"}, ctx=SimpleNamespace(sa_session=session))
+    async with database.reader_session():
+        response = await npi.get_all(request)
+        assert response.status == 200 and not session.rolled_back
+        assert settings.timeout_text == "7000"
+    assert len(timeout_values) == 2 and 0 < timeout_values[0] <= 100 and timeout_values[-1] == 7000
+    assert events == ["savepoint", "nested rollback", "page"] and session.count_reads == 1
+
+
+@pytest.mark.parametrize("metadata_seconds", [0.08, 0.11])
+async def test_npi_unfiltered_cache_lookup_and_count_share_deadline(monkeypatch, metadata_seconds):
+    import json
+
+    from api import provider_list_sql
+    from api.endpoint import npi
+
+    database, session, events = _optional_count_reader(monkeypatch, None, unfiltered=True)
+    clock = SimpleNamespace(value=1.0)
+    clock.monotonic = lambda: clock.value
+    monkeypatch.setattr(npi, "time", clock)
+    monkeypatch.setattr(provider_list_sql, "time", clock)
+
+    async def cache_identity(_model, **_kwargs):
+        clock.value += metadata_seconds
+        return "synthetic-publication"
+
+    timeout_values = []
+
+    @asynccontextmanager
+    async def native_timeout(owner, *, timeout_ms):
+        assert owner is session
+        timeout_values.append(timeout_ms)
+        yield
+
+    connection = database.acquire()._conn
+    read = connection.all
+
+    async def count_crosses_deadline(statement, **params):
+        response = await read(statement, **params)
+        if "page_npis AS" not in str(statement):
+            clock.value = 1.11
+        return response
+
+    monkeypatch.setattr(npi, "_npi_count_cache_identity", cache_identity)
+    monkeypatch.setattr(connection, "all", count_crosses_deadline)
+    monkeypatch.setattr(provider_list_sql, "_local_statement_timeout", native_timeout)
+    # Both expiry points must recover the Reader before fetching the page.
+    request = SimpleNamespace(args={"limit": "1"}, ctx=SimpleNamespace(sa_session=session))
+    async with database.reader_session():
+        response = await npi.get_all(request)
+        assert response.status == 200 and json.loads(response.body)["total_source"] == "estimated_timeout_floor"
+    assert session.count_reads == int(metadata_seconds < 0.1)
+    if metadata_seconds < 0.1:
+        assert len(timeout_values) == 1 and 20 <= timeout_values[0] <= 21
+    else:
+        assert timeout_values == []
+    assert npi._NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] is None
+    assert events == ["savepoint", "nested rollback", "page"]
+    assert npi._NPI_COUNT_READ_SCOPE.get() is None
+
+
+async def test_npi_count_metadata_statements_consume_one_phase_budget(monkeypatch):
+    import json
+
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+
+    from api import provider_list_sql
+    from api.endpoint import npi
+
+    database, session, events = _optional_count_reader(monkeypatch, None, unfiltered=True)
+    clock = SimpleNamespace(value=1.0)
+    clock.monotonic = lambda: clock.value
+    monkeypatch.setattr(npi, "time", clock)
+    monkeypatch.setattr(provider_list_sql, "time", clock)
+    budget = SimpleNamespace(milliseconds=None)
+    ceilings = []
+
+    @asynccontextmanager
+    async def native_timeout(owner, *, timeout_ms):
+        assert owner is session
+        budget.milliseconds = timeout_ms
+        ceilings.append(timeout_ms)
+        yield
+
+    async def metadata_execute(_statement, _parameters=None):
+        allowed = budget.milliseconds / 1000
+        clock.value += min(0.08, allowed)
+        if allowed < 0.08:
+            error = RuntimeError("synthetic statement timeout")
+            error.sqlstate = "57014"
+            raise DBAPIError(None, None, error)
+        return None
+
+    async def cache_identity(_model, *, session):
+        await npi._execute_stmt(text("SELECT first_metadata"), session=session)
+        await npi._execute_stmt(text("SELECT second_metadata"), session=session)
+        return "synthetic-publication"
+
+    monkeypatch.setattr(provider_list_sql, "_local_statement_timeout", native_timeout)
+    monkeypatch.setattr(npi, "_npi_count_cache_identity", cache_identity)
+    request = SimpleNamespace(args={"limit": "1"}, ctx=SimpleNamespace(sa_session=session))
+    async with database.reader_session():
+        monkeypatch.setattr(session, "execute", metadata_execute)
+        response = await npi.get_all(request)
+        assert response.status == 200 and json.loads(response.body)["total_source"] == "estimated_timeout_floor"
+    assert len(ceilings) == 2 and 100 <= ceilings[0] <= 101 and 20 <= ceilings[1] <= 21
+    assert clock.value <= 1.102 and session.count_reads == 0
+    assert events == ["savepoint", "nested rollback", "page"]
+    assert npi._NPI_COUNT_READ_SCOPE.get() is None
+
+
+def _native_cache_timeout_fixture(session):
+    """Emulate native cancellation and restoration on the original request session."""
+    from sqlalchemy.exc import DBAPIError
+
+    state = SimpleNamespace(aborted=False, native_reads=0, rollbacks=0, depth=0, failed_restores=0)
+    settings = SimpleNamespace(timeout_text="7", timeout_milliseconds="7")
+    execute = session.execute
+
+    @asynccontextmanager
+    async def nested():
+        state.depth += 1
+        try:
+            yield session
+        except BaseException:
+            state.aborted = False
+            state.rollbacks += 1
+            raise
+        finally:
+            state.depth -= 1
+
+    async def execute_cache(statement, parameters=None):
+        sql = str(statement)
+        if state.aborted:
+            assert "set_config(" in sql
+            state.failed_restores += 1
+            error = RuntimeError("synthetic aborted transaction")
+            error.sqlstate = "25P02"
+            raise DBAPIError(None, None, error)
+        if "AS timeout_text" in sql:
+            return SimpleNamespace(one_or_none=lambda: settings)
+        if "set_config(" in sql:
+            setting, timeout_value, local = statement.compile().params.values()
+            assert setting == "statement_timeout" and local is True and 0 < int(timeout_value) <= 7
+            settings.timeout_text = settings.timeout_milliseconds = timeout_value
+            return None
+        if "npi_canonical_publication_receipt" in sql:
+            assert state.depth == 1
+            return SimpleNamespace(all=lambda: [])
+        if "npi_result_generation" in sql:
+            assert state.depth == 2
+            state.native_reads += 1
+            state.aborted = True
+            error = RuntimeError("synthetic native identity statement timeout")
+            error.sqlstate = "57014"
+            raise DBAPIError(None, None, error)
+        return await execute(statement, parameters)
+
+    return state, settings, nested, execute_cache
+
+
+async def test_npi_count_native_cache_timeout_recovers_original_request_session(monkeypatch):
+    """Recover both nested scopes after native identity timeout without replacing the Reader."""
+    import json
+
+    from api import provider_list_sql
+    from api.endpoint import npi
+    from process.custom_import.read_core import _local_statement_timeout
+
+    cache_identity = npi._npi_count_cache_identity
+    database, session, _events = _optional_count_reader(monkeypatch, None, unfiltered=True)
+    monkeypatch.setattr(npi, "_npi_count_cache_identity", cache_identity)
+    monkeypatch.setattr(provider_list_sql, "_local_statement_timeout", _local_statement_timeout)
+    state, settings, nested, execute_cache = _native_cache_timeout_fixture(session)
+
+    monkeypatch.setattr(session, "begin_nested", nested)
+    request = SimpleNamespace(args={"count_only": "1"}, ctx=SimpleNamespace(sa_session=session))
+    async with database.reader_session():
+        monkeypatch.setattr(session, "execute", execute_cache)
+        response = await npi.get_all(request)
+        assert response.status == 503 and json.loads(response.body)["error"] == "count_timeout"
+        assert not state.aborted and not session.rolled_back
+        assert state.native_reads == 1 and state.rollbacks == 2 and state.failed_restores == 1
+        assert settings.timeout_text == "7"
+    assert session.count_reads == 0 and npi._NPI_COUNT_READ_SCOPE.get() is None
+
+
+@pytest.mark.parametrize("count_format", ["all", "full_taxonomy", "classification"])
+async def test_npi_formatted_counts_share_reader_deadline(monkeypatch, count_format):
+    import json
+
+    from api.endpoint import npi
+
+    database, session, events = _optional_count_reader(monkeypatch, "statement_timeout")
+    request = SimpleNamespace(
+        args={"count_only": "1", "classification": "Pharmacy", "city": "Synthetic", "format": count_format},
+        ctx=SimpleNamespace(sa_session=session),
+    )
+    async with database.reader_session():
+        result = await npi.get_all(request)
+        assert result.status == 503 and json.loads(result.body)["error"] == "count_timeout"
+        assert not session.rolled_back
+    assert session.count_reads == 1 and events == ["savepoint", "nested rollback"]
+    assert npi._NPI_COUNT_READ_SCOPE.get() is None
+
+
+async def test_npi_count_deadline_context_does_not_reach_another_task(monkeypatch):
+    from api import provider_list_sql
+    from api.endpoint import npi
+
+    started, other_finished = asyncio.Event(), asyncio.Event()
+    owner = object()
+    native_owners = []
+
+    @asynccontextmanager
+    async def native_timeout(session, *, timeout_ms):
+        native_owners.append(session)
+        yield
+
+    async def counted_read():
+        started.set()
+        await other_finished.wait()
+        return 1
+
+    async def count_task():
+        token = npi._NPI_COUNT_READ_SCOPE.set((owner, npi.time.monotonic() + 1))
+        try:
+            assert await npi._npi_count_read(counted_read) == 1
+        finally:
+            npi._NPI_COUNT_READ_SCOPE.reset(token)
+        assert npi._NPI_COUNT_READ_SCOPE.get() is None
+
+    async def unrelated_task():
+        await started.wait()
+        assert npi._NPI_COUNT_READ_SCOPE.get() is None
+        assert await npi._npi_count_read(AsyncMock(return_value=42)) == 42
+        other_finished.set()
+
+    monkeypatch.setattr(provider_list_sql, "_local_statement_timeout", native_timeout)
+    await asyncio.gather(count_task(), unrelated_task())
+    assert native_owners == [owner] and npi._NPI_COUNT_READ_SCOPE.get() is None
 
 
 @pytest.mark.parametrize("status", [200, 503])

@@ -247,9 +247,12 @@ def _authority_document(authority):
 
 def _descriptor(binding):
     from process import network_bootstrap_address_artifact as bootstrap
+    from process import network_indexed_address_artifact as indexed
 
     if type(binding) is dict and binding.get("contract") == bootstrap.CONTRACT:
         return bootstrap._descriptor(binding)
+    if type(binding) is dict and binding.get("contract") == indexed.CONTRACT:
+        return indexed._descriptor(binding)
     _require(
         type(binding) is dict
         and set(binding)
@@ -409,11 +412,16 @@ async def verify_network_address_artifact(connection, descriptor, *, runtime_rol
     API mode checks metadata only; consuming queries must independently verify their physical identities.
     """
     from process import network_bootstrap_address_artifact as bootstrap
+    from process import network_indexed_address_artifact as indexed
 
     await _require_api_read_context(connection, api_read)
     descriptor = _descriptor(descriptor)
     if descriptor["contract"] == bootstrap.CONTRACT:
         return await bootstrap.verify_bootstrap_address_artifact(
+            connection, descriptor, runtime_roles=runtime_roles, api_read=api_read
+        )
+    if descriptor["contract"] == indexed.CONTRACT:
+        return await indexed.verify_indexed_address_artifact(
             connection, descriptor, runtime_roles=runtime_roles, api_read=api_read
         )
     runtime_roles = _roles(runtime_roles)
