@@ -330,7 +330,6 @@ async def pin_api_retained_approved_membership_source(connection, manifest, *, c
     Re-resolve the manifest instead of trusting DTO/private JSON fields. This pin
     is not a historical seal; Source readers still require their independent seal.
     """
-    from process.network_candidate_custody import read_network_control_relation_pins
     from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
 
     try:
@@ -341,27 +340,52 @@ async def pin_api_retained_approved_membership_source(connection, manifest, *, c
         )
         if current != manifest:
             raise ApprovedMembershipSourceError("Approved API manifest differs")
-        namespace = _control_namespace(control_schema)
-        control = current.custody_control
-        if control is not None and type(control) is not dict:
-            raise ApprovedMembershipSourceError("Approved API control metadata differs")
-        (relation,) = await read_network_control_relation_pins(
-            connection,
-            ("registry_approved_record",),
-            control_schema=namespace[1:-1],
-            expected_candidate_table_oid=None if control is None else control["candidate_table_oid"],
-        )
-        pid = connection.get_server_pid()
-        approved = await _scope(
-            connection, current.approved_custom_revision, namespace, retained=True, read_identity=(relation, pid)
-        )
-        if approved.generation_id != current.source_generations.get("custom_membership"):
-            raise ApprovedMembershipSourceError("Approved API source generation differs")
-        return approved, relation
+        return await _pin_verified_api_approved_source(connection, current, control_schema=control_schema)
     except (asyncpg.PostgresError, ValueError, TypeError, KeyError) as error:
         if isinstance(error, ApprovedMembershipSourceError):
             raise
         raise ApprovedMembershipSourceError("Approved API source is unavailable") from error
+
+
+async def resolve_api_retained_approved_membership_source(connection, *, generation_id=None, control_schema=None):
+    """Resolve and pin one API manifest on the caller's original Reader transaction."""
+    from process.network_serving_read import resolve_network_serving_manifest
+
+    try:
+        manifest = await resolve_network_serving_manifest(
+            connection, generation_id=generation_id, control_schema=control_schema, api_read=True
+        )
+        approved, relation = await _pin_verified_api_approved_source(
+            connection, manifest, control_schema=control_schema
+        )
+        return manifest, approved, relation
+    except (asyncpg.PostgresError, ValueError, TypeError, KeyError) as error:
+        if isinstance(error, ApprovedMembershipSourceError):
+            raise
+        raise ApprovedMembershipSourceError("Approved API source is unavailable") from error
+
+
+async def _pin_verified_api_approved_source(connection, current, *, control_schema):
+    """Consume only the immediately resolved manifest; public DTO pins re-resolve first."""
+    from process.network_candidate_custody import read_network_control_relation_pins
+
+    namespace = _control_namespace(control_schema)
+    control = current.custody_control
+    if control is not None and type(control) is not dict:
+        raise ApprovedMembershipSourceError("Approved API control metadata differs")
+    (relation,) = await read_network_control_relation_pins(
+        connection,
+        ("registry_approved_record",),
+        control_schema=namespace[1:-1],
+        expected_candidate_table_oid=None if control is None else control["candidate_table_oid"],
+    )
+    pid = connection.get_server_pid()
+    approved = await _scope(
+        connection, current.approved_custom_revision, namespace, retained=True, read_identity=(relation, pid)
+    )
+    if approved.generation_id != current.source_generations.get("custom_membership"):
+        raise ApprovedMembershipSourceError("Approved API source generation differs")
+    return approved, relation
 
 
 async def _read_batch(connection, source, offset, limit, namespace):

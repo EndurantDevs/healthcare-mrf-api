@@ -6,6 +6,7 @@ import json
 from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -487,6 +488,17 @@ def _direct_reader_snapshot(boundary):
     return snapshot
 
 
+@asynccontextmanager
+async def _direct_canonical_scope(boundary, manifest, session, ordinary_session, actual_request, selectors):
+    assert actual_request is boundary.request and selectors["network_ids"] == "42"
+    assert actual_request.ctx.sa_session is session and boundary.depth == 1
+    ordinary_session.connection.assert_not_awaited()
+    async with address_scope.network_address_read_session_scope(
+        session, manifest, (42,), access_scope_sha256=boundary.access_scope
+    ) as selected:
+        yield selected
+
+
 @pytest.fixture
 def direct_detail(monkeypatch):
     """Keep ordinary and nested Reader lifetimes distinct without database I/O."""
@@ -520,11 +532,7 @@ def direct_detail(monkeypatch):
 
     session.execute.side_effect = read_metadata
 
-    async def pin(actual_request, selectors):
-        assert actual_request is request and selectors["network_ids"] == "42"
-        assert actual_request.ctx.sa_session is session and boundary.depth == 1
-        ordinary_session.connection.assert_not_awaited()
-        return manifest, (42,), boundary.access_scope, None
+    pin = partial(_direct_canonical_scope, boundary, manifest, session, ordinary_session)
 
     async def native_read(actual_request, npi):
         assert actual_request is request and npi == _NPI

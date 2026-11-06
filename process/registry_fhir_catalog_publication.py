@@ -7,12 +7,18 @@ from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 from process.network_membership_publication import lock_publication_controls
-from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_fhir_catalog_custody import verify_fhir_catalog_snapshot
 from process.registry_fhir_catalog_fingerprints import (
     require_fhir_catalog_mapping_revision,
     require_fhir_catalog_membership_reuse,
+)
+from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_reads,
+    verify_fhir_catalog_registry_reads,
+)
+from process.registry_fhir_catalog_registry_reader import (
+    resolve_fhir_catalog_network_manifest as resolve_network_serving_manifest,
 )
 from process.registry_publication_execution import (
     locked_publication_request_transaction,
@@ -85,7 +91,12 @@ def _metadata(command, *, split_revision=False):
 
 
 async def enqueue_fhir_catalog_publication(connection, command, *, authorize_metadata, control_schema=None):
-    """Accept only an authenticated standing metadata grant, never browser authority."""
+    """Accept only an authenticated standing metadata grant, never browser authority.
+
+    The caller encloses its transaction in ``fhir_catalog_registry_reads(connection)``
+    and verifies that scope before commit. Split-revision validation needs the
+    configured Reader, whose custody must remain held until the writer commits.
+    """
     if not connection.is_in_transaction():
         raise ValueError("registry_fhir_catalog_transaction_required")
     command = validated_fhir_catalog_command(command)
@@ -247,20 +258,21 @@ async def complete_queued_fhir_catalog_publication(
     if connection.is_in_transaction() or not callable(source_fence):
         raise ValueError("registry_fhir_catalog_source_fence_required")
     namespace = source_observation_namespace(control_schema)
-    async with connection.transaction(isolation="repeatable_read", readonly=True):
-        record = await publication_request(connection, request_id, lease_id, namespace)
-        command = _validated_request(record)
-        snapshot = await _snapshot(connection, namespace, command)
-        await _authority(authorize_metadata, command, snapshot, connection)
-    async with source_fence(snapshot=snapshot, connection=connection):
-        return await _complete_fenced(
-            connection,
-            request_id,
-            lease_id,
-            authorize_metadata=authorize_metadata,
-            verify_sources=verify_sources,
-            control_schema=control_schema,
-        )
+    async with fhir_catalog_registry_reads(connection):
+        async with connection.transaction(isolation="repeatable_read", readonly=True):
+            record = await publication_request(connection, request_id, lease_id, namespace)
+            command = _validated_request(record)
+            snapshot = await _snapshot(connection, namespace, command)
+            await _authority(authorize_metadata, command, snapshot, connection)
+        async with source_fence(snapshot=snapshot, connection=connection):
+            return await _complete_fenced(
+                connection,
+                request_id,
+                lease_id,
+                authorize_metadata=authorize_metadata,
+                verify_sources=verify_sources,
+                control_schema=control_schema,
+            )
 
 
 async def _complete_fenced(connection, request_id, lease_id, *, authorize_metadata, verify_sources, control_schema):
@@ -287,4 +299,5 @@ async def _complete_fenced(connection, request_id, lease_id, *, authorize_metada
         await finish_registry_publication_request(
             connection, request_id, lease_id, state="completed", result=result, control_schema=control_schema
         )
+        await verify_fhir_catalog_registry_reads()
         return result

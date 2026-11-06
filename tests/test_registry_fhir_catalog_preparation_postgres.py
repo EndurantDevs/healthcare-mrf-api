@@ -22,6 +22,10 @@ from process.registry_fhir_catalog_permissions import (
     verify_fhir_catalog_publication_permissions,
 )
 from process.registry_fhir_catalog_publication import FHIRCatalogPublicationRuntime
+from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_reads,
+    verify_fhir_catalog_registry_reads,
+)
 from process.registry_fhir_catalog_store import create_fhir_catalog_candidate, create_fhir_catalog_indexes
 from process.registry_fhir_catalog_validation import metadata_generation
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig
@@ -169,7 +173,7 @@ async def _load_empty_catalog(fixture):
 async def _seal_empty_catalog(fixture, catalog_target, snapshot_by_field):
     """Close and retain the candidate using its separate direct Sealer LOGIN."""
     config, roles_by_kind = fixture.config, fixture.roles_by_kind
-    async with _login(fixture, "sealer") as sealer, sealer.transaction():
+    async with _login(fixture, "sealer") as sealer, fhir_catalog_registry_reads(sealer), sealer.transaction():
         await verify_fhir_catalog_preparation_permissions(
             sealer, config, **fixture.options, role=roles_by_kind["sealer"]
         )
@@ -193,6 +197,7 @@ async def _seal_empty_catalog(fixture, catalog_target, snapshot_by_field):
                 for column in columns
             ),
         )
+        await verify_fhir_catalog_registry_reads()
 
 
 async def test_additive_preparation_works_with_restricted_logins_and_keeps_api_grants(catalog_preparation):

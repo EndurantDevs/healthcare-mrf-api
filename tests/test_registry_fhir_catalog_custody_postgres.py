@@ -41,6 +41,10 @@ from process.registry_fhir_catalog_projection import (
     SourceCatalogContext,
     format_fhir_catalog_projection,
 )
+from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_reads,
+    verify_fhir_catalog_registry_reads,
+)
 from process.registry_fhir_catalog_validation import canonical_json, metadata_generation
 from tests.test_registry_fhir_catalog_read import COMPANY, relationship_document
 
@@ -176,7 +180,7 @@ def expected_snapshot(fixture, target=None):
 async def freeze_metadata(fixture, target=None, snapshot=None):
     target = target or fixture.target
     snapshot = snapshot or expected_snapshot(fixture, target)
-    async with fixture.publisher.transaction():
+    async with fhir_catalog_registry_reads(fixture.publisher), fixture.publisher.transaction():
         receipt = await freeze_fhir_catalog_snapshot(
             fixture.publisher,
             target,
@@ -186,6 +190,7 @@ async def freeze_metadata(fixture, target=None, snapshot=None):
             expected_snapshot=snapshot,
             control_schema=fixture.control_schema,
         )
+        await verify_fhir_catalog_registry_reads()
     return {**snapshot, "custody_json": receipt, "accounting_json": receipt["validation"]["tables"]}
 
 
@@ -344,7 +349,7 @@ async def test_validation_batches_and_stable_digest(metadata_custody, monkeypatc
     explained = json.loads(await fixture.connection.fetchval("EXPLAIN (ANALYZE,FORMAT JSON) " + sql, *parameters))
     assert "registry_fhir_catalog_observation_pkey" in json.dumps(explained)
     counted = BatchCounter(fixture.publisher)
-    async with fixture.publisher.transaction():
+    async with fhir_catalog_registry_reads(counted), fixture.publisher.transaction():
         receipt = await freeze_fhir_catalog_snapshot(
             counted,
             fixture.target,
@@ -354,6 +359,7 @@ async def test_validation_batches_and_stable_digest(metadata_custody, monkeypatc
             expected_snapshot=snapshot_by_field,
             control_schema=fixture.control_schema,
         )
+        await verify_fhir_catalog_registry_reads()
     tables = receipt["validation"]["tables"]
     assert tables["registry_fhir_catalog_observation"]["rows"] == 1000
     assert tables["registry_fhir_catalog_observation"]["batches"] == 1

@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -31,7 +32,20 @@ MANIFEST = PinnedNetworkServingManifest(
 def canonical_pin(monkeypatch):
     mock_approved_control_metadata(monkeypatch)
     pin = AsyncMock(return_value=(MANIFEST, (42, 88), "a" * 64, None))
-    monkeypatch.setattr(scope_module, "_pin_network_scope", pin)
+
+    @asynccontextmanager
+    async def pinned_scope(request, selector):
+        manifest, network_ids, access_scope, legacy_checksums = await pin(request, selector)
+        async with scope_module.network_address_read_session_scope(
+            request.ctx.sa_session,
+            manifest,
+            network_ids,
+            access_scope_sha256=access_scope,
+            legacy_checksums=legacy_checksums,
+        ) as selected:
+            yield selected
+
+    monkeypatch.setattr(scope_module, "_pin_network_scope", pinned_scope)
     monkeypatch.setattr(
         pricing_module,
         "_resolve_internal_codes_for_request",

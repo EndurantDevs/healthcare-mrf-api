@@ -87,7 +87,8 @@ async def test_invalid_header_never_reaches_mapping_or_native(monkeypatch, raw):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-legacy-token")
     incoming, driver = request(raw)
     with pytest.raises(InvalidUsage):
-        await scope._pin_network_scope(incoming, scope._request_selector(incoming, None))
+        async with scope._pin_network_scope(incoming, scope._request_selector(incoming, None)):
+            pytest.fail("invalid selector admitted")
     driver.fetchrow.assert_not_awaited()
     incoming.ctx.sa_session.execute.assert_not_awaited()
 
@@ -131,7 +132,7 @@ async def test_verified_header_is_exact_pinned_scope_and_acknowledged(monkeypatc
     assert result.headers.get("X-Network-Legacy-Checksums") == checksums
     assert result.headers["X-Network-Generation"] == "7"
     assert scope.current_network_address_scope() is None
-    pin.assert_awaited_once_with(driver.native, generation_id=7, api_read=True)
+    pin.assert_awaited_once_with(driver.native, generation_id=7, control_schema=None, api_read=True)
     assert driver.fetchrow.await_count == int(checksums is not None)
 
 
@@ -156,7 +157,7 @@ async def test_nested_batch_read_reuses_the_outer_legacy_scope(monkeypatch):
     result = await batch(incoming)
     assert result.headers["X-Network-Generation"] == "7"
     assert result.headers["X-Network-Legacy-Checksums"] == "42"
-    pin.assert_awaited_once_with(driver.native, generation_id=7, api_read=True)
+    pin.assert_awaited_once_with(driver.native, generation_id=7, control_schema=None, api_read=True)
     assert driver.fetchrow.await_count == 1
     assert scope.current_network_address_scope() is None
 
@@ -191,7 +192,8 @@ async def test_header_requires_one_value_and_both_trusted_pins(monkeypatch, miss
     else:
         incoming.headers.add("X-Network-Legacy-Checksums", "84")
     with pytest.raises(InvalidUsage):
-        await scope._pin_network_scope(incoming, scope._request_selector(incoming, None))
+        async with scope._pin_network_scope(incoming, scope._request_selector(incoming, None)):
+            pytest.fail("invalid selector admitted")
     driver.fetchrow.assert_not_awaited()
 
 
@@ -204,9 +206,10 @@ async def test_http_pin_uses_bound_reader_instead_of_configuring_writer(monkeypa
     reader = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()), driver=driver)
     binder = AsyncMock(return_value=reader)
     monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", binder)
-    await scope._pin_network_scope(incoming, scope._request_selector(incoming, None))
+    async with scope._pin_network_scope(incoming, scope._request_selector(incoming, None)) as selected:
+        assert selected.manifest is MANIFEST
     binder.assert_awaited_once_with(incoming)
     ordinary.execute.assert_not_awaited()
     assert [str(call.args[0]) for call in reader.execute.await_args_list] == ["SET LOCAL lock_timeout='1s'"]
     reader_driver = reader.connection.return_value.get_raw_connection.return_value.driver_connection
-    pin.assert_awaited_once_with(reader_driver, generation_id=7, api_read=True)
+    pin.assert_awaited_once_with(reader_driver, generation_id=7, control_schema=None, api_read=True)
