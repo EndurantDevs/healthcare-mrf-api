@@ -1492,7 +1492,7 @@ def _ordinary_recipe_execution(monkeypatch, *, head, address_sources, failure=No
     config = RegistryPublicationConsumerConfig(
         "registry", "lifecycle", "execution", "api", "queue_owner", "physical_owner"
     )
-    source_pin = object()
+    source_pin = SimpleNamespace(compact_layout=None)
     transactions = []
 
     @asynccontextmanager
@@ -1585,6 +1585,54 @@ async def test_ordinary_nonzero_head_without_configured_sources_keeps_retained_s
     )
     assert execution.compose.await_args.kwargs["address_sources"] is execution.retained.return_value
     execution.retained.assert_awaited_once()
+
+
+@pytest.mark.parametrize("phase", [None, "replacement_source_recipes"])
+async def test_ordinary_indexed_base_selection_reaches_preparation_with_retained_npi(monkeypatch, phase):
+    retained = replace(_ordinary_recipe_sources(phase=phase), compact=True)
+    execution = _ordinary_recipe_execution(monkeypatch, head=7, address_sources=retained)
+    execution.source_pin.compact_layout = object()
+    execution.request["request_sha256"] = "c" * 64
+    monkeypatch.setattr(consumer, "_request", AsyncMock(return_value=execution.request))
+    indexed = PinnedAddressSource("network_candidate_" + "2" * 32, "entity_address_unified", "d" * 64)
+    configured = replace(retained, base_source=indexed)
+
+    async def prepare(**options):
+        sources = options["address_sources"]
+        assert options["source_manifest"] is execution.source_pin and options["expected_head"] == 7
+        assert sources.base_source == indexed and sources.npi_source == retained.npi_source
+        assert sources.replacement_source_recipes == configured.replacement_source_recipes
+        return sources
+
+    callback = AsyncMock(side_effect=prepare)
+    config = replace(execution.config, prepare_address_sources=callback)
+    assert await consumer._ordinary_publication(
+        execution.connection, execution.request, execution.authorize, config, configured
+    ) == {"state": "completed"}
+    callback.assert_awaited_once()
+    assert execution.compose.await_args.kwargs["address_sources"].base_source == indexed
+    assert execution.compose.await_args.kwargs["source_manifest"] is execution.source_pin
+    assert execution.authorize.await_count == 2
+
+
+@pytest.mark.parametrize("unsupported", ["configured_flat", "retained_flat", "unindexed"])
+async def test_ordinary_indexed_opt_in_keeps_unsupported_retained_selection(monkeypatch, unsupported):
+    retained = replace(_ordinary_recipe_sources(), compact=unsupported != "retained_flat")
+    execution = _ordinary_recipe_execution(monkeypatch, head=7, address_sources=retained)
+    execution.source_pin.compact_layout = object() if retained.compact else None
+    configured = replace(
+        retained,
+        base_source=PinnedAddressSource(
+            "other_base" if unsupported == "unindexed" else "network_candidate_" + "2" * 32,
+            "entity_address_unified",
+            "d" * 64,
+        ),
+        compact=unsupported != "configured_flat",
+    )
+    await consumer._ordinary_publication(
+        execution.connection, execution.request, execution.authorize, execution.config, configured
+    )
+    assert execution.compose.await_args.kwargs["address_sources"] is execution.retained.return_value
 
 
 @pytest.mark.parametrize("phase,head", [("initial_source_recipes", 7), ("replacement_source_recipes", 0)])

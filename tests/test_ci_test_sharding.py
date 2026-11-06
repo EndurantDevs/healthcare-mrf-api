@@ -364,7 +364,7 @@ def test_native_proofs_use_measured_shards_without_redistributing_other_cases(sh
         ),
         "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_metadata_execution_reader_successor_preserves_incumbent": (
             22,
-            47,
+            21,
         ),
         f"{catalog}::test_inaccessible_public_view_does_not_hide_unsafe_callbacks": (28, 2),
         f"{catalog}::test_inaccessible_public_view_keeps_complete_metadata_and_transition_census": (28, 2),

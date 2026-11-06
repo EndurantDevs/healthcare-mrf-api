@@ -213,7 +213,7 @@ async def _renew_active_lease(connection, config, request_record):
 
 
 async def _publication_address_sources(connection, expected_head, config, initial_address_sources):
-    """Resolve the retained base and reject any replacement that changes its authority."""
+    """Resolve retained inputs or an explicitly selected indexed equivalent."""
     source_pin = None
     if expected_head:
         async with connection.transaction(isolation="repeatable_read", readonly=True):
@@ -230,6 +230,16 @@ async def _publication_address_sources(connection, expected_head, config, initia
         address_sources = await _source_rollback_address_sources(
             connection, source_pin, config.control_schema, **({"compact_upgrade": True} if compact_upgrade else {})
         )
+        if (
+            initial_address_sources is not None
+            and initial_address_sources.compact
+            and address_sources.compact
+            and source_pin.compact_layout is not None
+        ):
+            from process.network_indexed_address_artifact import is_indexed_address_source
+
+            if is_indexed_address_source(initial_address_sources.base_source):
+                address_sources = replace(address_sources, base_source=initial_address_sources.base_source)
         if initial_address_sources is not None and (
             initial_address_sources.replacement_source_recipes or initial_address_sources.source_recipe_additions
         ):

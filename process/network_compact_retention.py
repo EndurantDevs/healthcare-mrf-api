@@ -11,6 +11,7 @@ from process.network_address_artifact import _descriptor
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_bootstrap_address_artifact import CONTRACT as BOOTSTRAP_ARTIFACT_CONTRACT
 from process.network_compact_readiness import COMPONENT, compact_readiness, is_compact_candidate
+from process.network_indexed_address_artifact import CONTRACT as INDEXED_ARTIFACT_CONTRACT
 from process.network_membership_validation import _json_object, _scope_report
 
 _PAGE_ROWS = 16
@@ -144,7 +145,7 @@ def _dependencies(candidate, receipt):
     )
     address_oids = (
         address["dependency_oids"]
-        if address["contract"] == BOOTSTRAP_ARTIFACT_CONTRACT
+        if address["contract"] in (BOOTSTRAP_ARTIFACT_CONTRACT, INDEXED_ARTIFACT_CONTRACT)
         else (address["table"]["oid"], address["authority_table_oid"])
     )
     dependencies = {*address_oids, *owned.values()}

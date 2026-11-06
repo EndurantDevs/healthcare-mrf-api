@@ -38,21 +38,29 @@ def compact_address_read_relations(layout):
     return tuple(relations)
 
 
-def _membership_arms(layout, *, selected):
+def _membership_arms(layout, *, selected, location_lookup=False):
     arms = []
     for index, artifact in enumerate(layout.artifacts):
         edge = compact_identifier(artifact.schema_name) + ".network_office_edge"
         selector = "AND ref.network_id=ANY(CAST(:_canonical_network_ids AS integer[]))" if selected else ""
         projected = "edge.location_key" if selected else "ref.network_id"
         office = "" if selected else "AND edge.location_key=office.location_key"
+        if selected and location_lookup:
+            office = "AND edge.location_key=office.location_key AND ref.office_bucket=(get_byte(sha256(convert_to(office.location_key,'UTF8')),0)&63)"
         arms.append(f"""SELECT {projected} FROM ONLY {_relation(layout.ref_map)} ref JOIN ONLY {edge} edge
             ON edge.slice_id=ref.slice_id WHERE ref.artifact_candidate_id=CAST(:_compact_artifact_{index} AS uuid)
             {office} {selector}""")
-    return " UNION ALL ".join(arms)
+    memberships = " UNION ALL ".join(arms)
+    if selected and location_lookup and memberships:
+        # Keep membership probes inside each already-bounded office lookup.
+        return "SELECT location_key FROM (" + memberships + ") bucket_members OFFSET 0"
+    return memberships
 
 
-def _address_query(layout, network_ids, visible_membership_sql):
+def _address_query(layout, network_ids, visible_membership_sql, location_lookup):
     compact_address_parameters(layout)
+    if type(location_lookup) is not bool:
+        raise ValueError("Compact location lookup must be boolean")
     if network_ids is not None and (
         type(network_ids) is not tuple
         or not 1 <= len(network_ids) <= 100
@@ -87,7 +95,7 @@ def _address_query(layout, network_ids, visible_membership_sql):
     )
     query = f"SELECT {output_columns} FROM ({base}) office"
     if network_ids is not None:
-        selected = _membership_arms(layout, selected=True)
+        selected = _membership_arms(layout, selected=True, location_lookup=location_lookup)
         return query + (f" WHERE office.location_key IN ({selected})" if selected else " WHERE FALSE")
     visibility = "row_origin IN ('base','ptg_overlay')"
     if visible_membership_sql is not None:
@@ -95,17 +103,18 @@ def _address_query(layout, network_ids, visible_membership_sql):
     return f"SELECT * FROM ({query}) visible_office WHERE {visibility}"
 
 
-def compact_address_relation_sql(layout, *, network_ids=None, visible_membership_sql=None):
+def compact_address_relation_sql(layout, *, network_ids=None, visible_membership_sql=None, location_lookup=False):
     """Return a parenthesized relation; selector/visibility binds belong to the caller.
 
     Layout and visibility SQL come only from trusted manifest/policy integration.
     Neither this query builder nor its DTOs establish custody or authorize reads.
+    Location lookups require an independently bounded outer address query.
     """
-    return "(" + _address_query(layout, network_ids, visible_membership_sql) + ")"
+    return "(" + _address_query(layout, network_ids, visible_membership_sql, location_lookup) + ")"
 
 
-def _bound_address_query(layout, network_ids, visible_membership_sql, read_statements=None):
-    sql = _address_query(layout, network_ids, visible_membership_sql)
+def _bound_address_query(layout, network_ids, visible_membership_sql, read_statements=None, *, location_lookup=False):
+    sql = _address_query(layout, network_ids, visible_membership_sql, location_lookup)
     if read_statements is not None:
         sql = read_statements.marker(compact_address_read_relations(layout)) + " " + sql
     query = text(sql)
@@ -116,14 +125,20 @@ def _bound_address_query(layout, network_ids, visible_membership_sql, read_state
     return query
 
 
-def compact_address_selectable(layout, *, network_ids=None, visible_membership_sql=None, read_statements=None):
+def compact_address_selectable(
+    layout, *, network_ids=None, visible_membership_sql=None, read_statements=None, location_lookup=False
+):
     """Expose model-column parity with raw SQL, including typed reserved binds."""
-    query = _bound_address_query(layout, network_ids, visible_membership_sql, read_statements)
+    query = _bound_address_query(
+        layout, network_ids, visible_membership_sql, read_statements, location_lookup=location_lookup
+    )
     columns = [column(col.name, col.type) for col in EntityAddressUnified.__table__.columns]
     return query.columns(*columns).subquery("entity_address_unified")
 
 
-def compact_address_native_sql(layout, *, first_parameter, network_ids=None, visible_membership_sql=None):
+def compact_address_native_sql(
+    layout, *, first_parameter, network_ids=None, visible_membership_sql=None, location_lookup=False
+):
     """Append typed binds to existing asyncpg parameters for the same logical rows.
 
     Only the common generated SQL is compiled; selectors and artifact UUIDs stay
@@ -131,7 +146,9 @@ def compact_address_native_sql(layout, *, first_parameter, network_ids=None, vis
     """
     if type(first_parameter) is not int or first_parameter < 1:
         raise ValueError("Compact native parameter position is invalid")
-    compiled = _bound_address_query(layout, network_ids, visible_membership_sql).compile(dialect=PGDialect_asyncpg())
+    compiled = _bound_address_query(
+        layout, network_ids, visible_membership_sql, location_lookup=location_lookup
+    ).compile(dialect=PGDialect_asyncpg())
     names = compiled.positiontup or ()
     if first_parameter + len(names) > 32768 or any(compiled.params[name] is None for name in names):
         raise ValueError("Compact native parameters are invalid")

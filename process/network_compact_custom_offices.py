@@ -167,6 +167,11 @@ async def _capture_inputs(connection, base, revision, roles, npi_source, control
     base_artifact, physical = await resolve_compact_address_origin(
         connection, candidate, base, runtime_roles=roles, control_schema=control[1:-1]
     )
+    from process import network_indexed_address_artifact as indexed
+
+    if npi_source is None and base_artifact.get("contract") == indexed.CONTRACT:
+        original = indexed.original_address_source(base_artifact)
+        npi_source = PinnedAddressSource(original.schema_name, "npi", original.generation_id)
     effective_npi, npi_identity = (
         await _capture_npi(connection, base.schema_name, npi_source, roles) if summary["npi_pairs"] else (None, None)
     )

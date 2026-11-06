@@ -10494,7 +10494,6 @@ async def get_near_npi(
             else:
                 capability_by_name = await _resolve_npi_filter_capabilities()
 
-        # If only zip was provided, resolve to coordinates before constructing geo SQL.
         if not has_coordinates and zip_codes and zip_codes[0]:
             async with _provider_list_connection(db, import_context, request_session) as conn_zip:
                 zip_rows = await conn_zip.all(canonical_zip_anchor_statement(), zip_code=zip_codes[0])
@@ -10506,9 +10505,10 @@ async def get_near_npi(
                     in_lat = float(coordinate_record[0])
                     in_long = float(coordinate_record[1])
 
-        address_table_sql = await _address_serving_table_sql(
-            _public_address_serving_column_keys(),
-            session=request_session,
+        address_table_sql = (
+            scoped_address_relation_sql(f"{_runtime_db_schema()}.entity_address_unified", location_lookup=True)
+            if current_network_address_scope() is not None and in_long is not None and in_lat is not None
+            else await _address_serving_table_sql(_public_address_serving_column_keys(), session=request_session)
         )
         plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
             request_session,

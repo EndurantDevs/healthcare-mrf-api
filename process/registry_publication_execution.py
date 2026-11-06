@@ -574,15 +574,25 @@ async def _finish_source_rollback_preview(
 
 def _compact_address_sources(candidate, address_pin):
     from process import network_bootstrap_address_artifact as bootstrap_artifact
+    from process import network_indexed_address_artifact as indexed_artifact
     from process.network_compact_custom_preparation import compact_custom_receipt
 
     custom = compact_custom_receipt(candidate)
     npi_source = None if custom is None else custom.npi_source
     descriptor = _document(candidate["validation_json"])["serving_readiness"]["address_artifact"]
+    original_address_pin = address_pin
+    if descriptor.get("contract") == indexed_artifact.CONTRACT:
+        descriptor = indexed_artifact._descriptor(descriptor)
+        if address_pin != PinnedAddressSource(
+            descriptor["namespace"]["name"], "entity_address_unified", descriptor["generation_id"]
+        ):
+            raise ValueError("registry_source_rollback_address_changed")
+        original_address_pin = indexed_artifact.original_address_source(descriptor)
+        descriptor = descriptor["origin_artifact"]
     if descriptor.get("contract") == bootstrap_artifact.CONTRACT:
         descriptor = bootstrap_artifact._descriptor(descriptor)
         receipt = bootstrap_sources._decode(_json(descriptor["bootstrap_receipt"]))
-        if receipt.address_source != address_pin or npi_source not in (None, receipt.npi_source):
+        if receipt.address_source != original_address_pin or npi_source not in (None, receipt.npi_source):
             raise ValueError("registry_source_rollback_address_changed")
         npi_source = receipt.npi_source
     return RegistryCompositionAddressSources(address_pin, npi_source, compact=True)
