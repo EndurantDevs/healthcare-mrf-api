@@ -132,7 +132,7 @@ async def _owner_schema(session):
     schema = CustomImportSnapshotFamily.__table__.schema
     translations = connection.sync_connection.get_execution_options().get("schema_translate_map") or {}
     schema = translations.get(schema, schema)
-    if type(schema) is not str or not schema or len(schema.encode()) > 63:
+    if not isinstance(schema, str) or not schema or len(schema.encode()) > 63:
         raise SnapshotRetirementRefused("snapshot retirement schema is invalid")
     quoted = connection.dialect.identifier_preparer.quote_schema(schema)
     allowed = await session.scalar(
