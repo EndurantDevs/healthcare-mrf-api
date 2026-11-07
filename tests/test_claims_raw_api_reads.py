@@ -305,6 +305,27 @@ async def test_guarded_npi_metadata_skips_ordinary_cache_reads_and_writes(monkey
     ordinary_set.assert_not_called()
 
 
+async def test_guarded_npi_capabilities_preserve_schema_refusal_without_fallback(monkeypatch):
+    session, _ = await _session()
+    capability_cache_by_entry = {"entry": None}
+    original = ServiceUnavailable("capability metadata unavailable")
+    execute = AsyncMock(side_effect=original)
+    table_available = AsyncMock(return_value=False)
+    monkeypatch.setattr(npi, "ENABLE_NPI_SCHEMA_CACHE", True)
+    monkeypatch.setattr(npi, "_NPI_FILTER_CAPABILITIES_CACHE_STATE", capability_cache_by_entry)
+    monkeypatch.setattr(npi, "_execute_stmt", execute)
+    monkeypatch.setattr(npi, "_is_table_available", table_available)
+
+    with pytest.raises(ServiceUnavailable) as caught:
+        await npi._resolve_npi_filter_capabilities(session=session)
+
+    assert caught.value is original
+    execute.assert_awaited_once()
+    assert execute.await_args.kwargs["session"] is session
+    table_available.assert_not_awaited()
+    assert capability_cache_by_entry == {"entry": None}
+
+
 @pytest.mark.parametrize("basis", ["quality_signal", "fallback_signal", "quality_feature", "raw"])
 async def test_each_current_taxonomy_evidence_basis_bypasses_the_ordinary_cache(monkeypatch, basis):
     taxonomy_evidence_by_field = {
