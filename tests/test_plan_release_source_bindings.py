@@ -139,8 +139,9 @@ class ReaderSession:
 
 
 @pytest.mark.asyncio
-async def test_guard_and_pricing_load_recheck_the_current_tuple_in_one_snapshot(monkeypatch):
-    session = ReaderSession([_binding_row()])
+@pytest.mark.parametrize("storage", [source.SOURCE_BINDING_STORAGE, source.CUSTOM_SOURCE_BINDING_STORAGE])
+async def test_guard_and_pricing_load_recheck_the_current_tuple_in_one_snapshot(monkeypatch, storage):
+    session = ReaderSession([_binding_row()], headers=[header(binding_storage=storage)])
     monkeypatch.setattr(custody, "require_source_binding_custody", AsyncMock())
     monkeypatch.setattr(serving, "has_pricing_projection_relation", AsyncMock(return_value=False))
     guard = await resolution.resolve_plan_release_guard_selection(session, PLAN_RELEASE_ID)
@@ -152,6 +153,8 @@ async def test_guard_and_pricing_load_recheck_the_current_tuple_in_one_snapshot(
     assert "hp_plan_current_release" in sql
     assert parameters["serving_revision_id"] == SERVING_REVISION_ID
     assert parameters["binding_set_digest"] == "a" * 64
+    assert storage in sql
+    assert ("release.semantic_manifest_json" in sql) == (storage == source.CUSTOM_SOURCE_BINDING_STORAGE)
 
 
 @pytest.mark.asyncio
