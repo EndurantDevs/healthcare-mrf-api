@@ -134,42 +134,59 @@ async def test_owned_component_can_drain_a_reader_before_removing_stages(monkeyp
     from tests import provider_directory_source_postgres_support as source_fixture
 
     original_cleanup = source_fixture._cleanup_native_source_component
-    reader = None
+    original_bindings = _bindings
+    readers = []
+    held_oids = []
     drained_stage_oids = []
 
     async def cleanup(*args):
         try:
-            if reader is not None:
+            for reader in readers:
                 assert reader.is_in_transaction()
-                assert await reader.fetchval(
-                    "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() "
-                    "AND relation=$1 AND mode='AccessShareLock' AND granted)",
-                    stage_oid,
-                )
+                for oid in held_oids:
+                    assert await reader.fetchval(
+                        "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() "
+                        "AND relation=$1 AND mode='AccessShareLock' AND granted)",
+                        oid,
+                    )
                 await reader.execute("ROLLBACK")
-                drained_stage_oids.append(stage_oid)
+                drained_stage_oids.append(tuple(held_oids))
         finally:
-            if reader is not None and not reader.is_closed():
-                await reader.close()
+            for reader in readers:
+                if not reader.is_closed():
+                    await reader.close()
             await original_cleanup(*args)
 
+    async def bindings(current, kind, *, published=False):
+        result = await original_bindings(current, kind, published=published)
+        if current is not staged and kind == "group" and not published:
+            assert not readers
+            url = staged.fixture.engine.url.set(drivername="postgresql")
+            reader = await asyncpg.connect(url.render_as_string(hide_password=False))
+            readers.append(reader)
+            await reader.execute("BEGIN")
+            candidate = current.ctx["context"][identities._CONTEXT_KEY]["group"]
+            for name in (current.stage.__tablename__, candidate.table["name"]):
+                held_oids.append(await reader.fetchval("SELECT to_regclass($1)::oid", f"{staged.schema}.{name}"))
+                await reader.fetchval(f'SELECT 1 FROM "{staged.schema}"."{name}" LIMIT 1')
+        return result
+
     monkeypatch.setattr(source_fixture, "_cleanup_native_source_component", cleanup)
+    monkeypatch.setitem(globals(), "_bindings", bindings)
     generator = staged_groups.__wrapped__(monkeypatch)
     try:
         staged = await anext(generator)
-        url = staged.fixture.engine.url.set(drivername="postgresql")
-        reader = await asyncpg.connect(url.render_as_string(hide_password=False))
-        await reader.execute("BEGIN")
-        stage_oid = await reader.fetchval(
-            "SELECT to_regclass($1)::oid", f"{staged.schema}.{staged.stage.__tablename__}"
-        )
-        await reader.fetchval(f'SELECT 1 FROM "{staged.schema}"."{staged.stage.__tablename__}" LIMIT 1')
+        await test_prepared_groups_publish_with_complete_family_and_stable_replay(staged, monkeypatch)
         await generator.aclose()
-        assert drained_stage_oids == [stage_oid]
+        assert len(readers) == 1 and len(set(held_oids)) == 2 and all(oid is not None for oid in held_oids)
+        assert drained_stage_oids == [tuple(held_oids)]
     finally:
-        if reader is not None and not reader.is_closed():
-            await reader.close()
-        await generator.aclose()
+        try:
+            await generator.aclose()
+        finally:
+            for reader in readers:
+                if not reader.is_closed():
+                    await reader.close()
 
 
 async def _prepare_groups(staged):
@@ -394,27 +411,21 @@ async def test_prepared_groups_publish_with_complete_family_and_stable_replay(st
         == prior + 1
     )
     replay = await _replay(staged)
-    try:
-        assert await _prepare_groups(replay) == 207 and await _prepare_sites(replay) == 206
-        assert await _bindings(replay, "group") == groups and await _bindings(replay, "site") == sites_map
-    finally:
-        await identities.discard_doctors_identities(staged.fixture.database, replay.ctx)
+    assert await _prepare_groups(replay) == 207 and await _prepare_sites(replay) == 206
+    assert await _bindings(replay, "group") == groups and await _bindings(replay, "site") == sites_map
 
 
 @pytest.mark.asyncio
 async def test_concurrent_publishers_keep_one_stable_winner_and_require_whole_reprepare(staged_groups):
     staged = staged_groups
     competitor = await _replay(staged)
-    try:
-        await _prepare_groups(staged)
-        await _prepare_sites(staged)
-        await _prepare_groups(competitor)
-        await _prepare_sites(competitor)
-        results = await asyncio.gather(_publish(staged), _publish(competitor), return_exceptions=True)
-        assert sum(not isinstance(value, BaseException) for value in results) == 1
-        loser = next(value for value in results if isinstance(value, BaseException))
-        assert isinstance(loser, identities.CMSIdentityReprepareRequired)
-        assert len(await _bindings(staged, "group", published=True)) == 207
-        assert len(await _bindings(staged, "site", published=True)) == 206
-    finally:
-        await identities.discard_doctors_identities(staged.fixture.database, competitor.ctx)
+    await _prepare_groups(staged)
+    await _prepare_sites(staged)
+    await _prepare_groups(competitor)
+    await _prepare_sites(competitor)
+    results = await asyncio.gather(_publish(staged), _publish(competitor), return_exceptions=True)
+    assert sum(not isinstance(value, BaseException) for value in results) == 1
+    loser = next(value for value in results if isinstance(value, BaseException))
+    assert isinstance(loser, identities.CMSIdentityReprepareRequired)
+    assert len(await _bindings(staged, "group", published=True)) == 207
+    assert len(await _bindings(staged, "site", published=True)) == 206

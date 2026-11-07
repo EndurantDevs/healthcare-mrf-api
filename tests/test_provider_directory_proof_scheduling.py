@@ -104,6 +104,43 @@ async def test_async_spool_completion_preserves_unions_and_metrics(monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_merge_allows_io_progress_before_finishing_records(monkeypatch, tmp_path):
+    """A short sequence of I/O waits must progress during the default merge."""
+    lines = [
+        proof._stable_json(
+            proof._proof_record(
+                _dataset_resource("Practitioner", f"person-{index:06d}", {"npi": "123"}),
+                LEGACY_RESOURCE_HASH_CONTRACT,
+            )
+        ).encode()
+        for index in range(512)
+    ]
+    sync_directory, async_directory = tmp_path / "sync", tmp_path / "async"
+    sync_directory.mkdir()
+    async_directory.mkdir()
+    expected = proof._complete_spools(*_spools(sync_directory, lines))
+    consumed, original_decode = [], proof._decoded_record
+
+    def decode(line):
+        consumed.append(1)
+        return original_decode(line)
+
+    async def io_work():
+        for _ in range(4):
+            await asyncio.sleep(0)
+        return len(consumed)
+
+    monkeypatch.setattr(proof, "_decoded_record", decode)
+    observer = asyncio.create_task(io_work())
+    try:
+        actual = await proof._drain_proof_steps_async(proof._complete_spool_steps(*_spools(async_directory, lines)))
+    finally:
+        progressed_at = await observer
+    assert actual == expected
+    assert 0 < progressed_at < len(lines)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ("resource", "npi", "compaction", "complete"))
 async def test_cancelled_proof_closes_streams_before_scratch_cleanup(monkeypatch, tmp_path, phase):
     monkeypatch.setattr(proof, "_SPOOL_ROWS", 1)
