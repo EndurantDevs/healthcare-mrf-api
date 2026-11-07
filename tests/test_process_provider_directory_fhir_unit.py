@@ -26855,6 +26855,33 @@ async def test_resource_scan_overlaps_foundation_and_keeps_role_serial(
     )
 
 
+@pytest.mark.asyncio
+async def test_resource_scan_reports_unsupported_type_after_parallel_wave(monkeypatch):
+    """An explicitly unavailable collection must not serialize its siblings."""
+    harness = _ResourceOverlapHarness()
+    unavailable_resources = []
+
+    async def fetch(source, resource_type, **options):
+        if resource_type == "Endpoint":
+            assert harness.foundation_completed.is_set()
+            unavailable_resources.append(resource_type)
+            return None
+        return await harness.fetch(source, resource_type, **options)
+
+    source = _patch_parallel_resource_flow(monkeypatch, fetch)
+    source["metadata_json"] = {
+        "provider_directory_supported_resources": ["Location", "HealthcareService", "PractitionerRole"],
+    }
+    resources = ["Location", "Endpoint", "HealthcareService", "PractitionerRole"]
+    counts = await asyncio.wait_for(
+        _run_parallel_resource_import(source, resources=resources, progress_callback=harness.capture_progress),
+        timeout=5,
+    )
+    assert resources == ["Location", "Endpoint", "HealthcareService", "PractitionerRole"]
+    assert counts.pop("Endpoint") == 0 and unavailable_resources == ["Endpoint"]
+    harness.assert_complete(counts, expected_bulk_export=False)
+
+
 @pytest.mark.parametrize("api_base", (importer.SCAN_PROVIDER_DIRECTORY_BASE, importer.UHC_PROVIDER_DIRECTORY_BASE))
 def test_resource_scan_keeps_reverse_lookup_role_outside_wave(monkeypatch, api_base):
     """Existing-seed discovery still needs its barrier without selected seeds."""

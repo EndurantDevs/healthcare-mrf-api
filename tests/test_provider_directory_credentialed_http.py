@@ -233,7 +233,10 @@ async def test_authenticated_throttle_keeps_retry_after_and_reduces_shared_slots
             assert limits == [4]
 
 
-async def test_reviewed_authenticated_scans_use_scheduler_without_enabling_page_prefetch(monkeypatch):
+@pytest.mark.parametrize("use_default_resources", (False, True))
+async def test_reviewed_authenticated_scans_use_scheduler_without_enabling_page_prefetch(
+    monkeypatch, use_default_resources
+):
     base = "https://payer.example/fhir"
     source_by_field, _spec = _reviewed_source(monkeypatch, base, "https://payer.example/token")
     checkpointed = _parallel_resource_source()
@@ -241,10 +244,18 @@ async def test_reviewed_authenticated_scans_use_scheduler_without_enabling_page_
     source_by_field["_pagination_checkpoint_context"] = dataclasses.replace(
         checkpointed["_pagination_checkpoint_context"], canonical_api_base=base
     )
+    source_by_field["metadata_json"] = {
+        "provider_directory_supported_resources": list(directory.anthem.RESOURCES),
+    }
     _patch_resource_scan_storage(monkeypatch, True)
-    options = _resource_concurrency_options(requested_concurrency=8, resource_types=directory.anthem.RESOURCES)
+    resources = tuple(directory.DEFAULT_RESOURCES) if use_default_resources else directory.anthem.RESOURCES
+    options = _resource_concurrency_options(requested_concurrency=8, resource_types=resources)
     async with directory._source_http_session_scope(force=True, request_concurrency=8):
         assert directory._effective_resource_scan_concurrency(source_by_field, options) == 7
+        assert (
+            directory.resource_scan_types(directory, source_by_field, resources, options) == directory.anthem.RESOURCES
+        )
+        assert options.resource_types == resources
         assert directory._rest_page_prefetch_session(source_by_field, base + "/Location") is None
         assert directory._partition_window_concurrency(source_by_field, base + "/Location") == 1
         assert (
@@ -387,6 +398,61 @@ async def test_reviewed_quick_retry_does_not_truncate_provider_delay(monkeypatch
         source_by_field, base + "/Location", timeout=1, is_last_candidate=True
     )
     assert fetch_result[0] == 200 and retries == 1 and waits == [1200]
+
+
+@pytest.mark.parametrize("recovers", (True, False))
+async def test_reviewed_server_error_cooldown_retries_the_unchanged_cursor(monkeypatch, recovers):
+    base = "https://payer.example/fhir"
+    source, _spec = _reviewed_source(monkeypatch, base, "https://payer.example/token")
+    url = base + "/Location?_count=1000&_page=opaque"
+    failure = (500, {"resourceType": "OperationOutcome"}, None, 0)
+    success = (200, {"resourceType": "Bundle", "entry": []}, None, 0)
+    fetch = AsyncMock(side_effect=[failure, success] if recovers else [failure, failure])
+    sleep = AsyncMock()
+    monkeypatch.setattr(directory, "_fetch_source_json", fetch)
+    monkeypatch.setattr(directory.asyncio, "sleep", sleep)
+    outcome = await directory._retry_rest_pagination_after_cooldown(source, url, failure, timeout=60, deadline_at=None)
+    assert outcome.retries == directory.REST_PAGINATION_COOLDOWN_RETRY_CAP == 2
+    assert outcome.recovered is recovers and outcome.exhausted is not recovers
+    assert not outcome.deadline_blocked
+    assert all(call.args == (source, url) and call.kwargs == {"timeout": 60} for call in fetch.await_args_list)
+    assert fetch.await_count == sleep.await_count == 2
+    assert outcome.fetch_result == (success if recovers else failure)
+
+
+@pytest.mark.parametrize(
+    ("status", "fetch_error", "source_base", "eligible"),
+    (
+        (500, None, "https://payer.example/fhir", True),
+        (500, "invalid_response", "https://payer.example/fhir", False),
+        (500, None, "https://other.example/fhir", False),
+        (503, None, "https://payer.example/fhir", False),
+    ),
+)
+def test_reviewed_server_error_cooldown_keeps_its_source_scope(monkeypatch, status, fetch_error, source_base, eligible):
+    _reviewed_source(monkeypatch, "https://payer.example/fhir", "https://payer.example/token")
+    assert (
+        directory._is_rest_pagination_cooldown_failure(status, fetch_error, source_record={"api_base": source_base})
+        is eligible
+    )
+    assert not directory._is_rest_pagination_cooldown_failure(500, None)
+
+
+async def test_reviewed_server_error_retry_after_cannot_overrun_the_resource_deadline(monkeypatch):
+    base = "https://payer.example/fhir"
+    source, _spec = _reviewed_source(monkeypatch, base, "https://payer.example/token")
+    failure = (500, {directory.SOURCE_RETRY_AFTER_FIELD: "1200"}, None, 0)
+    fetch = AsyncMock(side_effect=AssertionError("retry before provider delay forbidden"))
+    sleep = AsyncMock(side_effect=AssertionError("sleep beyond deadline forbidden"))
+    monkeypatch.setattr(directory, "_fetch_cooldown_checkpoint_page", fetch)
+    monkeypatch.setattr(directory.asyncio, "sleep", sleep)
+    outcome = await directory._retry_rest_pagination_after_cooldown(
+        source, base + "/Location", failure, timeout=60, deadline_at=directory.time.monotonic() + 700
+    )
+    assert outcome.deadline_blocked and outcome.retries == 0 and not outcome.exhausted
+    assert outcome.fetch_result == failure
+    fetch.assert_not_awaited()
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.parametrize("header", ["Authorization", "X-Api-Key"])
