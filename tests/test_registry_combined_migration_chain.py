@@ -17,6 +17,7 @@ def test_catalog_membership_and_inventory_extend_the_existing_target_head():
         "20261102030000_custom_import_build_scratch",
         "20261102040000_custom_import_post_seal_audit",
         "20261104010000_custom_import_unlogged_landing",
+        "20261107010000_custom_import_child_reference_aggregate",
     )
     assert scripts.get_heads() == [chain[-1]]
     for predecessor, successor in zip(chain, chain[1:]):

@@ -24,7 +24,11 @@ def test_landing_migration_extends_the_unique_current_head():
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == [migration.revision]
+    assert script.get_heads() == ["20261107010000_custom_import_child_reference_aggregate"]
+    assert (
+        script.get_revision("20261107010000_custom_import_child_reference_aggregate").down_revision
+        == migration.revision
+    )
     assert migration.down_revision == "20261102040000_custom_import_post_seal_audit"
     assert script.get_revision(migration.revision).down_revision == migration.down_revision
 
