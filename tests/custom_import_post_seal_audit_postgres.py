@@ -5,6 +5,7 @@
 import hashlib
 import json
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,308 @@ from tests import custom_import_query_projection_build_postgres as projection_fi
 from tests import test_custom_import_manual_acceptance_postgres as manual
 from tests.custom_import_postgres_support import _migration
 from tests.test_custom_import_build_source_postgres import _source_case
+
+
+def _aggregate_migration():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic/versions/20261107010000_custom_import_child_reference_aggregate.py"
+    )
+    return _migration(path, "child_reference_aggregate_test_migration")
+
+
+def _refresh_aggregate(connection, schema, *, rollback=False):
+    migration = _aggregate_migration()
+    ranges = migration._ranges()
+    ranges._schema = lambda: schema
+    migration._ranges = lambda: ranges
+    migration.op = Operations(MigrationContext.configure(connection))
+    (migration.downgrade if rollback else migration.upgrade)()
+
+
+def _child_reference_queries():
+    migration = _aggregate_migration()
+    original = migration._PREVIOUS_QUERY.replace("__CANDIDATE__", "__LEAF__")
+    assert original.endswith(" LIMIT 1;\n")
+    original = original.removesuffix(" LIMIT 1;\n") + ";\n"
+    aggregate = audit._sql_resource()[0]["arms"][18]["sql"]
+    context = SimpleNamespace(quoted="pg_temp", family=SimpleNamespace(family_id=1), base_family=None)
+    return [
+        audit._compiled(sql.replace("__LEAF__", "pg_temp").replace("__CONTROL__", "pg_temp"), context)
+        for sql in (original, aggregate)
+    ]
+
+
+def _child_reference_mirror_columns():
+    return {
+        "custom_import_build_attempt": "execution_id bigint,producing_fence bigint",
+        "custom_import_root_revision": "pack_id bigint",
+        "custom_import_family_child": "family_revision_id bigint",
+        "custom_import_child_revision": (
+            "child_revision_id bigint,dataset_id bigint,definition_revision_id bigint,schema_revision_id bigint,"
+            "root_record_id bigint,canonical_parent_key text,parent_key_sha256 bytea,collection_slot bigint,pack_id bigint"
+        ),
+        "custom_import_root_record": (
+            "root_record_id bigint,dataset_id bigint,canonical_logical_key text,logical_key_sha256 bytea"
+        ),
+        "custom_import_child_collection": "collection_slot bigint,dataset_id bigint,schema_revision_id bigint",
+        "custom_import_pack": (
+            "pack_id bigint,execution_id bigint,dataset_id bigint,definition_revision_id bigint,schema_revision_id bigint,"
+            "capture_bundle_id bigint,producing_fence bigint,producing_token_sha256 bytea,stream_slot bigint"
+        ),
+        "custom_import_source_stream": (
+            "definition_revision_id bigint,dataset_id bigint,schema_revision_id bigint,stream_slot bigint,"
+            "record_kind text,collection_slot bigint"
+        ),
+    }
+
+
+def _child_reference_valid_rows():
+    # Nullable mirrors also admit malformed duplicates that live PK/NOT NULL guards reject.
+    return {
+        "custom_import_child_revision": [[10, 2, 3, 4, 20, "parent", b"key", 30, 40]],
+        "custom_import_root_record": [[20, 2, "parent", b"key"]],
+        "custom_import_child_collection": [[30, 2, 4]],
+        "custom_import_pack": [[40, 5, 2, 3, 4, 6, 7, b"token", 50]],
+        "custom_import_source_stream": [[3, 2, 4, 50, "child", 30]],
+    }
+
+
+def _child_reference_regular_scenarios(valid_by_table, parameters_by_name):
+    scenarios = [("valid", valid_by_table, parameters_by_name, False)]
+    for table, mirror_rows in valid_by_table.items():
+        for index, cell in enumerate(mirror_rows[0]):
+            if table == "custom_import_child_revision" and index == 0:
+                continue
+            different = cell + 1 if isinstance(cell, int) else cell + (b"!" if isinstance(cell, bytes) else "!")
+            for changed in (None, different):
+                mirrors_by_table = deepcopy(valid_by_table)
+                mirrors_by_table[table][0][index] = changed
+                scenarios.append((f"{table}:{index}:{changed!r}", mirrors_by_table, parameters_by_name, True))
+    for table in valid_by_table:
+        mirrors_by_table = deepcopy(valid_by_table)
+        mirrors_by_table[table] = []
+        scenarios.append(
+            (f"missing:{table}", mirrors_by_table, parameters_by_name, table != "custom_import_child_revision")
+        )
+    return scenarios
+
+
+def _child_reference_special_scenarios(valid_by_table, parameters_by_name):
+    mirrors_by_table = deepcopy(valid_by_table)
+    for mirror_rows in mirrors_by_table.values():
+        mirror_rows.append(mirror_rows[0].copy())
+    scenarios = [("duplicate_valid_matches", mirrors_by_table, parameters_by_name, False)]
+    for table, index in (("custom_import_pack", 1), ("custom_import_source_stream", 4)):
+        mirrors_by_table = deepcopy(valid_by_table)
+        duplicate = mirrors_by_table[table][0].copy()
+        duplicate[index] = 999 if index == 1 else "root"
+        mirrors_by_table[table].append(duplicate)
+        scenarios.append((f"valid_and_invalid_duplicate:{table}", mirrors_by_table, parameters_by_name, False))
+    for indices in ((6,), (7,), (6, 7)):
+        mirrors_by_table = deepcopy(valid_by_table)
+        bindings_by_name = parameters_by_name.copy()
+        for index in indices:
+            mirrors_by_table["custom_import_pack"][0][index] = None
+            bindings_by_name[f"p_{index + 1}"] = None
+        scenarios.append((f"null_authority_match:{indices}", mirrors_by_table, bindings_by_name, False))
+    mirrors_by_table = deepcopy(valid_by_table)
+    mirrors_by_table["custom_import_child_revision"][0][5:7] = [None, None]
+    mirrors_by_table["custom_import_root_record"][0][2:4] = [None, None]
+    scenarios.append(("null_key_and_hash_match", mirrors_by_table, parameters_by_name, False))
+    mirrors_by_table = deepcopy(valid_by_table)
+    child = mirrors_by_table["custom_import_child_revision"][0].copy()
+    child[0:2] = [20, 999]
+    mirrors_by_table["custom_import_child_revision"].append(child)
+    scenarios.append(("valid_and_invalid_children", mirrors_by_table, parameters_by_name, True))
+    for identities in ((None,), (None, 10, 20, 10)):
+        mirrors_by_table = deepcopy(valid_by_table)
+        child = mirrors_by_table["custom_import_child_revision"][0]
+        mirrors_by_table["custom_import_child_revision"] = [[identity, *child[1:]] for identity in identities]
+        mirrors_by_table["custom_import_root_record"] = []
+        scenarios.append((f"invalid_witnesses:{identities}", mirrors_by_table, parameters_by_name, True))
+    return scenarios
+
+
+async def _replace_child_reference_mirrors(connection, columns_by_table, mirrors_by_table):
+    for table in columns_by_table:
+        await connection.execute(text(f"DELETE FROM pg_temp.{table}"))
+        for mirror_row in mirrors_by_table.get(table, ()):
+            bindings_by_name = {f"value_{index}": cell for index, cell in enumerate(mirror_row)}
+            placeholders = ",".join(f":{key}" for key in bindings_by_name)
+            await connection.execute(text(f"INSERT INTO pg_temp.{table} VALUES ({placeholders})"), bindings_by_name)
+
+
+def _assert_child_reference_witness(old_rows, new_rows, is_invalid, name):
+    assert bool(old_rows) is is_invalid, name
+    assert bool(new_rows) is is_invalid, name
+    assert len(new_rows) == int(is_invalid), name
+    if is_invalid:
+        assert new_rows[0] in old_rows, name
+        identities = [witness[1] for witness in old_rows if witness[1] is not None]
+        assert new_rows[0][1] == (min(identities) if identities else None), name
+
+
+async def test_child_reference_aggregate_preserves_null_and_duplicate_witnesses():
+    queries = _child_reference_queries()
+    columns_by_table = _child_reference_mirror_columns()
+    valid_by_table = _child_reference_valid_rows()
+    parameters_by_name = {"p_2": 2, "p_3": 3, "p_4": 4, "p_5": 5, "p_6": 6, "p_7": 7, "p_8": b"token"}
+    scenarios = _child_reference_regular_scenarios(valid_by_table, parameters_by_name)
+    scenarios.extend(_child_reference_special_scenarios(valid_by_table, parameters_by_name))
+    async with _source_case() as case, case.engine.begin() as connection:
+        for table, definition in columns_by_table.items():
+            await connection.execute(text(f"CREATE TEMP TABLE {table} ({definition}) ON COMMIT DROP"))
+        for name, mirrors_by_table, bindings_by_name, is_invalid in scenarios:
+            await _replace_child_reference_mirrors(connection, columns_by_table, mirrors_by_table)
+            old_rows = (await connection.execute(queries[0], bindings_by_name)).all()
+            new_rows = (await connection.execute(queries[1], bindings_by_name)).all()
+            _assert_child_reference_witness(old_rows, new_rows, is_invalid, name)
+
+
+async def _assert_rejected_function_metadata(connection, schema, identity, observation, before, changed):
+    with pytest.raises(RuntimeError, match="function_identity_mismatch"):
+        async with connection.begin_nested():
+            await connection.execute(text(f"ALTER FUNCTION {identity} {changed}"))
+            await connection.run_sync(_refresh_aggregate, schema)
+    assert (await connection.execute(observation, {"identity": identity})).one() == before
+
+
+async def _assert_historical_upgrade():
+    from tests import custom_import_unlogged_landing_postgres as unlogged
+    from tests.test_custom_import_staged_verification_postgres import _install as install_staged
+    from tests.test_custom_import_verification_arms_postgres import _install as install_arms
+    from tests.test_custom_import_verification_root_ranges_postgres import _install as install_ranges
+
+    async with _source_case() as case:
+        identity = f'"{case.schema_name}".verify_custom_import_build_structure(bigint)'
+        observation = text("SELECT p.prosrc,to_jsonb(p)-'prosrc' FROM pg_proc p WHERE oid=to_regprocedure(:identity)")
+        migration = _aggregate_migration()
+        previous, updated = migration._bodies(case.schema_name)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(install_staged, case.schema_name)
+            await connection.run_sync(install_arms, case.schema_name)
+        # Read the committed arms installation in a fresh transaction before upgrading it.
+        async with case.engine.begin() as connection:
+            stopped = (await connection.execute(observation, {"identity": identity})).one()
+            assert stopped[0] == " " + migration._ranges()._arms()._body(case.schema_name) + " "
+            await connection.run_sync(install_ranges, case.schema_name, 16_384)
+            assert (await connection.execute(observation, {"identity": identity})).one() == (previous, stopped[1])
+            await connection.run_sync(manual._install, case.schema_name)
+            await connection.run_sync(install_audit_migration, case.schema_name)
+            await connection.run_sync(unlogged._install, case.schema_name)
+            assert (await connection.execute(observation, {"identity": identity})).one() == (previous, stopped[1])
+            await connection.run_sync(_refresh_aggregate, case.schema_name)
+            assert (await connection.execute(observation, {"identity": identity})).one() == (updated, stopped[1])
+
+
+async def test_child_reference_refresh_preserves_metadata_and_exact_rollback(monkeypatch):
+    await _assert_historical_upgrade()
+    async with _source_case() as case:
+        await _ready(case, monkeypatch)
+        identity = f'"{case.schema_name}".verify_custom_import_build_structure(bigint)'
+        observation = text("SELECT p.prosrc,to_jsonb(p)-'prosrc' FROM pg_proc p WHERE oid=to_regprocedure(:identity)")
+        async with case.engine.begin() as connection:
+            before = (await connection.execute(observation, {"identity": identity})).one()
+            migration = _aggregate_migration()
+            old, new = migration._bodies(case.schema_name)
+            assert before[0] == new
+            await connection.run_sync(lambda conn: _refresh_aggregate(conn, case.schema_name, rollback=True))
+            rolled_back = (await connection.execute(observation, {"identity": identity})).one()
+            assert rolled_back == (old, before[1])
+            await connection.run_sync(_refresh_aggregate, case.schema_name)
+            assert (await connection.execute(observation, {"identity": identity})).one() == before
+            # Fresh installs are already current; their exact metadata still has to pass.
+            await connection.run_sync(_refresh_aggregate, case.schema_name)
+            assert (await connection.execute(observation, {"identity": identity})).one() == before
+            for changed in ("COST 101", "SET search_path TO public"):
+                await _assert_rejected_function_metadata(
+                    connection, case.schema_name, identity, observation, before, changed
+                )
+
+
+def _previous_audit_resource():
+    old_document = deepcopy(audit._sql_resource()[0])
+    old_sql = _aggregate_migration()._PREVIOUS_QUERY.replace("__CANDIDATE__", "__LEAF__")
+    old_document["arms"][18]["sql"] = old_sql
+    old_document["arms"][18]["sha256"] = hashlib.sha256(old_sql.encode()).hexdigest()
+    old_hash = hashlib.sha256((json.dumps(old_document, indent=2) + "\n").encode()).digest()
+    return old_document, old_hash
+
+
+async def _begin_original_audit_prefix(case, family_id, monkeypatch, old_document, old_hash):
+    with monkeypatch.context() as patch:
+        patch.setattr(audit, "_sql_resource", lambda: (old_document, old_hash))
+        progress = await _begin(case, family_id)
+        for _ in range(18):
+            progress = await _step(case, progress)
+        assert (progress.checkpoint, progress.next_ordinal, progress.state) == (18, 19, "scanning")
+        return progress
+
+
+async def _assert_logged_forward_migration(connection, schema, family_id):
+    from tests import custom_import_unlogged_landing_postgres as unlogged
+
+    before = await unlogged._catalog(connection, schema)
+    assert len(before) == 3
+    assert await unlogged._persistence(connection, family_id) == "p"
+    await connection.run_sync(unlogged._install, schema)
+    after = await unlogged._catalog(connection, schema)
+    assert before.keys() == after.keys()
+    assert all(before[oid]["metadata"] == after[oid]["metadata"] for oid in before)
+    assert all(before[oid]["body"] != after[oid]["body"] for oid in before)
+    assert await unlogged._persistence(connection, family_id) == "p"
+    await connection.run_sync(unlogged._install, schema)
+    assert await unlogged._catalog(connection, schema) == after
+    with pytest.raises(RuntimeError, match="custom_import_unlogged_landing_requires_forward_migration"):
+        unlogged._migration().downgrade()
+    await connection.run_sync(_refresh_aggregate, schema)
+    assert await unlogged._catalog(connection, schema) == after
+    assert await unlogged._persistence(connection, family_id) == "p"
+
+
+async def _assert_original_audit_prefix(case, progress, chain, original_chain, old_hash):
+    async with case.sessions() as session, session.begin():
+        assert (await session.execute(chain)).all() == original_chain
+        header = await session.get(Audit, progress.audit_id)
+        assert bytes(header.sql_sha256) == old_hash
+        old_rows = (await session.scalars(select(Checkpoint).where(Checkpoint.audit_id == progress.audit_id))).all()
+        assert sorted(checkpoint.checkpoint for checkpoint in old_rows) == list(range(19))
+        assert all(checkpoint.state == "scanning" for checkpoint in old_rows)
+        assert max(checkpoint.next_ordinal for checkpoint in old_rows) == 19
+
+
+async def test_child_reference_changed_sql_refuses_eighteen_checkpoint_prefix(monkeypatch):
+    monkeypatch.setattr(audit, "ROOT_PAGE_ROWS", 2)
+    async with _source_case() as case:
+        _request, _build_id, _sealed, family_id = await _ready(case, monkeypatch)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(lambda conn: _refresh_aggregate(conn, case.schema_name, rollback=True))
+        old_document, old_hash = _previous_audit_resource()
+        progress = await _begin_original_audit_prefix(case, family_id, monkeypatch, old_document, old_hash)
+        chain = (
+            select(Checkpoint.checkpoint, Checkpoint.previous_sha256, Checkpoint.checkpoint_sha256)
+            .where(Checkpoint.audit_id == progress.audit_id)
+            .order_by(Checkpoint.checkpoint)
+        )
+        async with case.sessions() as session, session.begin():
+            original_chain = (await session.execute(chain)).all()
+        with pytest.raises(audit.PostSealAuditRefused, match="SQL changed; start a new attempt"):
+            await _step(case, progress)
+        # Exercise the real04 ->05 transition before the new verifier refresh.
+        async with case.engine.begin() as connection:
+            await _assert_logged_forward_migration(connection, case.schema_name, family_id)
+        with monkeypatch.context() as patch:
+            patch.setattr(audit, "_sql_resource", lambda: (old_document, old_hash))
+            with pytest.raises(audit.PostSealAuditRefused, match="binding changed; start a new attempt"):
+                await _step(case, progress)
+        with pytest.raises(audit.PostSealAuditRefused, match="SQL changed; start a new attempt"):
+            await _begin(case, family_id)
+        restarted = await _begin(case, family_id, restart=True)
+        assert restarted.audit_id != progress.audit_id and restarted.checkpoint == 0 and restarted.next_ordinal == 1
+        completed = await _finish(case, restarted)
+        await _assert_complete(case, completed)
+        await _assert_original_audit_prefix(case, progress, chain, original_chain, old_hash)
 
 
 def install_audit_migration(connection, schema):
@@ -49,8 +352,12 @@ def test_audit_sql_matches_current_verifier():
     storage = bulk._storage()
     replace = staged._previous("20261019010000_custom_import_build_continuation")._replace
     resource = audit._sql_resource()[0]
-    body = ranges._body("audit_template")
+    successor = _aggregate_migration()
+    body = successor._bodies("audit_template")[1]
     for index, query in enumerate(arms._queries(staged)):
+        if index == 18:
+            assert query == successor._PREVIOUS_QUERY
+            query = successor._UPDATED_QUERY
         if (
             len(arms._LABELS[0]) <= index < 60
             and "WITH violations(failure_code,row_identity) AS MATERIALIZED (" not in query
@@ -85,6 +392,7 @@ async def _ready(case, monkeypatch):
     assert await manual._step(case, request, build_id) == "complete"
     sealed = await manual.output.build_output(case.sessions, request, build_id)
     async with case.engine.begin() as connection:
+        await connection.run_sync(_refresh_aggregate, case.schema_name)
         await connection.execute(text("SELECT pg_stat_force_next_flush()"))
     return request, build_id, sealed, await scratch._family(case, request)
 

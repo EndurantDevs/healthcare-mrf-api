@@ -357,3 +357,31 @@ def test_audit_sql_matches_current_verifier():
     )
 
     verify()
+
+
+async def test_child_reference_aggregate_preserves_null_and_duplicate_witnesses():
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_child_reference_aggregate_preserves_null_and_duplicate_witnesses as verify,
+    )
+
+    await verify()
+
+
+async def test_child_reference_refresh_preserves_metadata_and_exact_rollback(
+    monkeypatch,
+):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_child_reference_refresh_preserves_metadata_and_exact_rollback as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_child_reference_changed_sql_refuses_eighteen_checkpoint_prefix(
+    monkeypatch,
+):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_child_reference_changed_sql_refuses_eighteen_checkpoint_prefix as verify,
+    )
+
+    await verify(monkeypatch)

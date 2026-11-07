@@ -102,6 +102,7 @@ _SEALED_APPEND_UPGRADE_TAIL = (
     "20261102030000_custom_import_build_scratch",
     "20261102040000_custom_import_post_seal_audit",
     "20261104010000_custom_import_unlogged_landing",
+    "20261107010000_custom_import_child_reference_aggregate",
 )
 
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
@@ -278,7 +279,7 @@ def _assert_custom_import_manual_acceptance_lineage(script):
 
 def _assert_finality_migration_chain(script):
     """Keep the exact accepted migration head and predecessor assertions."""
-    assert script.get_heads() == ["20261104010000_custom_import_unlogged_landing"]
+    assert script.get_heads() == ["20261107010000_custom_import_child_reference_aggregate"]
     assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
     )
