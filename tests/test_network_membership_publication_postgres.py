@@ -15,6 +15,7 @@ from process.network_address_projection import project_network_address_arrays
 from process.network_membership_candidate_indexes import prepare_network_candidate_indexes
 from process.network_membership_candidate_lifecycle import _create_raw_membership
 from process.network_membership_publication import NetworkPublicationError, publish_network_candidate
+from process.network_membership_serving_indexes import _build_serving_indexes, _index_digest, _serving_plan
 from process.network_membership_validation import validate_network_membership_candidate
 from process.network_membership_writer_closure import freeze_network_candidate_writers
 from process.network_serving_reactivation import (
@@ -25,6 +26,7 @@ from process.network_serving_reactivation import (
 from process.network_serving_read import resolve_network_serving_manifest
 from tests.test_network_address_projection_postgres import projection_db
 from tests.test_network_membership_candidate_indexes_postgres import indexed_db
+from tests.test_network_membership_serving_indexes_postgres import _full_source, _more_source_rows
 from tests.test_network_membership_validation_postgres import validation_db
 from tests.test_network_serving_schema_postgres import serving_schema
 
@@ -48,7 +50,19 @@ async def publication_db(indexed_db):
 
 
 async def _synthetic_serving_receipt(fixture):
-    """Stand in for the separately owned trusted full compatibility gate."""
+    """Keep component accounting while building the genuine required search paths."""
+    await fixture.connection.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+    await fixture.connection.execute("CREATE EXTENSION IF NOT EXISTS btree_gin")
+    await fixture.connection.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
+    await _full_source(fixture)
+    await _full_source(fixture, source_table=f'"{fixture.copy_target.schema_name}".entity_address_unified')
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.copy_target.schema_name}".entity_address_unified projected '
+        f"SET address_key=source.address_key,premise_key=source.premise_key "
+        f'FROM "{fixture.control_schema}".retained_addresses source WHERE source.location_key=projected.location_key'
+    )
+    plan = _serving_plan(fixture.copy_target.schema_name)
+    await _build_serving_indexes(fixture.connection, fixture.copy_target.schema_name, plan)
     report = json.loads(
         await fixture.connection.fetchval(
             f'SELECT validation_json FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
@@ -61,7 +75,7 @@ async def _synthetic_serving_receipt(fixture):
         "ready": True,
         "index_profile": "serving",
         "scope": report["candidate_readiness"]["scope"],
-        "index_definition_sha256": "b" * 64,
+        "index_definition_sha256": await _index_digest(fixture.connection, fixture.copy_target.schema_name, plan),
     }
     await _write_report(fixture, report)
 
@@ -566,9 +580,7 @@ async def test_projection_row_count_does_not_add_publication_queries(publication
         first_manifest = await _publish(fixture)
         await asyncio.sleep(0)
         baseline_queries = [entry.query for entry in logged_queries]
-    await fixture.connection.execute(f"""INSERT INTO "{fixture.control_schema}".retained_addresses
-        SELECT lpad(to_hex(sequence_id),64,'0'),'npi','extra-'||sequence_id,'synthetic address','{{42}}'::int[],'{{999}}'::int[]
-        FROM generate_series(1,20000) sequence_id""")
+    await _more_source_rows(fixture, 20000)
     successor = await _second_candidate(fixture, expected_head=first_manifest["generation_id"])
     async with fixture.connection.transaction():
         await asyncio.sleep(0)

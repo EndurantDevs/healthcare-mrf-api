@@ -52,7 +52,17 @@ async def _native_owner(fixture, roles_by_kind, created_namespaces, created_role
         roles_by_kind["owner"] = retained_owner
 
 
+async def _prepare_search_indexes(connection, schema):
+    """Build the real serving profile before synthetic address authority is captured."""
+    from process.network_membership_serving_indexes import _build_serving_indexes, _serving_plan
+
+    for extension in ("postgis", "intarray", "btree_gin", "btree_gist"):
+        await connection.execute("CREATE EXTENSION IF NOT EXISTS " + extension)
+    await _build_serving_indexes(connection, schema, _serving_plan(schema))
+
+
 async def _native_storage(fixture, schema, roles_by_kind, created_namespaces, created_roles, office_setup=None):
+    """Capture synthetic retained address authority only after its search profile exists."""
     assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", schema) is None
     await _native_owner(fixture, roles_by_kind, created_namespaces, created_roles)
     await _create_alias_probe_schema(fixture.connection, schema, "source_office_" + uuid4().hex)
@@ -82,6 +92,7 @@ async def _native_storage(fixture, schema, roles_by_kind, created_namespaces, cr
     )
     if office_setup is not None:
         await office_setup(fixture.connection, schema)
+    await _prepare_search_indexes(fixture.connection, schema)
     for statement in aliases.generation_guard_statements(schema):
         await fixture.connection.execute(statement)
     for name in aliases.GUARDS:

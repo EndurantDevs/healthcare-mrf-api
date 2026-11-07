@@ -17,9 +17,12 @@ from process.custom_import.cli import _receipt_only_database_output, _set_engine
 from process.network_address_projection import _identifier
 from process.network_catalog_store import (
     MAX_CATALOG_BYTES,
+    ExistingPlanTierCatalogDraftRow,
     NetworkCatalogDraftRow,
+    NetworkCatalogPreimage,
     NetworkCatalogSeedError,
     NetworkCatalogSourceContext,
+    _prepare_plan_tier_rows,
     seed_network_catalog_drafts,
 )
 from process.network_legacy_alias_adoption import (
@@ -35,6 +38,30 @@ from process.registry_record_store import RegistryActor, _bounded_text, _validat
 from process.registry_source_import import _disconnect_database, _error_json, _ReceiptArgumentParser
 
 _ALIAS_FIELDS = {"source_system", "source_id", "scope_key", "evidence_id", "legacy_uuid", "reviewed_network_id"}
+_PLAN_TIER_FIELDS = {
+    "network_id",
+    "allocation_key",
+    "endpoint_id",
+    "network_key_id",
+    "evidence_id",
+    "display_name",
+    "aliases",
+}
+
+
+def _typed_input(catalog_rows, source_context):
+    rows = []
+    for row in catalog_rows:
+        if type(row) is not dict or set(row) != _PLAN_TIER_FIELDS:
+            raise ValueError("Network catalog typed row fields are invalid")
+        if type(row["allocation_key"]) is not str:
+            raise ValueError("Network catalog typed allocation key is invalid")
+        key = UUID(row["allocation_key"])
+        if str(key) != row["allocation_key"]:
+            raise ValueError("Network catalog typed allocation key is invalid")
+        rows.append(ExistingPlanTierCatalogDraftRow(**{**row, "allocation_key": key}))
+    _prepare_plan_tier_rows(rows, source_context)
+    return rows
 
 
 def _prepare_input(catalog_rows, actor, source_context):
@@ -48,6 +75,8 @@ def _prepare_input(catalog_rows, actor, source_context):
         raise ValueError("Network catalog requires a platform administrator source operator")
     _bounded_text(source_context.reason, 1000, "reason")
     _bounded_text(source_context.idempotency_key, 115, "idempotency_key")
+    if source_context.expected_preimage is not None:
+        return _typed_input(catalog_rows, source_context)
     prepared_rows = []
     for catalog_row in catalog_rows:
         if type(catalog_row) is not dict or set(catalog_row) != _ALIAS_FIELDS | {"display_name", "aliases"}:
@@ -85,6 +114,16 @@ async def import_network_catalog(session, catalog_rows, actor, source_context, *
             )
             if control is None:
                 raise NetworkCatalogSeedError("Network catalog revision control is missing")
+            if source_context.expected_preimage is not None:
+                return await seed_network_catalog_drafts(
+                    connection,
+                    prepared_rows,
+                    actor,
+                    source_context,
+                    api_role=api_role,
+                    owner_role=owner_role,
+                    control_schema=control_schema,
+                )
             adopted_aliases = await adopt_legacy_network_aliases(
                 session, [alias for alias, _fields in prepared_rows], schema=control_schema
             )
@@ -115,6 +154,7 @@ def _parser():
     parser = _ReceiptArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--input-file", type=Path, required=True)
     parser.add_argument("--actor-user-id", type=UUID, required=True)
+    parser.add_argument("--identity-kind", choices=("legacy", "existing-plan-tier"), default="legacy")
     for field in (
         "input-sha256",
         "source-system",
@@ -147,10 +187,18 @@ def _read_input(parsed):
         raise ValueError("Network catalog input exceeds byte limit")
     if hashlib.sha256(input_bytes).hexdigest() != parsed.input_sha256:
         raise ValueError("Network catalog input digest differs")
-    catalog_rows = json.loads(input_bytes, object_pairs_hook=_unique_fields)
+    document = json.loads(input_bytes, object_pairs_hook=_unique_fields)
+    expected = None
+    if parsed.identity_kind == "existing-plan-tier":
+        if type(document) is not dict or set(document) != {"expected_preimage", "rows"}:
+            raise ValueError("Network catalog typed input fields are invalid")
+        expected = NetworkCatalogPreimage(**document["expected_preimage"])
+        catalog_rows = document["rows"]
+    else:
+        catalog_rows = document
     actor = RegistryActor("platform_admin", parsed.actor_user_id, parsed.actor_client_id)
     source_context = NetworkCatalogSourceContext(
-        parsed.source_system, parsed.source_id, parsed.alias_scope, parsed.reason, parsed.idempotency_key
+        parsed.source_system, parsed.source_id, parsed.alias_scope, parsed.reason, parsed.idempotency_key, expected
     )
     _prepare_input(catalog_rows, actor, source_context)
     return catalog_rows, actor, source_context

@@ -61,8 +61,8 @@ async def _more_source_rows(fixture, row_count):
     )
 
 
-async def _full_source(fixture):
-    source_table = f'"{fixture.control_schema}".retained_addresses'
+async def _full_source(fixture, *, source_table=None):
+    source_table = source_table or f'"{fixture.control_schema}".retained_addresses'
     existing_columns = await fixture.connection.fetch(
         "SELECT attname FROM pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped",
         source_table,
@@ -78,7 +78,8 @@ async def _full_source(fixture):
         additions.append("ADD COLUMN " + str(CreateColumn(fixture_column).compile(dialect=postgresql.dialect())))
         if not model_column.nullable:
             constraints.append(f'ALTER COLUMN "{model_column.name}" SET NOT NULL')
-    await fixture.connection.execute(f"ALTER TABLE {source_table} " + ",".join(additions))
+    if additions:
+        await fixture.connection.execute(f"ALTER TABLE {source_table} " + ",".join(additions))
     await fixture.connection.execute(
         f"""UPDATE {source_table} SET checksum=42,type='primary',
         npi=CASE entity_id WHEN 'provider-a' THEN 1111111111 WHEN 'provider-b' THEN 2222222222 ELSE 3333333333 END,
@@ -89,7 +90,8 @@ async def _full_source(fixture):
         uuid4(),
         uuid4(),
     )
-    await fixture.connection.execute(f"ALTER TABLE {source_table} " + ",".join(constraints))
+    if constraints:
+        await fixture.connection.execute(f"ALTER TABLE {source_table} " + ",".join(constraints))
 
 
 async def _prepare(fixture, **changes):

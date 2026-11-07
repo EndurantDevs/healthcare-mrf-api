@@ -91,6 +91,15 @@ async def prepare_compact_network_readiness(
     report, slices = await _validated_slices(
         connection, copy_target, address_source, candidate, control_schema, offices
     )
+    if offices.custom is not None:
+        from process.network_membership_serving_indexes import (
+            _build_serving_indexes,
+            _require_address_search_indexes,
+            _serving_plan,
+        )
+
+        await _build_serving_indexes(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
+        await _require_address_search_indexes(connection, offices.custom)
     scope = _scope_report(candidate, address_source)
     canonical_readiness_by_field = _slice_readiness(scope, report, slices)
     serving_readiness_by_field = {

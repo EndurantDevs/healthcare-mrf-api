@@ -337,6 +337,11 @@ async def _publish_candidate(connection, copy_target, namespace, source_rollback
     )
     if predecessor is not None and custody is None:
         raise NetworkPublicationError("FHIR serving preservation requires independent candidate custody")
+    from process.network_membership_serving_indexes import verify_network_search_indexes
+
+    await verify_network_search_indexes(
+        connection, candidate, compact_layout=custody.get("compact_layout") if custody is not None else None
+    )
     return await _insert_manifest(connection, namespace, candidate, readiness)
 
 

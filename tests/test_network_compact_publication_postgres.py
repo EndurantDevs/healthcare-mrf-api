@@ -38,6 +38,8 @@ from tests.test_network_serving_schema_postgres import serving_schema
 
 
 async def _full_two_offices(connection, roles, original):
+    from process.network_membership_serving_indexes import _build_serving_indexes, _serving_plan
+
     schema = await original(connection, roles)
     table = f'"{schema}".entity_address_unified'
     await connection.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS postal_address")
@@ -59,6 +61,9 @@ async def _full_two_offices(connection, roles, original):
         + f" FROM {table} original WHERE location_key='old-office'",
         uuid4(),
     )
+    for extension in ("intarray", "btree_gin", "btree_gist"):
+        await connection.execute("CREATE EXTENSION IF NOT EXISTS " + extension)
+    await _build_serving_indexes(connection, schema, _serving_plan(schema))
     return schema
 
 

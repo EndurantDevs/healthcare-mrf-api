@@ -27,7 +27,7 @@ class NetworkCandidateIndexesError(ValueError):
     """Candidate canonical readiness failed without advancing its control state."""
 
 
-async def _catalog_readiness(connection, schema_name):
+async def _catalog_readiness(connection, schema_name, *, table_name="entity_address_unified", canonical=True):
     index_state = await connection.fetchrow(
         """
         SELECT c.relkind='r' AND canonical.atttypid='integer[]'::regtype AND canonical.attnotnull
@@ -57,14 +57,18 @@ async def _catalog_readiness(connection, schema_name):
             AND canonical.attnum>0 AND NOT canonical.attisdropped
         LEFT JOIN pg_attribute location ON location.attrelid=c.oid AND location.attname='location_key'
             AND location.attnum>0 AND NOT location.attisdropped
-        WHERE namespace.nspname=$1 AND c.relname='entity_address_unified'
+        WHERE namespace.nspname=$1 AND c.relname=$2
     """,
         schema_name,
+        table_name,
     )
-    if index_state is None or not all(
-        index_state[field] is True for field in ("has_canonical_column", "has_location_pk", "has_canonical_gin")
-    ):
-        raise NetworkCandidateIndexesError("Candidate column, primary key or native canonical GIN is not ready")
+    required = ("has_canonical_column", "has_location_pk", "has_canonical_gin") if canonical else ("has_location_pk",)
+    if index_state is None or not all(index_state[field] is True for field in required):
+        raise NetworkCandidateIndexesError(
+            "Candidate column, primary key or native canonical GIN is not ready"
+            if canonical
+            else "Candidate native location primary key is not ready"
+        )
     return dict(index_state)
 
 
