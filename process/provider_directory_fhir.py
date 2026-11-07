@@ -1506,6 +1506,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         christus.API_BASE,
         "https://api.capitalbluecrossfhir.com/r4/public-ma",
         "https://api.capitalbluecrossfhir.com/r4/public-chip",
+        "https://api-bcbsal-prd.safhir.io/v1/api/provider-directory",
         FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE,
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
@@ -40953,7 +40954,7 @@ async def _fetch_json_with_source_session(
     *,
     timeout: int,
     allow_redirects: bool = True,
-    preserve_url_bytes: bool = False,
+    preserve_url_bytes: bool = True,
     proxy_options: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
     allow_gzip: bool = False,
@@ -57543,27 +57544,7 @@ def _source_resource_fetch_order(
     requested_resources: list[str],
 ) -> list[str]:
     """Return the requested resources in the order appropriate for one source."""
-    priority = _source_metadata(source).get("provider_directory_resource_fetch_order")
-    if priority is not None:
-        if (
-            not isinstance(priority, list)
-            or any(not isinstance(item, str) or item not in DEFAULT_RESOURCES for item in priority)
-            or len(set(priority)) != len(priority)
-        ):
-            raise ValueError("provider_directory_resource_fetch_order_invalid")
-        return [item for item in priority if item in requested_resources] + [
-            item for item in requested_resources if item not in priority
-        ]
-    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
-    if api_base != CIGNA_PROVIDER_DIRECTORY_BASE:
-        return list(requested_resources)
-    foundational_resources = [
-        resource_type for resource_type in requested_resources if resource_type != "PractitionerRole"
-    ]
-    practitioner_role_resources = [
-        resource_type for resource_type in requested_resources if resource_type == "PractitionerRole"
-    ]
-    return foundational_resources + practitioner_role_resources
+    return bulk_parallel.resource_fetch_order(sys.modules[__name__], source, requested_resources)
 
 
 def _has_parallel_resource_transport(

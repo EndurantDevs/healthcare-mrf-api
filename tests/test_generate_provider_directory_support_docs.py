@@ -95,11 +95,11 @@ def test_rendered_inventory_summary_and_access_requirements():
     rendered_document = generator.render_markdown(manifest)
 
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 34 |" in rendered_document
+    assert "| Acquisition-configured | 35 |" in rendered_document
     assert "| Externally supported | 0 |" in rendered_document
     assert "| Probe-only | 13 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
-    assert "| Total tracked | 50 |" in rendered_document
+    assert "| Total tracked | 51 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
     assert (
         "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required"

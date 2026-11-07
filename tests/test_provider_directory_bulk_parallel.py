@@ -258,3 +258,14 @@ async def test_timeout_preserves_primary_error_and_releases_transfer_slot():
             pytest.fail("timed out transport returned a response")
     assert parallel.state(directory, source_by_field)["requests"].active == 0
     assert parallel.state(directory, source_by_field)["requests"].limit == 4
+
+
+@pytest.mark.parametrize("base", [directory.CIGNA_PROVIDER_DIRECTORY_BASE, "https://example.test/fhir"])
+def test_configured_order_keeps_existing_priority_contract(base):
+    source_by_field = {
+        "api_base": base,
+        "metadata_json": {"provider_directory_resource_fetch_order": ["PractitionerRole", "Organization"]},
+    }
+    assert directory._source_resource_fetch_order(
+        source_by_field, ["Organization", "PractitionerRole", "PractitionerRole", "Location"]
+    ) == ["PractitionerRole", "Organization", "Location"]
