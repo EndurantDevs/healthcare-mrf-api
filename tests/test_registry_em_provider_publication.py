@@ -16,6 +16,7 @@ import pytest
 from process import network_em_provider_inputs as provider
 from process import network_membership_pipeline as pipeline
 from process import network_membership_publication as publication
+from process import network_membership_serving_indexes as serving_indexes
 from process import network_membership_validation as validation
 from process import network_serving_reactivation as reactivation
 from process import network_serving_read as serving
@@ -33,6 +34,14 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture(autouse=True)
 def legacy_custody_lookup(monkeypatch):
     monkeypatch.setattr(publication, "verify_network_candidate_custody", AsyncMock(return_value=None))
+
+
+@pytest.fixture(autouse=True)
+def search_index_gate(monkeypatch):
+    """Model native readiness separately from these synthetic custody/CAS protocols."""
+    verify = AsyncMock()
+    monkeypatch.setattr(serving_indexes, "verify_network_search_indexes", verify)
+    return verify
 
 
 def _candidate(state="ready"):
@@ -194,10 +203,11 @@ async def test_managed_native_guard_requires_existing_rr_before_catalog_reads():
 
 @pytest.mark.parametrize("state", ["ready", "published"])
 @pytest.mark.parametrize("stale", [False, True])
-async def test_actual_publication_gate_precedes_insert_or_retained_replay(monkeypatch, state, stale):
+async def test_actual_publication_gate_precedes_insert_or_retained_replay(monkeypatch, state, stale, search_index_gate):
     candidate, copy_target, receipt = _candidate(state)
     conn = _connection()
     events = []
+    search_index_gate.side_effect = lambda *args, **kwargs: events.append("search_indexes")
     monkeypatch.setattr(publication, "_lock_publication_controls", AsyncMock(return_value=(2, 16)))
     monkeypatch.setattr(publication, "_locked_candidate", AsyncMock(return_value=candidate))
     monkeypatch.setattr(publication, "_publication_readiness", lambda _candidate: ({}, {}, {}, _closure()))
@@ -230,12 +240,13 @@ async def test_actual_publication_gate_precedes_insert_or_retained_replay(monkey
         assert (await publication._publish_candidate(conn, copy_target, '"registry"'))["replayed"] == (
             state == "published"
         )
-        assert events == ["custody", "replay" if state == "published" else "publish"]
+        assert events == (["custody", "replay"] if state == "published" else ["custody", "search_indexes", "publish"])
     if not stale and state == "ready":
         resolve_predecessor.assert_awaited_once_with(conn, generation_id=16, control_schema="registry")
     else:
         resolve_predecessor.assert_not_awaited()
     conn.execute.assert_not_awaited()
+    assert search_index_gate.await_count == int(not stale and state == "ready")
 
 
 async def test_phase_owned_publication_starts_rr_before_control_locks(monkeypatch):
@@ -280,7 +291,7 @@ async def test_pipeline_retained_replay_checks_custody_before_serving_reads(monk
 
 @pytest.mark.parametrize("head", [16, 17])
 @pytest.mark.parametrize("stale", [False, True])
-async def test_reactivation_checks_custody_before_cas_even_on_noop(monkeypatch, head, stale):
+async def test_reactivation_checks_custody_before_cas_even_on_noop(monkeypatch, head, stale, search_index_gate):
     candidate, _, receipt = _candidate("published")
     conn = _connection()
     conn.fetchrow.return_value = candidate
@@ -292,6 +303,12 @@ async def test_reactivation_checks_custody_before_cas_even_on_noop(monkeypatch, 
     monkeypatch.setattr(reactivation, "_publication_readiness", lambda *args: ({}, {}, {}, _closure()))
     native = AsyncMock(return_value=receipt, side_effect=ValueError("stale") if stale else None)
     monkeypatch.setattr(provider, "prepare_em_provider_inputs", native)
+
+    def before_cas(*args, **kwargs):
+        native.assert_awaited_once()
+        conn.execute.assert_not_awaited()
+
+    search_index_gate.side_effect = before_cas
     if stale:
         with pytest.raises(ValueError):
             await reactivation._reactivate(conn, '"registry"', 17, head, 2)
@@ -301,6 +318,7 @@ async def test_reactivation_checks_custody_before_cas_even_on_noop(monkeypatch, 
         assert result.changed == (head != 17)
         assert conn.execute.await_count == int(head != 17)
     native.assert_awaited_once()
+    assert search_index_gate.await_count == int(not stale and head != 17)
 
 
 async def test_trusted_refresh_requires_explicit_family_and_replaces_inherited_pin(monkeypatch):
@@ -387,7 +405,9 @@ def _seal():
 
 @pytest.mark.parametrize("state", ["ready", "published"])
 @pytest.mark.parametrize("changed", [False, True])
-async def test_protected_seal_gates_publication_without_final_owner_assumption(monkeypatch, state, changed):
+async def test_protected_seal_gates_publication_without_final_owner_assumption(
+    monkeypatch, state, changed, search_index_gate
+):
     candidate, copy_target, _ = _candidate(state)
     conn = _connection()
     native = AsyncMock(return_value=_seal(), side_effect=ValueError("changed protected seal") if changed else None)
@@ -421,6 +441,7 @@ async def test_protected_seal_gates_publication_without_final_owner_assumption(m
     native.assert_awaited_once_with(conn, copy_target, control_schema="registry", required=False)
     old_native.assert_not_awaited()
     conn.execute.assert_not_awaited()
+    assert search_index_gate.await_count == int(not changed and state == "ready")
 
 
 @pytest.mark.parametrize("failure", [None, ValueError("seal refused"), asyncio.CancelledError()])

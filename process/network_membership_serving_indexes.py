@@ -13,6 +13,7 @@ from process.network_membership_candidate_indexes import _catalog_readiness, _pr
 from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_validation import (
+    _json_object,
     _native_accounting,
     _scope_report,
     _validated_replay,
@@ -189,6 +190,63 @@ async def _index_digest(connection, schema_name, index_plan):
     return hashlib.sha256(
         json.dumps(definitions, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
+
+
+async def _require_address_search_indexes(connection, relation, *, canonical=False, compact_base=False):
+    """Check the exact searched heap without building or changing retained objects."""
+    from process.entity_address_unified import _required_geo_taxonomy_stage_index_sql
+
+    if not compact_base and relation.table_name != "entity_address_unified":
+        raise NetworkServingIndexesError("Search address relation differs")
+    table = f"{_identifier(relation.schema_name)}.{_identifier(relation.table_name)}"
+    await connection.execute(f"LOCK TABLE ONLY {table} IN ACCESS SHARE MODE NOWAIT")
+    if await connection.fetchval("SELECT to_regclass($1)::oid::bigint", table) != relation.table_oid:
+        raise NetworkServingIndexesError("Search address table identity differs")
+    if canonical or compact_base:
+        await _catalog_readiness(connection, relation.schema_name, table_name=relation.table_name, canonical=canonical)
+    digest = (
+        None
+        if compact_base
+        else await _index_digest(connection, relation.schema_name, _serving_plan(relation.schema_name))
+    )
+    if (
+        await connection.fetchval(
+            _required_geo_taxonomy_stage_index_sql(
+                relation.schema_name,
+                relation.table_name,
+                **({"table_oid": relation.table_oid} if compact_base else {}),
+            )
+        )
+        is not True
+    ):
+        raise NetworkServingIndexesError("Search address geo and taxonomy indexes are not ready")
+    return digest
+
+
+async def verify_network_search_indexes(connection, candidate, *, compact_layout=None):
+    """Require native search paths before a new head; retained reads stay compatible."""
+    from process.network_compact_layout import CompactAddressRelation, CompactNetworkLayout
+    from process.network_compact_readiness import compact_index_digest, is_compact_candidate
+
+    if not connection.is_in_transaction():
+        raise NetworkServingIndexesError("Search readiness requires a caller-owned transaction")
+    report = _json_object(candidate["validation_json"])
+    if is_compact_candidate(candidate):
+        if type(compact_layout) is not CompactNetworkLayout:
+            raise NetworkServingIndexesError("Verified compact search layout is required")
+        await _require_address_search_indexes(connection, compact_layout.base, compact_base=True)
+        if compact_layout.custom is not None:
+            await _require_address_search_indexes(connection, compact_layout.custom)
+        digest = await compact_index_digest(connection, candidate["schema_name"], candidate=candidate)
+    else:
+        relation = CompactAddressRelation(
+            candidate["schema_name"],
+            "entity_address_unified",
+            report["writer_closure"]["relation_oids"]["entity_address_unified"],
+        )
+        digest = await _require_address_search_indexes(connection, relation, canonical=True)
+    if digest != report["serving_readiness"]["index_definition_sha256"]:
+        raise NetworkServingIndexesError("Search index definitions differ from retained readiness")
 
 
 async def _prepare_serving(connection, copy_target, address_source, control_schema):

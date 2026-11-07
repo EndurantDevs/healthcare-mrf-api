@@ -60,6 +60,9 @@ async def _reactivate(connection, namespace, generation_id, expected_head, expec
     await _verify_provider_custody(connection, dict(retained), readiness[3])
     has_changed = current_head != generation_id
     if has_changed:
+        from process.network_membership_serving_indexes import verify_network_search_indexes
+
+        await verify_network_search_indexes(connection, dict(retained), compact_layout=manifest.compact_layout)
         status = await connection.execute(
             f"UPDATE {namespace}.network_serving_control SET generation_id=$1 WHERE id=1 AND generation_id=$2",
             generation_id,

@@ -284,9 +284,23 @@ async def _assert_revoked_execution_unchanged(fixture, lease, before, history_co
     assert status["state"] == "running" and status["result"] is None
 
 
+async def _assert_control_locks_absent(fixture):
+    """Fresh request authority precedes revision and serving control locks."""
+    assert (
+        await fixture.observer.fetchval(
+            "SELECT count(*) FROM pg_locks WHERE pid=$1 AND granted AND mode<>'AccessShareLock' "
+            "AND relation IN (to_regclass($2),to_regclass($3))",
+            fixture.connection.get_server_pid(),
+            f'"{fixture.control_schema}".registry_revision_control',
+            f'"{fixture.control_schema}".network_serving_control',
+        )
+        == 0
+    )
+
+
 async def _revoke_while_request_locked(fixture, lease, phase, table_name="registry_publication_request"):
     """Release the actual native row fence only after trusted authority is revoked."""
-    checked = asyncio.Event()
+    checked, rollback_done = asyncio.Event(), asyncio.Event()
     calls = []
     is_revoked = False
 
@@ -294,16 +308,8 @@ async def _revoke_while_request_locked(fixture, lease, phase, table_name="regist
         """Model trusted live authority changing while PostgreSQL fences the request."""
         checked.set()
         if is_revoked and table_name == "registry_publication_request":
-            assert (
-                await fixture.observer.fetchval(
-                    "SELECT count(*) FROM pg_locks WHERE pid=$1 AND granted AND mode<>'AccessShareLock' "
-                    "AND relation IN (to_regclass($2),to_regclass($3))",
-                    fixture.connection.get_server_pid(),
-                    f'"{fixture.control_schema}".registry_revision_control',
-                    f'"{fixture.control_schema}".network_serving_control',
-                )
-                == 0
-            )
+            await rollback_done.wait()
+            await _assert_control_locks_absent(fixture)
         return await _authority(calls, denied=is_revoked)(**request_by_name)
 
     blocker = fixture.observer.transaction()
@@ -334,6 +340,7 @@ async def _revoke_while_request_locked(fixture, lease, phase, table_name="regist
         await _wait_for_request_lock(fixture, pending)
         is_revoked = True
         await blocker.rollback()
+        rollback_done.set()
         with pytest.raises(PermissionError, match="registry_publication_denied"):
             await asyncio.wait_for(pending, 5)
     finally:
@@ -361,6 +368,39 @@ async def test_revocation_during_request_lock_preserves_state(pipeline_db, servi
     )
     await _revoke_while_request_locked(fixture, lease, phase)
     await _assert_revoked_execution_unchanged(fixture, lease, before, history_count)
+
+
+@pytest.mark.parametrize("phase", ["approval", "publication"])
+async def test_revocation_waits_for_rollback_ack(pipeline_db, serving_schema, phase):
+    """A released server lock does not make its observer connection available yet."""
+    fixture = pipeline_db
+    observer = fixture.observer
+    transaction = observer.transaction()
+    rollback_pending = asyncio.Event()
+
+    async def rollback():
+        rollback_pending.set()
+        try:
+            await transaction.rollback()
+            await asyncio.sleep(0.01)
+        finally:
+            rollback_pending.clear()
+
+    async def fetchval(*args, **kwargs):
+        assert not rollback_pending.is_set(), "observer query preceded rollback acknowledgement"
+        return await observer.fetchval(*args, **kwargs)
+
+    fixture.observer = SimpleNamespace(
+        transaction=lambda: SimpleNamespace(start=transaction.start, rollback=rollback),
+        fetchrow=observer.fetchrow,
+        fetchval=fetchval,
+        get_server_pid=observer.get_server_pid,
+        is_in_transaction=observer.is_in_transaction,
+    )
+    try:
+        await test_revocation_during_request_lock_preserves_state(fixture, serving_schema, phase)
+    finally:
+        fixture.observer = observer
 
 
 @pytest.mark.parametrize(
