@@ -6,6 +6,7 @@ import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -283,7 +284,7 @@ async def _publish_unsealed_legacy(fixture):
 
 
 @pytest.fixture
-async def indexed_db(bootstrap_db, serving_schema, request):
+async def indexed_db(bootstrap_db, serving_schema, request, monkeypatch):
     """Own an authenticated bootstrap, unsealed indexed predecessor and sealed compact head."""
     parent = bootstrap_db
     connection, control_schema, engine = serving_schema
@@ -319,7 +320,12 @@ async def indexed_db(bootstrap_db, serving_schema, request):
         )
         await _prepare(fixture, fixture.current)
         await _seal(fixture, fixture.current)
-        await _publish(fixture, fixture.current)
+        from process import network_membership_serving_indexes
+
+        # Retain the historical unindexed head; every tested successor uses the new gate.
+        with monkeypatch.context() as historical:
+            historical.setattr(network_membership_serving_indexes, "verify_network_search_indexes", AsyncMock())
+            await _publish(fixture, fixture.current)
         fixture.previous, fixture.previous_rows = await _read(fixture)
         yield fixture
 

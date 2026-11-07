@@ -1289,58 +1289,16 @@ async def _run_stage_index_statements(
             raise index_result
 
 
-def _required_geo_taxonomy_stage_index_sql(db_schema: str, stage_table: str) -> str:
-    required_index = _stage_index_name(stage_table, "geo_taxonomy")
-    geo_index = _stage_index_name(stage_table, "geo_idx")
-    return f"""
-    SELECT EXISTS (
-        SELECT 1
-          FROM pg_catalog.pg_index AS required_meta
-          JOIN pg_catalog.pg_class AS required_index
-            ON required_index.oid = required_meta.indexrelid
-          JOIN pg_catalog.pg_namespace AS index_namespace
-            ON index_namespace.oid = required_index.relnamespace
-          JOIN pg_catalog.pg_class AS stage_table
-            ON stage_table.oid = required_meta.indrelid
-          JOIN pg_catalog.pg_namespace AS table_namespace
-            ON table_namespace.oid = stage_table.relnamespace
-          JOIN pg_catalog.pg_am AS access_method
-            ON access_method.oid = required_index.relam
-          JOIN pg_catalog.pg_class AS geo_index
-            ON geo_index.relnamespace = required_index.relnamespace
-           AND geo_index.relname = {_sql_literal(geo_index)}
-          JOIN pg_catalog.pg_index AS geo_meta
-            ON geo_meta.indexrelid = geo_index.oid
-           AND geo_meta.indrelid = required_meta.indrelid
-         WHERE index_namespace.nspname = {_sql_literal(db_schema)}
-           AND table_namespace.nspname = {_sql_literal(db_schema)}
-           AND stage_table.relname = {_sql_literal(stage_table)}
-           AND required_index.relname = {_sql_literal(required_index)}
-           AND required_meta.indisvalid IS TRUE
-           AND required_meta.indisready IS TRUE
-           AND required_meta.indislive IS TRUE
-           AND required_meta.indisunique IS FALSE
-           AND required_meta.indnkeyatts = 2
-           AND required_meta.indnatts = 2
-           AND access_method.amname = 'gist'
-           AND geo_meta.indisvalid IS TRUE
-           AND geo_meta.indisready IS TRUE
-           AND geo_meta.indislive IS TRUE
-           AND pg_get_indexdef(required_meta.indexrelid, 1, TRUE)
-               = pg_get_indexdef(geo_meta.indexrelid, 1, TRUE)
-           AND pg_get_indexdef(required_meta.indexrelid, 2, TRUE) = 'taxonomy_array'
-           AND pg_get_expr(required_meta.indpred, required_meta.indrelid)
-               = pg_get_expr(geo_meta.indpred, geo_meta.indrelid)
-           AND (
-                SELECT array_agg(opclass.opcname::text ORDER BY key.position)
-                  FROM unnest(required_meta.indclass)
-                       WITH ORDINALITY AS key(opclass_oid, position)
-                  JOIN pg_catalog.pg_opclass AS opclass
-                    ON opclass.oid = key.opclass_oid
-                 WHERE key.position <= required_meta.indnkeyatts
-               ) = ARRAY['gist_geography_ops', 'gist__intbig_ops']::text[]
-    );
-    """
+def _required_geo_taxonomy_stage_index_sql(db_schema: str, stage_table: str, *, table_oid: int | None = None) -> str:
+    from process.entity_address_search_index_sql import required_geo_taxonomy_index_sql
+
+    return required_geo_taxonomy_index_sql(
+        _sql_literal(db_schema),
+        _sql_literal(stage_table),
+        _sql_literal(_stage_index_name(stage_table, "geo_taxonomy")),
+        _sql_literal(_stage_index_name(stage_table, "geo_idx")),
+        table_oid=table_oid,
+    )
 
 
 async def _require_geo_taxonomy_stage_index(

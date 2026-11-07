@@ -263,22 +263,27 @@ async def _parent(connection, schema_name, table_name, expected_oid):
 
 
 async def _catalog(connection, schema_name):
+    from process.network_membership_serving_indexes import _serving_plan
+
     namespace = await connection.fetchrow(
         "SELECT oid::bigint,nspowner::bigint FROM pg_namespace WHERE nspname=$1", schema_name
     )
     if namespace is None:
         raise NetworkBootstrapSourceError("Retained bootstrap namespace is absent")
+    legacy_objects = {"entity_address_unified", "npi", "entity_address_unified_pkey", "npi_pkey"}
+    indexed_objects = legacy_objects | {name for name, _ in _serving_plan(schema_name)}
     relations = await connection.fetch(
         """SELECT c.oid::bigint,c.relname,c.relowner::bigint,c.relkind,
       c.relpersistence,c.relrowsecurity,c.relforcerowsecurity,c.relhastriggers,i.indrelid::bigint,
-      i.indisvalid,i.indisready FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid
-      WHERE c.relnamespace=$1::oid ORDER BY c.relname LIMIT 9""",
+      i.indisvalid,i.indisready,i.indislive FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid
+      WHERE c.relnamespace=$1::oid ORDER BY c.relname LIMIT $2""",
         namespace["oid"],
+        len(indexed_objects) + 1,
     )
     heap_oids_by_name = {relation["relname"]: relation["oid"] for relation in relations if relation["relkind"] == b"r"}
     if (
         set(heap_oids_by_name) != {"entity_address_unified", "npi"}
-        or len(relations) != 4
+        or {relation["relname"] for relation in relations} not in (legacy_objects, indexed_objects)
         or any(
             relation["relkind"] not in {b"r", b"i"}
             or relation["relpersistence"] != b"p"
@@ -288,9 +293,11 @@ async def _catalog(connection, schema_name):
             or (
                 relation["relkind"] == b"i"
                 and (
-                    relation["indrelid"] not in heap_oids_by_name.values()
+                    relation["indrelid"]
+                    != heap_oids_by_name["npi" if relation["relname"] == "npi_pkey" else "entity_address_unified"]
                     or not relation["indisvalid"]
                     or not relation["indisready"]
+                    or not relation["indislive"]
                 )
             )
             for relation in relations
@@ -499,7 +506,9 @@ async def _copy_parent_rows(connection, schema_name, parent):
 
 
 async def _copy_parent_heaps(connection, schema_name, parents):
-    """COPY complete native rows in bounded batches and prove exact retained content."""
+    """Copy exact complete rows and prepare their search profile before closure."""
+    from process.network_membership_serving_indexes import _build_serving_indexes, _serving_plan
+
     namespace = _identifier(schema_name)
     for parent in parents:
         parent_table = f"{_identifier(parent.schema_name)}.{_identifier(parent.table_name)}"
@@ -512,6 +521,7 @@ async def _copy_parent_heaps(connection, schema_name, parents):
             raise NetworkBootstrapSourceError("Native copy content differs from the capture")
         key = "location_key" if parent.table_name == "entity_address_unified" else "npi"
         await connection.execute(f"ALTER TABLE {candidate_table} ADD PRIMARY KEY ({key})")
+    await _build_serving_indexes(connection, schema_name, _serving_plan(schema_name))
 
 
 async def _persist_capture(connection, receipt):

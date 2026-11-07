@@ -52,3 +52,44 @@ created/preserved counts and draft/approved revisions. Failures emit a fixed
 error code without input, connection or exception text. The command closes its
 pool on success, failure and cancellation. It does not approve records, publish
 serving data, import provider/location memberships or change source evidence.
+
+## Existing plan-tier identities
+
+Use the same command with `--identity-kind existing-plan-tier` to seed missing
+drafts for already allocated plan-tier identities. This mode accepts only the
+registered provider-file source and its `fhir-catalog/v1` alias scope. It never
+allocates identities or creates aliases. The default `legacy` mode and its UUID
+input remain unchanged.
+
+The typed input is an object with exactly `expected_preimage` and `rows`.
+`expected_preimage` contains the current integer `draft_revision`,
+`approved_revision`, `serving_generation`, and the 64-character lowercase hex
+`metadata_generation`. Each row contains exactly:
+
+| Field | Required evidence |
+| --- | --- |
+| `network_id` | Existing positive canonical integer ID |
+| `allocation_key` | Existing canonical UUID allocation key |
+| `endpoint_id` | Exact 64-character lowercase hex endpoint identity |
+| `network_key_id` | Exact 64-character lowercase hex plan-tier key |
+| `evidence_id` | Exact existing alias evidence, `<source-generation>:UHCPlanTier/<network-key>` |
+| `display_name`, `aliases` | Reviewed seed label and bounded alias list |
+
+The writer derives the allocation key using the existing plan-tier identity
+contract, then checks the protected identity, `fhir_plan_tier` alias, evidence and
+control preimage inside the same owner transaction. Any missing identity or
+alias, different key/evidence, stale preimage, mixed row shape or conflicting
+retry refuses the complete batch. It preserves existing heads and catalog rows.
+Rows use one native COPY and the existing set-based head/history insertion.
+
+An unchanged retry immediately after an all-missing-head batch is accepted only
+when every head matches that exact retained request/history and the only draft
+advance is the batch's own step. A later control change requires fresh review;
+do not update a retained request's preimage to force a retry. Retain the original
+input and receipt.
+
+Head creation does not approve bindings or change serving data. Save the source
+binding batch after the network histories exist. Normal source-batch selection
+includes missing network approvals from those histories together with its binding
+selection; authenticate the resolved selection and current revisions before the
+separate normal approval and publication steps.

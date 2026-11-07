@@ -100,10 +100,10 @@ SELECT jsonb_build_object(
  AND NOT EXISTS(SELECT FROM types WHERE oid>=16384 OR typnamespace<>'pg_catalog'::regnamespace OR typtype<>'b')
  AND NOT EXISTS(SELECT FROM types WHERE greatest(typinput::oid,typoutput::oid,typreceive::oid,typsend::oid,
  typmodin::oid,typmodout::oid,typsubscript::oid,typanalyze::oid)>=16384)
- AND NOT EXISTS(SELECT FROM operators WHERE oid>=16384 OR opcmethod<>403)
+ AND ($2::boolean OR (NOT EXISTS(SELECT FROM operators WHERE oid>=16384 OR opcmethod<>403)
  AND NOT EXISTS(SELECT FROM pg_amproc p WHERE p.amprocfamily IN (SELECT opcfamily FROM operators) AND p.amproc::oid>=16384)
  AND NOT EXISTS(SELECT FROM pg_amop op JOIN pg_operator p ON p.oid=op.amopopr
- WHERE op.amopfamily IN (SELECT opcfamily FROM operators) AND (p.oid>=16384 OR p.oprcode::oid>=16384))
+ WHERE op.amopfamily IN (SELECT opcfamily FROM operators) AND (p.oid>=16384 OR p.oprcode::oid>=16384))))
  AND NOT EXISTS(SELECT FROM heaps h JOIN pg_am am ON am.oid=h.relam WHERE am.oid>=16384 OR am.amname<>'heap')
  AND NOT EXISTS(SELECT FROM attributes a JOIN pg_collation c ON c.oid=a.attcollation
  WHERE c.oid>=16384 OR c.collnamespace<>'pg_catalog'::regnamespace)
@@ -119,8 +119,35 @@ SELECT jsonb_build_object(
  AND support.prorettype=2281 AND support.proargtypes='2281'::oidvector)
  AND p.proargtypes='1043 23 16'::oidvector AND p.prolang=(SELECT oid FROM pg_language WHERE lanname='internal'))
  AND NOT EXISTS(SELECT FROM dependencies d WHERE
+ (NOT $2::boolean OR d.classid<>'pg_class'::regclass) AND (
  (d.refclassid='pg_proc'::regclass AND d.refobjid>=16384)
- OR (d.refclassid='pg_operator'::regclass AND d.refobjid>=16384)) AS safe"""
+ OR (d.refclassid='pg_operator'::regclass AND d.refobjid>=16384))) AS safe"""
+
+
+async def _native_catalog(connection, receipt, subjects):
+    """Authenticate the complete serving profile through the existing native read gate."""
+    from process.mrf_address_publication import require_native_read_catalog_subjects
+    from process.network_address_artifact import _CatalogSession
+    from process.network_membership_serving_indexes import _serving_plan
+
+    names = {name for name, _ in receipt.index_oids}
+    legacy_names = {"entity_address_unified_pkey", "npi_pkey"}
+    has_search_indexes = names != legacy_names
+    _require(
+        not has_search_indexes
+        or names == legacy_names | {name for name, _ in _serving_plan(receipt.address_source.schema_name)}
+    )
+    native = await connection.fetchrow(_NATIVE_SQL, receipt.schema_oid, has_search_indexes)
+    _require(native["safe"] is True)
+    if has_search_indexes:
+        try:
+            await require_native_read_catalog_subjects(
+                _CatalogSession(connection), [oid for _, oid in receipt.relation_oids], subjects
+            )
+        except RuntimeError as error:
+            raise BootstrapReadAccessError("Bootstrap read-access successor is unavailable or differs") from error
+    return native
+
 
 _SERIAL_SQL = """SELECT d.oid,seq.oid AS sequence_oid,
  jsonb_build_array(seq.oid,seq.relnamespace,seq.relname,seq.relowner,seq.relkind,seq.relpersistence)::text AS sequence,
@@ -263,8 +290,8 @@ async def _native(connection, receipt, reader_oid, *, api_read=False):
             oid,
             ("npi" if name == "npi" else "location_key",),
         )
-    native = await connection.fetchrow(_NATIVE_SQL, receipt.schema_oid)
-    _require(native["safe"] is True)
+    reader = await connection.fetchval("SELECT rolname::text FROM pg_roles WHERE oid=$1::oid", reader_oid)
+    native = await _native_catalog(connection, receipt, tuple(sorted(set((*receipt.runtime_roles, reader)))))
     document = json.loads(native["document"])
     document["dormant_sequence"] = await _dormant_sequence(connection, receipt, document, reader_oid)
     return _digest(document)
@@ -354,11 +381,10 @@ async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_a
         if actors or api_read:
             caller = await connection.fetchval("SELECT current_user::text")
             caller_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", caller)
-            native = await connection.fetchrow(_NATIVE_SQL, receipt.schema_oid)
-            _require(native["safe"] is True)
-            await _dormant_sequence(connection, receipt, json.loads(native["document"]), caller_oid, roles=())
             if api_read:
                 actors = sorted(set((*actors, caller)))
+            native = await _native_catalog(connection, receipt, tuple(actors))
+            await _dormant_sequence(connection, receipt, json.loads(native["document"]), caller_oid, roles=())
         for actor in actors:
             _identifier(actor)
             actor_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", actor)

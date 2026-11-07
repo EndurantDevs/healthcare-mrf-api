@@ -151,8 +151,7 @@ async def _captured_descriptor(connection, receipt, runtime_roles, *, api_read):
     await require_native_read_catalog_subjects(
         artifact._CatalogSession(connection), [oid for _, oid in receipt.relation_oids], subjects
     )
-    native = await connection.fetchrow(access._NATIVE_SQL, receipt.schema_oid)
-    access._require(native["safe"] is True)
+    native = await access._native_catalog(connection, receipt, subjects)
     document = json.loads(native["document"])
     # Actor reach was checked above; this authenticates the same native serial dependency.
     dormant = await access._dormant_sequence(connection, receipt, document, caller["oid"], roles=())

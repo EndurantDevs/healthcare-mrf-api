@@ -566,6 +566,118 @@ async def _invoke_catalog(fixture, draft_rows, actor, source_context):
     return receipt
 
 
+async def test_typed_catalog_700_rows_use_one_copy_and_preserve_replay(permissions_db):
+    from tests.test_network_plan_tier_catalog_seed_postgres import _context as typed_context
+    from tests.test_network_plan_tier_catalog_seed_postgres import _existing_rows
+    from tests.test_network_plan_tier_catalog_seed_postgres import _seed as typed_seed
+
+    fixture, actor = permissions_db, _actor()
+    await _ready(fixture)
+    draft_rows = await _existing_rows(fixture)
+    context = await typed_context(fixture)
+    identities = await fixture.connection.fetch(
+        f'SELECT network_id,allocation_key FROM "{fixture.schema}".network_registry_identity ORDER BY network_id'
+    )
+    serving = await fixture.connection.fetchrow(f'SELECT * FROM "{fixture.schema}".network_serving_control')
+    sequence = f'"{fixture.schema}".network_registry_identity_network_id_seq'
+    sequence_values = tuple(await fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}"))
+    counted = _CountedConnection(fixture.connection)
+    receipt = await typed_seed(fixture, draft_rows, actor, context, counted)
+    assert (receipt["requested_records"], receipt["created_records"], receipt["preserved_records"]) == (700, 700, 0)
+    assert counted.calls.count("copy_records_to_table") == 1
+    assert receipt["draft_revision"] == context.expected_preimage.draft_revision + 1
+    assert receipt["approved_revision"] == context.expected_preimage.approved_revision == 0
+    heads = await fixture.connection.fetch(
+        f'SELECT network_id,display_name,aliases::text FROM "{fixture.schema}".network_registry_record'
+    )
+    assert {head["network_id"]: (head["display_name"], json.loads(head["aliases"])) for head in heads} == {
+        draft_row.network_id: (draft_row.display_name, list(draft_row.aliases)) for draft_row in draft_rows
+    }
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT count(*) FROM "{fixture.schema}".registry_record_history '
+            "WHERE custom_revision=1 AND revision=1 AND request_sha256=$1 AND actor_json->>'user_id'=$2",
+            receipt["request_sha256"],
+            str(actor.user_id),
+        )
+        == 700
+    )
+    state = await _state(fixture)
+    replay = await typed_seed(fixture, draft_rows, actor, context)
+    assert replay == {**receipt, "created_records": 0, "preserved_records": 700}
+    assert await _state(fixture) == state
+    assert (
+        await fixture.connection.fetch(
+            f'SELECT network_id,allocation_key FROM "{fixture.schema}".network_registry_identity ORDER BY network_id'
+        )
+        == identities
+    )
+    assert await fixture.connection.fetchrow(f'SELECT * FROM "{fixture.schema}".network_serving_control') == serving
+    assert tuple(await fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")) == sequence_values
+
+
+@pytest.mark.parametrize("invalid", ["preimage", "missing_alias", "conflicting_evidence"])
+async def test_typed_catalog_binding_refusal_preserves_caller_and_batch(permissions_db, invalid):
+    from tests.test_network_plan_tier_catalog_seed_postgres import _context as typed_context
+    from tests.test_network_plan_tier_catalog_seed_postgres import _existing_rows
+    from tests.test_network_plan_tier_catalog_seed_postgres import _seed as typed_seed
+
+    fixture = permissions_db
+    await _ready(fixture)
+    draft_rows = await _existing_rows(fixture, count=3)
+    context = await typed_context(fixture)
+    namespace = f'"{fixture.schema}"'
+    if invalid == "preimage":
+        await fixture.connection.execute(
+            f"UPDATE {namespace}.network_serving_control SET metadata_generation=$1", "d" * 64
+        )
+    elif invalid == "missing_alias":
+        await fixture.connection.execute(
+            f"DELETE FROM {namespace}.network_registry_alias WHERE network_id=$1", draft_rows[-1].network_id
+        )
+    else:
+        await fixture.connection.execute(
+            f"UPDATE {namespace}.network_registry_alias SET evidence_id=$1 WHERE network_id=$2",
+            "changed-evidence",
+            draft_rows[-1].network_id,
+        )
+    before = await _state(fixture)
+    caller = await fixture.connection.fetchval("SELECT current_user")
+    async with fixture.connection.transaction():
+        await fixture.connection.execute("CREATE TEMP TABLE typed_seed_caller(value int) ON COMMIT DROP")
+        await fixture.connection.execute("INSERT INTO typed_seed_caller VALUES(7)")
+        with pytest.raises(NetworkCatalogSeedError, match="preimage|binding"):
+            await typed_seed(fixture, draft_rows, _actor(), context)
+        assert await fixture.connection.fetchval("SELECT current_user") == caller
+        assert await fixture.connection.fetchval("SELECT value FROM typed_seed_caller") == 7
+        assert await _state(fixture) == before
+
+
+async def test_typed_catalog_native_insert_failure_rolls_back_all_history(permissions_db, monkeypatch):
+    from process import network_catalog_store as catalog_store
+    from tests.test_network_plan_tier_catalog_seed_postgres import _context as typed_context
+    from tests.test_network_plan_tier_catalog_seed_postgres import _existing_rows
+    from tests.test_network_plan_tier_catalog_seed_postgres import _seed as typed_seed
+
+    fixture = permissions_db
+    await _ready(fixture)
+    draft_rows = await _existing_rows(fixture, count=3)
+    context, original_insert = await typed_context(fixture), catalog_store._insert_missing
+    before = await _state(fixture)
+    caller = await fixture.connection.fetchval("SELECT current_user")
+
+    async def fail_after_insert(*args, **kwargs):
+        receipt = await original_insert(*args, **kwargs)
+        assert receipt["created_records"] == 3
+        raise RuntimeError("synthetic failure after native catalog insert")
+
+    monkeypatch.setattr(catalog_store, "_insert_missing", fail_after_insert)
+    with pytest.raises(RuntimeError, match="after native catalog insert"):
+        await typed_seed(fixture, draft_rows, _actor(), context)
+    assert await fixture.connection.fetchval("SELECT current_user") == caller
+    assert await _state(fixture) == before
+
+
 async def _coordinated_catalog(fixture, draft_rows, actor, context, ready, backend_ids):
     async with fixture.sessions() as session, session.begin():
         backend_ids.append(await session.scalar(text("SELECT pg_backend_pid()")))
