@@ -98,6 +98,16 @@ async def _payload_indexes(connection, policy, root, name):
     await connection.execute(f"ANALYZE {relation}")
 
 
+async def _identity_indexes(connection, policy, root, name):
+    secondary = _SECONDARY.get(root, (("source_id", "resource_type", "entity_id"),))
+    for index, fields in enumerate(secondary):
+        unique = "UNIQUE " if root == storage.CMS_RESOURCE_IDENTITY_ROOT else ""
+        await connection.execute(
+            f"CREATE {unique}INDEX {storage_identifier(name + '_i' + str(index))} "
+            f"ON {storage_relation(policy.schema, name)} ({','.join(storage_identifier(key) for key in fields)})"
+        )
+
+
 def _policy(value):
     _require(
         type(value) is dict
@@ -288,13 +298,6 @@ class CMSPreparedWorkspace:
                 if root not in storage.AUXILIARY_ROOTS:
                     await _payload_indexes(self.connection, self.policy, root, name)
                     continue
-                secondary = _SECONDARY.get(root, (("source_id", "resource_type", "entity_id"),))
-                for index, fields in enumerate(secondary):
-                    unique = "UNIQUE " if root == storage.CMS_RESOURCE_IDENTITY_ROOT else ""
-                    await self.connection.execute(
-                        f"CREATE {unique}INDEX {storage_identifier(name + '_i' + str(index))} ON {relation} "
-                        f"({','.join(storage_identifier(key) for key in fields)})"
-                    )
                 # Match content-proof ordering without changing the native map keys.
                 content_keys = CMS_IDENTITY_KEYS.get(root, ("source_id", "resource_type", "resource_id"))
                 content_fields = ",".join(storage_identifier(key) + ' COLLATE "C"' for key in content_keys)
@@ -362,6 +365,9 @@ async def _allocate_private_outputs(connection, policy, names, source_policy, ex
             f"CREATE TABLE {storage_relation(policy.schema, name)} ({','.join(definition)})"
             + storage.PRIVATE_HEAP_OPTIONS
         )
+        if root in storage.AUXILIARY_ROOTS:
+            # Identity replay and relationship lookups need these during loading.
+            await _identity_indexes(connection, policy, root, name)
     observed = await storage._capture(connection, policy, list(names.values()))
     await connection.execute("RESET ROLE")
     return observed
