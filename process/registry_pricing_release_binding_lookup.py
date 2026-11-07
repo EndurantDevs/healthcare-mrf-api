@@ -17,7 +17,13 @@ from api.plan_release_serving import (
     normalize_plan_release_id,
 )
 from api.plan_release_source_binding_custody import require_source_binding_custody_fetch
-from api.plan_release_source_bindings import _HEADER_SQL, SourceBindingAdmission, storage_admissions
+from api.plan_release_source_bindings import (
+    _HEADER_SQL,
+    CUSTOM_SOURCE_BINDING_STORAGE,
+    SOURCE_BINDING_STORAGE,
+    SourceBindingAdmission,
+    storage_admissions,
+)
 from process.network_approved_catalog_evidence import (
     MAX_NETWORKS,
     ApprovedNetworkCatalogEvidenceResourceLimit,
@@ -92,7 +98,12 @@ async def _fetch_admitted_binding_rows(
     except _OPTIONAL_STORAGE_ERRORS as error:
         raise ValueError("plan_release_source_binding_storage_missing") from error
     binding_rows = []
-    for identities, source_bindings in ((source_ids, True), (legacy_ids, False)):
+    groups = [
+        ([identity for identity in source_ids if admissions[identity].binding_storage == kind], True, kind)
+        for kind in (SOURCE_BINDING_STORAGE, CUSTOM_SOURCE_BINDING_STORAGE)
+    ]
+    groups.append((legacy_ids, False, SOURCE_BINDING_STORAGE))
+    for identities, source_bindings, binding_storage in groups:
         if not identities:
             continue
         binding_sql = plan_release_binding_set_sql(
@@ -100,6 +111,7 @@ async def _fetch_admitted_binding_rows(
             include_pricing_projection=has_projection,
             retained=retained and not source_bindings,
             source_bindings=source_bindings,
+            binding_storage=binding_storage,
         )
         try:
             page = await connection.fetchrow(
