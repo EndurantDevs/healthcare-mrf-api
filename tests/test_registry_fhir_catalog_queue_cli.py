@@ -99,6 +99,7 @@ async def test_catalog_watch_missing_optional_dependency_refuses_before_worker_c
     created = Mock()
     monkeypatch.setattr(queue, "create_fhir_catalog_worker", created)
     monkeypatch.setitem(sys.modules, "watchfiles", None)
-    with pytest.raises(ImportError, match="watchfiles not installed"):
+    with pytest.raises(ImportError, match="watchfiles not installed") as raised:
         await main._watch_catalog_worker(str(tmp_path), process.RegistryFHIRCatalogSync)
+    assert isinstance(raised.value.__cause__, ImportError)
     created.assert_not_called()

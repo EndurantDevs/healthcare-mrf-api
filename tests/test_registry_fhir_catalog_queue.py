@@ -98,6 +98,66 @@ async def _start(worker):
     return job
 
 
+@pytest.mark.parametrize("invalid", ["max_jobs", "max_tries", "job_timeout", "function_timeout"])
+async def test_catalog_worker_refuses_bounded_or_parallel_settings(catalog_redis, invalid):
+    async def body(_ctx):
+        pytest.fail("invalid worker settings started work")
+
+    settings_by_name = dict(
+        functions=[func(body, timeout=1 if invalid == "function_timeout" else None)],
+        redis_pool=catalog_redis,
+        job_timeout=None,
+        max_jobs=1,
+        max_tries=1,
+        handle_signals=False,
+    )
+    if invalid != "function_timeout":
+        settings_by_name[invalid] = 2
+    with pytest.raises(ValueError, match="registry_fhir_catalog_queue_settings_invalid"):
+        queue.FHIRCatalogWorker(**settings_by_name)
+
+
+async def test_expired_initial_claim_refuses_execution_and_drains_ownership(workers):
+    async def body(_ctx):
+        pytest.fail("expired owner started work")
+
+    worker = workers(body)
+    job = await worker.pool.enqueue_job("control_single_job_start", _queue_name=worker.queue_name)
+    worker._claims[job.job_id] = queue._Claim(b"expired-owner", worker.loop.time() - 1)
+    await worker.run_job(job.job_id, 0)
+    assert worker.jobs_failed == 1
+    assert not worker._claims
+    assert await worker.pool.exists(job_key_prefix + job.job_id)
+    assert await worker.pool.zscore(worker.queue_name, job.job_id) is not None
+
+
+@pytest.mark.parametrize("finish", [False, True])
+async def test_owned_finalization_preserves_requested_retention_and_retry_score(workers, finish):
+    async def body(_ctx):
+        pytest.fail("finalization must not execute work")
+
+    worker = workers(body)
+    job = await worker.pool.enqueue_job("control_single_job_start", _queue_name=worker.queue_name)
+    score = await worker.pool.zscore(worker.queue_name, job.job_id)
+    claim = queue._Claim(b"current-owner", worker.loop.time() + 1)
+    worker._claims[job.job_id] = claim
+    key = in_progress_key_prefix + job.job_id
+    await worker.pool.set(key, claim.token)
+    await worker.finish_job(job.job_id, finish, b"result", 0, True, 123, 0.5)
+    assert claim.finalizing
+    assert await worker.pool.get(key) == claim.token
+    assert 0 < await worker.pool.pttl(key) <= 500
+    if finish:
+        assert await worker.pool.get(result_key_prefix + job.job_id) == b"result"
+        assert await worker.pool.pttl(result_key_prefix + job.job_id) == -1
+        assert not await worker.pool.exists(job_key_prefix + job.job_id)
+        assert await worker.pool.zscore(worker.queue_name, job.job_id) is None
+    else:
+        assert await worker.pool.get(result_key_prefix + job.job_id) is None
+        assert await worker.pool.exists(job_key_prefix + job.job_id)
+        assert await worker.pool.zscore(worker.queue_name, job.job_id) == score + 123
+
+
 async def test_long_job_renews_claim_and_retention_without_a_runtime_timeout(workers):
     entered, finish = asyncio.Event(), asyncio.Event()
 

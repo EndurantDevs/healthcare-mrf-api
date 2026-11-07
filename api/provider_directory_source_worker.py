@@ -31,6 +31,18 @@ _FUNCTION = "control_single_job_start"
 
 
 @dataclass(frozen=True)
+class ProxyPoolTransition:
+    """An exact retained route's immutable append-only pool membership grant."""
+
+    from_revision: str
+    from_secret_name: str
+    to_revision: str
+    to_secret_name: str
+    from_proxy_ids: tuple[str, ...]
+    to_proxy_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class FHIRSourceWorkerLaunch:
     """Keep the owner image and observed native job outside serialized input."""
 
@@ -46,6 +58,56 @@ class FHIRSourceWorkerLaunch:
     pool_revision: str = ""
     pool_secret_name: str = ""
     proxy_cooldowns_json: str = ""
+    proxy_pool_transition: ProxyPoolTransition | None = None
+
+
+def _pool_transition(route):
+    """Validate a closed retained-only expansion without reading pool credentials."""
+    if "proxy_pool_transition" not in route:
+        return None
+    grant = route["proxy_pool_transition"]
+    error = "fhir_source_worker_route_invalid"
+    if (
+        route["root_run_id"] is None
+        or type(grant) is not dict
+        or set(grant)
+        != {"from_revision", "from_secret_name", "to_revision", "to_secret_name", "from_proxy_ids", "to_proxy_ids"}
+        or any(
+            type(grant[key]) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", grant[key])
+            for key in ("from_revision", "to_revision")
+        )
+        or grant["from_revision"] == grant["to_revision"]
+        or grant["from_secret_name"] == grant["to_secret_name"]
+        or any(
+            type(grant[key]) is not str
+            or len(grant[key]) > 253
+            or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", grant[key])
+            for key in ("from_secret_name", "to_secret_name")
+        )
+    ):
+        raise ValueError(error)
+    for key in ("from_proxy_ids", "to_proxy_ids"):
+        identifiers = grant[key]
+        if (
+            type(identifiers) is not list
+            or not 1 <= len(identifiers) <= 64
+            or any(
+                type(identifier) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", identifier)
+                for identifier in identifiers
+            )
+            or len(set(identifiers)) != len(identifiers)
+        ):
+            raise ValueError(error)
+    if not set(grant["from_proxy_ids"]) < set(grant["to_proxy_ids"]):
+        raise ValueError(error)
+    return ProxyPoolTransition(
+        grant["from_revision"],
+        grant["from_secret_name"],
+        grant["to_revision"],
+        grant["to_secret_name"],
+        tuple(grant["from_proxy_ids"]),
+        tuple(grant["to_proxy_ids"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -71,7 +133,8 @@ def _configured_routes(*, setting=ROUTES_ENV):
     for route in routes:
         if (
             type(route) is not dict
-            or set(route) != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
+            or set(route) - ({"proxy_pool_transition"} if setting == ROUTES_ENV else set())
+            != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
             or not (
                 (
                     route["root_run_id"] is None
@@ -94,7 +157,23 @@ def _configured_routes(*, setting=ROUTES_ENV):
         if route_identity_fields in identities:
             raise ValueError("fhir_source_worker_route_invalid")
         identities.add(route_identity_fields)
+        _pool_transition(route)
+    runtime_secrets = {route["secret_name"] for route in routes}
+    for route in routes:
+        grant = _pool_transition(route)
+        if grant is not None and {grant.from_secret_name, grant.to_secret_name}.intersection(runtime_secrets):
+            raise ValueError("fhir_source_worker_route_invalid")
     return routes
+
+
+def configured_source_proxy_pool_secrets():
+    """Reserve global and retained-route pools from all broad credential paths."""
+    names = {os.getenv(PROXY_POOL_SECRET_ENV, "").strip()} - {""}
+    for route in _configured_routes():
+        grant = _pool_transition(route)
+        if grant is not None:
+            names.update((grant.from_secret_name, grant.to_secret_name))
+    return frozenset(names)
 
 
 def _source_route(admitted_run, *, routes=None):
@@ -130,6 +209,12 @@ def _source_route(admitted_run, *, routes=None):
         and has_route_lineage
     ]
     if len(matches) != 1:
+        raise ValueError("fhir_source_worker_route_changed")
+    if (
+        _pool_transition(matches[0]) is not None
+        and _uses_source_http(params)
+        and params.get("allow_retained_pagination_reset") is not False
+    ):
         raise ValueError("fhir_source_worker_route_changed")
     return matches[0]
 
@@ -177,15 +262,7 @@ def _is_launch_secret_selected(selection, launch, *, allow_shared=False):
     pool_marker = selection.get("sourceProxyPool", False)
     if type(pool_marker) is not bool:
         raise ValueError("worker purpose proxy pool selector is invalid")
-    pool_secret = os.getenv(PROXY_POOL_SECRET_ENV, "").strip()
-    environment_name = str(selection.get("name") or "").strip()
-    secret_key = str(selection.get("key") or "").strip()
-    reserved = (
-        environment_name in {PROXY_POOL_ENV, PROXY_POLICY_ENV, PROXY_BINDING_ENV, PROXY_COOLDOWNS_ENV}
-        or secret_key == PROXY_POOL_ENV
-        or bool(pool_secret and secret_name == pool_secret)
-    )
-    if pool_marker or reserved:
+    if pool_marker or _is_proxy_pool_reference(selection):
         if (
             not allow_shared
             or not pool_marker
@@ -205,17 +282,24 @@ def _is_launch_secret_selected(selection, launch, *, allow_shared=False):
     return secret_name not in route_secret_names
 
 
-def requires_source_proxy_admission(selection):
+def needs_source_proxy_admission(selection):
     """Reserve the pool's key and configured Secret for exact Source admission."""
+    return "sourceProxyPool" in selection or _is_proxy_pool_reference(selection)
+
+
+requires_source_proxy_admission = needs_source_proxy_admission
+
+
+def _is_proxy_pool_reference(selection):
+    """Recognize reserved transport fields and either configured pool Secret."""
     secret = str(selection.get("secretName") or selection.get("secret_name") or "").strip()
-    configured_secret = os.getenv(PROXY_POOL_SECRET_ENV, "").strip()
+    configured_secrets = configured_source_proxy_pool_secrets()
     environment_name = str(selection.get("name") or "").strip()
     secret_key = str(selection.get("key") or "").strip()
     return (
-        "sourceProxyPool" in selection
-        or environment_name in {PROXY_POOL_ENV, PROXY_POLICY_ENV, PROXY_BINDING_ENV, PROXY_COOLDOWNS_ENV}
+        environment_name in {PROXY_POOL_ENV, PROXY_POLICY_ENV, PROXY_BINDING_ENV, PROXY_COOLDOWNS_ENV}
         or secret_key == PROXY_POOL_ENV
-        or bool(configured_secret and secret == configured_secret)
+        or secret in configured_secrets
     )
 
 
@@ -239,11 +323,20 @@ def _proxy_fields(source_ids, endpoint_scope, route, *, policy=None):
         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", revision)
     ):
         raise ValueError("fhir_source_worker_proxy_configuration_invalid")
+    grant = _pool_transition(route)
+    if grant is not None:
+        if (revision, secret) not in {
+            (grant.from_revision, grant.from_secret_name),
+            (grant.to_revision, grant.to_secret_name),
+        }:
+            raise ValueError("fhir_source_worker_proxy_configuration_invalid")
+        secret, revision = grant.to_secret_name, grant.to_revision
     return {
         "policy_revision": policy.policy_revision,
         "pool_revision": revision,
         "pool_secret_name": secret,
         "proxy_cooldowns_json": _cooldowns_json(endpoint_scope, revision, []) if route["root_run_id"] is None else "",
+        "proxy_pool_transition": grant,
     }
 
 
@@ -531,6 +624,7 @@ async def require_fhir_source_route_ancestry(connection, launch):
             type(params) is dict
             and params.get("source_ids") == [launch.source_id]
             and params.get("provider_directory_endpoint_scope") == launch.endpoint_scope
+            and (launch.proxy_pool_transition is None or params.get("allow_retained_pagination_reset") is False)
             and (
                 current_id == launch.root_run_id
                 or params.get("provider_directory_pagination_root_run_id") == launch.root_run_id
@@ -597,7 +691,7 @@ def _require_proxy_launch(launch):
     """A changed capability or server policy cannot silently replace its binding."""
     fields = (launch.policy_revision, launch.pool_revision, launch.pool_secret_name)
     if not launch.source_id and not any(fields):
-        if launch.proxy_cooldowns_json:
+        if launch.proxy_cooldowns_json or launch.proxy_pool_transition is not None:
             raise ValueError("fhir_source_worker_admission_unavailable")
         return
     route = next(
@@ -617,6 +711,8 @@ def _require_proxy_launch(launch):
     )
     expected = _proxy_fields([launch.source_id], launch.endpoint_scope, route)
     if fields != tuple(expected.get(name, "") for name in ("policy_revision", "pool_revision", "pool_secret_name")):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    if launch.proxy_pool_transition != expected.get("proxy_pool_transition"):
         raise ValueError("fhir_source_worker_admission_unavailable")
     if launch.pool_secret_name:
         _require_proxy_cooldowns(launch)
@@ -672,6 +768,11 @@ def _validated_cooldowns(snapshot, launch):
             or entry["proxy_id"] in boundaries_by_id
         ):
             raise ValueError(error)
+        if (
+            launch.proxy_pool_transition is not None
+            and entry["proxy_id"] not in launch.proxy_pool_transition.to_proxy_ids
+        ):
+            raise ValueError(error)
         boundary = entry["retry_not_before"]
         if boundary is not None:
             try:
@@ -701,7 +802,34 @@ def _require_proxy_cooldowns(launch):
         raise ValueError("fhir_source_worker_proxy_cooldowns_invalid")
 
 
+def _proxy_ancestor_scope(launch, binding, *, is_first, has_target_revision):
+    """Validate chronological bindings and return the recorded snapshot revision."""
+    grant = launch.proxy_pool_transition
+    expected_binding = _proxy_binding(launch)
+    allowed_ids = None
+    if grant is not None:
+        if type(grant) is not ProxyPoolTransition:
+            raise ValueError("fhir_source_worker_route_changed")
+        revision = binding.get("pool_revision") if type(binding) is dict else None
+        if (
+            revision not in (grant.from_revision, grant.to_revision)
+            or is_first
+            and revision != grant.from_revision
+            or has_target_revision
+            and revision == grant.from_revision
+        ):
+            raise ValueError("fhir_source_worker_route_changed")
+        has_target_revision = has_target_revision or revision == grant.to_revision
+        expected_binding["pool_revision"] = revision
+        allowed_ids = grant.to_proxy_ids if has_target_revision else grant.from_proxy_ids
+        launch = replace(launch, pool_revision=revision)
+    if binding != expected_binding:
+        raise ValueError("fhir_source_worker_route_changed")
+    return launch, allowed_ids, has_target_revision
+
+
 def _proxy_lineage_launch(launch, ancestors):
+    """Merge observed blocks across only the granted forward revision transition."""
     if not launch.pool_secret_name:
         if any(
             ancestor.get("source_http_proxy_binding") is not None
@@ -713,11 +841,18 @@ def _proxy_lineage_launch(launch, ancestors):
     if not ancestors:
         raise ValueError("fhir_source_worker_proxy_cooldowns_invalid")
     boundaries_by_id = {}
-    for ancestor in ancestors:
-        if ancestor.get("source_http_proxy_binding") != _proxy_binding(launch):
-            raise ValueError("fhir_source_worker_route_changed")
-        for entry in _validated_cooldowns(ancestor.get("source_http_proxy_cooldowns"), launch):
+    has_target_revision = False
+    for position, ancestor in enumerate(reversed(ancestors)):
+        snapshot_launch, allowed_ids, has_target_revision = _proxy_ancestor_scope(
+            launch,
+            ancestor.get("source_http_proxy_binding"),
+            is_first=position == 0,
+            has_target_revision=has_target_revision,
+        )
+        for entry in _validated_cooldowns(ancestor.get("source_http_proxy_cooldowns"), snapshot_launch):
             proxy_id, boundary = entry["proxy_id"], entry["retry_not_before"]
+            if allowed_ids is not None and proxy_id not in allowed_ids:
+                raise ValueError("fhir_source_worker_proxy_cooldowns_invalid")
             if proxy_id not in boundaries_by_id:
                 boundaries_by_id[proxy_id] = boundary
             elif boundaries_by_id[proxy_id] is not None:
