@@ -70,7 +70,6 @@ def matching_child_statement(context, predicates):
     family_model = context.model(CustomImportFamilyRevision)
     family_child_model = context.model(CustomImportFamilyChild)
     child_model = context.model(CustomImportChildRevision)
-    child_scalar_model = context.model(CustomImportChildScalar)
 
     collection_slot = context.collection_slots_by_name[context.definition.query.child_collection]
     statement = (
@@ -96,7 +95,10 @@ def matching_child_statement(context, predicates):
         .correlate(winner_model, family_model)
     )
     for predicate in predicates:
-        conditions = core._child_scalar_conditions(predicate.field, child_model.child_revision_id, context)
+        child_scalar_model = core._field_scalar_model(context, predicate.field)
+        conditions = core._child_scalar_conditions(
+            predicate.field, child_model.child_revision_id, context, scalar_model=child_scalar_model
+        )
         statement = statement.where(
             core._scalar_predicate(child_scalar_model, predicate, conditions).correlate(child_model, family_model)
         )
@@ -108,10 +110,10 @@ def child_order_expression(context, predicates, field):
 
     winner_model = context.model(CustomImportWinner)
     family_model = context.model(CustomImportFamilyRevision)
-    child_scalar_model = context.model(CustomImportChildScalar)
 
     child_revision_id = matching_child_statement(context, predicates).scalar_subquery()
-    conditions = core._child_scalar_conditions(field, child_revision_id, context)
+    child_scalar_model = core._field_scalar_model(context, field)
+    conditions = core._child_scalar_conditions(field, child_revision_id, context, scalar_model=child_scalar_model)
     value_column = getattr(child_scalar_model, core._SCALAR_COLUMNS[field.value_type])
     return (
         select(value_column)

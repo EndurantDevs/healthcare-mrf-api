@@ -298,6 +298,51 @@ async def test_start_uses_retained_bounds_and_original_producer_but_fresh_nonce(
         )
 
 
+async def test_reopen_started_epoch_preserves_lease_producer_and_all_original_bounds(retained):
+    await continuation.authorize_build_continuation(retained.session, retained.authorization, **retained.pins)
+    first = await continuation.start_build_continuation(
+        retained.session, retained.authorization, retained.nonce, lease_seconds=3600
+    )
+    lease_before, build_before = vars(retained.lease).copy(), vars(retained.build).copy()
+    reopened = await continuation.reopen_build_continuation(
+        retained.session, retained.authorization, retained.nonce, lease_seconds=3600
+    )
+    assert reopened == first
+    assert vars(retained.lease) == lease_before and vars(retained.build) == build_before
+    assert len(retained.session.added) == 1
+
+
+@pytest.mark.parametrize("problem", ("unstarted", "nonce", "expired", "epoch", "failed", "base", "producer"))
+async def test_reopen_refuses_unstarted_stale_or_changed_authority(retained, problem):
+    from process.custom_import.runner_types import LeaseAuthorityLost
+
+    await continuation.authorize_build_continuation(retained.session, retained.authorization, **retained.pins)
+    if problem != "unstarted":
+        await continuation.start_build_continuation(
+            retained.session, retained.authorization, retained.nonce, lease_seconds=3600
+        )
+    nonce = retained.nonce
+    match problem:
+        case "nonce":
+            nonce = b"x" * 32
+        case "expired":
+            retained.lease.expires_at = retained.now
+        case "epoch":
+            retained.lease.continuation_id += 1
+        case "failed":
+            retained.execution.state = "failed"
+        case "base":
+            retained.build.base_pointer_version += 1
+        case "producer":
+            retained.build.producing_token_sha256 = b"x" * 32
+    before = vars(retained.lease).copy()
+    with pytest.raises((IdempotencyConflict, LeaseAuthorityLost)):
+        await continuation.reopen_build_continuation(
+            retained.session, retained.authorization, nonce, lease_seconds=3600
+        )
+    assert vars(retained.lease) == before and len(retained.session.added) == 1
+
+
 @pytest.mark.parametrize("kind", ["wrong_nonce", "expired_launch", "expired_started", "stale_epoch", "canceling"])
 async def test_start_refuses_replay_expiry_and_lost_authority(retained, kind):
     retained = retained

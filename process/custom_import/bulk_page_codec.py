@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import re
 import struct
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 
 MAX_BATCH_ROWS = 100_000
 MAX_BATCH_BYTES = 268_435_456
+_NATIVE_MANIFEST_ROWS = 256
 _MAX_BIGINT = (1 << 63) - 1
 _MAX_INTEGER = (1 << 31) - 1
 
@@ -52,9 +54,30 @@ class LandingBatch(NamedTuple):
     manifest_sha256: bytes
 
 
+def _native_landing_manifest(records):
+    """Offer only concrete bounded rows; native refusal retains Python semantics."""
+    if (
+        type(records) not in (tuple, list)
+        or len(records) > _NATIVE_MANIFEST_ROWS
+        or any(type(record) is not LandingRow for record in records)
+    ):
+        return None
+    try:
+        module = importlib.import_module("ptg2_address_canon")
+    except ImportError:
+        return None
+    encoder = getattr(module, "custom_import_landing_manifest_v1", None)
+    return encoder(records) if callable(encoder) else None
+
+
 def landing_manifest_sha256(records: Iterable[LandingRow]) -> bytes:
     """Fingerprint exact COPY values and positions, excluding the batch UUID."""
 
+    encoded = _native_landing_manifest(records)
+    if encoded is not None:
+        if type(encoded) is not bytes or len(encoded) != 32:
+            raise ValueError("native landing manifest digest differs")
+        return encoded
     digest = hashlib.sha256(b"custom-import/landing-manifest/v1\x00")
     for record in records:
         for value in record[1:]:

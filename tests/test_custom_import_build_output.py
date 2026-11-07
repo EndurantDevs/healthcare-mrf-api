@@ -1003,6 +1003,7 @@ async def test_output_replay_refuses_missing_receipt_or_nonterminal_producer(mon
         ("_locked_lease", SimpleNamespace(continuation_id=None)),
         ("_locked_generation", generation),
         ("_locked_generation_seal", seal),
+        ("_validate_sealed_projection", None),
         ("_replayed_no_change_receipt", None),
     ):
         monkeypatch.setattr(output.publication, name, AsyncMock(return_value=helper_return))

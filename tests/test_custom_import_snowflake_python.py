@@ -210,29 +210,21 @@ def _parquet_tables(result) -> list[dict[str, list[object]]]:
 
 
 def test_connector_import_accepts_the_project_pyarrow_version():
-    completed = subprocess.run(
-        [sys.executable, "-W", "error::UserWarning", "-c", "import process.custom_import.snowflake_python"],
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=30,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-
     unrelated = subprocess.run(
         [
             sys.executable,
             "-W",
             "error::UserWarning",
             "-c",
-            "import process.custom_import.snowflake_python; import warnings; warnings.warn('unrelated', UserWarning)",
+            "import process.custom_import.snowflake_python; print('connector import succeeded', flush=True); "
+            "import warnings; warnings.warn('unrelated', UserWarning)",
         ],
         capture_output=True,
         check=False,
         text=True,
         timeout=30,
     )
+    assert unrelated.stdout == "connector import succeeded\n", unrelated.stderr
     assert unrelated.returncode != 0
     assert "UserWarning: unrelated" in unrelated.stderr
 

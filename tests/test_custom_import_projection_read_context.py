@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 
 from api import custom_import_read_http
-from process.custom_import import grouped_read, read_core
+from process.custom_import import family_block_binding, family_block_read_models, grouped_read, read_core, read_identity
 from process.custom_import.definition import canonical_json, canonical_sha256
 from process.custom_import.storage_layout import snapshot_models
 from tests import custom_import_grouped_support as grouped_fixture
@@ -43,8 +43,10 @@ def context_metadata(monkeypatch):
     monkeypatch.setattr(read_core, "_exact_profile", AsyncMock(return_value=None))
     monkeypatch.setattr(read_core, "_verified_profile", Mock(return_value=(1, 1)))
     monkeypatch.setattr(read_core, "_verified_field_rows", AsyncMock())
-    monkeypatch.setattr(read_core, "resolve_generation_snapshot", AsyncMock())
-    return SimpleNamespace(context=context, session=session)
+    monkeypatch.setattr(read_core, "resolve_generation_snapshot_binding", AsyncMock())
+    block_resolver = AsyncMock(side_effect=AssertionError("proven legacy layout must not resolve blocks"))
+    monkeypatch.setattr(family_block_binding, "resolve_pinned_family_block_binding", block_resolver)
+    return SimpleNamespace(context=context, session=session, block_resolver=block_resolver)
 
 
 @pytest.mark.asyncio
@@ -54,7 +56,9 @@ async def test_projection_mapping_is_retained(context_metadata, projection_helpe
     session = context_metadata.session
     tables = MappingProxyType({"synthetic_projection": object()})
     projection_helper.read_projection_tables.return_value = tables
-    read_core.resolve_generation_snapshot.return_value = family_id
+    read_core.resolve_generation_snapshot_binding.return_value = read_identity.GenerationSnapshotBinding(
+        family_id, True
+    )
 
     loaded = await read_core._load_read_context(session, expected.target)
 
@@ -65,11 +69,12 @@ async def test_projection_mapping_is_retained(context_metadata, projection_helpe
     assert loaded.collection_slots_by_name is expected.collection_slots_by_name
     assert loaded.collection_names_by_slot == expected.collection_names_by_slot
     projection_helper.read_projection_tables.assert_awaited_once_with(
-        session, expected.target, expected.definition, snapshot_family_id=family_id
+        session, expected.target, expected.definition, snapshot_family_id=family_id, family_block_binding=None
     )
     arguments = projection_helper.read_projection_tables.await_args.args
     assert arguments[0] is session and arguments[1] is expected.target and arguments[2] is expected.definition
-    read_core.resolve_generation_snapshot.assert_awaited_once_with(session, expected.target)
+    read_core.resolve_generation_snapshot_binding.assert_awaited_once_with(session, expected.target)
+    context_metadata.block_resolver.assert_not_awaited()
     session.execute.assert_not_awaited()
 
 
@@ -78,16 +83,83 @@ async def test_projection_mapping_is_retained(context_metadata, projection_helpe
 async def test_legacy_context_keeps_no_projection(context_metadata, projection_helper, family_id):
     expected = context_metadata.context
     projection_helper.read_projection_tables.return_value = None
-    read_core.resolve_generation_snapshot.return_value = family_id
+    read_core.resolve_generation_snapshot_binding.return_value = read_identity.GenerationSnapshotBinding(
+        family_id, family_id is not None
+    )
 
     loaded = await read_core._load_read_context(context_metadata.session, expected.target)
 
     assert loaded.projection_tables is None
     assert loaded.storage_models is (None if family_id is None else snapshot_models(family_id))
     projection_helper.read_projection_tables.assert_awaited_once_with(
-        context_metadata.session, expected.target, expected.definition, snapshot_family_id=family_id
+        context_metadata.session,
+        expected.target,
+        expected.definition,
+        snapshot_family_id=family_id,
+        family_block_binding=None,
     )
+    context_metadata.block_resolver.assert_not_awaited()
     context_metadata.session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_layout_runs_pinned_binding_and_preserves_its_result(
+    monkeypatch, context_metadata, projection_helper
+):
+    expected = context_metadata.context
+    session = context_metadata.session
+    pin = read_identity.GenerationSnapshotBinding(17, False)
+    read_core.resolve_generation_snapshot_binding.return_value = pin
+    binding = object()
+    context_metadata.block_resolver.side_effect = None
+    context_metadata.block_resolver.return_value = binding
+    block_models = MappingProxyType({"synthetic_block_model": object()})
+    read_models = Mock(return_value=block_models)
+    monkeypatch.setattr(family_block_read_models, "read_models", read_models)
+    tables = MappingProxyType({"synthetic_projection": object()})
+    projection_helper.read_projection_tables.return_value = tables
+
+    loaded = await read_core._load_read_context(session, expected.target)
+
+    context_metadata.block_resolver.assert_awaited_once_with(
+        session, pin, expected.definition, expected.collection_slots_by_name
+    )
+    projection_helper.read_projection_tables.assert_awaited_once_with(
+        session, expected.target, expected.definition, snapshot_family_id=17, family_block_binding=binding
+    )
+    assert loaded.family_block_binding is binding and loaded.projection_tables is tables
+    assert loaded.storage_models is block_models
+    read_models.assert_called_once_with(binding, expected.target)
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_layout_cannot_accept_an_empty_pinned_binding(context_metadata, projection_helper):
+    expected = context_metadata.context
+    read_core.resolve_generation_snapshot_binding.return_value = read_identity.GenerationSnapshotBinding(17, False)
+    context_metadata.block_resolver.side_effect = None
+    context_metadata.block_resolver.return_value = None
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="pinned query projection is unavailable"):
+        await read_core._load_read_context(context_metadata.session, expected.target)
+    projection_helper.read_projection_tables.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "detail", ["native relation identity differs", "column shape differs", "serving index differs"]
+)
+async def test_unresolved_layout_cannot_fall_back_after_full_binding_refusal(
+    context_metadata, projection_helper, detail
+):
+    expected = context_metadata.context
+    read_core.resolve_generation_snapshot_binding.return_value = read_identity.GenerationSnapshotBinding(17, False)
+    context_metadata.block_resolver.side_effect = family_block_binding.FamilyBlockUnavailable(detail)
+
+    with pytest.raises(read_core.CustomImportReadUnavailableError, match="pinned query projection is unavailable"):
+        await read_core._load_read_context(context_metadata.session, expected.target)
+
+    context_metadata.block_resolver.assert_awaited_once()
+    projection_helper.read_projection_tables.assert_not_awaited()
 
 
 def _persisted_profile(definition, profile_id, slot):
@@ -110,7 +182,7 @@ async def test_default_profile_preserves_projection(monkeypatch, context_metadat
     tables = MappingProxyType({"synthetic_projection": object()}) if projected else None
     projection_helper.read_projection_tables.return_value = tables
     read_core.verified_definition.return_value = expected.definition
-    read_core.resolve_generation_snapshot.return_value = 17
+    read_core.resolve_generation_snapshot_binding.return_value = read_identity.GenerationSnapshotBinding(17, True)
     monkeypatch.setattr(read_core, "_verified_profile", _VERIFIED_PROFILE)
     read_core._exact_profile.side_effect = [
         _persisted_profile(expected.definition, "families_by_period", 1),
@@ -138,7 +210,7 @@ async def test_default_profile_preserves_projection(monkeypatch, context_metadat
     )
     assert read_core._exact_profile.await_count == 2
     projection_helper.read_projection_tables.assert_awaited_once_with(
-        session, expected.target, expected.definition, snapshot_family_id=17
+        session, expected.target, expected.definition, snapshot_family_id=17, family_block_binding=None
     )
     session.execute.assert_not_awaited()
 
@@ -152,7 +224,7 @@ _VERIFIED_PROFILE = read_core._verified_profile
 )
 async def test_invalid_projection_fails_closed(monkeypatch, context_metadata, projection_helper, detail):
     expected = context_metadata.context
-    read_core.resolve_generation_snapshot.return_value = 17
+    read_core.resolve_generation_snapshot_binding.return_value = read_identity.GenerationSnapshotBinding(17, True)
     projection_helper.read_projection_tables.side_effect = _ProjectionUnavailable(detail)
     context_factory = Mock(side_effect=AssertionError("invalid projection constructed a context"))
     bind_profile = AsyncMock()
@@ -169,6 +241,10 @@ async def test_invalid_projection_fails_closed(monkeypatch, context_metadata, pr
     context_factory.assert_not_called()
     bind_profile.assert_not_awaited()
     projection_helper.read_projection_tables.assert_awaited_once_with(
-        context_metadata.session, expected.target, expected.definition, snapshot_family_id=17
+        context_metadata.session,
+        expected.target,
+        expected.definition,
+        snapshot_family_id=17,
+        family_block_binding=None,
     )
     context_metadata.session.execute.assert_not_awaited()

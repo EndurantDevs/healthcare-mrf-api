@@ -12,6 +12,7 @@ from db.models.custom_import_continuation import *
 from db.models.custom_import_post_seal_audit import *
 from db.models.custom_import_query_projection import *
 from db.models.custom_import_raw_capture import *
+from db.models.custom_import_retained_copy import *
 from db.models.custom_import_storage import *
 from db.models.facility_address_contribution import *
 from db.models.formulary_fhir import *

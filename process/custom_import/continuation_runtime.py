@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import hmac
 from dataclasses import dataclass, field
 
@@ -40,9 +41,7 @@ def processing_deadline(request):
     return None if getattr(request, "continuation", None) is not None else request.build_deadline_at
 
 
-def execution_continuation_matches(authorization, execution, lease, continuation_id, nonce_sha256, now):
-    """Compare the immutable epoch with the locked execution and mutable lease."""
-
+def _continuation_identity_matches(authorization, execution, lease, continuation_id, nonce_sha256):
     return (
         authorization is not None
         and authorization.continuation_id == continuation_id == getattr(lease, "continuation_id", None)
@@ -59,13 +58,19 @@ def execution_continuation_matches(authorization, execution, lease, continuation
         and hmac.compare_digest(bytes(authorization.nonce_sha256), nonce_sha256)
         and lease.token_sha256 is not None
         and hmac.compare_digest(bytes(lease.token_sha256), nonce_sha256)
+    )
+
+
+def execution_continuation_matches(authorization, execution, lease, continuation_id, nonce_sha256, now):
+    """Compare the immutable epoch with the locked execution and live lease."""
+    return (
+        _continuation_identity_matches(authorization, execution, lease, continuation_id, nonce_sha256)
         and lease.expires_at is not None
         and lease.expires_at > now
     )
 
 
-def verify_continuation_scope(request, execution, lease, authorization, now, *, build=None):
-    """Require the exact current epoch and unchanged retained build pins."""
+def _verify_continuation_scope(request, execution, lease, authorization, *, build, epoch_matches):
 
     context = getattr(request, "continuation", None)
     if context is None:
@@ -73,9 +78,7 @@ def verify_continuation_scope(request, execution, lease, authorization, now, *, 
             raise LeaseAuthorityLost("processing continuation requires its current epoch")
         return
     if (
-        not execution_continuation_matches(
-            authorization, execution, lease, context.continuation_id, lease_token_sha256(request.lease_token), now
-        )
+        not epoch_matches
         or authorization.build_id != context.build_id
         or any(
             getattr(authorization, name) != getattr(request, name)
@@ -89,6 +92,44 @@ def verify_continuation_scope(request, execution, lease, authorization, now, *, 
         or (build is not None and build.build_id != context.build_id)
     ):
         raise LeaseAuthorityLost("processing continuation authority is no longer current")
+
+
+def verify_continuation_scope(request, execution, lease, authorization, now, *, build=None):
+    """Require the exact current epoch and unchanged retained build pins."""
+    context = getattr(request, "continuation", None)
+    epoch_matches = context is None or execution_continuation_matches(
+        authorization, execution, lease, context.continuation_id, lease_token_sha256(request.lease_token), now
+    )
+    _verify_continuation_scope(request, execution, lease, authorization, build=build, epoch_matches=epoch_matches)
+
+
+async def verify_terminal_continuation(session, request, execution, lease, now, *, build):
+    """Authenticate an immutable terminal receipt without granting write authority."""
+    context = getattr(request, "continuation", None)
+    authorization = None
+    if context is not None:
+        authorization = (
+            await session.execute(
+                select(CustomImportBuildContinuation).where(
+                    CustomImportBuildContinuation.continuation_id == context.continuation_id
+                )
+            )
+        ).scalar_one_or_none()
+    finished = getattr(execution, "finished_at", None)
+    terminal = (
+        execution.state in {"completed", "no_change"}
+        and isinstance(finished, dt.datetime)
+        and finished.utcoffset() is not None
+        and finished <= now
+        and lease.expires_at == finished
+        and lease.heartbeat_at == finished
+    )
+    epoch_matches = context is None or _continuation_identity_matches(
+        authorization, execution, lease, context.continuation_id, lease_token_sha256(request.lease_token)
+    )
+    if not terminal:
+        raise LeaseAuthorityLost("terminal continuation completion differs")
+    _verify_continuation_scope(request, execution, lease, authorization, build=build, epoch_matches=epoch_matches)
 
 
 async def verify_and_bind_continuation(session, request, execution, lease, now, *, build=None):

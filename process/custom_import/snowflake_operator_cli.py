@@ -91,6 +91,7 @@ _SAFE_STATUSES = frozenset(
     {
         "activated",
         "candidate_rejected",
+        "capture_ready",
         "canceled",
         "lease_lost",
         "no_change",
@@ -792,6 +793,11 @@ async def _run_retained_snowflake_binding(
 async def _execute_loaded_candidate(database, loaded, idempotency_key, writer_transports):
     """Open credentials only after the fixed launch stage has passed and entered."""
 
+    from process.custom_import.family_shard_handoff import capture_bearer
+
+    owner_bearer = capture_bearer(idempotency_key)
+    if owner_bearer is not None and writer_transports is None:
+        raise ValueError("owner capture requires its authenticated launch stage")
     adapter = SnowflakePythonConnectorAdapter(role=loaded.binding.role, warehouse=loaded.binding.warehouse)
     with FixedLocalKeyPairCredentialProvider(FIXED_CREDENTIAL_DIRECTORY) as credential_provider:
         connector = SnowflakeBundleAcquisitionConnector(
@@ -806,7 +812,7 @@ async def _execute_loaded_candidate(database, loaded, idempotency_key, writer_tr
             definition=loaded.definition,
             bundle_request=_retained_bundle_request(connector, loaded),
             idempotency_key=idempotency_key,
-            lease_token=secrets.token_urlsafe(32),
+            lease_token=secrets.token_urlsafe(32) if owner_bearer is None else owner_bearer,
             source_binding_revision_id=loaded.source_binding_revision_id,
             source_binding_sha256=loaded.source_binding_sha256,
         )
@@ -816,6 +822,7 @@ async def _execute_loaded_candidate(database, loaded, idempotency_key, writer_tr
             request,
             getattr(loaded.binding, "processing_policy", None),
             writer_transports=writer_transports,
+            **({} if owner_bearer is None else {"capture_only": True}),
         )
 
 
@@ -836,14 +843,18 @@ def _retained_bundle_request(connector, loaded):
     )
 
 
-async def _run_configured_candidate(database, connector, request, processing_policy, *, writer_transports=None):
+async def _run_configured_candidate(
+    database, connector, request, processing_policy, *, writer_transports=None, capture_only=False
+):
     """Choose only the runner selected by the retained immutable binding."""
 
     if processing_policy is None:
-        if writer_transports is not None:
+        if writer_transports is not None or capture_only:
             raise ValueError("admission launch requires segmented processing")
         return await run_snowflake_bundle_candidate(database.session, connector, request)
     handoff = {} if writer_transports is None else {"writer_transports": writer_transports}
+    if capture_only:
+        handoff["capture_only"] = True
     return await run_segmented_snowflake_candidate(
         database.session_factory,
         connector,
