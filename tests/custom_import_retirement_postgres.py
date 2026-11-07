@@ -275,6 +275,105 @@ async def test_reference_proof_checks_wrong_parent_membership_and_every_bounded_
                     engine_id="synthetic",
                     assert_external_unreferenced=_external_fixture_check,
                 )
+        await _verify_sparse_remaining_reference_pages(case, family_id, monkeypatch)
+
+
+async def _prepare_sparse_reference_table(session, publication_case, family_id):
+    """Keep indexed references outside the family while paging sparse nullable bases."""
+    await session.execute(
+        text(
+            "CREATE TEMP TABLE custom_import_build_occurrence (occurrence_id bigint PRIMARY KEY,"
+            "root_revision_id bigint NOT NULL,child_revision_id bigint NOT NULL,"
+            "base_root_revision_id bigint,base_child_revision_id bigint) ON COMMIT DROP"
+        )
+    )
+    for column in ("root_revision_id", "child_revision_id"):
+        await session.execute(
+            text(f"CREATE INDEX sparse_{column} ON pg_temp.custom_import_build_occurrence ({column})")
+        )
+    await session.execute(
+        text(
+            f'INSERT INTO "{publication_case.schema_name}".custom_import_revision_home '
+            "(family_id,revision_kind,revision_ids) VALUES (:family,1,'{[9100000,9100001)}')"
+        ),
+        {"family": family_id},
+    )
+    indexed_value = 50_000_000_000
+    assert not await session.scalar(
+        text(
+            f'SELECT EXISTS (SELECT FROM "{publication_case.schema_name}".custom_import_revision_home '
+            "WHERE family_id=:family AND revision_ids @> CAST(:value AS bigint))"
+        ),
+        {"family": family_id, "value": indexed_value},
+    )
+    await session.execute(
+        text("INSERT INTO pg_temp.custom_import_build_occurrence VALUES (:identity,:indexed,:indexed,NULL,NULL)"),
+        [
+            {"identity": identity, "indexed": indexed_value}
+            for identity in (1, 3, 8, 10, 12, 15, 20, 21, 22, 23, 31, 40, 41, 63)
+        ],
+    )
+    return Table(
+        "custom_import_build_occurrence",
+        MetaData(),
+        Column("occurrence_id", BigInteger, primary_key=True),
+        *(Column(name, BigInteger) for name in retirement._REFERENCES["custom_import_build_occurrence"]),
+        schema="pg_temp",
+    )
+
+
+def _observe_sparse_reference_pages(session, monkeypatch):
+    """Require the remaining nullable references to filter before the keyset limit."""
+    page_queries = []
+    original_execute = session.execute
+
+    async def observe_page(statement, *args, **kwargs):
+        sql = str(statement)
+        if "reference_page" in sql:
+            page_queries.append(sql)
+            for name in ("base_root_revision_id", "base_child_revision_id"):
+                assert f".{name} IS NOT NULL" in sql[: sql.index("ORDER BY")]
+            for name in ("root_revision_id", "child_revision_id"):
+                assert f".{name} IS NOT NULL" not in sql
+        return await original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(session, "execute", observe_page)
+    return page_queries
+
+
+async def _verify_sparse_remaining_reference_pages(publication_case, family_id, monkeypatch):
+    """Preserve empty-page, keyset-gap, EOF, and independent base-reference refusals."""
+    async with publication_case.sessions() as session, session.begin():
+        await _bounded(session)
+        table = await _prepare_sparse_reference_table(session, publication_case, family_id)
+        page_queries = _observe_sparse_reference_pages(session, monkeypatch)
+        await retirement._reference_pages(session, table, family_id)
+        assert len(page_queries) == 1  # Indexed values must not keep NULL-only remaining references.
+        await session.execute(
+            text(
+                "UPDATE pg_temp.custom_import_build_occurrence SET "
+                "base_root_revision_id=CASE WHEN occurrence_id IN (10,40) THEN 900 END,"
+                "base_child_revision_id=CASE WHEN occurrence_id IN (21,40) THEN 901 END"
+            )
+        )
+        page_queries.clear()
+        await retirement._reference_pages(session, table, family_id)
+        assert len(page_queries) == 3  # Two qualifying pages and EOF, across NULL gaps and a NULL tail.
+        for column, revision_id in (("base_root_revision_id", 9100000), ("base_child_revision_id", 9000000)):
+            await session.execute(
+                text(
+                    "UPDATE pg_temp.custom_import_build_occurrence SET "
+                    "base_root_revision_id=NULL,base_child_revision_id=NULL WHERE occurrence_id=63"
+                )
+            )
+            await session.execute(
+                text(f"UPDATE pg_temp.custom_import_build_occurrence SET {column}=:value WHERE occurrence_id=63"),
+                {"value": revision_id},
+            )
+            with pytest.raises(retirement.SnapshotRetirementRefused, match="revision reference"):
+                await retirement._reference_pages(session, table, family_id)
+        assert await session.get(CustomImportSnapshotFamily, family_id) is not None
+        assert await session.get(CustomImportSnapshotRetirement, family_id) is None
 
 
 async def test_indexed_reference_proof_preserves_multirange_holes_and_unbounded_ranges(monkeypatch):

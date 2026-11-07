@@ -91,6 +91,19 @@ def _digest(document):
     return hashlib.sha256(CONTRACT.encode() + b"\0" + canonical_json(_plain(document)).encode()).digest()
 
 
+def _root_range_digest(roots):
+    """Hash a bounded ordered integer page with the existing canonical bytes."""
+    if (
+        type(roots) is not list
+        or len(roots) > ROOT_PAGE_ROWS
+        or any(type(root) is not int or root <= 0 for root in roots)
+        or roots != sorted(set(roots))
+    ):
+        raise PostSealAuditRefused("post-seal root range did not advance completely")
+    encoded = json.dumps(roots, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(CONTRACT.encode() + b"\0" + encoded.encode()).digest()
+
+
 @lru_cache(maxsize=1)
 def _sql_resource():
     raw = Path(__file__).with_name("post_seal_audit_sql.json").read_bytes()
@@ -534,12 +547,8 @@ async def _run_arm(session, context, previous):
         )
         if not roots:
             return values_by_name | {"outcome": "range_eof", "range_sha256": _digest([])}
-        if (
-            len(roots) > ROOT_PAGE_ROWS
-            or roots != sorted(set(roots))
-            or any(type(root) is not int or root <= 0 for root in roots)
-            or (previous.root_after_id is not None and roots[0] <= previous.root_after_id)
-        ):
+        range_digest = _root_range_digest(roots)
+        if previous.root_after_id is not None and roots[0] <= previous.root_after_id:
             raise PostSealAuditRefused("post-seal root range did not advance completely")
         parameters["p_10"] = roots
         values_by_name.update(
@@ -548,7 +557,7 @@ async def _run_arm(session, context, previous):
             root_eof=False,
             outcome="range_page",
             page_root_count=len(roots),
-            range_sha256=_digest(roots),
+            range_sha256=range_digest,
         )
     violation = (await session.execute(_compiled(arm["sql"], context), parameters)).first()
     if violation is not None:

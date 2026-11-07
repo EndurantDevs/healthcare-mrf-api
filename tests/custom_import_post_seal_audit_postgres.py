@@ -6,6 +6,7 @@ import hashlib
 import json
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from alembic.migration import MigrationContext
@@ -133,6 +134,37 @@ async def _assert_complete(case, progress):
         assert receipt["contract"] == audit.CONTRACT
 
 
+async def _verify_full_native_root_page(publication_case, family_id):
+    """Read the unchanged native root-page SQL at its full production cardinality."""
+    async with publication_case.sessions() as session, session.begin():
+        await scratch._bounds(session)
+        await session.execute(
+            text("CREATE TEMP TABLE custom_import_build_family (build_id bigint,root_record_id bigint) ON COMMIT DROP")
+        )
+        await session.execute(
+            text(
+                "CREATE TEMP TABLE custom_import_build_occurrence (build_id bigint,origin text,"
+                "child_revision_id bigint,root_record_id bigint) ON COMMIT DROP"
+            )
+        )
+        await session.execute(text("INSERT INTO pg_temp.custom_import_build_family SELECT 1,generate_series(1,16385)"))
+        await session.execute(
+            text("INSERT INTO pg_temp.custom_import_build_occurrence VALUES (1,'source',1,16384),(1,'source',2,16384)")
+        )
+        context = SimpleNamespace(quoted='"pg_temp"', family=SimpleNamespace(family_id=family_id), base_family=None)
+        sql = audit._sql_resource()[0]["root_page_sql"].replace("__LEAF__", "pg_temp")
+        statement = audit._compiled(sql, context)
+        parameters_by_name = {"p_1": 1, "p_2": None, "p_3": audit.ROOT_PAGE_ROWS}
+        roots = await session.scalar(statement, parameters_by_name)
+        assert roots == list(range(1, 16_385))
+        expected = hashlib.sha256(audit.CONTRACT.encode() + b"\0" + json.dumps(roots, separators=(",", ":")).encode())
+        assert audit._root_range_digest(roots) == expected.digest()
+        parameters_by_name["p_2"] = roots[-1]
+        assert await session.scalar(statement, parameters_by_name) == [16_385]
+        parameters_by_name["p_2"] = 16_385
+        assert await session.scalar(statement, parameters_by_name) is None
+
+
 async def test_manual_audit_resumes_and_authorizes_only_complete_cleanup(monkeypatch):
     monkeypatch.setattr(audit, "ROOT_PAGE_ROWS", 2)
     async with _source_case() as case:
@@ -158,6 +190,9 @@ async def test_manual_audit_resumes_and_authorizes_only_complete_cleanup(monkeyp
         assert first.checkpoint == 1 and (await _step(case, progress)).replayed
         progress = await _finish(case, first)
         await _assert_complete(case, progress)
+        with monkeypatch.context() as full_page:
+            full_page.setattr(audit, "ROOT_PAGE_ROWS", 16_384)
+            await _verify_full_native_root_page(case, family_id)
         assert await manual._proof(case, build_id) == original_proof
         assert not (await scratch._trim(case, family_id)).replayed
         assert (await scratch._trim(case, family_id)).replayed
