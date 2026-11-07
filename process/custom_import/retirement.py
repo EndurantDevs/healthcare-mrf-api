@@ -308,7 +308,12 @@ async def _reference_pages(session, table, family_id):
     columns = tuple(dict.fromkeys((*primary_columns, *(table.c[name] for name in reference_kinds_by_column))))
     after_keys = None
     while True:
-        statement = select(*columns).order_by(*primary_columns).limit(REFERENCE_PAGE_ROWS)
+        statement = (
+            select(*columns)
+            .where(or_(*(table.c[name].is_not(None) for name in reference_kinds_by_column)))
+            .order_by(*primary_columns)
+            .limit(REFERENCE_PAGE_ROWS)
+        )
         if after_keys is not None:
             statement = statement.where(tuple_(*primary_columns) > tuple_(*after_keys))
         page = statement.cte("reference_page").prefix_with("MATERIALIZED")
