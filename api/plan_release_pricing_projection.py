@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy import text
 
-from api.plan_release_source_bindings import canonical_binding_relation
+from api.plan_release_source_bindings import SOURCE_BINDING_STORAGE, canonical_binding_relation
 
 _PRICING_PROJECTION_SQL_TEMPLATE = """
        CASE
@@ -107,6 +107,7 @@ def _plan_release_serving_sql(
     pin_owner_parameter: str,
     retained: bool = False,
     source_bindings: bool = False,
+    binding_storage: str = SOURCE_BINDING_STORAGE,
 ) -> str:
     """Build release resolution SQL with an optional projection binding."""
 
@@ -131,7 +132,7 @@ def _plan_release_serving_sql(
         revision_relation=("ONLY " if retained else "") + f"{schema}.plan_release_serving_revision",
         old_pin_relation=("ONLY " if retained else "") + f"{schema}.ptg2_snapshot_pin",
         binding_relation=(
-            canonical_binding_relation(schema)
+            canonical_binding_relation(schema, binding_storage)
             if source_bindings
             else f"ONLY {schema}.plan_release_snapshot_binding_legacy"
             if retained
@@ -165,6 +166,7 @@ def plan_release_binding_set_sql(
     include_pricing_projection: bool,
     retained: bool = False,
     source_bindings: bool = False,
+    binding_storage: str = SOURCE_BINDING_STORAGE,
 ) -> str:
     """Build complete native-driver binding metadata for one bound release set."""
     from api.plan_release_source_bindings import current_source_predicate
@@ -174,6 +176,7 @@ def plan_release_binding_set_sql(
         include_pricing_projection=include_pricing_projection,
         retained=retained,
         source_bindings=source_bindings,
+        binding_storage=binding_storage,
         release_predicate="revision.plan_release_id = ANY($1::text[])"
         + (" AND " + current_source_predicate() if source_bindings else ""),
         pin_owner_parameter="$2",
@@ -199,7 +202,9 @@ async def has_pricing_projection_relation(session: Any, schema: str) -> bool:
     return bool(relation_result.scalar_one())
 
 
-def source_plan_release_serving_sql(schema: str, *, include_pricing_projection: bool) -> str:
+def source_plan_release_serving_sql(
+    schema: str, *, include_pricing_projection: bool, binding_storage: str = SOURCE_BINDING_STORAGE
+) -> str:
     """Load exact Source coordinates through the existing request Reader snapshot."""
     from api.plan_release_source_bindings import source_release_predicate
 
@@ -207,6 +212,7 @@ def source_plan_release_serving_sql(schema: str, *, include_pricing_projection: 
         schema,
         include_pricing_projection=include_pricing_projection,
         source_bindings=True,
+        binding_storage=binding_storage,
         release_predicate=source_release_predicate() + " AND revision.expected_binding_count=:expected_binding_count",
         pin_owner_parameter=":pin_owner_type",
     )

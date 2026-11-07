@@ -9,6 +9,14 @@ from typing import Literal
 
 from sqlalchemy import text
 
+from api.plan_release_custom_source_bindings import (
+    CUSTOM_BINDING_PREDICATE_SQL,
+    CUSTOM_ENTRY_PREDICATE_SQL,
+    CUSTOM_MANIFEST_PREDICATE_SQL,
+    CUSTOM_METADATA_SQL,
+    CUSTOM_SEMANTIC_JOIN_SQL,
+    CUSTOM_SOURCE_BINDING_STORAGE,
+)
 from db.plan_registry_schema import plan_registry_schema
 from db.plan_release_storage import storage_identifier
 
@@ -21,7 +29,7 @@ NOT_CURRENT_SOURCE_RELEASE = "not_current_source_release"
 _CANONICAL_BINDINGS_SQL = r"""(
  SELECT binding.serving_revision_id,binding.ordinal AS binding_ordinal,binding.snapshot_id,
         binding.source_key,binding.plan_id,binding.market_type AS plan_market_type,
-        binding.role,binding.required,jsonb_build_object() AS metadata_json
+        binding.role,binding.required,{metadata_sql} AS metadata_json
  FROM {registry_schema}.hp_plan_release_binding binding
  JOIN {registry_schema}.hp_plan_serving_revision revision
    ON revision.serving_revision_id=binding.serving_revision_id
@@ -39,13 +47,14 @@ _CANONICAL_BINDINGS_SQL = r"""(
   AND header.expected_binding_count=revision.binding_count
   AND header.expected_binding_count=release.expected_binding_count
  CROSS JOIN LATERAL (SELECT CAST(header.source_manifest AS jsonb) AS manifest) normalized
+ {semantic_join_sql}
  JOIN LATERAL jsonb_to_recordset(CASE
-   WHEN normalized.manifest->'binding_storage'=to_jsonb('source-plan-release-bindings-v1'::text)
+   WHEN normalized.manifest->'binding_storage'=to_jsonb('{binding_storage}'::text)
     AND jsonb_typeof(normalized.manifest->'bindings')='array'
    THEN normalized.manifest->'bindings' ELSE jsonb_build_array() END)
    AS sealed(ordinal integer,snapshot_id text,source_key text,plan_id text,market_type text,
              role text,required boolean,node_id text,source_file_import_id text,
-             logical_content_id text,received_installation_id uuid,custom_plan_component_id text)
+             logical_content_id text,received_installation_id uuid,custom_plan_component_id text{custom_fields})
    ON sealed.ordinal=binding.ordinal AND sealed.role=binding.role
   AND sealed.snapshot_id=binding.snapshot_id AND sealed.source_key=binding.source_key
   AND sealed.plan_id=binding.plan_id
@@ -54,10 +63,11 @@ _CANONICAL_BINDINGS_SQL = r"""(
   AND sealed.source_file_import_id IS NOT DISTINCT FROM binding.source_file_import_id
   AND nullif(sealed.logical_content_id,'') IS NOT DISTINCT FROM binding.logical_content_id
   AND sealed.received_installation_id IS NULL AND binding.received_installation_id IS NULL
-  AND sealed.custom_plan_component_id IS NULL AND binding.custom_plan_component_id IS NULL
+ {component_predicate_sql}
  WHERE jsonb_typeof(normalized.manifest)='object'
-   AND normalized.manifest->'binding_storage'=to_jsonb('source-plan-release-bindings-v1'::text)
-   AND jsonb_array_length(CASE WHEN normalized.manifest->'binding_storage'=to_jsonb('source-plan-release-bindings-v1'::text)
+   AND normalized.manifest->'binding_storage'=to_jsonb('{binding_storage}'::text)
+   {manifest_predicate_sql}
+   AND jsonb_array_length(CASE WHEN normalized.manifest->'binding_storage'=to_jsonb('{binding_storage}'::text)
     AND jsonb_typeof(normalized.manifest->'bindings')='array'
        THEN normalized.manifest->'bindings' ELSE jsonb_build_array() END)=header.expected_binding_count
    AND NOT EXISTS (
@@ -69,7 +79,7 @@ _CANONICAL_BINDINGS_SQL = r"""(
         OR jsonb_typeof(entry->'required') IS DISTINCT FROM 'boolean'
         OR (entry ? 'logical_content_id' AND jsonb_typeof(entry->'logical_content_id') NOT IN ('string','null'))
         OR (entry ? 'received_installation_id' AND jsonb_typeof(entry->'received_installation_id')<>'null')
-        OR (entry ? 'custom_plan_component_id' AND jsonb_typeof(entry->'custom_plan_component_id')<>'null')
+        {entry_predicate_sql}
         OR EXISTS (SELECT 1 FROM unnest(ARRAY['snapshot_id','source_key','plan_id','market_type',
              'role','node_id','source_file_import_id']) field(name)
              WHERE jsonb_typeof(entry->field.name) IS DISTINCT FROM 'string')
@@ -120,6 +130,7 @@ class SourceBindingAdmission:
     serving_revision_id: str
     binding_set_digest: str
     expected_binding_count: int
+    binding_storage: str = SOURCE_BINDING_STORAGE
 
     def __post_init__(self):
         if (
@@ -131,15 +142,33 @@ class SourceBindingAdmission:
             or re.fullmatch(r"[0-9a-f]{64}", self.binding_set_digest) is None
             or type(self.expected_binding_count) is not int
             or self.expected_binding_count <= 0
+            or self.binding_storage not in (SOURCE_BINDING_STORAGE, CUSTOM_SOURCE_BINDING_STORAGE)
         ):
             raise ValueError("plan_release_source_admission_invalid")
 
 
-def canonical_binding_relation(schema: str) -> str:
+def canonical_binding_relation(schema: str, binding_storage: str = SOURCE_BINDING_STORAGE) -> str:
     """Return the fixed direct Source relation without naming legacy binding storage."""
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema) is None:
         raise ValueError("plan_release_schema_invalid")
-    return _CANONICAL_BINDINGS_SQL.format(schema=schema, registry_schema=storage_identifier(required_registry_schema()))
+    if binding_storage not in (SOURCE_BINDING_STORAGE, CUSTOM_SOURCE_BINDING_STORAGE):
+        raise ValueError("plan_release_binding_storage_invalid")
+    is_custom = binding_storage == CUSTOM_SOURCE_BINDING_STORAGE
+    return _CANONICAL_BINDINGS_SQL.format(
+        schema=schema,
+        registry_schema=storage_identifier(required_registry_schema()),
+        binding_storage=binding_storage,
+        metadata_sql=CUSTOM_METADATA_SQL if is_custom else "jsonb_build_object()",
+        semantic_join_sql=CUSTOM_SEMANTIC_JOIN_SQL if is_custom else "",
+        custom_fields=",benefit_domain text,source_as_of text" if is_custom else "",
+        component_predicate_sql=CUSTOM_BINDING_PREDICATE_SQL
+        if is_custom
+        else "AND sealed.custom_plan_component_id IS NULL AND binding.custom_plan_component_id IS NULL",
+        manifest_predicate_sql=CUSTOM_MANIFEST_PREDICATE_SQL if is_custom else "",
+        entry_predicate_sql=CUSTOM_ENTRY_PREDICATE_SQL
+        if is_custom
+        else "OR (entry ? 'custom_plan_component_id' AND jsonb_typeof(entry->'custom_plan_component_id')<>'null')",
+    )
 
 
 def storage_admissions(header_rows) -> dict[str, SourceBindingAdmission | Literal["not_current_source_release"] | None]:
@@ -156,7 +185,7 @@ def storage_admissions(header_rows) -> dict[str, SourceBindingAdmission | Litera
         if (
             header_by_field["manifest_type"] != "object"
             or header_by_field["storage_type"] != "string"
-            or header_by_field["binding_storage"] != SOURCE_BINDING_STORAGE
+            or header_by_field["binding_storage"] not in (SOURCE_BINDING_STORAGE, CUSTOM_SOURCE_BINDING_STORAGE)
         ):
             raise ValueError("plan_release_binding_storage_invalid")
         count = header_by_field["expected_binding_count"]
@@ -167,6 +196,7 @@ def storage_admissions(header_rows) -> dict[str, SourceBindingAdmission | Litera
             header_by_field["serving_revision_id"],
             header_by_field["binding_set_digest"],
             count,
+            header_by_field["binding_storage"],
         )
         admission_by_release_id[release_id] = (
             NOT_CURRENT_SOURCE_RELEASE if header_by_field["current_header_count"] == 0 else admission
@@ -208,7 +238,11 @@ async def load_source_binding_rows(session, schema, admission, *, include_pricin
 
     await require_source_binding_custody(session, schema, admission)
     result = await session.execute(
-        text(source_plan_release_serving_sql(schema, include_pricing_projection=include_pricing_projection)),
+        text(
+            source_plan_release_serving_sql(
+                schema, include_pricing_projection=include_pricing_projection, binding_storage=admission.binding_storage
+            )
+        ),
         source_query_parameters(admission, "plan_release_serving_revision"),
     )
     rows = [dict(getattr(row, "_mapping", row)) for row in result]
