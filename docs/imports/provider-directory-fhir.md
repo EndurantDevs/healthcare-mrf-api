@@ -1730,6 +1730,14 @@ Medicaid-only
 coverage nor coverage of every affiliated insurer, product or state; preserve
 native plan, network and office participation evidence.
 
+The shared scheduler excludes explicitly unsupported types from its parallel
+wave. With deferred isolated acquisition, the seven supported Anthem types can
+scan independently, each owning its cursor; existing transport, storage and
+capacity checks may lower concurrency. An Anthem HTTP 500 page can use at most
+two existing cooldown cycles after its quick retries. Each cycle keeps the same
+URL and honors `Retry-After` and the resource deadline. Exhausted scans retain
+their checkpoints and remain incomplete and non-current.
+
 Configure an exact `api_bases` or `sources` credential rule using the existing
 secret-mounted JSON format below. Anthem uses OAuth2 `client_credentials` with
 Basic client authentication at

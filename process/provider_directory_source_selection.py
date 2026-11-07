@@ -30,6 +30,23 @@ def retry_after_limit(directory, source_record):
     return None if is_credentialed_rest_source(directory, source_record) else 600.0
 
 
+def is_pagination_cooldown_failure(directory, status_code, fetch_error, *, source_record=None):
+    """Classify cooldown failures under the reviewed source transport policy."""
+    if status_code in {423, 429}:
+        return True
+    if (
+        status_code == 500
+        and fetch_error is None
+        and source_record is not None
+        and is_credentialed_rest_source(directory, source_record)
+    ):
+        return True
+    if not fetch_error:
+        return False
+    normalized_error = fetch_error.lower()
+    return "timeout" in normalized_error or "timed out" in normalized_error
+
+
 def credentialed_rest_request_allowed(directory, source_record, url):
     """Reject origin, path and encoded traversal changes before resolving credentials."""
     if not is_credentialed_rest_source(directory, source_record):
