@@ -63,6 +63,7 @@ from process.import_status_events import (
     flush_terminal_status_event,
 )
 from process.live_progress import enqueue_live_progress
+from process.mrf_discovery_acquisition_guard import acquisition_command, require_acquisition_owner
 from process.mrf_discovery_catalog_manifest import (
     refresh_catalog_paging_manifests,
 )
@@ -14761,11 +14762,17 @@ async def _probe_mrf_file_heads(
         connector=connector,
         trust_env=False,
     ) as session:
-        workers = [asyncio.create_task(_file_probe_worker(execution_context, session)) for _ in range(worker_count)]
-        writer_task = asyncio.create_task(_file_probe_writer(execution_context))
-        await target_queue.join()
-        await asyncio.gather(*workers)
-        return await writer_task
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                for _ in range(worker_count):
+                    tasks.create_task(_file_probe_worker(execution_context, session))
+                writer_task = tasks.create_task(_file_probe_writer(execution_context))
+                await target_queue.join()
+        except BaseExceptionGroup as failure_group:
+            if len(failure_group.exceptions) == 1:
+                raise failure_group.exceptions[0] from None
+            raise
+        return writer_task.result()
 
 
 @dataclass(frozen=True)
@@ -15506,6 +15513,7 @@ def _run_discovery_source_process(
         try:
             if should_connect_database:
                 await ensure_database(processing_options.test_mode)
+                await require_acquisition_owner(processing_options.observation_run_id)
             return await _process_discovery_source_record(
                 source_record,
                 processing_options,
@@ -16181,33 +16189,39 @@ async def run_mrf_source_discovery_command(
     mrf_discovery_root_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Run source discovery with optional crawling and file probing."""
-    return await _execute_discovery_command(
-        _DiscoveryCommandState(
-            test_mode=test_mode,
-            provider=provider,
-            limit=limit,
-            source_entity_types=source_entity_types,
-            source_payer_query=source_payer_query,
-            dry_run=dry_run,
-            check_urls=check_urls,
-            crawl=crawl,
-            probe_files=probe_files,
-            file_probe_limit=file_probe_limit,
-            file_probe_types=file_probe_types,
-            file_probe_entity_types=file_probe_entity_types,
-            file_probe_payer_query=file_probe_payer_query,
-            max_toc_bytes=max_toc_bytes,
-            concurrency=concurrency,
-            crawl_target_limit=crawl_target_limit,
-            run_id=run_id,
-            retry_of_run_id=retry_of_run_id,
-            mrf_discovery_root_run_id=mrf_discovery_root_run_id,
-        )
-    )
+    command_params_by_name = dict(locals())
+    if dry_run is not True and isinstance(run_id, str) and run_id:
+        await ensure_database(test_mode)
+    async with acquisition_command(run_mrf_source_discovery_command, command_params_by_name):
+        return await _execute_discovery_command(_DiscoveryCommandState(**command_params_by_name))
 
 
 main = run_mrf_source_discovery_command
 main.__name__ = "main"
+
+
+def discovery_command_params(task: dict[str, Any]) -> dict[str, Any]:
+    """Use the worker's exact conversions for execution admission and dispatch."""
+    return {
+        "test_mode": bool(task.get("test_mode", task.get("test", False))),
+        "provider": task.get("provider"),
+        "limit": _as_int(task.get("limit")),
+        "source_entity_types": task.get("source_entity_types"),
+        "source_payer_query": task.get("source_payer_query"),
+        "dry_run": bool(task.get("dry_run", False)),
+        "check_urls": bool(task.get("check_urls", False)),
+        "crawl": bool(task.get("crawl", False)),
+        "probe_files": bool(task.get("probe_files", False)),
+        "file_probe_limit": _as_int(task.get("file_probe_limit")),
+        "file_probe_types": task.get("file_probe_types"),
+        "file_probe_entity_types": task.get("file_probe_entity_types"),
+        "file_probe_payer_query": task.get("file_probe_payer_query"),
+        "max_toc_bytes": int(task.get("max_toc_bytes") or MAX_TOC_BYTES_DEFAULT),
+        "concurrency": int(task.get("concurrency") or DEFAULT_CONCURRENCY),
+        "crawl_target_limit": _as_int(task.get("crawl_target_limit")),
+        "retry_of_run_id": str(task.get("retry_of_run_id") or "").strip() or None,
+        "mrf_discovery_root_run_id": str(task.get("mrf_discovery_root_run_id") or "").strip() or None,
+    }
 
 
 async def process_mrf_source_discovery_data(
@@ -16224,27 +16238,7 @@ async def process_mrf_source_discovery_data(
         ).strip()
         or None
     )
-    return await main(
-        test_mode=bool(task.get("test_mode", task.get("test", False))),
-        provider=task.get("provider"),
-        limit=_as_int(task.get("limit")),
-        source_entity_types=task.get("source_entity_types"),
-        source_payer_query=task.get("source_payer_query"),
-        dry_run=bool(task.get("dry_run", False)),
-        check_urls=bool(task.get("check_urls", False)),
-        crawl=bool(task.get("crawl", False)),
-        probe_files=bool(task.get("probe_files", False)),
-        file_probe_limit=_as_int(task.get("file_probe_limit")),
-        file_probe_types=task.get("file_probe_types"),
-        file_probe_entity_types=task.get("file_probe_entity_types"),
-        file_probe_payer_query=task.get("file_probe_payer_query"),
-        max_toc_bytes=int(task.get("max_toc_bytes") or MAX_TOC_BYTES_DEFAULT),
-        concurrency=int(task.get("concurrency") or DEFAULT_CONCURRENCY),
-        crawl_target_limit=_as_int(task.get("crawl_target_limit")),
-        run_id=run_id,
-        retry_of_run_id=(str(task.get("retry_of_run_id") or "").strip() or None),
-        mrf_discovery_root_run_id=(str(task.get("mrf_discovery_root_run_id") or "").strip() or None),
-    )
+    return await main(run_id=run_id, **discovery_command_params(task))
 
 
 process_data = process_mrf_source_discovery_data

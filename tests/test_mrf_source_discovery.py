@@ -8,6 +8,7 @@ import json
 import logging
 import types
 import zipfile
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -16,6 +17,17 @@ from tests.mrf_toc_stream_support import toc_session
 from tests.mrf_toc_stream_support import zip_members as encode_zip_members
 
 discovery = importlib.import_module("process.mrf_source_discovery")
+
+
+@pytest.fixture
+def admitted_acquisition(monkeypatch):
+    """Isolate progress/persistence components from separately tested admission."""
+
+    @asynccontextmanager
+    async def admitted(*args):
+        yield
+
+    monkeypatch.setattr(discovery, "acquisition_command", admitted)
 
 
 _EXPECTED_ANCILLARY_BENEFIT_LINES_BY_PAYER_NAME = types.MappingProxyType(
@@ -13323,7 +13335,7 @@ class _DirectDiscoveryHarness:
 
 
 @pytest.mark.asyncio
-async def test_direct_discovery_run_emits_visible_state(monkeypatch):
+async def test_direct_discovery_run_emits_visible_state(monkeypatch, admitted_acquisition):
     """Verify the source-discovery progress and persistence contract."""
     harness = _DirectDiscoveryHarness()
     monkeypatch.setattr(discovery, "_load_candidates", harness.load_candidates)
@@ -13382,7 +13394,7 @@ async def test_direct_discovery_run_emits_visible_state(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch):
+async def test_direct_discovery_run_closes_visible_state_on_failure(monkeypatch, admitted_acquisition):
     """Direct CLI discovery failures must publish terminal visible state."""
     push_calls = []
     control_events = []

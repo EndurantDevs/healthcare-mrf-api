@@ -3439,6 +3439,7 @@ async def test_provider_retry_rejects_conflicting_parents_before_replay(monkeypa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("importer", ["openaddresses", "mrf-source-discovery"])
 async def test_nested_retry_normalization_is_limited_to_provider_directory(monkeypatch, importer):
+    monkeypatch.setattr(control_imports.mrf_acquisition, "require_acquisition", AsyncMock())
     _install_provider_admission_stubs(monkeypatch, [])
     monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", AsyncMock(return_value=None))
     monkeypatch.setattr(control_imports, "_has_isolated_pricing_admission", AsyncMock(return_value=False))

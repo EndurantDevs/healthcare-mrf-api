@@ -909,8 +909,8 @@ class Database:
             yield proxy
 
     @asynccontextmanager
-    async def acquire_driver(self) -> AsyncIterator[Any]:
-        """Yield a raw driver connection without a SQLAlchemy-owned transaction."""
+    async def acquire_driver(self, *, detached: bool = False) -> AsyncIterator[Any]:
+        """Yield a raw driver without an owned transaction, optionally outside the data pool."""
         if self.has_reader_session():
             raise RuntimeError("Reader scopes cannot acquire a Writer driver")
         if self.engine is None:
@@ -923,6 +923,8 @@ class Database:
                 "driver_connection",
                 raw_connection,
             )
+            if detached:
+                raw_connection.detach()
             try:
                 yield driver_connection
             except BaseException:
