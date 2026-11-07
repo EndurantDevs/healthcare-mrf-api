@@ -77,6 +77,7 @@ async def test_projection_finality_failure_preserves_publication_error_contract(
 
     failure = QueryProjectionUnavailable("synthetic projection unavailable")
     monkeypatch.setattr(read_identity, "verify_generation_storage", AsyncMock())
+    monkeypatch.setattr(publication, "_finality_materialization_models", AsyncMock(return_value=None))
     monkeypatch.setattr(query_projection_finality, "validate_sealed_projection", AsyncMock(side_effect=failure))
     with pytest.raises(PublicationConflict, match="synthetic projection unavailable") as caught:
         await publication._validate_sealed_projection(object(), object(), object())

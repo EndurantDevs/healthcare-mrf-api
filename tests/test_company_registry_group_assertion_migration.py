@@ -30,8 +30,18 @@ def _migration(revision=REVISION):
 
 
 def _assert_source_inventory_migration_head(script):
-    """Require the inventory head and its refresh and catalog predecessors."""
-    assert script.get_heads() == ["20261107010000_custom_import_child_reference_aggregate"]
+    """Require the current head and exact inventory, refresh and catalog lineage."""
+    assert script.get_heads() == ["20261107010000_custom_import_retained_copy"]
+    for revision, predecessor in (
+        ("20261107010000_custom_import_retained_copy", "20261104020000_custom_import_family_blocks"),
+        ("20261104020000_custom_import_family_blocks", "20261107010000_custom_import_child_reference_aggregate"),
+        ("20261107010000_custom_import_child_reference_aggregate", "20261104010000_custom_import_unlogged_landing"),
+        ("20261104010000_custom_import_unlogged_landing", "20261102040000_custom_import_post_seal_audit"),
+        ("20261102040000_custom_import_post_seal_audit", "20261102030000_custom_import_build_scratch"),
+        ("20261102030000_custom_import_build_scratch", "20261102010000_custom_import_snapshot_retirement"),
+        ("20261102010000_custom_import_snapshot_retirement", "20261029010000_registry_source_inventory"),
+    ):
+        assert script.get_revision(revision).down_revision == predecessor
     assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
     )
@@ -311,7 +321,7 @@ def test_native_fixture_head_checks_preserve_history_without_database_work():
     from tests.test_provider_directory_profile_capacity_adoption_postgres import _assert_registry_migration_lineage
 
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert _assert_registry_migration_lineage() == {"20261107010000_custom_import_child_reference_aggregate"}
+    assert _assert_registry_migration_lineage() == {"20261107010000_custom_import_retained_copy"}
     assert _assert_address_migration_chain(script) is None
 
 

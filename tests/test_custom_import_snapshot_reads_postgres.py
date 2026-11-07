@@ -723,6 +723,41 @@ async def _assert_snapshot_reader_locks(session, pinned):
 
 
 @pytest.mark.parametrize("snapshot", [False, True])
+async def test_readonly_layout_binding_uses_one_query_and_keeps_native_pins(snapshot):
+    async with _pinned_read_case(snapshot=snapshot) as pinned, _readonly(pinned) as session:
+        with _captured_statements(pinned.case.engine) as statements:
+            binding = await read_identity.resolve_generation_snapshot_binding(session, pinned.target)
+
+        assert binding == read_identity.GenerationSnapshotBinding(pinned.family_id, snapshot)
+        assert len(statements) == 1
+        assert "WITH pinned AS MATERIALIZED" in statements[0]
+        assert statements[0].count("resolve_custom_import_generation_snapshot(") == 1
+        if snapshot:
+            # This real legacy fixture includes origin storage and serving indexes.
+            await _assert_snapshot_reader_locks(session, pinned)
+
+
+async def test_readonly_complete_legacy_layout_ignores_unregistered_block_sentinel():
+    async with _pinned_read_case() as pinned:
+        namespace = snapshot_schema(pinned.family_id)
+        async with pinned.case.sessions() as owner, owner.begin():
+            await owner.execute(text(f'CREATE TABLE "{namespace}".custom_import_block_family (synthetic integer)'))
+        async with _readonly(pinned) as session:
+            binding = await read_identity.resolve_generation_snapshot_binding(session, pinned.target)
+            assert binding == read_identity.GenerationSnapshotBinding(pinned.family_id, True)
+            with _captured_statements(pinned.case.engine) as statements:
+                context = await read_core._load_read_context(session, pinned.target)
+            assert context.family_block_binding is None
+            assert sum("resolve_custom_import_generation_snapshot(" in statement for statement in statements) == 1
+            assert not any("resolve_custom_import_snapshot_relations(" in statement for statement in statements)
+            assert not await session.scalar(
+                text("SELECT has_function_privilege(current_user, :identity, 'EXECUTE')"),
+                {"identity": f'"{pinned.case.schema_name}".resolve_custom_import_snapshot_relations(bigint)'},
+            )
+            await _assert_snapshot_reader_locks(session, pinned)
+
+
+@pytest.mark.parametrize("snapshot", [False, True])
 async def test_readonly_snapshot_and_legacy_grouped_child_parity(snapshot):
     """Compare complete grouped reads while proving namespace and read-lock isolation."""
 

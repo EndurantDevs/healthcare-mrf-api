@@ -14,6 +14,9 @@ pub mod contact_canon;
 pub mod copy_format;
 pub mod custom_import_graph;
 pub mod custom_import_graph_projection;
+#[cfg(any(feature = "python", test))]
+mod custom_import_landing;
+pub mod custom_import_route_merge;
 pub mod custom_import_scalar;
 pub mod custom_import_source;
 pub mod custom_import_source_columns;
@@ -123,6 +126,7 @@ mod python_api {
     include!("python_hospital_price.rs");
     include!("python_custom_import.rs");
     include!("python_custom_import_source_columns.rs");
+    include!("python_custom_import_route_merge.rs");
     include!("python_custom_import_graph.rs");
     include!("python_custom_import_graph_projection.rs");
     include!("python_registry.rs");
@@ -706,8 +710,14 @@ mod python_api {
         m.add_function(wrap_pyfunction!(hospital_price_decode_service_block, m)?)?;
         m.add_function(wrap_pyfunction!(hospital_price_decode_fact_block, m)?)?;
         m.add_function(wrap_pyfunction!(custom_import_scalar_frames_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            crate::custom_import_landing::custom_import_landing_manifest_v1,
+            m
+        )?)?;
         m.add_function(wrap_pyfunction!(custom_import_source_documents_v1, m)?)?;
         m.add_function(wrap_pyfunction!(custom_import_source_columns_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(custom_import_route_sort_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(custom_import_route_merge_v1, m)?)?;
         m.add_class::<SourceColumnsPlan>()?;
         m.add_function(wrap_pyfunction!(custom_import_source_columns_plan_v1, m)?)?;
         m.add_function(wrap_pyfunction!(
@@ -866,6 +876,7 @@ mod python_api {
                 assert!(module.hasattr("canonicalize_contact_batch").unwrap());
                 assert!(module.hasattr("custom_import_source_documents_v1").unwrap());
                 assert!(module.hasattr("custom_import_source_columns_v1").unwrap());
+                assert!(module.hasattr("custom_import_landing_manifest_v1").unwrap());
                 assert!(module
                     .hasattr("custom_import_source_columns_plan_v1")
                     .unwrap());

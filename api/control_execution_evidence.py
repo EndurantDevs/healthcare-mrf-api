@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import hmac
 import json
 import os
@@ -281,3 +282,170 @@ async def execution_evidence(request):
     """Read exact retained evidence through the dedicated operator audience."""
 
     return await serve_execution_evidence(request, getattr(request.ctx, "sa_session", None))
+
+
+async def serve_owner_handoff(request, factory, *, operation):
+    """Fixed private owner operations; signed scope is required before mutation."""
+    from process.custom_import import family_shard_handoff as handoff
+    from process.custom_import.family_shard_owner_cli import profile
+
+    if not _is_authorized(getattr(request, "headers", None)):
+        return _error("forbidden", 403)
+    try:
+        if getattr(request, "query_string", ""):
+            raise ValueError()
+        request_by_field = handoff.document(request.body)
+        profile_document, key, _limits = profile()
+        if operation == "prepare":
+            return await _prepare_owner_handoff(factory, request_by_field, profile_document)
+        return await _signed_owner_handoff(factory, request_by_field, profile_document, key, operation)
+    except Exception:
+        # Neither the request nor exception text is echoed (the body contains a bearer).
+        return _error("owner_handoff_unavailable", 503)
+
+
+def _owner_factory():
+    from db.connection import db
+
+    return db.session_factory
+
+
+@blueprint.post("/custom-import/owner-handoff-prepare")
+async def owner_handoff_prepare(request):
+    """Prepare one native original-request descriptor through private authentication."""
+    return await serve_owner_handoff(request, _owner_factory(), operation="prepare")
+
+
+@blueprint.post("/custom-import/owner-handoff")
+async def owner_handoff(request):
+    """Accept one signed original request into durable owner custody."""
+    return await serve_owner_handoff(request, _owner_factory(), operation="launch")
+
+
+@blueprint.post("/custom-import/owner-handoff-observe")
+async def owner_handoff_observe(request):
+    """Observe exact owner custody and Job identity after an uncertain reply."""
+    return await serve_owner_handoff(request, _owner_factory(), operation="observe")
+
+
+@blueprint.post("/custom-import/owner-handoff-stop")
+async def owner_handoff_stop(request):
+    """Stop the exact owner Job only after native cancellation or finality."""
+    return await serve_owner_handoff(request, _owner_factory(), operation="stop")
+
+
+@blueprint.post("/custom-import/owner-handoff-cleanup")
+async def owner_handoff_cleanup(request):
+    """Release protected files only after native finality and exact Pod absence."""
+    return await serve_owner_handoff(request, _owner_factory(), operation="cleanup")
+
+
+@blueprint.post("/custom-import/owner-attempt")
+async def owner_attempt(request):
+    """Operate one explicitly signed recovery child of the original owner."""
+    from api.custom_import_owner_attempt import serve
+
+    return await serve(request, _owner_factory())
+
+
+async def _prepare_owner_handoff(factory, request_by_field, profile_document):
+    """Resolve the native sealed request without a cursor or worker result hint."""
+    from process.custom_import import family_shard_handoff as handoff
+    from process.custom_import.family_shard_production import original_request
+
+    if type(request_by_field) is not dict or request_by_field.keys() != {"locator", "bearer"}:
+        raise ValueError()
+    locator = request_by_field["locator"]
+    if type(locator) is not dict or locator.keys() != {
+        "dataset_id",
+        "definition_revision_id",
+        "source_binding_revision_id",
+        "controller_execution_id",
+    }:
+        raise ValueError()
+    for name in ("dataset_id", "definition_revision_id", "source_binding_revision_id"):
+        _positive_id(locator[name])
+    if (
+        type(locator["controller_execution_id"]) is not str
+        or _IDEMPOTENCY_KEY.fullmatch(locator["controller_execution_id"]) is None
+    ):
+        raise ValueError()
+    original = await original_request(
+        factory, locator, handoff.checked_bearer(request_by_field["bearer"].encode("ascii"))
+    )
+    return _reply(
+        {
+            "native": original.native,
+            "owner_profile_sha256": hashlib.sha256(handoff.canonical(profile_document)).hexdigest(),
+            "owner_image": profile_document["image"],
+        }
+    )
+
+
+async def _signed_owner_handoff(factory, request_by_field, profile_document, key, operation):
+    """Dispatch only the closed signed owner lifecycle operations."""
+    import time
+
+    from api import custom_import_owner_retirement as retired
+    from api import custom_import_owner_worker as owner
+    from process.custom_import import family_shard_handoff as handoff
+    from process.custom_import.family_shard_production import retained_state
+
+    fields = (
+        {"signed", "bearer"}
+        if operation == "launch"
+        else {"signed", "receipt"}
+        if operation in {"stop", "cleanup"}
+        else {"signed"}
+    )
+    if type(request_by_field) is not dict or request_by_field.keys() != fields:
+        raise ValueError()
+    signed = request_by_field["signed"]
+    bearer = handoff.checked_bearer(request_by_field["bearer"].encode("ascii")) if operation == "launch" else None
+    handoff.verify(signed, verifying_key=key, bearer=bearer, now=time.time() if operation == "launch" else None)
+    owner.require_profile(signed, profile_document)
+    if operation == "launch":
+        owner_receipt = await owner.launch(signed, bearer, factory)
+        return _reply(owner_receipt | owner.custody_receipt(signed))
+    state = (
+        await retained_state(factory, signed["descriptor"])
+        if operation == "observe"
+        else await retired.terminal_state(factory, signed, profile_document)
+    )
+    if operation == "observe":
+        owner_receipt = await owner.observed(signed, profile_document)
+        if owner_receipt is not None:
+            handoff.is_launch_file_created(
+                signed, "job.json", {"job_uid": owner_receipt["job_uid"], "handoff_id": handoff.identity(signed)}
+            )
+        return _reply((owner_receipt or {"status": "absent"}) | owner.custody_receipt(signed) | {"engine_state": state})
+    if state not in {"canceling", "canceled", "failed", "completed", "no_change", "retired"}:
+        raise ValueError()
+    receipt = request_by_field["receipt"]
+    if type(receipt) is not dict or receipt.get("handoff_id") != handoff.identity(signed):
+        raise ValueError()
+    absent = await owner.is_stopped(
+        signed, profile_document, expected_uid=receipt.get("job_uid"), require_terminal=operation == "cleanup"
+    )
+    is_cleaned = False
+    if operation == "cleanup" and absent:
+        if state == "canceling":
+            raise ValueError()
+        if await retired.ensure_files_cleaned(factory, signed, profile_document):
+            owner.cleanup(signed, receipt)
+            is_cleaned = True
+    return _reply(
+        {
+            "handoff_id": handoff.identity(signed),
+            "pods_absent": absent,
+            "cleaned": is_cleaned,
+        }
+    )
+
+
+@blueprint.post("/custom-import/retained-capture-copy")
+async def retained_capture_copy(request):
+    """Delegate a closed maintenance operation through the existing private authority."""
+    from api.custom_import_retained_copy import serve
+
+    return await serve(request, _owner_factory())

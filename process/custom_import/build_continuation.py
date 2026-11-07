@@ -367,6 +367,43 @@ async def start_build_continuation(session, authorization, nonce, *, lease_secon
     return request
 
 
+async def reopen_build_continuation(session, authorization, nonce, *, lease_seconds):
+    """Recover the current started epoch without consuming or renewing a lease."""
+    from process.custom_import.continuation_runtime import verify_continuation_scope
+
+    document = parse_build_continuation_authorization(authorization)
+    if (
+        type(nonce) is not bytes
+        or len(nonce) != 32
+        or not _is_positive(lease_seconds)
+        or lease_seconds > MAX_LEASE_SECONDS
+    ):
+        raise ValueError("invalid continuation reopen")
+    authorization_record = (
+        await session.scalars(
+            select(CustomImportBuildContinuation).where(
+                CustomImportBuildContinuation.authorization_id == document["authorization_id"]
+            )
+        )
+    ).one_or_none()
+    if authorization_record is None or authorization_record.canonical_authorization != authorization_bytes(
+        document
+    ).decode("utf-8"):
+        raise IdempotencyConflict("continuation authorization is unavailable")
+    execution, lease, build = await _locked_retained(
+        session, authorization_record.dataset_id, authorization_record.execution_id, authorization_record.build_id
+    )
+    snapshot = await _snapshot_row(session, document, lock=False)
+    _same_build(document, execution, build, snapshot)
+    _eligible(execution, lease, build, snapshot, first=False)
+    if lease.continuation_started_at is None:
+        raise IdempotencyConflict("continuation epoch has not started")
+    await _require_base_and_capture(session, execution, build)
+    request = await _request(session, authorization_record, build, nonce, lease_seconds)
+    verify_continuation_scope(request, execution, lease, authorization_record, await database_now(session), build=build)
+    return request
+
+
 async def _request(session, authorization_record, build, nonce, lease_seconds):
     from process.custom_import.build_source import SourceBuildRequest
 

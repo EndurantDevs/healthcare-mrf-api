@@ -297,9 +297,10 @@ async def _indexed_revision_references(session, table, family_id, reference_kind
     }
 
 
-async def _reference_pages(session, table, family_id):
+async def _reference_pages(session, table, family_id, reference_kinds_by_column=None):
     """Probe indexed ID intervals first; page only the remaining reference columns."""
-    reference_kinds_by_column = await _indexed_revision_references(session, table, family_id, _REFERENCES[table.name])
+    columns = _REFERENCES[table.name] if reference_kinds_by_column is None else reference_kinds_by_column
+    reference_kinds_by_column = await _indexed_revision_references(session, table, family_id, columns)
     if not reference_kinds_by_column:
         return
     primary_columns = tuple(table.primary_key.columns)
@@ -343,15 +344,28 @@ async def _reference_pages(session, table, family_id):
 
 
 async def _revision_references(session, family, retained, *, include_canonical=True):
+    from process.custom_import.retirement_storage import (
+        assert_no_membership_references,
+        reference_columns,
+        resolve_storage,
+    )
+
     if not await session.scalar(select(exists().where(CustomImportRevisionHome.family_id == family.family_id))):
         return
     canonical_tables_by_name = {model.__tablename__: model.__table__ for model in SNAPSHOT_MODELS}
-    stores = [snapshot_tables(row.family_id) for row in retained if row.family_id != family.family_id]
     if include_canonical:
-        stores.insert(0, canonical_tables_by_name)
-    for store in stores:
-        for name in set(_REFERENCES) & store.keys():
-            await _reference_pages(session, store[name], family.family_id)
+        for name in set(_REFERENCES) & canonical_tables_by_name.keys():
+            await _reference_pages(session, canonical_tables_by_name[name], family.family_id)
+    _schema, quoted = await _owner_schema(session)
+    for retained_family in retained:
+        if retained_family.family_id == family.family_id:
+            continue
+        storage = await resolve_storage(session, quoted, retained_family)
+        for table in storage.tables_by_name.values():
+            columns = reference_columns(storage, table)
+            if columns:
+                await _reference_pages(session, table, family.family_id, columns)
+        await assert_no_membership_references(session, quoted, storage, family.family_id)
     for retained_family in retained:
         if retained_family.family_id != family.family_id and retained_family.origin_table_oid is not None:
             origin = Table(
@@ -368,32 +382,35 @@ async def _revision_references(session, family, retained, *, include_canonical=T
 
 
 async def _locked_relations(session, quoted, family, retained):
+    from process.custom_import.retirement_storage import resolve_storage
+
     projection_names = await lock_historical_projection(session, family)
     for row in retained:
-        await session.execute(
-            text(f"SELECT * FROM {quoted}.resolve_custom_import_snapshot_relations(:family)"), {"family": row.family_id}
-        )
+        storage = await resolve_storage(session, quoted, row)
         namespace = snapshot_schema(row.family_id)
-        names = list(snapshot_tables(row.family_id))
+        names = list(storage.tables_by_name)
         if row.landing_table_oid is not None:
             names.append("source_bulk_landing")
         if row.origin_table_oid is not None:
             names.append("legacy_copy_origin")
         if row.family_id == family.family_id:
             names.extend(projection_names)
-        targets = ",".join(f'"{namespace}"."{name}"' for name in names)
+        targets = ",".join(f'"{namespace}"."{name}"' for name in dict.fromkeys(names))
         mode = "ACCESS EXCLUSIVE" if row.family_id == family.family_id else "ACCESS SHARE"
         await session.execute(text(f"LOCK TABLE {targets} IN {mode} MODE NOWAIT"))
         if row.family_id != family.family_id and row.frozen_at is not None:
-            await _close_frozen_reference_heaps(session, row)
-        await session.execute(
-            text(f"SELECT * FROM {quoted}.resolve_custom_import_snapshot_relations(:family)"), {"family": row.family_id}
-        )
+            await _close_frozen_reference_heaps(session, row, quoted)
+        await resolve_storage(session, quoted, row)
 
 
-async def _close_frozen_reference_heaps(session, family):
+async def _close_frozen_reference_heaps(session, family, quoted=None):
     """Keep frozen reference scans stable against owner DML while allowing reads."""
-    names = sorted(set(_REFERENCES) & snapshot_tables(family.family_id).keys())
+    from process.custom_import.retirement_storage import reference_tables, resolve_storage
+
+    if quoted is None:
+        _schema, quoted = await _owner_schema(session)
+    storage = await resolve_storage(session, quoted, family)
+    names = sorted(reference_tables(storage))
     if family.origin_table_oid is not None:
         names.append("legacy_copy_origin")
     namespace = snapshot_schema(family.family_id)
@@ -403,16 +420,36 @@ async def _close_frozen_reference_heaps(session, family):
 
 async def _close_mutable_references(session, quoted, retained):
     """Close writes only for the short final proof; never wait behind a writer."""
+    from process.custom_import.retirement_storage import reference_tables, resolve_storage
+
     tables = [f'{quoted}."{model.__tablename__}"' for model in SNAPSHOT_MODELS if model.__tablename__ in _REFERENCES]
     for row in retained:
         if row.frozen_at is not None:
             continue
         namespace = snapshot_schema(row.family_id)
-        names = set(_REFERENCES) & snapshot_tables(row.family_id).keys()
+        storage = await resolve_storage(session, quoted, row)
+        names = reference_tables(storage)
         tables.extend(f'"{namespace}"."{name}"' for name in sorted(names))
         if row.origin_table_oid is not None:
             tables.append(f'"{namespace}".legacy_copy_origin')
     await session.execute(text("LOCK TABLE " + ",".join(tables) + " IN SHARE MODE NOWAIT"))
+
+
+async def _registry_targets(session, quoted):
+    """Close the additive block audit registries when their migration is installed."""
+    names = ["custom_import_snapshot_family", "custom_import_snapshot_relation"]
+    block_names = ("custom_import_family_block_layout", "custom_import_family_block_relation")
+    installed = (
+        await session.execute(
+            text("SELECT pg_catalog.to_regclass(:layout),pg_catalog.to_regclass(:relations)"),
+            {"layout": quoted + "." + block_names[0], "relations": quoted + "." + block_names[1]},
+        )
+    ).one()
+    if any(value is not None for value in installed):
+        if any(value is None for value in installed):
+            raise SnapshotRetirementRefused("snapshot retirement block registry is incomplete")
+        names.extend(block_names)
+    return ",".join(quoted + "." + name for name in names)
 
 
 async def _commit_reference_closure(session, quoted, family, retained, engine_id, reason):
@@ -429,10 +466,7 @@ async def _commit_reference_closure(session, quoted, family, retained, engine_id
         family_columns = tuple(CustomImportSnapshotFamily.__table__.columns)
         census = [tuple(getattr(entry, column.name) for column in family_columns) for entry in retained]
         await session.execute(
-            text(
-                f"LOCK TABLE {quoted}.custom_import_snapshot_family, {quoted}.custom_import_snapshot_relation "
-                "IN SHARE ROW EXCLUSIVE MODE NOWAIT"
-            )
+            text(f"LOCK TABLE {await _registry_targets(session, quoted)} IN SHARE ROW EXCLUSIVE MODE NOWAIT")
         )
         fresh_census = (
             await session.execute(
@@ -462,6 +496,9 @@ async def _commit_reference_closure(session, quoted, family, retained, engine_id
 
 
 async def _physical_drop(session, quoted, family):
+    from process.custom_import.retirement_storage import resolve_storage
+
+    storage = await resolve_storage(session, quoted, family)
     namespace = snapshot_schema(family.family_id)
     routines = (
         await session.execute(
@@ -497,18 +534,23 @@ async def _physical_drop(session, quoted, family):
             raise SnapshotRetirementRefused("snapshot retirement routine dependencies are cyclic")
         for oid in ready_oids:
             await session.execute(text(f"DROP FUNCTION {signatures_by_oid.pop(oid)} RESTRICT"))
-    names = list(snapshot_tables(family.family_id))
+    names = list(storage.tables_by_name)
     if family.landing_table_oid is not None:
         names.append("source_bulk_landing")
     if family.origin_table_oid is not None:
         names.append("legacy_copy_origin")
-    if await session.scalar(select(exists().where(CustomImportQueryProjection.family_id == family.family_id))):
+    if not storage.is_block and await session.scalar(
+        select(exists().where(CustomImportQueryProjection.family_id == family.family_id))
+    ):
         names.extend(("custom_import_derived_root", "custom_import_derived_child"))
     qualified_tables_sql = ",".join(f'"{namespace}"."{name}"' for name in names)
     # Native RESTRICT protects external dependents, including row-type consumers.
     await session.execute(text(f"DROP TABLE {qualified_tables_sql} RESTRICT"))
     await session.execute(text(f'DROP SCHEMA "{namespace}" RESTRICT'))
-    for model in (CustomImportRevisionHome, CustomImportSnapshotRelation):
+    models = (
+        (CustomImportRevisionHome,) if storage.is_block else (CustomImportRevisionHome, CustomImportSnapshotRelation)
+    )
+    for model in models:
         delete_result = await session.execute(delete(model).where(model.family_id == family.family_id))
         if model is CustomImportSnapshotRelation and delete_result.rowcount != 15:
             raise SnapshotRetirementRefused("snapshot retirement relation census changed")

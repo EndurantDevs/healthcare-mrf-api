@@ -37,11 +37,25 @@ def bind_materialization(materialization, evidence):
     return replace(materialization, **hashes_by_name, query_projection_evidence=evidence)
 
 
-async def load_generation_evidence(session, generation, definition=None, *, frozen=True):
+def _block_definition(binding, definition=None):
+    from process.custom_import.family_block_binding import FamilyBlockBinding
+
+    if type(binding) is not FamilyBlockBinding:
+        raise QueryProjectionUnavailable("family block projection binding type differs")
+    if definition is not None and definition.digest != binding.layout.definition.digest:
+        raise QueryProjectionUnavailable("family block projection definition differs")
+    return binding.layout.definition
+
+
+async def load_generation_evidence(session, generation, definition=None, *, frozen=True, family_block_binding=None):
     """Accept legacy sealed snapshots; require complete evidence for new capabilities."""
 
+    if family_block_binding is not None:
+        definition = _block_definition(family_block_binding, definition)
     seal = await session.get(CustomImportGenerationSeal, generation.generation_id)
     if seal is not None and read_seal_projection_evidence(seal) is None:
+        if family_block_binding is not None and configured_fields(family_block_binding.layout.definition):
+            raise QueryProjectionUnavailable("family block projection completion evidence is missing")
         return None
     if definition is None:
         revision = await session.get(CustomImportDefinitionRevision, generation.definition_revision_id)
@@ -62,22 +76,42 @@ async def load_generation_evidence(session, generation, definition=None, *, froz
     if manifest is None:
         raise QueryProjectionUnavailable("required query projection manifest is missing")
     evidence = completed_projection_evidence(manifest, generation=generation, definition=definition, seal=seal)
+    if family_block_binding is not None:
+        from process.custom_import.family_block_binding import check_projection_manifest
+
+        check_projection_manifest(family_block_binding, manifest)
+        # The caller has just pinned this logged/frozen layout and every native index.
+        return evidence
     await lock_projection_tables(session, manifest, definition, require_complete=frozen)
     return evidence
 
 
-async def bind_generation_materialization(session, generation, materialization, definition=None):
+async def bind_generation_materialization(
+    session, generation, materialization, definition=None, *, family_block_binding=None
+):
     """Share one commitment across compact, exhaustive and legacy verification."""
 
+    binding_by_name = {} if family_block_binding is None else {"family_block_binding": family_block_binding}
     if session.in_transaction():
-        return bind_materialization(materialization, await load_generation_evidence(session, generation, definition))
+        return bind_materialization(
+            materialization,
+            await load_generation_evidence(session, generation, definition, **binding_by_name),
+        )
     async with session.begin():
-        return bind_materialization(materialization, await load_generation_evidence(session, generation, definition))
+        return bind_materialization(
+            materialization,
+            await load_generation_evidence(session, generation, definition, **binding_by_name),
+        )
 
 
-async def validate_sealed_projection(session, generation, seal, definition=None):
+async def validate_sealed_projection(session, generation, seal, definition=None, *, family_block_binding=None):
     """Avoid an extra metadata lookup only for an explicitly legacy immutable seal."""
 
+    if family_block_binding is not None:
+        definition = _block_definition(family_block_binding, definition)
     if read_seal_projection_evidence(seal) is None:
+        if family_block_binding is not None and configured_fields(family_block_binding.layout.definition):
+            raise QueryProjectionUnavailable("family block projection completion evidence is missing")
         return None
-    return await load_generation_evidence(session, generation, definition)
+    binding_by_name = {} if family_block_binding is None else {"family_block_binding": family_block_binding}
+    return await load_generation_evidence(session, generation, definition, **binding_by_name)

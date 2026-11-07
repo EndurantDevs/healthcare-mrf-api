@@ -36,6 +36,8 @@ from api import custom_import_read_http as transport
 from db.models.custom_import import CustomImportGeneration, CustomImportGenerationSeal
 from process.custom_import import publication, read_core
 from process.custom_import.definition import CustomImportDefinition, canonical_json, canonical_sha256
+from process.custom_import.family_block_layout import ROLE_SPECS
+from process.custom_import.storage_layout import SNAPSHOT_MODELS
 from tests.signed_request_reader_support import cold_caller, install_reader_factory
 from tests.test_custom_import_provider_geo_sql import _geo_row
 from tests.test_custom_import_provider_http import _Session
@@ -58,6 +60,7 @@ def _result(rows):
     scalars = [row[0] for row in rows]
     return SimpleNamespace(
         all=lambda: rows,
+        one=lambda: rows[0],
         one_or_none=lambda: rows[0] if rows else None,
         scalar_one=lambda: scalars[0],
         scalar_one_or_none=lambda: scalars[0] if scalars else None,
@@ -148,18 +151,30 @@ class SyntheticSession(_Session):
 
     def _generation_snapshot_result(self, query_sql, parameters):
         schema = postgresql.dialect().identifier_preparer.quote_schema(CustomImportGeneration.__table__.schema)
-        assert query_sql == (
-            f"SELECT {schema}.resolve_custom_import_generation_snapshot("
+        invocation = (
+            f"{schema}.resolve_custom_import_generation_snapshot("
             "CAST(:generation_id AS bigint), CAST(:dataset_id AS bigint), "
             "CAST(:definition_revision_id AS bigint), CAST(:schema_revision_id AS bigint))"
         )
-        assert parameters == {
+        parameters_by_name = {
             "generation_id": self.target["generation_id"],
             "dataset_id": 11,
             "definition_revision_id": self.target["definition_revision_id"],
             "schema_revision_id": self.target["schema_revision_id"],
         }
-        return _result([(None,)])
+        if query_sql == f"SELECT {invocation}":
+            assert parameters == parameters_by_name
+            return _result([(None,)])
+        assert query_sql.lstrip().startswith(f"WITH pinned AS MATERIALIZED (SELECT {invocation} AS family_id)")
+        assert query_sql.count(invocation) == 1
+        assert "FROM pg_catalog.pg_namespace" in query_sql and "END AS block_role_oids" in query_sql
+        parameters_by_name.update(
+            legacy_names=[model.__tablename__ for model in SNAPSHOT_MODELS],
+            block_slots=[slot for slot, _ in ROLE_SPECS.values()],
+            block_names=[name for _, name in ROLE_SPECS.values()],
+        )
+        assert parameters == parameters_by_name
+        return _result([(None, False, [])])
 
     def _persisted_result_rows(self, statement):
         """Return synthetic metadata or identity rows for the requested query."""

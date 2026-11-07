@@ -223,12 +223,22 @@ async def _finish(session_factory, request, captured, policy, terminal_state, *,
     return "canceled" if transition.state == "canceled" else "lease_lost"
 
 
-async def _activate(session_factory, request, output):
+async def _activate(session_factory, request, output, *, reader_activation=None, reader_layout=None):
     """Use the ordinary pointer CAS only after terminal sealing has committed."""
 
     try:
-        async with _session(session_factory, transaction=True) as session:
-            await _set_timeout(session, request.statement_timeout_ms)
+        scope = (
+            _session(session_factory, transaction=True)
+            if reader_activation is None
+            else reader_activation.publication_session(session_factory, request, output, reader_layout)
+        )
+        async with scope as session:
+            if reader_activation is None:
+                await _set_timeout(session, request.statement_timeout_ms)
+            else:
+                from process.custom_import.build_source import _prepare_statement
+
+                await _prepare_statement(session)
             return await activate_generation(
                 session,
                 dataset_id=request.dataset_id,
@@ -265,10 +275,12 @@ async def run_segmented_snowflake_candidate(
     *,
     processing_policy,
     writer_transports=None,
+    capture_only=False,
 ):
     """Carry one source claim through bounded replay, verified sealing and activation."""
 
     policy = _validated_policy(processing_policy)
+    _require_capture_mode(capture_only, writer_transports)
     if request.source_binding_revision_id is None or request.source_binding_sha256 is None:
         raise CandidateRunnerError("segmented execution requires an immutable source binding")
     if writer_transports is not None:
@@ -279,6 +291,8 @@ async def run_segmented_snowflake_candidate(
     counts = SourceOutcomeCounts(0, 0)
     if captured.status not in {"capture_sealed", "capture_bound"}:
         return _result(captured.status, captured, counts)
+    if capture_only:
+        return await _finish_owner_capture(session_factory, request, captured, policy, counts)
     handoff = {} if writer_transports is None else {"writer_transports": writer_transports}
     try:
         with failure_phase(FailurePhase.BEGIN_BUILD):
@@ -314,3 +328,27 @@ async def run_segmented_snowflake_candidate(
     with failure_phase(FailurePhase.ACTIVATE):
         publication = await _activate(session_factory, build_request, output)
     return _result("sealed_unpublished" if publication is None else "activated", captured, counts, output, publication)
+
+
+async def _finish_owner_capture(session_factory, request, captured, policy, counts):
+    """Drain capture, then refresh only its original unexpired lease and fence."""
+    from process.custom_import.execution import heartbeat_execution
+
+    async with _session(session_factory, transaction=True) as session:
+        await _set_timeout(session, policy.build.statement_timeout_ms)
+        grant = await heartbeat_execution(
+            session,
+            execution_id=captured.execution_id,
+            fence=captured.fence,
+            token=request.lease_token,
+            lease_seconds=policy.build.lease_seconds,
+        )
+    return _result(
+        "capture_ready" if grant is not None and grant.state == "running" else "lease_lost", captured, counts
+    )
+
+
+def _require_capture_mode(capture_only, writer_transports):
+    """Deny a capture-only mode without the original authenticated launch."""
+    if type(capture_only) is not bool or capture_only and writer_transports is None:
+        raise CandidateRunnerError("owner capture requires its authenticated launch")

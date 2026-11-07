@@ -160,8 +160,17 @@ async def _continue_trimmed_base(case, request, sealed, before_read, monkeypatch
     next_output = await build_output.build_output(case.sessions, continued, staged.build_id)
     assert next_output.no_change is not None
     assert next_output.seal.effective_output_sha256 == sealed.seal.effective_output_sha256
+    assert not next_output.seal.replayed and not next_output.no_change.replayed
+    replayed = await build_output.build_output(case.sessions, continued, staged.build_id)
+    assert replayed == replace(
+        next_output,
+        seal=replace(next_output.seal, replayed=True),
+        no_change=replace(next_output.no_change, replayed=True),
+    )
     with pytest.raises(LeaseAuthorityLost, match="continuation authority"):
-        await build_output.build_output(case.sessions, continued, staged.build_id)
+        await build_output.build_output(
+            case.sessions, replace(continued, lease_token=next_request.lease_token), staged.build_id
+        )
     assert await _read(case, request, sealed.generation_id) == before_read
 
 

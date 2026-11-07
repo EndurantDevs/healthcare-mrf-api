@@ -208,8 +208,16 @@ async def _assert_completed(case, original, continued, build_id, sealed, before)
             == producer_token_sha256(original)
         )
         assert (await session.get(CustomImportExecution, original.execution_id)).state in {"completed", "no_change"}
-    with pytest.raises(LeaseAuthorityLost):
-        await output.build_output(case.sessions, continued, build_id)
+    assert not sealed.seal.replayed
+    assert sealed.no_change is None or not sealed.no_change.replayed
+    replayed = await output.build_output(case.sessions, continued, build_id)
+    assert replayed == replace(
+        sealed,
+        seal=replace(sealed.seal, replayed=True),
+        no_change=replace(sealed.no_change, replayed=True) if sealed.no_change is not None else None,
+    )
+    with pytest.raises(LeaseAuthorityLost, match="continuation authority"):
+        await output.build_output(case.sessions, replace(continued, lease_token=original.lease_token), build_id)
 
 
 @pytest.mark.parametrize("retained", [False, True])

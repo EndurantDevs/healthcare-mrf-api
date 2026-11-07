@@ -21,6 +21,7 @@ from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.publication import GenerationSealReceipt, PublicationReceipt
 
 RunStatus = Literal[
+    "capture_ready",
     "activated",
     "candidate_rejected",
     "canceled",

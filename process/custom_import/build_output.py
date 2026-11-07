@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hmac
 from collections import deque
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import dataclass, replace
 from itertools import chain, groupby, islice
 
@@ -93,7 +93,11 @@ from process.custom_import.build_source import (
 from process.custom_import.build_source import _call as _typed_call
 from process.custom_import.bulk_page_codec import MAX_BATCH_BYTES, MAX_BATCH_ROWS
 from process.custom_import.compact_materialization import frozen_materialization as _frozen_materialization
-from process.custom_import.continuation_runtime import producer_token_sha256, verify_and_bind_continuation
+from process.custom_import.continuation_runtime import (
+    producer_token_sha256,
+    verify_and_bind_continuation,
+    verify_terminal_continuation,
+)
 from process.custom_import.query_projection_values import configured_fields
 from process.custom_import.runner_codec import (
     digest_text,
@@ -1349,7 +1353,7 @@ async def _finalize_sealed_build(session, request, build, generation, candidate_
     return publication._receipt(event, replayed=False)
 
 
-async def _terminal_seal(session_factory, request, build_id, materialization):
+async def _terminal_seal(session_factory, request, build_id, materialization, *, block_work=None):
     async with _session(session_factory, transaction=True) as session:
         await session.execute(select(func.set_config("statement_timeout", str(request.statement_timeout_ms), True)))
         await publication._begin_finality_operation(session)
@@ -1359,34 +1363,50 @@ async def _terminal_seal(session_factory, request, build_id, materialization):
         await _prepare_statement(session)
         proof = await session.get(CustomImportBuildVerification, build_id)
         _proof_matches(build, generation, proof)
-        if any(getattr(materialization, name) != getattr(proof, name) for name in _COUNT_NAMES):
-            raise CandidateRunnerError("final structural proof counts differ")
-        unchanged_base = await _unchanged_base(session, request, build, materialization)
-        await _prepare_statement(session)
-        execution = await session.get(CustomImportExecution, request.execution_id)
-        await _prepare_statement(session)
-        lease = await session.get(CustomImportLease, request.execution_id)
-        seal_request = publication._GenerationSealRequest(
-            request.dataset_id, generation.generation_id, request.fence, producer_token_sha256(request)
-        )
-        await _prepare_statement(session)
-        now = await publication._database_now(session)
-        continuation_options_dict = {}
-        if request.continuation is not None:
-            authorization = await verify_and_bind_continuation(session, request, execution, lease, now, build=build)
-            continuation_options_dict = {"continuation_request": request, "continuation_authorization": authorization}
-        publication._validate_generation_sealing_authority(
-            execution, lease, generation, materialization, seal_request, now, **continuation_options_dict
-        )
-        candidate_seal = publication._new_generation_seal(generation, materialization, seal_request)
-        session.add(candidate_seal)
-        await _flush_page(session)
-        no_change = await _finalize_sealed_build(
-            session, request, build, generation, candidate_seal, unchanged_base, materialization
-        )
-        return BuildOutputResult(
-            generation.generation_id, publication._seal_receipt(candidate_seal, replayed=False), no_change
-        )
+        materialization_context = nullcontext(materialization)
+        if block_work is not None:
+            if materialization is not None:
+                raise CandidateRunnerError("shard finality cannot reuse an earlier materialization")
+            from process.custom_import.family_shard_finality import finality_materialization
+
+            materialization_context = finality_materialization(session, request, build, generation, work=block_work)
+        async with materialization_context as materialization:
+            if any(getattr(materialization, name) != getattr(proof, name) for name in _COUNT_NAMES):
+                raise CandidateRunnerError("final structural proof counts differ")
+            if block_work is None:
+                unchanged_base = await _unchanged_base(session, request, build, materialization)
+            else:
+                from process.custom_import.family_shard_finality import unchanged_block_base
+
+                unchanged_base = await unchanged_block_base(session, request, build, materialization)
+            await _prepare_statement(session)
+            execution = await session.get(CustomImportExecution, request.execution_id)
+            await _prepare_statement(session)
+            lease = await session.get(CustomImportLease, request.execution_id)
+            seal_request = publication._GenerationSealRequest(
+                request.dataset_id, generation.generation_id, request.fence, producer_token_sha256(request)
+            )
+            await _prepare_statement(session)
+            now = await publication._database_now(session)
+            continuation_options_dict = {}
+            if request.continuation is not None:
+                authorization = await verify_and_bind_continuation(session, request, execution, lease, now, build=build)
+                continuation_options_dict = {
+                    "continuation_request": request,
+                    "continuation_authorization": authorization,
+                }
+            publication._validate_generation_sealing_authority(
+                execution, lease, generation, materialization, seal_request, now, **continuation_options_dict
+            )
+            candidate_seal = publication._new_generation_seal(generation, materialization, seal_request)
+            session.add(candidate_seal)
+            await _flush_page(session)
+            no_change = await _finalize_sealed_build(
+                session, request, build, generation, candidate_seal, unchanged_base, materialization
+            )
+            return BuildOutputResult(
+                generation.generation_id, publication._seal_receipt(candidate_seal, replayed=False), no_change
+            )
 
 
 async def _replay(session_factory, request, build_id):
@@ -1400,20 +1420,25 @@ async def _replay(session_factory, request, build_id):
         lease = await publication._locked_lease(session, request.execution_id)
         build = await session.get(CustomImportBuildAttempt, build_id, with_for_update=True)
         _verify_request(build, request, execution)
-        if request.continuation is not None or getattr(lease, "continuation_id", None) is not None:
-            now = await publication._database_now(session)
-            await verify_and_bind_continuation(session, request, execution, lease, now, build=build)
+        is_continued = request.continuation is not None or getattr(lease, "continuation_id", None) is not None
         if build.generation_id is None:
+            if is_continued:
+                now = await publication._database_now(session)
+                await verify_and_bind_continuation(session, request, execution, lease, now, build=build)
             return None
         generation = await publication._locked_generation(
             session, dataset_id=request.dataset_id, generation_id=build.generation_id
         )
         seal = await publication._locked_generation_seal(session, build.generation_id)
+        if is_continued:
+            now = await publication._database_now(session)
+            if seal is not None and execution.state in {"completed", "no_change"}:
+                await verify_terminal_continuation(session, request, execution, lease, now, build=build)
+            else:
+                await verify_and_bind_continuation(session, request, execution, lease, now, build=build)
         if seal is None:
             return None
-        from process.custom_import.query_projection_finality import validate_sealed_projection
-
-        await validate_sealed_projection(session, generation, seal, request.definition)
+        await publication._validate_sealed_projection(session, generation, seal)
         if execution.state == "no_change":
             no_change_request = publication._NoChangeRequest(
                 request.dataset_id,

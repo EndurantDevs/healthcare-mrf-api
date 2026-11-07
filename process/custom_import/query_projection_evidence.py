@@ -181,17 +181,21 @@ async def _read_projection_metadata(session, target):
     return rows
 
 
-async def read_projection_tables(session, target, definition, *, snapshot_family_id) -> Mapping[str, Table] | None:
+async def read_projection_tables(
+    session, pinned_target, definition, *, snapshot_family_id, family_block_binding=None
+) -> Mapping[str, Table] | None:
     """Bind advertised projections once inside an already authorized pinned read transaction."""
 
     if not session.in_transaction():
         raise QueryProjectionUnavailable("projection reads require an active transaction")
     _definition_digest(definition)
-    generation, seal, manifest = await _read_projection_metadata(session, target)
+    generation, seal, manifest = await _read_projection_metadata(session, pinned_target)
     if getattr(seal, "seal_contract", None) != "custom-import-generation-seal/v1":
         raise QueryProjectionUnavailable("projection generation seal contract is invalid")
     evidence = read_seal_projection_evidence(seal)
     if evidence is None:
+        if family_block_binding is not None and configured_fields(definition):
+            raise QueryProjectionUnavailable("family block projection completion evidence is missing")
         try:
             _verify_producer(seal, generation, sealed=True)
         except AttributeError:
@@ -204,6 +208,19 @@ async def read_projection_tables(session, target, definition, *, snapshot_family
     ):
         raise QueryProjectionUnavailable("projection pinned snapshot family differs")
     completed_projection_evidence(manifest, generation=generation, definition=definition, seal=seal)
+    if family_block_binding is not None:
+        from process.custom_import.family_block_binding import FamilyBlockBinding, check_projection_manifest
+        from process.custom_import.family_block_read_sql import query_projection_views
+
+        if (
+            type(family_block_binding) is not FamilyBlockBinding
+            or family_block_binding.family_id != snapshot_family_id
+            or family_block_binding.layout.definition.digest != definition.digest
+        ):
+            raise QueryProjectionUnavailable("family block projection binding differs")
+        check_projection_manifest(family_block_binding, manifest)
+        # The logged resolver just proved complete native role/column/index custody.
+        return query_projection_views(family_block_binding)
     return await lock_projection_tables(session, manifest, definition)
 
 
