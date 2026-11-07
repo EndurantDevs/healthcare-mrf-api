@@ -41731,17 +41731,7 @@ async def _fetch_source_json_pinned_session(
         _SOURCE_HTTP_PINNED_ANONYMOUS_SESSION.reset(session_token)
 
 
-def _is_rest_pagination_cooldown_failure(
-    status_code: int | None,
-    fetch_error: str | None,
-) -> bool:
-    """Wait on rate limits and locked pages without losing the current cursor."""
-    if status_code in {423, 429}:
-        return True
-    if not fetch_error:
-        return False
-    normalized_error = fetch_error.lower()
-    return "timeout" in normalized_error or "timed out" in normalized_error
+_is_rest_pagination_cooldown_failure = partial(source_selection.is_pagination_cooldown_failure, sys.modules[__name__])
 
 
 def _rest_pagination_cooldown_delay_seconds(
@@ -41769,7 +41759,7 @@ async def _retry_rest_pagination_after_cooldown(
     wait_seconds = 0.0
     while retries < REST_PAGINATION_COOLDOWN_RETRY_CAP:
         status_code, fhir_payload, fetch_error, _elapsed_ms = fetch_result
-        if not _is_rest_pagination_cooldown_failure(status_code, fetch_error):
+        if not _is_rest_pagination_cooldown_failure(status_code, fetch_error, source_record=source_record):
             break
         delay_seconds = _rest_pagination_cooldown_delay_seconds(
             status_code,
@@ -41804,6 +41794,7 @@ async def _retry_rest_pagination_after_cooldown(
     is_failure_transient = _is_rest_pagination_cooldown_failure(
         status_code,
         fetch_error,
+        source_record=source_record,
     )
     return RestPaginationCooldownResult(
         fetch_result=fetch_result,
@@ -53858,6 +53849,7 @@ async def _fetch_resource_rows(
                 and _is_rest_pagination_cooldown_failure(
                     page_fetch_result[0],
                     page_fetch_result[2],
+                    source_record=source_record,
                 )
             ):
                 pinned_session_token = (

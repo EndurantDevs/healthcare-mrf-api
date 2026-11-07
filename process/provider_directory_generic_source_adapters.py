@@ -395,6 +395,7 @@ def resource_scan_types(directory, source_record, resource_types, options):
     from process.provider_directory_generic_source_policy import _FACTORY
 
     is_bulk = directory.bulk_parallel.is_bulk_scan(directory, source_record, options)
+    supported = directory._source_supported_resource_types(source_record)
     factory = _FACTORY.get()
     include_role = (
         options.deferred_materialization
@@ -415,7 +416,7 @@ def resource_scan_types(directory, source_record, resource_types, options):
     return tuple(
         resource_type
         for resource_type in directory._source_resource_fetch_order(source_record, list(resource_types))
-        if resource_type != "PractitionerRole" or include_role
+        if (supported is None or resource_type in supported) and (resource_type != "PractitionerRole" or include_role)
     )
 
 
