@@ -37,6 +37,12 @@ def _aggregate_migration():
 
 
 def _refresh_aggregate(connection, schema, *, rollback=False):
+    identity = f'"{schema}".verify_custom_import_build_structure(bigint)'
+    installed = connection.scalar(
+        text("SELECT prosrc FROM pg_proc WHERE oid=to_regprocedure(:identity)"), {"identity": identity}
+    )
+    if installed == _family_reference_migration()._bodies(schema)[1]:
+        _refresh_family_reference(connection, schema, rollback=True)
     migration = _aggregate_migration()
     ranges = migration._ranges()
     ranges._schema = lambda: schema
@@ -228,6 +234,7 @@ async def test_child_reference_refresh_preserves_metadata_and_exact_rollback(mon
         identity = f'"{case.schema_name}".verify_custom_import_build_structure(bigint)'
         observation = text("SELECT p.prosrc,to_jsonb(p)-'prosrc' FROM pg_proc p WHERE oid=to_regprocedure(:identity)")
         async with case.engine.begin() as connection:
+            await connection.run_sync(lambda conn: _refresh_family_reference(conn, case.schema_name, rollback=True))
             before = (await connection.execute(observation, {"identity": identity})).one()
             migration = _aggregate_migration()
             old, new = migration._bodies(case.schema_name)
@@ -282,6 +289,7 @@ async def _assert_logged_forward_migration(connection, schema, family_id):
     with pytest.raises(RuntimeError, match="custom_import_unlogged_landing_requires_forward_migration"):
         unlogged._migration().downgrade()
     await connection.run_sync(_refresh_aggregate, schema)
+    await connection.run_sync(_refresh_family_reference, schema)
     assert await unlogged._catalog(connection, schema) == after
     assert await unlogged._persistence(connection, family_id) == "p"
 
@@ -353,11 +361,15 @@ def test_audit_sql_matches_current_verifier():
     replace = staged._previous("20261019010000_custom_import_build_continuation")._replace
     resource = audit._sql_resource()[0]
     successor = _aggregate_migration()
-    body = successor._bodies("audit_template")[1]
+    family_reference = _family_reference_migration()
+    body = family_reference._bodies("audit_template")[1]
     for index, query in enumerate(arms._queries(staged)):
         if index == 18:
             assert query == successor._PREVIOUS_QUERY
             query = successor._UPDATED_QUERY
+        if index == 20:
+            assert query == family_reference._PREVIOUS_QUERY
+            query = family_reference._UPDATED_QUERY
         if (
             len(arms._LABELS[0]) <= index < 60
             and "WITH violations(failure_code,row_identity) AS MATERIALIZED (" not in query
@@ -394,6 +406,7 @@ async def _ready(case, monkeypatch):
     sealed = await manual.output.build_output(case.sessions, request, build_id)
     async with case.engine.begin() as connection:
         await connection.run_sync(_refresh_aggregate, case.schema_name)
+        await connection.run_sync(_refresh_family_reference, case.schema_name)
         await connection.execute(text("SELECT pg_stat_force_next_flush()"))
     return request, build_id, sealed, await scratch._family(case, request)
 
@@ -719,3 +732,313 @@ async def test_audit_binds_completed_projection_heaps_and_manifest():
                     await audit.advance_post_seal_audit(
                         session, progress.audit_id, engine_id="synthetic_engine", expected_checkpoint=0
                     )
+
+
+def _family_reference_migration():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic/versions/20261108010000_custom_import_family_child_reference_aggregate.py"
+    )
+    return _migration(path, "family_reference_aggregate_test")
+
+
+def _refresh_family_reference(connection, schema, *, rollback=False):
+    migration = _family_reference_migration()
+    parent = migration._parent()
+    ranges = parent._ranges()
+    ranges._schema = lambda: schema
+    parent._ranges = lambda: ranges
+    migration._parent = lambda: parent
+    migration.op = Operations(MigrationContext.configure(connection))
+    (migration.downgrade if rollback else migration.upgrade)()
+
+
+def _family_reference_mirrors():
+    return {
+        "custom_import_build_attempt": "execution_id bigint,producing_fence bigint",
+        "custom_import_root_revision": "pack_id bigint",
+        "custom_import_family_child": "family_revision_id bigint,dataset_id bigint,schema_revision_id bigint,root_record_id bigint,child_revision_id bigint,collection_slot bigint",
+        "custom_import_family_revision": "family_revision_id bigint,dataset_id bigint,schema_revision_id bigint,root_record_id bigint",
+        "custom_import_child_revision": "child_revision_id bigint,dataset_id bigint,definition_revision_id bigint,schema_revision_id bigint,root_record_id bigint,collection_slot bigint,pack_id bigint",
+    }
+
+
+def _matching_reference_null_cases(valid_by_table, parameters_by_name):
+    positions_by_field = {
+        "dataset": (
+            ("custom_import_family_child", 1),
+            ("custom_import_family_revision", 1),
+            ("custom_import_child_revision", 1),
+        ),
+        "schema": (
+            ("custom_import_family_child", 2),
+            ("custom_import_family_revision", 2),
+            ("custom_import_child_revision", 3),
+        ),
+        "root": (
+            ("custom_import_family_child", 3),
+            ("custom_import_family_revision", 3),
+            ("custom_import_child_revision", 4),
+        ),
+        "collection": (("custom_import_family_child", 5), ("custom_import_child_revision", 5)),
+        "definition": (("custom_import_child_revision", 2),),
+    }
+    parameter_by_field = {"dataset": "p_2", "schema": "p_4", "definition": "p_3"}
+    for field, positions in positions_by_field.items():
+        changed, parameters = deepcopy(valid_by_table), parameters_by_name.copy()
+        for table, index in positions:
+            changed[table][0][index] = None
+        if field in parameter_by_field:
+            parameters[parameter_by_field[field]] = None
+        yield f"matching_null:{field}", changed, parameters, False
+
+
+def _family_reference_cases():
+    valid_by_table = {
+        "custom_import_family_child": [[10, 2, 4, 20, 30, 40]],
+        "custom_import_family_revision": [[10, 2, 4, 20]],
+        "custom_import_child_revision": [[30, 2, 3, 4, 20, 40, None]],
+    }
+    parameters_by_name = {"p_2": 2, "p_3": 3, "p_4": 4, "p_5": 5, "p_7": 7}
+    cases = [("valid", valid_by_table, parameters_by_name, False)]
+    for table, reference_rows in valid_by_table.items():
+        compared = len(reference_rows[0]) - int(table == "custom_import_child_revision")
+        for index in range(compared):
+            for replacement in (None, reference_rows[0][index] + 1):
+                changed = deepcopy(valid_by_table)
+                changed[table][0][index] = replacement
+                cases.append((f"{table}:{index}:{replacement}", changed, parameters_by_name, True))
+        changed = deepcopy(valid_by_table)
+        changed[table] = []
+        cases.append((f"missing:{table}", changed, parameters_by_name, table != "custom_import_family_child"))
+    for table in ("custom_import_family_revision", "custom_import_child_revision"):
+        changed = deepcopy(valid_by_table)
+        bad = changed[table][0].copy()
+        bad[1] = 999
+        changed[table].append(bad)
+        cases.append((f"mixed_duplicate:{table}", deepcopy(changed), parameters_by_name, False))
+        changed[table][0][1] = 999
+        cases.append((f"invalid_duplicates:{table}", deepcopy(changed), parameters_by_name, True))
+    changed = deepcopy(valid_by_table)
+    for reference_rows in changed.values():
+        reference_rows.append(reference_rows[0].copy())
+    cases.append(("duplicates_both_sides", changed, parameters_by_name, False))
+    cases.extend(_matching_reference_null_cases(valid_by_table, parameters_by_name))
+    for witnesses in ((None,), (None, 30, 10, 30)):
+        changed = deepcopy(valid_by_table)
+        child = changed["custom_import_family_child"][0]
+        changed["custom_import_family_child"] = [[*child[:4], witness, child[5]] for witness in witnesses]
+        changed["custom_import_family_revision"] = []
+        cases.append((f"invalid_witnesses:{witnesses}", changed, parameters_by_name, True))
+    return cases
+
+
+async def test_family_reference_aggregate_preserves_null_and_duplicate_witnesses():
+    migration = _family_reference_migration()
+    old = migration._PREVIOUS_QUERY.replace("__CANDIDATE__", "pg_temp").replace("__CONTROL__", "pg_temp")
+    old = old.removesuffix(" LIMIT 1;\n") + ";\n"
+    new = audit._sql_resource()[0]["arms"][20]["sql"].replace("__LEAF__", "pg_temp").replace("__CONTROL__", "pg_temp")
+    context = SimpleNamespace(quoted="pg_temp", family=SimpleNamespace(family_id=1), base_family=None)
+    queries = [audit._compiled(query, context) for query in (old, new)]
+    async with _source_case() as case, case.engine.begin() as connection:
+        columns = _family_reference_mirrors()
+        for table, definition in columns.items():
+            await connection.execute(text(f"CREATE TEMP TABLE {table} ({definition}) ON COMMIT DROP"))
+        for name, rows, bindings, invalid in _family_reference_cases():
+            await _replace_child_reference_mirrors(connection, columns, rows)
+            old_rows = (await connection.execute(queries[0], bindings)).all()
+            new_rows = (await connection.execute(queries[1], bindings)).all()
+            _assert_child_reference_witness(old_rows, new_rows, invalid, name)
+
+
+async def test_family_reference_planner_restores_native_transaction_setting(monkeypatch):
+    from tests.test_custom_import_post_seal_audit_ranges import _range_context
+
+    compiled = audit._compiled
+    monkeypatch.setattr(
+        audit,
+        "_compiled",
+        lambda sql, context: compiled(sql.replace("__LEAF__", "pg_temp").replace("__CONTROL__", "pg_temp"), context),
+    )
+
+    context = _range_context()
+    context.quoted = "pg_temp"
+    context.generation.dataset_id, context.generation.definition_revision_id, context.generation.schema_revision_id = (
+        2,
+        3,
+        4,
+    )
+    context.generation.execution_id, context.generation.producing_fence = 5, 7
+    async with _source_case() as case, case.sessions() as session, session.begin():
+        columns = _family_reference_mirrors()
+        for table, definition in columns.items():
+            await session.execute(text(f"CREATE TEMP TABLE {table} ({definition}) ON COMMIT DROP"))
+        await _replace_child_reference_mirrors(session, columns, _family_reference_cases()[0][1])
+        for setting in ("on", "off"):
+            await session.execute(text("SELECT set_config('enable_nestloop',:setting,true)"), {"setting": setting})
+            progress = await audit._run_arm(session, context, SimpleNamespace(next_ordinal=21, checkpoint=20))
+            assert progress["outcome"] == "passed"
+            assert await session.scalar(text("SELECT current_setting('enable_nestloop')")) == setting
+            await session.execute(text("ALTER TABLE pg_temp.custom_import_child_revision RENAME TO missing_child"))
+            with pytest.raises(DBAPIError):
+                await audit._run_arm(session, context, SimpleNamespace(next_ordinal=21, checkpoint=20))
+            assert await session.scalar(text("SELECT current_setting('enable_nestloop')")) == setting
+            await session.execute(text("ALTER TABLE pg_temp.missing_child RENAME TO custom_import_child_revision"))
+
+
+async def test_family_reference_refresh_preserves_exact_metadata_and_rollback():
+    async with _source_case() as case, case.engine.begin() as connection:
+        await connection.run_sync(scratch.install_current_verification, case.schema_name)
+        identity = f'"{case.schema_name}".verify_custom_import_build_structure(bigint)'
+        observation = text("SELECT p.prosrc,to_jsonb(p)-'prosrc' FROM pg_proc p WHERE oid=to_regprocedure(:identity)")
+        migration = _family_reference_migration()
+        old, new = migration._bodies(case.schema_name)
+        before = (await connection.execute(observation, {"identity": identity})).one()
+        assert before[0] == new
+        await connection.run_sync(lambda conn: _refresh_family_reference(conn, case.schema_name, rollback=True))
+        assert (await connection.execute(observation, {"identity": identity})).one() == (old, before[1])
+        await connection.run_sync(_refresh_family_reference, case.schema_name)
+        assert (await connection.execute(observation, {"identity": identity})).one() == before
+        await connection.run_sync(_refresh_family_reference, case.schema_name)
+        assert (await connection.execute(observation, {"identity": identity})).one() == before
+        for changed in ("COST 101", "SET search_path TO public"):
+            with pytest.raises(RuntimeError, match="function_identity_mismatch"):
+                async with connection.begin_nested():
+                    await connection.execute(text(f"ALTER FUNCTION {identity} {changed}"))
+                    await connection.run_sync(_refresh_family_reference, case.schema_name)
+            assert (await connection.execute(observation, {"identity": identity})).one() == before
+
+
+async def test_family_reference_changed_sql_requires_fresh_twenty_checkpoint_audit(monkeypatch):
+    monkeypatch.setattr(audit, "ROOT_PAGE_ROWS", 2)
+    async with _source_case() as case:
+        _request, _build_id, _sealed, family_id = await _ready(case, monkeypatch)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(lambda conn: _refresh_family_reference(conn, case.schema_name, rollback=True))
+        old_document = deepcopy(audit._sql_resource()[0])
+        old_sql = _family_reference_migration()._PREVIOUS_QUERY.replace("__CANDIDATE__", "__LEAF__")
+        old_document["arms"][20].update(sql=old_sql, sha256=hashlib.sha256(old_sql.encode()).hexdigest())
+        old_hash = hashlib.sha256((json.dumps(old_document, indent=2) + "\n").encode()).digest()
+        with monkeypatch.context() as patch:
+            patch.setattr(audit, "_sql_resource", lambda: (old_document, old_hash))
+            previous = await _begin(case, family_id)
+            for _ in range(20):
+                previous = await _step(case, previous)
+        assert (previous.checkpoint, previous.next_ordinal) == (20, 21)
+        chain = (
+            select(Checkpoint.checkpoint, Checkpoint.previous_sha256, Checkpoint.checkpoint_sha256)
+            .where(Checkpoint.audit_id == previous.audit_id)
+            .order_by(Checkpoint.checkpoint)
+        )
+        async with case.sessions() as session:
+            before = (await session.execute(chain)).all()
+        with pytest.raises(audit.PostSealAuditRefused, match="SQL changed; start a new attempt"):
+            await _step(case, previous)
+        with pytest.raises(audit.PostSealAuditRefused, match="SQL changed; start a new attempt"):
+            await _begin(case, family_id)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(_refresh_family_reference, case.schema_name)
+        with monkeypatch.context() as patch:
+            patch.setattr(audit, "_sql_resource", lambda: (old_document, old_hash))
+            with pytest.raises(audit.PostSealAuditRefused, match="binding changed; start a new attempt"):
+                await _step(case, previous)
+        restarted = await _begin(case, family_id, restart=True)
+        assert restarted.audit_id != previous.audit_id and (restarted.checkpoint, restarted.next_ordinal) == (0, 1)
+        for _ in range(20):
+            restarted = await _step(case, restarted)
+        append = audit._append
+
+        async def interrupted(session, header, latest, **values):
+            if values["checkpoint"] == 21:
+                raise ConnectionError("synthetic failure before checkpoint append")
+            return await append(session, header, latest, **values)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(audit, "_append", interrupted)
+            with pytest.raises(ConnectionError, match="before checkpoint append"):
+                await _step(case, restarted)
+        async with case.sessions() as session:
+            latest = await audit._latest(session, restarted.audit_id)
+            assert (latest.checkpoint, latest.next_ordinal) == (20, 21)
+        completed = await _finish(case, restarted)
+        await _assert_complete(case, completed)
+        async with case.sessions() as session:
+            assert (await session.execute(chain)).all() == before
+            header = await session.get(Audit, previous.audit_id)
+            assert bytes(header.sql_sha256) == old_hash
+
+
+def _check_native_scoped_planner(session, request, build_id, function, setting, failure):
+    from process.custom_import import build_output
+
+    with build_output._read_transaction(session, request, build_id) as (_build, deadline):
+        build_output._build_storage_models(session, build_id)
+        build_output._prepare_read(session, request, deadline)
+        session.execute(text("SELECT set_config('enable_nestloop',:setting,true)"), {"setting": setting})
+        savepoint = session.begin_nested()
+        try:
+            if failure:
+                with pytest.raises(DBAPIError, match="division by zero"):
+                    session.execute(text(f"SELECT * FROM {function}(:build)"), {"build": build_id}).one()
+                savepoint.rollback()
+            else:
+                row = session.execute(text(f"SELECT * FROM {function}(:build)"), {"build": build_id}).one()
+                assert row.page_sequence == 21
+            assert session.scalar(text("SELECT current_setting('enable_nestloop')")) == setting
+        finally:
+            if savepoint.is_active:
+                savepoint.rollback()
+
+
+async def _replace_native_verifier_body(case, refresh, before, after):
+    async with case.engine.begin() as connection:
+        await connection.run_sync(lambda conn: refresh(conn, before, after))
+
+
+async def _assert_native_planner_modes(case, request, build_id, function, failure):
+    from tests.test_custom_import_staged_verification_postgres import _state
+
+    for setting in ("on", "off"):
+        async with case.sessions() as session:
+            await session.run_sync(
+                lambda sync: _check_native_scoped_planner(sync, request, build_id, function, setting, failure)
+            )
+        assert (await _state(case, build_id))[1][2] == 20
+
+
+async def test_family_reference_native_verifier_restores_scoped_planner(monkeypatch):
+    """The actual verifier preserves settings and its checkpoint on success and error."""
+    from tests.test_custom_import_staged_verification_postgres import _frozen, _state, _step
+
+    async with _source_case() as case:
+        request, build_id, _generation_id = await _frozen(case, monkeypatch)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(scratch.install_current_verification, case.schema_name)
+        for _ in range(20):
+            assert await _step(case, request, build_id) == "scanning"
+        assert (await _state(case, build_id))[1][2] == 20
+        migration = _family_reference_migration()
+        parent = migration._parent()
+        staged = parent._ranges()._arms()._staged()
+        bulk = staged._finality()._bulk()
+        storage = bulk._storage()
+        continuation = staged._previous("20261019010000_custom_import_build_continuation")
+        current = migration._bodies(case.schema_name)[1]
+        literal = storage._literal(bulk._control_sql(storage, case.schema_name, migration._UPDATED_QUERY))
+        faulty = continuation._replace(current, literal, storage._literal("SELECT 1/0"))
+        identity = f'"{case.schema_name}".verify_custom_import_build_structure(bigint)'
+        function = identity.removesuffix("(bigint)")
+
+        def refresh(connection, before, after):
+            continuation._schema = lambda: case.schema_name
+            continuation.op = Operations(MigrationContext.configure(connection))
+            continuation._refresh(identity, before, after)
+
+        for failure in (False, True):
+            if failure:
+                await _replace_native_verifier_body(case, refresh, current, faulty)
+            try:
+                await _assert_native_planner_modes(case, request, build_id, function, failure)
+            finally:
+                if failure:
+                    await _replace_native_verifier_body(case, refresh, faulty, current)
