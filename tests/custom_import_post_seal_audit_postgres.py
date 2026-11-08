@@ -385,7 +385,8 @@ def test_audit_sql_matches_current_verifier():
 async def _ready(case, monkeypatch):
     async with case.engine.begin() as connection:
         await connection.run_sync(install_audit_migration, case.schema_name)
-    request, build_id, generation_id = await manual._ready(case, monkeypatch)
+    # Three roots give each two-row audit range more than one page.
+    request, build_id, generation_id = await manual._ready(case, monkeypatch, root_count=3)
     assert await manual._step(case, request, build_id) == "scanning"
     async with case.sessions() as session, session.begin():
         await manual._accept(session, case, build_id, request=request)

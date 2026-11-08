@@ -44,8 +44,8 @@ def _install_parent(connection, schema, root_batch_size):
     arms.upgrade()
 
 
-async def _frozen(case, monkeypatch):
-    request = await _request_for(case, _records(17, 2), page_rows=8)
+async def _frozen(case, monkeypatch, *, root_count=17):
+    request = await _request_for(case, _records(root_count, 2), page_rows=8)
     build_id, generation_id = await _build(case, request)
 
     def interrupted(*_):
@@ -298,6 +298,22 @@ async def test_inventory_does_not_certify_interrupted_preparation(monkeypatch):
 async def test_inventory_excludes_only_the_target_and_completed_retired_sources():
     from tests.custom_import_retirement_inventory_postgres import (
         test_inventory_excludes_only_the_target_and_completed_retired_sources as verify,
+    )
+
+    await verify()
+
+
+async def test_inventory_counts_complete_sources_and_only_pages_relevant_rows(monkeypatch):
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_counts_complete_sources_and_only_pages_relevant_rows as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_inventory_does_not_reuse_evidence_after_unknown_commit_outcome():
+    from tests.custom_import_retirement_inventory_postgres import (
+        test_inventory_does_not_reuse_evidence_after_unknown_commit_outcome as verify,
     )
 
     await verify()
