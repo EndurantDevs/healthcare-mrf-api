@@ -36,11 +36,15 @@ async def _inventory_case():
             finally:
                 if connection.in_transaction():
                     await connection.rollback()
-                async with AsyncSession(bind=connection) as session, session.begin():
-                    await inventory.cleanup_frozen_reference_inventory(session)
-                assert await connection.scalar(text(f"SELECT to_regclass('pg_temp.{inventory._TABLE}')")) is None
-                assert inventory._KEY not in connection.info and inventory._OWNED_KEY not in connection.info
-                await connection.rollback()
+                await _cleanup_inventory(connection)
+
+
+async def _cleanup_inventory(connection):
+    async with AsyncSession(bind=connection) as session, session.begin():
+        await inventory.cleanup_frozen_reference_inventory(session)
+    assert await connection.scalar(text(f"SELECT to_regclass('pg_temp.{inventory._TABLE}')")) is None
+    assert inventory._KEY not in connection.info and inventory._OWNED_KEY not in connection.info
+    await connection.rollback()
 
 
 @asynccontextmanager
@@ -270,3 +274,84 @@ async def test_inventory_excludes_owner_writes_and_discards_cross_commit_evidenc
                     engine_id="synthetic",
                     assert_external_unreferenced=_external_fixture_check,
                 )
+
+
+async def _sparse_families(case, kept, references, *, gaps=False):
+    count = len(references)
+    buckets = [1 if index < count // 2 else 9 for index in range(count)]
+    positions = [1, 1009, 999999, 7, 2**40, 2**63 - 1] if gaps else list(range(1, count + 1))
+    async with case.sessions() as session, session.begin():
+        await session.execute(
+            text(
+                f'INSERT INTO "{retirement.snapshot_schema(kept)}".custom_import_build_family '
+                "(build_id,root_record_id,root_key_sha256,selection_kind,source_root_occurrence_id,"
+                "last_child_collection_slot,last_child_key_sha256,last_input_child_revision_id,attached_child_count) "
+                "SELECT source_bucket,source_position,decode(repeat('11',32),'hex'),'source',source_position,"
+                "CASE WHEN source_reference IS NOT NULL THEN 1 END,"
+                "CASE WHEN source_reference IS NOT NULL THEN decode(repeat('22',32),'hex') END,source_reference,0 "
+                "FROM unnest(CAST(:references AS bigint[]),CAST(:buckets AS bigint[]),CAST(:positions AS bigint[])) "
+                "source_rows(source_reference,source_bucket,source_position)"
+            ),
+            {"references": references, "buckets": buckets, "positions": positions},
+        )
+
+
+async def _assert_null_reference_write_excluded(case, kept):
+    relation = f'"{retirement.snapshot_schema(kept)}".custom_import_build_family'
+    with pytest.raises(DBAPIError) as refused:
+        async with case.sessions() as writer, writer.begin():
+            await writer.execute(text("SET LOCAL lock_timeout='100ms'"))
+            await writer.execute(
+                text(
+                    f"UPDATE {relation} SET last_child_collection_slot=1,"
+                    "last_child_key_sha256=decode(repeat('22',32),'hex'),last_input_child_revision_id=9000000 "
+                    "WHERE build_id=1 AND root_record_id=1"
+                )
+            )
+    assert getattr(refused.value.orig, "sqlstate", None) == "55P03"
+
+
+async def _assert_inventory_shape(case, connection, target, kept, shape, references):
+    relevant = sum(value is not None for value in references)
+    async with _prepared(connection) as (session, receipt):
+        coverage = connection.info[inventory._KEY].coverage[kept, "custom_import_build_family"][1]
+        assert coverage == ((relevant + 1) // 2, len(references), relevant), shape
+        assert receipt["source_rows"] == len(references), shape
+        assert receipt["relevant_rows"] == relevant, shape
+        assert receipt["pages"] == receipt["rows"] == (relevant + 1) // 2, shape
+        assert await _prove(session, target) is True, shape
+        if shape == "all_null":
+            await _assert_null_reference_write_excluded(case, kept)
+
+
+async def test_inventory_counts_complete_sources_and_only_pages_relevant_rows(monkeypatch):
+    references_by_shape = {
+        "empty": [],
+        "all_null": [None] * 7,
+        "sparse": [None, 11, None, 17, None, 23, None],
+        "dense": [11, 13, 17, 19, 23],
+        "composite_gaps": [11, None, None, 17, None, 23],
+    }
+    async with _inventory_case() as (case, connection, target, kept, _graph):
+        await _home(case, target, "{[9000000,9000001)}")
+        monkeypatch.setattr(retirement, "REFERENCE_PAGE_ROWS", 2)
+        for shape, references in references_by_shape.items():
+            await _sparse_families(case, kept, references, gaps=shape == "composite_gaps")
+            await _assert_inventory_shape(case, connection, target, kept, shape, references)
+            await _cleanup_inventory(connection)
+            async with case.sessions() as session, session.begin():
+                await session.execute(
+                    text(f'DELETE FROM "{retirement.snapshot_schema(kept)}".custom_import_build_family')
+                )
+
+
+async def test_inventory_does_not_reuse_evidence_after_unknown_commit_outcome():
+    async with _inventory_case() as (_case, connection, target, _kept, _graph):
+        with pytest.raises(ConnectionError, match="commit response"):
+            async with _prepared(connection) as (session, _receipt):
+                assert await _prove(session, target) is True
+            # Simulate a lost response after the real transaction commits.
+            raise ConnectionError("synthetic commit response lost")
+        async with AsyncSession(bind=connection) as session, session.begin():
+            await _bounded(session)
+            assert await _prove(session, target) is False

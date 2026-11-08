@@ -31,7 +31,7 @@ def _install(connection, schema):
     migration.upgrade()
 
 
-async def _ready(case, monkeypatch, *, continuation=False):
+async def _ready(case, monkeypatch, *, continuation=False, root_count=17):
     if continuation:
         request, build_id, generation_id = await _frozen_continuation(case, monkeypatch, continuation=True)
         async with case.engine.begin() as connection:
@@ -40,7 +40,7 @@ async def _ready(case, monkeypatch, *, continuation=False):
         for _ in range(40):
             assert await _step(case, request, build_id) == "scanning"
     else:
-        request, build_id, generation_id = await _frozen(case, monkeypatch)
+        request, build_id, generation_id = await _frozen(case, monkeypatch, root_count=root_count)
     async with case.engine.begin() as connection:
         await connection.run_sync(_install_ranges, case.schema_name, 16_384)
         before = await connection.scalar(

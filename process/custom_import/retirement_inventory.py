@@ -163,6 +163,10 @@ async def _page_columns(session, table, table_oid):
     return primary_columns
 
 
+def _reference_predicate(reference_kinds_by_column, quote):
+    return " OR ".join(f"{quote(name)} IS NOT NULL" for name in reference_kinds_by_column)
+
+
 def _reference_page_statement(table, primary_columns, reference_kinds_by_column, has_after, quote):
     """Aggregate one bounded keyset page without exporting its reference rows."""
     relation = f"{quote(table.schema)}.{quote(table.name)}"
@@ -185,11 +189,9 @@ def _reference_page_statement(table, primary_columns, reference_kinds_by_column,
             f"SELECT '{name}' AS reference_column,{expression} AS revision_kind,{quote(name)} AS revision_id "
             f"FROM page WHERE {quote(name)} IS NOT NULL"
         )
-    predicate = (
-        f"WHERE ROW({order}) > ROW({','.join(':key_' + str(i) for i in range(len(primary_columns)))})"
-        if has_after
-        else ""
-    )
+    predicate = f"WHERE ({_reference_predicate(reference_kinds_by_column, quote)})"
+    if has_after:
+        predicate += f" AND ROW({order}) > ROW({','.join(':key_' + str(i) for i in range(len(primary_columns)))})"
     return text(f"""
             WITH page AS MATERIALIZED (
                 SELECT {selected} FROM {relation} {predicate} ORDER BY {order} LIMIT :limit
@@ -210,33 +212,46 @@ def _reference_page_statement(table, primary_columns, reference_kinds_by_column,
 
 
 async def _copy_reference_pages(session, family_id, table, table_oid, reference_kinds_by_column):
-    """Return only page accounting and the last PK; reference IDs stay in SQL."""
+    """Count the complete pinned source; page and reconcile only relevant rows."""
     from process.custom_import.retirement import REFERENCE_PAGE_ROWS
 
     primary_columns = await _page_columns(session, table, table_oid)
     connection = await session.connection()
+    quote = connection.dialect.identifier_preparer.quote
+    relation = f"{quote(table.schema)}.{quote(table.name)}"
+    source_rows = await session.scalar(text(f"SELECT count(*) FROM {relation}"))
+    relevant_rows = await session.scalar(
+        text(f"SELECT count(*) FROM {relation} WHERE {_reference_predicate(reference_kinds_by_column, quote)}")
+    )
+    if not (type(source_rows) is int and type(relevant_rows) is int and 0 <= relevant_rows <= source_rows):
+        _refuse("reference source counts differ")
     after_keys = None
-    page_number = inventory_rows = reference_count = source_rows = 0
+    page_number = inventory_rows = reference_count = paged_rows = 0
     while True:
         statement = _reference_page_statement(
             table,
             primary_columns,
             reference_kinds_by_column,
             after_keys is not None,
-            connection.dialect.identifier_preparer.quote,
+            quote,
         )
         parameters_by_name = {"family": family_id, "oid": table_oid, "page": page_number, "limit": REFERENCE_PAGE_ROWS}
         if after_keys is not None:
             parameters_by_name.update({"key_" + str(index): key for index, key in enumerate(after_keys)})
         cursor = (await session.execute(statement, parameters_by_name)).mappings().one_or_none()
         if cursor is None:
-            return inventory_rows, reference_count, (page_number, source_rows)
+            if paged_rows != relevant_rows:
+                _refuse("reference page census differs")
+            # Keep exact full-source accounting even when the relevant keyset is empty.
+            return inventory_rows, reference_count, (page_number, source_rows, relevant_rows)
         next_keys = tuple(cursor[name] for name in primary_columns)
         if next_keys == after_keys or not 0 < cursor["inventory_source_rows"] <= REFERENCE_PAGE_ROWS:
             _refuse("reference page did not advance")
         after_keys = next_keys
         page_number += 1
-        source_rows += cursor["inventory_source_rows"]
+        paged_rows += cursor["inventory_source_rows"]
+        if paged_rows > relevant_rows:
+            _refuse("reference page census differs")
         inventory_rows += cursor["inventory_rows"]
         reference_count += cursor["inventory_references"]
 
@@ -306,7 +321,13 @@ async def prepare_frozen_reference_inventory(session):
         reference_count,
         await _read_transaction_identity(session),
     )
-    return {"families": len(families), "pages": sum(entry[1][0] for entry in coverage.values()), "rows": inventory_rows}
+    return {
+        "families": len(families),
+        "pages": sum(entry[1][0] for entry in coverage.values()),
+        "source_rows": sum(entry[1][1] for entry in coverage.values()),
+        "relevant_rows": sum(entry[1][2] for entry in coverage.values()),
+        "rows": inventory_rows,
+    }
 
 
 async def can_prove_frozen_reference_inventory(session, family, retained):
