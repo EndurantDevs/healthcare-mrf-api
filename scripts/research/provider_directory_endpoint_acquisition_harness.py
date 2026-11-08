@@ -298,6 +298,13 @@ def entry_params(manifest: dict[str, Any], entry: dict[str, Any]) -> dict[str, A
             resource_scan_concurrency=8,
             allow_retained_pagination_reset=False,
         )
+    if entry["entry_id"] == "vsp-provider-directory" and classification == "acquisition":
+        params_by_name.update(
+            probe=False,
+            defer_typed_materialization=True,
+            resource_deadline_seconds=518400,
+            allow_retained_pagination_reset=False,
+        )
     return params_by_name
 
 
@@ -311,7 +318,7 @@ def _selected_entries(manifest: dict[str, Any], selected_entry_ids: frozenset[st
     if unknown_entry_ids:
         raise ManifestError("unknown manifest entries: " + ",".join(sorted(unknown_entry_ids)))
     if not selected_entry_ids:
-        return list(manifest["entries"])
+        return [entry for entry in manifest["entries"] if entry["entry_id"] != "vsp-provider-directory"]
     return [entry for entry in manifest["entries"] if entry["entry_id"] in selected_entry_ids]
 
 

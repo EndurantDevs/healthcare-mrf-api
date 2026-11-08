@@ -18,7 +18,6 @@ import pytest
 
 from process import provider_directory_profile as profile
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -55,9 +54,7 @@ def _patch_fresh_profile_stage_identity(monkeypatch) -> None:
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
-        AsyncMock(
-            side_effect=[None, None, (21, "r", "p"), (22, "r", "p")]
-        ),
+        AsyncMock(side_effect=[None, None, (21, "r", "p"), (22, "r", "p")]),
     )
     monkeypatch.setattr(
         importer,
@@ -146,9 +143,7 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
     monkeypatch,
 ):
     """Keep a valid logged checkpoint resumable after the calendar day changes."""
-    dataset_fence, evidence_fence, profile_fence = (
-        _profile_build_identity_fixture()
-    )
+    dataset_fence, evidence_fence, profile_fence = _profile_build_identity_fixture()
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_scope_source_ids",
@@ -170,9 +165,7 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
         profile_fence,
     )
     checkpoint.return_value = _resumable_profile_checkpoint(initial_build)
-    stage_identity = AsyncMock(
-        side_effect=[(21, "r", "p"), (22, "r", "p")]
-    )
+    stage_identity = AsyncMock(side_effect=[(21, "r", "p"), (22, "r", "p")])
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
@@ -204,57 +197,38 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
 
 
 def test_profile_source_spec_matches_reviewed_and_retained_entries():
-    """Require every importable source plus explicit retained-only sources."""
+    """Keep managed profile enrollment separate from acquisition-only entries."""
     source_spec = profile.load_profile_source_spec()
     manifest = json.loads(
-        (
-            REPO_ROOT
-            / "specs/provider_directory_endpoint_acquisition_manifest.json"
-        ).read_text(encoding="utf-8")
+        (REPO_ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json").read_text(encoding="utf-8")
     )
-    entries_by_id = {
-        entry["entry_id"]: entry for entry in manifest["entries"]
-    }
+    entries_by_id = {entry["entry_id"]: entry for entry in manifest["entries"]}
     retained_registry = json.loads(
-        (
-            REPO_ROOT
-            / "specs/provider_directory_source_neutral_registry.json"
-        ).read_text(encoding="utf-8")
+        (REPO_ROOT / "specs/provider_directory_source_neutral_registry.json").read_text(encoding="utf-8")
     )
-    retained_entries_by_id = {
-        entry["entry_id"]: entry for entry in retained_registry["entries"]
-    }
+    retained_entries_by_id = {entry["entry_id"]: entry for entry in retained_registry["entries"]}
     retained_entry_ids = set(source_spec.get("retained_entry_ids", ()))
-    dataset_scoped_entry_ids = set(
-        source_spec.get("dataset_scoped_entry_ids", ())
-    )
+    dataset_scoped_entry_ids = set(source_spec.get("dataset_scoped_entry_ids", ()))
     importable_entry_ids = {
         entry_id
         for entry_id, entry in entries_by_id.items()
-        if entry["classification"] in PROFILE_SOURCE_CLASSIFICATIONS
+        if entry["classification"] in PROFILE_SOURCE_CLASSIFICATIONS and entry_id != "vsp-provider-directory"
     }
-    expected_profile_entry_ids = (
-        retained_entry_ids | dataset_scoped_entry_ids | importable_entry_ids
+    expected_profile_entry_ids = retained_entry_ids | dataset_scoped_entry_ids | importable_entry_ids
+    expected_source_ids = (
+        {source_id for entry_id in importable_entry_ids for source_id in entries_by_id[entry_id]["source_ids"]}
+        | {retained_entries_by_id[entry_id]["registered_source_id"] for entry_id in retained_entry_ids}
+        | {
+            source_row["source_id"]
+            for source_row in source_spec["verification_matrix"]["sources"]
+            if source_row["entry_id"] in dataset_scoped_entry_ids
+        }
     )
-    expected_source_ids = {
-        source_id
-        for entry_id in importable_entry_ids
-        for source_id in entries_by_id[entry_id]["source_ids"]
-    } | {
-        retained_entries_by_id[entry_id]["registered_source_id"]
-        for entry_id in retained_entry_ids
-    } | {
-        source_row["source_id"]
-        for source_row in source_spec["verification_matrix"]["sources"]
-        if source_row["entry_id"] in dataset_scoped_entry_ids
-    }
 
     assert set(source_spec["entry_ids"]) == expected_profile_entry_ids
     assert set(source_spec["source_ids"]) == expected_source_ids
     assert all(
-        entries_by_id[entry_id]["classification"]
-        in PROFILE_SOURCE_CLASSIFICATIONS
-        for entry_id in importable_entry_ids
+        entries_by_id[entry_id]["classification"] in PROFILE_SOURCE_CLASSIFICATIONS for entry_id in importable_entry_ids
     )
     assert all(
         retained_entries_by_id[entry_id]["acquisition_runnable"] is True
@@ -350,12 +324,8 @@ async def test_profile_npi_sql_predicate_matches_python_in_postgresql():
     finally:
         await connection.close()
 
-    assert {
-        int(predicate_row["candidate"]): bool(predicate_row["is_valid"])
-        for predicate_row in predicate_rows
-    } == {
-        candidate: profile.is_valid_npi(candidate)
-        for candidate in candidates
+    assert {int(predicate_row["candidate"]): bool(predicate_row["is_valid"]) for predicate_row in predicate_rows} == {
+        candidate: profile.is_valid_npi(candidate) for candidate in candidates
     }
 
 
@@ -382,27 +352,15 @@ def test_profile_publication_filters_invalid_npis_from_new_and_copied_rows():
 
     assert "(npi) BETWEEN 1000000000 AND 2999999999" in evidence_insert_sql
     assert "(npi) BETWEEN 1000000000 AND 2999999999" in evidence_copy_sql
-    assert "source_id = ANY(CAST(:retained_source_ids AS varchar[]))" in (
-        evidence_copy_sql
-    )
-    assert "source_id <> ALL(CAST(:retained_source_ids AS varchar[]))" in (
-        profile_copy_sql
-    )
-    assert (
-        "(profile.npi) BETWEEN 1000000000 AND 2999999999"
-        in profile_copy_sql
-    )
-    assert "JOIN \"mrf\".\"npi\"" not in evidence_insert_sql
+    assert "source_id = ANY(CAST(:retained_source_ids AS varchar[]))" in (evidence_copy_sql)
+    assert "source_id <> ALL(CAST(:retained_source_ids AS varchar[]))" in (profile_copy_sql)
+    assert "(profile.npi) BETWEEN 1000000000 AND 2999999999" in profile_copy_sql
+    assert 'JOIN "mrf"."npi"' not in evidence_insert_sql
 
 
 def test_profile_artifact_scope_materializes_endpoint_resources():
-    assert "Endpoint" in importer.PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES[
-        "profile"
-    ]
-    assert (
-        "OrganizationAffiliation"
-        in importer.PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES["profile"]
-    )
+    assert "Endpoint" in importer.PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES["profile"]
+    assert "OrganizationAffiliation" in importer.PROVIDER_DIRECTORY_ARTIFACT_TARGET_RESOURCE_TYPES["profile"]
     assert "Endpoint" in importer.PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_TYPES
 
 
@@ -419,35 +377,25 @@ def test_artifact_scope_projection_reuses_exact_materialization_selects():
         "fixture",
         "source_scope",
     )
-    source_projection = (
-        importer._provider_directory_artifact_source_projection_sql(
-            source_model,
-            "fixture",
-        )
+    source_projection = importer._provider_directory_artifact_source_projection_sql(
+        source_model,
+        "fixture",
     )
     practitioner_model = next(
-        model
-        for model in importer.RESOURCE_MODELS
-        if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
+        model for model in importer.RESOURCE_MODELS if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
     )
-    resource_select = (
-        importer._artifact_resource_batch_select_sql(
-            practitioner_model,
-            "fixture",
-        )
+    resource_select = importer._artifact_resource_batch_select_sql(
+        practitioner_model,
+        "fixture",
     )
-    resource_insert = (
-        importer._artifact_resource_batch_insert_sql(
-            practitioner_model,
-            "fixture",
-            "practitioner_scope",
-        )
+    resource_insert = importer._artifact_resource_batch_insert_sql(
+        practitioner_model,
+        "fixture",
+        "practitioner_scope",
     )
-    resource_projection = (
-        importer._artifact_resource_batch_projection_sql(
-            practitioner_model,
-            "fixture",
-        )
+    resource_projection = importer._artifact_resource_batch_projection_sql(
+        practitioner_model,
+        "fixture",
     )
 
     assert source_select in source_insert
@@ -460,9 +408,7 @@ def test_artifact_scope_projection_reuses_exact_materialization_selects():
     assert "FOR SHARE" not in resource_select.upper()
     assert "SUM(pg_column_size(projected_rows))" in source_projection
     assert "SUM(pg_column_size(projected_rows))" in resource_projection
-    assert 'MAX("resource_id")::varchar AS last_cursor' in (
-        resource_projection
-    )
+    assert 'MAX("resource_id")::varchar AS last_cursor' in (resource_projection)
 
 
 def test_cutover_dataset_lock_scope_and_wal_count_are_exact():
@@ -480,12 +426,11 @@ def test_cutover_dataset_lock_scope_and_wal_count_are_exact():
         )
     )
 
-    assert importer._provider_directory_artifact_fence_locked_dataset_ids(
-        fence
-    ) == ["dataset-candidate", "dataset-current"]
-    assert importer._provider_directory_profile_cutover_row_lock_count(
-        fence
-    ) == 10
+    assert importer._provider_directory_artifact_fence_locked_dataset_ids(fence) == [
+        "dataset-candidate",
+        "dataset-current",
+    ]
+    assert importer._provider_directory_profile_cutover_row_lock_count(fence) == 10
     lock_sql = importer._artifact_fence_dataset_rows_sql(for_update=True)
     assert "dataset.dataset_id = ANY" in lock_sql
     assert "FOR UPDATE OF dataset" in lock_sql
@@ -646,19 +591,15 @@ async def test_artifact_scope_exact_projection_includes_sources_and_batches(
 ):
     """Bind ordered source and per-dataset batch coordinates into one hash."""
     practitioner_model = next(
-        model
-        for model in importer.RESOURCE_MODELS
-        if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
+        model for model in importer.RESOURCE_MODELS if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
     )
     projection_query = AsyncMock(side_effect=_artifact_projection_query_rows())
     monkeypatch.setattr(importer.db, "first", projection_query)
-    projection = (
-        await importer._provider_directory_artifact_scope_exact_projection(
-            "fixture",
-            _artifact_projection_fence(),
-            frozenset({"Practitioner"}),
-            batch_size=2,
-        )
+    projection = await importer._provider_directory_artifact_scope_exact_projection(
+        "fixture",
+        _artifact_projection_fence(),
+        frozenset({"Practitioner"}),
+        batch_size=2,
     )
 
     assert [table.table_name for table in projection.tables] == [
@@ -667,9 +608,7 @@ async def test_artifact_scope_exact_projection_includes_sources_and_batches(
     ]
     source_table = projection.tables[0]
     practitioner_table = next(
-        table
-        for table in projection.tables
-        if table.table_name == practitioner_model.__tablename__
+        table for table in projection.tables if table.table_name == practitioner_model.__tablename__
     )
     assert source_table.resource_type == "source"
     assert source_table.projected_rows == 2
@@ -680,14 +619,10 @@ async def test_artifact_scope_exact_projection_includes_sources_and_batches(
     ]
     assert practitioner_table.projected_rows == 4
     assert practitioner_table.projected_logical_bytes == 450
-    assert _artifact_batch_coordinates(
-        practitioner_table
-    ) == _expected_artifact_batch_coordinates()
+    assert _artifact_batch_coordinates(practitioner_table) == _expected_artifact_batch_coordinates()
     assert projection.projected_rows == 6
     assert projection.projected_logical_bytes == 660
-    assert projection.projection_hash == importer._identity_hash(
-        projection.canonical_payload()
-    )
+    assert projection.projection_hash == importer._identity_hash(projection.canonical_payload())
     assert len(projection.projection_hash) == 64
     assert projection_query.await_count == 7
 
@@ -697,9 +632,7 @@ async def test_exact_projection_includes_a_proven_linked_resource_family(
     monkeypatch,
 ):
     practitioner_model = next(
-        model
-        for model in importer.RESOURCE_MODELS
-        if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
+        model for model in importer.RESOURCE_MODELS if importer.RESOURCE_TYPES_BY_MODEL[model] == "Practitioner"
     )
     linked_dataset = importer.ProviderDirectoryArtifactDataset(
         source_id="source_a",
@@ -725,14 +658,12 @@ async def test_exact_projection_includes_a_proven_linked_resource_family(
     )
     monkeypatch.setattr(importer.db, "first", projection_query)
 
-    projection = await (
-        importer._provider_directory_artifact_resource_exact_projection(
-            "fixture",
-            practitioner_model,
-            importer.ProviderDirectoryArtifactDatasetFence((linked_dataset,)),
-            frozenset({"Practitioner"}),
-            batch_size=100,
-        )
+    projection = await importer._provider_directory_artifact_resource_exact_projection(
+        "fixture",
+        practitioner_model,
+        importer.ProviderDirectoryArtifactDatasetFence((linked_dataset,)),
+        frozenset({"Practitioner"}),
+        batch_size=100,
     )
 
     assert projection.resource_type == "Practitioner"
@@ -789,9 +720,7 @@ def test_profile_aggregation_preflight_reuses_exact_output_query():
     assert "ON CONFLICT (npi) DO NOTHING" not in count_sql
     write_common = write_sql[write_sql.index("WITH affected_npis") :]
     count_common = count_sql[count_sql.index("WITH affected_npis") :]
-    assert write_common.split("SELECT npi,")[0] == (
-        count_common.split("SELECT npi,")[0]
-    )
+    assert write_common.split("SELECT npi,")[0] == (count_common.split("SELECT npi,")[0])
 
 
 def test_profile_aggregation_supports_bounded_npi_ranges():
@@ -806,9 +735,7 @@ def test_profile_aggregation_supports_bounded_npi_ranges():
 
     assert "npi >= CAST(:profile_npi_start AS bigint)" in sql
     assert "npi < CAST(:profile_npi_end AS bigint)" in sql
-    assert (
-        "WHERE evidence.npi >= CAST(:profile_npi_start AS bigint)" in sql
-    )
+    assert "WHERE evidence.npi >= CAST(:profile_npi_start AS bigint)" in sql
     assert "FROM scoped_evidence AS evidence" in sql
 
     with pytest.raises(ValueError, match="requires both bounds"):
@@ -915,11 +842,9 @@ async def test_profile_scope_filters_to_current_immutable_dataset_fence(
     )
     monkeypatch.setattr(importer.db, "all", fake_all)
 
-    source_ids, retained_source_ids, source_contexts = (
-        await importer._provider_directory_profile_scope_source_ids(
-            "mrf",
-            {"source_allowed"},
-        )
+    source_ids, retained_source_ids, source_contexts = await importer._provider_directory_profile_scope_source_ids(
+        "mrf",
+        {"source_allowed"},
     )
 
     assert source_ids == ["source_allowed"]
@@ -989,14 +914,8 @@ async def test_profile_stage_build_creates_logged_tables_without_rewrite(
     )
 
     statements = [call.args[0] for call in status.await_args_list]
-    assert any(
-        'CREATE TABLE "mrf"."evidence_stage"' in statement
-        for statement in statements
-    )
-    assert any(
-        'CREATE TABLE "mrf"."profile_stage"' in statement
-        for statement in statements
-    )
+    assert any('CREATE TABLE "mrf"."evidence_stage"' in statement for statement in statements)
+    assert any('CREATE TABLE "mrf"."profile_stage"' in statement for statement in statements)
     assert not any("CREATE UNLOGGED TABLE" in statement for statement in statements)
     assert not any("SET LOGGED" in statement for statement in statements)
     assert sum("cls.relpersistence" in query for query in scalar_queries) == 2
@@ -1050,15 +969,14 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
         evidence_stage="evidence_stage",
         profile_stage="profile_stage",
     )
-    build_fence = importer.ProviderDirectoryArtifactBuildFence(
-        target_oid=None
-    )
+    build_fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
     status = AsyncMock(return_value=1)
     assert_logged = AsyncMock()
 
     @contextlib.asynccontextmanager
     async def transaction():
         yield None
+
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=0))
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
@@ -1079,16 +997,12 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
         build_fence,
         build_fence,
     )
-    joined_sql = "\n".join(
-        str(awaited.args[0]) for awaited in status.await_args_list
-    )
+    joined_sql = "\n".join(str(awaited.args[0]) for awaited in status.await_args_list)
     assert 'CREATE TABLE "mrf"."evidence_stage"' in joined_sql
     assert 'CREATE TABLE "mrf"."profile_stage"' in joined_sql
     assert "CREATE UNLOGGED TABLE" not in joined_sql
     assert "SET LOGGED" not in joined_sql
-    assert [
-        awaited.args for awaited in assert_logged.await_args_list
-    ] == [
+    assert [awaited.args for awaited in assert_logged.await_args_list] == [
         ("mrf", "evidence_stage"),
         ("mrf", "profile_stage"),
     ]
@@ -1102,29 +1016,21 @@ def _assert_profile_fact_population_calls(insert_calls, build):
     """Require every source/fact/resource partition exactly once."""
     assert len(insert_calls) == 115 * len(build.source_ids)
     assert all(len(call.kwargs["source_ids"]) == 1 for call in insert_calls)
-    assert {
-        (call.kwargs["source_ids"][0], call.kwargs["dataset_ids"][0])
-        for call in insert_calls
-    } == {("source_a", "dataset_a"), ("source_b", "dataset_b")}
-    role_bucket_calls = [
-        call
-        for call in insert_calls
-        if "profile_role_bucket" in call.kwargs
-    ]
-    assert len(role_bucket_calls) == (
-        len(build.source_ids)
-        * 3
-        * profile.PROFILE_AFFILIATION_ROLE_BUCKETS
-    )
+    assert {(call.kwargs["source_ids"][0], call.kwargs["dataset_ids"][0]) for call in insert_calls} == {
+        ("source_a", "dataset_a"),
+        ("source_b", "dataset_b"),
+    }
+    role_bucket_calls = [call for call in insert_calls if "profile_role_bucket" in call.kwargs]
+    assert len(role_bucket_calls) == (len(build.source_ids) * 3 * profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
     assert {
         fact_type
         for call in role_bucket_calls
         for fact_type in ("affiliation", "organization", "plan_membership")
         if f"fact_type = '{fact_type}'" in str(call.args[0])
     } == {"affiliation", "organization", "plan_membership"}
-    assert {
-        call.kwargs["profile_role_bucket"] for call in role_bucket_calls
-    } == set(range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS))
+    assert {call.kwargs["profile_role_bucket"] for call in role_bucket_calls} == set(
+        range(profile.PROFILE_AFFILIATION_ROLE_BUCKETS)
+    )
 
 
 @pytest.mark.asyncio
@@ -1153,32 +1059,19 @@ async def test_profile_evidence_population_bounds_each_fact_and_role_bucket(
         bounded=True,
     )
 
-    insert_calls = [
-        call
-        for call in status.await_args_list
-        if "dataset_ids" in call.kwargs
-    ]
+    insert_calls = [call for call in status.await_args_list if "dataset_ids" in call.kwargs]
     _assert_profile_fact_population_calls(insert_calls, build)
     log_messages = [log_record.getMessage() for log_record in caplog.records]
+    assert any("kind=fact source_id=source_a fact_type=name role_bucket=1/1" in message for message in log_messages)
     assert any(
-        "kind=fact source_id=source_a fact_type=name role_bucket=1/1"
-        in message
-        for message in log_messages
-    )
-    assert any(
-        "Completed Provider Directory Profile evidence batch" in message
-        and "rows=1 elapsed_seconds=" in message
+        "Completed Provider Directory Profile evidence batch" in message and "rows=1 elapsed_seconds=" in message
         for message in log_messages
     )
 
 
 def _profile_write_calls(status):
     """Return artifact writes without maintenance statements."""
-    return [
-        call
-        for call in status.await_args_list
-        if "ANALYZE" not in str(call.args[0])
-    ]
+    return [call for call in status.await_args_list if "ANALYZE" not in str(call.args[0])]
 
 
 def _assert_incremental_evidence_writes(write_calls):
@@ -1189,10 +1082,7 @@ def _assert_incremental_evidence_writes(write_calls):
         "source_a",
         "source_b",
     ]
-    assert all(
-        call.kwargs["dataset_ids"] == ["dataset_a"]
-        for call in write_calls[1:]
-    )
+    assert all(call.kwargs["dataset_ids"] == ["dataset_a"] for call in write_calls[1:])
     assert all(
         "profile_role_bucket" in call.kwargs
         for call in write_calls[1:]
@@ -1208,9 +1098,7 @@ def _assert_incremental_compact_writes(write_calls):
     assert len(write_calls) == 401
     assert "affected_npis" in write_calls[0].args[0]
     assert all("generation_id" in call.kwargs for call in write_calls[1:])
-    assert all(
-        "profile_npi_start" in call.kwargs for call in write_calls[1:]
-    )
+    assert all("profile_npi_start" in call.kwargs for call in write_calls[1:])
 
 
 @pytest.mark.parametrize(
@@ -1232,14 +1120,8 @@ def test_profile_worker_windows_preserve_database_pool_reserve(
         raising=False,
     )
 
-    assert (
-        importer._provider_directory_profile_evidence_window_size()
-        == expected_workers
-    )
-    assert (
-        importer._provider_directory_profile_compact_window_size()
-        == expected_workers
-    )
+    assert importer._provider_directory_profile_evidence_window_size() == expected_workers
+    assert importer._provider_directory_profile_compact_window_size() == expected_workers
 
 
 def test_profile_worker_windows_reject_pool_or_override_over_admission(
@@ -1312,18 +1194,9 @@ async def test_profile_delta_builds_affected_npis_per_source_then_stage(
         affected_npi_stage="affected_stage",
     )
 
-    assert (
-        await importer._populate_provider_directory_profile_affected_npi_stage(
-            build
-        )
-        == 3
-    )
+    assert await importer._populate_provider_directory_profile_affected_npi_stage(build) == 3
 
-    writes = [
-        call
-        for call in status.await_args_list
-        if "INSERT INTO" in call.args[0]
-    ]
+    writes = [call for call in status.await_args_list if "INSERT INTO" in call.args[0]]
     assert [call.kwargs.get("source_id") for call in writes] == [
         "source_a",
         "source_b",
@@ -1359,28 +1232,17 @@ async def test_profile_compact_population_batches_affected_npi_ranges(
         npi_batch_size=500_000_000,
     )
 
-    batch_calls = [
-        call
-        for call in status.await_args_list
-        if "profile_npi_start" in call.kwargs
-    ]
-    assert [
-        (call.kwargs["profile_npi_start"], call.kwargs["profile_npi_end"])
-        for call in batch_calls
-    ] == [
+    batch_calls = [call for call in status.await_args_list if "profile_npi_start" in call.kwargs]
+    assert [(call.kwargs["profile_npi_start"], call.kwargs["profile_npi_end"]) for call in batch_calls] == [
         (1_000_000_000, 1_500_000_000),
         (1_500_000_000, 2_000_000_000),
         (2_000_000_000, 2_500_000_000),
         (2_500_000_000, 3_000_000_000),
     ]
     log_messages = [log_record.getMessage() for log_record in caplog.records]
+    assert any("kind=npi npi_start=1000000000 npi_end=1500000000" in message for message in log_messages)
     assert any(
-        "kind=npi npi_start=1000000000 npi_end=1500000000" in message
-        for message in log_messages
-    )
-    assert any(
-        "Completed Provider Directory Profile compact batch" in message
-        and "rows=1 elapsed_seconds=" in message
+        "Completed Provider Directory Profile compact batch" in message and "rows=1 elapsed_seconds=" in message
         for message in log_messages
     )
 
@@ -1458,6 +1320,7 @@ async def test_profile_cancellation_waits_for_failure_marker(monkeypatch):
         marker_started.set()
         await release_marker.wait()
         marker_completed.set()
+
     monkeypatch.setattr(
         importer,
         "_claim_provider_directory_profile_build_checkpoint",
@@ -1491,7 +1354,6 @@ async def test_profile_cancellation_waits_for_failure_marker(monkeypatch):
             has_existing_artifacts=False,
         )
     )
-
     await population_started.wait()
     task.cancel()
     await marker_started.wait()
@@ -1533,12 +1395,8 @@ async def test_profile_resume_does_not_reopen_completed_evidence_phase(
 ):
     """Start the next compact batch without rewriting phase state first."""
     build, checkpoint_state = _completed_evidence_profile_fixture()
-    evidence_population = AsyncMock(
-        side_effect=AssertionError("completed evidence phase was reopened")
-    )
-    compact_population = AsyncMock(
-        side_effect=RuntimeError("hard stop before next compact batch")
-    )
+    evidence_population = AsyncMock(side_effect=AssertionError("completed evidence phase was reopened"))
+    compact_population = AsyncMock(side_effect=RuntimeError("hard stop before next compact batch"))
     mark_failed = AsyncMock()
     monkeypatch.setattr(
         importer,
@@ -1624,9 +1482,7 @@ async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
         "_is_table_present",
         AsyncMock(side_effect=[True, False]),
     )
-    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(
-        fence
-    )
+    fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
     try:
         with pytest.raises(
             RuntimeError,

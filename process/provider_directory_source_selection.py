@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from process import provider_directory_generic_source_policy as source_policy
+from process import vsp_directory_integration as vsp_directory
 
 QUALIFICATION_API_BASE = contextvars.ContextVar("provider_directory_qualification_api_base", default=None)
 CREDENTIAL_REQUEST_LOCKS = contextvars.ContextVar("provider_directory_credential_request_locks", default=None)
@@ -162,7 +163,8 @@ def is_anonymous_source_url(url: str) -> bool:
 def requires_verified_session(directory, source_record):
     """Keep strict source transports independent of the ordinary TLS setting."""
     return bool(
-        directory.current_version_census_contract(source_record) is not None
+        vsp_directory.is_source(source_record)
+        or directory.current_version_census_contract(source_record) is not None
         or directory.capped_partition.enabled(directory, source_record)
         or uses_census_retry_policy(directory, source_record)
         or is_credentialed_rest_source(directory, source_record)
@@ -201,6 +203,60 @@ async def probe_sources_with_session(directory, source_records, *, census_contra
         return await directory._run_source_probe_batch(source_records, **options)
 
 
+async def probe_source(directory, source_record, *, timeout, run_id):
+    """Qualify the selected source over its declared transport."""
+    if vsp_directory.is_source(source_record):
+        return await vsp_directory.probe(directory, source_record, timeout=timeout, run_id=run_id)
+    if directory._uses_uhc_official_file_connector(source_record):
+        return await directory._probe_uhc_official_file_connector(
+            source_record,
+            timeout=timeout,
+            run_id=run_id,
+        )
+    if directory._uses_alohr_graphql_connector(source_record):
+        return await directory._probe_alohr_graphql_connector(source_record, timeout=timeout, run_id=run_id)
+    metadata_urls = directory._candidate_metadata_urls(source_record)
+    if not metadata_urls:
+        source_probe_map = {
+            "status": "no_api",
+            "http_status": None,
+            "response_time_ms": 0,
+            "url": None,
+            "error": "missing api_base",
+            "run_id": run_id,
+        }
+        return source_probe_map, None
+    missing_credential_result = await resolve_probe_credentials(
+        directory._credential_probe_short_circuit,
+        source_record,
+        metadata_urls,
+        run_id=run_id,
+        run_in_thread=is_credentialed_rest_source(directory, source_record),
+    )
+    if missing_credential_result:
+        return missing_credential_result
+    collection_probe = await probe_declared_collection(directory, source_record, timeout=timeout, run_id=run_id)
+    if collection_probe is not None:
+        return collection_probe
+    best_probe: dict[str, Any] | None = None
+    best_payload: dict[str, Any] | None = None
+    for candidate_base, metadata_url in metadata_urls:
+        candidate_probe_map, capability_payload = await directory._probe_metadata_candidate(
+            source_record,
+            candidate_base,
+            metadata_url,
+            timeout=timeout,
+            run_id=run_id,
+        )
+        if candidate_probe_map["status"] == "valid":
+            return candidate_probe_map, capability_payload
+        if best_probe is None or candidate_probe_map.get("http_status") == 200:
+            best_probe = candidate_probe_map
+            best_payload = capability_payload
+    assert best_probe is not None
+    return best_probe, best_payload
+
+
 async def probe_with_deadline(directory, source_record, *, isolate_tls, timeout, run_id, hard_timeout):
     """Keep the existing probe timeout inside its source's transport scope."""
     async with verified_session_scope(directory, [source_record], enabled=isolate_tls):
@@ -223,7 +279,11 @@ def resource_endpoint_signature(directory, source):
         (field, directory._clean_text(source.get(field)) or "")
         for field in sorted(directory.RESOURCE_ENDPOINT_FIELDS.values())
     )
-    connector_contract = directory._alohr_graphql_acquisition_contract(source)
+    connector_contract = (
+        vsp_directory.endpoint_contract()
+        if vsp_directory.is_source(source)
+        else directory._alohr_graphql_acquisition_contract(source)
+    )
     if connector_contract is not None:
         signature_items += (
             (
@@ -654,6 +714,7 @@ async def qualify_stale_isolated_source(directory, source_rows, task, *, timeout
         or directory.current_version_census_contract(source_record) is not None
         or directory._uses_alohr_graphql_connector(source_record)
         or directory._uses_uhc_official_file_connector(source_record)
+        or vsp_directory.is_source(source_record)
     ):
         return source_rows
     decision = directory._resource_import_source_decision(

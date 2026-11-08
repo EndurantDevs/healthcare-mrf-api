@@ -102,7 +102,7 @@ DEFAULT_OUTPUT = ROOT / "docs/imports/provider-directory-endpoint-support.md"
 DEFAULT_BLOCKER_REGISTRY = ROOT / "specs/provider_directory_blocker_registry.json"
 DEFAULT_VERIFICATION_SNAPSHOT = ROOT / "specs/provider_directory_endpoint_verification.json"
 DEFAULT_CURRENT_DATASET_AUDIT = ROOT / "specs/provider_directory_current_dataset_audit.json"
-METHODS = {"rest", "bulk", "graphql", "official-files", "probe"}
+METHODS = {"rest", "bulk", "graphql", "official-files", "official-json", "probe"}
 DISPLAY_VALUES = {
     "supported": "Supported",
     "externally-supported": "Externally supported",
@@ -121,6 +121,7 @@ DISPLAY_VALUES = {
     "bulk": "Bulk",
     "graphql": "GraphQL",
     "official-files": "Official files",
+    "official-json": "Official JSON directory",
     "probe": "Probe",
     "not-importable": "Not importable",
 }
