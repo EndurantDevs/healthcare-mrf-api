@@ -179,6 +179,8 @@ class SourceProxyRun:
     def attach_audit(self, metrics):
         """Retain shared nonsecret state in the caller's durable terminal audit."""
         if self._audit:
+            binding = self.bindings[self._audit["binding"]["source_id"]]
+            self._audit["cooldowns"] = binding.cooldown_snapshot()
             metrics["source_http_proxy"] = self._audit
 
     def enabled(self, source_record):

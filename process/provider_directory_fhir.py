@@ -117,6 +117,7 @@ from process import provider_directory_profile_target_wal_witness as profile_sta
 from process import provider_directory_serving_recovery as serving_recovery
 from process import provider_directory_source_proxy as source_proxy
 from process import provider_directory_source_selection as source_selection
+from process import vsp_directory_integration as vsp_directory
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
     mark_control_run,
@@ -633,7 +634,7 @@ REVIEWED_ACCEPTING_MEDICAID_EXTENSION_URLS = frozenset(
         "https://healthporta.com/fhir/provider-directory/accepting-medicaid",
     }
 )
-FHIR_FETCH_MODES = frozenset({"rest_bundle", "rest_read", "bulk_ndjson", "graphql"})
+FHIR_FETCH_MODES = frozenset({"rest_bundle", "rest_read", "bulk_ndjson", "graphql", vsp_directory.TRANSPORT})
 _PUBLISH_SCOPE_UNSET = object()
 _DATASET_SERVING_RELATION_ROOT_UNSET = object()
 FHIR_RESOURCE_PATH_SEGMENTS = frozenset(resource_type.lower() for resource_type in DEFAULT_RESOURCES)
@@ -42190,56 +42191,7 @@ async def _probe_source(
     source_record: dict[str, Any], *, timeout: int, run_id: str | None
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Probe the source's actual acquisition transport and return normalized status."""
-    if _uses_uhc_official_file_connector(source_record):
-        return await _probe_uhc_official_file_connector(
-            source_record,
-            timeout=timeout,
-            run_id=run_id,
-        )
-    if _uses_alohr_graphql_connector(source_record):
-        return await _probe_alohr_graphql_connector(source_record, timeout=timeout, run_id=run_id)
-    metadata_urls = _candidate_metadata_urls(source_record)
-    if not metadata_urls:
-        source_probe_map = {
-            "status": "no_api",
-            "http_status": None,
-            "response_time_ms": 0,
-            "url": None,
-            "error": "missing api_base",
-            "run_id": run_id,
-        }
-        return source_probe_map, None
-    missing_credential_result = await source_selection.resolve_probe_credentials(
-        _credential_probe_short_circuit,
-        source_record,
-        metadata_urls,
-        run_id=run_id,
-        run_in_thread=source_selection.is_credentialed_rest_source(sys.modules[__name__], source_record),
-    )
-    if missing_credential_result:
-        return missing_credential_result
-    collection_probe = await source_selection.probe_declared_collection(
-        sys.modules[__name__], source_record, timeout=timeout, run_id=run_id
-    )
-    if collection_probe is not None:
-        return collection_probe
-    best_probe: dict[str, Any] | None = None
-    best_payload: dict[str, Any] | None = None
-    for candidate_base, metadata_url in metadata_urls:
-        candidate_probe_map, capability_payload = await _probe_metadata_candidate(
-            source_record,
-            candidate_base,
-            metadata_url,
-            timeout=timeout,
-            run_id=run_id,
-        )
-        if candidate_probe_map["status"] == "valid":
-            return candidate_probe_map, capability_payload
-        if best_probe is None or candidate_probe_map.get("http_status") == 200:
-            best_probe = candidate_probe_map
-            best_payload = capability_payload
-    assert best_probe is not None
-    return best_probe, best_payload
+    return await source_selection.probe_source(sys.modules[__name__], source_record, timeout=timeout, run_id=run_id)
 
 
 def _source_probe_hard_timeout_seconds(source: dict[str, Any], *, timeout: int) -> int:
@@ -58030,7 +57982,10 @@ def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[
     if not api_base:
         return source.get("source_id") or "", "", ()
     proxy_run = source_proxy.current_run()
-    if proxy_run is not None and source.get("source_id") in proxy_run.descriptors:
+    if vsp_directory.is_source(source):
+        vsp_directory.require(not _credential_spec_for_source(source), "vsp_source_credentials_forbidden")
+        credential_descriptor = None
+    elif proxy_run is not None and source.get("source_id") in proxy_run.descriptors:
         credential_descriptor = proxy_run.descriptors[source["source_id"]]
     else:
         credential_descriptor = _credential_request_options_for_source(source, f"{api_base}/metadata")["descriptor"]
@@ -67919,6 +67874,32 @@ async def _import_resources(
                 ),
             )
 
+        if vsp_directory.is_source(partition_source):
+            vsp_directory.require(
+                source_ids == [vsp_directory.SOURCE_ID]
+                and set(_endpoint_dataset_selected_resources(source_group, resources))
+                == set(vsp_directory.RESOURCE_TYPES)
+                and defer_typed_materialization
+                and per_resource_limit == page_limit == linked_resource_limit == 0
+                and not stale_cleanup,
+                "vsp_full_deferred_acquisition_required",
+            )
+
+            async def capture_progress(details):
+                """Add retained acquisition counts to the existing progress report."""
+                async with progress_lock:
+                    active_group_by_key[group_key]["directory_capture"] = details
+                await report_progress()
+
+            async with asyncio.timeout(resource_deadline_seconds or None):
+                return await vsp_directory.import_group(
+                    sys.modules[__name__],
+                    partition_source,
+                    run_id=run_id,
+                    persist=persist_resource_rows,
+                    progress_callback=capture_progress,
+                    cancel_check=resource_import_cancellation.check,
+                )
         if _uses_alohr_graphql_connector(partition_source):
             active_group_by_key[group_key]["resource_fetch_timing"] = _unavailable_resource_timings(
                 resources, "graphql"
@@ -69996,7 +69977,11 @@ async def process_provider_directory_fhir_data(
         total=1,
         message="resolving Provider Directory source catalog",
     )
-    if census_request is not None:
+    is_vsp_selected = census_request is None and vsp_directory.explicit_selection(requested_source_ids, source_query)
+    if is_vsp_selected:
+        vsp_directory.require(not test_mode, "vsp_test_capture_forbidden")
+        seed_rows = []
+    elif census_request is not None:
         seed_rows = reviewed_census_seed_rows
     elif test_mode and not task.get("seed_db_path") and not task.get("seed_db_url"):
         seed_rows = [
@@ -70023,7 +70008,7 @@ async def process_provider_directory_fhir_data(
             limit=None if (task.get("retest_results_path") or task.get("retest_results_url")) else limit,
             source_query=source_query,
         )
-    if census_request is None:
+    if census_request is None and not is_vsp_selected:
         retest_path, retest_tmpdir = _resolve_retest_results(
             retest_results_path,
             _clean_text(task.get("retest_results_url")),
@@ -70054,7 +70039,14 @@ async def process_provider_directory_fhir_data(
     proxy_token, proxy_run = source_proxy.enter_run(sys.modules[__name__])
     try:
         source_rows = _dedupe_source_rows([_source_row_from_seed(seed_record) for seed_record in seed_rows])
-        if census_request is None:
+        if is_vsp_selected:
+            source_rows = [vsp_directory.source_row(_now())]
+        elif census_request is None:
+            source_rows = [
+                source_record
+                for source_record in source_rows
+                if source_record.get("source_id") != vsp_directory.SOURCE_ID
+            ]
             source_rows = _add_uhc_official_file_source(
                 source_rows,
                 requested_source_ids=requested_source_ids,
@@ -70450,6 +70442,8 @@ async def process_provider_directory_fhir_data(
         print("PROVIDER_DIRECTORY_FHIR_IMPORT_DONE\t" + json.dumps(metrics_by_key, sort_keys=True, default=str))
         return metrics_by_key
     finally:
+        if proxy_run.bindings:
+            proxy_run.attach_audit(ctx["context"].setdefault("audit", {}))
         source_proxy.exit_run(proxy_token)
         if seen_stage_table_for_publish:
             await _drop_import_seen_stage_table(seen_stage_table_for_publish)

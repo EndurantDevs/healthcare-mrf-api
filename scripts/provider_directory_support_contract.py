@@ -141,7 +141,7 @@ def _validate_endpoint_classification(
     expected_support = {
         "acquisition": (
             "acquisition-configured",
-            {"graphql", "official-files", "rest"},
+            {"graphql", "official-files", "official-json", "rest"},
             True,
         ),
         "bulk_acquisition": ("acquisition-configured", {"bulk"}, True),
