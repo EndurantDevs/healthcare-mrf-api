@@ -200,12 +200,16 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     assert sorted(path.name for path in workflows.iterdir()) == ["artifact-cleanup.yml", "ci.yml"]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(text)
-    assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push"}
+    assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push", "merge_group"}
     assert set(workflow.get("on", workflow.get(True))["pull_request"]["types"]) == {
         "opened",
         "synchronize",
         "reopened",
         "edited",
+    }
+    assert workflow.get("on", workflow.get(True))["merge_group"] == {
+        "types": ["checks_requested"],
+        "branches": ["dev"],
     }
     assert workflow.get("on", workflow.get(True))["push"]["branches"] == ["main", "dev"]
     assert workflow["permissions"] == {
@@ -238,6 +242,8 @@ def _assert_hosted_job_policies(workflow, revision):
     for job_id, job in workflow["jobs"].items():
         _assert_job_label(job_id, job)
         condition = "!cancelled()" if job_id in {"measurement", "source-validation"} else "success()"
+        if job_id == "dev-image-publication":
+            condition = "github.event_name != 'merge_group' && " + condition
         if job_id == "smoke":
             assert job["if"] == "${{ success() }}"
         elif job_id == "source-validation":
