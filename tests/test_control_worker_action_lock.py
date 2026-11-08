@@ -43,6 +43,27 @@ def test_exact_worker_presence_queries_job_and_pod_for_same_run(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("role", ["start", "source-publication"])
+def test_source_presence_selects_the_exact_publication_or_acquisition_role(monkeypatch, role):
+    paths = []
+    payload = {"run_id": RUN_ID, "importer": "provider-directory-fhir", "role": role}
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
+    monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "sample")
+
+    def request(method, path):
+        paths.append(path)
+        return {"items": []}
+
+    monkeypatch.setattr(control_workers, "_kubernetes_request", request)
+    assert control_workers.exact_worker_presence(payload)["stopped"] is True
+    assert len(paths) == 2
+    for path in paths:
+        selector = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["labelSelector"][0]
+        assert f"healthporta.com/role={role}" in selector.split(",")
+        assert "healthporta.com/run-id-hash=" in selector
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("importer", ["plan-pricing-projection", "provider-directory-fhir"])
 async def test_worker_ensure_holds_exact_run_lock_through_launch(
